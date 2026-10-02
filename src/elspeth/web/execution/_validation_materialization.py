@@ -6,22 +6,24 @@ owner of check ordering and ledger mutation.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 from uuid import UUID
 
 import yaml
 
-from elspeth.contracts.blobs import BlobRecord
-from elspeth.contracts.blobs_inline import BlobInlineValidationViolation
+from elspeth.contracts.blobs import AllowedMimeType, BlobNotFoundError, BlobRecord, BlobStateError
+from elspeth.contracts.blobs_inline import BlobContentResolutionError, BlobInlineRef, BlobInlineValidationViolation
+from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import PipelineLoweringError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.core.blobs_inline import (
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
     BLOB_INLINE_PER_REF_BYTE_CAP,
+    _discover_blob_content_refs,
     _substitute_blob_content_refs_for_validation,
     _validate_blob_content_refs_sync,
 )
@@ -43,7 +45,6 @@ from elspeth.web.execution.schemas import (
     CHECK_LLM_BASE_URL_POLICY,
     CHECK_LLM_RETRY_BUDGET_POLICY,
     CHECK_LLM_TRACING_POLICY,
-    CHECK_MANAGED_IDENTITY_POLICY,
     ValidationCheck,
     ValidationError,
 )
@@ -55,7 +56,6 @@ from elspeth.web.provider_config_policy import (
     web_llm_base_url_policy_error,
     web_llm_retry_budget_policy_error,
     web_llm_tracing_policy_error,
-    web_rag_provider_config_policy_error,
 )
 
 
@@ -175,6 +175,95 @@ def _blob_inline_validation_error(violation: BlobInlineValidationViolation) -> V
     )
 
 
+_LLM_PROMPT_SURFACE_OPTION_ROOTS: Final[frozenset[str]] = frozenset({"prompt_template", "system_prompt", "model"})
+
+
+def llm_prompt_surface_field(field_path: str) -> tuple[str, str] | None:
+    """Return ``(node_name, option_path)`` when an inline-ref path is an ``llm`` prompt surface or model.
+
+    The one definition of the domain every LLM-authored inline-blob refusal
+    guards: ``wire_blob_inline_ref`` and the node-option authoring tools, the
+    /validate materialization phase, and run admission. ``field_path`` is the
+    canonical ``node:<name>.options.<key>[.<key>...]`` form
+    ``_discover_blob_content_refs`` produces. The guarded options are
+    ``prompt_template``, ``system_prompt`` and ``model`` (and anything beneath
+    them), and ``queries`` as a whole value, a whole ``queries.<name>`` value,
+    or that query's ``template``: every value that is, or would carry, a query
+    template. Other options, including a query's ``input_fields``, are not
+    guarded. Whether ``<name>`` is an ``llm`` node is the caller's decision,
+    made from the representation it holds.
+    """
+    prefix, separator, option_path = field_path.partition(".options.")
+    if separator == "" or not prefix.startswith("node:"):
+        return None
+    keys = option_path.split(".")
+    root = keys[0]
+    is_query_prompt = root == "queries" and (len(keys) <= 2 or keys[2] == "template")
+    if root not in _LLM_PROMPT_SURFACE_OPTION_ROOTS and not is_query_prompt:
+        return None
+    return prefix.removeprefix("node:"), option_path
+
+
+def is_llm_authored_prompt_surface_binding(
+    field_path: str,
+    *,
+    llm_node_names: Collection[str],
+    creation_modality: CreationModality,
+) -> bool:
+    """Whether binding a blob of ``creation_modality`` at ``field_path`` is refused.
+
+    ADR-034 admits ``inline_content`` markers in prompt fields so a USER-uploaded
+    prompt artifact can back an ``llm`` node. The ``llm_prompt_template`` and
+    ``llm_model_choice`` reviews read those options as strings, and the run
+    substitutes blob bytes afterwards, so an LLM-authored blob there would become
+    the executed prompt or model with no operator review. Only user-verbatim blob
+    content may stand in for that text.
+    """
+    surface = llm_prompt_surface_field(field_path)
+    return surface is not None and surface[0] in llm_node_names and is_llm_authored_creation_modality(creation_modality)
+
+
+def _llm_authored_prompt_surface_refs(
+    refs: list[BlobInlineRef],
+    records_by_blob_id: Mapping[UUID, BlobRecord],
+    *,
+    llm_node_names: Collection[str],
+) -> list[BlobInlineRef]:
+    """Inline refs that bind an LLM-authored blob into an ``llm`` prompt surface or model.
+
+    Called only after the metadata validation found no violation, so every ref
+    is well formed and its blob resolved: ``records_by_blob_id`` holds the
+    record that validation read for each one, and no metadata is read again.
+    """
+    refused: list[BlobInlineRef] = []
+    for ref in refs:
+        record = records_by_blob_id[ref.blob_id]
+        if is_llm_authored_prompt_surface_binding(
+            ref.field_path,
+            llm_node_names=llm_node_names,
+            creation_modality=record.creation_modality,
+        ):
+            refused.append(ref)
+    return refused
+
+
+def _llm_authored_prompt_surface_error(ref: BlobInlineRef) -> ValidationError:
+    return ValidationError(
+        component_id=_blob_inline_component_id(ref.field_path),
+        component_type=_blob_inline_component_type(ref.field_path),
+        message=(
+            f"Inline content blob reference at {ref.field_path} is llm_authored: blob {ref.blob_id} was written by "
+            "the composer, and an llm node's prompt template, system prompt, query template or model admits only "
+            "user-uploaded blob content, because the prompt-template and model-choice reviews cover those fields"
+        ),
+        suggestion=(
+            "Write the text directly into the option with patch_node_options or upsert_node so its review is "
+            "staged, or bind a user-uploaded blob instead."
+        ),
+        error_code="llm_authored_inline_blob_content",
+    )
+
+
 def materialize_validation_yaml(
     interpretation: InterpretationValidatedState,
     *,
@@ -183,6 +272,7 @@ def materialize_validation_yaml(
     session_id: str | None,
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None,
     load_yaml: Callable[[str], object],
+    blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
 ) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Generate the exact runtime YAML and validate inline-blob metadata.
 
@@ -225,13 +315,78 @@ def materialize_validation_yaml(
         )
     pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(data_dir), session_id=session_id)
 
-    if blob_get_metadata is not None and "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml:
+    if "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml:
         loaded = load_yaml(pipeline_yaml)
         if type(loaded) is not dict:
             raise TypeError(f"generate_yaml() produced non-dict YAML (got {type(loaded).__name__}) — this is a bug in the YAML generator")
         config_dict = cast(dict[str, object], loaded)
+        try:
+            refs = _discover_blob_content_refs(config_dict)
+        except BlobContentResolutionError as exc:
+            malformed = [
+                BlobInlineValidationViolation(category="malformed", field_path=field_path, detail=reason)
+                for field_path, reason in exc.malformed
+            ]
+            detail = _blob_inline_validation_detail(malformed)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=tuple(_blob_inline_validation_error(violation) for violation in malformed),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        if not refs:
+            # The YAML substring check also matches literal prompt/table text.
+            # Only discovered markers require authorized blob readers.
+            return PhaseReport(
+                artifact=MaterializedYaml(
+                    authored=interpretation.authored,
+                    materialized_state=interpretation.materialized_state,
+                    pipeline_yaml=pipeline_yaml,
+                ),
+                checks=(
+                    ValidationCheck(
+                        name=CHECK_BLOB_INLINE_REFS,
+                        passed=True,
+                        detail="No inline-content blob references found",
+                        affected_nodes=(),
+                        outcome_code=None,
+                    ),
+                ),
+            )
+        if blob_get_metadata is None:
+            unavailable = [
+                BlobInlineValidationViolation(
+                    category="not_ready", field_path=ref.field_path, detail="authorized blob metadata read is unavailable"
+                )
+                for ref in refs
+            ]
+            detail = _blob_inline_validation_detail(unavailable)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=tuple(_blob_inline_validation_error(violation) for violation in unavailable),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        # The modality refusal below reuses the records this validation reads,
+        # so each ref's metadata is fetched once and both checks judge one record.
+        resolved_records: dict[UUID, BlobRecord] = {}
+
+        def _recorded_blob_metadata(blob_id: UUID) -> BlobRecord | None:
+            if blob_id in resolved_records:
+                return resolved_records[blob_id]
+            record = blob_get_metadata(blob_id)
+            if record is not None:
+                resolved_records[blob_id] = record
+            return record
+
         blob_violations = _validate_blob_content_refs_sync(
-            blob_get_metadata,
+            _recorded_blob_metadata,
             config_dict,
             per_ref_byte_cap=BLOB_INLINE_PER_REF_BYTE_CAP,
             aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
@@ -251,10 +406,150 @@ def materialize_validation_yaml(
                 readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
                 semantic_contracts=interpretation.authored.semantic_contracts,
             )
-        check_detail = "All inline-content blob references are valid"
-        pipeline_yaml = yaml.dump(_substitute_blob_content_refs_for_validation(config_dict), default_flow_style=False)
-    elif blob_get_metadata is None:
-        check_detail = "No blob metadata service — check skipped"
+        # Readiness parity with run admission (InlineBlobPromptSurfaceAdmissionError):
+        # the same predicate refuses an LLM-authored blob in an llm prompt surface
+        # or model here, so /validate is not ready for exactly the pipelines whose
+        # run would be refused after creation. The runtime YAML names each node by
+        # its composer id (collectors, named by scope, cannot carry the llm plugin).
+        llm_authored_refs = _llm_authored_prompt_surface_refs(
+            refs,
+            resolved_records,
+            llm_node_names=frozenset(node.id for node in interpretation.materialized_state.nodes if node.plugin == "llm"),
+        )
+        if llm_authored_refs:
+            detail = "; ".join(f"{ref.field_path}: llm_authored" for ref in llm_authored_refs)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS,
+                    passed=False,
+                    detail=detail,
+                    affected_nodes=(),
+                    outcome_code=None,
+                ),
+                errors=tuple(_llm_authored_prompt_surface_error(ref) for ref in llm_authored_refs),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        if blob_get_content is None:
+            unavailable = [
+                BlobInlineValidationViolation(
+                    category="not_ready", field_path=ref.field_path, detail="authorized blob content read is unavailable"
+                )
+                for ref in refs
+            ]
+            detail = _blob_inline_validation_detail(unavailable)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=tuple(_blob_inline_validation_error(violation) for violation in unavailable),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        fetched: dict[BlobInlineRef, bytes] = {}
+        content_by_blob_id: dict[UUID, bytes] = {}
+        content_failure_by_blob_id: dict[UUID, BlobInlineValidationViolation] = {}
+        content_violations: list[BlobInlineValidationViolation] = []
+        actual_total_bytes = 0
+        for ref in refs:
+            if ref.blob_id in content_failure_by_blob_id:
+                previous_failure = content_failure_by_blob_id[ref.blob_id]
+                content_violations.append(
+                    BlobInlineValidationViolation(
+                        category=previous_failure.category, field_path=ref.field_path, detail=previous_failure.detail
+                    )
+                )
+                continue
+            if ref.blob_id not in content_by_blob_id:
+                try:
+                    content_record, content = blob_get_content(ref.blob_id)
+                except BlobNotFoundError:
+                    failure = BlobInlineValidationViolation(category="missing", field_path=ref.field_path, detail="blob not found")
+                    content_failure_by_blob_id[ref.blob_id] = failure
+                    content_violations.append(failure)
+                    continue
+                except BlobStateError:
+                    failure = BlobInlineValidationViolation(category="not_ready", field_path=ref.field_path, detail="blob is not ready")
+                    content_failure_by_blob_id[ref.blob_id] = failure
+                    content_violations.append(failure)
+                    continue
+                metadata_record = resolved_records[ref.blob_id]
+                if (
+                    content_record.id != metadata_record.id
+                    or content_record.session_id != metadata_record.session_id
+                    or content_record.status != "ready"
+                    or content_record.content_hash != metadata_record.content_hash
+                    or content_record.mime_type != metadata_record.mime_type
+                    or content_record.size_bytes != metadata_record.size_bytes
+                    or len(content) != metadata_record.size_bytes
+                    or content_record.creation_modality != metadata_record.creation_modality
+                ):
+                    failure = BlobInlineValidationViolation(
+                        category="not_ready", field_path=ref.field_path, detail="blob changed during validation"
+                    )
+                    content_failure_by_blob_id[ref.blob_id] = failure
+                    content_violations.append(failure)
+                    continue
+                content_by_blob_id[ref.blob_id] = content
+            content = content_by_blob_id[ref.blob_id]
+            if len(content) > BLOB_INLINE_PER_REF_BYTE_CAP:
+                content_violations.append(
+                    BlobInlineValidationViolation(
+                        category="oversized",
+                        field_path=ref.field_path,
+                        detail=f"{len(content)} bytes exceeds per-ref cap {BLOB_INLINE_PER_REF_BYTE_CAP}",
+                    )
+                )
+            actual_total_bytes += len(content)
+            fetched[ref] = content
+        if actual_total_bytes > BLOB_INLINE_AGGREGATE_BYTE_CAP:
+            content_violations.append(
+                BlobInlineValidationViolation(
+                    category="oversized",
+                    field_path="(aggregate)",
+                    detail=f"total resolved bytes {actual_total_bytes} exceeds aggregate cap {BLOB_INLINE_AGGREGATE_BYTE_CAP}",
+                )
+            )
+        if content_violations:
+            detail = _blob_inline_validation_detail(content_violations)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=tuple(_blob_inline_validation_error(violation) for violation in content_violations),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        try:
+            resolved_config = _substitute_blob_content_refs_for_validation(
+                config_dict,
+                fetched,
+                refs=refs,
+                blob_metadata={
+                    record.id: (cast(AllowedMimeType, record.mime_type), len(content_by_blob_id[record.id]))
+                    for record in resolved_records.values()
+                },
+            )
+        except BlobContentResolutionError as exc:
+            decode_violations = [
+                BlobInlineValidationViolation(category="malformed", field_path=field_path, detail=f"cannot decode as {encoding}")
+                for field_path, encoding in exc.undecodable
+            ]
+            detail = _blob_inline_validation_detail(decode_violations)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=tuple(_blob_inline_validation_error(violation) for violation in decode_violations),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        check_detail = "All inline-content blob references and bytes are valid"
+        pipeline_yaml = yaml.dump(resolved_config, default_flow_style=False)
     else:
         check_detail = "No inline-content blob references found"
 
@@ -269,70 +564,6 @@ def materialize_validation_yaml(
                 name=CHECK_BLOB_INLINE_REFS,
                 passed=True,
                 detail=check_detail,
-                affected_nodes=(),
-                outcome_code=None,
-            ),
-        ),
-    )
-
-
-def validate_managed_identity_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
-    """Reject web-authored managed identity configuration.
-
-    Subject set is every PLUGIN-BEARING node (elspeth-df8082552d). This gate
-    is OPTION-shaped — it reads ``options["provider"]`` and
-    ``options["provider_config"]`` and never consults the plugin name — so
-    ``node_type`` was the sole limiter, and a collector or aggregation
-    carrying a managed-identity ``provider_config`` passed it silently.
-    Measured before the fix, with a transform control: transform FIRES,
-    aggregation and collector SILENT.
-
-    Containment was incidental and LATE, never structural: a batch-aware
-    plugin's config model is ``extra="forbid"`` and has no ``provider_config``
-    field, so the composition dies at ``validate_runtime_plugins`` — two
-    phases AFTER this gate, with an unrelated error. The reactivation trigger
-    is one batch-aware plugin adding a ``provider_config`` field to its own
-    config model.
-    """
-    for node in materialized.authored.policy.state.nodes:
-        if node.plugin is None:
-            continue
-        policy_error = web_rag_provider_config_policy_error(node.options)
-        if policy_error is None:
-            continue
-        return PhaseFailure(
-            passed_checks=(),
-            failed_check=ValidationCheck(
-                name=CHECK_MANAGED_IDENTITY_POLICY,
-                passed=False,
-                detail=f"{node.node_type.capitalize()} '{node.id}' uses disallowed managed identity provider_config",
-                affected_nodes=(node.id,),
-                outcome_code=None,
-            ),
-            errors=(
-                ValidationError(
-                    component_id=node.id,
-                    component_type="transform",
-                    message=policy_error,
-                    suggestion="Use api_key authentication or an operator-controlled named connector/allowlist.",
-                    error_code=None,
-                ),
-            ),
-            readiness=_blocked_readiness(
-                code=CHECK_MANAGED_IDENTITY_POLICY,
-                detail=f"{node.node_type} {node.id} enables managed identity from web-authored provider_config",
-                component_id=node.id,
-                component_type="transform",
-            ),
-            semantic_contracts=materialized.authored.semantic_contracts,
-        )
-    return PhaseReport(
-        artifact=_snapshot_materialized_evidence(materialized),
-        checks=(
-            ValidationCheck(
-                name=CHECK_MANAGED_IDENTITY_POLICY,
-                passed=True,
-                detail="No web-authored managed identity provider_config",
                 affected_nodes=(),
                 outcome_code=None,
             ),
@@ -501,7 +732,7 @@ def validate_aws_s3_endpoint_url_policy(
             policy_error = web_aws_s3_endpoint_url_policy_error(source.plugin, source.options)
             if policy_error is None:
                 continue
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
+            source_component = _source_policy_component_id(source_name)
             return PhaseFailure(
                 passed_checks=(),
                 failed_check=ValidationCheck(
@@ -597,7 +828,7 @@ def validate_aws_s3_source_policy(
             if policy_error is None:
                 profiled_source = profiled_source or source.plugin == "aws_s3"
                 continue
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
+            source_component = _source_policy_component_id(source_name)
             return PhaseFailure(
                 passed_checks=(),
                 failed_check=ValidationCheck(
@@ -655,5 +886,4 @@ __all__ = [
     "validate_llm_base_url_policy",
     "validate_llm_retry_budget_policy",
     "validate_llm_tracing_policy",
-    "validate_managed_identity_policy",
 ]

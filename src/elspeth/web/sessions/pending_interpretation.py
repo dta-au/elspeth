@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, TypedDict, cast, final
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast, final
 from uuid import UUID
 
 from elspeth.contracts.composer_interpretation import (
@@ -36,19 +36,28 @@ from elspeth.web.interpretation_state import (
     PROMPT_TEMPLATE_PARTS_KEY,
     SOURCE_AUTHORING_KEY,
     SOURCE_COMPONENT_ID,
+    approved_prompt_artifact_hash_from_options,
     current_source_data_contract_demand,
     model_choice_artifact_hash,
+    multi_query_prompt_surface_from_options,
     parse_interpretation_requirements,
     pipeline_decision_artifact_hash,
+    prompt_review_anchor_hash_from_options,
+    prompt_review_draft_from_options,
     prompt_structure_hash_from_options,
     source_name_from_component_id,
     validate_pipeline_decision_node_semantics,
 )
 from elspeth.web.sessions.converters import state_from_record
-from elspeth.web.sessions.guided_replay import validation_errors_for_composer_surface
+from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, SessionInlineBlobSnapshot
+from elspeth.web.sessions.interpretation_validation import (
+    SessionInterpretationValidationInputs,
+    validate_composition_state_with_interpretation_inputs,
+)
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
+    CompositionValidationError,
     InterpretationDraftMismatchError,
     InterpretationNodeMissingError,
     InterpretationNodePluginMutatedError,
@@ -65,11 +74,10 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 if TYPE_CHECKING:
-    from elspeth.web.catalog.protocol import CatalogService
-    from elspeth.web.composer.state import CompositionState, ValidationSummary
+    from elspeth.contracts.blobs import BlobRecord
+    from elspeth.web.composer.state import CompositionState
     from elspeth.web.execution.schemas import ValidationResult
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 
 
 class _InterpretationHashDomainV2Payload(TypedDict):
@@ -84,10 +92,11 @@ class _InterpretationHashDomainV2Payload(TypedDict):
     llm_draft: str
     accepted_value: str
     actor: str
-    model_identifier: str
-    model_version: str
-    provider: str
-    composer_skill_hash: str
+    # None for a surface no LLM raised (state revert, YAML import, E2E seed).
+    model_identifier: str | None
+    model_version: str | None
+    provider: str | None
+    composer_skill_hash: str | None
 
 
 def _interpretation_hash_domain_v2(
@@ -101,10 +110,10 @@ def _interpretation_hash_domain_v2(
     llm_draft: str,
     accepted_value: str,
     actor: str,
-    model_identifier: str,
-    model_version: str,
-    provider: str,
-    composer_skill_hash: str,
+    model_identifier: str | None,
+    model_version: str | None,
+    provider: str | None,
+    composer_skill_hash: str | None,
     context: str,
 ) -> _InterpretationHashDomainV2Payload:
     domain_dict: _InterpretationHashDomainV2Payload = {
@@ -174,6 +183,9 @@ def _find_llm_transform_node(
             node["options"] if "options" in node else None,
             message=f"{context}: node {affected_node_id!r} has no options mapping",
         )
+        if multi_query_prompt_surface_from_options(options) is not None:
+            approved_prompt_artifact_hash_from_options(options)
+            return node
         if "prompt_template" not in options or type(options["prompt_template"]) is not str:
             raise InterpretationPlaceholderConsumedError(f"{context}: node {affected_node_id!r} options.prompt_template is not a string")
         prompt_template = options["prompt_template"]
@@ -539,7 +551,7 @@ def _reviewed_content_identity(
         context=context,
     )
     if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-        structure_hash = prompt_structure_hash_from_options(options)
+        structure_hash = prompt_review_anchor_hash_from_options(options)
         if structure_hash is None:
             prompt_template = options["prompt_template"] if "prompt_template" in options else None
             if type(prompt_template) is not str:
@@ -777,8 +789,9 @@ def _patch_structured_interpretation_prompt(
     # Defense-in-depth backstop: the matched requirement must be referenced by
     # at least one ``interpretation_ref`` part, or the accepted value never
     # lands in the rendered prompt — a "resolved" review whose decision silently
-    # never reaches the runtime, i.e. the exact audit divergence CLAUDE.md
-    # forbids. Unreachable once the staging gate (vague_term_wiring_count) holds;
+    # never reaches the runtime, i.e. the exact audit divergence the
+    # auditability principle forbids (ARCHITECTURE.md §Design Principles).
+    # Unreachable once the staging gate (vague_term_wiring_count) holds;
     # present so a bypass crashes loudly instead of corrupting the prompt.
     if matched_ref_count == 0:
         raise InterpretationPlaceholderConsumedError(
@@ -788,7 +801,6 @@ def _patch_structured_interpretation_prompt(
         )
 
     new_template = "".join(rendered)
-    resolved_prompt_template_hash = stable_hash(new_template)
     updated_requirement = dict(matching_requirement)
     updated_requirement["status"] = "resolved"
     if event_id is not None:
@@ -798,13 +810,13 @@ def _patch_structured_interpretation_prompt(
     # the full render: the render changes again when a sibling vague term
     # resolves, and reconciliation must be able to re-verify every resolved
     # requirement against state that survives those later resolutions. The
-    # full-render hash lives at node level (options.resolved_prompt_template_hash).
+    # full-render hash lives at node level (options.approved_prompt_artifact_hash).
     updated_requirement["resolved_prompt_template_hash"] = stable_hash(accepted_value)
     requirements[matching_index] = updated_requirement
 
     patched_options = dict(options)
     patched_options["prompt_template"] = new_template
-    patched_options["resolved_prompt_template_hash"] = resolved_prompt_template_hash
+    patched_options["approved_prompt_artifact_hash"] = approved_prompt_artifact_hash_from_options(patched_options)
     patched_options[INTERPRETATION_REQUIREMENTS_KEY] = requirements
     return patched_options
 
@@ -978,9 +990,9 @@ def _patch_llm_transform_prompt(
         # ``NodeSpec.options`` after ``state_from_record`` and flows into the
         # runtime YAML emitted by ``generate_pipeline_dict``. The same helper
         # also writes the resolved-prompt-template hash into
-        # ``options.resolved_prompt_template_hash`` (the cross-DB anchor
+        # ``options.approved_prompt_artifact_hash`` (the cross-DB anchor
         # the LLM transform plugin reads at execution time to populate the
-        # Landscape ``calls.resolved_prompt_template_hash`` column).
+        # Landscape ``calls.approved_prompt_artifact_hash`` column).
         new_template = f"{template[: placeholder_match.start()]}{accepted_value}{template[placeholder_match.end() :]}"
         patched_node = dict(node)
         patched_options = dict(options)
@@ -1005,7 +1017,7 @@ def _resolve_vague_term(
     user_term: str,
     llm_draft: str,
     accepted_value: str,
-) -> tuple[Mapping[str, Mapping[str, Any]] | None, list[Mapping[str, Any]], str]:
+) -> tuple[Mapping[str, Mapping[str, Any]] | None, list[Mapping[str, Any]], str | None]:
     live_node = _find_llm_transform_node(
         state_record,
         affected_node_id=affected_node_id,
@@ -1049,22 +1061,21 @@ def _resolve_vague_term(
         llm_draft=llm_draft,
     )
     patched_node = next(n for n in patched_nodes if n["id"] == affected_node_id)
-    resolved_template: str = patched_node["options"]["prompt_template"]
-    resolved_prompt_template_hash = stable_hash(resolved_template)
+    artifact_hash = approved_prompt_artifact_hash_from_options(patched_node["options"])
 
     final_nodes: list[Mapping[str, Any]] = []
     for n in patched_nodes:
         if n["id"] == affected_node_id:
             node_with_hash = dict(n)
             options_with_hash = dict(n["options"])
-            options_with_hash["resolved_prompt_template_hash"] = resolved_prompt_template_hash
+            options_with_hash["approved_prompt_artifact_hash"] = artifact_hash
             node_with_hash["options"] = options_with_hash
             final_nodes.append(node_with_hash)
         else:
             final_nodes.append(n)
     # Vague-term review patches only nodes; the sources map is carried forward
     # unchanged. The legacy singular ``source`` column is dead.
-    return state_record.sources, final_nodes, resolved_prompt_template_hash
+    return state_record.sources, final_nodes, artifact_hash
 
 
 @observation_boundary(
@@ -1128,7 +1139,7 @@ def _surfacing_prompt_structure_hash(
             # Options absent or not a mapping
             return None
         try:
-            return prompt_structure_hash_from_options(options)
+            return prompt_review_anchor_hash_from_options(options)
         except (TypeError, KeyError, ValueError):
             # Malformed ``prompt_template_parts`` is exactly the "prompt parts
             # unavailable" case this function's docstring and its
@@ -1152,7 +1163,7 @@ def _resolve_prompt_template_review(
     user_term: str,
     accepted_value: str,
     surfacing_structure_hash: str | None,
-) -> tuple[Mapping[str, Mapping[str, Any]] | None, list[Mapping[str, Any]], str]:
+) -> tuple[Mapping[str, Mapping[str, Any]] | None, list[Mapping[str, Any]], str | None]:
     node = _find_llm_transform_node(
         state_record,
         affected_node_id=affected_node_id,
@@ -1162,8 +1173,8 @@ def _resolve_prompt_template_review(
         node["options"],
         message=f"resolve_interpretation_event: node {affected_node_id!r} options is not a mapping",
     )
-    prompt_template = options["prompt_template"]
-    if type(prompt_template) is not str:
+    prompt_template = options["prompt_template"] if "prompt_template" in options else None
+    if type(prompt_template) is not str and multi_query_prompt_surface_from_options(options) is None:
         raise InterpretationPlaceholderConsumedError(
             f"resolve_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
         )
@@ -1178,15 +1189,20 @@ def _resolve_prompt_template_review(
     # equal the post-bake template). A genuine prompt edit changes the skeleton
     # and is still rejected as stale. Legacy no-parts nodes have no skeleton;
     # they fall back to the original rendered-text equality.
-    live_structure_hash = prompt_structure_hash_from_options(options)
+    live_structure_hash = prompt_review_anchor_hash_from_options(options)
     if live_structure_hash is not None or surfacing_structure_hash is not None:
         if live_structure_hash != surfacing_structure_hash:
             raise InterpretationPlaceholderConsumedError(
                 "resolve_interpretation_event: llm_prompt_template prompt skeleton no longer matches the structure the review approved"
             )
-    elif accepted_value != prompt_template:
+    elif accepted_value != prompt_review_draft_from_options(options):
+        # Unstructured single-prompt node: accepted_as_drafted carries the event's
+        # review draft, which is the one derivation
+        # (``prompt_review_draft_from_options``) — ``prompt_template`` itself
+        # up to the review bound, its shortened display beyond it. The
+        # accepted value is never written into the prompt.
         raise InterpretationPlaceholderConsumedError(
-            "resolve_interpretation_event: llm_prompt_template accepted value must equal current options.prompt_template"
+            "resolve_interpretation_event: llm_prompt_template accepted value must equal the current prompt review draft"
         )
     requirements, matching_index = _matching_pending_requirement_index(
         options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None,
@@ -1194,17 +1210,12 @@ def _resolve_prompt_template_review(
         user_term=user_term,
         context="resolve_interpretation_event",
     )
-    # Node-level / returned hash stays the final-prompt-string hash (the runtime
-    # LLM plugin reads options.resolved_prompt_template_hash to populate
-    # calls.resolved_prompt_template_hash). The REQUIREMENT-level attestation
-    # anchor, by contrast, is the prompt *skeleton* for structured nodes: the
-    # prompt-template review approves the LLM-authored structure, while the
-    # vague-term reviews approve the slot values. Anchoring the requirement to
-    # the skeleton keeps it invariant under vague-term resolution (which rewrites
-    # the rendered prompt) — see interpretation_state.prompt_structure_hash.
-    resolved_prompt_template_hash = stable_hash(prompt_template)
-    structure_hash = prompt_structure_hash_from_options(options)
-    requirement_anchor_hash = structure_hash if structure_hash is not None else resolved_prompt_template_hash
+    # The event and runtime node share the effective artifact identity. The
+    # requirement separately attests the authored surface/skeleton, so resolving
+    # a vague-term slot does not invalidate the approval of that skeleton.
+    artifact_hash = approved_prompt_artifact_hash_from_options(options)
+    structure_hash = prompt_review_anchor_hash_from_options(options)
+    requirement_anchor_hash = structure_hash if structure_hash is not None else stable_hash(prompt_template)
     requirement = dict(requirements[matching_index])
     requirement["status"] = "resolved"
     requirement["event_id"] = event_id
@@ -1217,7 +1228,7 @@ def _resolve_prompt_template_review(
         if current_node["id"] == affected_node_id:
             patched_node = dict(current_node)
             patched_options = dict(options)
-            patched_options["resolved_prompt_template_hash"] = resolved_prompt_template_hash
+            patched_options["approved_prompt_artifact_hash"] = artifact_hash
             patched_options[INTERPRETATION_REQUIREMENTS_KEY] = requirements
             patched_node["options"] = patched_options
             final_nodes.append(patched_node)
@@ -1225,7 +1236,7 @@ def _resolve_prompt_template_review(
             final_nodes.append(current_node)
     # Prompt-template review patches only node review metadata; the sources map
     # is carried forward unchanged. The legacy singular ``source`` column is dead.
-    return state_record.sources, final_nodes, resolved_prompt_template_hash
+    return state_record.sources, final_nodes, artifact_hash
 
 
 def _resolve_invented_source(
@@ -1529,6 +1540,8 @@ def _resolve_source_data_contract(
     for index, existing in enumerate(requirements):
         if InterpretationKind(existing["kind"]) is InterpretationKind.SOURCE_DATA_CONTRACT:
             requirement_row["id"] = existing["id"]
+            if "display_title" in existing:
+                requirement_row["display_title"] = existing["display_title"]
             requirements[index] = requirement_row
             replaced = True
             break
@@ -1565,100 +1578,72 @@ def _pending_interpretation_validation_candidate_digest(
 
 
 # Runtime-equivalent preflight for interpretation-resolution state writes:
-# ``(patched_state, user_id, session_id, plugin_snapshot) -> ValidationResult``.
+# A fifth frozen content reader is supplied only for inline-marker states.
 # Bound at app wiring over ``validate_pipeline`` with the app's settings and
 # secret resolver — the sessions layer never imports the execution stack.
-SessionRuntimePreflight = Callable[
-    ["CompositionState", str | None, str, "PluginAvailabilitySnapshot | None"],
-    "ValidationResult",
-]
-
-
-def _validate_patched_composition_state_for_policy(
-    state: CompositionState,
-    *,
-    profile_aware: bool,
-    plugin_snapshot: PluginAvailabilitySnapshot | None,
-    profile_registry: OperatorProfileRegistry | None,
-    catalog: CatalogService | None,
-) -> ValidationSummary:
-    """Validate a candidate without retaining its originating session service."""
-    if not profile_aware:
-        return state.validate()
-    if plugin_snapshot is None:
-        raise AuditIntegrityError("Profile-aware composition validation has no principal snapshot")
-    if profile_registry is None or catalog is None:
-        raise AuditIntegrityError("Profile-aware composition validation dependencies are unavailable")
-
-    from elspeth.web.plugin_policy.validation import validate_authored_composition_state
-
-    result = validate_authored_composition_state(
-        state,
-        snapshot=plugin_snapshot,
-        profile_registry=profile_registry,
-        catalog=catalog,
-    )
-    return result.validation
+class SessionRuntimePreflight(Protocol):
+    def __call__(
+        self,
+        state: CompositionState,
+        user_id: str | None,
+        session_id: str,
+        plugin_snapshot: PluginAvailabilitySnapshot | None,
+        blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
+    ) -> ValidationResult: ...
 
 
 @final
 class _SessionPendingInterpretationValidator:
-    """Exact validation-only capability for process-local, synchronous, handle-free dependencies."""
+    """Exact validation capability retaining closed profile facts and preflight evidence."""
 
     __slots__ = (
-        "__catalog",
-        "__plugin_snapshot",
-        "__profile_aware",
-        "__profile_registry",
+        "__expected_anchor",
+        "__expected_live",
+        "__inline_blob_snapshot",
         "__runtime_preflight",
         "__session_id",
         "__user_id",
+        "__validation_inputs",
     )
 
     def __init__(
         self,
         *,
-        profile_aware: bool,
-        plugin_snapshot: PluginAvailabilitySnapshot | None,
-        profile_registry: OperatorProfileRegistry | None,
-        catalog: CatalogService | None,
+        validation_inputs: SessionInterpretationValidationInputs,
         runtime_preflight: SessionRuntimePreflight | None = None,
+        inline_blob_snapshot: SessionInlineBlobSnapshot | None = None,
+        expected_anchor: CompositionStateRecord | None = None,
+        expected_live: CompositionStateRecord | None = None,
         session_id: str,
         user_id: str | None,
     ) -> None:
-        from elspeth.web.catalog.service import CatalogServiceImpl
-        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-        from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-
-        if type(profile_aware) is not bool:
-            raise TypeError("profile_aware must be an exact boolean")
-        for field_name, dependency, allowed_type in (
-            ("plugin_snapshot", plugin_snapshot, PluginAvailabilitySnapshot),
-            ("profile_registry", profile_registry, OperatorProfileRegistry),
-            ("catalog", catalog, CatalogServiceImpl),
-        ):
-            # Exact nominal typing is the whole guard (ADR-032): any other
-            # object, including one that merely wraps a runtime or authority
-            # handle, is refused here. The retired object-graph scanner that
-            # used to name the hidden handle was rejected by review (hidden
-            # carriers, pre-rejection traversal, unbounded work) and its
-            # replacement is the closed per-principal validation DTO.
-            if dependency is None or type(dependency) is allowed_type:
-                continue
-            raise TypeError(f"pending interpretation {field_name} must be the exact process-local {allowed_type.__name__}")
+        if type(validation_inputs) is not SessionInterpretationValidationInputs:
+            raise TypeError("pending interpretation validation_inputs must be exact SessionInterpretationValidationInputs")
         if type(session_id) is not str or not session_id:
             raise TypeError("pending interpretation session_id must be a nonblank exact string")
         if user_id is not None and type(user_id) is not str:
             raise TypeError("pending interpretation user_id must be an exact string or None")
         if runtime_preflight is not None and not callable(runtime_preflight):
             raise TypeError("pending interpretation runtime_preflight must be callable")
-        self.__profile_aware = profile_aware
-        self.__plugin_snapshot = plugin_snapshot
-        self.__profile_registry = profile_registry
-        self.__catalog = catalog
+        self.__validation_inputs = validation_inputs
         self.__runtime_preflight = runtime_preflight
+        self.__inline_blob_snapshot = inline_blob_snapshot
+        self.__expected_anchor = expected_anchor
+        self.__expected_live = expected_live
         self.__session_id = session_id
         self.__user_id = user_id
+
+    def assert_source_state(self, snapshot: SessionPendingInterpretationSnapshot) -> None:
+        """Refuse a candidate derived from different locked state rows."""
+        if self.__expected_anchor is not None and snapshot.anchor_state != self.__expected_anchor:
+            raise AuditIntegrityError("pending interpretation anchor changed after inline blob snapshot")
+        if self.__expected_live is not None and snapshot.live_state != self.__expected_live:
+            raise AuditIntegrityError("pending interpretation live state changed after inline blob snapshot")
+
+    @property
+    def inline_blob_snapshot(self) -> SessionInlineBlobSnapshot | None:
+        """Expose immutable preflight evidence to the DB-owning repository."""
+        return self.__inline_blob_snapshot
 
     def __call__(
         self,
@@ -1681,13 +1666,7 @@ class _SessionPendingInterpretationValidator:
                 validation_errors=None,
             )
         )
-        validation = _validate_patched_composition_state_for_policy(
-            candidate_state,
-            profile_aware=self.__profile_aware,
-            plugin_snapshot=self.__plugin_snapshot,
-            profile_registry=self.__profile_registry,
-            catalog=self.__catalog,
-        )
+        validation = validate_composition_state_with_interpretation_inputs(candidate_state, self.__validation_inputs).validation
         messages: tuple[str, ...] = tuple(error.message for error in validation.errors)
         is_valid = validation.is_valid
         # The persisted ``is_valid`` contract is the full runtime-preflight
@@ -1696,7 +1675,17 @@ class _SessionPendingInterpretationValidator:
         # interpretation-resolution row never claims validity over engine
         # stages the authoring validator cannot see.
         if is_valid and self.__runtime_preflight is not None:
-            runtime = self.__runtime_preflight(candidate_state, self.__user_id, self.__session_id, self.__plugin_snapshot)
+            inline_snapshot = self.__inline_blob_snapshot
+            if inline_snapshot is not None:
+                if not inline_snapshot.assert_covers(InlinePreflightState.from_composition_state(candidate_state)):
+                    raise AuditIntegrityError("pending interpretation candidate introduced an unprepared inline blob marker")
+                runtime = self.__runtime_preflight(
+                    candidate_state, self.__user_id, self.__session_id, self.__validation_inputs.plugin_snapshot, inline_snapshot.content
+                )
+            else:
+                runtime = self.__runtime_preflight(
+                    candidate_state, self.__user_id, self.__session_id, self.__validation_inputs.plugin_snapshot
+                )
             if not runtime.is_valid:
                 is_valid = False
                 messages = (*messages, *(error.message for error in runtime.errors))
@@ -1705,6 +1694,15 @@ class _SessionPendingInterpretationValidator:
             is_valid=is_valid,
             validation_errors=messages or None,
         )
+
+
+def _pending_validation_error_records(
+    validation: SessionPendingInterpretationValidationResult,
+) -> tuple[CompositionValidationError, ...] | None:
+    """Adapt digest-bound message authority only when preparing persistence."""
+    if validation.validation_errors is None:
+        return None
+    return tuple(CompositionValidationError(message=message, error_code=None, component=None) for message in validation.validation_errors)
 
 
 @final
@@ -1732,13 +1730,15 @@ class _SessionPendingInterpretationPlanner:
         suppresses=("R1", "R5"),
         invariant="Malformed non-null interpretation requirements raise InterpretationPlaceholderConsumedError before a review decision is produced.",
         test_ref="tests/unit/web/sessions/test_interpretation_trust_boundaries.py::test_pending_interpretation_plan_rejects_malformed_requirements",
-        test_fingerprint="89f255fca82efd59b4ea5c646c231fd468fe88873e8e094b0f34944d645a33ac",
+        test_fingerprint="587d212c8d829339aa25f3272c58f0e9d45cd95b80a44c0b1f724bc41ae81885",
     )
     def plan(
         command: SessionPendingInterpretationCommand,
         snapshot: SessionPendingInterpretationSnapshot,
         validator: SessionPendingInterpretationValidator,
     ) -> SessionPendingInterpretationDecision:
+        if type(validator) is _SessionPendingInterpretationValidator:
+            validator.assert_source_state(snapshot)
         event_id = command.event_id
         composition_state_id = command.composition_state_id
         affected_node_id = command.affected_node_id
@@ -1898,13 +1898,17 @@ class _SessionPendingInterpretationPlanner:
                         )
             elif kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
                 prompt_template = options["prompt_template"] if "prompt_template" in options else None
-                if type(prompt_template) is not str:
+                if type(prompt_template) is not str and multi_query_prompt_surface_from_options(options) is None:
                     raise ValueError(
                         f"create_pending_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
                     )
-                if llm_draft != prompt_template:
+                # The review draft is the one derivation the auto-stager uses:
+                # the prompt SURFACE for a multi-query node (the node-level
+                # template alone may never be sent), ``prompt_template``
+                # bounded for display otherwise.
+                if llm_draft != prompt_review_draft_from_options(options):
                     raise InterpretationDraftMismatchError(
-                        "create_pending_interpretation_event: llm_prompt_template event draft must match current options.prompt_template"
+                        "create_pending_interpretation_event: llm_prompt_template event draft must match the current prompt review draft"
                     )
                 try:
                     _matching_pending_requirement_index(
@@ -2114,11 +2118,7 @@ class _SessionPendingInterpretationPlanner:
         patched_state = replace(
             patched_state,
             is_valid=validation.is_valid,
-            validation_errors=validation_errors_for_composer_surface(
-                composer_meta=live_state.composer_meta,
-                is_valid=validation.is_valid,
-                validation_errors=list(validation.validation_errors) if validation.validation_errors is not None else None,
-            ),
+            validation_errors=_pending_validation_error_records(validation),
         )
         return SessionPendingInterpretationDecision(
             result_event_id=event_id,
@@ -2130,7 +2130,9 @@ class _SessionPendingInterpretationPlanner:
             arguments_hash=stable_hash(domain_dict),
             hash_domain_version="v2",
             interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT,
-            resolved_prompt_template_hash=(resolved_hash if kind is InterpretationKind.LLM_PROMPT_TEMPLATE else None),
+            approved_prompt_artifact_hash=(
+                resolved_hash if kind in (InterpretationKind.LLM_PROMPT_TEMPLATE, InterpretationKind.VAGUE_TERM) else None
+            ),
             ensure_opt_out_marker=True,
             appended_state=SessionCompositionStateCreation(
                 id=uuid.uuid4(),

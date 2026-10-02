@@ -9,7 +9,8 @@ Why base class inheritance is required:
 - Python's Protocol with non-method members (name, determinism, etc.) cannot
   support issubclass() - only isinstance() on already-instantiated objects
 - Base classes enforce self-consistency via __init_subclass__ hooks
-- Per CLAUDE.md "Plugin Ownership", all plugins are system code, not user extensions
+- Per docs/guides/data-trust-and-error-handling.md §Plugin Ownership, all plugins
+  are system code, not user extensions
 
 The protocol definitions (SourceProtocol, TransformProtocol, SinkProtocol) exist
 for type-checking purposes only - they define the interface contract but cannot
@@ -35,7 +36,9 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, cast
 
 from elspeth.contracts import (
@@ -46,6 +49,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.field_spelling import FieldMappingKeys, SourceFieldRenames
 from elspeth.contracts.plugin_capabilities import (
     CapabilityDeclaration,
     ContentTrust,
@@ -53,7 +57,7 @@ from elspeth.contracts.plugin_capabilities import (
     PluginCapability,
     WebConfigAuthority,
 )
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema_contract import FieldContract, OutputFieldDeclaration, PipelineRow, SchemaContract
 from elspeth.contracts.trust_boundary import trust_boundary
 
 if TYPE_CHECKING:
@@ -64,7 +68,7 @@ if TYPE_CHECKING:
         InputSemanticRequirements,
         OutputSemanticDeclaration,
     )
-    from elspeth.contracts.schema import SchemaConfig
+    from elspeth.contracts.schema import FieldDefinition, OutputFieldDeclarer, SchemaConfig
     from elspeth.contracts.schema_contract import SchemaContract
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.plugins.infrastructure.config_base import PluginConfig, TransformDataConfig
@@ -149,7 +153,7 @@ def _demote_required_model_fields(
     pydantic hoists that constraint OUT of the annotation into the FieldInfo.
     Rebuilding a field from ``.annotation`` alone therefore silently accepts
     NaN and Infinity — in a codebase that maintains a dedicated
-    ``_find_non_finite_value_path`` walker to reject exactly those.
+    ``_find_non_canonical_number_path`` walker to reject exactly those.
 
     The field is deliberately KEPT in the model rather than removed: ``mode:
     fixed`` builds ``extra="forbid"``, so dropping it would reject rows that
@@ -450,6 +454,26 @@ class BaseTransform(ABC):
     # explicitly so composer/tool validation can reject accidental placement.
     supports_row_mode_when_batch_aware: bool = False
 
+    # True for a batch-aware plugin that reads ``ctx.aggregation_batch`` (the
+    # flush window's trigger and row positions), which only an aggregation
+    # flush supplies. runtime_factory refuses such a plugin as a collector,
+    # whose end_of_group flush has no window, instead of letting every group
+    # abort at run time.
+    requires_aggregation_batch_context: bool = False
+
+    # True only for a batch-aware plugin whose every successful flush emits
+    # exactly one row per buffered row, in buffered order, as
+    # TransformResult.success_multi (also for a one-row batch) and with no
+    # quarantined_indices. That is what output_mode: passthrough carries: each
+    # buffered token continues with its own row. runtime_factory refuses a
+    # plugin that does not declare it as a passthrough aggregation, and the
+    # composer's placement rule reads the same declaration. A plugin that
+    # declares it and then emits another shape is a plugin bug: the flush
+    # records every buffered token FAILED and the run aborts. False by default
+    # (a reducer, a replicator, a plugin that skips rows); every batch-aware
+    # plugin states it explicitly.
+    flush_emits_one_row_per_buffered_row: bool = False
+
     # Token creation flag for deaggregation transforms
     # When True AND process() returns success_multi(), the processor creates
     # new token_ids for each output row with parent linkage to input token.
@@ -513,6 +537,22 @@ class BaseTransform(ABC):
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
 
+    # Identity-carrying renames (``TransformProtocol.renamed_input_fields``):
+    # source spelling -> new name for every field ``process`` moves to a new
+    # key while the output contract carries its recorded original name there.
+    # Per-INSTANCE (computed from config — field_mapper's flat mapping), so a
+    # declarer sets it in ``__init__`` and passes exactly these renames to
+    # ``narrow_contract_to_output``; the build's name resolution follows them.
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+
+    # Header-spelled row lookups (``TransformProtocol.header_spelled_lookups``):
+    # literal -> declared field for every row lookup the node makes by a
+    # spelling other than the field it declares (a template's row['Name']
+    # under required_input_fields [name]). Per-INSTANCE (computed from the
+    # template and the declaration), so a template consumer sets it in
+    # ``__init__``; the build proves each can resolve on an arriving row.
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
+
     # Value-preservation declaration (elspeth-e6e552ce34).
     #
     # `passes_through_input` and `forwards_input_fields` are PRESENCE
@@ -573,10 +613,13 @@ class BaseTransform(ABC):
     # Fail-closed string-scan declaration (elspeth-b19dfe41fb).
     # Transforms that quarantine a row when an explicitly configured scan field
     # is missing or non-string set this to those field names at construction.
-    # Consumed only at build time by
+    # Its type claim is consumed only at build time by
     # validate_transform_string_typed_input_fields, which rejects a pipeline
-    # whose producer schema provably types such a field int/float/bool. Empty
-    # frozenset means the transform makes no string-typed input claim.
+    # whose producer schema provably types such a field int/float/bool. Its
+    # names are also part of declared_read_fields, so the field-name spelling
+    # rule refuses a header spelling of one at build, in the Web Composer and
+    # per row. Empty frozenset means the transform makes no string-typed input
+    # claim.
     declared_string_input_fields: frozenset[str] = frozenset()
 
     # Runtime preflight opt-in. Transforms that need an engine-time external
@@ -601,7 +644,7 @@ class BaseTransform(ABC):
     # DAG contract for output field validation (centralized in DAG builder).
     # Transforms that add fields must set this via _build_output_schema_config()
     # so the DAG builder can validate downstream required_input_fields.
-    # None = no output contract provided (acceptable for shape-preserving transforms).
+    # None = no output contract; every registered transform sets one (ADR-050 D2 gate).
     _output_schema_config: SchemaConfig | None
 
     # The transform's INPUT schema config. Captured centrally by
@@ -747,8 +790,10 @@ class BaseTransform(ABC):
                 f"Transform {self.name!r} declares declared_input_fields "
                 f"{sorted(declared_input_fields)!r} but is batch-aware. No "
                 f"batch-pre-execution dispatch site exists; ADR-013 scopes "
-                f"DeclaredRequiredFieldsContract to non-batch transforms until "
-                f"an ADR-010 amendment lands."
+                f"DeclaredRequiredFieldsContract to non-batch transforms. A batch "
+                f"plugin declares the columns every buffered row must carry through "
+                f"schema.required_fields, which the flush's input check classifies "
+                f"with the same rule (ADR-013 Amendment 2026-09-27)."
             )
         self._validated_config = validated_config
         self.declared_input_fields = declared_input_fields
@@ -895,26 +940,265 @@ class BaseTransform(ABC):
             locked=expected_locked,
         )
 
-    def _apply_declared_output_field_contracts(self, contract: SchemaContract) -> SchemaContract:
-        """Apply declared output field metadata to an emitted row contract.
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The fields this transform CREATES, with the types the PLUGIN declares for them.
 
-        Contract propagation infers newly added fields from runtime values, which
-        marks them as ``source="inferred"`` and ``required=False``. When a
-        transform has an explicit ``_output_schema_config`` field declaration,
-        ADR-014 expects emitted contracts to carry that declared metadata.
+        The plugin-authored half of a transform's output declaration (ADR-050).
+        Every field a transform computes gets a contract BEFORE the first row,
+        by precedence: the operator's ``schema.fields`` type, else the type
+        the plugin declares here, else ``any`` (nullable). A field named here
+        with ``field_type="any"`` is an explicit "this plugin cannot know the
+        type" (value_transform's expression targets); a concrete type here is
+        enforced on every emitted value by the engine
+        (``engine/executors/declared_output_types``: the per-row seam and the
+        aggregation/collector flush postflight), so declare one only for a
+        field whose type the plugin's own code fixes.
+
+        This is a RUNTIME declaration read by ``_apply_declared_output_field_contracts``.
+        The base class does not fold it into ``_output_schema_config``: that
+        config is the planner-visible projection, and an observed
+        ``SchemaConfig`` cannot carry field definitions at all. Promoting these
+        types into the projection is a separate decision behind the
+        composer/runtime agreement test. One builder reads the hook for the
+        names the operator did not author: json_explode's flexible-mode
+        builder projects ``output_field`` (``any``, nullable) and
+        ``item_index`` (``int``) from it, so that projection now records
+        ``any`` as nullable (ADR-050 §Decision 10); no composer reader
+        consumes ``nullable``.
+
+        Names only are still declared through ``declared_output_fields`` (the
+        ADR-011 guarantee surface); a name in both is declared once, here.
+        The default declares nothing: such a transform's created fields are
+        stamped ``any`` from ``declared_output_fields``.
+        """
+        return ()
+
+    def carried_output_fields(self) -> frozenset[str]:
+        """Emitted names whose VALUE this transform copies from an input field.
+
+        A carried field is not created: its value is an upstream field's value
+        under that field's contract — a source-locked or upstream-declared
+        type that is the same on every row — so the stamp must not rewrite it
+        to ``any``. The one shipped case is a field_mapper rename whose
+        target inherits the source field's contract through
+        ``narrow_contract_to_output``, including an identity mapping by an
+        original header, which writes the literal header key under the
+        normalized field's contract and so is carried without being a
+        ``declared_output_fields`` name. A dotted extraction is NOT carried: its
+        value's type is not in any contract, so it is created (``any``). Nor
+        is a rename the operator declared by its TARGET name alone: that
+        declaration is not the source field's contract, and no input check
+        held the value to it.
+
+        Excluded from the ``any`` fallback in ``_stamped_output_field_contracts``,
+        admitted by the post-emission completeness check as contract-carrying
+        rather than stamped, and never value-checked by the engine
+        (``engine/executors/declared_output_types``): the input check already
+        admitted the value. Not to be confused with ``authorship: carried`` on
+        a ``DeclaredOutputTypeViolation``, which marks an input field the
+        transform REWROTE under the same name.
+
+        Derived from ``carried_output_sources()``, the one declaration of
+        which input field each carried name copies; override that, not this.
+        """
+        return frozenset(self.carried_output_sources())
+
+    def carried_output_sources(self) -> dict[str, str]:
+        """Each carried output name mapped to the input field whose value it copies.
+
+        The authority behind ``carried_output_fields()`` (its keys). The value
+        is the rename SOURCE as the operator wrote it, so the build can follow
+        a carried value's type upstream under the name it arrived with
+        (``core/dag/guarantees.resolve_guaranteed_field_type``'s carried-rename
+        arm, the union-coalesce refusal). The default carries nothing.
+        """
+        return {}
+
+    def _stamped_output_field_contracts(self) -> dict[str, FieldContract]:
+        """The declared contract of every field this transform stamps on emission.
+
+        One table, built from three declaration sources in precedence order
+        (ADR-050: operator > plugin > ``any``) by ``output_field_declarations``;
+        see there for the precedence and for who is recorded as each field's
+        declarer.
+        """
+        return {name: declaration.contract for name, declaration in self.output_field_declarations().items()}
+
+    def output_field_declared_by(self) -> dict[str, OutputFieldDeclarer]:
+        """Who declared the type of each field in the stamp table: ``operator`` or ``plugin`` (ADR-050).
+
+        The authorship bit of the amended spec's D6, read from the same table
+        the stamp is built from so the two cannot disagree. The engine's value
+        check records it on a ``DeclaredOutputTypeViolation``: a plugin whose
+        own computed value breaks the type IT declared is a plugin bug, while
+        a value breaking the operator's declared type is the row's data (or
+        the operator's declaration) at fault. Keyed by the same names as
+        ``_stamped_output_field_contracts``.
+        """
+        return {name: declaration.declared_by for name, declaration in self.output_field_declarations().items()}
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        """Every stamped field's declared contract and the declarer of its type: THE stamp table (ADR-050).
+
+        Public because the DAG build publishes it verbatim on
+        ``NodeInfo.output_field_declarations`` (and the composer reads it from
+        its validation probe instance): build-time reasoning about the types a
+        node's rows carry reads the table the runtime stamps from, never a
+        re-derivation of it.
+
+        Three declaration sources in precedence order (ADR-050: operator >
+        plugin > ``any``):
+
+        1. the operator's AUTHORED ``schema.fields`` type, read through
+           ``_output_schema_config.fields`` (the output config builders
+           extend the authored fields with a required, nullable ``any`` for
+           each guaranteed name they know only by name — that placeholder
+           is not an operator declaration and yields to the plugin's);
+        2. the plugin's ``created_output_fields()``;
+        3. every remaining ``declared_output_fields`` name as ``any``,
+           required when the output config guarantees it — except the
+           ``carried_output_fields()``, whose contract is the input field's.
+
+        A field the output config carries under a name the operator never
+        authored and the plugin does not declare — a builder's projection of
+        an authored declaration onto a renamed target, or a field the
+        plugin's builder types itself (blob_fetch's ``blob_size_bytes: int``,
+        a reference_join type derived from its fixed table) — keeps the
+        config's contract.
+
+        The declarer is ``operator`` when the output config holds the
+        operator's authored definition unchanged, or when the name is a
+        ``carried_output_fields()`` target (the builder projected the
+        operator's declaration of the source field onto it); it is ``plugin``
+        for everything the plugin's code typed: a builder-typed config field
+        (including one a builder REPLACED under an authored name, as
+        blob_json_expand does for its record index), a ``created_output_fields()``
+        entry, and an ``any`` fallback.
+
+        An ``any`` field is nullable: nothing checks the value of an ``any``
+        field, so ``nullable=False`` on one would be a claim the engine never
+        verifies. Sources are untouched — this is the transform stamp only.
+
+        Empty when the transform has no ``_output_schema_config`` (a
+        shape-preserving transform that declares no output at all).
         """
         output_schema_config = self._output_schema_config
-        if output_schema_config is None or output_schema_config.fields is None:
+        if output_schema_config is None:
+            return {}
+
+        from elspeth.contracts.schema_contract_factory import create_contract_from_config, field_definition_python_type
+
+        authored_schema = self._schema_config
+        authored_definitions = (
+            {field.name: field for field in authored_schema.fields}
+            if authored_schema is not None and authored_schema.fields is not None
+            else {}
+        )
+        carried = self.carried_output_fields()
+        declarations: dict[str, OutputFieldDeclaration] = {}
+        if output_schema_config.fields is not None:
+            config_definitions = {field.name: field for field in output_schema_config.fields}
+            for contract in create_contract_from_config(output_schema_config).fields:
+                name = contract.normalized_name
+                operator_declared = name in carried or (
+                    name in authored_definitions and authored_definitions[name] == config_definitions[name]
+                )
+                declarations[name] = OutputFieldDeclaration(contract, "operator" if operator_declared else "plugin")
+        for definition in self.created_output_fields():
+            if definition.name in declarations and definition.name in authored_definitions:
+                continue
+            declarations[definition.name] = OutputFieldDeclaration(
+                FieldContract(
+                    normalized_name=definition.name,
+                    original_name=definition.name,
+                    python_type=field_definition_python_type(definition),
+                    required=definition.required,
+                    source="declared",
+                    nullable=definition.nullable,
+                ),
+                "plugin",
+            )
+        guaranteed = output_schema_config.get_effective_guaranteed_fields()
+        for name in self.declared_output_fields:
+            if name in declarations or name in carried:
+                continue
+            declarations[name] = OutputFieldDeclaration(
+                FieldContract(
+                    normalized_name=name,
+                    original_name=name,
+                    python_type=object,
+                    required=name in guaranteed,
+                    source="declared",
+                    nullable=True,
+                ),
+                "plugin",
+            )
+        return {
+            name: (
+                replace(declaration, contract=replace(declaration.contract, nullable=True))
+                if declaration.contract.python_type is object and not declaration.contract.nullable
+                else declaration
+            )
+            for name, declaration in declarations.items()
+        }
+
+    def _apply_declared_output_field_contracts(
+        self,
+        contract: SchemaContract,
+        *,
+        dynamic_created_fields: tuple[FieldDefinition, ...] = (),
+    ) -> SchemaContract:
+        """Stamp the declared contract of every declared field onto an emitted row contract.
+
+        The ONE stamping authority (ADR-050). Contract propagation infers a
+        newly added field from the value it saw on this row, which is
+        ``source="inferred"`` / ``required=False`` and a type that can differ
+        from one emission to the next; the node's recorded output contract
+        would then be a per-row measurement and the merge of two emissions
+        could conflict. Every declared field — an operator-typed field, a
+        plugin-typed created field, a created field known only by name — is
+        rewritten here to the metadata in ``_stamped_output_field_contracts``,
+        so all of a node's emissions carry the same types from row 1 and the
+        record never changes shape after it. The declared types are enforced
+        against the emitted VALUES by the engine.
+
+        ``dynamic_created_fields`` is for the one shape whose created NAMES
+        are data, not config: blob_csv_expand emits a column per CSV header.
+        Their TYPE is still fixed by the plugin's code before row 1 (a CSV
+        cell is text), so the plugin passes them here on each emission as
+        ``FieldDefinition``s of that type and they are stamped ``declared``
+        like any other created field; the field SET may grow row to row,
+        which the node-contract record folds without a type conflict. A
+        name that is also statically declared keeps its static declaration.
+
+        The emitted field's ``original_name`` is kept: the declaration types a
+        field, it does not rename it, and display headers and lineage read
+        the original spelling.
+        """
+        stamped = self._stamped_output_field_contracts()
+        if dynamic_created_fields:
+            from elspeth.contracts.schema_contract_factory import field_definition_python_type
+
+            for definition in dynamic_created_fields:
+                if definition.name in stamped:
+                    continue
+                python_type = field_definition_python_type(definition)
+                stamped[definition.name] = FieldContract(
+                    normalized_name=definition.name,
+                    original_name=definition.name,
+                    python_type=python_type,
+                    required=definition.required,
+                    source="declared",
+                    nullable=definition.nullable or python_type is object,
+                )
+        if not stamped:
             return contract
 
-        from elspeth.contracts.schema_contract_factory import create_contract_from_config
-
-        declared_fields = {field.normalized_name: field for field in create_contract_from_config(output_schema_config).fields}
         fields: list[FieldContract] = []
         changed = False
         for field in contract.fields:
-            if field.normalized_name in declared_fields:
-                fields.append(declared_fields[field.normalized_name])
+            if field.normalized_name in stamped:
+                fields.append(replace(stamped[field.normalized_name], original_name=field.original_name))
                 changed = True
             else:
                 fields.append(field)
@@ -927,6 +1211,42 @@ class BaseTransform(ABC):
             fields=tuple(fields),
             locked=contract.locked,
         )
+
+    def _batch_output_contract(self, emitted_keys: Iterable[str]) -> SchemaContract:
+        """The contract of the rows a batch transform COMPUTES from its buffered input (ADR-050).
+
+        A reductive batch output — a statistics row, a comparison, an
+        assembled report — carries no input row's contract: every key is
+        created by the plugin. Each key enters as an ``any``/``inferred``
+        placeholder and the ONE stamp (``_apply_declared_output_field_contracts``)
+        rewrites every declared one to the type the plugin fixes in
+        ``created_output_fields()`` (``any`` for a value it carries from the
+        data), ``source="declared"``, required when guaranteed. The batch
+        postflight (``batch_contract_validation.validate_success_outputs``)
+        then checks those declared types against the emitted values, so a
+        plugin computing the wrong type for its own statistic fails the batch
+        value-free instead of recording a false contract.
+        ``_align_output_contract`` sets the declared output mode and lock.
+        Keys are deduplicated in first-seen order.
+
+        A passthrough batch output (rows the plugin annotates or replicates)
+        merges its input contracts instead and stamps the created fields with
+        the same call; see ``batch_outlier_annotator`` and ``batch_replicate``.
+        """
+        from elspeth.contracts.schema_contract import SchemaContract
+
+        fields = tuple(
+            FieldContract(
+                normalized_name=key,
+                original_name=key,
+                python_type=object,
+                required=False,
+                source="inferred",
+            )
+            for key in dict.fromkeys(emitted_keys)
+        )
+        contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
+        return self._align_output_contract(self._apply_declared_output_field_contracts(contract))
 
     def _align_output_row_contract(self, row: PipelineRow) -> PipelineRow:
         """Return ``row`` with contract semantics aligned to this transform."""
@@ -1195,9 +1515,92 @@ class BaseTransform(ABC):
         in this shape is forced to declare its intent rather than lose the
         requirement quietly.
         """
+        return self.declared_input_fields | self.schema_required_input_fields() | self._config_named_input_columns()
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        """Fields every arriving row must CARRY: this transform's ``schema.required_fields``.
+
+        The authored ``required_fields`` plus whatever the transform folds in
+        itself — every batch transform that reads a configured column
+        (``value_field``, ``group_by``, ``inspect_fields`` …) injects it here on
+        its rebuilt SchemaConfig. This is the runtime presence requirement
+        ``batch_contract_validation.validate_batch_inputs`` enforces on every
+        buffered row before a batch plugin runs (elspeth-5887fb7928 R1).
+
+        Deliberately NOT ``consumed_input_fields``: that one also counts every
+        column a config option names, defaults included, because demotion must
+        fail toward requiredness. Rejecting on it would reject rows for a column
+        a transform reads only when present (``batch_replicate.copies_field``).
+
+        ``_schema_config is None`` is a transform that never validated a config
+        (see the attribute's comment): it declares no requirement, so the empty
+        set is the declaration, not a skipped check.
+        """
         schema_config = self._schema_config
-        declared_required = frozenset(schema_config.required_fields or ()) if schema_config is not None else frozenset()
-        return self.declared_input_fields | declared_required | self._config_named_input_columns()
+        if schema_config is None:
+            return frozenset()
+        return frozenset(schema_config.required_fields or ())
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        """Every name this transform DECLARES it reads from an arriving row.
+
+        The read half of the declaration surface the field-name spelling rule
+        governs (operator ruling 2026-09-25, ``contracts.field_spelling``): a
+        name the node commits to before any row exists and that the engine
+        compares to row keys as written, so a header spelling of it never meets
+        the field it means. Four surfaces:
+
+        - ``schema.fields`` names this transform does not create — a created
+          field's declaration types an output (``declared_created_fields``);
+        - ``schema.required_fields``, where every batch transform folds its
+          configured input columns (``value_field``, ``group_by`` ...);
+        - ``declared_input_fields``: ``required_input_fields`` plus every option
+          a plugin projects onto it (``url_field``, ``query_field``,
+          ``blob_ref_field``, ``key_field``, type_coerce's
+          ``conversions[].field`` ...);
+        - ``declared_string_input_fields``: the scan fields the text-scanning
+          family (keyword_filter, the content-safety and prompt-shield
+          guardrails, document intelligence's ``source_field``) requires
+          present and string-valued. The string-type build validator compares
+          them to the upstream schema as written, so a header spelling would
+          walk past it.
+
+        Deliberately NOT the column-option limb of ``consumed_input_fields``:
+        an option that stays off those surfaces is a row LOOKUP, resolved
+        through ``PipelineRow`` under either spelling (truncate's ``fields``,
+        field_mapper's non-normalized mapping sources), and the ruling keeps lookups
+        spelling-free. json_explode's ``array_field`` was one until it became a
+        declared input (elspeth-5887fb7928 R2): it is on ``declared_input_fields``
+        now, so it is spelled as rows carry the field.
+
+        The build (``validate_declared_field_spellings``), the Web Composer's
+        Stage-1 mirror and the transform and batch preflights all read this one
+        property, so the surfaces they check cannot drift apart.
+        """
+        schema_config = self._schema_config
+        authored: frozenset[str] = frozenset()
+        if schema_config is not None and schema_config.fields is not None:
+            authored = frozenset(field.name for field in schema_config.fields) - self.self_created_input_fields
+        return authored | self.schema_required_input_fields() | self.declared_input_fields | self.declared_string_input_fields
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        """Every name this transform declares it WRITES as a field of its own.
+
+        The create half of the spelling rule's declaration surface: the
+        ADR-011 guarantee surface (``declared_output_fields``), the ADR-050
+        created declarations (``created_output_fields()``) and the demotion set
+        (``self_created_input_fields``, where value_transform keeps its
+        targets). A created name that is a header spelling of a field the row
+        carries forward lands beside that field under a second key: a silent
+        shadow, or ``Duplicate original_name`` when the literal is that field's
+        own header. A name may be both read and created (a target that reads
+        its own field); the create rule is the stronger one at build time.
+        """
+        return (
+            self.declared_output_fields | frozenset(field.name for field in self.created_output_fields()) | self.self_created_input_fields
+        )
 
     def _config_named_input_columns(self) -> frozenset[str]:
         """Column names this transform's own config options point at for READING.
@@ -1789,6 +2192,38 @@ class BaseSink(ABC, SinkEffectContract):
     # Empty frozenset = no required-field check.
     declared_required_fields: frozenset[str] = frozenset()
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        """Every name this sink DECLARES it reads from an arriving row.
+
+        The sink half of the declaration surface the field-name spelling rule
+        governs (operator ruling 2026-09-25, ``contracts.field_spelling``): the
+        ``schema.fields`` names (the declared input model's fields, keyed as
+        written), ``declared_required_fields`` (which folds in the options a
+        sink writes FROM: text/document ``field``, chroma ``id_field`` and
+        ``document_field``), and every other option naming a row column
+        (``config_named_input_columns``). Each is compared to row keys as
+        written, so a header spelling of it never meets the field it means.
+
+        The build (``validate_declared_field_spellings``), the Web Composer's
+        Stage-1 mirror and the sink's pre-write validation all read this one
+        property.
+        """
+        return frozenset(self.input_schema.model_fields) | self.declared_required_fields | self.config_named_input_columns()
+
+    def config_named_input_columns(self) -> frozenset[str]:
+        """Row columns this sink's own options name, beyond its schema and required fields.
+
+        The default is the keys of a custom ``headers`` mapping (csv, json,
+        aws_s3, azure_blob): ``apply_display_headers`` matches them to row keys
+        as written, and a row field no key matches is a write-time error. A
+        sink whose other options key output by row field names (dataverse
+        ``field_mapping``) extends this. Chroma's ``metadata_fields`` need no
+        entry: its config requires each to be a declared schema field.
+        """
+        mapping = self._headers_custom_mapping
+        return frozenset() if mapping is None else frozenset(mapping)
+
     # Failsink infrastructure — set by orchestrator from SinkSettings.on_write_failure.
     # None until injected at pipeline startup; "discard" or sink name at runtime.
     _on_write_failure: str | None
@@ -1860,8 +2295,11 @@ class BaseSink(ABC, SinkEffectContract):
 
     # Display header state — set by init_display_headers() in subclass __init__.
     # Declared here for mypy structural typing against DisplayHeaderHost protocol.
+    # The custom mapping alone carries a class default: None is the truthful
+    # value for a sink that never initialises display headers, and
+    # config_named_input_columns reads it on every sink.
     _headers_mode: HeaderMode
-    _headers_custom_mapping: dict[str, str] | None
+    _headers_custom_mapping: dict[str, str] | None = None
     _resolved_display_headers: dict[str, str] | None
     _display_headers_resolved: bool
     _needs_resume_field_resolution: bool
@@ -2271,6 +2709,31 @@ class BaseSource(ABC):
 
     # Schema contract for row validation
     _schema_contract: SchemaContract | None = None
+
+    # The source's validated ``field_mapping`` (key -> row key), set at
+    # construction by every source whose config carries one
+    # (TabularSourceDataConfig and the json, aws_s3, azure_blob and dataverse
+    # configs); None for a source that renames nothing. ``_field_mapping_keys``
+    # is what the source matches those keys against: the normalized external
+    # name, unless the source reads headerless CSV, whose keys are the
+    # configured column names as written (set at construction by csv, aws_s3
+    # and azure_blob from the same condition their loaders use). Read through
+    # ``field_renames``.
+    _field_mapping: dict[str, str] | None = None
+    _field_mapping_keys: FieldMappingKeys = "normalized"
+    # A positive source capability: only sources that derive row keys from
+    # external headers may offer an original-header spelling to downstream
+    # lookups. Identity sources leave this False.
+    _normalizes_external_names: bool = False
+
+    @property
+    def field_renames(self) -> SourceFieldRenames:
+        """The renames this source applies, keyed the way it keys them (``SourceProtocol.field_renames``)."""
+        return SourceFieldRenames(
+            mapping={} if self._field_mapping is None else self._field_mapping,
+            keys=self._field_mapping_keys,
+            normalizes_external_names=self._normalizes_external_names,
+        )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         # Enforces the contract documented in contracts/enums.py:Determinism —

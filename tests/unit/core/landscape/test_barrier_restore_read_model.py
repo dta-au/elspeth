@@ -26,20 +26,29 @@ def test_barrier_restore_read_model_reports_duplicate_live_buffered_acceptances(
         node_type=NodeType.TRANSFORM,
         plugin_name="batch_stats",
     )
-    batch = setup.factory.execution.create_batch(setup.run_id, agg_node_id)
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
-        setup.source_node_id,
-        0,
-        {"id": 1},
-        source_row_index=0,
-        ingest_sequence=0,
+    batch = setup.factory.execution.create_batch(agg_node_id, coordination_token=setup.coordination_token)
+    row, token = setup.factory.data_flow.create_row_with_token(
+        setup.source_node_id, 0, {"id": 1}, source_row_index=0, ingest_sequence=0, coordination_token=setup.coordination_token
     )
-    token = setup.factory.data_flow.create_token(row_id=row.row_id)
     ref = TokenRef(token_id=token.token_id, run_id=setup.run_id)
+    work_item = setup.factory.scheduler.enqueue_ready_claimed(
+        member_token=setup.coordination_token.membership,
+        token_id=token.token_id,
+        row_id=row.row_id,
+        node_id=agg_node_id,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json='{"id":1}',
+        lease_owner=setup.coordination_token.worker_id,
+        lease_seconds=60,
+    )
 
-    setup.factory.data_flow.record_token_outcome(ref, None, TerminalPath.BUFFERED, batch_id=batch.batch_id)
-    setup.factory.data_flow.record_token_outcome(ref, None, TerminalPath.BUFFERED, batch_id=batch.batch_id)
+    setup.factory.data_flow.record_token_outcome(
+        ref, None, TerminalPath.BUFFERED, batch_id=batch.batch_id, member_token=setup.coordination_token.membership, work_item=work_item
+    )
+    setup.factory.data_flow.record_token_outcome(
+        ref, None, TerminalPath.BUFFERED, batch_id=batch.batch_id, member_token=setup.coordination_token.membership, work_item=work_item
+    )
 
     duplicate_acceptances = setup.factory.barrier_restore.find_duplicate_live_buffered_acceptances(setup.run_id)
 
@@ -49,17 +58,16 @@ def test_barrier_restore_read_model_reports_duplicate_live_buffered_acceptances(
 def test_barrier_restore_read_model_reports_max_node_state_attempts() -> None:
     setup = make_recorder_with_run(run_id="run-restore-attempts")
     node_id = register_test_node(setup.factory.data_flow, setup.run_id, "sink-node")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
-        setup.source_node_id,
-        0,
-        {"id": 1},
-        source_row_index=0,
-        ingest_sequence=0,
+    row, _initial_token = setup.factory.data_flow.create_row_with_token(
+        setup.source_node_id, 0, {"id": 1}, source_row_index=0, ingest_sequence=0, coordination_token=setup.coordination_token
     )
-    token = setup.factory.data_flow.create_token(row_id=row.row_id, token_id="token-attempt")
-    setup.factory.execution.begin_node_state(token.token_id, node_id, setup.run_id, 1, {"id": 1}, attempt=0)
-    setup.factory.execution.begin_node_state(token.token_id, node_id, setup.run_id, 2, {"id": 1}, attempt=3)
+    token = setup.factory.data_flow.create_token(row_id=row.row_id, token_id="token-attempt", coordination_token=setup.coordination_token)
+    setup.factory.execution.begin_node_state(
+        token.token_id, node_id, 1, {"id": 1}, attempt=0, member_token=setup.coordination_token.membership
+    )
+    setup.factory.execution.begin_node_state(
+        token.token_id, node_id, 2, {"id": 1}, attempt=3, member_token=setup.coordination_token.membership
+    )
 
     assert setup.factory.barrier_restore.get_max_node_state_attempts(setup.run_id, [token.token_id]) == {token.token_id: 3}
     assert setup.factory.barrier_restore.get_max_node_state_attempts(
@@ -72,32 +80,15 @@ def test_barrier_restore_read_model_reports_max_node_state_attempts() -> None:
 def test_barrier_restore_read_model_reports_open_coalesce_hold_state_ids() -> None:
     setup = make_recorder_with_run(run_id="run-restore-open-holds")
     node_id = register_test_node(setup.factory.data_flow, setup.run_id, "coalesce-node")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
-        setup.source_node_id,
-        0,
-        {"id": 1},
-        source_row_index=0,
-        ingest_sequence=0,
+    row, _initial_token = setup.factory.data_flow.create_row_with_token(
+        setup.source_node_id, 0, {"id": 1}, source_row_index=0, ingest_sequence=0, coordination_token=setup.coordination_token
     )
-    token = setup.factory.data_flow.create_token(row_id=row.row_id, token_id="token-held")
+    token = setup.factory.data_flow.create_token(row_id=row.row_id, token_id="token-held", coordination_token=setup.coordination_token)
     setup.factory.execution.begin_node_state(
-        token.token_id,
-        node_id,
-        setup.run_id,
-        1,
-        {"id": 1},
-        state_id="state-low",
-        attempt=0,
+        token.token_id, node_id, 1, {"id": 1}, state_id="state-low", attempt=0, member_token=setup.coordination_token.membership
     )
     setup.factory.execution.begin_node_state(
-        token.token_id,
-        node_id,
-        setup.run_id,
-        1,
-        {"id": 1},
-        state_id="state-high",
-        attempt=2,
+        token.token_id, node_id, 1, {"id": 1}, state_id="state-high", attempt=2, member_token=setup.coordination_token.membership
     )
 
     assert setup.factory.barrier_restore.get_open_node_state_ids(
@@ -109,16 +100,16 @@ def test_barrier_restore_read_model_reports_open_coalesce_hold_state_ids() -> No
 
 def test_barrier_restore_read_model_finds_one_durable_group_loss_by_closer() -> None:
     setup = make_recorder_with_run(run_id="run-restore-branch-loss")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
+    row, _initial_token = setup.factory.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"id": 1},
         row_id="row-lost",
         source_row_index=0,
         ingest_sequence=0,
+        coordination_token=setup.coordination_token,
     )
-    setup.factory.data_flow.create_token(row_id=row.row_id, token_id="token-lost")
+    setup.factory.data_flow.create_token(row_id=row.row_id, token_id="token-lost", coordination_token=setup.coordination_token)
     with begin_write(setup.db.engine) as conn:
         record_group_loss(
             conn,
@@ -173,21 +164,22 @@ def test_group_member_reads_roster_from_frames_and_group_record() -> None:
     # token_id) -- frames and group records are seeded through the real
     # writer, never raw INSERTs into the new tables.
     setup = make_recorder_with_run(run_id="run-restore-group-roster")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
+    row, _initial_token = setup.factory.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"id": 1},
         source_row_index=0,
         ingest_sequence=0,
         row_id="row-roster",
+        coordination_token=setup.coordination_token,
     )
-    opener = setup.factory.data_flow.create_token(row_id=row.row_id, token_id="token-opener")
+    opener = setup.factory.data_flow.create_token(row_id=row.row_id, token_id="token-opener", coordination_token=setup.coordination_token)
     children, expand_group_id = setup.factory.data_flow.expand_token(
         parent_ref=TokenRef(token_id=opener.token_id, run_id=setup.run_id),
         row_id=row.row_id,
         child_payloads=[{"item": 0}, {"item": 1}],
         output_contract=_MINIMAL_CONTRACT,
+        member_token=setup.coordination_token.membership,
     )
     reads = setup.factory.barrier_restore
 
@@ -218,27 +210,33 @@ def test_has_completed_group_for_node_discriminates_sibling_groups_on_one_row() 
     # invariant (no coalesce/collect release is exercised in this test).
     setup = make_recorder_with_run(run_id="run-restore-group-sibling")
     node_id = register_test_node(setup.factory.data_flow, setup.run_id, "merge_x")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
+    row, _initial_token = setup.factory.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"id": 1},
         source_row_index=0,
         ingest_sequence=0,
         row_id="row-1",
+        coordination_token=setup.coordination_token,
     )
     g1_token = setup.factory.data_flow.create_token(
         row_id=row.row_id,
         token_id="token-g1-left",
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-1", member_key="left"),),
+        coordination_token=setup.coordination_token,
     )
     setup.factory.data_flow.create_token(
         row_id=row.row_id,
         token_id="token-g2-left",
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-2", member_key="left"),),
+        coordination_token=setup.coordination_token,
     )
-    state = setup.factory.execution.begin_node_state(g1_token.token_id, node_id, setup.run_id, 1, {"id": 1})
-    setup.factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+    state = setup.factory.execution.begin_node_state(
+        g1_token.token_id, node_id, 1, {"id": 1}, member_token=setup.coordination_token.membership
+    )
+    setup.factory.execution.complete_node_state(
+        state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0, member_token=setup.coordination_token.membership
+    )
 
     reads = setup.factory.barrier_restore
     assert reads.has_completed_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-fork-1") is True
@@ -250,22 +248,27 @@ def test_has_completed_group_for_node_discriminates_sibling_groups_on_one_row() 
 def test_get_completed_group_ids_for_nodes_pairs() -> None:
     setup = make_recorder_with_run(run_id="run-restore-group-pairs")
     node_id = register_test_node(setup.factory.data_flow, setup.run_id, "merge_x")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
+    row, _initial_token = setup.factory.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"id": 1},
         source_row_index=0,
         ingest_sequence=0,
         row_id="row-1",
+        coordination_token=setup.coordination_token,
     )
     g1_token = setup.factory.data_flow.create_token(
         row_id=row.row_id,
         token_id="token-g1-left",
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-1", member_key="left"),),
+        coordination_token=setup.coordination_token,
     )
-    state = setup.factory.execution.begin_node_state(g1_token.token_id, node_id, setup.run_id, 1, {"id": 1})
-    setup.factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+    state = setup.factory.execution.begin_node_state(
+        g1_token.token_id, node_id, 1, {"id": 1}, member_token=setup.coordination_token.membership
+    )
+    setup.factory.execution.complete_node_state(
+        state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0, member_token=setup.coordination_token.membership
+    )
 
     pairs = setup.factory.barrier_restore.get_completed_group_ids_for_nodes(setup.run_id, frozenset({node_id}))
     assert pairs == {(node_id, "g-fork-1")}
@@ -282,31 +285,45 @@ def test_get_released_group_ids_for_nodes_pairs_and_discriminates_from_failed() 
 
     setup = make_recorder_with_run(run_id="run-restore-group-released-pairs")
     node_id = register_test_node(setup.factory.data_flow, setup.run_id, "row_union_x")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
+    row, _initial_token = setup.factory.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"id": 1},
         source_row_index=0,
         ingest_sequence=0,
         row_id="row-1",
+        coordination_token=setup.coordination_token,
     )
     released_token = setup.factory.data_flow.create_token(
         row_id=row.row_id,
         token_id="token-released",
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-released", member_key="left"),),
+        coordination_token=setup.coordination_token,
     )
-    released_state = setup.factory.execution.begin_node_state(released_token.token_id, node_id, setup.run_id, 1, {"id": 1})
-    setup.factory.execution.complete_node_state(released_state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+    released_state = setup.factory.execution.begin_node_state(
+        released_token.token_id, node_id, 1, {"id": 1}, member_token=setup.coordination_token.membership
+    )
+    setup.factory.execution.complete_node_state(
+        released_state.state_id,
+        NodeStateStatus.COMPLETED,
+        output_data={"id": 1},
+        duration_ms=1.0,
+        member_token=setup.coordination_token.membership,
+    )
 
     failed_token = setup.factory.data_flow.create_token(
         row_id=row.row_id,
         token_id="token-failed",
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-failed", member_key="left"),),
+        coordination_token=setup.coordination_token,
     )
-    failed_state = setup.factory.execution.begin_node_state(failed_token.token_id, node_id, setup.run_id, 1, {"id": 1})
+    failed_state = setup.factory.execution.begin_node_state(
+        failed_token.token_id, node_id, 1, {"id": 1}, member_token=setup.coordination_token.membership
+    )
     error = ExecutionError(exception="boom", exception_type="ValueError")
-    setup.factory.execution.complete_node_state(failed_state.state_id, NodeStateStatus.FAILED, error=error, duration_ms=1.0)
+    setup.factory.execution.complete_node_state(
+        failed_state.state_id, NodeStateStatus.FAILED, error=error, duration_ms=1.0, member_token=setup.coordination_token.membership
+    )
 
     pairs = setup.factory.barrier_restore.get_released_group_ids_for_nodes(setup.run_id, frozenset({node_id}))
     assert pairs == {(node_id, "g-fork-released")}
@@ -319,24 +336,29 @@ def test_resolve_group_collector_node_agrees_with_the_real_closer() -> None:
     # completion (no durable evidence yet), a singleton set after.
     setup = make_recorder_with_run(run_id="run-restore-resolve-node-happy")
     node_id = register_test_node(setup.factory.data_flow, setup.run_id, "stitch")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
+    row, _initial_token = setup.factory.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"id": 1},
         source_row_index=0,
         ingest_sequence=0,
         row_id="row-1",
+        coordination_token=setup.coordination_token,
     )
     member = setup.factory.data_flow.create_token(
         row_id=row.row_id,
         token_id="token-member",
         lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="g-expand-1", member_key="m-1"),),
+        coordination_token=setup.coordination_token,
     )
     assert setup.factory.barrier_restore.resolve_group_collector_node(run_id=setup.run_id, group_id="g-expand-1") == frozenset()
 
-    state = setup.factory.execution.begin_node_state(member.token_id, node_id, setup.run_id, 1, {"id": 1})
-    setup.factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+    state = setup.factory.execution.begin_node_state(
+        member.token_id, node_id, 1, {"id": 1}, member_token=setup.coordination_token.membership
+    )
+    setup.factory.execution.complete_node_state(
+        state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0, member_token=setup.coordination_token.membership
+    )
 
     assert setup.factory.barrier_restore.resolve_group_collector_node(run_id=setup.run_id, group_id="g-expand-1") == frozenset({node_id})
 
@@ -354,29 +376,47 @@ def test_resolve_group_collector_node_returns_every_node_for_a_nested_group() ->
     setup = make_recorder_with_run(run_id="run-restore-resolve-node-forced-apart")
     node_a = register_test_node(setup.factory.data_flow, setup.run_id, "stitch-a")
     node_b = register_test_node(setup.factory.data_flow, setup.run_id, "stitch-b")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
+    row, _initial_token = setup.factory.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"id": 1},
         source_row_index=0,
         ingest_sequence=0,
         row_id="row-1",
+        coordination_token=setup.coordination_token,
     )
     member_a = setup.factory.data_flow.create_token(
         row_id=row.row_id,
         token_id="token-member-a",
         lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="g-expand-split", member_key="m-a"),),
+        coordination_token=setup.coordination_token,
     )
     member_b = setup.factory.data_flow.create_token(
         row_id=row.row_id,
         token_id="token-member-b",
         lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="g-expand-split", member_key="m-b"),),
+        coordination_token=setup.coordination_token,
     )
-    state_a = setup.factory.execution.begin_node_state(member_a.token_id, node_a, setup.run_id, 1, {"id": 1})
-    setup.factory.execution.complete_node_state(state_a.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
-    state_b = setup.factory.execution.begin_node_state(member_b.token_id, node_b, setup.run_id, 1, {"id": 1})
-    setup.factory.execution.complete_node_state(state_b.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+    state_a = setup.factory.execution.begin_node_state(
+        member_a.token_id, node_a, 1, {"id": 1}, member_token=setup.coordination_token.membership
+    )
+    setup.factory.execution.complete_node_state(
+        state_a.state_id,
+        NodeStateStatus.COMPLETED,
+        output_data={"id": 1},
+        duration_ms=1.0,
+        member_token=setup.coordination_token.membership,
+    )
+    state_b = setup.factory.execution.begin_node_state(
+        member_b.token_id, node_b, 1, {"id": 1}, member_token=setup.coordination_token.membership
+    )
+    setup.factory.execution.complete_node_state(
+        state_b.state_id,
+        NodeStateStatus.COMPLETED,
+        output_data={"id": 1},
+        duration_ms=1.0,
+        member_token=setup.coordination_token.membership,
+    )
 
     assert setup.factory.barrier_restore.resolve_group_collector_node(run_id=setup.run_id, group_id="g-expand-split") == frozenset(
         {node_a, node_b}
@@ -395,14 +435,14 @@ def test_group_completion_joins_match_any_frame_depth_not_only_innermost() -> No
     emits one pair PER depth."""
     setup = make_recorder_with_run(run_id="run-restore-group-nested-depth")
     node_id = register_test_node(setup.factory.data_flow, setup.run_id, "merge_x")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
+    row, _initial_token = setup.factory.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"id": 1},
         source_row_index=0,
         ingest_sequence=0,
         row_id="row-1",
+        coordination_token=setup.coordination_token,
     )
     nested_token = setup.factory.data_flow.create_token(
         row_id=row.row_id,
@@ -411,9 +451,14 @@ def test_group_completion_joins_match_any_frame_depth_not_only_innermost() -> No
             LineageFrame(kind=FrameKind.FORK, group_id="g-outer-fork", member_key="left"),
             LineageFrame(kind=FrameKind.EXPAND, group_id="g-inner-expand", member_key="token-nested"),
         ),
+        coordination_token=setup.coordination_token,
     )
-    state = setup.factory.execution.begin_node_state(nested_token.token_id, node_id, setup.run_id, 1, {"id": 1})
-    setup.factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0)
+    state = setup.factory.execution.begin_node_state(
+        nested_token.token_id, node_id, 1, {"id": 1}, member_token=setup.coordination_token.membership
+    )
+    setup.factory.execution.complete_node_state(
+        state.state_id, NodeStateStatus.COMPLETED, output_data={"id": 1}, duration_ms=1.0, member_token=setup.coordination_token.membership
+    )
 
     reads = setup.factory.barrier_restore
     assert reads.has_completed_group_for_node(run_id=setup.run_id, node_id=node_id, group_id="g-outer-fork") is True
@@ -436,23 +481,28 @@ def test_has_released_group_for_node_discriminates_completed_from_failed() -> No
 
     setup = make_recorder_with_run(run_id="run-restore-group-failed-vs-completed")
     node_id = register_test_node(setup.factory.data_flow, setup.run_id, "merge_x")
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
+    row, _initial_token = setup.factory.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"id": 1},
         source_row_index=0,
         ingest_sequence=0,
         row_id="row-1",
+        coordination_token=setup.coordination_token,
     )
     failed_token = setup.factory.data_flow.create_token(
         row_id=row.row_id,
         token_id="token-failed",
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="g-fork-failed", member_key="left"),),
+        coordination_token=setup.coordination_token,
     )
-    state = setup.factory.execution.begin_node_state(failed_token.token_id, node_id, setup.run_id, 1, {"id": 1})
+    state = setup.factory.execution.begin_node_state(
+        failed_token.token_id, node_id, 1, {"id": 1}, member_token=setup.coordination_token.membership
+    )
     error = ExecutionError(exception="boom", exception_type="ValueError")
-    setup.factory.execution.complete_node_state(state.state_id, NodeStateStatus.FAILED, error=error, duration_ms=1.0)
+    setup.factory.execution.complete_node_state(
+        state.state_id, NodeStateStatus.FAILED, error=error, duration_ms=1.0, member_token=setup.coordination_token.membership
+    )
 
     reads = setup.factory.barrier_restore
     # completed_at IS set on a FAILED state -- the weaker check reports True.

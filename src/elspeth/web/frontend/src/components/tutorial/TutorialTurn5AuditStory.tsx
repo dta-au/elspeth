@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type JSX, useCallback, useEffect, useRef, useState } from "react";
 import { getRunAuditSummary } from "@/api/client";
 import { Button } from "@/components/ui";
 import type { RunAuditStoryResponse } from "@/types/api";

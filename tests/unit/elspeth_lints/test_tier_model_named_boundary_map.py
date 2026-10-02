@@ -48,6 +48,23 @@ def test_every_map_entry_resolves_to_one_live_definition() -> None:
     )
 
 
+def test_composer_owner_boundary_entries_have_explicit_raw_r5_audit(monkeypatch) -> None:
+    """Keep the live R5 exemption exact and reject an inert advisor exemption."""
+    destinations = {
+        "web/composer/advisor_checkpoint.py": ("AdvisorCheckpointOwner._validate_advisor_arguments", 0),
+        "web/composer/composer_preflight.py": ("ComposerPreflight.cached_runtime_preflight", 3),
+    }
+    for file_path, (qualified_name, raw_count) in destinations.items():
+        assert (qualified_name in TierModelVisitor._R5_NAMED_BOUNDARY_CONTEXTS.get(file_path, frozenset())) == (raw_count > 0)
+        source = (SOURCE_ROOT / file_path).read_text(encoding="utf-8")
+        active = _visitor_findings(file_path, source)
+        assert f"R5:{qualified_name}" not in active
+        with monkeypatch.context() as patch:
+            patch.setattr(TierModelVisitor, "_R5_NAMED_BOUNDARY_CONTEXTS", {})
+            raw = _visitor_findings(file_path, source)
+        assert raw.count(f"R5:{qualified_name}") == raw_count
+
+
 def test_map_keys_are_qualified_symbol_paths() -> None:
     """A bare method name would silently match on every class; keys must carry the class."""
     for file_path, names in TierModelVisitor._R5_NAMED_BOUNDARY_CONTEXTS.items():

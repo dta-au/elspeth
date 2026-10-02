@@ -129,13 +129,89 @@ class TestBatchTopK:
         assert [(type(row["group_value"]).__name__, row["group_value"]) for row in result.rows] == [("bool", True), ("int", 1)]
         assert [row["batch_size"] for row in result.rows] == [2, 2]
 
-    def test_non_scalar_value_raises_type_error(self, ctx: PluginContext) -> None:
+    @pytest.mark.parametrize(
+        ("bad_value", "frozen_type"),
+        [
+            # PipelineRow deep-freezes row data: a JSON array arrives as a tuple,
+            # a JSON object as a mappingproxy. Both have no frequency bucket.
+            (["leaked-array-value"], "tuple"),
+            ({"k": "leaked-object-value"}, "mappingproxy"),
+        ],
+    )
+    def test_non_scalar_value_fails_the_whole_batch_with_a_recorded_reason(
+        self, ctx: PluginContext, bad_value: object, frozen_type: str
+    ) -> None:
+        """A non-scalar value fails the BATCH with a value-free reason (elspeth-d5034647f0).
+
+        The bad row is not skipped and no top-k is published over the surviving
+        rows. The reason names the field, the expected and found types and the
+        BATCH row index, and never the row value.
+        """
+        from elspeth.plugins.transforms.batch_top_k import BatchTopK
+
+        transform = BatchTopK({"schema": DYNAMIC_SCHEMA, "field": "label"})
+        rows = [
+            _make_row({"label": "a"}),
+            _make_row({"label": bad_value}),
+            _make_row({"label": "b"}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "label"
+        assert result.reason["expected"] == "a scalar top-k value (str, int, float, bool, or None)"
+        assert result.reason["actual_type"] == frozen_type
+        assert "in row 1" in result.reason["error"]
+        assert f"must be a scalar top-k value (str, int, float, bool, or None), got {frozen_type}" in result.reason["error"]
+        # The offending VALUE is row content and must not reach the audit trail.
+        assert "leaked" not in repr(sorted(result.reason.items()))
+
+    def test_non_scalar_value_in_a_later_group_reports_the_batch_row_index(self, ctx: PluginContext) -> None:
+        """With group_by, the reported row index is the BATCH index, not the in-group index.
+
+        Row 3 is the second row of cohort B (in-group index 1). The reason must say
+        row 3, the index an operator can find in the buffered batch.
+        """
+        from elspeth.plugins.transforms.batch_top_k import BatchTopK
+
+        transform = BatchTopK({"schema": DYNAMIC_SCHEMA, "field": "label", "group_by": "cohort"})
+        rows = [
+            _make_row({"cohort": "A", "label": "x"}),
+            _make_row({"cohort": "B", "label": "y"}),
+            _make_row({"cohort": "A", "label": "x"}),
+            _make_row({"cohort": "B", "label": ["leaked-array-value"]}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["field"] == "label"
+        assert result.reason["actual_type"] == "tuple"
+        assert "in row 3" in result.reason["error"]
+        assert "in row 1" not in result.reason["error"]
+        assert "leaked" not in repr(sorted(result.reason.items()))
+
+    def test_none_value_stays_skip_and_report_not_a_batch_failure(self, ctx: PluginContext) -> None:
+        """None is a missing value, counted in missing_count; only a wrong TYPE fails the batch."""
         from elspeth.plugins.transforms.batch_top_k import BatchTopK
 
         transform = BatchTopK({"schema": DYNAMIC_SCHEMA, "field": "label"})
 
-        with pytest.raises(TypeError, match="must be a scalar top-k value"):
-            transform.process([_make_row({"label": ["a"]})], ctx)
+        result = transform.process([_make_row({"label": None}), _make_row({"label": "a"})], ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row["missing_count"] == 1
+        assert result.row["count"] == 1
 
     def test_bool_and_int_do_not_collide(self, ctx: PluginContext) -> None:
         # Python: True == 1 and hash(True) == hash(1). Treating them as the same

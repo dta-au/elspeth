@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.fixtures.audit_hashing import fake_sha256
+
 sqlcipher3 = pytest.importorskip("sqlcipher3", reason="sqlcipher3 not installed (install with: uv pip install 'elspeth[security]')")
 
 
@@ -91,7 +93,7 @@ class TestSQLCipherCreateAndRead:
                         run_id="test-run-001",
                         status="RUNNING",
                         started_at=datetime.now(UTC),
-                        config_hash="abc123",
+                        config_hash=fake_sha256("abc123"),
                         settings_json="{}",
                         canonical_version="1.0.0",
                         openrouter_catalog_sha256="0" * 64,
@@ -275,7 +277,7 @@ class TestSQLCipherReadOnly:
                         run_id="write-should-fail",
                         status="RUNNING",
                         started_at=datetime.now(UTC),
-                        config_hash="abc123",
+                        config_hash=fake_sha256("abc123"),
                         settings_json="{}",
                         canonical_version="1.0.0",
                         openrouter_catalog_sha256="0" * 64,
@@ -318,7 +320,7 @@ class TestSQLCipherForeignKeys:
                         "nt": "source",
                         "pv": "1.0.0",
                         "det": "deterministic",
-                        "ch": "hash",
+                        "ch": fake_sha256("hash"),
                         "cj": "{}",
                         "seq": 0,
                         "rat": datetime.now(UTC).isoformat(),
@@ -470,7 +472,7 @@ class TestSQLCipherPassphraseEscaping:
                         run_id="test-escape",
                         status="RUNNING",
                         started_at=datetime.now(UTC),
-                        config_hash="abc",
+                        config_hash=fake_sha256("abc"),
                         settings_json="{}",
                         canonical_version="1.0.0",
                         openrouter_catalog_sha256="0" * 64,

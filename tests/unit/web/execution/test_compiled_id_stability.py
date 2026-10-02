@@ -8,7 +8,7 @@ plugin), while the composer dry-run used to build bare (profile-lowered,
 secret-resolved config) — the same node minted a different id on every
 preflight vs every run (seam A), and the tolerant/strict interpretation
 materializers minted different ids across adjacent turns (seam B: strict adds
-``resolved_prompt_template_hash`` and the rendered prompt; tolerant does not).
+``approved_prompt_artifact_hash`` and the rendered prompt; tolerant does not).
 
 None of these ids was pinned anywhere: ``tests/unit/core/test_dag.py``'s
 "deterministic ids" test reuses one settings object and one build path, so it
@@ -155,7 +155,7 @@ def _profiled_llm_state(tmp_path: Path, *, prompt_requirement_status: str = "res
 
     The resolved ``llm_prompt_template`` requirement is what arms the seam-B
     delta: the strict materializer renders the prompt and stamps
-    ``resolved_prompt_template_hash`` into the node options; the tolerant
+    ``approved_prompt_artifact_hash`` into the node options; the tolerant
     (authoring) materializer does neither, so lane-local identity hashing
     minted two ids for this one node.
     """
@@ -328,7 +328,7 @@ def test_tolerant_and_strict_preflight_mint_identical_node_ids(tmp_path: Path, m
     pass the strict lane at all — ``interpretation_review`` fails closed
     before any graph exists), which is exactly the adjacent-turn shape whose
     ids churned: strict materialization stamps the rendered prompt and
-    ``resolved_prompt_template_hash`` into the llm node options, tolerant
+    ``approved_prompt_artifact_hash`` into the llm node options, tolerant
     materialization does not.
     """
     profiles, snapshot = _llm_profile_policy_context(llm_profile=_bedrock_profile())

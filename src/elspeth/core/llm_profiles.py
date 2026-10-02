@@ -21,6 +21,7 @@ from elspeth.core.llm_provider_validation import (
     validate_gateway_capabilities,
     validate_gateway_contract_major,
     validate_gateway_endpoint,
+    validate_openrouter_profile_base_url,
 )
 from elspeth.core.url_validation import validate_credential_safe_https_url
 
@@ -39,8 +40,14 @@ LLM_PROFILE_PRIVATE_FIELDS = frozenset(
         "profile_alias",
         "provider",
         "model",
+        "pricing_model",
         "api_key",
         "api_key_secret",
+        # Bedrock's static IAM credentials: provider-binding credentials like
+        # ``api_key``, so a profiled node may never author them.
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
         "base_url",
         "endpoint",
         "deployment_name",
@@ -53,6 +60,7 @@ LLM_PROFILE_PRIVATE_FIELDS = frozenset(
         "tracing",
         "timeout_seconds",
         "max_tokens",
+        "temperature",
         "pool_size",
         "min_dispatch_delay_ms",
         "max_dispatch_delay_ms",
@@ -62,7 +70,7 @@ LLM_PROFILE_PRIVATE_FIELDS = frozenset(
         "prompt_template_source",
         "lookup_source",
         "system_prompt_source",
-        "resolved_prompt_template_hash",
+        "approved_prompt_artifact_hash",
     }
 )
 
@@ -108,8 +116,10 @@ class LLMProfileSettings(BaseModel):
 
     provider: str = Field(repr=False)
     model: str = Field(min_length=1, max_length=512, repr=False)
+    pricing_model: str | None = Field(default=None, min_length=1, max_length=512, pattern=r"\S", strict=True, repr=False)
     credential_scope: CredentialScope | None = Field(default=None, repr=False)
     credential_ref: str | None = Field(default=None, repr=False)
+    base_url: str | None = Field(default=None, repr=False)
     region_name: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", repr=False)
     endpoint: str | None = Field(default=None, repr=False)
     deployment_name: str | None = Field(default=None, min_length=1, max_length=256, repr=False)
@@ -118,6 +128,7 @@ class LLMProfileSettings(BaseModel):
     required_capabilities: tuple[str, ...] | None = Field(default=None, repr=False)
     timeout_seconds: float = Field(default=60.0, gt=0, le=300, repr=False)
     max_tokens: int | None = Field(default=None, gt=0, le=131072, repr=False)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0, strict=True, allow_inf_nan=False, repr=False)
 
     @model_validator(mode="after")
     def _validate_provider_binding(self) -> LLMProfileSettings:
@@ -130,9 +141,16 @@ class LLMProfileSettings(BaseModel):
         if self.provider == "azure" and self.region_name is not None:
             raise ValueError("azure profile does not support region_name")
         if self.provider == "bedrock":
-            if self.credential_scope is not None or self.credential_ref is not None:
-                raise ValueError("Bedrock profiles use the keyless AWS credential chain")
-            if self.endpoint is not None or self.deployment_name is not None or self.api_version is not None:
+            # Bedrock credentials are optional: a scope-less profile uses the
+            # AWS default credential chain, and a credentialed one names an
+            # Amazon Bedrock API key that lowering wires as ``api_key``. A
+            # profile carries one reference, so the static IAM credential
+            # pair is reachable only through explicit node options.
+            if (self.credential_scope is None) != (self.credential_ref is None):
+                raise ValueError("Bedrock profile credential requires both scope and reference, or neither")
+            if self.credential_ref is not None and SECRET_REF_PATTERN.fullmatch(self.credential_ref) is None:
+                raise ValueError("credential reference has invalid syntax")
+            if any(value is not None for value in (self.base_url, self.endpoint, self.deployment_name, self.api_version)):
                 raise ValueError("Bedrock profile contains fields owned by another provider")
             validate_bedrock_model(self.model)
         else:
@@ -140,10 +158,14 @@ class LLMProfileSettings(BaseModel):
                 raise ValueError("credentialed profile requires explicit scope and reference")
             if SECRET_REF_PATTERN.fullmatch(self.credential_ref) is None:
                 raise ValueError("credential reference has invalid syntax")
+            if self.provider != "openrouter" and self.base_url is not None:
+                raise ValueError(f"{self.provider} profile contains fields owned by another provider")
             if self.provider == "openrouter" and any(
                 value is not None for value in (self.region_name, self.endpoint, self.deployment_name, self.api_version)
             ):
                 raise ValueError("OpenRouter profile contains unsupported provider fields")
+            if self.provider == "openrouter" and self.base_url is not None:
+                validate_openrouter_profile_base_url(self.base_url)
             if self.provider == "azure":
                 if self.endpoint is None or self.deployment_name is None:
                     raise ValueError("Azure profile requires operator endpoint and deployment")
@@ -186,7 +208,10 @@ class RuntimeLLMProfile:
                 ("deployment_name", settings.deployment_name),
                 ("api_version", settings.api_version),
             ),
-            "openrouter": (("timeout_seconds", settings.timeout_seconds),),
+            "openrouter": (
+                ("base_url", settings.base_url),
+                ("timeout_seconds", settings.timeout_seconds),
+            ),
             "gateway": (
                 ("endpoint", settings.endpoint),
                 ("contract_major", settings.contract_major),
@@ -194,9 +219,19 @@ class RuntimeLLMProfile:
                 ("timeout_seconds", settings.timeout_seconds),
             ),
         }
-        options = tuple(
-            (name, value) for name, value in (*provider_fields[settings.provider], ("max_tokens", settings.max_tokens)) if value is not None
+        options: tuple[tuple[str, object], ...] = tuple(
+            (name, value)
+            for name, value in (
+                *provider_fields[settings.provider],
+                ("max_tokens", settings.max_tokens),
+                ("pricing_model", settings.pricing_model),
+            )
+            if value is not None
         )
+        # Omission leaves the provider config default intact. Explicit null
+        # is an operator instruction to omit temperature from the wire.
+        if "temperature" in settings.model_fields_set:
+            options += (("temperature", settings.temperature),)
         return cls(
             alias=alias,
             provider=settings.provider,

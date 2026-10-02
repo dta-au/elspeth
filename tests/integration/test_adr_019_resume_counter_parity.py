@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
+from elspeth.cli import app
 from elspeth.contracts import NodeStateStatus, NodeType
+from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import CoalesceFailureReason
+from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.run_result import RunResult
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape.database import LandscapeDB
@@ -25,6 +30,16 @@ from tests.integration._helpers import (
     build_test_pipeline_with_on_error_route,
     build_test_pipeline_with_source_quarantine,
     run_pipeline,
+)
+from tests.integration.pipeline.quarantine_resume_matrix import (
+    KINDS,
+    WINDOWS,
+    assert_crash_image,
+    crash_run,
+    lapse_crashed_leases,
+    resume,
+    run_id_of,
+    write_settings,
 )
 
 
@@ -158,6 +173,70 @@ def test_resume_counter_derivation_replays_diversion_structural_count(
     _status, counters = derive_resume_terminal_status_from_audit(factory, live.run_id)
 
     assert counters.rows_diverted == live.result.rows_diverted
+
+
+_CLI_COUNTERS = re.compile(r"✓(\d+) succeeded \| ✗(\d+) failed \| ⚠(\d+) quarantined")
+
+
+def _cli_counters(output: str) -> tuple[int, int, int]:
+    """The (succeeded, failed, quarantined) counters the CLI reports for the run it just finished."""
+    found = _CLI_COUNTERS.findall(output)
+    assert found, output
+    succeeded, failed, quarantined = found[-1]
+    return int(succeeded), int(failed), int(quarantined)
+
+
+@pytest.mark.parametrize("window_name", ["W1", "W3"])
+@pytest.mark.parametrize("kind_name", ["json_type", "json_drift"])
+def test_crashed_quarantine_resume_counters_match_an_uninterrupted_control(
+    kind_name: str,
+    window_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source-quarantined row crashed before its sink write resumes to the counters of a run that never crashed.
+
+    DESIGN-QR section 5. The crashed run is a REAL ``elspeth run`` crashed at the
+    sink-effect seam (W1: another sink fails first and every token is parked,
+    the 3pt shape; W3: the quarantine sink has published, its effect is not
+    finalized), then a real ``elspeth resume``; the control is the same
+    settings run once without a crash. Both the counters the CLI reports and
+    the audit-derived counters (``derive_resume_terminal_status_from_audit``)
+    must agree, fixed schema (``json_type``) and observed (``json_drift``, the
+    lane's false-SUCCESS shape) alike.
+    """
+    kind = KINDS[kind_name]
+    control_dir = tmp_path / "control"
+    control_dir.mkdir()
+    control_url = f"sqlite:///{control_dir / 'audit.db'}"
+    control_settings = write_settings(control_dir, kind, control_url)
+    control = CliRunner().invoke(app, ["run", "-s", str(control_settings), "--execute"])
+    # Exit 1 is COMPLETED_WITH_FAILURES (the quarantined row), not an error.
+    assert control.exit_code == 1, control.output
+    control_db = LandscapeDB.from_url(control_url, create_tables=False)
+
+    crashed_dir = tmp_path / "crashed"
+    crashed_dir.mkdir()
+    crashed_url = f"sqlite:///{crashed_dir / 'audit.db'}"
+    crashed_settings = write_settings(crashed_dir, kind, crashed_url)
+    window = WINDOWS[window_name]
+    crash_run(crashed_settings, crashed_url, window, process_death=False, monkeypatch=monkeypatch)
+    crashed_db = LandscapeDB.from_url(crashed_url, create_tables=False)
+    try:
+        image = assert_crash_image(crashed_dir, crashed_db, window)
+        lapse_crashed_leases(crashed_db, image.run_id, seat=False)
+        resumed = resume(crashed_settings, image.run_id)
+        assert resumed.exit_code == 1, resumed.output
+
+        control_counters = _resume_counter_snapshot_from_audit(control_db, run_id_of(control_db))
+        resumed_counters = _resume_counter_snapshot_from_audit(crashed_db, image.run_id)
+        assert resumed_counters == control_counters
+        assert control_counters["rows_quarantined"] == 1
+        assert control_counters["rows_failed"] == 1
+        assert _cli_counters(resumed.output) == _cli_counters(control.output) == (3, 1, 1)
+    finally:
+        control_db.close()
+        crashed_db.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -605,7 +684,7 @@ def test_resume_derives_rows_coalesce_failed_from_durable_audit() -> None:
 
     Engine-level rebuild (maintainer ruling 2026-08-23, WS2 controller):
     ``count_failed_coalesce_barrier_rows`` counts DISTINCT (coalesce node,
-    row_id) pairs over FAILED node_states — a PURE function of durable
+    fork group) pairs over FAILED node_states — a PURE function of durable
     state (see its own docstring, core/landscape/run_status_projection.py)
     with no concept of "before/after resume" at all; `derive_terminal_status_from_audit`
     (aliased `derive_resume_terminal_status_from_audit`) is likewise "pure
@@ -626,19 +705,29 @@ def test_resume_derives_rows_coalesce_failed_from_durable_audit() -> None:
     register_test_node(factory.data_flow, "run-adr019", "coalesce-merge_paths", node_type=NodeType.COALESCE, plugin_name="coalesce")
 
     def _fail_barrier(row_id: str, token_id: str, state_id: str, sequence: int) -> None:
-        factory.data_flow.create_row(
-            "run-adr019",
+        factory.data_flow.create_row_with_token(
             "source-0",
             0,
             {"value": 1},
             row_id=row_id,
+            coordination_token=setup.coordination_token,
             source_row_index=sequence,
             ingest_sequence=sequence,
         )
-        factory.data_flow.create_token(row_id, token_id=token_id)
-        factory.execution.begin_node_state(token_id, "coalesce-merge_paths", "run-adr019", 0, {"value": 1}, state_id=state_id)
+        # The barrier holds a branch token of the row's fork group; that group
+        # is the derive's unit, so each row's failure is its own barrier.
+        factory.data_flow.create_token(
+            row_id,
+            token_id=token_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=f"fg-{row_id}", member_key="direct_branch"),),
+            coordination_token=setup.coordination_token,
+        )
+        factory.execution.begin_node_state(
+            token_id, "coalesce-merge_paths", 0, {"value": 1}, state_id=state_id, member_token=setup.coordination_token.membership
+        )
         factory.execution.complete_node_state(
             state_id=state_id,
+            member_token=setup.coordination_token.membership,
             status=NodeStateStatus.FAILED,
             error=CoalesceFailureReason(
                 failure_reason="quorum_not_met_at_timeout",

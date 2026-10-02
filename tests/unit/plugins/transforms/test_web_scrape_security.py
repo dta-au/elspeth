@@ -19,10 +19,17 @@ import respx
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit import Call
+from elspeth.contracts.call_mode import ReplaySSRFRequest
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
+from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
 from elspeth.testing import make_pipeline_row
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 
 class _RecordedCall:
@@ -45,6 +52,8 @@ class _RecordCallRecorder:
     def __call__(
         self,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         state_id: str,
         call_index: int,
         call_type: CallType,
@@ -55,8 +64,12 @@ class _RecordCallRecorder:
         latency_ms: float | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> Call:
+        assert token_usage == UNKNOWN_TOKEN_USAGE
+        assert source_call_id is None
         kwargs = {
             "state_id": state_id,
             "call_index": call_index,
@@ -68,7 +81,8 @@ class _RecordCallRecorder:
             "latency_ms": latency_ms,
             "request_ref": request_ref,
             "response_ref": response_ref,
-            "resolved_prompt_template_hash": resolved_prompt_template_hash,
+            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
+            "token_usage": token_usage,
         }
         self.calls.append(_RecordedCall((), kwargs))
         return Call(
@@ -83,7 +97,7 @@ class _RecordCallRecorder:
             response_hash="test-response-hash" if response_data is not None else None,
             response_ref=response_ref or ("test-response-ref-hash" if response_data is not None else None),
             latency_ms=latency_ms,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
         )
 
 
@@ -92,7 +106,7 @@ class _AuditWriterDouble:
         self._call_index = 0
         self.record_call = _RecordCallRecorder()
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         call_index = self._call_index
         self._call_index += 1
         return call_index
@@ -174,6 +188,7 @@ def mock_ctx():
     """Create PluginContext with required attributes for security testing."""
     ctx = PluginContext(
         run_id="test-run-456",
+        **mock_item_audit_authority("test-run-456"),
         config={},
         landscape=_AuditWriterDouble(),
         payload_store=_PayloadStoreDouble(),
@@ -190,7 +205,9 @@ def test_ssrf_blocks_file_scheme(transform, mock_ctx):
 
     assert result.status == "error"
     assert result.reason["error_type"] == "SSRFBlockedError"
-    assert "file" in result.reason["error"].lower()
+    assert result.reason["cause"] == "forbidden_scheme"
+    # The refused URL is row data: the reason never repeats it (C3).
+    assert "/etc/passwd" not in repr(result.reason)
 
 
 def test_ssrf_blocks_private_ip(transform, mock_ctx):
@@ -200,6 +217,21 @@ def test_ssrf_blocks_private_ip(transform, mock_ctx):
 
         assert result.status == "error"
         assert result.reason["error_type"] == "SSRFBlockedError"
+        # Neither the row's host nor the address it resolved to is persisted (C3).
+        assert "internal.example.com" not in repr(result.reason)
+        assert "192.168.1.1" not in repr(result.reason)
+
+
+def test_dns_failure_reason_does_not_name_the_host(transform, mock_ctx):
+    """An unresolvable row host routes value-free: the host is row data (C3)."""
+    with patch("socket.getaddrinfo", side_effect=socket.gaierror(-2, "Name or service not known")):
+        result = transform.process(make_pipeline_row({"url": "https://sntlhost-h9.invalid/x"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "validation_failed"
+    assert result.reason["cause"] == "dns_failed"
+    assert result.reason["error"] == "the row's URL host could not be resolved"
+    assert "sntlhost" not in repr(result.reason)
 
 
 def test_ssrf_blocks_loopback(transform, mock_ctx):
@@ -221,6 +253,121 @@ def test_ssrf_blocks_cloud_metadata(transform, mock_ctx):
 
         assert result.status == "error"
         assert result.reason["error_type"] == "SSRFBlockedError"
+
+
+def test_web_scrape_replay_uses_archived_pin_without_dns(transform, mock_ctx, monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.transforms.web_scrape as web_scrape_module
+
+    url = "https://example.com/image"
+    captured: list[SSRFSafeRequest] = []
+
+    class _ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_ssrf_request(self, **_kwargs: Any) -> ReplaySSRFRequest:
+            return ReplaySSRFRequest(url, "93.184.216.34", "example.com", 443, "/image", "https", "example.com")
+
+    def _dns_forbidden(*_args: Any, **_kwargs: Any) -> object:
+        raise AssertionError("DNS validation called during replay")
+
+    monkeypatch.setattr(web_scrape_module, "validate_url_for_ssrf", _dns_forbidden)
+    response = httpx.Response(
+        200,
+        content=b"binary",
+        headers={"content-type": "image/png"},
+        request=httpx.Request("GET", "https://93.184.216.34/image"),
+    )
+
+    def _fetch(safe: SSRFSafeRequest, _ctx: object) -> tuple[httpx.Response, str, None]:
+        captured.append(safe)
+        return response, url, None
+
+    monkeypatch.setattr(transform, "_fetch_url", _fetch)
+    mock_ctx.call_mode_session = _ReplaySession()
+    mock_ctx.run_mode = RunMode.REPLAY
+    mock_ctx.replay_from = "source-run"
+    result = transform.process(make_pipeline_row({"url": url}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "non_text_content_type"
+    assert captured[0].resolved_ip == "93.184.216.34"
+
+
+@respx.mock
+def test_web_scrape_post_audits_the_sent_json_body(mock_ctx) -> None:
+    endpoint = respx.post("https://93.184.216.34:443/search").mock(
+        return_value=httpx.Response(200, text="found", headers={"content-type": "text/plain"})
+    )
+    transform = WebScrapeTransform(
+        {
+            "schema": {"mode": "observed"},
+            "url_field": "url",
+            "content_field": "content",
+            "fingerprint_field": "fingerprint",
+            "method": "POST",
+            "request_json_field": "query",
+            "format": "raw",
+            "http": {"abuse_contact": "test@example.com", "scraping_reason": "Public data search"},
+        }
+    )
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo("93.184.216.34")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query": {"term": "found"}}), mock_ctx)
+
+    assert result.status == "success"
+    assert endpoint.call_count == 1
+    calls = mock_ctx.landscape.record_call.calls
+    assert len(calls) == 1
+    request = calls[0].kwargs["request_data"].to_dict()
+    assert request["method"] == "POST"
+    assert request["json"] == {"term": "found"}
+    assert request["resolved_ip"] == "93.184.216.34"
+
+
+def test_web_scrape_post_verify_preflight_binds_body_before_dns(mock_ctx, monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.transforms.web_scrape as web_scrape_module
+
+    url = "https://example.com/search"
+    preflight: list[dict[str, Any]] = []
+
+    class _VerifySession:
+        mode = RunMode.VERIFY
+
+        def replay_ssrf_request(self, **_kwargs: Any) -> ReplaySSRFRequest:
+            return ReplaySSRFRequest(url, "93.184.216.34", "example.com", 443, "/search", "https", "example.com")
+
+        def preflight_verify_http_request(self, *, request_data: dict[str, Any], **_kwargs: Any) -> None:
+            preflight.append(request_data)
+            raise RuntimeError("stop after preflight")
+
+    def _dns_forbidden(*_args: Any, **_kwargs: Any) -> object:
+        raise AssertionError("DNS called before POST body preflight")
+
+    monkeypatch.setattr(web_scrape_module, "validate_url_for_ssrf", _dns_forbidden)
+    transform = WebScrapeTransform(
+        {
+            "schema": {"mode": "observed"},
+            "url_field": "url",
+            "content_field": "content",
+            "fingerprint_field": "fingerprint",
+            "method": "POST",
+            "request_json_field": "query",
+            "format": "raw",
+            "http": {"abuse_contact": "test@example.com", "scraping_reason": "Public data search"},
+        }
+    )
+    transform.on_start(mock_ctx)
+    mock_ctx.call_mode_session = _VerifySession()
+    mock_ctx.run_mode = RunMode.VERIFY
+    mock_ctx.replay_from = "source-run"
+
+    with pytest.raises(RuntimeError, match="stop after preflight"):
+        transform.process(make_pipeline_row({"url": url, "query": {"term": "found"}}), mock_ctx)
+
+    assert len(preflight) == 1
+    assert preflight[0]["method"] == "POST"
+    assert preflight[0]["json"] == {"term": "found"}
+    assert "resolved_ip" not in preflight[0]
 
 
 @respx.mock
@@ -406,6 +553,28 @@ class TestAllowedHostsEndToEnd:
         assert result.status == "error"
         assert result.reason["error_type"] == "SSRFBlockedError"
 
+    def test_unapproved_row_origin_refused_before_dns(self, mock_ctx):
+        transform = WebScrapeTransform(
+            {
+                "schema": {"mode": "observed"},
+                "url_field": "url",
+                "content_field": "page_content",
+                "fingerprint_field": "page_fingerprint",
+                "http": {
+                    "abuse_contact": "ops@example.com",
+                    "scraping_reason": "test",
+                    "allowed_origins": ["https://example.gov.au"],
+                },
+            }
+        )
+        transform.on_start(mock_ctx)
+        with patch("socket.getaddrinfo") as resolve:
+            result = transform.process(make_pipeline_row({"url": "https://attacker.test/search?term=private"}), mock_ctx)
+        resolve.assert_not_called()
+        assert result.status == "error"
+        assert result.reason["cause"] == "origin_not_allowed"
+        assert "attacker" not in str(result.reason)
+
     def test_cloud_metadata_blocked_with_allow_private(self, allow_private_transform, mock_ctx):
         """Cloud metadata always blocked even with allow_private."""
         with patch("socket.getaddrinfo", _mock_getaddrinfo("169.254.169.254")):
@@ -540,7 +709,6 @@ class TestRedirectAllowedRangesBehavior:
         ``fingerprint_url`` returns unchanged; this one supplies the shape
         where redaction is observable.
         """
-        import urllib.parse
 
         from elspeth.core.security.web import SSRFSafeRequest
 
@@ -635,7 +803,7 @@ class TestRedirectAllowedRangesBehavior:
             ),
             patch(
                 "elspeth.plugins.infrastructure.clients.http.validate_url_for_ssrf",
-                side_effect=SSRFBlockedError("Blocked IP range: 192.168.1.1"),
+                side_effect=SSRFBlockedError("Blocked IP range: 192.168.1.1", kind="blocked_range"),
             ),
             patch("httpx.Client") as httpx_client_factory,
         ):
@@ -672,7 +840,7 @@ class TestRedirectAllowedRangesBehavior:
             ),
             patch(
                 "elspeth.plugins.infrastructure.clients.http.validate_url_for_ssrf",
-                side_effect=SSRFBlockedError("Always-blocked IP range: 169.254.169.254"),
+                side_effect=SSRFBlockedError("Always-blocked IP range: 169.254.169.254", kind="always_blocked_range"),
             ),
             patch("httpx.Client") as httpx_client_factory,
         ):
@@ -690,14 +858,13 @@ class TestRedirectAllowedRangesBehavior:
 
 
 class TestErrorPathURLRedaction:
-    """Error paths must never embed the raw request URL (elspeth-600360c72e).
+    """Error paths never name the request URL (elspeth-600360c72e, C3).
 
-    Secret-bearing query values (sensitive-named params), userinfo, and
-    fragments must be fingerprinted/stripped eagerly at construction — the
-    executor-level scrubber passes unknown-shaped URLs verbatim, so these
-    strings persist to transform_errors / node_states / payload-store blobs
-    as built here. Mirrors blob_fetch's eager safe_url = fingerprint_url()
-    pattern and its redaction tests.
+    The URL is row data (the url_field value): it stays in the row carrier and
+    the recorded call. Every string built here persists to transform_errors /
+    node_states / payload-store blobs, so no reason and no exception message
+    may carry any part of it — not its secrets, and not its host or path
+    either. Mirrors blob_fetch's redaction tests.
     """
 
     SECRET_URL = "https://example.com/hop?sig=ERRPATH_SIG_SECRET&view=full#ERRFRAG_SECRET"
@@ -726,14 +893,11 @@ class TestErrorPathURLRedaction:
         t.on_start(mock_ctx)
         return t
 
-    def _assert_no_secrets(self, text: str) -> None:
+    def _assert_no_url(self, text: str) -> None:
         assert "ERRPATH_SIG_SECRET" not in text
         assert "ERRFRAG_SECRET" not in text
-
-    @staticmethod
-    def _assert_fingerprinted(text: str) -> None:
-        # urlencode percent-encodes the <fingerprint:...> marker inside URLs
-        assert "<fingerprint:" in urllib.parse.unquote(text)
+        assert "example.com" not in text
+        assert "/hop" not in text
 
     @respx.mock
     def test_http_status_error_reason_redacts_url_secrets(self, mock_ctx):
@@ -745,8 +909,7 @@ class TestErrorPathURLRedaction:
 
         assert result.status == "error"
         assert result.reason["error_type"] == "NotFoundError"
-        self._assert_no_secrets(repr(result.reason))
-        self._assert_fingerprinted(result.reason["error"])
+        self._assert_no_url(repr(result.reason))
 
     @respx.mock
     def test_retryable_error_message_redacts_url_secrets(self, mock_ctx):
@@ -758,8 +921,7 @@ class TestErrorPathURLRedaction:
         with patch("socket.getaddrinfo", _mock_getaddrinfo("104.18.27.120")), pytest.raises(ServerError) as exc_info:
             transform.process(make_pipeline_row({"url": self.SECRET_URL}), mock_ctx)
 
-        self._assert_no_secrets(str(exc_info.value))
-        self._assert_fingerprinted(str(exc_info.value))
+        self._assert_no_url(str(exc_info.value))
 
     @respx.mock
     def test_network_error_message_redacts_url_secrets(self, mock_ctx):
@@ -771,7 +933,7 @@ class TestErrorPathURLRedaction:
         with patch("socket.getaddrinfo", _mock_getaddrinfo("104.18.27.120")), pytest.raises(NetworkError) as exc_info:
             transform.process(make_pipeline_row({"url": self.SECRET_URL}), mock_ctx)
 
-        self._assert_no_secrets(str(exc_info.value))
+        self._assert_no_url(str(exc_info.value))
 
     @respx.mock
     def test_body_cap_error_reason_redacts_hop_url(self, mock_ctx):
@@ -786,8 +948,8 @@ class TestErrorPathURLRedaction:
 
         assert result.status == "error"
         assert result.reason["reason"] == "body_too_large"
-        self._assert_no_secrets(repr(result.reason))
-        self._assert_fingerprinted(str(result.reason["url"]))
+        self._assert_no_url(repr(result.reason))
+        assert "url" not in result.reason
 
     @respx.mock
     def test_non_text_content_type_reason_redacts_url_secrets(self, mock_ctx):
@@ -799,5 +961,5 @@ class TestErrorPathURLRedaction:
 
         assert result.status == "error"
         assert result.reason["reason"] == "non_text_content_type"
-        self._assert_no_secrets(repr(result.reason))
-        self._assert_fingerprinted(str(result.reason["url"]))
+        self._assert_no_url(repr(result.reason))
+        assert "url" not in result.reason

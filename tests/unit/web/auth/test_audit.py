@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
@@ -20,6 +21,7 @@ from elspeth.web.auth import audit as audit_module
 from elspeth.web.auth.audit import AuthAuditRecorder, classify_authentication_failure
 from elspeth.web.auth.models import AccessPending, AuthenticationError, AuthProviderUnavailable, IdentityDisabled
 from elspeth.web.auth.sso import SSO_FAILURE_CATEGORIES, SsoIdpError, SsoLoginError, SsoStateMismatch
+from elspeth.web.coordination.identity_authority import PendingIdentitiesPurged
 from elspeth.web.schema_probe import EXTERNAL_POSTGRES_POOL_KWARGS
 
 _STATE_POLICY_MATRIX = [
@@ -45,6 +47,7 @@ def _settings(deployment_target: str, state_mode: str) -> Any:
         landscape_url=landscape_url,
         session_db_url=session_url,
         landscape_passphrase=None,
+        compartment_id="alpha",
         get_landscape_url=lambda: landscape_url,
         get_session_db_url=lambda: session_url,
     )
@@ -59,6 +62,7 @@ def test_from_settings_schema_policy_follows_resolved_state_mode(
     recorder = AuthAuditRecorder.from_settings(_settings(deployment_target, state_mode))
 
     assert recorder.create_tables is expected
+    assert recorder.compartment_id == "alpha"
 
 
 def test_from_settings_external_mode_retains_raw_explicit_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -78,6 +82,15 @@ def test_direct_construction_requires_create_tables_policy() -> None:
             landscape_url="sqlite:///auth-audit.db",
             landscape_passphrase=None,
         )
+
+
+def test_recorder_reuses_one_engine_between_events(tmp_path) -> None:
+    recorder = AuthAuditRecorder(landscape_url=f"sqlite:///{tmp_path / 'reuse.db'}", landscape_passphrase=None, create_tables=True)
+    with recorder._open_landscape(audit_module.AuthAuditOperation.LOGIN_FAILURE) as first:
+        first_engine = first.engine
+    with recorder._open_landscape(audit_module.AuthAuditOperation.LOGIN_FAILURE) as second:
+        assert second.engine is first_engine
+    recorder.close()
 
 
 def test_external_recorder_open_forwards_postgres_engine_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -405,6 +418,7 @@ def test_identity_retirement_is_recorded_as_an_operator_disable_with_its_cause(m
             "cause": "credential_deleted",
             "retired_subject": "ada#retired-identity-1",
             "reason": "local credential deleted",
+            "compartment_id": None,
         },
     )
 
@@ -638,6 +652,110 @@ def _metadata(row: Any) -> dict[str, Any]:
     return json.loads(row.metadata_json)
 
 
+def test_compartment_stamped_on_paired_login_request_and_no_request_rows(tmp_path: Any) -> None:
+    url = f"sqlite:///{tmp_path / 'compartment-audit.db'}"
+    recorder = AuthAuditRecorder(landscape_url=url, landscape_passphrase=None, create_tables=True, compartment_id="alpha")
+    recorder.record_login_success_and_token_issued(
+        _request(),
+        provider="local",
+        user_id="alice",
+        username="alice",
+        access_token=_issued_token(),
+    )
+    recorder.record_identity_enabled(
+        _request(),
+        provider="local",
+        identity_id="identity-1",
+        username="alice",
+        actor_identity_id="admin-1",
+        note="returned",
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+    recorder.record_identity_retired(
+        provider="local",
+        identity_id="identity-1",
+        username="alice",
+        retired_subject="retired",
+        reason="deleted",
+    )
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == ["login", "token_issued", "identity_enabled", "identity_disabled"]
+    assert [_metadata(row)["compartment_id"] for row in rows] == ["alpha"] * 4
+
+
+def test_unconfigured_auth_audit_still_has_explicit_null_compartment(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_login_failure(_request(), provider="local", username="unknown", failure_category="invalid_credentials")
+    (row,) = _durable_rows(url)
+    assert _metadata(row)["compartment_id"] is None
+
+
+def test_auth_audit_rejects_a_caller_compartment_override() -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    repository = create_autospec(AuthAuditRepository, instance=True)
+    proxy = audit_module._CompartmentStampedAuthAudit(repository, "alpha")
+    with pytest.raises(AuditIntegrityError, match="cannot override"):
+        proxy.record_auth_event(
+            event_type="logout",
+            outcome="success",
+            provider="local",
+            user_id="alice",
+            username="alice",
+            failure_category=None,
+            request_id=None,
+            client_host=None,
+            user_agent=None,
+            metadata={"compartment_id": "foreign"},
+        )
+    repository.record_auth_event.assert_not_called()
+
+
+def test_approval_supersession_writes_cause_and_trigger_to_landscape(tmp_path: Any) -> None:
+    from datetime import UTC, datetime
+
+    from elspeth.web.coordination.approval_authority import ApprovalBinding, ApprovalRecord, ApprovalSupersession
+
+    now = datetime(2026, 9, 19, tzinfo=UTC)
+    approval = ApprovalRecord(
+        approval_id="approval-1",
+        session_id="session-1",
+        state_id="state-1",
+        binding=ApprovalBinding("config", "canonical", "manifest", "catalog", "generation", "policy"),
+        requested_by_identity_id="author",
+        approver_identity_id="addressed",
+        requested_at=now,
+        decided_at=now,
+        decision="superseded",
+        request_note="please review",
+        decision_seen_at=None,
+        decided_by_identity_id="original-decider",
+        decision_note=None,
+        revoked_by_identity_id=None,
+        revocation_actor_kind=None,
+        revocation_event_id=None,
+    )
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_approval_superseded(
+        ApprovalSupersession(
+            approval=approval,
+            provider="local",
+            actor_identity_id="rejecting-decider",
+            cause="later_rejection",
+            trigger_approval_id="approval-2",
+        )
+    )
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.identity_id, row.provider) == ("approval_decided", "rejecting-decider", "local")
+    assert {key: _metadata(row)[key] for key in ("approval_id", "decision", "cause", "trigger_approval_id")} == {
+        "approval_id": "approval-1",
+        "decision": "superseded",
+        "cause": "later_rejection",
+        "trigger_approval_id": "approval-2",
+    }
+
+
 _PROVENANCE: dict[str, object] = {"on_behalf_of": None, "console_request_id": None}
 
 
@@ -660,6 +778,7 @@ def test_activation_writes_identity_role_and_quota_rows_in_order_with_the_reques
         note="approved",
         role="user",
         role_id="role-1",
+        retained_roles=(),
         tokens_per_day=1000,
         storage_bytes=2000,
         on_behalf_of=None,
@@ -679,6 +798,74 @@ def test_activation_writes_identity_role_and_quota_rows_in_order_with_the_reques
     assert (_metadata(rows[2])["tokens_per_day"], _metadata(rows[2])["storage_bytes"]) == (1000, 2000)
 
 
+def test_pending_purge_audit_names_the_exact_deleted_rows_and_batch(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    outcome = PendingIdentitiesPurged(
+        identity_ids=("pending-1", "pending-2"),
+        batch_id="batch-1",
+        has_more=True,
+        actor_identity_id="identity-admin",
+        retention_days=90,
+        at=datetime.now(UTC),
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+
+    recorder.record_pending_identities_purged(_request(), provider="local", outcome=outcome)
+
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == ["pending_identities_purged"] * 3
+    assert [row.identity_id for row in rows] == [None, "pending-1", "pending-2"]
+    summary = _metadata(rows[0])
+    assert summary["batch_id"] == "batch-1"
+    assert summary["deleted_count"] == 2
+    assert summary["deleted_identity_ids"] == ["pending-1", "pending-2"]
+    assert summary["has_more"] is True
+    assert all(_metadata(row)["retention_days"] == 90 for row in rows)
+
+
+def test_an_activation_that_granted_nothing_records_the_access_the_identity_kept(tmp_path: Any) -> None:
+    """R9 made "no ``role_granted`` row" stop meaning "no role".
+
+    A dormancy re-pend leaves an identity's grants standing, so an
+    administrator re-admitting it with ``role="none"`` writes only the
+    ``identity_activated`` row while the person comes back a deployment
+    administrator. Without ``retained_roles`` on that row the trail reads as
+    an admission with no authority, and the database contradicts it.
+
+    The roles go in the metadata rather than into ``role_granted`` rows of
+    their own: such a row asserts a grant, and each of these already has one
+    from the day it was actually made.
+    """
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_activated(
+        _request(),
+        provider="oidc",
+        identity_id="identity-1",
+        username="ada",
+        actor_identity_id="identity-admin",
+        cause="admin_activation",
+        note="back from long service leave",
+        role=None,
+        role_id=None,
+        retained_roles=(("admin", None), ("reviewer", "compartment-7")),
+        tokens_per_day=None,
+        storage_bytes=None,
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+    rows = _durable_rows(url)
+    # One row only: nothing was granted and no allowance was written, so
+    # neither sub-row may claim otherwise.
+    assert [row.event_type for row in rows] == ["identity_activated"]
+    # Each with its scope: a deployment-wide ``admin`` and a scoped grant
+    # are different authorities, and only the first is admin authority.
+    assert _metadata(rows[0])["retained_roles"] == [
+        {"role": "admin", "scope": None},
+        {"role": "reviewer", "scope": "compartment-7"},
+    ]
+
+
 def test_a_request_less_bootstrap_activation_writes_null_request_columns_and_an_operator_actor(tmp_path: Any) -> None:
     recorder, url = _durable_recorder(tmp_path)
     recorder.record_identity_activated(
@@ -691,6 +878,7 @@ def test_a_request_less_bootstrap_activation_writes_null_request_columns_and_an_
         note="seed",
         role="admin",
         role_id="role-1",
+        retained_roles=(),
         tokens_per_day=None,
         storage_bytes=None,
         on_behalf_of=None,
@@ -839,7 +1027,7 @@ def test_logout_writes_a_request_bound_row(tmp_path: Any) -> None:
         "ada",
     )
     assert (row.request_id, row.client_host, row.user_agent) == ("request-id", "127.0.0.1", "bounded-agent")
-    assert _metadata(row) == {"method": "POST", "path": "/api/auth/login"}
+    assert _metadata(row) == {"method": "POST", "path": "/api/auth/login", "compartment_id": None}
 
 
 def test_an_admin_mutation_audit_failure_propagates_and_is_logged_by_operation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -877,6 +1065,7 @@ def test_an_admin_mutation_audit_failure_propagates_and_is_logged_by_operation(m
             note="seed",
             role=None,
             role_id=None,
+            retained_roles=(),
             tokens_per_day=None,
             storage_bytes=None,
             on_behalf_of=None,
@@ -888,3 +1077,320 @@ def test_an_admin_mutation_audit_failure_propagates_and_is_logged_by_operation(m
     operation_value = operation.value if isinstance(operation, audit_module.AuthAuditOperation) else operation
     assert operation_value == "identity_activated"
     assert "RAW_SQL_MARKER" not in repr(logs)
+
+
+# ── R9 dormancy: the re-pend and D34's exemption ─────────────────────────
+
+
+def test_dormancy_re_pend_is_recorded_as_a_system_disable_naming_the_state_it_reached(tmp_path: Any) -> None:
+    """The re-pend row: ``identity_disabled`` with ``cause=dormant`` and the state spelled out.
+
+    The event vocabulary is closed and its CHECK is hand-written, so a
+    fourteenth value would cost a Landscape epoch bump. ``cause`` already
+    distinguishes a retirement from a rebound; ``state`` is what stops a
+    reader having to infer ``pending`` from an event type that says
+    ``disabled``.
+    """
+    from datetime import UTC, datetime
+
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_dormant(
+        provider="oidc",
+        identity_id="identity-1",
+        username="ada",
+        last_login_at=datetime(2026, 1, 1, tzinfo=UTC),
+        dormancy_days=90,
+    )
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.outcome) == ("identity_disabled", "success")
+    # Not request-bound: the authority acted, not a request.
+    assert row.request_id is None and row.client_host is None and row.user_agent is None
+    metadata = _metadata(row)
+    assert metadata["actor"] == "system"
+    assert metadata["cause"] == "dormant"
+    assert metadata["state"] == "pending"
+    # Both numbers: the login the window was measured from -- which the
+    # identity row no longer holds -- and the window in force when it tripped.
+    assert metadata["last_login_at"] == "2026-01-01T00:00:00+00:00"
+    assert metadata["dormancy_days"] == 90
+
+
+def test_the_dormancy_exemption_row_says_the_disable_did_not_happen(tmp_path: Any) -> None:
+    """D34's row, and the one assertion that keeps it from lying.
+
+    The identity was NOT re-pended. ``outcome='failure'`` on the event type
+    the re-pend would have written is what says so, so a reader keying on
+    ``(event_type, outcome)`` cannot read this as a disable -- and it is the
+    only evidence the exemption fired at all, because an exemption changes
+    nothing on the identity.
+    """
+    from datetime import UTC, datetime
+
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_dormancy_exempted(
+        provider="oidc",
+        identity_id="identity-1",
+        username="root",
+        last_login_at=datetime(2026, 1, 1, tzinfo=UTC),
+        dormancy_days=90,
+    )
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.outcome) == ("identity_disabled", "failure")
+    assert row.failure_category == "dormancy_last_admin_exempt"
+    metadata = _metadata(row)
+    assert metadata["actor"] == "system"
+    assert metadata["cause"] == "dormant"
+    assert metadata["exemption"] == "last_active_human_admin"
+    assert metadata["last_login_at"] == "2026-01-01T00:00:00+00:00"
+    assert metadata["dormancy_days"] == 90
+
+
+def test_the_two_dormancy_rows_are_distinguishable_from_each_other_and_from_a_rebound(tmp_path: Any) -> None:
+    """Three ``identity_disabled`` rows, three different meanings, one query away.
+
+    All three take the same event type because the vocabulary is closed. What
+    an administrator reads them by is ``(outcome, metadata.cause)``, and this
+    is the test that fails if a later edit collapses them.
+    """
+    from datetime import UTC, datetime
+
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_rebound(
+        provider="oidc",
+        identity_id="identity-1",
+        username="ada",
+        previous_email="ada@old.example",
+        current_email="ada@new.example",
+    )
+    recorder.record_identity_dormant(
+        provider="oidc",
+        identity_id="identity-2",
+        username="bob",
+        last_login_at=datetime(2026, 1, 1, tzinfo=UTC),
+        dormancy_days=90,
+    )
+    recorder.record_identity_dormancy_exempted(
+        provider="oidc",
+        identity_id="identity-3",
+        username="root",
+        last_login_at=datetime(2026, 1, 1, tzinfo=UTC),
+        dormancy_days=90,
+    )
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == ["identity_disabled"] * 3
+    assert [(row.outcome, _metadata(row)["cause"]) for row in rows] == [
+        ("success", "rebound"),
+        ("success", "dormant"),
+        ("failure", "dormant"),
+    ]
+
+
+def test_quota_exceeded_row_carries_dimension_cap_ceiling_and_usage(tmp_path: Any) -> None:
+    """R14 (spec :834, :1297): the row names the dimension, the cap, the ceiling in force and the measured usage.
+
+    Read from the LANDSCAPE engine: ``auth_events`` is a Landscape table
+    (core/landscape/schema.py:2542), never a sessions table.
+    """
+    from elspeth.web.coordination.quota_authority import QuotaExceeded
+
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_quota_exceeded(
+        QuotaExceeded(
+            identity_id="identity-1",
+            provider="local",
+            operation="composer",
+            dimension="tokens",
+            cap=1000,
+            ceiling=5000,
+            usage=1000,
+            identity_policy_id="quota-identity",
+            container_policy_id="quota-container",
+        )
+    )
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.outcome, row.provider, row.identity_id, row.failure_category) == (
+        "quota_exceeded",
+        "failure",
+        "local",
+        "identity-1",
+        "quota_exceeded_tokens",
+    )
+    assert (row.user_id, row.username, row.request_id, row.client_host, row.user_agent) == (None, None, None, None, None)
+    assert _metadata(row) == {
+        "actor": "system",
+        "operation": "composer",
+        "dimension": "tokens",
+        "cap": 1000,
+        "ceiling": 5000,
+        "usage": 1000,
+        "identity_policy_id": "quota-identity",
+        "container_policy_id": "quota-container",
+        "compartment_id": None,
+    }
+
+
+def test_storage_quota_exceeded_row_names_storage_and_measured_usage(tmp_path: Any) -> None:
+    from elspeth.web.coordination.quota_authority import QuotaExceeded
+
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_quota_exceeded(
+        QuotaExceeded(
+            identity_id="identity-1",
+            provider="oidc",
+            operation="session_fork",
+            dimension="storage",
+            cap=100,
+            ceiling=None,
+            usage=90,
+            identity_policy_id="storage-identity",
+            container_policy_id=None,
+        )
+    )
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.outcome, row.provider, row.identity_id, row.failure_category) == (
+        "quota_exceeded",
+        "failure",
+        "oidc",
+        "identity-1",
+        "quota_exceeded_storage",
+    )
+    assert _metadata(row) == {
+        "actor": "system",
+        "operation": "session_fork",
+        "dimension": "storage",
+        "cap": 100,
+        "ceiling": None,
+        "usage": 90,
+        "identity_policy_id": "storage-identity",
+        "container_policy_id": None,
+        "compartment_id": None,
+    }
+
+
+def test_review_rows_anchor_on_actor_and_identify_authorizing_request(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_review_requested(
+        _request(),
+        provider="local",
+        request_id="req-1",
+        session_id="sess-1",
+        state_id="state-1",
+        requested_by_identity_id="alice",
+        reviewer_identity_id="bob",
+        note="please look",
+    )
+    recorder.record_review_request_cancelled(
+        None,
+        provider="local",
+        request_id="req-1",
+        session_id="sess-1",
+        state_id="state-1",
+        requested_by_identity_id="alice",
+    )
+    recorder.record_review_attested(
+        _request(),
+        provider="local",
+        attestation_id="att-1",
+        authorizing_request_id="req-2",
+        session_id="sess-1",
+        state_id="state-1",
+        payload_digest="sha256:" + "ab" * 32,
+        reviewer_identity_id="bob",
+        author_identity_id="alice",
+        verdict="changes_requested",
+        note="rename the sink",
+    )
+
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == ["review_requested", "review_request_cancelled", "review_attested"]
+    assert [row.identity_id for row in rows] == ["alice", "alice", "bob"]
+    assert all((row.outcome, row.provider, row.user_id, row.username) == ("success", "local", None, None) for row in rows)
+    assert (rows[0].request_id, rows[0].client_host, rows[0].user_agent) == ("request-id", "127.0.0.1", "bounded-agent")
+    assert (rows[1].request_id, rows[1].client_host, rows[1].user_agent) == (None, None, None)
+    requested, cancelled, attested = (_metadata(row) for row in rows)
+    assert (requested["actor"], requested["request_id"], requested["session_id"], requested["state_id"]) == (
+        "alice",
+        "req-1",
+        "sess-1",
+        "state-1",
+    )
+    assert (requested["reviewer_identity_id"], requested["note"]) == ("bob", "please look")
+    assert (cancelled["actor"], cancelled["request_id"]) == ("alice", "req-1")
+    assert (
+        attested["actor"],
+        attested["attestation_id"],
+        attested["authorizing_request_id"],
+        attested["author_identity_id"],
+        attested["verdict"],
+        attested["note"],
+    ) == ("bob", "att-1", "req-2", "alice", "changes_requested", "rename the sink")
+    assert (attested["session_id"], attested["state_id"], attested["payload_digest"]) == (
+        "sess-1",
+        "state-1",
+        "sha256:" + "ab" * 32,
+    )
+    assert all({key: _metadata(row)[key] for key in _PROVENANCE} == _PROVENANCE for row in rows)
+
+
+def test_library_rows_anchor_on_publisher_and_keep_source_compartment_distinct(tmp_path: Any) -> None:
+    url = f"sqlite:///{tmp_path / 'library-audit.db'}"
+    recorder = AuthAuditRecorder(landscape_url=url, landscape_passphrase=None, create_tables=True, compartment_id="audit-alpha")
+    recorder.record_library_published(
+        _request(),
+        provider="oidc",
+        entry_id="entry-1",
+        publisher_identity_id="alice",
+        actor_identity_id="alice",
+        payload_digest="a" * 64,
+        entry_compartment_id="source-beta",
+        title="classify tickets",
+        version=1,
+        published_from_session_id="session-1",
+    )
+    curation = {
+        "entry_id": "entry-1",
+        "publisher_identity_id": "alice",
+        "actor_identity_id": "carol",
+        "payload_digest": "a" * 64,
+        "entry_compartment_id": "source-beta",
+    }
+    recorder.record_library_accepted(_request(), provider="oidc", note=None, **curation)
+    recorder.record_library_rejected(None, provider="oidc", note="x" * 4096, **curation)
+    recorder.record_library_deprecated(_request(), provider="oidc", note="superseded", **curation)
+    recorder.record_library_recalled(_request(), provider="oidc", note=None, **curation)
+
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == [
+        "library_published",
+        "library_accepted",
+        "library_rejected",
+        "library_deprecated",
+        "library_recalled",
+    ]
+    assert all(
+        (row.outcome, row.provider, row.identity_id, row.user_id, row.username) == ("success", "oidc", "alice", None, None) for row in rows
+    )
+    metadata = [_metadata(row) for row in rows]
+    assert [(item["actor"], item["entry_compartment_id"], item["compartment_id"]) for item in metadata] == [
+        ("alice", "source-beta", "audit-alpha"),
+        ("carol", "source-beta", "audit-alpha"),
+        ("carol", "source-beta", "audit-alpha"),
+        ("carol", "source-beta", "audit-alpha"),
+        ("carol", "source-beta", "audit-alpha"),
+    ]
+    assert (
+        metadata[0]["entry_id"],
+        metadata[0]["payload_digest"],
+        metadata[0]["title"],
+        metadata[0]["version"],
+        metadata[0]["published_from_session_id"],
+    ) == (
+        "entry-1",
+        "a" * 64,
+        "classify tickets",
+        1,
+        "session-1",
+    )
+    assert [item["note"] for item in metadata[1:]] == [None, "x" * 512, "superseded", None]
+    assert rows[2].request_id is None
+    assert all({key: item[key] for key in _PROVENANCE} == _PROVENANCE for item in metadata)

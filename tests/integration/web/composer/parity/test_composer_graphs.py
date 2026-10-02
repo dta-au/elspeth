@@ -167,9 +167,9 @@ def test_source_and_output_paths_reduce_to_basename() -> None:
 def test_effective_options_drops_explicit_plugin_defaults() -> None:
     """A plugin default made explicit on one side is effective-equal to its absence.
 
-    The guided stage protocol persists the full ``model_dump`` (every default
-    explicit); ``set_pipeline`` persists authored-minimal options. Locking this
-    direction protects the comparator contract: csv
+    Some authoring paths persist the full ``model_dump`` (every default
+    explicit), while ``set_pipeline`` persists authored-minimal options.
+    Locking this direction protects the comparator contract: csv
     ``delimiter``/``encoding`` and json ``encoding`` at their model defaults must
     not break isomorphism against a side that omits them.
     """
@@ -301,13 +301,9 @@ def test_gate_and_coalesce_failure_policy_route_vs_discard_is_detected(node_inde
 def test_absent_and_none_on_error_are_equivalent() -> None:
     """An absent on_error is the identical terminal policy as an explicit None.
 
-    The guided-staged stage protocol persists the full pydantic ``model_dump``
-    (``on_error`` explicit, ``None`` for a gate/coalesce), while ``set_pipeline``
-    persists authored-minimal options (``on_error`` omitted entirely). Both are
-    the same "no error routing" terminal, so now that on_error is compared for
-    every non-queue node it must normalize absent == None — otherwise the
-    guided-staged column would false-FAIL against the freeform/guided-full
-    columns on the structural gate/coalesce nodes.
+    Pydantic ``model_dump`` makes ``on_error`` explicit as ``None`` for a
+    gate/coalesce, while authored-minimal options omit it. Both mean the same
+    terminal policy, so the comparator normalizes absent and ``None``.
     """
     left = _fork_state()  # gate + coalesce carry an explicit on_error: None
     right = copy.deepcopy(left)

@@ -40,7 +40,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.protocol import (
     PIPELINE_STAGED_AUTO_COMMIT_MESSAGE,
     PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE,
@@ -104,6 +104,8 @@ def _red_result() -> ValidationResult:
             completion_ready=False,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
+                    note=None,
                     code="graph_structure",
                     component_id="map_node",
                     component_type="transform",
@@ -131,6 +133,8 @@ def _pending_review_result() -> ValidationResult:
             completion_ready=True,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
+                    note=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="map_node",
                     component_type="transform",
@@ -176,12 +180,8 @@ def _plan(candidate_state: CompositionState | None) -> PipelinePlanResult:
     proposal = PipelineProposal.create(
         pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
     return PipelinePlanResult(
         proposal=proposal,
@@ -215,17 +215,17 @@ async def _stage(
     state = _empty_state()
 
     if isinstance(preflight, BaseException):
-        preflight_mock = AsyncMock(spec=service._cached_runtime_preflight, side_effect=preflight)
+        preflight_mock = AsyncMock(spec=service._preflight.cached_runtime_preflight, side_effect=preflight)
     else:
-        preflight_mock = AsyncMock(spec=service._cached_runtime_preflight, return_value=preflight)
+        preflight_mock = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=preflight)
 
     with (
-        patch.object(service, "_sessions_service", sessions),
-        patch.object(service, "_persist_pipeline_planner_audit", new_callable=AsyncMock),
-        patch.object(service, "_cached_runtime_preflight", preflight_mock),
+        patch.object(service._planning_application, "_sessions_service_optional", sessions),
+        patch.object(service._planning_application, "_persist_pipeline_planner_audit", new_callable=AsyncMock),
+        patch.object(service._preflight, "cached_runtime_preflight", preflight_mock),
     ):
         staged_session_id = uuid4()
-        result = await service._stage_pipeline_plan(
+        result = await service._planning_application._stage_pipeline_plan(
             plan=_plan(candidate_state),
             state=state,
             session_id=staged_session_id,
@@ -238,6 +238,7 @@ async def _stage(
             planner_llm_calls=(),
             planner_attempts=(),
             planner_invocations=(),
+            planner_withheld_replies=(),
             plugin_snapshot=None,
         )
     return result, sessions

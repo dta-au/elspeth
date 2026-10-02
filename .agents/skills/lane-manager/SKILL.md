@@ -114,7 +114,7 @@ with the **full suite** passing:
 
 1. **RED** — base commit + only the lane's test files: the test command must
    FAIL AT AN ASSERTION, as recorded by the RUNNER. `verify` launches pytest
-   with prove-it's `prove_it_red_plugin` (`-p`), which records every
+   with lane-manager's `lane_red_plugin` (`-p`), which records every
    call-phase report whose outcome is `failed`; RED means that report carried
    a `pytest.fail` or an `AssertionError` raised in a test file. An xfail is
    reported skipped and never counts; an assert inside production code is a

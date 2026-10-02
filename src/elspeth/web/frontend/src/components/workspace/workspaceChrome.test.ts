@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 // Structural contracts for the workspace chrome — the pane seam, the bottom
-// action bar and the inspector drawer — from the 2026-08-14 professionalisation
+// action bar — from the 2026-08-14 professionalisation
 // review.
 //
 // These are deliberately NOT "the file contains this string" tests. Each one
@@ -13,7 +13,7 @@ import { describe, expect, it } from "vitest";
 // drifted apart: the drawer's width against the strip the pane reserved for it,
 // the bar's outer gap against the gaps inside its groups, the authoring-side
 // band against the action bar it has to meet across the divider. A single
-// declaration read back as text would have passed while all three were broken.
+// declaration read back as text would have passed while the relationships were broken.
 //
 // cwd-relative per the tokenReferences.test.ts idiom; vitest runs from the
 // frontend root.
@@ -72,106 +72,11 @@ function declaration(selector: string, property: string): string {
   return declarations[0];
 }
 
-describe("workspace inspector drawer (elspeth-4e54200207)", () => {
-  it("reserves the drawer's strip from the same measure the drawer is drawn at", () => {
-    // The drawer used to be an absolutely-positioned overlay spanning the full
-    // workspace height with no scrim and nothing on the artifact side
-    // reserving for it, so it sliced the primary action's box mid-word and hid
-    // "Focus Graph" entirely — over controls that stayed live and clickable.
-    // The reserve is only correct while it is the SAME measure as the drawer,
-    // so read both out of the stylesheet and compare rather than pinning 512px
-    // twice.
-    expect(declaration(".workspace-inspector", "width")).toBe(
-      "min(var(--workspace-inspector-width), 100%)",
-    );
-
-    // Exactly one occupant reserves: the artifact pane. The drawer occupies
-    // the pane row only (below), so the bottom bar's artifact cell runs its
-    // full width beneath the drawer and must NOT reserve — while it did
-    // (elspeth-b4e88f0f8c) the bar wrapped to three or four lines under an
-    // open drawer at every width up to 1600, and the whole bar row paid for
-    // that wrap in height.
-    const reserve = rules.filter((rule) =>
-      rule.selector.includes(".workspace-inspector:not([hidden])"),
-    );
-    expect(reserve).toHaveLength(1);
-    const reserveTargets = reserve[0].selector.split(",").map((selector) => {
-      const compounds = selector.trim().split(/\s+/);
-      return compounds[compounds.length - 1];
-    });
-    expect(reserveTargets).toEqual([".workspace-artifact-pane"]);
-    expect(reserve[0].declarations).toContain(
-      "padding-right: var(--workspace-inspector-width);",
-    );
-
-    // Narrow mode moves the slot to the full width and the drawer becomes the
-    // view, so the reserve must not apply there.
-    expect(reserve[0].selector).toContain(':not([data-layout-mode="narrow"])');
-  });
-
-  it("confines the drawer to the pane row and leaves the bottom bar beneath it (elspeth-b4e88f0f8c)", () => {
-    // The slot is a grid item in the artifact cell of the PANE row, not an
-    // absolutely-positioned box spanning the workspace — that is what keeps
-    // the drawer off the bar row. position: relative is load-bearing: the
-    // drawer inside is inset: 0 0 0 auto, and without a positioned slot that
-    // would resolve against the workspace root and span both rows again.
-    const slot = ".workspace-inspector-slot";
-    expect(declaration(slot, "position")).toBe("relative");
-    expect(declaration(slot, "grid-row")).toBe("1");
-    expect(declaration(slot, "grid-column")).toBe("2");
-    expect(ruleFor(slot)).not.toMatch(/(?:^|;)\s*(?:inset|top|bottom|left|right):/);
-    expect(declaration(".workspace-inspector", "inset")).toBe("0 0 0 auto");
-
-    // The collapsed state needs no override: column 1 is 0px wide then, so
-    // the artifact cell already starts at x=0. Narrow mode spans every row
-    // because there the drawer IS the view.
-    expect(
-      rules.some(
-        (rule) =>
-          rule.selector.includes('[data-authoring-collapsed="true"]') &&
-          rule.selector.includes(slot),
-      ),
-    ).toBe(false);
-    const narrowSlot = `.composer-workspace[data-layout-mode="narrow"] ${slot}`;
-    expect(declaration(narrowSlot, "grid-row")).toBe("1 / -1");
-    expect(declaration(narrowSlot, "grid-column")).toBe("1");
-  });
-
-  it("compresses the drawer band with the shared workspace band token", () => {
-    // elspeth-7bd392c0dc: the bands were hard-built from 8px padding plus a
-    // 36px control, so the density regime compressed the artifact toolbar
-    // beside them to 45px while they stayed at 53. Same construction as
-    // .artifact-workspace-toolbar: height from the token, no vertical padding.
-    const bands = ".workspace-inspector-header";
-    expect(declaration(bands, "min-height")).toBe(
-      declaration(".artifact-workspace-toolbar", "min-height"),
-    );
-    expect(declaration(bands, "padding")).toBe(
-      declaration(".artifact-workspace-toolbar", "padding"),
-    );
-  });
-
-  it("keeps the inspector title on the type scale with no UA margins (elspeth-3e23bed130)", () => {
-    // The title was the app's only bare <h2> — UA 24px with 19.92px block
-    // margins, inflating the header band to 93px against the 45px artifact
-    // toolbar one seam away. The band's height must stay owned by
-    // --size-workspace-band, so the title contributes no margins and sits on
-    // the product type scale (the .graph-modal-header h2 recipe, common.css).
-    expect(declaration(".workspace-inspector-header h2", "margin")).toBe("0");
-    expect(declaration(".workspace-inspector-header h2", "font-size")).toBe(
-      "var(--font-size-lg)",
-    );
-    expect(declaration(".workspace-inspector-header h2", "line-height")).toBe(
-      "var(--line-height-heading)",
-    );
-  });
-});
-
 describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
   // Every gap in the bar has to move together. Lowering only the bar's own gap
   // left the group BOUNDARIES at 4px while the gaps INSIDE the status and
   // completion groups stayed at 8px, so the eye bonded "Audit N issues" to
-  // "Save for review" at exactly the viewport where the bar is most crowded.
+  // "Share inspect link" at exactly the viewport where the bar is most crowded.
   const gapBearingSelectors = [
     ".workspace-action-bar",
     ".workspace-action-bar .completion-bar",
@@ -292,8 +197,8 @@ describe("workspace completion group (recut 2026-08-15, supersedes elspeth-c6fd7
   });
 
   it("keeps the bar's composition stable when the middle group is absent", () => {
-    // space-between would change the arrangement depending on whether guided
-    // mode rendered a completion bar. flex-start keeps status and the
+    // space-between would change the arrangement depending on whether a
+    // completion bar rendered. flex-start keeps status and the
     // Save/Import cluster as one left-anchored run; the completion group's
     // own grow and its flexible column (above) are what hold the right edge,
     // and they do it identically whether or not the status cluster renders.
@@ -364,13 +269,6 @@ describe("workspace stacking order (elspeth-cf4b08e271)", () => {
     );
   });
 
-  it("puts the drawer's slot no lower than the panel controls it must cover", () => {
-    // The slot is the LAST child of .composer-workspace, so an equal rung is
-    // resolved in its favour by tree order; a LOWER rung is the filed bug.
-    expect(declaration(".workspace-inspector-slot", "z-index")).toBe(
-      "var(--z-panel-controls)",
-    );
-  });
 });
 
 describe("workspace bottom edge (elspeth-215c989bed, elspeth-9c94a58500)", () => {
@@ -453,9 +351,7 @@ describe("workspace bottom edge (elspeth-215c989bed, elspeth-9c94a58500)", () =>
     // density regime's --workspace-bar-inset override would tighten it twice.
     // The bar's padding and the control's margin are the only two carriers
     // (both pinned to the token in the rhythm describe above); neither the
-    // wrapper nor the artifact cell has any — the cell no longer reserves for
-    // the inspector drawer either (elspeth-b4e88f0f8c), so no rule anywhere
-    // pads it.
+    // wrapper nor the artifact cell has any, so no rule pads it.
     expect(ruleFor(slot)).not.toMatch(/(?:^|;)\s*padding[a-z-]*:/);
     expect(
       rules
@@ -541,11 +437,4 @@ describe("artifact column gutter (elspeth-87195dda2c)", () => {
     expect(declaration(selector, property)).toBe(expected);
   });
 
-  it("keeps the inspector band on the same inline inset as the toolbar", () => {
-    // Already pinned pairwise by the band-height test above; restated on the
-    // gutter axis so a band that leaves the gutter is named by THIS failure.
-    expect(
-      declaration(".workspace-inspector-header", "padding"),
-    ).toBe(declaration(".artifact-workspace-toolbar", "padding"));
-  });
 });

@@ -90,8 +90,6 @@ def execution_counters(draw: st.DrawFn) -> ExecutionCounters:
     Pure-engine accumulation strategy. ADR-019 subset invariants still apply
     even for non-terminal ``RunResult`` snapshots, so routed/quarantine
     provenance counters are drawn beneath their lifecycle parent counters.
-    Tests that construct a validated COMPLETED / COMPLETED_WITH_FAILURES /
-    EMPTY shape must use ``completed_row_counter_shapes`` instead.
     """
     rows_succeeded = draw(counter_values)
     rows_failed = draw(counter_values)
@@ -105,54 +103,12 @@ def execution_counters(draw: st.DrawFn) -> ExecutionCounters:
         rows_forked=draw(counter_values),
         rows_coalesced=draw(counter_values),
         rows_coalesce_failed=draw(counter_values),
+        collector_groups_failed=draw(counter_values),
         rows_expanded=draw(counter_values),
         rows_buffered=draw(counter_values),
         rows_diverted=draw(counter_values),
         routed_destinations=Counter(draw(routed_dests)),
     )
-
-
-@st.composite
-def completed_row_counter_shapes(draw: st.DrawFn) -> dict[str, int]:
-    """Counters valid for COMPLETED / completed API response construction.
-
-    elspeth-5069612f3c — for property tests that construct a validated
-    terminal model (``RunResult(status=COMPLETED...)``, ``CompletedData``, or
-    ``RunStatusResponse``).
-    Drawing ``rows_routed_success`` / ``rows_routed_failure`` independently
-    is forbidden in those paths because ``rows_processed < sum_terminal``
-    can crash the harness at model construction.  This composite ensures
-    ``rows_processed >= sum_terminal`` is true by construction so the
-    property body — not the harness — is the unit under test.
-
-    A property that needs ``COMPLETED`` specifically should add an
-    ``assume(shape['rows_succeeded'] > 0 or shape['rows_routed_success'] > 0)``
-    guard or draw at least one success indicator as positive.  A property
-    that needs ``FAILED`` should leave success indicators zero and draw a
-    failure indicator positive.  Do NOT rely on Pydantic constructor
-    crashes as a Hypothesis filter.
-    """
-    rows_succeeded = draw(st.integers(min_value=0, max_value=10))
-    rows_failed = draw(st.integers(min_value=0, max_value=10))
-    rows_routed_success = draw(st.integers(min_value=0, max_value=rows_succeeded))
-    rows_routed_failure = draw(st.integers(min_value=0, max_value=rows_failed))
-    rows_quarantined = draw(st.integers(min_value=0, max_value=rows_failed))
-    rows_diverted = draw(st.integers(min_value=0, max_value=10))
-    rows_coalesce_failed = draw(st.integers(min_value=0, max_value=10))
-    terminal_sum = (
-        rows_succeeded + rows_failed + rows_routed_success + rows_routed_failure + rows_quarantined + rows_diverted + rows_coalesce_failed
-    )
-    rows_processed = draw(st.integers(min_value=terminal_sum, max_value=terminal_sum + 10))
-    return {
-        "rows_processed": rows_processed,
-        "rows_succeeded": rows_succeeded,
-        "rows_failed": rows_failed,
-        "rows_routed_success": rows_routed_success,
-        "rows_routed_failure": rows_routed_failure,
-        "rows_quarantined": rows_quarantined,
-        "rows_diverted": rows_diverted,
-        "rows_coalesce_failed": rows_coalesce_failed,
-    }
 
 
 def _make_token(*, branch_name: str | None = None) -> TokenInfo:
@@ -208,6 +164,8 @@ def _make_row_result(
         path=path,
         sink_name=sink_name,
         error=error,  # type: ignore[arg-type]
+        # A real sink-bound result always carries its durable PENDING_SINK handoff.
+        scheduler_pending_sink=sink_name is not None,
         join_group_id=join_group_id,
     )
 
@@ -491,6 +449,7 @@ class TestAccumulateFlushResultProperties:
             rows_forked=counters.rows_forked,
             rows_coalesced=counters.rows_coalesced,
             rows_coalesce_failed=counters.rows_coalesce_failed,
+            collector_groups_failed=counters.collector_groups_failed,
             rows_expanded=counters.rows_expanded,
             rows_buffered=counters.rows_buffered,
             rows_diverted=counters.rows_diverted,
@@ -510,6 +469,7 @@ class TestAccumulateFlushResultProperties:
             rows_forked=counters.rows_forked,
             rows_coalesced=counters.rows_coalesced,
             rows_coalesce_failed=counters.rows_coalesce_failed,
+            collector_groups_failed=counters.collector_groups_failed,
             rows_expanded=counters.rows_expanded,
             rows_buffered=counters.rows_buffered,
             rows_diverted=counters.rows_diverted,
@@ -839,6 +799,7 @@ class TestRunResultFieldProperties:
         assert result.rows_forked == 0
         assert result.rows_coalesced == 0
         assert result.rows_coalesce_failed == 0
+        assert result.collector_groups_failed == 0
         assert result.rows_expanded == 0
         assert result.rows_buffered == 0
         assert result.rows_diverted == 0
@@ -866,6 +827,7 @@ class TestRunResultFieldProperties:
             ("rows_forked", result.rows_forked, counters.rows_forked),
             ("rows_coalesced", result.rows_coalesced, counters.rows_coalesced),
             ("rows_coalesce_failed", result.rows_coalesce_failed, counters.rows_coalesce_failed),
+            ("collector_groups_failed", result.collector_groups_failed, counters.collector_groups_failed),
             ("rows_expanded", result.rows_expanded, counters.rows_expanded),
             ("rows_buffered", result.rows_buffered, counters.rows_buffered),
             ("rows_diverted", result.rows_diverted, counters.rows_diverted),

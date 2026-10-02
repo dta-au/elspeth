@@ -54,7 +54,9 @@ TERMINATE_OWN_ROLE_BACKENDS_SQL: Final = (
 FENCE_EPOCH_SQL: Final = "SELECT operation_epoch FROM session_operation_fences WHERE session_id = :session_id"
 FENCE_OWNER_SQL: Final = "SELECT owner_instance_id FROM session_operation_fences WHERE session_id = :session_id"
 DATABASE_NOW_SQL: Final = "SELECT clock_timestamp()"
-GUIDED_OPERATIONS_SINCE_SQL: Final = "SELECT count(*) FROM guided_operations WHERE session_id = :session_id AND created_at >= :since"
+MESSAGE_INGRESS_RECEIPT_ROWS_SQL: Final = (
+    "SELECT count(*) FROM message_ingress_receipts WHERE session_id = :session_id AND client_request_id = :client_request_id"
+)
 RUN_IDS_SQL: Final = "SELECT id FROM runs WHERE session_id = :session_id ORDER BY id"
 LANDSCAPE_RUN_IDS_OF_SESSION_SQL: Final = (
     "SELECT landscape_run_id FROM runs WHERE session_id = :session_id AND landscape_run_id IS NOT NULL"
@@ -270,24 +272,19 @@ class SqlReader(ABC):
 class PostgresEvidenceObserver(EvidenceObserver):
     """The database facts the probes score, read through the runtime's own PostgreSQL databases.
 
-    ``guided_operation_rows(session, since_epoch=e)`` counts the rows created
-    since the database clock reading taken by the ``fence_epoch`` call that
-    returned ``e`` (the driver reads the epoch immediately before firing a
-    trial and again after), so each trial counts its own rows and the database
-    clock, not the driver's, sets the window.
+    P1 counts the append-only freeform ingress receipt for the trial's exact
+    ``client_request_id``. The sessions store enforces one receipt per
+    ``(session_id, client_request_id)`` without a timestamp window.
     """
 
     def __init__(self, *, sessions: SqlReader, landscape: SqlReader) -> None:
         self._sessions = sessions
         self._landscape = landscape
-        self._marks: dict[tuple[str, int], datetime] = {}
 
     def fence_epoch(self, session_id: str) -> int:
         epoch = self._sessions.scalar(FENCE_EPOCH_SQL, session_id=session_id)
-        now = self._sessions.scalar(DATABASE_NOW_SQL)
-        if type(epoch) is not int or type(now) is not datetime or now.tzinfo is None:
+        if type(epoch) is not int:
             raise AcceptanceCheckError("probe_observation")
-        self._marks[(session_id, epoch)] = now
         return epoch
 
     def fence_owner(self, session_id: str) -> str | None:
@@ -296,10 +293,12 @@ class PostgresEvidenceObserver(EvidenceObserver):
             raise AcceptanceCheckError("probe_observation")
         return owner
 
-    def guided_operation_rows(self, session_id: str, *, since_epoch: int) -> int:
-        if (session_id, since_epoch) not in self._marks:
-            raise AcceptanceInputError("guided_operation_rows needs the fence_epoch reading taken before the trial")
-        count = self._sessions.scalar(GUIDED_OPERATIONS_SINCE_SQL, session_id=session_id, since=self._marks[(session_id, since_epoch)])
+    def message_ingress_receipt_rows(self, session_id: str, *, client_request_id: str) -> int:
+        count = self._sessions.scalar(
+            MESSAGE_INGRESS_RECEIPT_ROWS_SQL,
+            session_id=session_id,
+            client_request_id=client_request_id,
+        )
         if type(count) is not int or count < 0:
             raise AcceptanceCheckError("probe_observation")
         return count

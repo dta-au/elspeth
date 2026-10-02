@@ -114,7 +114,7 @@ def test_blob_inline_field_path_schema_discloses_forbidden_metadata_roots() -> N
 def test_runtime_owned_hash_rejection_names_the_retry_tool(tool_name: str) -> None:
     error = _runtime_owned_llm_option_error(
         "llm",
-        {"resolved_prompt_template_hash": None},
+        {"approved_prompt_artifact_hash": None},
         tool_name=tool_name,
     )
 

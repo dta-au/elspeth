@@ -13,6 +13,7 @@ from scripts.state_engine_profile_reporter import RuntimeProfileReporter
 from sqlalchemy import insert
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -26,6 +27,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 from tests.helpers.state_engine import capture_state_engine_image
 
@@ -48,7 +50,7 @@ def _make_repository() -> _QueueHarness:
                 insert(runs_table).values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     settings_json="{}",
                     canonical_version="v1",
                     status="running",
@@ -64,7 +66,7 @@ def _make_repository() -> _QueueHarness:
                     node_type=NodeType.SOURCE.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -82,7 +84,7 @@ def _make_repository() -> _QueueHarness:
                     node_type=NodeType.TRANSFORM.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -95,7 +97,7 @@ def _make_repository() -> _QueueHarness:
                     row_index=0,
                     source_row_index=0,
                     ingest_sequence=0,
-                    source_data_hash=f"hash-{row_id}",
+                    source_data_hash=fake_sha256(f"hash-{row_id}"),
                     created_at=now,
                 )
             )
@@ -144,7 +146,7 @@ def _enqueue_ready(
     step_index: int = 1,
 ) -> TokenWorkItem:
     return repo.enqueue_ready(
-        run_id="run-a",
+        member_token=WorkerMembershipToken(run_id="run-a", worker_id="worker-a"),
         token_id=token_id,
         row_id=row_id,
         node_id=node_id,
@@ -160,7 +162,7 @@ def _enqueue_ready_claimed(
     payload: str,
 ) -> TokenWorkItem:
     return repo.enqueue_ready_claimed(
-        run_id="run-a",
+        member_token=WorkerMembershipToken(run_id="run-a", worker_id="worker-a"),
         token_id="token-a",
         row_id="row-a",
         node_id="normalize-a",
@@ -320,3 +322,104 @@ def test_existing_ready_claim_event_failure_rolls_back_complete_state_engine_ima
         )
 
     assert capture_state_engine_image(queue_harness.db, run_id="run-a") == before
+
+
+@pytest.mark.parametrize("worker_status", ("evicted", "departed", "absent"))
+@pytest.mark.parametrize("verb", ("enqueue", "claim", "heartbeat", "terminal", "blocked", "failed", "pending_sink"))
+def test_membership_loss_refuses_scheduler_mutation(queue_harness: _QueueHarness, worker_status: str, verb: str) -> None:
+    """Every worker entry point refuses even when the last registration disappears."""
+    from sqlalchemy import delete, select, update
+
+    from elspeth.contracts.errors import RunMembershipLostError
+    from elspeth.core.landscape.schema import run_coordination_events_table
+
+    claimed = _enqueue_ready_claimed(queue_harness.repo, payload=queue_harness.payload)
+    member = WorkerMembershipToken(run_id="run-a", worker_id="worker-a")
+    with queue_harness.db.engine.begin() as conn:
+        if worker_status == "absent":
+            conn.execute(delete(run_workers_table))
+        else:
+            conn.execute(
+                update(run_workers_table).values(
+                    status=worker_status,
+                    evicted_at=queue_harness.now if worker_status == "evicted" else None,
+                )
+            )
+    before = capture_state_engine_image(queue_harness.db, run_id="run-a")
+    expected_error = AuditIntegrityError if worker_status == "absent" else RunMembershipLostError
+    with pytest.raises(expected_error):
+        match verb:
+            case "enqueue":
+                _enqueue_ready(queue_harness.repo, payload=queue_harness.payload)
+            case "claim":
+                queue_harness.repo.claim_ready(member_token=member, lease_owner="worker-a", lease_seconds=30)
+            case "heartbeat":
+                queue_harness.repo.heartbeat_lease(
+                    member_token=member, work_item_id=claimed.work_item_id, lease_owner="worker-a", lease_seconds=60
+                )
+            case "terminal":
+                queue_harness.repo.mark_terminal(member_token=member, work_item_id=claimed.work_item_id, expected_lease_owner="worker-a")
+            case "blocked":
+                queue_harness.repo.mark_blocked(
+                    member_token=member,
+                    work_item_id=claimed.work_item_id,
+                    row_payload_json=claimed.row_payload_json,
+                    expected_lease_owner="worker-a",
+                    queue_key="q",
+                    barrier_key=None,
+                )
+            case "failed":
+                queue_harness.repo.mark_failed(member_token=member, work_item_id=claimed.work_item_id, expected_lease_owner="worker-a")
+            case "pending_sink":
+                queue_harness.repo.mark_pending_sink(
+                    member_token=member,
+                    work_item_id=claimed.work_item_id,
+                    expected_lease_owner="worker-a",
+                    row_payload_json=queue_harness.payload,
+                    sink_name="out",
+                    outcome="completed",
+                    path="success",
+                    error_hash=None,
+                    error_message=None,
+                )
+            case _:
+                raise AssertionError(f"unhandled test verb {verb}")
+    after = capture_state_engine_image(queue_harness.db, run_id="run-a")
+    assert after.tables["token_work_items"] == before.tables["token_work_items"]
+    assert after.tables["scheduler_events"] == before.tables["scheduler_events"]
+    if worker_status == "absent":
+        return
+    with queue_harness.db.engine.connect() as conn:
+        refusal = (
+            conn.execute(select(run_coordination_events_table).where(run_coordination_events_table.c.event_type == "fence_refusal"))
+            .mappings()
+            .one()
+        )
+    assert refusal["worker_id"] == "worker-a"
+    assert refusal["leader_epoch"] is None
+
+
+def test_follower_disposition_cannot_use_another_workers_lease(queue_harness: _QueueHarness) -> None:
+    """Live membership is insufficient to settle an item leased to another worker."""
+    claimed = _enqueue_ready_claimed(queue_harness.repo, payload=queue_harness.payload)
+    before = capture_state_engine_image(queue_harness.db, run_id="run-a")
+    with pytest.raises(ValueError, match="lease owner must match"):
+        queue_harness.repo.mark_terminal(
+            member_token=WorkerMembershipToken(run_id="run-a", worker_id="other-worker"),
+            work_item_id=claimed.work_item_id,
+            expected_lease_owner="worker-a",
+        )
+    assert capture_state_engine_image(queue_harness.db, run_id="run-a") == before
+
+
+def test_follower_heartbeat_commits_lease_loss_event(queue_harness: _QueueHarness) -> None:
+    from elspeth.contracts.errors import SchedulerLeaseLostError
+
+    claimed = _enqueue_ready_claimed(queue_harness.repo, payload=queue_harness.payload)
+    member = WorkerMembershipToken(run_id="run-a", worker_id="worker-a")
+    queue_harness.repo.mark_terminal(member_token=member, work_item_id=claimed.work_item_id, expected_lease_owner="worker-a")
+    with pytest.raises(SchedulerLeaseLostError):
+        queue_harness.repo.heartbeat_lease(member_token=member, work_item_id=claimed.work_item_id, lease_owner="worker-a", lease_seconds=60)
+    after = capture_state_engine_image(queue_harness.db, run_id="run-a")
+    assert after.tables["token_work_items"][0]["status"] == "terminal"
+    assert after.tables["scheduler_events"][-1]["event_type"] == "lease_lost"

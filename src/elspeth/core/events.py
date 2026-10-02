@@ -31,8 +31,9 @@ class EventBus:
     """Simple synchronous event bus for pipeline observability.
 
     Events are dispatched synchronously to all subscribers. Handler
-    exceptions propagate to the caller - formatters are "our code"
-    per CLAUDE.md, so bugs should crash immediately.
+    exceptions propagate to the caller - formatters are our code, so bugs
+    should crash immediately (see
+    docs/guides/data-trust-and-error-handling.md §Operation Wrapping Rules).
 
     Example:
         bus = EventBus()
@@ -100,8 +101,9 @@ class NullEventBus:
     this is a no-op by design - use only when you genuinely don't want
     event observability (e.g., programmatic API usage, testing).
 
-    Per CLAUDE.md: "A defective plugin that silently produces wrong
-    results is worse than a crash." If someone subscribes expecting
+    Per docs/guides/data-trust-and-error-handling.md §Plugin Ownership, a
+    defective plugin that silently produces wrong results is worse than a
+    crash. If someone subscribes expecting
     callbacks, inheritance would hide the bug. Protocol-based design
     makes the no-op behavior explicit.
 

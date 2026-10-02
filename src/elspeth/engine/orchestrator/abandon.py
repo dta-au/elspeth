@@ -35,8 +35,8 @@ from datetime import datetime
 from sqlalchemy import func, select
 
 from elspeth.contracts import RunStatus
-from elspeth.contracts.checkpoint import ResumeCheck
-from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
+from elspeth.contracts.checkpoint import ResumeCheck, ResumeRefusalCause
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import AbandonRefusedError
 from elspeth.contracts.freeze import freeze_fields
@@ -46,9 +46,6 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import token_outcomes_table, token_work_items_table, tokens_table
-
-ABANDON_ENTRY_POINT = "abandon"
-"""``run_coordination_events`` entry-point label the takeover CAS records."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,9 +71,12 @@ class LeaderlessRunPreflight:
     work_item_counts: Mapping[str, int]
     undecided_tokens: int
     refusal: str | None
+    refusal_cause: ResumeRefusalCause | None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "source_lifecycle", "work_item_counts")
+        if (self.refusal is None) != (self.refusal_cause is None):
+            raise ValueError("Abandon refusal must carry both reason and cause")
 
     @property
     def admissible(self) -> bool:
@@ -109,7 +109,9 @@ def _resume_verdict(db: LandscapeDB, run_id: str) -> ResumeCheck:
     if not lifecycle_gate.check.can_resume:
         return lifecycle_gate.check
     if CheckpointManager(db).get_latest_checkpoint(run_id) is None:
-        return ResumeCheck(can_resume=False, reason="no resume baseline exists (checkpointing was disabled)")
+        return ResumeCheck(
+            can_resume=False, reason="no resume baseline exists (checkpointing was disabled)", cause=ResumeRefusalCause.CHECKPOINT_MISSING
+        )
     return ResumeCheck(can_resume=True)
 
 
@@ -181,10 +183,11 @@ def inspect_leaderless_run(db: LandscapeDB, run_id: str) -> LeaderlessRunPreflig
             seat_expires_at=None,
             seat_live=False,
             source_lifecycle={},
-            resume_check=ResumeCheck(can_resume=False, reason=f"Run {run_id} not found"),
+            resume_check=ResumeCheck(can_resume=False, reason=f"Run {run_id} not found", cause=ResumeRefusalCause.RUN_NOT_FOUND),
             work_item_counts={},
             undecided_tokens=0,
             refusal=f"Run {run_id} not found",
+            refusal_cause=ResumeRefusalCause.RUN_NOT_FOUND,
         )
 
     leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id)
@@ -192,11 +195,14 @@ def inspect_leaderless_run(db: LandscapeDB, run_id: str) -> LeaderlessRunPreflig
     resume_check = _resume_verdict(db, run_id)
 
     refusal: str | None
+    refusal_cause: ResumeRefusalCause | None
     if run.status is not RunStatus.RUNNING:
+        refusal_cause = ResumeRefusalCause.RUN_NOT_RUNNING
         refusal = f"run status is {run.status.value!r}, already terminal; nothing to abandon" + (
             " (it is resumable: use `elspeth resume`)" if resume_check.can_resume else ""
         )
     elif leader is not None and leader.seat_live:
+        refusal_cause = ResumeRefusalCause.LEADER_LIVE
         refusal = (
             f"run is led by live leader {leader.leader_worker_id!r} "
             f"(seat expires {leader.leader_heartbeat_expires_at.isoformat()}) — "
@@ -204,6 +210,7 @@ def inspect_leaderless_run(db: LandscapeDB, run_id: str) -> LeaderlessRunPreflig
         )
     else:
         refusal = None
+        refusal_cause = None
 
     work = _read_run_work(db, run_id)
     return LeaderlessRunPreflight(
@@ -217,6 +224,23 @@ def inspect_leaderless_run(db: LandscapeDB, run_id: str) -> LeaderlessRunPreflig
         work_item_counts=work.work_item_counts,
         undecided_tokens=work.undecided_tokens,
         refusal=refusal,
+        refusal_cause=refusal_cause,
+    )
+
+
+def _acquire_leaderless_run_seat(factory: RecorderFactory, *, run_id: str) -> CoordinationToken:
+    """Take the dead leader's seat through the takeover CAS (epoch+1) for one abandon.
+
+    The mutation-fencing gate admits exactly this helper for the ``abandon``
+    entry point, the way it admits ``web/app.py``'s orphan finaliser for
+    ``orphan-finalize``: one run-bound ``mint_worker_id``, the nominal
+    liveness window, and a literal entry-point label.
+    """
+    return factory.run_coordination.acquire_run_leadership(
+        run_id=run_id,
+        worker_id=mint_worker_id(run_id),
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        entry_point="abandon",
     )
 
 
@@ -241,23 +265,18 @@ def abandon_leaderless_run(db: LandscapeDB, run_id: str) -> AbandonOutcome:
     """
     preflight = inspect_leaderless_run(db, run_id)
     if preflight.refusal is not None:
-        raise AbandonRefusedError(run_id, preflight.refusal)
+        assert preflight.refusal_cause is not None
+        raise AbandonRefusedError(run_id, preflight.refusal, cause=preflight.refusal_cause)
 
     factory = RecorderFactory(db)
-    worker_id = mint_worker_id(run_id)
-    coordination_token = factory.run_coordination.acquire_run_leadership(
-        run_id=run_id,
-        worker_id=worker_id,
-        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-        entry_point=ABANDON_ENTRY_POINT,
-    )
+    coordination_token = _acquire_leaderless_run_seat(factory, run_id=run_id)
     factory.run_lifecycle.complete_run(RunStatus.INTERRUPTED, coordination_token=coordination_token)
     abandoned_tokens = _read_run_work(db, run_id).abandoned_tokens
     factory.run_coordination.release_seat(token=coordination_token)
     return AbandonOutcome(
         run_id=run_id,
         run_status=RunStatus.INTERRUPTED,
-        worker_id=worker_id,
+        worker_id=coordination_token.worker_id,
         leader_epoch=coordination_token.leader_epoch,
         abandoned_tokens=abandoned_tokens,
     )

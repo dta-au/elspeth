@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Annotated, Optional
 
 import pytest
@@ -117,21 +118,30 @@ class TestTypesCompatibleAnnotated:
         """float is compatible with Optional[Annotated[float, ...]]."""
         assert _types_compatible(float, Optional[Annotated[float, "constraint"]]) is True  # noqa: UP045
 
-    def test_int_compatible_with_annotated_float_nonstrict(self) -> None:
-        """int -> Annotated[float, ...] is compatible when not strict."""
-        assert _types_compatible(int, Annotated[float, "constraint"], consumer_strict=False) is True
+    def test_int_compatible_with_annotated_float(self) -> None:
+        """int -> Annotated[float, ...] is compatible: an int satisfies a float declaration (ruling C3).
 
-    def test_int_incompatible_with_annotated_float_strict(self) -> None:
-        """int -> Annotated[float, ...] is rejected when strict."""
-        assert _types_compatible(int, Annotated[float, "constraint"], consumer_strict=True) is False
+        The build applies the runtime's one declared-type rule
+        (``declared_type_admits``); a strict consumer refused this edge while
+        every row it would carry passed ``SchemaContract.validate`` and pydantic
+        strict.
+        """
+        assert _types_compatible(int, Annotated[float, "constraint"]) is True
+
+    @pytest.mark.parametrize(
+        ("actual", "expected"),
+        [(bool, float), (bool, int), (float, int), (Decimal, float), (str, float)],
+        ids=["bool-under-float", "bool-under-int", "float-under-int", "decimal-under-float", "str-under-float"],
+    )
+    def test_nothing_else_widens(self, actual: type, expected: type) -> None:
+        assert _types_compatible(actual, Annotated[expected, "constraint"]) is False
 
     def test_annotated_int_compatible_with_optional_annotated_float(self) -> None:
-        """Annotated[int, ...] -> Optional[Annotated[float, ...]] compatible (int->float coercion)."""
+        """Annotated[int, ...] -> Optional[Annotated[float, ...]] compatible (an int satisfies a float)."""
         assert (
             _types_compatible(
                 Annotated[int, "producer_meta"],
                 Optional[Annotated[float, "consumer_meta"]],  # noqa: UP045
-                consumer_strict=False,
             )
             is True
         )
@@ -314,8 +324,8 @@ class TestCheckCompatibilityConstraints:
             score: FiniteFloat
 
         result = check_compatibility(ProducerSchema, ConsumerSchema)
-        # int -> float coercion is allowed (consumer_strict=False by default),
-        # and int values are always finite, so no constraint issue.
+        # An int satisfies a float declaration (declared_type_admits), and int
+        # values are always finite, so no constraint issue.
         assert result.compatible is True
 
 

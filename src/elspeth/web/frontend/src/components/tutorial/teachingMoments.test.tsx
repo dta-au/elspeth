@@ -97,8 +97,7 @@ describe("tutorial teaching moments — render at the right turn", () => {
     expect(screen.queryByText(/received its score/i)).not.toBeInTheDocument();
     expect(screen.getByText(/what it chose to include or leave out/i)).toBeInTheDocument();
     // The Back button here really does return to the run-results view
-    // (previousStep(audit) === "run", cache-backed re-view) — not a
-    // free-text prompt editor, which the staged guided walk retired (F6).
+    // (previousStep(audit) === "run", cache-backed re-view) — not the Build editor.
     const backButton = screen.getByRole("button", {
       name: "Back to your pipeline run",
     });

@@ -1,15 +1,4 @@
-"""Explicit transaction helpers for fenced and legacy scheduler writes.
-
-This module deliberately has no optional-authority transaction selector.  A
-fenced caller must provide a :class:`CoordinationToken`; the one remaining
-scheduler legacy arm must opt into a separately named unfenced helper.
-
-Other legacy allowances documented when the scheduler ratchet landed remain
-owned by their existing boundaries: ``complete_run`` / ``update_run_status`` /
-``finalize_run`` in the run-lifecycle repository, and checkpoint create/delete
-in ``CheckpointManager``.  This helper split neither widens nor ratchets those
-independent APIs.
-"""
+"""Explicit leader transaction helper for scheduler writes."""
 
 from __future__ import annotations
 
@@ -18,17 +7,17 @@ from contextlib import AbstractContextManager
 from sqlalchemy.engine import Connection
 
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
-from elspeth.core.landscape.database import Tier1Engine, begin_write
+from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 
 
 def require_coordination_token(
-    coordination_token: CoordinationToken | None,
+    coordination_token: CoordinationToken,
     *,
     verb: str,
 ) -> CoordinationToken:
     """Reject missing authority before a strict scheduler write can transact."""
-    if coordination_token is None:
+    if not isinstance(coordination_token, CoordinationToken):
         raise TypeError(f"{verb} requires coordination_token; None cannot select an unfenced write")
     return coordination_token
 
@@ -49,29 +38,10 @@ def fenced_write(
     ``CURRENT_TIMESTAMP`` inside the transaction it opens, so a caller clock
     could only have been recorded, never obeyed.
     """
-    coordination_token = require_coordination_token(coordination_token, verb=verb)
+    require_coordination_token(coordination_token, verb=verb)
     return fenced_leader_transaction(
         engine,
         token=coordination_token,
         window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
         verb=verb,
     )
-
-
-def legacy_unfenced_recover_expired_leases_write(
-    engine: Tier1Engine,
-) -> AbstractContextManager[Connection]:
-    """Return the named legacy transaction for direct-harness lease recovery.
-
-    ``recover_expired_leases_legacy_unfenced`` is intentionally callable
-    without a coordination seat by direct repository/integration harnesses
-    that build a crashed image under unregistered worker identities. Keeping
-    this helper token-free and recovery-specific makes the unfenced choice
-    visible at the sole authorized source call site without trusting a
-    caller-supplied verb.
-
-    Only ``SchedulerLeaseRepository.recover_expired_leases_legacy_unfenced``
-    may call this low-level helper; the strict public recovery API never
-    selects transactions from optional authority.
-    """
-    return begin_write(engine)

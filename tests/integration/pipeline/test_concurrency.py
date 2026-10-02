@@ -21,7 +21,7 @@ from elspeth.engine.executors import TransformExecutor
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.engine.processor import DAGTraversalContext, RowProcessor
 from elspeth.engine.spans import SpanFactory
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.fixtures.pipeline import build_linear_pipeline
 
 if TYPE_CHECKING:
@@ -104,6 +104,7 @@ class TestConcurrencyConfigInRowProcessor:
     def test_processor_accepts_max_workers(self, landscape_db: LandscapeDB) -> None:
         """RowProcessor constructor accepts and forwards max_workers."""
         factory = make_factory(landscape_db)
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="test-run")
         span_factory = SpanFactory()
         source_node_id, source_on_success, traversal = _build_traversal_from_graph()
 
@@ -117,6 +118,7 @@ class TestConcurrencyConfigInRowProcessor:
             traversal=traversal,
             max_workers=4,
             scheduler=factory.scheduler,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
         # Verify max_workers was passed to TransformExecutor
         assert processor._transform_executor._max_workers == 4
@@ -124,6 +126,7 @@ class TestConcurrencyConfigInRowProcessor:
     def test_processor_without_max_workers(self, landscape_db: LandscapeDB) -> None:
         """RowProcessor works without max_workers."""
         factory = make_factory(landscape_db)
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="test-run")
         span_factory = SpanFactory()
         source_node_id, source_on_success, traversal = _build_traversal_from_graph()
 
@@ -136,6 +139,7 @@ class TestConcurrencyConfigInRowProcessor:
             source_on_success=source_on_success,
             traversal=traversal,
             scheduler=factory.scheduler,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
         # No max_workers means no cap
         assert processor._transform_executor._max_workers is None

@@ -21,6 +21,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.web.execution.diagnostics import (
     RunDiagnosticsAuditUnavailableError,
     llm_safe_diagnostics_snapshot,
@@ -35,6 +36,7 @@ from elspeth.web.execution.schemas import (
     RunDiagnosticSummary,
     RunDiagnosticToken,
 )
+from tests.fixtures.landscape import leader_coordination_token
 
 _OBSERVED_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 _DIAGNOSTIC_TIME = datetime(2026, 1, 1, tzinfo=UTC)
@@ -417,13 +419,13 @@ def _register_node(
     plugin_name: str,
 ) -> None:
     factory.data_flow.register_node(
-        run_id=run_id,
         node_id=node_id,
         plugin_name=plugin_name,
         node_type=node_type,
         plugin_version="1.0",
         config={},
         schema_config=_OBSERVED_SCHEMA,
+        coordination_token=leader_coordination_token(factory, run_id),
     )
 
 
@@ -434,55 +436,77 @@ def _seed_diagnostics_run(db: LandscapeDB, tmp_path, *, web_run_id: str = "web-r
     _register_node(factory, web_run_id, "extract", NodeType.TRANSFORM, "llm_extract")
     _register_node(factory, web_run_id, "json_out", NodeType.SINK, "json")
 
-    first_row = factory.data_flow.create_row(
-        web_run_id, "source", 0, {"html": "<h1>A</h1>"}, row_id="row-0", source_row_index=0, ingest_sequence=0
+    _first_row, first_token = factory.data_flow.create_row_with_token(
+        "source",
+        0,
+        {"html": "<h1>A</h1>"},
+        row_id="row-0",
+        source_row_index=0,
+        ingest_sequence=0,
+        coordination_token=leader_coordination_token(factory, web_run_id),
+        token_id="token-0",
     )
-    second_row = factory.data_flow.create_row(
-        web_run_id, "source", 1, {"html": "<h1>B</h1>"}, row_id="row-1", source_row_index=1, ingest_sequence=1
+    _second_row, second_token = factory.data_flow.create_row_with_token(
+        "source",
+        1,
+        {"html": "<h1>B</h1>"},
+        row_id="row-1",
+        source_row_index=1,
+        ingest_sequence=1,
+        coordination_token=leader_coordination_token(factory, web_run_id),
+        token_id="token-1",
     )
-    first_token = factory.data_flow.create_token(first_row.row_id, token_id="token-0")
-    second_token = factory.data_flow.create_token(second_row.row_id, token_id="token-1")
 
     first_state = factory.execution.begin_node_state(
         first_token.token_id,
         "extract",
-        web_run_id,
         1,
         {"html": "<h1>A</h1>"},
         state_id="state-token-0",
+        member_token=leader_coordination_token(factory, web_run_id).membership,
     )
     factory.execution.complete_node_state(
         first_state.state_id,
         NodeStateStatus.COMPLETED,
         output_data={"title": "A"},
         duration_ms=125.0,
+        member_token=leader_coordination_token(factory, web_run_id).membership,
     )
     factory.execution.begin_node_state(
         second_token.token_id,
         "extract",
-        web_run_id,
         1,
         {"html": "<h1>B</h1>"},
         state_id="state-token-1",
+        member_token=leader_coordination_token(factory, web_run_id).membership,
     )
-    factory.data_flow.record_token_outcome(
+    factory.data_flow.record_token_outcome_leader(
         TokenRef(token_id=first_token.token_id, run_id=web_run_id),
         TerminalOutcome.SUCCESS,
         TerminalPath.DEFAULT_FLOW,
         sink_name="json_out",
+        coordination_token=leader_coordination_token(factory, web_run_id),
     )
-    source_operation = factory.execution.begin_operation(web_run_id, "source", "source_load")
-    factory.execution.complete_operation(source_operation.operation_id, "completed", duration_ms=15.0)
-    factory.execution.register_artifact(
-        run_id=web_run_id,
-        state_id=first_state.state_id,
-        sink_node_id="json_out",
-        artifact_type="json",
-        path=str(tmp_path / "out.json"),
-        content_hash="a" * 64,
-        size_bytes=42,
-        artifact_id="artifact-1",
+    source_operation = factory.execution.begin_operation(
+        "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
     )
+    factory.execution.complete_operation(
+        source_operation.operation_id, "completed", duration_ms=15.0, coordination_token=leader_coordination_token(factory, web_run_id)
+    )
+    with fenced_leader_transaction(
+        db.engine, token=leader_coordination_token(factory, web_run_id), window_seconds=300, verb="seed_artifact"
+    ) as conn:
+        factory.execution.artifacts.register_artifact(
+            run_id=web_run_id,
+            state_id=first_state.state_id,
+            sink_node_id="json_out",
+            artifact_type="json",
+            path=str(tmp_path / "out.json"),
+            content_hash="a" * 64,
+            size_bytes=42,
+            artifact_id="artifact-1",
+            conn=conn,
+        )
 
 
 def test_diagnostics_returns_bounded_tokens_states_operations_and_artifacts(tmp_path) -> None:
@@ -525,8 +549,7 @@ def test_diagnostics_projects_lineage_frames(tmp_path) -> None:
     """The batch token_lineage_frames query and RunDiagnosticLineageFrame
     projection actually run and round-trip a real frame, not just the
     empty-lineage shape _seed_diagnostics_run's tokens carry."""
-    from elspeth.contracts.enums import FrameKind
-    from elspeth.contracts.identity import LineageFrame
+    from elspeth.core.landscape.schema import token_lineage_frames_table
 
     db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
     try:
@@ -534,19 +557,32 @@ def test_diagnostics_projects_lineage_frames(tmp_path) -> None:
         factory = RecorderFactory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
         _register_node(factory, web_run_id, "source", NodeType.SOURCE, "text")
-        row = factory.data_flow.create_row(
-            web_run_id, "source", 0, {"html": "<h1>A</h1>"}, row_id="row-0", source_row_index=0, ingest_sequence=0
-        )
-        token = factory.data_flow.create_token(
-            row.row_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"html": "<h1>A</h1>"},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
             token_id="token-fork-0",
-            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
         )
-        factory.data_flow.record_token_outcome(
+        # This read-model fixture attaches its frame to the initial token;
+        # creating a second token would change the diagnostic sample count.
+        with fenced_leader_transaction(
+            db.engine, token=leader_coordination_token(factory, web_run_id), window_seconds=300, verb="seed_lineage"
+        ) as conn:
+            conn.execute(
+                token_lineage_frames_table.insert().values(
+                    token_id=token.token_id, run_id=web_run_id, depth=0, kind="fork", group_id="fg-1", member_key="path_a"
+                )
+            )
+        factory.data_flow.record_token_outcome_leader(
             TokenRef(token_id=token.token_id, run_id=web_run_id),
             TerminalOutcome.SUCCESS,
             TerminalPath.DEFAULT_FLOW,
             sink_name="source",
+            coordination_token=leader_coordination_token(factory, web_run_id),
         )
 
         diagnostics = load_run_diagnostics_from_db(
@@ -635,19 +671,24 @@ def test_diagnostics_surfaces_latest_failed_operation_as_failure_detail(tmp_path
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
         _register_node(factory, web_run_id, "transform", NodeType.TRANSFORM, "llm")
 
-        ok_op = factory.execution.begin_operation(web_run_id, "transform", "runtime_preflight")
-        factory.execution.complete_operation(ok_op.operation_id, "completed", duration_ms=10.0)
+        ok_op = factory.execution.begin_operation(
+            "transform", "runtime_preflight", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
+        factory.execution.complete_operation(
+            ok_op.operation_id, "completed", duration_ms=10.0, coordination_token=leader_coordination_token(factory, web_run_id)
+        )
 
-        bad_op = factory.execution.begin_operation(web_run_id, "transform", "runtime_preflight")
+        bad_op = factory.execution.begin_operation(
+            "transform", "runtime_preflight", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
         factory.execution.complete_operation(
             bad_op.operation_id,
             "failed",
-            error=(
-                "pre_flight_failed: llm provider openrouter failed runtime preflight: "
-                "LLMClientError: HTTP 400 | provider error body redacted "
-                "(body_present=true; chars=58)"
-            ),
+            error="pre_flight_failed: llm provider openrouter failed runtime preflight: "
+            "LLMClientError: HTTP 400 | provider error body redacted "
+            "(body_present=true; chars=58)",
             duration_ms=995.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
         )
 
         diagnostics = load_run_diagnostics_from_db(
@@ -689,17 +730,24 @@ def test_diagnostics_failure_detail_prefers_failed_node_state_over_operation_own
         _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
         _register_node(factory, web_run_id, "hoist_items", NodeType.TRANSFORM, "value_transform")
 
-        row = factory.data_flow.create_row(
-            web_run_id, "source", 0, {"item": {"product": "mouse"}}, row_id="row-0", source_row_index=0, ingest_sequence=0
+        _row, token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"item": {"product": "mouse"}},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-0",
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+
         state = factory.execution.begin_node_state(
             token.token_id,
             "hoist_items",
-            web_run_id,
             1,
             {"item": {"product": "mouse"}},
             state_id="state-token-0",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         factory.execution.complete_node_state(
             state.state_id,
@@ -709,14 +757,18 @@ def test_diagnostics_failure_detail_prefers_failed_node_state_over_operation_own
                 exception="Transform 'value_transform' input validation failed: 2 validation errors",
                 exception_type="PluginContractViolation",
             ),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
         factory.execution.complete_operation(
             source_op.operation_id,
             "failed",
             error="Transform 'value_transform' input validation failed: 2 validation errors",
             duration_ms=50.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
         )
 
         diagnostics = load_run_diagnostics_from_db(
@@ -757,18 +809,43 @@ def test_diagnostics_failure_detail_ignores_a_diverted_rows_failed_state(tmp_pat
         _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
         _register_node(factory, web_run_id, "sink_rows", NodeType.SINK, "database")
 
-        row = factory.data_flow.create_row(web_run_id, "source", 0, {"id": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
-        state = factory.execution.begin_node_state(token.token_id, "sink_rows", web_run_id, 1, {"id": 1}, state_id="state-token-0")
+        _row, token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"id": 1},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-0",
+        )
+
+        state = factory.execution.begin_node_state(
+            token.token_id,
+            "sink_rows",
+            1,
+            {"id": 1},
+            state_id="state-token-0",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
+        )
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
             duration_ms=1.0,
             error=ExecutionError(exception=shared_driver_error, exception_type="SinkDiscard", phase="write"),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
-        factory.execution.complete_operation(source_op.operation_id, "failed", error=shared_driver_error, duration_ms=5.0)
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error=shared_driver_error,
+            duration_ms=5.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+        )
 
         diagnostics = load_run_diagnostics_from_db(
             db,
@@ -793,12 +870,15 @@ def test_diagnostics_failure_detail_keeps_operation_owner_when_no_failed_node_st
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
         _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
 
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
         factory.execution.complete_operation(
             source_op.operation_id,
             "failed",
             error="Source 'json' failed to read input file: malformed JSON at line 3",
             duration_ms=5.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
         )
 
         diagnostics = load_run_diagnostics_from_db(
@@ -833,22 +913,35 @@ def test_diagnostics_failure_detail_node_state_lookup_ignores_token_preview_limi
         _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
         _register_node(factory, web_run_id, "hoist_items", NodeType.TRANSFORM, "value_transform")
 
-        first_row = factory.data_flow.create_row(
-            web_run_id, "source", 0, {"ok": True}, row_id="row-0", source_row_index=0, ingest_sequence=0
+        _first_row, _first_row_token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"ok": True},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-0",
         )
-        factory.data_flow.create_token(first_row.row_id, token_id="token-0")
-        second_row = factory.data_flow.create_row(
-            web_run_id, "source", 1, {"item": {}}, row_id="row-1", source_row_index=1, ingest_sequence=1
+
+        _second_row, failing_token = factory.data_flow.create_row_with_token(
+            "source",
+            1,
+            {"item": {}},
+            row_id="row-1",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-1",
         )
-        failing_token = factory.data_flow.create_token(second_row.row_id, token_id="token-1")
 
         state = factory.execution.begin_node_state(
             failing_token.token_id,
             "hoist_items",
-            web_run_id,
             1,
             {"item": {}},
             state_id="state-token-1",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         factory.execution.complete_node_state(
             state.state_id,
@@ -858,13 +951,17 @@ def test_diagnostics_failure_detail_node_state_lookup_ignores_token_preview_limi
                 exception="Transform 'value_transform' input validation failed",
                 exception_type="PluginContractViolation",
             ),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
         factory.execution.complete_operation(
             source_op.operation_id,
             "failed",
             error="Transform 'value_transform' input validation failed",
             duration_ms=50.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
         )
 
         diagnostics = load_run_diagnostics_from_db(
@@ -904,15 +1001,24 @@ def test_diagnostics_failure_detail_ignores_a_failed_node_state_that_did_not_fai
         _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
         _register_node(factory, web_run_id, "explode_items", NodeType.TRANSFORM, "json_explode")
 
-        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        _row, token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"value": 1},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-0",
+        )
+
         state = factory.execution.begin_node_state(
             token.token_id,
             "explode_items",
-            web_run_id,
             1,
             {"value": 1},
             state_id="state-token-0",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         # Row-level failure, routed away by on_error — the run carried on.
         factory.execution.complete_node_state(
@@ -923,15 +1029,19 @@ def test_diagnostics_failure_detail_ignores_a_failed_node_state_that_did_not_fai
                 exception="row 1 could not be exploded",
                 exception_type="TypeError",
             ),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
         # The source then dies mid-stream. Its error is what failed the run.
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
         factory.execution.complete_operation(
             source_op.operation_id,
             "failed",
             error="SOURCE BLEW UP mid-stream on row 3",
             duration_ms=50.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
         )
 
         diagnostics = load_run_diagnostics_from_db(
@@ -968,34 +1078,70 @@ def test_diagnostics_failure_detail_correlates_past_an_uncorrelated_later_failur
 
         fatal_message = "Transform 'value_transform' input validation failed: 2 validation errors"
 
-        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        _row, token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"value": 1},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-0",
+        )
+
         raising_state = factory.execution.begin_node_state(
-            token.token_id, "hoist_items", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+            token.token_id,
+            "hoist_items",
+            1,
+            {"value": 1},
+            state_id="state-token-0",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         factory.execution.complete_node_state(
             raising_state.state_id,
             NodeStateStatus.FAILED,
             duration_ms=2.0,
             error=ExecutionError(exception=fatal_message, exception_type="PluginContractViolation"),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        later_row = factory.data_flow.create_row(
-            web_run_id, "source", 1, {"value": 2}, row_id="row-1", source_row_index=1, ingest_sequence=1
+        _later_row, later_token = factory.data_flow.create_row_with_token(
+            "source",
+            1,
+            {"value": 2},
+            row_id="row-1",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-1",
         )
-        later_token = factory.data_flow.create_token(later_row.row_id, token_id="token-1")
+
         later_state = factory.execution.begin_node_state(
-            later_token.token_id, "tidy_values", web_run_id, 1, {"value": 2}, state_id="state-token-1"
+            later_token.token_id,
+            "tidy_values",
+            1,
+            {"value": 2},
+            state_id="state-token-1",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         factory.execution.complete_node_state(
             later_state.state_id,
             NodeStateStatus.FAILED,
             duration_ms=2.0,
             error=ExecutionError(exception="unrelated diverted row", exception_type="TypeError"),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
-        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error=fatal_message,
+            duration_ms=50.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+        )
 
         diagnostics = load_run_diagnostics_from_db(
             db,
@@ -1035,34 +1181,70 @@ def test_diagnostics_failure_detail_prefers_an_exact_match_over_a_newer_substrin
 
         fatal_message = "Transform 'value_transform' input validation failed: 2 validation errors"
 
-        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        _row, token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"value": 1},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-0",
+        )
+
         raising_state = factory.execution.begin_node_state(
-            token.token_id, "hoist_items", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+            token.token_id,
+            "hoist_items",
+            1,
+            {"value": 1},
+            state_id="state-token-0",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         factory.execution.complete_node_state(
             raising_state.state_id,
             NodeStateStatus.FAILED,
             duration_ms=2.0,
             error=ExecutionError(exception=fatal_message, exception_type="PluginContractViolation"),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        later_row = factory.data_flow.create_row(
-            web_run_id, "source", 1, {"value": 2}, row_id="row-1", source_row_index=1, ingest_sequence=1
+        _later_row, later_token = factory.data_flow.create_row_with_token(
+            "source",
+            1,
+            {"value": 2},
+            row_id="row-1",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-1",
         )
-        later_token = factory.data_flow.create_token(later_row.row_id, token_id="token-1")
+
         later_state = factory.execution.begin_node_state(
-            later_token.token_id, "tidy_values", web_run_id, 1, {"value": 2}, state_id="state-token-1"
+            later_token.token_id,
+            "tidy_values",
+            1,
+            {"value": 2},
+            state_id="state-token-1",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         factory.execution.complete_node_state(
             later_state.state_id,
             NodeStateStatus.FAILED,
             duration_ms=2.0,
             error=ExecutionError(exception="2", exception_type="TypeError"),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
-        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error=fatal_message,
+            duration_ms=50.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+        )
 
         diagnostics = load_run_diagnostics_from_db(
             db,
@@ -1103,34 +1285,70 @@ def test_diagnostics_failure_detail_prefers_the_whole_message_over_a_newer_prefi
         fatal_message = "Transform 'value_transform' input validation failed: 2 validation errors"
         diverted_message = "Transform 'value_transform' input validation failed"
 
-        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        _row, token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"value": 1},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-0",
+        )
+
         raising_state = factory.execution.begin_node_state(
-            token.token_id, "hoist_items", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+            token.token_id,
+            "hoist_items",
+            1,
+            {"value": 1},
+            state_id="state-token-0",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         factory.execution.complete_node_state(
             raising_state.state_id,
             NodeStateStatus.FAILED,
             duration_ms=2.0,
             error=ExecutionError(exception=fatal_message, exception_type="PluginContractViolation"),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        later_row = factory.data_flow.create_row(
-            web_run_id, "source", 1, {"value": 2}, row_id="row-1", source_row_index=1, ingest_sequence=1
+        _later_row, later_token = factory.data_flow.create_row_with_token(
+            "source",
+            1,
+            {"value": 2},
+            row_id="row-1",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-1",
         )
-        later_token = factory.data_flow.create_token(later_row.row_id, token_id="token-1")
+
         later_state = factory.execution.begin_node_state(
-            later_token.token_id, "tidy_values", web_run_id, 1, {"value": 2}, state_id="state-token-1"
+            later_token.token_id,
+            "tidy_values",
+            1,
+            {"value": 2},
+            state_id="state-token-1",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         factory.execution.complete_node_state(
             later_state.state_id,
             NodeStateStatus.FAILED,
             duration_ms=2.0,
             error=ExecutionError(exception=diverted_message, exception_type="PluginContractViolation"),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
-        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error=fatal_message,
+            duration_ms=50.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+        )
 
         diagnostics = load_run_diagnostics_from_db(
             db,
@@ -1165,20 +1383,43 @@ def test_diagnostics_failure_detail_ignores_a_degenerate_substring_candidate(tmp
 
         fatal_message = "AttributeError: 'NoneType' object has no attribute 'get'"
 
-        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        _row, token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"value": 1},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-0",
+        )
+
         diverted_state = factory.execution.begin_node_state(
-            token.token_id, "tidy_values", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+            token.token_id,
+            "tidy_values",
+            1,
+            {"value": 1},
+            state_id="state-token-0",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         factory.execution.complete_node_state(
             diverted_state.state_id,
             NodeStateStatus.FAILED,
             duration_ms=2.0,
             error=ExecutionError(exception="None", exception_type="TypeError"),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
-        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error=fatal_message,
+            duration_ms=50.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+        )
 
         diagnostics = load_run_diagnostics_from_db(
             db,
@@ -1220,10 +1461,24 @@ def test_diagnostics_failure_detail_does_not_correlate_two_exceptions_collapsed_
         fatal_message = scrub_text_for_audit("ConnectionError: https://svc:hunter2@db.internal:5432/items refused")
         assert fatal_message == REDACTED_SECRET_TEXT  # the operation side really collapsed
 
-        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        _row, token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"value": 1},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-0",
+        )
+
         bystander_state = factory.execution.begin_node_state(
-            token.token_id, "explode", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+            token.token_id,
+            "explode",
+            1,
+            {"value": 1},
+            state_id="state-token-0",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         bystander_error = ExecutionError(exception="ValueError: api_key=sk-live-000 rejected by explode", exception_type="ValueError")
         assert bystander_error.exception == REDACTED_SECRET_TEXT  # the state side really collapsed
@@ -1232,10 +1487,19 @@ def test_diagnostics_failure_detail_does_not_correlate_two_exceptions_collapsed_
             NodeStateStatus.FAILED,
             duration_ms=2.0,
             error=bystander_error,
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
-        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error=fatal_message,
+            duration_ms=50.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+        )
 
         diagnostics = load_run_diagnostics_from_db(
             db,
@@ -1267,23 +1531,50 @@ def test_diagnostics_failure_detail_still_correlates_a_genuine_cause_beside_a_sc
 
         fatal_message = "Transform 'value_transform' input validation failed: 2 validation errors"
 
-        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        _row, token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"value": 1},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-0",
+        )
+
         raising_state = factory.execution.begin_node_state(
-            token.token_id, "hoist_items", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+            token.token_id,
+            "hoist_items",
+            1,
+            {"value": 1},
+            state_id="state-token-0",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         factory.execution.complete_node_state(
             raising_state.state_id,
             NodeStateStatus.FAILED,
             duration_ms=2.0,
             error=ExecutionError(exception=fatal_message, exception_type="PluginContractViolation"),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
-        later_row = factory.data_flow.create_row(
-            web_run_id, "source", 1, {"value": 2}, row_id="row-1", source_row_index=1, ingest_sequence=1
+        _later_row, later_token = factory.data_flow.create_row_with_token(
+            "source",
+            1,
+            {"value": 2},
+            row_id="row-1",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-1",
         )
-        later_token = factory.data_flow.create_token(later_row.row_id, token_id="token-1")
+
         bystander_state = factory.execution.begin_node_state(
-            later_token.token_id, "explode", web_run_id, 1, {"value": 2}, state_id="state-token-1"
+            later_token.token_id,
+            "explode",
+            1,
+            {"value": 2},
+            state_id="state-token-1",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         bystander_error = ExecutionError(exception="ValueError: api_key=sk-live-000 rejected by explode", exception_type="ValueError")
         assert bystander_error.exception == REDACTED_SECRET_TEXT
@@ -1292,10 +1583,19 @@ def test_diagnostics_failure_detail_still_correlates_a_genuine_cause_beside_a_sc
             NodeStateStatus.FAILED,
             duration_ms=2.0,
             error=bystander_error,
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
-        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error=fatal_message,
+            duration_ms=50.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+        )
 
         diagnostics = load_run_diagnostics_from_db(
             db,
@@ -1329,20 +1629,43 @@ def test_diagnostics_failure_detail_correlates_a_short_exception_matching_the_me
 
         fatal_message = "bad row"
 
-        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        _row, token = factory.data_flow.create_row_with_token(
+            "source",
+            0,
+            {"value": 1},
+            row_id="row-0",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+            token_id="token-0",
+        )
+
         raising_state = factory.execution.begin_node_state(
-            token.token_id, "hoist_items", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+            token.token_id,
+            "hoist_items",
+            1,
+            {"value": 1},
+            state_id="state-token-0",
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
         factory.execution.complete_node_state(
             raising_state.state_id,
             NodeStateStatus.FAILED,
             duration_ms=2.0,
             error=ExecutionError(exception=fatal_message, exception_type="ValueError"),
+            member_token=leader_coordination_token(factory, web_run_id).membership,
         )
 
-        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
-        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+        source_op = factory.execution.begin_operation(
+            "source", "source_load", coordination_token=leader_coordination_token(factory, web_run_id)
+        )
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error=fatal_message,
+            duration_ms=50.0,
+            coordination_token=leader_coordination_token(factory, web_run_id),
+        )
 
         diagnostics = load_run_diagnostics_from_db(
             db,
@@ -1461,21 +1784,21 @@ def _seed_source_validation_discards(db: LandscapeDB, *, run_id: str, discard_co
     _register_node(factory, run_id, "source", NodeType.SOURCE, "csv")
     for index in range(discard_count):
         factory.data_flow.record_validation_error(
-            run_id,
             "source",
             {"amount": f"cell-value-{index}"},
             f"1 validation error: amount: Input should be a valid integer, row {index} [int_parsing]",
             "fixed",
             "discard",
+            coordination_token=leader_coordination_token(factory, run_id),
         )
     for index in range(quarantined_count):
         factory.data_flow.record_validation_error(
-            run_id,
             "source",
             {"amount": f"quarantined-cell-{index}"},
             f"1 validation error: amount: Input should be a valid integer, quarantined row {index} [int_parsing]",
             "fixed",
             "rejects",
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
 

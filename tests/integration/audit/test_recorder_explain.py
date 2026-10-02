@@ -11,7 +11,7 @@ from sqlalchemy import text
 
 from elspeth.contracts import Determinism, NodeType, PipelineRow
 from elspeth.contracts.audit import NodeStateCompleted
-from elspeth.contracts.errors import AuditIntegrityError, CoalesceCollisionError
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.identity import path_branch_name
 from elspeth.contracts.schema import SchemaConfig
@@ -24,7 +24,7 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.base_classes import _TestSchema
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import leader_coordination_token, make_landscape_db
 from tests.fixtures.plugins import CollectSink
 from tests.integration.pipeline.orchestrator.test_branch_transforms import _build_branch_pipeline
 
@@ -48,7 +48,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -59,8 +59,8 @@ class TestExplainGracefulDegradation:
         # create_row auto-stores payload via configured payload_store
         row_data = {"name": "test", "value": 42}
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=row_data,
@@ -95,7 +95,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -106,8 +106,8 @@ class TestExplainGracefulDegradation:
         # create_row auto-stores payload via configured payload_store
         row_data = {"name": "test"}
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=row_data,
@@ -140,7 +140,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -151,8 +151,8 @@ class TestExplainGracefulDegradation:
         # create_row auto-stores payload via configured payload_store
         row_data = {"name": "test", "value": 123}
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=row_data,
@@ -198,7 +198,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -206,8 +206,8 @@ class TestExplainGracefulDegradation:
             schema_config=DYNAMIC_SCHEMA,
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"name": "test"},
@@ -240,7 +240,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -249,8 +249,8 @@ class TestExplainGracefulDegradation:
         )
 
         # Create row — no payload_store configured, so source_data_ref will be None
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"name": "test"},
@@ -280,7 +280,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -289,8 +289,8 @@ class TestExplainGracefulDegradation:
         )
 
         # create_row auto-stores valid canonical JSON via payload_store
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"name": "test"},
@@ -329,7 +329,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -338,8 +338,8 @@ class TestExplainGracefulDegradation:
         )
 
         # create_row auto-stores valid canonical JSON via payload_store
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"name": "test"},
@@ -378,7 +378,7 @@ class TestExplainGracefulDegradation:
         run2 = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         source = factory.data_flow.register_node(
-            run_id=run1.run_id,
+            coordination_token=leader_coordination_token(factory, run1.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -388,8 +388,8 @@ class TestExplainGracefulDegradation:
 
         # Create row in run1 (create_row auto-stores payload)
         row_data = {"name": "test"}
-        row = factory.data_flow.create_row(
-            run_id=run1.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run1.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=row_data,
@@ -423,8 +423,8 @@ class TestExplainGracefulDegradation:
 # (union_field_origins, union_field_collisions) is persisted to the
 # Landscape audit trail via node_states.context_after_json. Covers both the
 # success path (last_wins default policy) and the failure path (fail policy
-# raises CoalesceCollisionError, audit trail still captures the full collision
-# value-independent collision record via the executor's cleanup handler).
+# fails the coalesce group as a routed row fault; the audit trail captures the
+# full value-independent collision record on each FAILED hold).
 
 
 class _ScoreATransform(BaseTransform):
@@ -481,7 +481,7 @@ def _load_coalesce_context_after(db: LandscapeDB, run_id: str, coalesce_name: st
         rows = conn.execute(
             text(
                 """
-                SELECT ns.context_after_json, ns.status
+                SELECT ns.context_after_json, ns.status, ns.error_json
                 FROM node_states AS ns
                 JOIN nodes AS n
                   ON n.node_id = ns.node_id
@@ -493,7 +493,14 @@ def _load_coalesce_context_after(db: LandscapeDB, run_id: str, coalesce_name: st
             ),
             {"run_id": run_id, "plugin": f"coalesce:{coalesce_name}"},
         ).fetchall()
-    return [{"status": row[1], "context": json.loads(row[0]) if row[0] is not None else None} for row in rows]
+    return [
+        {
+            "status": row[1],
+            "context": json.loads(row[0]) if row[0] is not None else None,
+            "error": json.loads(row[2]) if row[2] is not None else None,
+        }
+        for row in rows
+    ]
 
 
 def _find_merged_token_id(db: LandscapeDB, run_id: str) -> str:
@@ -532,7 +539,8 @@ def _find_merged_token_id(db: LandscapeDB, run_id: str) -> str:
 class TestUnionMergeFieldProvenance:
     """Verify union_field_origins reaches the audit trail AND the explain() API.
 
-    Covers both concerns raised by CLAUDE.md's attributability standard:
+    Covers both concerns raised by the attributability standard
+    (``engine-patterns-reference`` skill §The Attributability Test):
 
     * **Audit trail surface**: the underlying ``node_states.context_after_json``
       column captures ``union_field_origins`` and ``union_field_collisions``.
@@ -562,7 +570,8 @@ class TestUnionMergeFieldProvenance:
           * Calling ``explain(run_id, token_id=merged_token_id)`` and then
             drilling into each consumed parent token's ``LineageResult`` exposes
             the same provenance via ``NodeState.context_after_json`` — the API
-            contract auditors rely on under CLAUDE.md's attributability standard.
+            contract auditors rely on under the attributability standard
+            (``engine-patterns-reference`` skill §The Attributability Test).
 
         This exercises the production code path:
         ExecutionGraph.from_plugin_instances -> Orchestrator.run -> CoalesceExecutor
@@ -649,7 +658,8 @@ class TestUnionMergeFieldProvenance:
         assert ctx["merge_strategy"] == "union"
 
         # ─────────────────────────────────────────────────────────────────
-        # explain() API contract: CLAUDE.md attributability standard
+        # explain() API contract: the attributability standard
+        # (engine-patterns-reference skill §The Attributability Test)
         # ─────────────────────────────────────────────────────────────────
         # The audit trail (above) holds the data, but the attributability
         # standard is specifically about the explain(recorder, run_id, token_id)
@@ -698,7 +708,7 @@ class TestUnionMergeFieldProvenance:
 
         assert provenance_via_explain is not None, (
             "explain() did not surface union_field_origins on any parent token's "
-            "node_states. This breaks CLAUDE.md's attributability standard — "
+            "node_states. This breaks the attributability standard — "
             "auditors cannot reach field provenance through the explain() API."
         )
 
@@ -712,17 +722,14 @@ class TestUnionMergeFieldProvenance:
         assert "union_field_collision_values" not in provenance_via_explain
 
     def test_audit_trail_captures_collision_metadata_on_fail_policy(self, payload_store) -> None:
-        """Failure path: union_collision_policy=fail raises but persists metadata.
+        """Failure path: union_collision_policy=fail fails the group and persists the record.
 
-        When the pipeline sets union_collision_policy='fail', a field collision
-        raises CoalesceCollisionError. The coalesce executor's cleanup handler
-        must still propagate metadata_for_audit to complete_node_state so the
-        collision record reaches node_states.context_after_json with FAILED status.
-
-        This is the regression guard for the Task 3 fix: metadata_for_audit
-        is hoisted before _merge_data is called so the except-block cleanup
-        handler can pass it as context_after even when the raise happens
-        after metadata was built.
+        A collision on fields the rows carry (not provable at build) is a row
+        fault: the coalesce group fails with the closed, value-free reason
+        ``union_field_collision``, every consumed token terminates, and the run
+        completes instead of aborting. The collision record (field origins and
+        the collided names, never values) reaches each FAILED hold's
+        node_states.context_after_json, where explain/MCP readers find it.
         """
         db = make_landscape_db()
         gate = GateSettings(
@@ -754,48 +761,25 @@ class TestUnionMergeFieldProvenance:
         )
 
         orchestrator = Orchestrator(db)
-
-        # The collision must surface — either raised directly or wrapped in the
-        # engine's row-processing error envelope. Either way, no rows reach the sink.
-        with pytest.raises(Exception) as excinfo:
-            orchestrator.run(
-                config,
-                graph=graph,
-                settings=settings,
-                payload_store=payload_store,
-            )
-
-        # Ensure the underlying cause is CoalesceCollisionError
-        exc_chain: list[BaseException] = []
-        cur: BaseException | None = excinfo.value
-        seen_exceptions: set[int] = set()
-        while cur is not None and id(cur) not in seen_exceptions:
-            seen_exceptions.add(id(cur))
-            exc_chain.append(cur)
-            cur = cur.__cause__ or cur.__context__
-        assert any(isinstance(e, CoalesceCollisionError) for e in exc_chain), (
-            f"expected CoalesceCollisionError in exception chain, got: {[type(e).__name__ for e in exc_chain]}"
+        result = orchestrator.run(
+            config,
+            graph=graph,
+            settings=settings,
+            payload_store=payload_store,
         )
         assert not output_sink.results, "sink must not receive rows when fail policy triggers"
-
-        # The audit trail must still capture the collision record via the
-        # cleanup handler (Task 3 regression guard). Find the FAILED node_state
-        # and assert its context_after_json has value-independent collision metadata.
-        # Note: we use the orchestrator-assigned run_id, which we recover from
-        # the database since orchestrator.run raised.
-        with db.connection() as conn:
-            run_row = conn.execute(text("SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1")).fetchone()
-        assert run_row is not None
-        run_id = run_row[0]
+        run_id = result.run_id
+        assert result.rows_failed == 2  # both consumed branch tokens
+        assert result.rows_coalesce_failed == 1
 
         states = _load_coalesce_context_after(db, run_id, "merge_scores_strict")
         failed_with_ctx = [s["context"] for s in states if s["status"] == "failed" and s["context"] is not None]
         assert failed_with_ctx, f"expected FAILED coalesce node_state with context_after_json; got: {states}"
 
+        assert len(failed_with_ctx) == 2, f"expected one FAILED hold with the collision record per arrived branch; got: {states}"
+        assert {s["error"]["failure_reason"] for s in states if s["status"] == "failed"} == {"union_field_collision"}
         ctx = failed_with_ctx[0]
-        assert "union_field_origins" in ctx, (
-            f"FAILED state missing union_field_origins — cleanup handler did not propagate metadata_for_audit. Got: {ctx}"
-        )
+        assert "union_field_origins" in ctx, f"FAILED state missing union_field_origins. Got: {ctx}"
         assert ctx["union_field_origins"]["score"] == "path_b"
         assert ctx["union_field_collisions"]["score"] == ["path_a", "path_b"]
         serialized_context = json.dumps(ctx, sort_keys=True)

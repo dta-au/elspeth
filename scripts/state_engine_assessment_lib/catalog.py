@@ -54,6 +54,8 @@ def _v3_case_ids(leg: dict[str, Any]) -> list[str]:
 
 
 def _validate_v3_cases(catalog: dict[str, Any], legs: list[dict[str, Any]], profile_case_ids: list[str]) -> None:
+    amended_leg_contracts = {"PB-01", "RM-09", "RM-10"}
+    retired_leg_ids = {"RM-09", "RM-10"}
     canonical_v2 = _canonical_v2_catalog()
     v2_by_id = {leg["id"]: leg for leg in canonical_v2["legs"]}
     v2_profiles = canonical_v2["applicability_profiles"]
@@ -68,10 +70,14 @@ def _validate_v3_cases(catalog: dict[str, Any], legs: list[dict[str, Any]], prof
         _require(set(leg) == {"id", "family", "title", "contract", "required_cases"}, f"catalog leg {leg_id} has unexpected fields")
         v2_leg = v2_by_id[leg_id]
         _require(
-            {key: leg[key] for key in ("id", "family", "title", "contract")}
-            == {key: v2_leg[key] for key in ("id", "family", "title", "contract")},
-            f"catalog v3 changed frozen v2 leg semantics: {leg_id}",
+            {key: leg[key] for key in ("id", "family")} == {key: v2_leg[key] for key in ("id", "family")},
+            f"catalog v3 changed frozen v2 leg identity: {leg_id}",
         )
+        if leg_id not in amended_leg_contracts:
+            _require(
+                {key: leg[key] for key in ("title", "contract")} == {key: v2_leg[key] for key in ("title", "contract")},
+                f"catalog v3 changed frozen v2 leg semantics: {leg_id}",
+            )
         cases = _list(leg["required_cases"], f"catalog leg {leg_id} cases")
         _require(bool(cases), f"catalog leg {leg_id} has no required cases")
         case_ids = _v3_case_ids(leg)
@@ -118,7 +124,9 @@ def _validate_v3_cases(catalog: dict[str, Any], legs: list[dict[str, Any]], prof
                             isinstance(reason, str) and bool(reason.strip()),
                             f"catalog leg {leg_id} not_applicable cell needs a reviewed reason",
                         )
-                    if leg_id != "PB-09":
+                    if leg_id in retired_leg_ids:
+                        _require(status == "not_applicable", f"catalog v3 retired leg still required: {leg_id}/{profile_case}/{dimension}")
+                    elif leg_id != "PB-09":
                         v2_profile = v2_profiles[v2_leg["applicability_profile"]]
                         expected = (
                             "required"

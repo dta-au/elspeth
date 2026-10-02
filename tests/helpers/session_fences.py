@@ -18,7 +18,7 @@ from sqlalchemy import Connection, insert
 
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.sessions.models import session_operation_fences_table
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def seed_session_operation_fence(
@@ -466,7 +466,7 @@ async def read_blob_content_under_fence(sessions_service, blob_service, session_
         return await blob_service.read_blob_content(blob_id, session_operation_context=context)
 
 
-class FencedComposeTurnHarness(DualFencedSessionServiceHarness):
+class FencedComposeTurnHarness(FencedSessionServiceHarness):
     """Supply the sync ``persist_compose_turn`` primitive its COMPOSE authority.
 
     The harness's other adapters are async and cannot cover this primitive:

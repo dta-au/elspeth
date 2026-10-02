@@ -17,6 +17,22 @@ from elspeth.core.expression_parser import (
 )
 
 
+@pytest.mark.parametrize(
+    "expression",
+    ["-" * 1000 + "1", "+".join(["row['a']"] * 300)],
+    ids=["unary-chain", "binary-chain"],
+)
+def test_deep_expression_rejected_before_recursive_validation(expression: str) -> None:
+    with pytest.raises(ExpressionSyntaxError, match="nesting"):
+        ExpressionParser(expression)
+
+
+def test_shallow_expression_still_validates_and_evaluates() -> None:
+    parser = ExpressionParser("+".join(["row['a']"] * 30))
+    assert parser.evaluate({"a": 2}) == 60
+    assert not parser.is_boolean_expression()
+
+
 class TestExpressionParserBasicOperations:
     """Test basic allowed operations."""
 
@@ -1399,14 +1415,14 @@ class TestExpressionEvaluationError:
         error_msg = str(exc_info.value)
         assert "missing_field" in error_msg
 
-    def test_evaluation_error_preserves_original_exception(self) -> None:
-        """ExpressionEvaluationError chains the original exception."""
+    def test_evaluation_error_classifies_the_arm_without_chaining_the_operand_error(self) -> None:
+        """``kind`` names the failed arm; the operand exception is not chained (its text can be a row value)."""
         parser = ExpressionParser("row['x'] / row['y']")
         with pytest.raises(ExpressionEvaluationError) as exc_info:
             parser.evaluate({"x": 1, "y": 0})
-        # Original exception should be chained via __cause__
-        assert exc_info.value.__cause__ is not None
-        assert isinstance(exc_info.value.__cause__, ZeroDivisionError)
+        assert exc_info.value.kind == "division_by_zero"
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
 
     def test_comparison_type_error_raises_evaluation_error(self) -> None:
         """Type error in comparison raises ExpressionEvaluationError."""
@@ -1468,14 +1484,124 @@ class TestExpressionEvaluationError:
         with pytest.raises(ExpressionEvaluationError, match=r"row\.get"):
             parser.evaluate({"field": "value"})
 
-    def test_missing_field_error_preserves_cause(self) -> None:
-        """KeyError is preserved as __cause__ for missing field errors."""
+    def test_missing_field_error_is_classified_missing_key(self) -> None:
+        """A missing field is ``missing_key``; the KeyError (whose text is the key) is not chained."""
         parser = ExpressionParser("row['missing']")
         with pytest.raises(ExpressionEvaluationError) as exc_info:
             parser.evaluate({})
-        # Original KeyError should be chained
-        assert exc_info.value.__cause__ is not None
-        assert isinstance(exc_info.value.__cause__, KeyError)
+        assert exc_info.value.kind == "missing_key"
+        assert exc_info.value.__cause__ is None
+
+
+_ROW_SENTINEL = "CUSTOMER_PRIVATE_739"
+
+
+class TestExpressionEvaluationErrorIsValueFree:
+    """Every evaluation-error message names no value the row supplied (C3, review r1 F1).
+
+    A key or index the expression spells out is config text and is named; one
+    computed from the row prints as a placeholder. Operand exception text is
+    never embedded or chained.
+    """
+
+    @pytest.mark.parametrize(
+        ("expression", "row", "kind"),
+        [
+            ("row[row['code']]", {"code": _ROW_SENTINEL}, "missing_key"),
+            ("row['lookup'][row['code']]", {"lookup": {"a": 1}, "code": _ROW_SENTINEL}, "missing_key"),
+            ("row['items'][row['idx']]", {"items": [1, 2], "idx": 918273645}, "index_out_of_range"),
+            ("row['items'][row['idx']]", {"items": [1, 2], "idx": -918273646}, "index_out_of_range"),
+            ("row['text'][row['code']]", {"text": "abc", "code": _ROW_SENTINEL}, "incompatible_types"),
+            ("row['n'][row['code']]", {"n": 5, "code": _ROW_SENTINEL}, "incompatible_types"),
+            ("row['lookup'][row['keys']]", {"lookup": {"a": 1}, "keys": [_ROW_SENTINEL]}, "incompatible_types"),
+            ("len(row['n'])", {"n": 918273645}, "incompatible_types"),
+            ("upper(row['n'])", {"n": 918273645}, "incompatible_types"),
+            ("abs(row['text'])", {"text": _ROW_SENTINEL}, "incompatible_types"),
+            ("row.get(row['keys'])", {"keys": [_ROW_SENTINEL]}, "incompatible_types"),
+            ("{row['keys']: 1}", {"keys": [_ROW_SENTINEL]}, "incompatible_types"),
+            ("len({row['keys'], 1})", {"keys": [_ROW_SENTINEL]}, "incompatible_types"),
+            ("row['text'] > 5", {"text": _ROW_SENTINEL}, "incompatible_types"),
+            ("row['text'] - 1", {"text": _ROW_SENTINEL}, "incompatible_types"),
+            ("-row['text']", {"text": _ROW_SENTINEL}, "incompatible_types"),
+            ("row['n'] / row['zero']", {"n": 918273645, "zero": 0}, "division_by_zero"),
+            (" * ".join(["row['n']"] * 36) + " / 3", {"n": 918273645}, "arithmetic_overflow"),
+            (" * ".join(["row['n']"] * 36) + " + 0.5", {"n": 918273645}, "arithmetic_overflow"),
+            # ``%`` formatting (review r2): each exception class the operator raises from row data
+            ("row['fmt'] % {'a': 1}", {"fmt": f"%({_ROW_SENTINEL})s"}, "missing_key"),
+            ("row['fmt'] % row['lookup']", {"fmt": f"%({_ROW_SENTINEL})s", "lookup": {"a": 1}}, "missing_key"),
+            ("'%(a)s' % row['lookup']", {"lookup": {_ROW_SENTINEL: 1}}, "missing_key"),
+            ("row['fmt'] % row['n']", {"fmt": f"%{_ROW_SENTINEL}", "n": 1}, "invalid_value"),
+            ("row['fmt'] % row['n']", {"fmt": "%c", "n": 918273645}, "arithmetic_overflow"),
+            ("row['fmt'] % row['n']", {"fmt": f"%s %s {_ROW_SENTINEL}", "n": 1}, "incompatible_types"),
+        ],
+    )
+    def test_message_names_no_row_value(self, expression: str, row: dict[str, object], kind: str) -> None:
+        with pytest.raises(ExpressionEvaluationError) as exc_info:
+            ExpressionParser(expression).evaluate(row)
+        message = str(exc_info.value)
+        assert _ROW_SENTINEL not in message
+        assert "918273" not in message
+        assert exc_info.value.kind == kind
+        assert exc_info.value.__cause__ is None
+
+    def test_computed_key_prints_placeholder(self) -> None:
+        with pytest.raises(ExpressionEvaluationError) as exc_info:
+            ExpressionParser("row[row['code']]").evaluate({"code": _ROW_SENTINEL})
+        assert str(exc_info.value) == "Field <a key the expression does not spell out> not found in dict"
+
+    def test_computed_key_on_pipeline_row_prints_placeholder(self) -> None:
+        from elspeth.testing import make_pipeline_row
+
+        row = make_pipeline_row({"code": _ROW_SENTINEL})
+        with pytest.raises(ExpressionEvaluationError) as exc_info:
+            ExpressionParser("row[row['code']]").evaluate(row)
+        assert str(exc_info.value) == "Key <a key the expression does not spell out> not found in PipelineRow"
+
+    def test_computed_index_prints_placeholder_and_the_length(self) -> None:
+        with pytest.raises(ExpressionEvaluationError) as exc_info:
+            ExpressionParser("row['items'][row['idx']]").evaluate({"items": [1, 2], "idx": 918273645})
+        assert str(exc_info.value) == "Index <an index the expression does not spell out> out of range for list of length 2"
+
+    def test_spelled_out_key_and_index_are_named(self) -> None:
+        """A literal key is the operator's config text and stays in the message."""
+        with pytest.raises(ExpressionEvaluationError) as key_info:
+            ExpressionParser("row['nonexistent']").evaluate({})
+        assert str(key_info.value) == "Field 'nonexistent' not found in dict"
+        with pytest.raises(ExpressionEvaluationError) as index_info:
+            ExpressionParser("row['items'][-5]").evaluate({"items": [1]})
+        assert str(index_info.value) == "Index -5 out of range for list of length 1"
+
+    def test_format_key_miss_names_only_the_mapping_type(self) -> None:
+        """``str % mapping`` raises KeyError whose text is the row-derived key (review r2).
+
+        It is a missing key (the mapping lacks what the format asks for), not an
+        evaluator bug to crash through, and the key is never named.
+        """
+        from types import MappingProxyType
+
+        from elspeth.testing import make_pipeline_row
+
+        with pytest.raises(ExpressionEvaluationError) as literal_info:
+            ExpressionParser("row['fmt'] % {'a': 1}").evaluate({"fmt": f"%({_ROW_SENTINEL})s"})
+        assert str(literal_info.value) == "%-format key not found in dict (Mod operation)"
+        assert literal_info.value.kind == "missing_key"
+        assert literal_info.value.__cause__ is None
+        row = make_pipeline_row({"fmt": f"%({_ROW_SENTINEL})s", "lookup": MappingProxyType({"a": 1})})
+        with pytest.raises(ExpressionEvaluationError) as frozen_info:
+            ExpressionParser("row['fmt'] % row['lookup']").evaluate(row)
+        assert str(frozen_info.value) == "%-format key not found in mappingproxy (Mod operation)"
+        assert frozen_info.value.kind == "missing_key"
+
+    def test_call_names_argument_types_only(self) -> None:
+        with pytest.raises(ExpressionEvaluationError) as exc_info:
+            ExpressionParser("abs(row['text'])").evaluate({"text": _ROW_SENTINEL})
+        assert str(exc_info.value) == "invalid argument to abs(): cannot apply to (str)"
+
+    def test_unexpected_error_names_the_type_not_the_text(self) -> None:
+        expression = " * ".join(["row['n']"] * 36) + " / 3"
+        with pytest.raises(ExpressionEvaluationError) as exc_info:
+            ExpressionParser(expression).evaluate({"n": 918273645})
+        assert str(exc_info.value) == f"Unexpected error evaluating expression {expression!r}: OverflowError"
 
 
 class TestExpressionValidatorFailClosed:
@@ -2002,3 +2128,42 @@ class TestStaticFieldReads:
         reads = parser.static_field_reads("row")
         assert reads.fields == frozenset()
         assert reads.complete is True
+
+
+class TestResultCanBeSet:
+    """Whether a set literal can reach the expression's value (elspeth-5887fb7928 AC-R3)."""
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "{1, 2}",
+            "row['a'] or {1}",
+            "row['a'] and {1}",
+            "{1} if row['a'] else 2",
+            "2 if row['a'] else {1}",
+            "[{1}]",
+            "({1},)",
+            "{'k': {1}}",
+            "{1} - {2}",
+        ],
+    )
+    def test_set_in_value_position(self, expression: str) -> None:
+        assert ExpressionParser(expression).result_can_be_set() is True
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "row['a'] in {1, 2}",
+            "row['a'] not in {1, 2}",
+            "{1} == {1}",
+            "len({row['a'], row['b']})",
+            "not {1}",
+            "1 if {1} else 2",
+            "[1, 2]",
+            "{'k': [1]}",
+            "(1, 2)",
+            "row['a']",
+        ],
+    )
+    def test_set_consumed_or_absent(self, expression: str) -> None:
+        assert ExpressionParser(expression).result_can_be_set() is False

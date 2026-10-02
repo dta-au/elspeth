@@ -79,7 +79,8 @@ class TestLLMConfigSchema:
         """
         schema = LLMTransform.get_config_schema()
         azure = schema["$defs"]["AzureOpenAIConfig"]
-        assert set(azure["required"]) >= {"deployment_name", "endpoint", "api_key", "prompt_template"}
+        assert set(azure["required"]) >= {"deployment_name", "endpoint", "api_key"}
+        assert "prompt_template" not in azure["required"]
 
     def test_openrouter_variant_publishes_required_provider_fields(self) -> None:
         """Mirror of the Azure test for the other provider — fail loudly if the
@@ -89,15 +90,21 @@ class TestLLMConfigSchema:
         """
         schema = LLMTransform.get_config_schema()
         openrouter = schema["$defs"]["OpenRouterConfig"]
-        assert set(openrouter["required"]) >= {"api_key", "model", "prompt_template"}
+        assert set(openrouter["required"]) >= {"api_key", "model"}
+        assert "prompt_template" not in openrouter["required"]
 
-    def test_bedrock_variant_publishes_keyless_provider_fields(self) -> None:
+    def test_bedrock_variant_publishes_optional_credential_fields(self) -> None:
         schema = LLMTransform.get_config_schema()
         bedrock = schema["$defs"]["BedrockConfig"]
 
-        assert set(bedrock["required"]) >= {"model", "prompt_template", "provider"}
+        assert set(bedrock["required"]) >= {"model", "provider"}
+        assert "prompt_template" not in bedrock["required"]
         assert "region_name" in bedrock["properties"]
-        assert "api_key" not in bedrock["properties"]
+        # Credentials are published but never required: the AWS default
+        # credential chain (task role) must keep working with none of them.
+        credential_fields = {"api_key", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"}
+        assert credential_fields <= set(bedrock["properties"])
+        assert credential_fields.isdisjoint(bedrock["required"])
 
     def test_matches_typeadapter_fixture(self) -> None:
         """Schema drift detector: compare against an explicit TypeAdapter.

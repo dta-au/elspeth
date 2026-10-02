@@ -24,6 +24,7 @@ from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperatio
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.fixture()
@@ -43,7 +44,9 @@ def authority(db_engine) -> SQLiteLocalSessionOperationAuthority:
 
 
 @pytest.fixture()
-def session_id(authority) -> UUID:
+def session_id(authority, db_engine) -> UUID:
+    with db_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     created = authority.create_session_with_initial_fence(
         user_id="alice",
         title="read admission",

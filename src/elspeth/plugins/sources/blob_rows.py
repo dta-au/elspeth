@@ -24,7 +24,7 @@ import re
 from collections.abc import Iterator
 from typing import Annotated, Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.blobs import STORAGE_MIME_TYPES
@@ -33,6 +33,7 @@ from elspeth.contracts.contract_builder import ContractBuilder
 from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
@@ -55,7 +56,10 @@ class BlobRowsEntry(BaseModel):
     payload_ref: str = Field(description="64-lowercase-hex SHA-256 content hash in the payload store.")
     filename: str = Field(min_length=1, max_length=512, description="Blob filename recorded at admission.")
     mime_type: str = Field(description="Declared storage MIME type recorded at admission.")
-    size_bytes: int = Field(ge=0, description="Blob byte length recorded at admission.")
+    # The row carries this value, and the audit trail hashes rows as canonical
+    # JSON, whose integers stop at 2**53-1: a larger configured size is refused
+    # here, at construction, not at the first row's ingest.
+    size_bytes: int = Field(ge=0, le=2**53 - 1, description="Blob byte length recorded at admission.")
 
     @field_validator("blob_id")
     @classmethod
@@ -125,7 +129,7 @@ class BlobRowsSource(BaseSource):
     name = "blob_rows"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9dcd7c4dd2553d22"
+    source_file_hash: str | None = "sha256:694f938d877c1127"
     config_model = BlobRowsSourceConfig
     # DESIGN DEVIATION (recorded for adjudication): the approved design lists
     # ``creates_tokens = True``, but that attribute exists only on the
@@ -253,8 +257,12 @@ class BlobRowsSource(BaseSource):
 
             contract = self.require_schema_contract()
             yield SourceRow.valid(validated_row, contract=contract, source_row_index=source_row_index)
-        except ValueError as exc:
-            error_msg = f"blob_rows row failed schema validation: {exc}"
+        except ValidationError as exc:
+            # Input-free text: str(exc) echoes the offending value (here a
+            # custody filename) into audit surfaces (elspeth-a300402c58).
+            # Only a schema failure quarantines; any other ValueError in this
+            # block is a ContractBuilder "source plugin bug" and must crash.
+            error_msg = f"blob_rows row failed schema validation: {safe_validation_error_text(exc, self._schema_class)}"
             ctx.record_validation_error(
                 row=row,
                 error=error_msg,

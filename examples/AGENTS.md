@@ -21,6 +21,8 @@ These run immediately with no setup:
 |---------|------|-------|
 | `audit_export` | 8 | Demonstrates audit data export |
 | `batch_aggregation` | 15 | Batch accumulation and trigger |
+| `batch_error_routing` | 12 each | A failed aggregation batch and its `on_error`; ships three `settings*.yaml` files, run one at a time, and **all three end PARTIAL/exit 1 by design**. One order's amount is a string, so its whole batch of 3 fails: `settings.yaml` routes all 3 rows, with their original values, to `failed_batches.csv` (3 totals written); `settings_discard.yaml` records the same 3 rows as quarantined and writes them nowhere; `settings_declared.yaml` declares a `value_transform` output `int` (ADR-050), so the bad value is routed on its own row before the batch and 4 totals are written. The README carries the audit queries for the outcomes, the single DIVERT and the per-row `transform_errors` |
+| `batch_rank_passthrough` | 12 | Aggregation `output_mode: passthrough` with `batch_rank` (count 4 = one prompt per batch), then a shortlist gate on the rank; ships two `settings*.yaml` files, run one at a time, both COMPLETED/exit 0 with 7 rows to `shortlist.csv` and 5 to `remaining.csv`. `settings.yaml` keeps the source's 12 tokens (0 parent links); `settings_transform.yaml` writes the same rows through 12 new child tokens (24 tokens, 12 parent links). One null score passes through unranked. The README carries the lineage queries and the validate refusal of `batch_stats` under passthrough |
 | `report_assemble` | 5 (3 reports) | Paginated report aggregation with count and end-of-source flushes |
 | `statistical_batch_plugins` | 8 each | Statistical batch plugin examples; run one `settings_*.yaml` file at a time |
 | `boolean_routing` | 10 | True/false gate routing |
@@ -30,7 +32,7 @@ These run immediately with no setup:
 | `deep_routing` | 20 | Multi-level cascading gates; fixture ends PARTIAL/exit 1 with 2 blocked rows quarantined by design |
 | `error_routing` | 17 | Error-triggered routing; fixture ends PARTIAL/exit 1 with 4 blocked rows quarantined by design |
 | `explicit_routing` | 10 | Named route destinations |
-| `fork_coalesce` | 5 each | Parallel path fork/join DAG; ships five `settings*.yaml` files, run one at a time. `settings.yaml` coalesces both branches; `settings_per_branch.yaml` runs a different transform chain per branch (ARCH-15); the three union variants exercise the field-collision policies — `settings_union_last_wins.yaml` and `settings_union_first_wins.yaml` resolve the same collision to opposite branches (`path_b` / `path_a`), and `settings_union_fail.yaml` raises `CoalesceCollisionError` and exits non-zero **by design** |
+| `fork_coalesce` | 5 each | Parallel path fork/join DAG; ships five `settings*.yaml` files, run one at a time. `settings.yaml` coalesces both branches; `settings_per_branch.yaml` runs a different transform chain per branch (ARCH-15); the three union variants exercise the field-collision policies — `settings_union_last_wins.yaml` and `settings_union_first_wins.yaml` resolve the same collision to opposite branches (`path_b` / `path_a`), and `settings_union_fail.yaml` fails every row's group with `union_field_collision` and ends `FAILED` (exit 2) **by design** |
 | `row_union_ab_experiment` | 8 (16 unioned, 1 comparison row) | Fork-based A/B: `row_union` releases both variant branches as one correlated group; run one `settings*.yaml` at a time. `settings_screened.yaml` screens ahead of the fork and ends SUCCESS (3 tickets screened out before forking); `settings_screened_at_settlement.yaml` screens mid-branch on a post-fork field and ends PARTIAL **by design** (3 tickets discarded inside the control branch, their orphaned treatment siblings fail closed) |
 | `json_explode` | 3 | JSON source with array expansion (3→6 output) |
 | `transform_pipeline` | 5 | Type coercion followed by dependent derived-field calculations |
@@ -53,7 +55,7 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 
 ### Exit 0 is not the corpus gate
 
-Thirteen shipped configs end non-zero **by design**. A runner that treats any
+Sixteen shipped configs end non-zero **by design**. A runner that treats any
 non-zero exit as failure will report phantom defects; encode the expected exit
 per config, not a blanket `-eq 0`:
 
@@ -63,17 +65,20 @@ per config, not a blanket `-eq 0`:
 | `error_routing/settings.yaml` | 1 | 4 blocked rows quarantined |
 | `pdf_rasterize/settings.yaml` | 1 | 1 malformed document quarantined |
 | `row_union_ab_experiment/settings_screened_at_settlement.yaml` | 1 | 3 tickets discarded mid-branch, orphaned treatment siblings fail closed |
-| `fork_coalesce/settings_union_fail.yaml` | non-zero | raising `CoalesceCollisionError` is the point of the variant |
+| `fork_coalesce/settings_union_fail.yaml` | 2 | every row's group failing `union_field_collision` (run `FAILED`, collision record on each FAILED hold) is the point of the variant |
 | `scope_collector/settings.yaml` | 1 | 1 malformed page lost; `require_all` withholds that group's statistics |
 | `scope_collector/settings_best_effort.yaml` | 1 | the same lost page; `best_effort` still reports over survivors |
 | `ab_llm_experiment/settings_arm_loss.yaml` | 1 | 3 of 24 cases lose an arm; each surviving sibling is invalidated with it |
 | `document_review_panel/settings_incomplete.yaml` | 1 | one page loses a reviewer; the page, then the document verdict, fail closed |
 | `document_review_panel/settings_run_as_row.yaml` | 1 | same loss, run encapsulated as one row — the corpus verdict is refused entirely |
 | `reference_join/settings_missing_product.yaml` | 1 | 1 order names a product absent from the reference table; `on_miss: fail` quarantines it |
+| `batch_error_routing/settings.yaml` | 1 | 1 wrongly typed amount fails its batch; all 3 rows of it routed to `failed_batches` |
+| `batch_error_routing/settings_discard.yaml` | 1 | the same failed batch under `on_error: discard`; its 3 rows recorded as quarantined |
+| `batch_error_routing/settings_declared.yaml` | 1 | the declared `amount_cents: int` routes the 1 bad row before the batch |
 | `chaosweb/settings.yaml` | 1, stochastic | injected fetch faults route to `scrape_failures.csv` |
 | `chaosllm_endurance/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
 
-The first eleven are deterministic fixtures with fixed counts. The last two
+The first fourteen are deterministic fixtures with fixed counts. The last two
 depend on randomly injected faults, so they may also exit 0 — for those the
 acceptance criterion is **conservation**, not the exit code: every source row
 reaches either the result sink or the error sink, with the failure reason
@@ -157,6 +162,29 @@ elspeth run --settings examples/chaosweb/settings.yaml --execute
 | Example | Rows | Notes |
 |---------|------|-------|
 | `chaosweb` | 10 | Web scraping with fault injection; may end PARTIAL/exit 1 with rows in `scrape_failures.csv` — see "Exit 0 is not the corpus gate" |
+
+### Replay / verify (own fixture server, no credentials)
+
+```bash
+./examples/replay_verify/run.sh
+```
+
+| Example | Rows | Notes |
+|---------|------|-------|
+| `replay_verify` | 3 per run | `run.sh` starts its OWN deterministic page server on 8204 (`serve_pages.py`). It records a LIVE `web_scrape` run, REPLAYS it with the server stopped (asserts 0 requests and 3 `calls.source_call_id` bindings), then VERIFIES it with the server restarted (asserts 3/3 `call_verifications.is_match = 1`). Ends exit 0. The three negative arms are INTERNAL and asserted on their reason: missing `replay_from` (exit 1), drifted settings (exit 4), changed page under verify (exit 4, run `failed`). Replay/verify settings are GENERATED into `runs/` because `replay_from` must be literal YAML. Do not swap in ChaosLLM: OpenRouter replay always refuses, and verify never matches a server that sends `Date` or per-response ids (see the README's "Known limitations (0.8.1)") |
+
+### Fixed web search (own fixture server, no credentials)
+
+Run `./examples/fixed_web_search/run_fixture.sh`. The script starts a local
+search server on port 8213, runs `web_scrape` with a fixed node URL and row
+field mapped to query parameter `q`, and asserts three requests and output
+rows, then offline replay and live verification. It refuses to overwrite an existing audit DB or output. The separate
+`settings_abn_page.yaml` targets the public ABN Lookup results page as a small
+live example; it is not part of the offline fixture check.
+
+`./examples/fixed_web_search/run_detail_fixture.sh` runs a separate loopback
+search-to-detail pipeline on port 8215. It checks zero, one, and multiple
+candidate outcomes, source-to-output lineage, offline replay, and live verify.
 
 ### Chroma RAG (embedded, no external server)
 

@@ -66,14 +66,17 @@ the same row.
 Two independent SME reviews (a solution-design reviewer and a
 systems-thinking pattern-recognizer) traced the call paths and reached
 the same conclusion, recorded here. Their full verdicts are attached to
-Filigree issue `elspeth-a90f68e076`.
+legacy issue tracker issue `elspeth-a90f68e076`.
 
 ### What the call-path trace established
 
 - **The telemetry-vs-audit divergence does not exist.** `core.py:1787`
   reassigns `source_item` to its *sanitized* form before **both**
   `create_row` (the audit `data_hash`, via `create_quarantine_token` →
-  `engine/tokens.py:176`) **and** the telemetry `content_hash`
+  `engine/tokens.py:176`; since 2026-09-28 the fenced ingest
+  `engine.tokens.ingest_source_quarantine` →
+  `SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink`, which
+  receives the row `quarantine_router` already sanitized) **and** the telemetry `content_hash`
   (`core.py:1851`). For a quarantined row, audit `source_data_hash` ==
   telemetry `content_hash` — one algorithm, no divergence. Pinned by
   `tests/integration/pipeline/orchestrator/test_quarantine_routing.py:727`.
@@ -109,9 +112,11 @@ NOT be unified.**
   control surface*.
 
 These answer different audit questions. **Sanitizing the error-path hash
-would be fabrication** under CLAUDE.md's fabrication test: the audit
-record would attest to a normalized value (`None`) the external system
-never sent, erasing the very anomaly the error record exists to capture.
+would be fabrication** under the decision test
+(docs/guides/data-trust-and-error-handling.md §The Decision Test): the
+audit record would attest to a normalized value (`None`) the external
+system never sent, erasing the very anomaly the error record exists to
+capture.
 
 The three `repr_hash` fallbacks in `data_flow_repository.py` **stay**.
 They are load-bearing: they hash raw Tier-3 data that genuinely can
@@ -178,8 +183,10 @@ that basis, and that judgement is affirmed here.
 ### Neutral Consequences
 
 - The stale-rationale note: `create_row`'s `repr_hash` fallback is dead
-  code at its sole live caller (`create_quarantine_token`, which
-  pre-sanitizes). It is **kept** as a contract-defense guard — a future
+  code at its sole live caller (`create_quarantine_token` when this was
+  written; since 2026-09-28 the fenced quarantine ingest
+  `SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink`, whose
+  row `quarantine_router` pre-sanitizes). It is **kept** as a contract-defense guard — a future
   caller passing `quarantined=True` without sanitizing would otherwise
   lose a Tier-3 audit record. Its allowlist entry should be re-justified
   on contract-defense grounds rather than "data may contain NaN/Inf"
@@ -196,7 +203,8 @@ algorithm — matching the orchestrator telemetry path.
 
 **Rejected because:** It would sanitize the row **before** the error-path
 hash, making `validation_errors.row_hash` attest to a normalized value
-the external system never sent — fabrication under the CLAUDE.md test, and
+the external system never sent — fabrication under the decision test
+(docs/guides/data-trust-and-error-handling.md §The Decision Test), and
 the destruction of the raw-anomaly fingerprint the error record exists to
 preserve. It would also change emitted hash *values* (a schema-semantics
 migration that breaks historical reproducibility, baselines, and fixtures)
@@ -233,7 +241,7 @@ Consequences). Removing them would crash the audit write on the first
 - Related: ADR-010 (declaration-trust framework) and ADR-021 (sources and
   sinks uniformly boundary) — the trust-tier classification machinery that
   defines the Tier-3 boundary this ADR's hashes straddle.
-- Follow-up: Filigree `elspeth-a90f68e076` — durable hash-algorithm
+- Follow-up: legacy issue tracker `elspeth-a90f68e076` — durable hash-algorithm
   discriminator column (closes the post-purge ambiguity), a shared
   `audit_hash` primitive, and a cross-site lint (closes the proliferation
   loop). Both SME verdicts are attached there.
@@ -247,7 +255,8 @@ Consequences). Removing them would crash the audit write on the first
   `:1787`, quarantine `content_hash` at `:1851`, pending-error pop at
   `:1781`.
 - `src/elspeth/engine/tokens.py` — `create_quarantine_token` (~176) and
-  `link_validation_error_to_row` (~184–189).
+  `link_validation_error_to_row` (~184–189); both deleted 2026-09-28, the
+  link now runs inside `ingest_source_quarantine`'s one fenced transaction.
 - `src/elspeth/core/canonical.py` — `stable_hash`, `repr_hash`,
   `sanitize_for_canonical`, `canonical_json`.
 - `config/cicd/enforce_tier_model/core.yaml` — the four signed cicd-judge

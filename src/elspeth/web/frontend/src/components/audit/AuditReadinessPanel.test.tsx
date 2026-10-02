@@ -6,6 +6,7 @@ import { AuditReadinessPanel } from "./AuditReadinessPanel";
 import { useSessionStore } from "../../stores/sessionStore";
 import { useAuditReadinessStore, getInitialState } from "../../stores/auditReadinessStore";
 import { useExecutionStore } from "../../stores/executionStore";
+import { useMailboxStore } from "@/stores/mailboxStore";
 import { useInlineSourceStore } from "@/stores/inlineSourceStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
@@ -118,6 +119,8 @@ function snapshotWithValidationErrorAndProvenanceWarning(version: number): Audit
             component_id: "source",
             component_type: "source",
             detail: "source",
+            suggestion: null,
+            note: null,
           },
         ],
       },
@@ -167,6 +170,24 @@ describe("AuditReadinessPanel", () => {
     resetStore(useInterpretationEventsStore);
     resetStore(usePreferencesStore);
     vi.clearAllMocks();
+  });
+
+  it("does not host the approval controls — a blocking state belongs at the top level, not in this sub-tab", async () => {
+    // Operator placement ruling: a blocking state and the control that clears it
+    // sit in the chat/action bar, never behind Pipeline -> Checks. A pending
+    // approval withholds execution, so the request controls moved to ChatPanel
+    // beside the decision panel. This pins the absence so they cannot drift back.
+    useMailboxStore.setState({
+      summary: { governance: "on", roles: ["approver"], approvals_to_decide: 0, reviews_to_attest: 0, decisions_unseen: 0 },
+    } as never);
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) => makeAbortablePromise(allGreenSnapshot(1), { signal }),
+    );
+    render(<AuditReadinessPanel />);
+    await waitFor(() => expect(api.fetchAuditReadiness).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Request approval" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Request review" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Workflow approval readiness")).not.toBeInTheDocument();
   });
 
   it("auto-fetches on mount using compositionState.version", async () => {
@@ -464,6 +485,8 @@ describe("AuditReadinessPanel", () => {
             component_id: "first",
             component_type: "transform",
             detail: "first",
+            suggestion: null,
+            note: null,
           },
         ],
       },
@@ -644,6 +667,8 @@ describe("AuditReadinessPanel", () => {
               component_id: "source",
               component_type: "source",
               detail: "source",
+              suggestion: null,
+              note: null,
             },
           ],
         },
@@ -1046,6 +1071,9 @@ describe("AuditReadinessPanel", () => {
   });
 
   it("renders inline-content-hashed provenance row when the source is inline_blob-backed (Phase 5a.7)", async () => {
+    useSessionStore.setState({ compositionState: makeComposition(1, {
+      sources: { source: { plugin: "csv_file", options: { blob_ref: "blob-uuid" } } },
+    }) });
     // Seed an inline-source summary so the panel's projection branch fires.
     useInlineSourceStore.getState().setSummary(SESSION_ID, {
       blobId: "blob-uuid",
@@ -1079,7 +1107,12 @@ describe("AuditReadinessPanel", () => {
   });
 
   it("renders the default backend-supplied provenance summary when no inline source is bound (Phase 5a.7)", async () => {
-    // No inline source seeded — store returns null for getSummary(SESSION_ID).
+    // A cached previous blob must not describe the current pipeline.
+    useInlineSourceStore.getState().setSummary(SESSION_ID, {
+      blobId: "removed-blob", filename: "old.csv", mimeType: "text/csv",
+      contentPreview: "old", rowCount: 1, contentHash: "abc123def456789",
+      provenance: "verbatim",
+    });
     vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
       (_sid, signal) =>
         makeAbortablePromise(snapshotWithProvenanceWarning(1), { signal }),
@@ -1167,7 +1200,7 @@ describe("AuditReadinessPanel", () => {
       hash_domain_version: null,
       runtime_model_identifier_at_resolve: null,
       runtime_model_version_at_resolve: null,
-      resolved_prompt_template_hash: null,
+    approved_prompt_artifact_hash: null,
       ...overrides,
     };
   }

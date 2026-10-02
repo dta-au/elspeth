@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+# One retry policy for Composer convergence and every planner surface.
+LLM_API_MAX_ATTEMPTS = 3
+LLM_API_RETRY_BASE_DELAY_SECONDS = 1.0
+
 PROVIDER_REQUIRED_ENV_KEYS: dict[str, tuple[str, ...]] = {
     "anthropic": ("ANTHROPIC_API_KEY",),
     "azure": ("AZURE_API_KEY",),
-    "azure_ai": ("AZURE_API_KEY",),
+    "azure_ai": ("AZURE_AI_API_KEY",),
     # LiteLLM's Bedrock provider uses boto3's default AWS credential chain
-    # (task role, environment, profile, etc.); Composer must not inject or
-    # require a parallel static API-key contract.
+    # (task role, environment, profile, etc.), so Composer REQUIRES no key:
+    # a non-empty tuple here would mark Bedrock unavailable on every
+    # task-role deployment. A Bedrock API key (AWS_BEARER_TOKEN_BEDROCK) or
+    # static IAM pair is an optional alternative that LiteLLM reads from the
+    # same environment; it is never a precondition for availability.
     "bedrock": (),
     "openai": ("OPENAI_API_KEY",),
     "openrouter": ("OPENROUTER_API_KEY",),

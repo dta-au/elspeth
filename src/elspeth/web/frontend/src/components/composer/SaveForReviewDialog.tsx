@@ -20,7 +20,7 @@
  * selectable, so users on locked-down browsers can still copy manually.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { type JSX, useEffect, useRef, useState } from "react";
 
 import { Button, Input } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";

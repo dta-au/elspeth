@@ -112,6 +112,8 @@ def _make_export_enabled_settings() -> ElspethSettings:
                 "enabled": True,
                 "sink": "default",
                 "format": "json",
+                "signing_mode": "unsigned",
+                "compartment_id": "test-compartment",
                 "total_record_limit": 10_000,
                 "total_byte_limit": 10 * 1024 * 1024,
                 "chunk_limit": 100,

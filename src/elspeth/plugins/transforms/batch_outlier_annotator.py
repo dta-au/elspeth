@@ -12,39 +12,55 @@ from pydantic import Field, field_validator, model_validator
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.emitted_option import EmittedToOutput
-from elspeth.contracts.errors import PluginContractViolation, RowErrorEntry, TransformErrorReason
+from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowFieldCollisionError, BatchRowTypeError
 
 type BatchOutlierAnnotationRow = dict[str, object]
 
-_ANNOTATION_FIELD_SUFFIXES = (
-    "batch_size",
-    "is_outlier",
-    "mad",
-    "mean",
-    "median",
-    "missing_count",
-    "missing_indices",
-    "non_finite_count",
-    "non_finite_indices",
-    "reason",
-    "robust_z_score",
-    "robust_z_threshold",
-    "row_index",
-    "skipped_count",
-    "stdev",
-    "valid_count",
-    "value",
-    "value_field",
-    "z_score",
-    "z_threshold",
+# Every annotation suffix with the type the plugin's code fixes (ADR-050).
+# ``value`` is the row's own ``value_field`` value copied onto the annotation
+# unconverted (an int stays an int); only finite int and float values are
+# annotated at all (``_finite_entries_for``), so it is declared ``float``: an
+# int value satisfies a float declaration (ADR-050 Decision 5, ruling C3), and
+# any other type would be this plugin's filter failing. ``value_field`` is the
+# configured name and ``reason`` the joined reason labels. Only int and float values
+# reach the arithmetic (``_finite_entries_for`` fails the batch on any other
+# type), and ``_stats_for`` converts each one with ``float(...)`` before
+# computing, so the mean, median, stdev and MAD are floats; the thresholds are
+# the config model's floats and the counts are ints. A z-score is undefined
+# when the batch has no spread (stdev, MAD and mean absolute deviation all
+# zero) and is emitted None then, never 0.0 (B4.5-c). The index lists are
+# lists the schema DSL has no type for.
+_ANNOTATION_CREATED_SUFFIXES: tuple[FieldDefinition, ...] = (
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("is_outlier", "bool"),
+    FieldDefinition("mad", "float"),
+    FieldDefinition("mean", "float"),
+    FieldDefinition("median", "float"),
+    FieldDefinition("missing_count", "int"),
+    FieldDefinition("missing_indices", "any"),
+    FieldDefinition("non_finite_count", "int"),
+    FieldDefinition("non_finite_indices", "any"),
+    FieldDefinition("reason", "str"),
+    FieldDefinition("robust_z_score", "float", nullable=True),
+    FieldDefinition("robust_z_threshold", "float"),
+    FieldDefinition("row_index", "int"),
+    FieldDefinition("skipped_count", "int"),
+    FieldDefinition("stdev", "float"),
+    FieldDefinition("valid_count", "int"),
+    FieldDefinition("value", "float"),
+    FieldDefinition("value_field", "str"),
+    FieldDefinition("z_score", "float", nullable=True),
+    FieldDefinition("z_threshold", "float"),
 )
+_ANNOTATION_FIELD_SUFFIXES = tuple(field.name for field in _ANNOTATION_CREATED_SUFFIXES)
 _BACKWARD_INVARIANT_DROPPED_FIELD = "batch_outlier_annotator_dropped_probe_field"
 _MAX_BATCH_ROWS = 4096
 _MAX_SKIPPED_INDEX_DETAILS = 128
@@ -161,9 +177,11 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9b1f674f2a7a098d"
+    source_file_hash: str | None = "sha256:2501c11261dd8660"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
+    # Not passthrough-capable: a row whose value is null or non-finite is not emitted, and a one-row emission is TransformResult.success.
+    flush_emits_one_row_per_buffered_row = False
     preserves_input_values = True
     usage_when_to_use: str = (
         "Use for window-local z-score and robust-z annotations on finite numeric rows, preserving each valid "
@@ -202,9 +220,10 @@ class BatchOutlierAnnotator(BaseTransform):
                 summary="Annotates finite numeric rows with batch z-score and robust-z outlier fields.",
                 composer_hints=(
                     "Use batch_outlier_annotator under aggregations with a trigger; it needs the batch distribution.",
-                    "value_field must be numeric; missing and non-finite values are skipped and reported.",
-                    "output_prefix creates many annotation fields, so choose a prefix that cannot collide with input fields.",
+                    "value_field must be numeric; missing and non-finite values are skipped and reported, and a present non-numeric value fails the whole batch.",
+                    "output_prefix creates many annotation fields, so choose a prefix that cannot collide with input fields; an input row already carrying one fails the whole batch.",
                     "It emits one annotated row per finite input value and may drop skipped rows from success output.",
+                    "Use output_mode: transform; skipped invalid rows prevent the one-row-per-buffered-row guarantee required by passthrough. A failed batch applies on_error to all buffered rows; discard records quarantine outcomes.",
                 ),
             )
         return None
@@ -306,14 +325,18 @@ class BatchOutlierAnnotator(BaseTransform):
         ]
 
     def _reject_runtime_output_field_collision(self, rows: list[PipelineRow]) -> None:
+        """Fail the batch when a buffered row already carries an annotation field.
+
+        Under an observed upstream only the row data decides whether such a
+        field arrives, so this is a row fault, routed like any failed batch
+        (ruling on elspeth-d90495084c); an explicit schema declaring one is
+        refused at construction by ``_reject_explicit_output_field_collision``.
+        """
         for row_index, row in enumerate(rows):
             collisions = detect_field_collisions(set(row.keys()), self.declared_output_fields)
             if collisions is None:
                 continue
-            raise PluginContractViolation(
-                f"Transform '{self.name}' would overwrite existing input fields {collisions} "
-                f"in row {row_index}. This is a pipeline configuration error — choose a different output_prefix."
-            )
+            raise BatchRowFieldCollisionError(row_index=row_index, collisions=collisions)
 
     def _finite_entries_for(
         self,
@@ -329,11 +352,15 @@ class BatchOutlierAnnotator(BaseTransform):
                 missing_indices.append(row_index)
                 continue
 
+            # No coercion: a str that is not a number is not a number. A
+            # present wrong-typed value fails the WHOLE batch (the None and
+            # non-finite branches either side keep skip-and-report).
             if type(raw_value) not in (int, float):
-                raise TypeError(
-                    f"Field '{self._value_field}' must be numeric (int or float), "
-                    f"got {type(raw_value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                raise BatchRowTypeError(
+                    field=self._value_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(raw_value).__name__,
                 )
 
             if type(raw_value) is float and not math.isfinite(raw_value):
@@ -456,6 +483,13 @@ class BatchOutlierAnnotator(BaseTransform):
     def _field(self, suffix: str) -> str:
         return f"{self._output_prefix}_{suffix}"
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed suffix table above under the configured prefix (ADR-050)."""
+        return tuple(
+            FieldDefinition(self._field(field.name), field.field_type, required=field.required, nullable=field.nullable)
+            for field in _ANNOTATION_CREATED_SUFFIXES
+        )
+
     def _annotation_for(self, entry: _FiniteEntry, stats: _BatchStats) -> dict[str, object]:
         value = self._coerce_finite_float(entry.value, operation="float_conversion")
         missing_indices = stats.missing_indices[:_MAX_SKIPPED_INDEX_DETAILS]
@@ -527,6 +561,9 @@ class BatchOutlierAnnotator(BaseTransform):
                 if field.normalized_name not in merged_fields:
                     merged_fields[field.normalized_name] = field
 
+        # Each annotation enters as a placeholder; the ONE stamp rewrites it to
+        # the plugin's declaration (ADR-050) and the batch postflight checks
+        # every declared concrete type against the emitted values.
         for field_name in sorted(self.declared_output_fields):
             merged_fields[field_name] = FieldContract(
                 normalized_name=field_name,
@@ -541,7 +578,7 @@ class BatchOutlierAnnotator(BaseTransform):
             fields=tuple(merged_fields.values()),
             locked=True,
         )
-        return self._align_output_contract(output_contract)
+        return self._align_output_contract(self._apply_declared_output_field_contracts(output_contract))
 
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext
@@ -552,8 +589,15 @@ class BatchOutlierAnnotator(BaseTransform):
         if len(rows) > _MAX_BATCH_ROWS:
             return self._error_for_batch_too_large(batch_size=len(rows))
 
-        self._reject_runtime_output_field_collision(rows)
-        entries, missing_indices, non_finite_indices = self._finite_entries_for(rows)
+        try:
+            self._reject_runtime_output_field_collision(rows)
+            entries, missing_indices, non_finite_indices = self._finite_entries_for(rows)
+        except (BatchRowFieldCollisionError, BatchRowTypeError) as exc:
+            # The batch records that it failed and WHY — which row, which
+            # field(s) — never a row value (elspeth-d5034647f0). The caller
+            # owns disposition: an aggregation's on_error receives every
+            # buffered row, a collector fails the group.
+            return TransformResult.error(exc.as_reason(), retryable=False)
         if not entries:
             return self._error_for_no_finite_values(
                 batch_size=len(rows),

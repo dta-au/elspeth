@@ -124,20 +124,16 @@ secret is still sensitive evidence and does not belong in the package.
 
 ## 4. Capture structural and tracker state
 
-Use Loomweave only from the primary checkout. Record index identity,
-freshness, commit, capture time, and any diagnostic limitations. Absence in a
-stale or degraded index is not unreachability evidence.
+Inspect callers, definitions, and references in the assessed checkout. Record
+the commit, capture time, commands, and any search limitations. Absence from a
+text search alone is not unreachability evidence.
 
-Capture Filigree with exact non-truncated queries. At minimum retain:
+Capture the relevant GitHub Issues with complete, paginated queries. Retain
+the query, repository, issue URLs, captured fields, and capture time. Legacy
+`elspeth-*` identifiers remain archival references until separately triaged
+and imported; do not treat them as GitHub issue numbers.
 
-```bash
-filigree --version
-filigree search '[state engine]' --json
-filigree ready --json
-filigree blocked --json
-```
-
-Prefer a full JSONL export when tracker identity is load-bearing. Record the
+Prefer a complete issue export when tracker identity is load-bearing. Record the
 capture time, command/query, atomicity limitations, byte size, and SHA-256. A
 truncated session-context screen is orientation, not canonical evidence.
 
@@ -247,12 +243,12 @@ from decided terminal outcomes, ordinary pending work, and illegal re-entry.
 ## 8. Classify gaps and tracker ownership
 
 Every unresolved cell records a reason, observable exit gate, and
-`owner_issue`. Use `null` when genuinely unowned. Create or update a Filigree
+`owner_issue`. Use `null` when genuinely unowned. Create or update a GitHub
 issue for a coherent confirmed defect or actionable remediation theme; do not
 create one issue per unknown proof cell. A closed evidence-package issue is
 historical context, not the owner of broader residual work.
 
-Filigree status is live and mutable. Store the issue ID and captured snapshot;
+GitHub issue status is live and mutable. Store the issue ID and captured snapshot;
 do not copy current assignment or priority into evergreen architecture prose.
 
 ## 9. Review and iterate
@@ -399,8 +395,7 @@ rewrite a legacy result into v1 or v2 form.
 
 ## Failure handling
 
-- `SCHEMA_MISMATCH`: stop and surface the Filigree upgrade guidance.
-- stale Loomweave: refresh before structural claims.
+- incomplete source inspection: record the limitation before structural claims.
 - missing external credentials: mark affected cells unknown; do not infer pass.
 - dirty unrecorded worktree: stop or capture the complete overlay.
 - interrupted command: retain partial output as failed evidence and rerun under

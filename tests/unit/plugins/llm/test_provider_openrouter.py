@@ -10,13 +10,20 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 import pytest
 
 from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.call_governance import LLMCallGovernance
+from elspeth.contracts.call_mode import ReplayCallEvidence
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
@@ -38,6 +45,181 @@ if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 
 
+# Mock-only authority: these providers use FakeAuditRecorder, never a database.
+_LEADER_TOKEN = CoordinationToken(run_id="run-1", worker_id="leader-1", leader_epoch=1)
+_MEMBER_TOKEN = _LEADER_TOKEN.membership
+_WORK_ITEM = Mock(spec=TokenWorkItem)
+
+
+def test_replay_mode_reaches_openrouter_http_transport() -> None:
+    session = SimpleNamespace(mode=RunMode.REPLAY)
+    provider = OpenRouterLLMProvider(
+        api_key="test-key",
+        recorder=FakeAuditRecorder(),
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        call_mode_session=session,
+    )
+    with patch("elspeth.plugins.transforms.llm.providers.openrouter.AuditedHTTPClient") as transport:
+        provider._get_http_client(LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN))
+    assert transport.call_args.kwargs["call_mode_session"] is session
+
+
+def test_replay_semantic_llm_record_binds_source_call() -> None:
+    response = RawCallPayload({"content": "answer"})
+
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **kwargs: Any) -> SimpleNamespace:
+            assert kwargs["call_type"] is CallType.LLM
+            return SimpleNamespace(
+                source_call_id="original-semantic-call",
+                status=CallStatus.SUCCESS,
+                response_data=response.to_dict(),
+                error_data=None,
+            )
+
+    recorder = FakeAuditRecorder()
+    parent = LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN)
+    parent.record_call(
+        recorder,
+        call_index=0,
+        call_type=CallType.LLM,
+        status=CallStatus.SUCCESS,
+        request_data=RawCallPayload({"model": "gpt-4"}),
+        response_data=response,
+        call_mode_session=ReplaySession(),
+    )
+
+    assert recorder.operation_calls[0]["source_call_id"] == "original-semantic-call"
+
+
+def test_replay_semantic_llm_record_accepts_frozen_nested_response() -> None:
+    response = RawCallPayload({"content": "answer", "raw_response": {"choices": [{"message": {"content": "answer"}}]}})
+
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **_kwargs: Any) -> ReplayCallEvidence:
+            return ReplayCallEvidence("source-call", CallStatus.SUCCESS, response.to_dict(), None, 1.0)
+
+    recorder = FakeAuditRecorder()
+    LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN).record_call(
+        recorder,
+        call_index=0,
+        call_type=CallType.LLM,
+        status=CallStatus.SUCCESS,
+        request_data=RawCallPayload({"model": "gpt-4"}),
+        response_data=response,
+        call_mode_session=ReplaySession(),
+    )
+
+    assert recorder.operation_calls[0]["source_call_id"] == "source-call"
+
+
+def test_replay_semantic_llm_row_record_keeps_claim_authority() -> None:
+    response = RawCallPayload({"content": "answer"})
+
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **kwargs: Any) -> SimpleNamespace:
+            assert kwargs["current_state_id"] == "state-1"
+            return SimpleNamespace(
+                source_call_id="original-row-call",
+                status=CallStatus.SUCCESS,
+                response_data=response.to_dict(),
+                error_data=None,
+            )
+
+    recorder = FakeAuditRecorder()
+    parent = LLMAuditParent.for_row(state_id="state-1", token_id="token-1", member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM)
+    parent.record_call(
+        recorder,
+        call_index=0,
+        call_type=CallType.LLM,
+        status=CallStatus.SUCCESS,
+        request_data=RawCallPayload({"model": "gpt-4"}),
+        response_data=response,
+        call_mode_session=ReplaySession(),
+    )
+
+    recorded = recorder.calls[0]
+    assert recorded["source_call_id"] == "original-row-call"
+    assert recorded["member_token"] is _MEMBER_TOKEN
+    assert recorded["work_item"] is _WORK_ITEM
+
+
+def test_verify_semantic_llm_record_is_admitted_before_audit_and_compared_after() -> None:
+    recorder = FakeAuditRecorder()
+    request = RawCallPayload({"model": "gpt-4"})
+    response = RawCallPayload({"content": "answer"})
+    events: list[str] = []
+
+    class VerifySession:
+        mode = RunMode.VERIFY
+
+        def admit_verify_call(self, **kwargs: Any) -> str:
+            assert kwargs["request_data"] == request.to_dict()
+            assert recorder.operation_calls == []
+            events.append("admit")
+            return "source-call"
+
+        def verify_call(self, **kwargs: Any) -> SimpleNamespace:
+            assert len(recorder.operation_calls) == 1
+            assert kwargs["live_response_data"] == response.to_dict()
+            events.append("verify")
+            return SimpleNamespace(is_match=True)
+
+    parent = LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN)
+    parent.record_call(
+        recorder,
+        call_index=0,
+        call_type=CallType.LLM,
+        status=CallStatus.SUCCESS,
+        request_data=request,
+        response_data=response,
+        call_mode_session=VerifySession(),
+    )
+
+    assert events == ["admit", "verify"]
+
+
+@pytest.mark.parametrize("source_problem", ["missing", "ambiguous"])
+def test_verify_semantic_request_preflight_refuses_egress(source_problem: str) -> None:
+    class VerifySession:
+        mode = RunMode.VERIFY
+
+        def preflight_verify_request(self, **kwargs: Any) -> str:
+            assert kwargs["call_type"] is CallType.LLM
+            assert kwargs["request_data"]["model"] == "gpt-4"
+            raise AuditIntegrityError(f"Source request is {source_problem}")
+
+    recorder = FakeAuditRecorder()
+    provider = OpenRouterLLMProvider(
+        api_key="test-key",
+        recorder=recorder,
+        run_id="run-1",
+        telemetry_emit=FakeTelemetryEmit(),
+        call_mode_session=VerifySession(),
+    )
+    with (
+        patch.object(provider, "_get_http_client", side_effect=AssertionError("HTTP must not be constructed")) as transport,
+        pytest.raises(AuditIntegrityError, match=source_problem),
+    ):
+        provider.execute_query(
+            [ChatMessage(role="user", content="hello")],
+            model="gpt-4",
+            temperature=0.0,
+            max_tokens=32,
+            audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
+        )
+
+    transport.assert_not_called()
+    assert recorder.operation_calls == []
+
+
 @dataclass
 class FakeAuditRecorder:
     call_indexes: list[int] = field(default_factory=list)
@@ -46,13 +228,13 @@ class FakeAuditRecorder:
     calls: list[dict[str, Any]] = field(default_factory=list)
     operation_calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id: str | None) -> int:
+    def allocate_call_index(self, state_id: str | None, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         self.allocated_state_ids.append(state_id)
         if self.call_indexes:
             return self.call_indexes.pop(0)
         return len(self.allocated_state_ids) - 1
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         self.allocated_operation_ids.append(operation_id)
         return len(self.allocated_operation_ids) - 1
 
@@ -63,6 +245,7 @@ class FakeAuditRecorder:
     def record_operation_call(self, **call: Any) -> SimpleNamespace:
         self.operation_calls.append(call)
         return SimpleNamespace(
+            call_id=f"operation-call-{len(self.operation_calls)}",
             request_ref=f"operation-request-{len(self.operation_calls)}",
             response_ref=f"operation-response-{len(self.operation_calls)}",
         )
@@ -143,6 +326,69 @@ def _install_cached_http_client(
 ) -> None:
     provider._http_clients[audit_parent.cache_key] = cast("AuditedHTTPClient", http_client)
     provider._http_client_refs[audit_parent.cache_key] = 0
+
+
+@pytest.mark.parametrize("mode", ["success", "unknown", "malformed", "refused"])
+@pytest.mark.parametrize("preflight", [False, True])
+def test_governance_admits_before_dispatch_and_settles_recorded_outcomes(
+    audit_recorder: FakeAuditRecorder, telemetry_emit: FakeTelemetryEmit, mode: str, preflight: bool
+) -> None:
+    events: list[str] = []
+
+    def before() -> str:
+        events.append("before")
+        if mode == "refused":
+            raise RuntimeError("quota refused")
+        return "attempt-1"
+
+    def after(attempt_id: str, call_id: str) -> None:
+        assert attempt_id == "attempt-1"
+        assert call_id == f"operation-call-{len(audit_recorder.operation_calls)}"
+        assert audit_recorder.operation_calls[-1]["call_type"] is CallType.LLM
+        events.append("after")
+
+    provider = OpenRouterLLMProvider(
+        api_key="test-key",
+        recorder=audit_recorder,
+        run_id="run-1",
+        telemetry_emit=telemetry_emit,
+        llm_call_governance=LLMCallGovernance(before_call=before, after_call=after),
+    )
+    response = _make_http_response()
+    if mode == "unknown":
+        body = response.json()
+        del body["usage"]
+        response = httpx.Response(200, json=body, request=response.request)
+    elif mode == "malformed":
+        response = httpx.Response(200, json={"usage": {"prompt_tokens": 10, "completion_tokens": 5}}, request=response.request)
+    http_client = FakeHTTPClient(response=response)
+
+    def invoke() -> None:
+        if preflight:
+            provider.runtime_preflight(operation_id="op-1", model="gpt-4o", coordination_token=_LEADER_TOKEN)
+        else:
+            provider.execute_query(
+                [ChatMessage(role="user", content="hello")],
+                model="gpt-4o",
+                temperature=0.0,
+                max_tokens=32,
+                audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
+            )
+
+    with _provider_http_client(provider, http_client):
+        if mode == "refused":
+            with pytest.raises(RuntimeError, match="quota refused"):
+                invoke()
+        elif mode == "malformed":
+            with pytest.raises(LLMClientError):
+                invoke()
+        else:
+            invoke()
+    assert events == (["before"] if mode == "refused" else ["before", "after"])
+    assert len(http_client.post_calls) == (0 if mode == "refused" else 1)
+    assert len(audit_recorder.operation_calls) == (0 if mode == "refused" else 1)
+    if mode == "unknown":
+        assert audit_recorder.operation_calls[0]["token_usage"].prompt_tokens is None
 
 
 @pytest.fixture()
@@ -266,6 +512,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -284,7 +532,7 @@ class TestExecuteQuery:
         audit_recorder: FakeAuditRecorder,
         telemetry_emit: FakeTelemetryEmit,
     ) -> None:
-        parent = LLMAuditParent.for_row(state_id="state-1", token_id="token-1")
+        parent = LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-1", token_id="token-1")
         client = FakeHTTPClient(
             response=_make_http_response(),
             close_error=RuntimeError("close failed"),
@@ -311,7 +559,7 @@ class TestExecuteQuery:
         provider: OpenRouterLLMProvider,
         telemetry_emit: FakeTelemetryEmit,
     ) -> None:
-        parent = LLMAuditParent.for_operation(operation_id="operation-1")
+        parent = LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1")
         client = FakeHTTPClient(
             response=_make_error_response(503, body='{"error": "SENTINEL-provider-body"}'),
             close_error=RuntimeError("close failed"),
@@ -348,7 +596,7 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+                audit_parent=LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1"),
             )
 
         assert audit_recorder.calls == []
@@ -371,7 +619,7 @@ class TestExecuteQuery:
                     model="gpt-4o",
                     temperature=0.0,
                     max_tokens=100,
-                    audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+                    audit_parent=LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1"),
                 )
 
         assert audit_recorder.calls == []
@@ -395,6 +643,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=None,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -420,6 +670,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -439,13 +691,15 @@ class TestExecuteQuery:
             request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
         )
         http_client = FakeHTTPClient(response=resp)
-        with _provider_http_client(provider, http_client), pytest.raises(ContentPolicyError, match="null content"):
+        with _provider_http_client(provider, http_client), pytest.raises(LLMClientError, match="null content"):
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -472,6 +726,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -495,6 +751,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -526,19 +784,23 @@ class TestExecuteQuery:
                     temperature=0.0,
                     max_tokens=100,
                     audit_parent=LLMAuditParent.for_row(
+                        member_token=_MEMBER_TOKEN,
+                        work_item=_WORK_ITEM,
                         state_id="state-1",
                         token_id="tok-1",
                     ),
                 )
 
-    def test_empty_string_content_raises_content_policy_error(self, provider: OpenRouterLLMProvider) -> None:
+    def test_empty_string_content_raises_content_policy_error(
+        self, provider: OpenRouterLLMProvider, audit_recorder: FakeAuditRecorder
+    ) -> None:
         """Empty string content (not null) must raise ContentPolicyError,
         not ValueError from LLMQueryResult invariant."""
         body = json.dumps(
             {
                 "choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}],
+                "usage": {"completion_tokens_details": {"reasoning_tokens": 4}},
                 "model": "gpt-4o",
-                "usage": {"prompt_tokens": 10, "completion_tokens": 0},
             }
         )
         resp = httpx.Response(
@@ -555,13 +817,18 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
             )
 
-    def test_whitespace_only_content_raises_content_policy_error(self, provider: OpenRouterLLMProvider) -> None:
-        """Whitespace-only content must raise ContentPolicyError."""
+        assert audit_recorder.calls[-1]["token_usage"].reasoning_tokens == 4
+        assert audit_recorder.calls[-1]["token_usage"].prompt_tokens is None
+
+    def test_whitespace_only_content_without_refusal_raises_client_error(self, provider: OpenRouterLLMProvider) -> None:
+        """Whitespace alone does not establish a provider policy refusal."""
         body = json.dumps(
             {
                 "choices": [{"message": {"content": "   "}, "finish_reason": "stop"}],
@@ -576,13 +843,15 @@ class TestExecuteQuery:
             request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
         )
         http_client = FakeHTTPClient(response=resp)
-        with _provider_http_client(provider, http_client), pytest.raises(ContentPolicyError, match="empty content"):
+        with _provider_http_client(provider, http_client), pytest.raises(LLMClientError, match="empty content"):
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -597,6 +866,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -614,6 +885,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -645,6 +918,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -668,6 +943,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -682,6 +959,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -697,6 +976,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -712,6 +993,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -726,6 +1009,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -740,6 +1025,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -754,6 +1041,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -772,6 +1061,8 @@ class TestHTTPErrorMapping:
                     temperature=0.0,
                     max_tokens=100,
                     audit_parent=LLMAuditParent.for_row(
+                        member_token=_MEMBER_TOKEN,
+                        work_item=_WORK_ITEM,
                         state_id="state-1",
                         token_id="tok-1",
                     ),
@@ -800,6 +1091,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -824,6 +1117,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -845,6 +1140,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -866,9 +1163,15 @@ class TestClientCaching:
             telemetry_emit=telemetry_emit,
         )
 
-        client1 = provider._get_http_client(LLMAuditParent.for_row(state_id="state-a", token_id="tok-1"))
-        client2 = provider._get_http_client(LLMAuditParent.for_row(state_id="state-a", token_id="tok-1"))
-        client3 = provider._get_http_client(LLMAuditParent.for_row(state_id="state-b", token_id="tok-2"))
+        client1 = provider._get_http_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-a", token_id="tok-1")
+        )
+        client2 = provider._get_http_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-a", token_id="tok-1")
+        )
+        client3 = provider._get_http_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-b", token_id="tok-2")
+        )
 
         assert client1 is client2
         assert client1 is not client3
@@ -891,7 +1194,9 @@ class TestClientCaching:
 
         def create_client() -> None:
             barrier.wait()
-            c = provider._get_http_client(LLMAuditParent.for_row(state_id="state-race", token_id="tok-1"))
+            c = provider._get_http_client(
+                LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-race", token_id="tok-1")
+            )
             with collect_lock:
                 clients.append(c)
 
@@ -916,7 +1221,9 @@ class TestClientCaching:
             telemetry_emit=telemetry_emit,
         )
 
-        provider._get_http_client(LLMAuditParent.for_row(state_id="state-1", token_id="tok-1"))
+        provider._get_http_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-1", token_id="tok-1")
+        )
         assert len(provider._http_clients) == 1
 
         provider.close()
@@ -954,13 +1261,80 @@ class TestRuntimePreflight:
        audited HTTP payload, not web-visible exception text.
     """
 
+    @pytest.mark.parametrize("content", [None, "", "   "])
+    @pytest.mark.parametrize(
+        ("finish_reason", "refusal", "expected_type", "diagnostic"),
+        [
+            ("length", None, LLMClientError, "output token budget"),
+            ("stop", None, LLMClientError, "without an explicit refusal"),
+            ("content_filter", None, ContentPolicyError, "provider refused or filtered"),
+            ("stop", "private refusal detail", ContentPolicyError, "provider refused or filtered"),
+        ],
+    )
+    def test_preflight_missing_content_classification(
+        self,
+        provider: OpenRouterLLMProvider,
+        content: str | None,
+        finish_reason: str,
+        refusal: str | None,
+        expected_type: type[LLMClientError],
+        diagnostic: str,
+    ) -> None:
+        # Captured live failure shape: all 32 completion tokens were reasoning,
+        # finish_reason=length, content=null, refusal=null. No text was emitted.
+        response = httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": content, "refusal": refusal}, "finish_reason": finish_reason}],
+                "model": "test-reasoning-model",
+                "usage": {
+                    "prompt_tokens": 43,
+                    "completion_tokens": 32,
+                    "total_tokens": 75,
+                    "completion_tokens_details": {"reasoning_tokens": 32},
+                },
+            },
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        )
+        http_client = FakeHTTPClient(response=response)
+        with patch("elspeth.plugins.transforms.llm.providers.openrouter.AuditedHTTPClient", autospec=True) as client_cls:
+            client_cls.return_value = http_client
+            with pytest.raises(expected_type, match=diagnostic) as exc_info:
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="test-reasoning-model")
+        assert type(exc_info.value) is expected_type
+        assert exc_info.value.retryable is False
+        assert "private refusal detail" not in str(exc_info.value)
+
+    def test_preflight_reserves_bounded_reasoning_allowance(self, provider: OpenRouterLLMProvider) -> None:
+        # Captured successful control used 25 reasoning tokens plus two text
+        # tokens. Success must still require visible provider-authored content.
+        response = httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok", "refusal": None}, "finish_reason": "stop"}],
+                "model": "test-reasoning-model",
+                "usage": {
+                    "prompt_tokens": 43,
+                    "completion_tokens": 27,
+                    "total_tokens": 70,
+                    "completion_tokens_details": {"reasoning_tokens": 25},
+                },
+            },
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+        )
+        http_client = FakeHTTPClient(response=response)
+        with patch("elspeth.plugins.transforms.llm.providers.openrouter.AuditedHTTPClient", autospec=True) as client_cls:
+            client_cls.return_value = http_client
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="test-reasoning-model")
+        assert http_client.last_post.kwargs["json"]["max_tokens"] == 256
+
     def test_preflight_request_max_tokens_meets_azure_floor(self, provider: OpenRouterLLMProvider) -> None:
         """Preflight request body must include max_tokens >= 16 (Azure backend floor)."""
         http_client = FakeHTTPClient(response=_make_http_response(content="OK"))
         with patch("elspeth.plugins.transforms.llm.providers.openrouter.AuditedHTTPClient", autospec=True) as client_cls:
             client_cls.return_value = http_client
 
-            provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             request_body = http_client.last_post.kwargs["json"]
             assert "max_tokens" in request_body, (
@@ -983,7 +1357,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             assert "HTTP 400" in message
@@ -1003,7 +1377,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(RateLimitError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             assert "Rate limited" in message
@@ -1020,7 +1394,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(ServerError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             assert "Server error (HTTP 500)" in message
@@ -1043,6 +1417,8 @@ class TestRuntimePreflight:
                     temperature=0.0,
                     max_tokens=100,
                     audit_parent=LLMAuditParent.for_row(
+                        member_token=_MEMBER_TOKEN,
+                        work_item=_WORK_ITEM,
                         state_id="state-1",
                         token_id="tok-1",
                     ),
@@ -1065,7 +1441,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             assert len(message) < 600, (
@@ -1084,7 +1460,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             _assert_provider_body_redacted(message, "authorization", "sk-or-v1-header-secret")
@@ -1102,7 +1478,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             _assert_provider_body_redacted(message, "application/sk-or-v1-header-secret", "sk-or-v1-header-secret")
@@ -1124,7 +1500,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             assert "HTTP 400" in message

@@ -1,12 +1,140 @@
 # ADR-047: Landscape Database-Clock Authority — Custody, Liveness, Expiry and Takeover Decisions Read the Landscape Database's Clock
 
 **Date:** 2026-09-05
-**Status:** Accepted (P4-C6, elspeth-0ff11aa42e; ruled EXECUTE under Q1(c), elspeth-d729c26729; accepted at the 0.8.0 release — C6.0–C6.4 landed, the gate's four ids green at `-n 0`, programme ticket closed 2026-09-06)
+**Status:** Accepted; amended 2026-09-08 for fresh lease decisions (elspeth-8f97b3403e, operator approval recorded in comment 9902). Original P4-C6 programme: elspeth-0ff11aa42e; Q1(c): elspeth-d729c26729.
 **Deciders:** ELSPETH maintainer
 **Review evidence:** the fail-closed gate `tests/unit/core/landscape/test_database_clock_authority.py` (4 red ids; corpus measured at p4/c `ccb98a293`: 180 distinct findings across 21 files); the Sessions-side precedent `_SessionOperationAuthorityRepository._database_now` / `_lock_fence_and_read_database_time`; ADR-030
 **Tags:** landscape, coordination, multi-replica, clock, fencing, related-adr-030
 
-## Context
+## Current decision — amendment of 2026-09-08
+
+Landscape remains the sole database clock authority for Landscape custody,
+liveness and expiry. For a lease decision, acquire the required authority and
+lease-subject locks before obtaining a fresh, aware-UTC Landscape database sample.
+Reuse that sample for the decision's eligibility predicates, CAS conditions,
+deadline writes and associated timestamps. No process or Sessions clock enters
+the decision, and no public caller can supply its time.
+
+`read_landscape_decision_time(conn)` in
+`src/elspeth/core/landscape/database_clock.py` provides the fresh sample. On
+PostgreSQL it executes a separate `SELECT clock_timestamp()` after locking;
+on SQLite it reads database time with millisecond resolution after the write
+lock is acquired. PostgreSQL's transaction-start `CURRENT_TIMESTAMP` is not
+fresh after a wait. An inline `clock_timestamp()` in a contended UPDATE also
+does not establish post-lock sampling: the target expression can be evaluated
+before the row lock is obtained. The old `read_landscape_transaction_time`
+helper retains its separately named transaction-time semantics; it cannot
+stand in for the fresh sample of a locked lease decision. The dialects'
+timestamp semantics are documented by [PostgreSQL](https://www.postgresql.org/docs/16/functions-datetime.html#FUNCTIONS-DATETIME-CURRENT)
+and [SQLite](https://www.sqlite.org/lang_datefunc.html).
+
+The leader identity-and-epoch fence remains the first authority operation,
+with a direct full-token conditional UPDATE and immediate cardinality-one
+refusal. An identity-preserving UPDATE establishes the lock before the fresh
+deadline renewal. The lock remains held through commit or rollback. Expiry is
+not added to this admission predicate. A pure membership fence checks active
+worker identity and does not issue or renew a heartbeat. Item fencing retains
+its active-member, owner and attempt predicates: expiry makes an item eligible
+for recovery, but recovery's generation change revokes its owner. Sink-effect
+operations retain their owner, generation, status and strict-expiry rules.
+An effect's strict expiry check admits the operation while the effect and
+authority locks remain held; later audit-body work does not acquire a new
+expiry-through-completion guarantee.
+
+The transaction owner must finalize only the continuing deadlines that its
+transaction explicitly issues or renews, after its body and while the required
+locks remain held, or refuse completion when its selected reserve has been
+consumed. The implementation uses explicit family-owned issuance and renewal:
+
+- A successful leader-fenced body renews its still-owned seat at its normal
+  completion boundary. Intentional release cancels that obligation; the
+  completion path must not recreate the seat.
+- Registration, acquisition and leader heartbeat issue paired seat and worker
+  deadlines from one final sample. Ordinary leader-fenced writes renew only
+  the seat. Follower admission rechecks the foreign seat's liveness and cannot
+  renew that seat.
+- Scheduler and sink-effect writers lock the target, sample once, issue their
+  deadline and register the exact persisted expiry. Their immutable return
+  values and audit events retain that exact expiry. A long remaining body is
+  refused rather than silently changing those published values.
+- Connection-accepting helpers register obligations on the caller's outer
+  transaction. Returning from a helper is not a commit; the helper neither
+  commits nor retries the caller's body. Registration inside a savepoint is
+  rejected until nested rollback semantics are explicitly supported.
+
+A shared read-only commit guard checks registered deadlines after journal
+enrichment, serialization and outbox insertion, immediately before the DBAPI
+commit. Family renewal DML occurs before journal serialization. The guard does
+not discover leases, rewrite deadlines or retry work. State is scoped to the
+outer transaction and cleared on every exit, including rollback and failed
+commit, so pooled connections cannot retain another transaction's obligations.
+
+A LandscapeDB engine installs this guard during setup. Externally supplied
+engines should install it before concurrent use; lazy registration alone does
+not establish safe first installation alongside an already-running custom
+commit listener.
+
+For effective nominal duration `W` (the duration actually added after any
+dialect or TTL alignment), the implementation requires a remaining reserve of
+`min(1 second, 0.1 × W)` at that check. This is a completion threshold chosen
+to reject consumed tails while supporting short test and configured leases;
+it is not a measured bound on production commit latency. Consumed reserve
+raises an owned timeout and rolls back the transaction, without claiming lost
+membership, corruption or permission to replay an external effect. An uncertain
+commit or a delayed postcommit journal drain must not cause automatic replay.
+
+The configured duration is nominal from the final issuance sample. The check
+establishes remaining life at the check, not an unconditional lifetime after
+an unbounded commit or delayed client receipt. A minimum-at-commit guarantee
+would additionally require a bound on the remaining commit delay and database
+clock movement. Subsequent protected operations still revalidate authority.
+Equality is required within each locked decision, not between every clock read
+throughout an arbitrarily long transaction. Earlier conservative candidate
+discovery may use an earlier sample, but the locked decision revalidates the
+relevant eligibility conditions.
+
+This amendment supersedes the original transaction-time/equality ruling,
+the inline first-fence deadline requirement, the fence's SQLite formatting
+exception, and corresponding consequences and clock pins below. Database
+custody, aware UTC, separate Landscape/Sessions domains, forensic-clock
+freedom, and the prohibition on caller-clock injection remain in force.
+The implementation and verification plan — "Landscape lease clocks",
+2026-09-08 — has been retired from the active public docs and is retrievable
+from git history. The 0.8.1 entry of the [changelog](../../../CHANGELOG.md)
+records the resulting behaviour: lease deadlines are issued after locked
+admission rather than from a clock sampled before it, and sink-effect clocks
+are sampled after their lease locks.
+
+### Evidence and limits
+
+The original PostgreSQL proof held a vacant export seat for 82 seconds and
+observed an 80-second lease already expired after acquisition returned. That
+measures post-return residual life, not an exact commit timestamp or deployed
+contention frequency. The independent follow-up reproduced pre-lock evaluation
+of an inline fresh clock expression. These establish the defect and the need
+for explicit ordering without requiring a production measurement campaign.
+
+Leader-fenced database bodies hold the seat lock through completion, so expiry
+alone cannot install another epoch during that body. This does not prove the
+safety of every external-effect protocol. Journaling can extend the transaction
+through precommit work; its postcommit drain occurs after the original seat lock
+is released. The ACA web opening path does not enable that journal.
+
+Required proofs cover server-observed lock waits, expiry crossed while waiting,
+long leader and caller-owned bodies, intentional release, unchanged member
+liveness, exact returned/event/persisted expiries, journal-delay rollback,
+connection reuse and the distinction between transaction and decision time.
+Static gates must prove clock provenance and operation ordering, and retain
+their adversarial controls. The full default and serial PostgreSQL suites run
+on the integrated implementation before closure.
+
+## Original decision record — superseded where stated above
+
+The remaining sections preserve the original C6 rationale and implementation
+record. Their counts and future-tense instructions describe that historical
+programme; they are not the current inventory or execution instructions.
+
+## Original context
 
 ADR-030 made the Landscape database the arbiter of run leadership, worker
 liveness, scheduler leases, sink-effect leases and checkpoint fencing. Every
@@ -101,7 +229,7 @@ Constraints the design must respect:
   scheduling and forensic `recorded_at`.
 - No `xfail`, no `--deselect`, no assertion loosening (Phase 4 doctrine).
 
-## Decision
+## Original decision
 
 **Every custody, liveness, expiry, takeover and stale-owner decision against the
 Landscape derives its "now" from the Landscape database, read inside the same
@@ -112,23 +240,24 @@ time, never by passing time.**
 Concretely:
 
 1. **One read-once helper, in the Landscape domain.**
-   `elspeth.core.landscape.database.landscape_database_now(conn) -> datetime`
+   `elspeth.core.landscape.database_clock.read_landscape_transaction_time(conn) -> datetime`
    executes `SELECT CURRENT_TIMESTAMP` on both dialects (SQLite: UTC text at
    1 s resolution; PostgreSQL: transaction start time at µs resolution),
-   parses the result, and returns an aware UTC `datetime`. It is called **once per
-   write transaction, after the transaction's locks are taken**, and the
-   value is threaded to every deadline write and comparison in that
-   transaction. It raises `NotImplementedError` for any other dialect. It
-   lives next to `begin_write` so the transaction owner and the clock are the
-   same module, and it never imports from `elspeth.web`.
+   parses the result, and returns an aware UTC `datetime`. The returned value
+   is threaded to the deadline writes and comparisons of the decision. It
+   raises `NotImplementedError` for any other dialect and never imports from
+   `elspeth.web`. The original locks-before-read requirement does not establish
+   clock freshness on PostgreSQL: some callers read before locking, and even
+   a read after locking still returns transaction-start time. SQLite's
+   `BEGIN IMMEDIATE` acquires its write lock before the clock query.
 
    `CURRENT_TIMESTAMP` (not `clock_timestamp()`) is chosen on PostgreSQL so
    that the in-SQL fence expression (item 2) and the read-once value are the
    **same instant** within one transaction (ruled 2026-09-05, comment 9425
    on elspeth-0ff11aa42e). The Sessions authority uses `clock_timestamp()`;
-   the two domains are separate and the difference is deliberate: Landscape
-   transactions are `BEGIN IMMEDIATE` write transactions whose decisions
-   must be internally consistent.
+   the two domains are separate and the difference is deliberate. SQLite
+   Landscape writes use `BEGIN IMMEDIATE`; PostgreSQL uses its own transaction
+   and row-lock semantics. Both require internally consistent decisions.
 
    **Timezone contract.** The helper returns an *aware UTC* `datetime` on
    both dialects: PostgreSQL `CURRENT_TIMESTAMP` is `timestamptz` and is
@@ -144,34 +273,34 @@ Concretely:
    agreed. The pin tests in C6.0 (Notes, below) cover an aware non-UTC
    input and a non-UTC session timezone.
 
-   **Transaction time is the conservative direction — and its one
-   exception.** Inside a transaction every read of `CURRENT_TIMESTAMP` is
-   the transaction's *start*, so a verb that waited on a lock sees a `now`
-   that is *earlier* than wall time by its lock wait. For every
-   expiry/takeover/recovery predicate in the corpus the stale-early side is
-   the safe side: `stored_deadline < now` becomes true *later*, so a
-   takeover, lease recovery, dead-worker eviction, or expiry-driven
-   `NonResumableRunError` cannot fire early, and an extension writes
-   `start + window`, which is never later than the truth. The exception is
-   any check whose *permissive* outcome is "still live": a stale-early
-   `now` can over-report liveness by at most the transaction's age. Two
-   sites are of that shape — `admit_follower` (admits a follower while the
-   seat reads live) and the `seat_live` projection `worker_heartbeat` returns
-   to the heartbeat thread — and both are bounded and self-correcting: the
-   transaction is one statement long with no I/O inside it, so its age is
-   the lock wait plus one round trip; and an over-admitted follower is
-   refused at its first fenced verb (`verify_and_extend_leader_fence` is
-   identity+epoch, not time) while the heartbeat thread re-reads on its next
-   beat. The ordering proof for everything else is locks-before-read: every
-   verb holds its transaction's write lock (`BEGIN IMMEDIATE` on SQLite; the
-   row lock of its `SELECT … FOR UPDATE` or of the CAS `UPDATE … WHERE
-   deadline < now`, which re-evaluates its predicate on the locked row, on
-   PostgreSQL) at the moment it *decides* on a deadline, and a sibling's
-   fence or release committed after our transaction began is visible to
-   that locked decision (READ COMMITTED sees committed rows) and is compared
-   against our earlier `now` — which, by the paragraph above, can only make
-   the sibling's row look *less* expired. No Landscape verb needs to observe
-   a sibling's write as *already expired* to be correct.
+   **Erratum, 2026-09-08: expiry predicates and deadline writes have different
+   timing requirements.** PostgreSQL's `CURRENT_TIMESTAMP` is the transaction's
+   start, even when queried after a lock wait. An early `now` delays the truth
+   of `stored_deadline < now`; it does not make that expiry predicate fire
+   early. Conversely, it can over-report "still live", including in
+   `admit_follower` and the `seat_live` heartbeat projection. These verbs use
+   multiple statements; their transaction age is not merely one round trip.
+
+   The previous explanation incorrectly extended that conservative-predicate
+   argument to deadline writes. A deadline of `transaction_start + window`
+   has remaining life `window - transaction_age` at commit. Lock waits and
+   work performed by the transaction body both consume this life. The default
+   80-second window equals the documented sizing minimum, so the implementation
+   cannot promise that full minimum remains after commit. A PostgreSQL proof
+   observed an 80-second export lease already expired after an 82-second seat
+   lock wait (`elspeth-8f97b3403e`; evidence also recorded in comment 9894 on
+   `elspeth-0ff11aa42e`). This is a liveness defect, not evidence that a lock
+   wait of that duration occurs in deployed workloads.
+
+   Leader-fenced database mutations retain the seat-row lock through their
+   transaction's commit or rollback. Takeover waits for that lock; expiry
+   alone cannot install another epoch during the fenced body. Long bodies can
+   nevertheless delay heartbeat and takeover and leave an expired deadline
+   when they commit. External effects outside that transaction need their own
+   effect-protocol evidence; the seat lock alone does not establish their
+   safety. This erratum corrects the rationale without changing the selected
+   clock. A deadline-freshness contract and its implementation remain subject
+   to a separate architectural decision.
 
 2. **The first fence writes database time in SQL.**
    `verify_and_extend_leader_fence(conn, *, token, window_seconds, verb)` loses
@@ -273,7 +402,7 @@ What this ADR does **not** do:
   seam. The absence of a seam is the safety property.
 - It does not add a `--deselect`; the four ids go green by implementation.
 
-## Consequences
+## Original consequences
 
 ### Positive Consequences
 
@@ -315,7 +444,7 @@ What this ADR does **not** do:
 - `updated_at` on the coordination seat becomes database time from the fence
   and `database_now` elsewhere; it is forensic but harmlessly consistent.
 
-## Alternatives Considered
+## Original alternatives considered
 
 ### Alternative 1: Keep the caller clock and require replicas to run NTP
 
@@ -401,7 +530,8 @@ four ids are green at `-n 0`, and the programme ticket elspeth-0ff11aa42e
 closed 2026-09-06. This ADR is Accepted; the plan above is retained as the
 implementation record.**
 
-Rulings (2026-09-05, hub comment 9425 on elspeth-0ff11aa42e; no merge-writer
+Original rulings (2026-09-05, hub comment 9425 on elspeth-0ff11aa42e; superseded
+for fresh lease decisions by the 2026-09-08 amendment above; no merge-writer
 veto):
 
 1. `CURRENT_TIMESTAMP` (transaction time) on PostgreSQL — **confirmed**; the

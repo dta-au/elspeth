@@ -141,18 +141,27 @@ class TestBatchDriftCompare:
         transform = BatchDriftCompare({"schema": DYNAMIC_SCHEMA, "cohort_field": "cohort", "value_field": "score"})
 
         rows = [
-            _make_row({"cohort": "baseline", "score": 1e308}),
-            _make_row({"cohort": "baseline", "score": 1e308}),
-            _make_row({"cohort": "current", "score": 1.0}),
+            _make_row({"cohort": "leaked-baseline", "score": 1e308}),
+            _make_row({"cohort": "leaked-current", "score": 1.0}),
+            _make_row({"cohort": "leaked-baseline", "score": 1e308}),
         ]
 
         result = transform.process(rows, ctx)
 
         assert result.status == "error"
+        assert result.retryable is False
         assert result.reason is not None
         assert result.reason["reason"] == "float_overflow"
         assert result.reason["operation"] == "baseline_mean"
-        assert result.reason["group_value"] == "current"
+        assert result.reason["field"] == "score"
+        assert result.reason["group_by"] == "cohort"
+        assert result.reason["batch_size"] == 3
+        # Cohorts are named by the batch row where each was first seen, never by value.
+        assert result.reason["error"] == (
+            "baseline_mean overflowed comparing the cohort first seen in row 1 against the baseline cohort first seen in row 0"
+        )
+        assert "group_value" not in result.reason
+        assert "leaked-" not in repr(sorted(result.reason.items()))
 
     def test_categorical_drift_uses_total_variation_and_chi_square_summary(self, ctx: PluginContext) -> None:
         from elspeth.plugins.transforms.batch_drift_compare import BatchDriftCompare
@@ -210,36 +219,120 @@ class TestBatchDriftCompare:
         assert shifts[("int", 1)]["baseline_count"] == 0
         assert shifts[("int", 1)]["cohort_count"] == 1
 
-    def test_numeric_non_numeric_values_raise_type_error(self, ctx: PluginContext) -> None:
+    def test_numeric_non_numeric_value_fails_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
+        """A wrong-typed numeric value fails the BATCH with a value-free reason naming its BATCH row.
+
+        The bad row is the second row of its cohort but row 3 of the batch; the
+        reason must name the batch position, which is where the operator finds it.
+        """
         from elspeth.plugins.transforms.batch_drift_compare import BatchDriftCompare
 
         transform = BatchDriftCompare({"schema": DYNAMIC_SCHEMA, "cohort_field": "cohort", "value_field": "score"})
 
         rows = [
             _make_row({"cohort": "baseline", "score": 1.0}),
-            _make_row({"cohort": "current", "score": "high"}),
-        ]
-
-        with pytest.raises(TypeError, match="must be numeric"):
-            transform.process(rows, ctx)
-
-    def test_no_valid_values_for_cohort_returns_error(self, ctx: PluginContext) -> None:
-        from elspeth.plugins.transforms.batch_drift_compare import BatchDriftCompare
-
-        transform = BatchDriftCompare({"schema": DYNAMIC_SCHEMA, "cohort_field": "cohort", "value_field": "score"})
-
-        rows = [
-            _make_row({"cohort": "baseline", "score": 1.0}),
-            _make_row({"cohort": "current", "score": None}),
+            _make_row({"cohort": "current", "score": 2.0}),
+            _make_row({"cohort": "baseline", "score": 3.0}),
+            _make_row({"cohort": "current", "score": "leaked-score-text"}),  # Fails the BATCH, never skipped
         ]
 
         result = transform.process(rows, ctx)
 
         assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "score"
+        assert result.reason["expected"] == "numeric (int or float)"
+        assert result.reason["actual_type"] == "str"
+        assert result.reason["error"] == "must be numeric (int or float), got str in row 3"
+        assert "leaked-score-text" not in repr(sorted(result.reason.items()))
+
+    def test_categorical_non_scalar_value_fails_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
+        """A float category fails the BATCH with a value-free reason naming its BATCH row."""
+        from elspeth.plugins.transforms.batch_drift_compare import BatchDriftCompare
+
+        transform = BatchDriftCompare(
+            {"schema": DYNAMIC_SCHEMA, "cohort_field": "cohort", "value_field": "label", "value_type": "categorical"}
+        )
+
+        rows = [
+            _make_row({"cohort": "baseline", "label": "a"}),
+            _make_row({"cohort": "current", "label": "b"}),
+            _make_row({"cohort": "baseline", "label": "a"}),
+            _make_row({"cohort": "current", "label": 2.71828}),  # Fails the BATCH, never skipped
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "label"
+        assert result.reason["expected"] == "a scalar category (str, int, or bool)"
+        assert result.reason["actual_type"] == "float"
+        assert result.reason["error"] == "must be a scalar category (str, int, or bool), got float in row 3"
+        assert "2.71828" not in repr(sorted(result.reason.items()))
+
+    def test_no_valid_values_for_cohort_names_batch_rows_not_the_cohort_value(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_drift_compare import BatchDriftCompare
+
+        transform = BatchDriftCompare({"schema": DYNAMIC_SCHEMA, "cohort_field": "cohort", "value_field": "score"})
+
+        rows = [
+            _make_row({"cohort": "baseline", "score": 1.0}),
+            _make_row({"cohort": "leaked-cohort-name", "score": None}),
+            _make_row({"cohort": "baseline", "score": 2.0}),
+            _make_row({"cohort": "leaked-cohort-name", "score": float("nan")}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
         assert result.reason is not None
         assert result.reason["reason"] == "validation_failed"
         assert result.reason["cause"] == "no_valid_values"
-        assert result.reason["group_value"] == "current"
+        assert result.reason["field"] == "score"
+        assert result.reason["group_by"] == "cohort"
+        assert result.reason["valid_count"] == 0
+        assert result.reason["skipped_count"] == 2
+        assert result.reason["row_errors"] == [
+            {"row_index": 1, "reason": "missing_value"},
+            {"row_index": 3, "reason": "non_finite_value"},
+        ]
+        assert "group_value" not in result.reason
+        assert "leaked-cohort-name" not in repr(sorted(result.reason.items()))
+
+    def test_configured_baseline_missing_counts_cohorts_without_listing_their_values(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_drift_compare import BatchDriftCompare
+
+        transform = BatchDriftCompare(
+            {"schema": DYNAMIC_SCHEMA, "cohort_field": "cohort", "value_field": "score", "baseline_cohort": "baseline"}
+        )
+
+        rows = [
+            _make_row({"cohort": "leaked-cohort-a", "score": 1.0}),
+            _make_row({"cohort": "leaked-cohort-b", "score": 2.0}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason is not None
+        assert result.reason["reason"] == "validation_failed"
+        assert result.reason["cause"] == "baseline_cohort_missing"
+        assert result.reason["group_by"] == "cohort"
+        # The configured baseline is operator config, not row content.
+        assert result.reason["expected"] == "baseline"
+        assert result.reason["count"] == 2
+        assert "leaked-cohort" not in repr(sorted(result.reason.items()))
 
     def test_empty_batch_returns_error(self, ctx: PluginContext) -> None:
         from elspeth.plugins.transforms.batch_drift_compare import BatchDriftCompare

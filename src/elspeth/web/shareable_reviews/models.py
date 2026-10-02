@@ -155,8 +155,8 @@ class NodeSpecResponse(_StrictResponse):
     # in ``nodes[].id`` and the edge list) and the public YAML consumer
     # ``generate_public_pipeline_dict`` requires it to lower the ``scopes:``
     # block (yaml_generator.py ``_require_node_key(c, "scope_name", ...)``).
-    # The guided ``_CollectorBehavior`` privacy ruling governs the stable-id'd
-    # proposal projection, which this mirror is not.
+    # Proposal projections have their own privacy boundary; this strict
+    # mirror is not a proposal projection.
     scope_name: str | None = None
     scope_opener: str | None = None
     scope_policy: str | None = None
@@ -185,9 +185,7 @@ class OutputSpecResponse(_StrictResponse):
 class CompositionStateResponse(_StrictResponse):
     """Strict wire mirror of ``CompositionState`` (web/composer/state.py).
 
-    Shape tracks ``CompositionState.to_dict()`` exactly. ``guided_session``
-    is intentionally absent — the producer (``to_dict``) does not emit it,
-    and the shared-inspect view has no read on guided-session state.
+    Shape tracks ``CompositionState.to_dict()`` exactly.
 
     JsonValue is acceptable as the type of free-form plugin options but
     the structural top-level keys are closed.
@@ -220,9 +218,8 @@ class SharedInspectResponse(_StrictResponse):
     identity id the token signature binds — stable, but meaningless to a
     recipient who has no login. ``created_by_username`` is the sharer's
     human-readable name, frozen into the snapshot at mark-time, and is
-    what the reviewer's banner shows. It is ``None`` for snapshots minted
-    before the field existed; those blobs are immutable signed bytes and
-    cannot be backfilled, so the frontend falls back to the opaque id.
+    what the reviewer's banner shows. This release requires it in every
+    signed share snapshot.
 
     ``expires_at`` lets the frontend show "this link expires in N days"
     without re-decoding the token.
@@ -235,8 +232,6 @@ class SharedInspectResponse(_StrictResponse):
     yaml: str
     audit_readiness: AuditReadinessSnapshot
     created_by_user_id: str
-    # Required-but-nullable rather than defaulted: every producer must decide
-    # what attribution it has. Only the legacy-blob path may answer "none".
-    created_by_username: str | None
+    created_by_username: str
     created_at: datetime
     expires_at: datetime

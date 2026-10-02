@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json
@@ -375,9 +375,15 @@ async def test_legacy_persistence_bounds_deep_response_before_recursive_projecti
     )
 
     message = service.messages[0]
-    expected = {"_redaction_status": "response_projection_limit"}
+    # upsert_node declares ``data`` known, so the over-depth value degrades to
+    # the per-key sentinel and the envelope framing survives; the canary is
+    # never walked into the persisted row or the invocation projection.
+    expected = {**result, "data": "<redacted-response-projection-limit>"}
+    persisted_result = message.kwargs["tool_calls"][0]["invocation"]["result_canonical"]
     assert json.loads(message.content) == expected
-    assert json.loads(message.kwargs["tool_calls"][0]["invocation"]["result_canonical"]) == expected
+    assert json.loads(persisted_result) == expected
+    assert "RAW_DEEP_PERSISTENCE_CANARY" not in message.content
+    assert "RAW_DEEP_PERSISTENCE_CANARY" not in persisted_result
 
 
 @pytest.mark.asyncio
@@ -509,6 +515,7 @@ async def test_schema_valid_semantic_arg_error_persists_only_closed_argument_pro
         finished_at=datetime(2026, 7, 27, tzinfo=UTC),
         latency_ms=12,
         actor="composer-web:user-test",
+        error_category=ToolArgumentErrorCategory.SEMANTIC_RULE,
     )
     service = _CapturingSessionService()
     session_id = uuid4()
@@ -722,6 +729,7 @@ async def test_arg_error_result_for_response_model_tool_persists_without_success
         finished_at=datetime(2026, 5, 24, tzinfo=UTC),
         latency_ms=12,
         actor="composer-web:user-test",
+        error_category=ToolArgumentErrorCategory.SEMANTIC_RULE,
     )
     service = _CapturingSessionService()
     session_id = uuid4()

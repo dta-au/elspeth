@@ -9,13 +9,29 @@ the resource group. This runbook is the Azure equivalent of
 **evidence**, not in code: where the Azure control plane already produces a
 fact, the receipt records a sanitized projection of it.
 
-> **Status.** This runbook is a skeleton prepared by Phase 6b before the first
-> live run. Every step marked **LIVE** is filled in by the operator-run
-> acceptance (6b-7) and its receipt. Until the sanitized receipt exists at
-> `docs/operator/evidence/azure-container-apps/0.8.0.json`, this runbook is
-> not a support claim. The public support statement in
-> [Deployment Platforms](../reference/deployment-platforms.md) flips in the
-> same commit as that receipt.
+> **Status.** The implemented ACA slice received desktop acceptance:
+> `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
+> acceptance is claimed. This executable procedure can produce a future receipt
+> at `docs/operator/evidence/azure-container-apps/0.8.1.json`. Steps marked
+> **LIVE** require measurements from that operator run. Neither a live run nor
+> a receipt is an outstanding closure condition. See
+> [Deployment Platforms](../reference/deployment-platforms.md) for support scope.
+
+The supported configuration retains `Single` revision mode, `sticky` session
+affinity and 2–4 replicas with one web process per replica. External PostgreSQL
+provides single-use tickets and durable run-event replay on authorized peer
+reconnect, renewable Composer request leases with saved progress and current
+inflight accounting, and shared budgets for auth, writes and Composer/execution
+work. An interrupted provider request is not automatically resumed. Automatic
+run handoff covers durable admission, permit-bound PREPARED initialization and
+eligible checkpoint resume, using fresh web and Landscape authority. Unsafe
+effects, incomplete sources and identity/compatibility failures remain
+`recovery_required`; see the [handoff contract](../reference/deployment-platforms.md#durable-run-handoff).
+Integrated verification is recorded in the
+[ACA plan](../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
+Evidence remains limited to
+local PostgreSQL mechanism and integration evidence, with no cloud receipt or
+no-affinity deployment qualification.
 
 > **Scope.** The tracked Bicep bundle is
 > [`deploy/azure-container-apps/`](../../deploy/azure-container-apps/README.md)
@@ -38,10 +54,9 @@ Use this runbook when you need to:
 - provision, exercise at replicas > 1, and destroy the disposable Azure
   Container Apps acceptance environment for one release candidate;
 - prove schema, persistence, identity-based blob access, replica fencing,
-  run-start coordination, lease takeover and cross-replica progress before
-  admitting traffic; or
-- produce the sanitized receipt that flips the Azure Container Apps support
-  claim.
+  run-start coordination, lease takeover and shared state visibility, while
+  recording the legacy P4b receipt's conservative limitation; or
+- produce a sanitized receipt of an actual cloud acceptance run.
 
 Do not use it to publish a durable image, to operate a long-lived
 environment, to automate a destructive database reset, or to infer that Log
@@ -74,7 +89,7 @@ Analytics evidence replaces the Landscape audit record.
   Vault; Entra token authentication is excluded on the record (plan D4).
 - Every response carries `X-Elspeth-Instance` and `/api/system/status`
   reports `instance_id`, `CONTAINER_APP_REVISION` and
-  `CONTAINER_APP_REPLICA_NAME` (facts §2.1) once 6b-3 lands; the probe driver
+  `CONTAINER_APP_REPLICA_NAME` (facts §2.1); the probe driver
   refuses to score a trial until it has seen two distinct values.
 - No credential enters a receipt. Receipts record secret **names and
   versions**, never values.
@@ -91,7 +106,7 @@ Analytics evidence replaces the Landscape audit record.
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
   (facts §1.1), `jq`, `curl`, `psql`, `cosign`, Node 24/npm 11 and Playwright
   Chromium installed from reviewed locks before mutation.
-- The epoch-53 image (session epoch 53, Landscape epoch 38) in the registry.
+- The epoch-71 image (session epoch 71, Landscape epoch 49) in the registry.
   The epoch literals in this runbook are byte-bound to the live constants by
   `tests/unit/web/test_azure_container_apps_runbook_contract.py`.
 - 6b-2's membership writer merged, or P3 is recorded as unreachable rather
@@ -137,24 +152,36 @@ protected_timeout_seconds() {
   printf '%s\n' "$ceiling"
 }
 
-protected_capture() {
-  local kind="$1" failure_class="$2"
+protected_capture() (
+  local kind="$1" failure_class="$2" seconds scratch cleanup stderr_reader status
   shift 2
-  local seconds stderr_file status
-  seconds=$(protected_timeout_seconds "$kind") || return 1
-  stderr_file=$(mktemp -p /tmp elspeth-capture.XXXXXX) || return 1
-  chmod 600 "$stderr_file" || { rm -f -- "$stderr_file"; return 1; }
-  trap 'rm -f -- "$stderr_file"' RETURN
+  seconds=$(protected_timeout_seconds "$kind") || exit 1
+  scratch=$(mktemp -d -p /tmp elspeth-capture.XXXXXX) || exit 1
+  printf -v cleanup 'rm -rf -- %q' "$scratch"
+  trap "$cleanup" EXIT
+  : >"$scratch/stderr"
+  chmod 600 "$scratch/stderr"
+  # Bound captured streams; an inherited file-size limit breaks Bicep's runtime.
+  mkfifo "$scratch/stderr-pipe"
+  head -c "$((ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES + 1))" <"$scratch/stderr-pipe" >"$scratch/stderr" &
+  stderr_reader=$!
   set +e
-  ( ulimit -f 4096; timeout --signal=TERM --kill-after=5s "$seconds" "$@" 2>"$stderr_file" ) \
-    | head -c "$ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES"
+  timeout --signal=TERM --kill-after=5s "$seconds" "$@" 2>"$scratch/stderr-pipe" \
+    | head -c "$((ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES + 1))" >"$scratch/stdout"
   status=${PIPESTATUS[0]}
+  wait "$stderr_reader"
   set -e
+  if test "$(wc -c <"$scratch/stdout")" -gt "$ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES" \
+    || test "$(wc -c <"$scratch/stderr")" -gt "$ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES"; then
+    printf '%s\n' 'command_output_limit_exceeded' >&2
+    exit 1
+  fi
   if test "$status" -ne 0; then
     printf '%s\n' "$failure_class" >&2
-    return "$status"
+    exit "$status"
   fi
-}
+  cat "$scratch/stdout"
+)
 
 az_capture() { protected_capture az az_command_failed az "$@"; }
 az_deploy_capture() { protected_capture az-deploy az_deployment_failed az "$@"; }
@@ -193,6 +220,146 @@ mkdir -p -m 0700 "$EVIDENCE_DIR"
 Raw Azure output stays under `$EVIDENCE_DIR` (mode 0700) outside the
 worktree; only sanitized receipts are committed.
 
+The executable driver uses concrete operator-local ARM JSON inputs. Compile
+the local completed environment parameters into `MAIN_PARAMETERS`; replace
+the sample registry identity, administrator login/password, region and IP
+allowlists before what-if. After the environment stage, resolve
+`WORKLOAD_PARAMETERS` with the cold-install resolver and inventory outputs.
+Copy that resolved file to `WORKLOAD_A_PARAMETERS` and
+`WORKLOAD_B_PARAMETERS`; in all three files set the same `acceptanceRuntimeSecretUrls`
+object to `{a: {sessionDbUrl, landscapeUrl}, b: {sessionDbUrl, landscapeUrl}}`,
+using each role's versioned URLs. Set Multiple mode, none affinity, min/max
+replicas 1 and runtimeRoleLabel a/b on the two labelled files. Preserve the
+production runtime URL parameters in all files. Every deployment retains
+production and both acceptance roles' named application secrets through the
+final Single-revision pass; the label selects the references used by that revision.
+Keep schema-owner URLs in the dedicated schema-owner vault. Never pass a
+tracked placeholder example to a deployment.
+
+| Driver input | Required concrete value |
+| --- | --- |
+| `MAIN_PARAMETERS` | Local subscription-scope ARM parameter JSON with real environment inputs |
+| `WORKLOAD_PARAMETERS` | Local production ARM parameters from the cold-install resolver |
+| `APPLICATION_PARAMETERS` | Exported path to flat application JSON completed from `application.example.json`: budgets, nonlocal auth, SSO, both Composer roles and pipeline profiles |
+| `ELSPETH_ACCEPTANCE_BEARER_TOKEN` | Authenticated session token for an admitted user with the required workload role; required for generated nonlocal-auth workloads before `prepare`, `probes` and `single-revision` |
+| `WORKLOAD_A_PARAMETERS`, `WORKLOAD_B_PARAMETERS` | Local role-specific workload ARM parameters with pinned secret versions |
+| `COMPATIBILITY_RECORD` | Candidate-bound compatibility record; the driver produces `TESTCONTAINER_RECEIPT` against the provisioned Flexible Server |
+| `ELSPETH_ACCEPTANCE_PYTHON` | Existing venv Python; bind both worktree source roots with `PYTHONPATH` |
+| `P1_TRIAL_REQUESTS` | JSON file of at least 20 unique `{session_id, body}` freeform message requests, each with a fresh `client_request_id` |
+| `P2_SESSION_IDS` | JSON array of at least 20 unique fresh executable session IDs, one per trial |
+| `P4_SESSION_ID` | Prepared executable session for cross-replica progress |
+| `P3_SESSION_ID` | Prepared long-running session when running the probes stage separately |
+| `P3_SINK_PATH`, `P3_SINK_KEY_FIELD` | Operator-mounted shared NFS CSV path containing `{session_id}` and unique output row key; collector checks the exact persisted sink path |
+| `PG_MAX_CONNECTIONS`, `PG_APPROVED_BUDGET`, `PG_SAFETY_MARGIN` | Measured database limit and approved connection budget |
+| `SENTINEL_HASH` | Expected sentinel from the selected candidate |
+| `PROBE_YAML`, `P3_YAML` | Local executable P2/P4 YAML and a long-running CSV-sink P3 YAML for the `prepare` stage |
+| `PROBE_SOURCE_BLOB`, `PROBE_SOURCE_NAME` | Local CreateInlineBlobRequest JSON (`filename`, `content`, `mime_type`) and source mapping name (default `input`) |
+| `P4_MESSAGE_BODY` | Valid Composer message JSON asking for an explanation without changing pipeline structure |
+| `P1_BODY` | JSON template with nonempty `content`; `prepare` creates a fresh session and adds a new `client_request_id` for each trial |
+| `ACCEPTANCE_SECRET_DIR` | Private directory of the bootstrap password and application-secret files listed below |
+| `PGSSLROOTCERT` | Operator-host CA bundle for Flexible Server TLS verification |
+| `BOOTSTRAP_PRINCIPAL_ID`, `BOOTSTRAP_PRINCIPAL_TYPE` | Explicit operator object ID and `User` or `ServicePrincipal`, granted Key Vault Secrets Officer on both disposable vaults |
+
+The `all` path invokes `scripts/bootstrap-acceptance.sh` after environment and
+image publication. Export `APPLICATION_PARAMETERS` before calling the driver;
+the helper supplies `SECRET_VERSION_DIR` from the secret versions it captures.
+Prepare SSO/provider `extraSecrets` version URLs and corresponding environment
+bindings as described in the cold-install runbook. `ACCEPTANCE_SECRET_DIR` must contain four distinct password
+files (`elspeth-schema-owner-password`, `elspeth-runtime-password`,
+`elspeth-runtime-a-password`, `elspeth-runtime-b-password`) and the application
+value files `elspeth-secret-key`, `elspeth-shareable-link-signing-key`,
+`elspeth-fingerprint-key`, `elspeth-operator-metrics-bearer-token`. Optional
+Composer credentials use `COMPOSER_ENDPOINT_SECRET_NAME` and a file of that
+name. Files stay mode 0600 outside Git. The operator needs role-assignment
+permission and network access to PostgreSQL and Key Vault. The helper creates
+the four database roles, writes versioned secrets, and emits all three concrete
+workload parameter files and a private `acceptance-env.json` containing host
+observer credentials. That credential file is never receipt evidence. A failed
+bootstrap stops the driver and leaves only a private bounded error log; do not
+rerun the cold-only SQL against partially created roles without investigating.
+The helper first proves the operator's newly assigned secret-write permission
+by writing the real owner session URL to the schema-owner vault and the real
+`elspeth-secret-key` value to the runtime vault. It retries only an explicit
+`ForbiddenByRbac` response, for at most 600 seconds; firewall, network and other
+failures stop immediately. SQL role creation starts only after both succeed,
+so an ordinary RBAC propagation delay does not strand non-idempotent role
+creation. This follows Microsoft's [Key Vault RBAC guidance](https://learn.microsoft.com/en-us/azure/key-vault/general/rbac-guide),
+which requires allowing role assignments time to refresh. A shorter bound can
+be selected through `KEY_VAULT_RBAC_WAIT_SECONDS` (1–600).
+
+Use individual driver stages while establishing the environment, role grants,
+secret versions and probe fixtures. The `all` path runs `prepare` through the
+public API after rollout: it uploads the source and imports the supplied YAML
+into fresh sessions, including one session for each P2 trial. It writes
+`prepared-sessions.json` and `p2-session-ids.json` under the evidence directory.
+Generated workloads retain the selected nonlocal authentication provider.
+They require an existing `ELSPETH_ACCEPTANCE_BEARER_TOKEN`: the driver's
+username/password fallback calls local registration/login and cannot perform
+SSO. The local/open `workload.acceptance.bicepparam` is a disposable compilation
+fixture, not a production authentication setting to copy into the generated
+parameters.
+
+For a fresh SSO installation, use the staged workflow instead of `all`, which
+does not pause for first login:
+
+1. Run `environment`, `image`, `bootstrap`, `jobs`, `testcontainer`,
+   `workload-production`, then `receipts`, using
+   `bash deploy/azure-container-apps/scripts/acceptance.sh <stage>` with the
+   same exported inputs and `EVIDENCE_DIR`. Resume after any already completed
+   stage rather than rerunning the cold-only bootstrap.
+2. Sign in through the configured public origin using SSO. Bootstrap the first
+   administrator and admit the acceptance user with the required workload role
+   as described in the cold-install runbook. Obtain that user's application
+   session bearer through the authenticated login flow and export
+   `ELSPETH_ACCEPTANCE_BEARER_TOKEN` privately; do not use an IdP access token
+   or print the application token into evidence.
+3. Run `workload-probes`, then `prepare`, `probes`, `single-revision`,
+   `evidence`, `cleanup`, and `bundle`. Retain the same bearer in the calling
+   shell for each stage; renew it through SSO if it expires. `prepare` targets
+   the `a` revision's labeled origin and uses the shared Sessions identity.
+
+Keep the configured SSO provider throughout these stages. Neither local
+registration credentials nor an anonymous readiness response establishes an
+admitted acceptance user.
+
+### 0.8.1 fix-on-fail cycle
+
+Run each acceptance attempt against an exact candidate commit and published
+image digest. Give each attempt a fresh `ACCEPTANCE_RUN_ID` and private
+`EVIDENCE_DIR`, retaining the candidate SHA, digest, resolved parameters and
+compatibility record. For a local-auth installation, run the complete driver:
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+bash deploy/azure-container-apps/scripts/acceptance.sh all
+```
+
+Treat a nonzero exit or `bundle.json` with `passed: false` as a failed attempt.
+Inspect the retained stage evidence, `restore.log`, `cleanup.log` and Resource
+Graph result. Complete restoration and cleanup if the automatic attempt failed.
+Fix the source, configuration or operator inputs and rerun the affected local
+checks. A source fix needs a new candidate SHA and image digest. Each retry
+needs a fresh run ID and the full acceptance sequence. For SSO, use the staged
+procedure above with a fresh attempt and complete all stages. Never combine
+receipts from different attempts or candidate identities. Keep the public
+desktop-acceptance wording until a live result has been reviewed.
+
+The standalone `probes` stage can consume the prepared session inputs listed
+above. The driver stops at the first
+failure; inspect retained evidence before resuming. Explicit cleanup remains
+available after failure; a failed probe never becomes a passing receipt.
+The `all` path runs the required PostgreSQL selection itself with the existing
+venv Python and the provisioned inventory host, then constructs the shared
+testcontainer receipt. It does not accept an empty or skipped test run as
+evidence. Pre-prepared session IDs and a pre-existing testcontainer receipt
+are not prerequisites for `all`.
+
+The complete `all` sequence is environment, image copy, bootstrap, Jobs,
+PostgreSQL tests, production rollout and initial receipts, labelled workload,
+session preparation, **P1, P2, P4, P3**, `single-revision`, evidence, cleanup,
+then bundle validation. The final Single-revision pass is part of `all`,
+before evidence collection and deletion of the disposable resource group.
+
 ---
 
 ## 1. Create the resource group and environment
@@ -202,14 +369,14 @@ az_capture account set --subscription "$AZURE_SUBSCRIPTION_ID"
 az_deploy_capture deployment sub what-if \
   --location "$AZURE_LOCATION" \
   --template-file deploy/azure-container-apps/main.bicep \
-  --parameters deploy/azure-container-apps/main.acceptance.bicepparam \
+  --parameters "@$MAIN_PARAMETERS" \
   --parameters resourceGroupName="$RESOURCE_GROUP" acceptanceRunId="$ACCEPTANCE_RUN_ID" \
   >"$EVIDENCE_DIR/what-if.json"
 az_deploy_capture deployment sub create \
   --name "elspeth-acc-${ACCEPTANCE_RUN_ID}" \
   --location "$AZURE_LOCATION" \
   --template-file deploy/azure-container-apps/main.bicep \
-  --parameters deploy/azure-container-apps/main.acceptance.bicepparam \
+  --parameters "@$MAIN_PARAMETERS" \
   --parameters resourceGroupName="$RESOURCE_GROUP" acceptanceRunId="$ACCEPTANCE_RUN_ID" \
   >"$EVIDENCE_DIR/deployment.json"
 jq -S '.properties.outputs' "$EVIDENCE_DIR/deployment.json" >"$EVIDENCE_DIR/inventory.json"
@@ -220,10 +387,16 @@ The resource group is tagged `elspeth.acceptance-run-id`. The environment
 deployment creates the virtual network, the Container Apps environment with
 an NFS storage definition, the Premium FileStorage account with its NFS share
 (`rootSquash: NoRootSquash`, encryption in transit off, private endpoint), the
-Flexible Server with both databases, two runtime roles and one schema-owner
-role, the Key Vault (RBAC, purge protection **off** for the disposable group),
-the Log Analytics workspace and the user-assigned identity. The what-if
+Flexible Server with both databases and its administrator login, separate
+runtime and schema-owner Key Vaults (RBAC, purge protection **off** for the
+disposable group), the Log Analytics workspace and separate runtime and
+schema-owner user-assigned identities. Only the schema-owner identity reads
+the owner vault; both identities can read application keys in the runtime
+vault. Bootstrap grants the operator secret-write access to both vaults. The what-if
 output replaces the ECS plan review; its SHA-256 is bound into the receipt.
+Create the runtime and schema-owner roles and their grants before writing
+their Key Vault URL versions and starting the doctor Jobs; the Bicep database
+resources do not create application PostgreSQL roles.
 
 > **LIVE:** record the NFS share root's ownership and mode, the mount options
 > the platform applied (`mount | grep /mnt/elspeth` through `az_exec_capture`),
@@ -252,12 +425,25 @@ no-op that re-asserts the same digest.
 
 ## 3. Run the Jobs in order
 
-Each Job runs the candidate digest with the same NFS mount and identity as
-the app. Start it, poll its execution to a terminal state, and require
+The doctor Jobs run the candidate digest with the same NFS mount as the app.
+Only `doctor-schema-init` attaches the schema-owner identity; runtime and Blob
+checks attach the runtime identity. The root `provision-storage` Job has no
+identity and uses its separately pinned public image. Start each Job, poll
+its execution to a terminal state, and require
 `Succeeded`; retrieve the doctor's `--json` report from Log Analytics by
 execution name.
 
 ```bash
+for label in a b; do
+  if [[ "$label" == a ]]; then role_parameters=$WORKLOAD_A_PARAMETERS; else role_parameters=$WORKLOAD_B_PARAMETERS; fi
+  az_deploy_capture deployment group create --resource-group "$RESOURCE_GROUP" \
+    --name "elspeth-jobs-${label}" --mode Incremental \
+    --template-file deploy/azure-container-apps/workload.bicep \
+    --parameters "@$role_parameters" \
+    --parameters deployWebApp=false candidateSourceSha="$CANDIDATE_SHA" image="$CANDIDATE_IMAGE" \
+      runtimeRoleLabel="$label" >"$EVIDENCE_DIR/jobs-${label}.json"
+done
+
 run_job_to_completion() {
   local job="$1" execution status
   execution=$(az_capture containerapp job start --name "$job" --resource-group "$RESOURCE_GROUP" \
@@ -285,8 +471,8 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   `/mnt/elspeth/data`, `/mnt/elspeth/data/blobs` and `/mnt/elspeth/payloads`
   owned `1654:1654`, mode `0700`.
 - `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
-  with the schema-owner URLs and initializes both schemas at session epoch 53
-  and Landscape epoch 38.
+  with the schema-owner URLs and initializes both schemas at session epoch 71
+  and Landscape epoch 49.
 - `doctor-runtime-a` / `doctor-runtime-b` run `elspeth doctor deployment --json`
   with each runtime role's URLs; `session_schema`, `landscape_schema`,
   `session_tls`, `landscape_tls`, `payload_store_writable` and
@@ -297,9 +483,11 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   cases inside the environment, the one auth mode whose truth depends on
   where the process runs.
 
-> **LIVE:** the no-schema dry run against the current `release/0.8.0` image
-> (expected: both schema checks red, everything else green) proves the wiring
-> before the epoch-53 image exists; record its execution names.
+> **LIVE:** for 0.8.1 acceptance, run the Jobs with the candidate digest and
+> require both schema checks to pass after initialization at session epoch 71
+> and Landscape epoch 49. Record the execution names. Any no-schema dry run
+> against a `release/0.8.0` image is predecessor-only wiring evidence; it
+> cannot establish the candidate's schema compatibility or acceptance.
 
 ## 4. Deploy the production shape and prove the rollout
 
@@ -308,15 +496,16 @@ az_deploy_capture deployment group create \
   --name "elspeth-workload-${CANDIDATE_SHA:0:12}" \
   --resource-group "$RESOURCE_GROUP" \
   --template-file deploy/azure-container-apps/workload.bicep \
-  --parameters deploy/azure-container-apps/workload.production.bicepparam \
-  --parameters image="$CANDIDATE_IMAGE" revisionSuffix="${CANDIDATE_SHA:0:12}" \
+  --parameters "@$WORKLOAD_PARAMETERS" \
+  --parameters image="$CANDIDATE_IMAGE" revisionSuffix="r${CANDIDATE_SHA:0:12}" \
+    candidateSourceSha="$CANDIDATE_SHA" deployWebApp=true \
     composerTransportIdleCeilingSeconds="$ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS" \
   >"$EVIDENCE_DIR/workload-production.json"
 az_capture containerapp revision list --name elspeth-web --resource-group "$RESOURCE_GROUP" \
   --query "[?properties.active].{name:name,traffic:properties.trafficWeight,state:properties.runningState}" \
   >"$EVIDENCE_DIR/revisions-production.json"
 az_capture containerapp replica list --name elspeth-web --resource-group "$RESOURCE_GROUP" \
-  --revision "elspeth-web--${CANDIDATE_SHA:0:12}" >"$EVIDENCE_DIR/replicas-production.json"
+  --revision "elspeth-web--r${CANDIDATE_SHA:0:12}" >"$EVIDENCE_DIR/replicas-production.json"
 ```
 
 Proof of rollout (replaces the ECS `jq` gate): exactly one active revision at
@@ -340,7 +529,7 @@ proof of rollout above (exactly one active revision carrying the candidate
 digest) is what makes the custody serialisation claim hold.
 
 > **LIVE:** the public-behaviour pass (Playwright tutorial through the
-> ingress, a fork and a guided convert, the two seams Phase 3 trialled) and
+> ingress, a fork and a freeform Composer turn) and
 > the WebSocket behaviour at the 240 s request timeout.
 
 ---
@@ -362,14 +551,14 @@ parity test feeds one corpus through both).
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_revision_sha256": "64-lowercase-hex",
   "candidate_doctor_job_sha256": "64-lowercase-hex",
-  "candidate_package_version": "0.8.0",
+  "candidate_package_version": "0.8.1",
   "previous_source_sha": "",
   "previous_image_digest": "",
   "previous_revision_sha256": "",
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 53, "landscape_epoch": 38, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 71, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",
@@ -433,17 +622,19 @@ through `ALTER DEFAULT PRIVILEGES` in
 # One deployment per runtime role: the label selects the role's URL secrets
 # and the doctor Job name (doctor-runtime-a / doctor-runtime-b).
 for label in a b; do
+  if [[ "$label" == a ]]; then role_parameters=$WORKLOAD_A_PARAMETERS; else role_parameters=$WORKLOAD_B_PARAMETERS; fi
   az_deploy_capture deployment group create \
     --name "elspeth-workload-probes-${CANDIDATE_SHA:0:12}-${label}" \
     --resource-group "$RESOURCE_GROUP" \
     --template-file deploy/azure-container-apps/workload.bicep \
-    --parameters deploy/azure-container-apps/workload.acceptance.bicepparam \
-    --parameters image="$CANDIDATE_IMAGE" revisionSuffix="${CANDIDATE_SHA:0:12}-${label}" \
+    --parameters "@$role_parameters" \
+    --parameters image="$CANDIDATE_IMAGE" revisionSuffix="r${CANDIDATE_SHA:0:12}-${label}" \
+      candidateSourceSha="$CANDIDATE_SHA" deployWebApp=true \
       runtimeRoleLabel="$label" \
       composerTransportIdleCeilingSeconds="$ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS" \
     >"$EVIDENCE_DIR/workload-probes-${label}.json"
   az_capture containerapp revision label add --name elspeth-web --resource-group "$RESOURCE_GROUP" \
-    --label "$label" --revision "elspeth-web--${CANDIDATE_SHA:0:12}-${label}"
+    --label "$label" --revision "elspeth-web--r${CANDIDATE_SHA:0:12}-${label}"
 done
 # Traffic weights and labels are application-scope changes: no new revision.
 az_capture containerapp ingress traffic set --name elspeth-web --resource-group "$RESOURCE_GROUP" \
@@ -457,16 +648,69 @@ curl_capture "$LABEL_B_URL/api/system/status" | jq -e '.instance_id' >/dev/null
 ```
 
 Run the probes in the order **P1, P2, P4, P3** (P3 is destructive and last),
-then the single-revision `maxReplicas = 2` pass of P1 and P4a. Every receipt
+then the Single-revision `minReplicas = maxReplicas = 2` pass of P1 and P4a. Every receipt
 carries its `mechanism`, a closed enum: a receipt cannot claim more than the
 tree proves, and overclaiming is a schema violation rather than a convention.
 
 | probe | action | passing evidence | `mechanism` |
 |---|---|---|---|
-| **P1** concurrent guided ops from two replicas | 20 trials; the same `POST /api/sessions/{id}/guided/respond` fired at `LABEL_A_URL` and `LABEL_B_URL` within 5 ms | per trial exactly one 2xx and one 409 `"Session operation is already active"`; the fence's `operation_epoch` advances by exactly one; exactly one `guided_operations` row; two distinct `owner_instance_id` values across the run | `session_operation_fence` |
-| **P2** run-start coordination | 20 trials; `POST /api/sessions/{id}/execute` from both labels concurrently | exactly one `runs` row and one Landscape run per trial; one 202 and one 409. The receipt asserts that no `run_start_permits` row exists: the table has no writer, and the driver has no code path that could claim one | `session_operation_fence_execute` |
-| **P4** cross-replica progress | session and run created via `LABEL_A_URL`; status, outputs, messages and a blob written by `rA` read via `LABEL_B_URL` | **P4a (must pass):** all DB-backed state visible from `rB` within one poll interval; blob bytes identical through NFS; terminal status observed on `rB`. **P4b (recorded, cannot pass):** the live progress stream and the WebSocket ticket are owner-affine; the driver records the production sticky-session setting as the mitigation | `postgresql_and_nfs` (P4a); `owner_affine` (P4b) |
-| **P3** lease takeover after a partitioned owner | long run started via `LABEL_A_URL` (owner `rA`); partition `rA` by role revocation (below); wait past `session_operation_lease_seconds` (30) and the membership lease; then `az containerapp revision deactivate` on `rA`; restore the role afterwards | before expiry `LABEL_B_URL` gets 409; after expiry the survivor's sweep cancels the run with the orphan reason and `rB` acquires the session; `rA`'s `web_instances` row is still `state='active'` with an expired lease; no duplicate sink effect; the fence's `owner_instance_id` becomes `rB`'s | `role_revocation_lease_expiry`; downgraded to `graceful_stop` if a `stopped` row landed |
+| **P1** concurrent freeform turns from two replicas | 20 trials in fresh sessions; the same `POST /api/sessions/{id}/messages` body with nonempty `content` and canonical UUID `client_request_id` fired at `LABEL_A_URL` and `LABEL_B_URL` within 5 ms | per trial exactly one 2xx and one 409 `"Session operation is already active"`; `session_operation_fences.operation_epoch` advances by exactly one, `owner_instance_id` equals the winner, and exactly one `message_ingress_receipts` row exists for `(session_id, client_request_id)` | `session_operation_fence` |
+| **P2** run-start coordination | 20 trials; `POST /api/sessions/{id}/execute` from both labels concurrently | exactly one `runs` row and one Landscape run per trial; one 202 and one 409. This legacy receipt does not measure durable permit admission or handoff; its field set records run-start contention only | `session_operation_fence_execute` |
+| **P4** cross-replica progress | session and run created via `LABEL_A_URL`; status, outputs, messages and a blob written by `rA` read via `LABEL_B_URL` | **P4a (must pass):** all DB-backed state visible from `rB` within one poll interval; blob bytes identical through NFS; terminal status observed on `rB`. **P4b (recorded, cannot pass):** the legacy v2 receipt conservatively retains its owner-affine result and records production sticky sessions; it does not measure the new durable ticket/event replay mechanisms | `postgresql_and_nfs` (P4a); `owner_affine` (P4b) |
+| **P3** lease takeover after a partitioned owner | long run started via `LABEL_A_URL` (owner `rA`); partition `rA` by role revocation (below); observe the survivor before and after the session-operation and membership lease deadlines; restore the role afterwards | before expiry `LABEL_B_URL` gets 409; after expiry the survivor's sweep cancels the run with the orphan reason and `rB` acquires the session; `rA`'s `web_instances` row is still `state='active'` with an expired lease; no duplicate sink effect; the fence's `owner_instance_id` becomes `rB`'s | `role_revocation_lease_expiry`; downgraded to `graceful_stop` if a `stopped` row landed |
+
+P3 retains the legacy receipt's cancellation-shaped oracle; it does not measure
+the new automatic dispatch or checkpoint-resume transitions. A run that takes
+one of those transitions must not be relabelled as satisfying that oracle.
+
+The legacy v2 P4b result remains `cannot_pass` and does not measure the new
+runtime capabilities. Receipt evolution is explicitly deferred; keep its
+existing mechanism and validators. Local PostgreSQL progress, Composer and
+shared-budget tests do not promote this receipt or qualify routing without
+affinity.
+
+### Final Single-revision pass
+
+`scripts/acceptance.sh all` restores the partitioned runtime roles, then deploys
+`r<sha12>-single` in `Single` mode with `sticky` affinity and exactly two
+replicas. It creates fresh freeform trial sessions and a fresh executable P4a
+session through the default ingress. Two persistent cookie clients discover
+distinct process UUIDs, and `/api/system/status` binds their revision and
+platform replica names to the live Azure inventory. P1 still requires at least
+20 fresh client-request-ID requests; P4a checks fresh messages, run status, output
+metadata and uploaded blob bytes across those clients.
+
+To run only this final stage before cleanup, retain the same `EVIDENCE_DIR`,
+inventory, verified Job reports, resolved workload parameter files and private
+`parameters/acceptance-env.json`. Set the common driver inputs above plus an
+existing `ELSPETH_ACCEPTANCE_BEARER_TOKEN`, `P1_BODY`, `PROBE_YAML`,
+`PROBE_SOURCE_BLOB` and `P4_MESSAGE_BODY`:
+
+```bash
+bash deploy/azure-container-apps/scripts/acceptance.sh single-revision
+```
+
+The standalone stage validates that bearer-token input before deployment. It
+uses the production runtime role. If an earlier P3 invocation was interrupted,
+complete the driver's `restore` stage first. It creates its own sessions and
+uses the default ingress URL.
+
+The private evidence directory contains `single-p1-trial-requests.json`,
+`prepared-single-p4-message.json`, `single-p1/` and `single-p4/` observations
+with each probe's `binding.json`, and these receipt artifacts:
+
+| Probe | Required receipt kind | Extracted receipt | Receipt-store digest |
+| --- | --- | --- | --- |
+| P1 | `single-revision-fence-conflict` | `single-p1.receipt.json` | `single-p1.receipt.sha256` |
+| P4a | `single-revision-progress` | `single-p4.receipt.json` | `single-p4.receipt.sha256` |
+
+The corresponding `.stream` files retain the facade output. Receipt-store
+subjects use the actual cookie-selected replica, and stored receipts remain
+bound to their candidate, revision and replica. Each Single-revision topology
+also carries the ARM `container_app_id`, allowing every receipt admission to
+recompute both replica-binding hashes from the receipt itself. Changing the deployment or
+probe inputs requires fresh evidence; a committed collector and passing local
+tests do not replace the live run or promote the platform support claim.
 
 ### P3 primary primitive: role revocation by self-termination
 
@@ -658,29 +902,41 @@ remaining=$(az_capture graph query \
   -q "Resources | where resourceGroup =~ '${RESOURCE_GROUP}' | count" \
   --query 'data[0].Count' --output tsv)
 test "$remaining" = 0
-az_capture keyvault purge --name "$KEY_VAULT_NAME" --location "$AZURE_LOCATION" \
-  || printf '%s\n' 'key_vault_tombstoned' >>"$EVIDENCE_DIR/cleanup-notes.txt"
+SCHEMA_OWNER_KEY_VAULT_NAME=$(jq -er '.schemaOwnerKeyVaultName.value' "$EVIDENCE_DIR/inventory.json")
+for vault_name in "$KEY_VAULT_NAME" "$SCHEMA_OWNER_KEY_VAULT_NAME"; do
+  az_capture keyvault purge --name "$vault_name" --location "$AZURE_LOCATION" \
+    || printf '%s\n' "key_vault_tombstoned:$vault_name" >>"$EVIDENCE_DIR/cleanup-notes.txt"
+done
 ```
 
 The resource group is a true ownership boundary; Azure Resource Graph is the
 subscription-wide inventory; a Key Vault that cannot be purged is recorded as
-a tombstone with its scheduled purge date. The ECS gate ledger and HMAC
+a tombstone with its scheduled purge date. Record runtime and schema-owner
+vault fates separately in the cleanup receipt: `runtime_key_vault_purged` /
+`runtime_key_vault_tombstoned` / `runtime_scheduled_purge_date` and
+`schema_owner_key_vault_purged` / `schema_owner_key_vault_tombstoned` /
+`schema_owner_scheduled_purge_date`. The ECS gate ledger and HMAC
 approvals are not reproduced for this disposable group (plan D1).
 
 ---
 
-## Receipt and docs flip
+## Receipt from an operator-run acceptance
 
 The facade validates the bundle of receipts (`verify-doctor-job`,
 `verify-storage-job`, `verify-blob-managed-identity`, `verify-log-analytics`,
 `verify-connection-budget`, `compatibility-record`, `revision-rollout`,
 `replica-fence-conflict`, `replica-run-start`, `replica-lease-takeover`,
-`replica-progress`, `resource-graph-cleanup`, `testcontainer-run` — the last
+`replica-progress`, `single-revision-fence-conflict`, `single-revision-progress`,
+`resource-graph-cleanup`, `testcontainer-run` — the last
 through the shared gate, which refuses the bundle without exactly one passing
-run) and writes the sanitized
-receipt to `docs/operator/evidence/azure-container-apps/0.8.0.json`. That
-receipt, the support-claim flip in
-[Deployment Platforms](../reference/deployment-platforms.md) and the CHANGELOG
-rewording land in **one commit** with a three-seat sign-off. The first run is
-expected to fail forward on the platform-facing pieces; the bar is a second
-clean run end to end.
+run). The driver captures the `bundle-validate` verdict in private
+`$EVIDENCE_DIR/bundle.json` and exits nonzero when validation fails. It does
+not create a public receipt. Review the protected receipts and publish a
+sanitized account of measured facts at
+`docs/operator/evidence/azure-container-apps/0.8.1.json` only after the live
+procedure completes and the bundle passes. Never create a receipt from desktop
+analysis or treat skipped or failed probes as passes. If a run fails, retain
+its diagnostics, fix the defect and rerun before claiming live acceptance.
+Task `elspeth-5ec3befc1a` already closed through desktop acceptance. Any later
+documentation claim about live results must cite the validated receipt and its
+measured scope.

@@ -40,11 +40,13 @@ from elspeth.testing import make_token_info
 _RECORDED_AT = datetime(2026, 7, 3, 12, 0, 0, tzinfo=UTC)
 _SINK = "output"
 
-# Counter fields the table governs. rows_processed and rows_coalesce_failed
+# Counter fields the table governs. rows_processed and structural failure counts
 # are query-derived in the audit path (distinct source rows / FAILED coalesce
 # node_states), never per-record increments, so they are outside the table.
 _TABLE_GOVERNED_FIELDS = tuple(
-    f.name for f in fields(ExecutionCounters) if f.name not in ("rows_processed", "rows_coalesce_failed", "routed_destinations")
+    f.name
+    for f in fields(ExecutionCounters)
+    if f.name not in ("rows_processed", "rows_coalesce_failed", "collector_groups_failed", "routed_destinations")
 )
 
 
@@ -111,6 +113,9 @@ class _FakeRunStatusProjection:
     def count_failed_coalesce_barrier_rows(self, run_id: str) -> int:
         return 0
 
+    def count_failed_collector_groups(self, run_id: str) -> int:
+        return 0
+
 
 @dataclass(frozen=True, slots=True)
 class _FakeFactory:
@@ -161,9 +166,11 @@ def _row_result(
         token=result_token,
         sink_name=sink_name,
         error=error,
-        scheduler_pending_sink=False,
+        # A real sink-bound result always carries its durable handoff (_route_to_sink refuses one without).
+        scheduler_pending_sink=True,
         authoritative_error_hash=None,
         join_group_id="join-1" if path is TerminalPath.COALESCED else None,
+        counts_failed_barrier=False,
     )
 
 

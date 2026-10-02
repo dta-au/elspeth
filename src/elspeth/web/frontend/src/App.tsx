@@ -1,4 +1,5 @@
 import {
+  type JSX,
   useEffect,
   useState,
   useCallback,
@@ -26,14 +27,16 @@ import {
 } from "./components/common/AppNoticeCenter";
 import { ShortcutsHelp } from "./components/common/ShortcutsHelp";
 import { ClassificationBanner } from "./components/common/ClassificationBanner";
-import { DefaultModeChangedBanner } from "./components/common/DefaultModeChangedBanner";
 import { ChatPanel } from "./components/chat/ChatPanel";
 import { CatalogDrawer } from "./components/catalog/CatalogDrawer";
 import { RecoveryPanel } from "./components/recovery/RecoveryPanel";
 import { RunOutcomeNotice } from "./components/execution/RunOutcomeNotice";
 import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { ComposerPreferencesPanel } from "./components/settings/ComposerPreferencesPanel";
-import { UserAdminDialog } from "./components/settings/UserAdminDialog";
+import { PeopleAccessDialog } from "./components/admin/PeopleAccessDialog";
+import { fetchPeopleCapabilities } from "./api/people";
+import { MailboxDialog } from "./components/workflow/MailboxDialog";
+import { LibraryDialog } from "./components/library/LibraryDialog";
 import { HelloWorldTutorial } from "./components/tutorial";
 import {
   REQUEST_RUN_EVENT,
@@ -41,9 +44,9 @@ import {
   dispatchArtifactViewIntent,
 } from "./lib/composer-events";
 import { useAuthStore } from "./stores/authStore";
+import { useMailboxStore } from "./stores/mailboxStore";
 import { initStoreSubscriptions, requestValidate } from "./stores/subscriptions";
 import { useSessionStore } from "./stores/sessionStore";
-import { isGuidedBuildActive } from "./components/chat/guided/guidedBuildActive";
 import { useExecutionStore } from "./stores/executionStore";
 import {
   selectTutorialCompleted,
@@ -62,7 +65,6 @@ import { SharedInspectView } from "./components/shared/SharedInspectView";
 import { SaveForReviewDialog } from "./components/composer/SaveForReviewDialog";
 import { ComposerWorkspace } from "./components/workspace/ComposerWorkspace";
 import { ArtifactWorkspace } from "./components/workspace/ArtifactWorkspace";
-import { WorkspaceInspector } from "./components/workspace/WorkspaceInspector";
 import { WorkspaceActionBar } from "./components/workspace/WorkspaceActionBar";
 import { useWorkspacePaneController } from "./components/workspace/WorkspacePaneContext";
 import { useCollapsedAuthoringStatus } from "./components/workspace/useCollapsedAuthoringStatus";
@@ -107,7 +109,7 @@ function App() {
   // dev disarms the feature) plus the stable-mismatch latch. Latched once
   // the polled frontend_build differs across STALE_BUILD_POLLS_REQUIRED
   // consecutive health checks; only a refresh clears it — never auto-reload
-  // (an in-flight guided operation must not be yanked).
+  // (an in-flight compose operation must not be yanked).
   const ownBuild = useMemo(() => ownFrontendBuild(), []);
   const staleBuildStreakRef = useRef(0);
   const [staleBuildDetected, setStaleBuildDetected] = useState(false);
@@ -120,9 +122,36 @@ function App() {
   const [catalogOpen, setCatalogOpen] = useState(false);
   const logout = useAuthStore((s) => s.logout);
   const authUser = useAuthStore((s) => s.user);
-  const [showUserAdmin, setShowUserAdmin] = useState(false);
-  const openUserAdmin = useCallback(() => setShowUserAdmin(true), []);
-  const closeUserAdmin = useCallback(() => setShowUserAdmin(false), []);
+  const [showPeopleAccess, setShowPeopleAccess] = useState(false);
+  // Whether the account menu offers People & access. Asked of the server's
+  // capability projection, once per signed-in identity: the entry must not
+  // depend on the mailbox having loaded, and it is advice only, since the
+  // panel re-reads capabilities when it opens and every route re-checks.
+  const [canAdministerPeople, setCanAdministerPeople] = useState(false);
+  const [showMailbox, setShowMailbox] = useState(false);
+  const [showLibrary, setShowLibrary] = useState(false);
+  const openPeopleAccess = useCallback(() => setShowPeopleAccess(true), []);
+  const closePeopleAccess = useCallback(() => setShowPeopleAccess(false), []);
+  const peopleAccessUnavailable = useCallback(() => {
+    setShowPeopleAccess(false);
+    setCanAdministerPeople(false);
+  }, []);
+  const authIdentityId = authUser?.user_id ?? null;
+  useEffect(() => {
+    setCanAdministerPeople(false);
+    if (authIdentityId === null) return;
+    const controller = new AbortController();
+    void fetchPeopleCapabilities(controller.signal).then(
+      (capabilities) => setCanAdministerPeople(capabilities.identity_admin || capabilities.local_accounts),
+      // Unknown is not "yes": with no answer the entry stays hidden.
+      () => undefined,
+    );
+    return () => controller.abort();
+  }, [authIdentityId]);
+  const openMailbox = useCallback(() => setShowMailbox(true), []);
+  const closeMailbox = useCallback(() => setShowMailbox(false), []);
+  const openLibrary = useCallback(() => setShowLibrary(true), []);
+  const closeLibrary = useCallback(() => setShowLibrary(false), []);
   const openComposerSettings = useCallback(
     () => setShowComposerSettings(true),
     [],
@@ -145,6 +174,20 @@ function App() {
   const sharedToken = useSharedToken();
   const { isAuthenticated } = useAuth();
 
+  useEffect(() => {
+    if (!isAuthenticated || sharedToken !== null) return;
+    return useMailboxStore.getState().startPolling();
+  }, [isAuthenticated, sharedToken]);
+
+  useEffect(() => {
+    if (isAuthenticated) return;
+    setShowMailbox(false);
+    // Unmounting the panel is what clears its selection, its cached
+    // administrative data and any password still on screen.
+    setShowPeopleAccess(false);
+    setShowLibrary(false);
+  }, [isAuthenticated]);
+
   // Sync URL hash ↔ session/tab state for deep linking & back/forward
   const { redirectToast } = useHashRouter({
     enabled: isAuthenticated && sharedToken === null,
@@ -153,12 +196,6 @@ function App() {
 
   const createSession = useSessionStore((s) => s.createSession);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
-  // Guided build on screen → ChatPanel renders the two-column workspace and
-  // this shell must drop the freeform SideRail (the workspace rail replaces
-  // it). Selector returns a primitive so zustand only re-renders on flips.
-  const guidedBuildActive = useSessionStore((s) =>
-    isGuidedBuildActive(s.guidedSession, s.guidedNextTurn),
-  );
   const compositionState = useSessionStore((s) => s.compositionState);
   const sessionsLoaded = useSessionStore((s) => s.sessionsLoaded);
   const hasLiveSessions = useSessionStore((s) =>
@@ -176,8 +213,9 @@ function App() {
   const bootstrapPrefs = usePreferencesStore((s) => s.bootstrap);
   const preferencesLoaded = usePreferencesStore((s) => s.loaded);
   const tutorialCompleted = usePreferencesStore(selectTutorialCompleted);
-  const preferencesWriteError = usePreferencesStore((s) => s.writeError);
-  // I5: when bootstrap failed (writeError is set), tutorialCompleted is at
+  const preferencesError = usePreferencesStore((s) => s.bootstrapError ?? s.writeError);
+  const preferencesBootstrapError = usePreferencesStore((s) => s.bootstrapError);
+  // When bootstrap failed, tutorialCompleted is at
   // its initial-state default of false — but that's "we don't know," not
   // "definitively not completed." Showing the tutorial on the failure
   // branch would re-prompt a returning user who has already completed it
@@ -185,7 +223,7 @@ function App() {
   // unknown state as "don't surface tutorial," consistent with the
   // no-fabrication contract in the store.
   const showTutorial =
-    preferencesLoaded && !tutorialCompleted && preferencesWriteError === null;
+    preferencesLoaded && !tutorialCompleted && preferencesBootstrapError === null;
 
   // Returning-user auto-resume (elspeth-e69642fede): once sessions have
   // loaded, select the most recently active one instead of landing on an
@@ -194,7 +232,7 @@ function App() {
   // preferences to settle before deciding), the shared-inspect route, and
   // hash deep links (checked inside the hook).
   const preferencesSettled =
-    preferencesLoaded || preferencesWriteError !== null;
+    preferencesLoaded || preferencesError !== null;
   useAutoResumeSession(
     isAuthenticated &&
       sharedToken === null &&
@@ -222,14 +260,12 @@ function App() {
   const runAdmissionAvailable =
     sharedToken === null &&
     !showTutorial &&
-    !showEmptyLanding &&
-    !guidedBuildActive;
-  const catalogAvailable = !guidedBuildActive;
+    !showEmptyLanding;
+  const catalogAvailable = true;
   const workspaceActionCapabilities = useMemo(
     () => ({
       // completion also admits the CompletionBar's Import YAML trigger; in
-      // this mount (shared/tutorial/empty all excluded above) it reduces to
-      // the same !guidedBuildActive fact a separate importYaml flag carried.
+      // this mount (shared/tutorial/empty all excluded above) it is available.
       // catalogAvailable is passed to ArtifactWorkspace directly — the
       // Plugin-catalog trigger lives in the artifact toolbar since the
       // More-actions popover was retired (2026-08-15 UX review).
@@ -254,7 +290,7 @@ function App() {
 
   // Phase 1B + I5: load account-level composer preferences once authenticated.
   // bootstrapPrefs() is contracted to NEVER reject — it catches failures
-  // internally, degrades to the guided default, and surfaces the failure
+  // internally and surfaces the failure
   // via the store's writeError (rendered by the role="alert" region wired
   // by Phase 1B-round-2). The earlier .catch(console.error) was silently
   // swallowing CorruptPreferencesError, the named backend integrity
@@ -336,12 +372,18 @@ function App() {
       ) {
         useSessionStore.getState().setComposerModel(status.composer_model);
       }
+      // Same publication for the advisor model that gates completion. The
+      // field is required on the wire (the server always sends the
+      // configured advisor model), so every successful poll publishes it.
+      useSessionStore
+        .getState()
+        .setComposerAdvisorModel(status.composer_advisor_model);
       // Derive the compose abort ceiling from the deployment's configured
       // wall clock — a hard-coded client cap only satisfies the
       // client-outlives-server invariant for the checked-in defaults.
       // Latch the store readiness gate (the single source of truth) true once
-      // a known-good ceiling is applied: the Send affordances (freeform,
-      // guided, side-rail Apply) ungate only then, closing the bootstrap race
+      // a known-good ceiling is applied: chat Send and side-rail Apply ungate
+      // only then, closing the bootstrap race
       // where a send started before this fetch would schedule an abort from
       // the stale default. Only ever set true — the backend wall clock does
       // not change mid-session, so a later partial health response must not
@@ -596,13 +638,13 @@ function App() {
         ),
       });
     }
-    if (preferencesWriteError !== null) {
+    if (preferencesError !== null) {
       notices.push({
         kind: "preferences",
         role: "alert",
         content: (
           <>
-            <strong>Preferences:</strong> {preferencesWriteError}
+            <strong>Preferences:</strong> {preferencesError}
           </>
         ),
       });
@@ -692,7 +734,7 @@ function App() {
     healthChecking,
     lastHealthCheckAt,
     openSecrets,
-    preferencesWriteError,
+    preferencesError,
     redirectToast,
     staleBuildDetected,
     systemStatus,
@@ -742,9 +784,9 @@ function App() {
         <AppHeader
           onOpenSettings={openComposerSettings}
           onSignOut={logout}
-          onOpenUserManagement={
-            authUser?.dev_admin === true ? openUserAdmin : undefined
-          }
+          onOpenMailbox={openMailbox}
+          onOpenLibrary={openLibrary}
+          onOpenPeopleAccess={canAdministerPeople ? openPeopleAccess : undefined}
         />
         {showTutorial ? (
           <div id="composer-main" className="app-main" tabIndex={-1}>
@@ -798,7 +840,6 @@ function App() {
           >
             <ComposerWorkspace
               authoring={<ChatPanel onOpenSecrets={openSecrets} />}
-              authoringStatus={<DefaultModeChangedBanner />}
               collapsedStatus={<CollapsedAuthoringStatus />}
               artifact={
                 // Same availability fact that mounts the REQUEST_RUN_EVENT
@@ -810,7 +851,6 @@ function App() {
                   catalogAvailable={catalogAvailable}
                 />
               }
-              inspector={<WorkspaceInspector />}
               actionBar={
                 <WorkspaceActionBar
                   capabilities={workspaceActionCapabilities}
@@ -820,7 +860,12 @@ function App() {
           </div>
         )}
 
-        {showSecrets && <SecretsPanel onClose={closeSecrets} />}
+        {showSecrets && (
+          <SecretsPanel
+            onClose={closeSecrets}
+            userSecretsEnabled={systemStatus?.user_secrets_enabled !== false}
+          />
+        )}
         <GraphModal />
         <ImportYamlModalHost />
         {/* Phase 6B Task 4: mount the SaveForReviewDialog at app-root level so
@@ -838,11 +883,10 @@ function App() {
             onResetTutorialComplete={handleResetTutorialComplete}
           />
         )}
-        {showUserAdmin && authUser !== null && (
-          <UserAdminDialog
-            onClose={closeUserAdmin}
-            currentUsername={authUser.username}
-          />
+        {showMailbox && <MailboxDialog onClose={closeMailbox} />}
+        {showLibrary && <LibraryDialog onClose={closeLibrary} />}
+        {showPeopleAccess && authUser !== null && (
+          <PeopleAccessDialog onClose={closePeopleAccess} onUnavailable={peopleAccessUnavailable} />
         )}
         <CommandPalette
           isOpen={showPalette}

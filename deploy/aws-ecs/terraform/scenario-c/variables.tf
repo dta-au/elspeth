@@ -395,7 +395,37 @@ variable "gateway_oauth_token_url" {
   description = "HTTPS OAuth2 client-credentials token endpoint."
 }
 
+variable "gateway_oauth_auth_method" {
+  type        = string
+  description = "OAuth2 client authentication method used by the gateway at its token endpoint."
+}
+
 variable "gateway_model_mappings_json" {
   type        = string
   description = "Strict-JSON object of model alias => adapter-defined mapping object; must cover both composer models."
+}
+
+variable "gateway_max_messages" {
+  type        = number
+  description = "Maximum messages accepted in one gateway request."
+}
+
+variable "gateway_max_tools" {
+  type        = number
+  description = "Maximum tools accepted in one gateway request."
+}
+
+variable "gateway_max_string_chars" {
+  type        = number
+  description = "Maximum characters in a gateway request string."
+}
+
+variable "gateway_max_schema_bytes" {
+  type        = number
+  description = "Maximum JSON schema size in bytes accepted by the gateway."
+}
+
+variable "gateway_max_schema_depth" {
+  type        = number
+  description = "Maximum JSON schema nesting depth accepted by the gateway."
 }

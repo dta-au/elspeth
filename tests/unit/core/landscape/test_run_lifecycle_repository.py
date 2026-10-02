@@ -17,15 +17,23 @@ from typing import Any, TypedDict
 
 import pytest
 from sqlalchemy import select, update
+from sqlalchemy.engine import Connection
 
 from elspeth.contracts import (
+    CallStatus,
+    CallType,
     Determinism,
     ExportStatus,
+    NodeStateStatus,
     NodeType,
     ReproducibilityGrade,
     RunStatus,
     SecretResolutionInput,
+    TerminalOutcome,
+    TerminalPath,
 )
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.declaration_contracts import (
     DeclarationContract,
@@ -46,6 +54,7 @@ from elspeth.core.landscape.run_lifecycle_repository import (
     is_valid_sha256_hex,
 )
 from elspeth.core.landscape.schema import run_attributions_table, run_web_plugin_policy_table, runs_table
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, make_recorder_with_run, register_test_node
 
 
@@ -180,21 +189,31 @@ class TestBeginRunDirect:
         ops = DatabaseOps(db)
         repo = RunLifecycleRepository(db, ops, RunLoader())
         observed_run_ids: list[str] = []
+        original_register = RunCoordinationRepository.register_run_leader_on
 
-        def spy_register_run_leader_on(self: RunCoordinationRepository, *args: object, **kwargs: object) -> CoordinationToken:
-            del self, args
-            observed_run_ids.append(str(kwargs["run_id"]))
-            return CoordinationToken(
-                run_id=str(kwargs["run_id"]),
-                worker_id=str(kwargs["worker_id"]),
-                leader_epoch=1,
+        def spy_register_run_leader_on(
+            self: RunCoordinationRepository,
+            conn: Connection,
+            *,
+            run_id: str,
+            worker_id: str,
+            window_seconds: float,
+            entry_point: str,
+        ) -> CoordinationToken:
+            observed_run_ids.append(run_id)
+            return original_register(
+                self,
+                conn,
+                run_id=run_id,
+                worker_id=worker_id,
+                window_seconds=window_seconds,
+                entry_point=entry_point,
             )
 
         monkeypatch.setattr(
             RunCoordinationRepository,
             "register_run_leader_on",
             spy_register_run_leader_on,
-            raising=False,
         )
 
         repo.begin_run(
@@ -205,6 +224,11 @@ class TestBeginRunDirect:
         )
 
         assert observed_run_ids == ["public-composition-run"]
+        assert leader_token_for(db, "public-composition-run") == CoordinationToken(
+            run_id="public-composition-run",
+            worker_id="worker:public-composition-run:abc123",
+            leader_epoch=1,
+        )
 
     def test_begin_run_self_mints_worker_identity_when_omitted(self) -> None:
         """Uniformity-for-free: callers that pass no identity still get a seat."""
@@ -380,12 +404,17 @@ class TestBeginRunDirect:
             run_id="corrupt-policy-run",
             web_plugin_policy_evidence=_web_policy_evidence(),
         )
+        # ``ck_run_web_plugin_policy_policy_hash_hex`` rejects a malformed digest
+        # in a normal write; the read-side guard is defence-in-depth for
+        # out-of-band tampering, so the corruption is planted with CHECKs off.
         with db.write_connection() as conn:
+            conn.exec_driver_sql("PRAGMA ignore_check_constraints = ON")
             conn.execute(
                 update(run_web_plugin_policy_table)
                 .where(run_web_plugin_policy_table.c.run_id == "corrupt-policy-run")
                 .values(**corrupt_values)
             )
+            conn.exec_driver_sql("PRAGMA ignore_check_constraints = OFF")
 
         with pytest.raises(AuditIntegrityError, match=message):
             repo.get_web_plugin_policy_evidence("corrupt-policy-run")
@@ -771,7 +800,7 @@ class TestGetSourceFieldResolution:
                 source_node_id=source_node_id,
                 source_name=source_name,
                 plugin_name="csv",
-                config_hash=source_name,
+                config_hash=fake_sha256(source_name),
                 lifecycle_state="loaded",
                 field_resolution_mapping=shared_mapping,
                 normalization_version="v1",
@@ -799,7 +828,7 @@ class TestGetSourceFieldResolution:
             source_node_id="source_orders",
             source_name="orders",
             plugin_name="csv",
-            config_hash="orders",
+            config_hash=fake_sha256("orders"),
             lifecycle_state="loaded",
             field_resolution_mapping={"Order ID": "order_id", "Amount": "amount"},
             normalization_version="v1",
@@ -809,7 +838,7 @@ class TestGetSourceFieldResolution:
             source_node_id="source_refunds",
             source_name="refunds",
             plugin_name="csv",
-            config_hash="refunds",
+            config_hash=fake_sha256("refunds"),
             lifecycle_state="loaded",
             field_resolution_mapping={"Refund ID": "refund_id", "Amount": "amount"},
             normalization_version="v1",
@@ -833,7 +862,7 @@ class TestGetSourceFieldResolution:
             source_node_id="source_orders",
             source_name="orders",
             plugin_name="csv",
-            config_hash="orders",
+            config_hash=fake_sha256("orders"),
             lifecycle_state="loaded",
             field_resolution_mapping={"Order ID": "order_id"},
             normalization_version="v1",
@@ -843,7 +872,7 @@ class TestGetSourceFieldResolution:
             source_node_id="source_refunds",
             source_name="refunds",
             plugin_name="csv",
-            config_hash="refunds",
+            config_hash=fake_sha256("refunds"),
             lifecycle_state="loaded",
             coordination_token=setup.coordination_token,
         )
@@ -1223,6 +1252,72 @@ class TestCompleteRunCrashPath:
         assert run.status == RunStatus.COMPLETED
         assert run.reproducibility_grade == ReproducibilityGrade.FULL_REPRODUCIBLE
 
+    def test_completion_counts_both_llm_parent_types_and_excludes_other_calls_and_runs(self) -> None:
+        db, repo = _make_repo(run_id="counted-run")
+        factory = make_factory(db)
+        repo.begin_run(config={}, canonical_version="v1", run_id="foreign-run")
+        for run_id in ("counted-run", "foreign-run"):
+            authority = leader_token_for(db, run_id)
+            source_id = register_test_node(factory.data_flow, run_id, f"source-{run_id}", node_type=NodeType.SOURCE)
+            transform_id = register_test_node(factory.data_flow, run_id, f"transform-{run_id}")
+            row, token = factory.data_flow.create_row_with_token(
+                source_id, 0, {"value": 1}, source_row_index=0, ingest_sequence=0, coordination_token=authority
+            )
+            item = factory.scheduler.enqueue_ready_claimed(
+                member_token=authority.membership,
+                token_id=token.token_id,
+                row_id=row.row_id,
+                node_id=transform_id,
+                step_index=1,
+                ingest_sequence=0,
+                row_payload_json='{"value":1}',
+                lease_owner=authority.worker_id,
+                lease_seconds=300,
+            )
+            state = factory.execution.begin_node_state(token.token_id, transform_id, 1, {"value": 1}, member_token=authority.membership)
+            state_calls = [(CallType.LLM, CallStatus.SUCCESS)]
+            if run_id == "counted-run":
+                state_calls.extend([(CallType.LLM, CallStatus.ERROR), (CallType.HTTP, CallStatus.SUCCESS)])
+            for index, (call_type, call_status) in enumerate(state_calls):
+                factory.execution.record_call(
+                    state.state_id,
+                    index,
+                    call_type,
+                    call_status,
+                    RawCallPayload({"index": index}),
+                    member_token=authority.membership,
+                    work_item=item,
+                )
+            factory.execution.complete_node_state(
+                state.state_id, NodeStateStatus.COMPLETED, output_data={"value": 1}, duration_ms=1, member_token=authority.membership
+            )
+            # The row reaches its recorded outcome before its work item closes:
+            # a success stamp never coexists with an outcomeless token (QR-4).
+            factory.data_flow.record_token_outcome(
+                TokenRef(token_id=token.token_id, run_id=run_id),
+                TerminalOutcome.SUCCESS,
+                TerminalPath.FILTER_DROPPED,
+                member_token=authority.membership,
+                work_item=item,
+            )
+            factory.scheduler.mark_terminal(
+                member_token=authority.membership, work_item_id=item.work_item_id, expected_lease_owner=authority.worker_id
+            )
+            operation = factory.execution.begin_operation(source_id, "source_load", coordination_token=authority)
+            operation_calls = [CallType.LLM, CallType.FILESYSTEM] if run_id == "counted-run" else [CallType.LLM]
+            for call_type in operation_calls:
+                factory.execution.record_operation_call(
+                    operation.operation_id, call_type, CallStatus.SUCCESS, RawCallPayload({}), coordination_token=authority
+                )
+            factory.execution.complete_operation(operation.operation_id, "completed", duration_ms=1, coordination_token=authority)
+
+        assert repo.get_run("counted-run").llm_call_count is None
+        completed = repo.complete_run(RunStatus.COMPLETED, coordination_token=leader_token_for(db, "counted-run"))
+        assert completed.llm_call_count == 3
+        assert repo.get_run("foreign-run").llm_call_count is None
+        with db.read_only_connection() as conn:
+            assert conn.execute(select(runs_table.c.llm_call_count).where(runs_table.c.run_id == "counted-run")).scalar_one() == 3
+
     def test_double_completion_rejected(self) -> None:
         """Already-terminal run cannot be completed again.
 
@@ -1272,6 +1367,25 @@ class TestCompleteRunCrashPath:
 
 class TestUpdateRunStatus:
     """Direct tests for update_run_status transition guards."""
+
+    @pytest.mark.parametrize("terminal_status", [RunStatus.FAILED, RunStatus.INTERRUPTED])
+    def test_resuming_running_clears_the_previous_reproducibility_grade(self, terminal_status: RunStatus) -> None:
+        db, repo = _make_repo()
+        authority = leader_token_for(db, "run-1")
+        completed = repo.complete_run(
+            terminal_status,
+            coordination_token=authority,
+            reproducibility_grade=ReproducibilityGrade.FULL_REPRODUCIBLE,
+        )
+        assert completed.reproducibility_grade is ReproducibilityGrade.FULL_REPRODUCIBLE
+        assert completed.completed_at is not None
+        repo.update_run_status(RunStatus.RUNNING, coordination_token=authority)
+        resumed = repo.get_run("run-1")
+        assert resumed.status is RunStatus.RUNNING
+        assert resumed.reproducibility_grade is None
+        assert resumed.completed_at is None
+        with db.read_only_connection() as conn:
+            assert conn.execute(select(runs_table.c.reproducibility_grade).where(runs_table.c.run_id == "run-1")).scalar_one() is None
 
     def test_running_to_running_accepted(self) -> None:
         """Non-terminal to non-terminal transition is valid."""
@@ -1407,7 +1521,7 @@ class TestFinalizeRunEdgeCases:
         # Register a nondeterministic node via the factory (need DataFlowRepository)
         factory = make_factory(db)
         factory.data_flow.register_node(
-            run_id="nd-run",
+            coordination_token=leader_token_for(db, "nd-run"),
             plugin_name="llm_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -1499,16 +1613,16 @@ class TestPreflightAuditWriteErrors:
             repo.record_preflight_results(preflight, coordination_token=_ghost_token())
 
     def test_record_readiness_check_missing_run_is_refused_by_the_fence(self) -> None:
-        """A run with no seat is refused before the readiness INSERT runs."""
+        """A worker with no registration is refused before the readiness INSERT."""
         _, repo = _make_repo()
-        with pytest.raises(RunLeadershipLostError):
+        with pytest.raises(AuditIntegrityError, match="unregistered worker"):
             repo.record_readiness_check(
                 name="probe",
                 collection="docs",
                 reachable=True,
                 count=1,
                 message="ok",
-                coordination_token=_ghost_token(),
+                member_token=_ghost_token().membership,
             )
 
     def test_record_readiness_check_normalizes_a_rejected_write(self) -> None:
@@ -1527,7 +1641,7 @@ class TestPreflightAuditWriteErrors:
                 reachable=True,
                 count=1,
                 message="ok",
-                coordination_token=leader_token_for(db, "run-1"),
+                member_token=leader_token_for(db, "run-1").membership,
             )
 
 
@@ -1599,36 +1713,6 @@ class TestBeginRunOpenrouterCatalogSnapshotValidation:
                 canonical_version="v1",
                 run_id="none-sha-run",
                 openrouter_catalog_sha256=None,  # type: ignore[arg-type]
-                openrouter_catalog_source="bundled",
-            )
-
-
-class TestWriteRepositoryOpenrouterCatalogSnapshotValidation:
-    """Pin the same hex-shape guard at the synthesised-run write site."""
-
-    def test_record_synthesised_run_rejects_non_hex_sha256(self) -> None:
-        from datetime import UTC, datetime
-
-        from elspeth.contracts import NodeType
-        from elspeth.contracts.synthesised_audit import SynthesisedNodeSpec
-        from elspeth.core.landscape.write_repository import LandscapeWriteRepository
-
-        db = make_landscape_db()
-        repo = LandscapeWriteRepository(db)
-        node_specs = (
-            SynthesisedNodeSpec(node_type=NodeType.SOURCE, plugin_name="csv_file", plugin_version="1.0"),
-            SynthesisedNodeSpec(node_type=NodeType.SINK, plugin_name="json_file", plugin_version="1.0"),
-        )
-        with pytest.raises(LandscapeRecordError, match="openrouter_catalog_sha256 must be 64 lowercase hex chars"):
-            repo.record_synthesised_run(
-                pipeline_yaml="version: 1",
-                rows=(),
-                source_data_hash="0" * 64,
-                llm_call_count=0,
-                node_specs=node_specs,
-                started_at=datetime.now(UTC),
-                metadata={"seeded_from_cache": True, "cache_key": "c" * 64},
-                openrouter_catalog_sha256="not-a-sha",
                 openrouter_catalog_source="bundled",
             )
 
@@ -1749,17 +1833,16 @@ class TestCompleteRunDiagnosisOrder:
         factory = make_factory(db)
         source_node = register_test_node(factory.data_flow, "run-diag-residual", "src-1", node_type=NodeType.SOURCE)
         transform_node = register_test_node(factory.data_flow, "run-diag-residual", "t-1")
-        row = factory.data_flow.create_row(
-            run_id="run-diag-residual",
+        row, journal_token = factory.data_flow.create_row_with_token(
+            coordination_token=token,
             source_node_id=source_node,
             row_index=0,
             data={"id": 1},
             source_row_index=0,
             ingest_sequence=0,
         )
-        journal_token = factory.data_flow.create_token(row_id=row.row_id)
         TokenSchedulerRepository(db.engine).enqueue_ready(
-            run_id="run-diag-residual",
+            member_token=token.membership,
             token_id=journal_token.token_id,
             row_id=row.row_id,
             node_id=transform_node,
@@ -1776,3 +1859,86 @@ class TestCompleteRunDiagnosisOrder:
         run = repo.get_run("run-diag-residual")
         assert run is not None
         assert run.status == RunStatus.RUNNING
+
+    @pytest.mark.parametrize("success_status", [RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_FAILURES, RunStatus.EMPTY])
+    def test_token_without_outcome_or_work_refuses_every_success_stamp(self, success_status: RunStatus) -> None:
+        """QR-4: a token with no completed outcome and NO scheduler work is invisible
+        to journal quiescence; the undecided-token arm refuses the success stamp and
+        names the token, while a FAILED stamp (resume's ceremony) still lands."""
+        from datetime import UTC, datetime
+
+        from elspeth.contracts.errors import OrchestrationInvariantError
+        from elspeth.core.landscape.schema import token_outcomes_table
+
+        run_id = f"run-qr4-{success_status.value}"
+        db, repo, token = _make_repo_with_token(run_id=run_id)
+        factory = make_factory(db)
+        source_node = register_test_node(factory.data_flow, run_id, "src-1", node_type=NodeType.SOURCE)
+        tokens = [
+            factory.data_flow.create_row_with_token(
+                coordination_token=token,
+                source_node_id=source_node,
+                row_index=index,
+                data={"id": index},
+                source_row_index=index,
+                ingest_sequence=index,
+            )[1]
+            for index in range(2)
+        ]
+        decided, undecided = tokens
+        with db.engine.begin() as conn:
+            conn.execute(
+                token_outcomes_table.insert().values(
+                    outcome_id="outcome-qr4-decided",
+                    run_id=run_id,
+                    token_id=decided.token_id,
+                    outcome="success",
+                    path="default_flow",
+                    completed=1,
+                    recorded_at=datetime.now(UTC),
+                )
+            )
+
+        with pytest.raises(OrchestrationInvariantError, match=r"1 token\(s\) have no completed terminal outcome") as refused:
+            repo.complete_run(success_status, coordination_token=token)
+        assert undecided.token_id in str(refused.value)
+        assert decided.token_id not in str(refused.value)
+        run = repo.get_run(run_id)
+        assert run is not None
+        assert run.status == RunStatus.RUNNING, "the refused stamp mutated nothing"
+
+        assert repo.complete_run(RunStatus.FAILED, coordination_token=token).status is RunStatus.FAILED
+
+    def test_every_token_decided_without_work_stamps_success(self) -> None:
+        """QR-4 negative control: every token carries a completed outcome and no work
+        remains — the undecided-token arm admits the success stamp."""
+        from datetime import UTC, datetime
+
+        from elspeth.core.landscape.schema import token_outcomes_table
+
+        run_id = "run-qr4-all-decided"
+        db, repo, token = _make_repo_with_token(run_id=run_id)
+        factory = make_factory(db)
+        source_node = register_test_node(factory.data_flow, run_id, "src-1", node_type=NodeType.SOURCE)
+        _row, only = factory.data_flow.create_row_with_token(
+            coordination_token=token,
+            source_node_id=source_node,
+            row_index=0,
+            data={"id": 0},
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+        with db.engine.begin() as conn:
+            conn.execute(
+                token_outcomes_table.insert().values(
+                    outcome_id="outcome-qr4-only",
+                    run_id=run_id,
+                    token_id=only.token_id,
+                    outcome="success",
+                    path="default_flow",
+                    completed=1,
+                    recorded_at=datetime.now(UTC),
+                )
+            )
+
+        assert repo.complete_run(RunStatus.COMPLETED, coordination_token=token).status is RunStatus.COMPLETED

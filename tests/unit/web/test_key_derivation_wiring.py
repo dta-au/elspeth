@@ -27,9 +27,10 @@ itself can catch:
 
 SCOPE, STATED HONESTLY
 ----------------------
-The per-site checks are an AST check over the argument expression at four
-named call sites. They prove those four call sites pass the derivation each
-was meant to receive. They do NOT prove that no *fifth* consumer exists, and
+The per-site checks are an AST check over each named consumer and argument.
+They prove those call sites pass the derivation each was meant to receive.
+The keyword inventory also rejects unregistered signing/generation consumers,
+but these checks do not prove no consumer using another argument exists, and
 they cannot see a raw use added inside a different callable -- the raw-use
 sweep below is what bounds that, over the ``web`` package only.
 
@@ -60,11 +61,12 @@ from elspeth_lints.core.ast_walker import iter_python_files
 
 _WEB_ROOT = Path(web_package.__file__).parent
 
-# (module path, keyword argument or call, expected derivation function)
+# (module path, consumer, keyword argument, expected derivation function)
 _DERIVED_CALL_SITES = (
-    ("app.py", "generation_key", "derive_binding_generation_key"),
-    ("app.py", "signing_key", "derive_session_token_key"),
-    ("_aws_ecs_acceptance/bedrock.py", "generation_key", "derive_binding_generation_key"),
+    ("app.py", "RequestPluginSnapshotFactory", "generation_key", "derive_binding_generation_key"),
+    ("app.py", "SessionTokenIssuer", "signing_key", "derive_session_token_key"),
+    ("app.py", "RepositoryRateLimitAuthority", "signing_key", "derive_rate_limit_key"),
+    ("_aws_ecs_acceptance/bedrock.py", "build_plugin_snapshot", "generation_key", "derive_binding_generation_key"),
 )
 
 _DERIVATION_PREFIX = "derive_"
@@ -74,11 +76,11 @@ def _parse(relative: str) -> ast.Module:
     return ast.parse((_WEB_ROOT / relative).read_text(encoding="utf-8"))
 
 
-def _keyword_value_calls(tree: ast.Module, keyword_name: str) -> list[str]:
-    """Return the called-function name of every ``keyword_name=<call>(...)``."""
+def _keyword_value_calls(tree: ast.Module, consumer: str, keyword_name: str) -> list[str]:
+    """Return derivations for one consumer's named key argument."""
     called: list[str] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+        if not isinstance(node, ast.Call) or _consumer_name(node) != consumer:
             continue
         for keyword in node.keywords:
             if keyword.arg != keyword_name:
@@ -91,11 +93,26 @@ def _keyword_value_calls(tree: ast.Module, keyword_name: str) -> list[str]:
     return called
 
 
-@pytest.mark.parametrize(("module", "keyword", "derivation"), _DERIVED_CALL_SITES)
-def test_every_derived_key_site_passes_its_own_derivation(module: str, keyword: str, derivation: str) -> None:
-    calls = _keyword_value_calls(_parse(module), keyword)
-    assert calls, f"{module} no longer passes {keyword}= at all — this guard has gone blind"
-    assert all(call == derivation for call in calls), f"{module} passes {keyword} from {calls}, expected {derivation}"
+@pytest.mark.parametrize(("module", "consumer", "keyword", "derivation"), _DERIVED_CALL_SITES)
+def test_every_derived_key_site_passes_its_own_derivation(module: str, consumer: str, keyword: str, derivation: str) -> None:
+    calls = _keyword_value_calls(_parse(module), consumer, keyword)
+    assert calls, f"{module} no longer passes {consumer}({keyword}=) — this guard has gone blind"
+    assert all(call == derivation for call in calls), f"{module} passes {consumer}({keyword}=) from {calls}, expected {derivation}"
+
+
+def test_named_key_arguments_have_no_unregistered_consumers() -> None:
+    """Callee scoping must not silently stop inventorying a new signing user."""
+    for module in {site[0] for site in _DERIVED_CALL_SITES}:
+        expected = {(consumer, keyword) for path, consumer, keyword, _ in _DERIVED_CALL_SITES if path == module}
+        keywords = {keyword for _, keyword in expected}
+        actual = {
+            (_consumer_name(node), keyword.arg)
+            for node in ast.walk(_parse(module))
+            if isinstance(node, ast.Call)
+            for keyword in node.keywords
+            if keyword.arg in keywords
+        }
+        assert actual == expected
 
 
 def _derivation_name(node: ast.AST) -> str | None:

@@ -5,13 +5,16 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
 from elspeth.contracts import RunStatus
+from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.events import RunCompletionStatus, RunFinished, RunSummary
 from elspeth.contracts.run_result import RunResult
 from elspeth.engine.orchestrator.ceremony import RunCeremony
+from tests.fixtures.exception_coalesce_consumer import make_diagnostic_recorder
 
 
 class RecordingEvents:
@@ -94,6 +97,7 @@ def test_run_ceremony_emits_partial_summary_from_run_result(monkeypatch: pytest.
         rows_routed_success=2,
         rows_routed_failure=1,
         routed_destinations={"default": 2, "quarantine": 1},
+        collector_groups_failed=2,
     )
 
     class _FrozenClockTime:
@@ -133,10 +137,36 @@ def test_run_ceremony_emits_partial_summary_from_run_result(monkeypatch: pytest.
     assert summary.succeeded == 2
     assert summary.failed == 1
     assert summary.quarantined == 1
+    assert summary.collector_groups_failed == 2
     assert summary.duration_seconds == 2.5
     assert summary.routed_success == 2
     assert summary.routed_failure == 1
     assert summary.routed_destinations == (("default", 2), ("quarantine", 1))
+
+
+def test_interrupted_summary_reads_durable_collector_failure_count() -> None:
+    setup = make_diagnostic_recorder(run_id="run-interrupted-groups")
+    try:
+        event_bus = RecordingEvents()
+        ceremony = RunCeremony(events=event_bus, telemetry=None)
+        shutdown = GracefulShutdownError(rows_processed=0, run_id=setup.run_id)
+        with patch.object(setup.factory.run_status_projection, "count_failed_collector_groups", return_value=2) as count_failed:
+            ceremony.emit_interrupted_ceremony(
+                setup.run_id,
+                setup.factory,
+                shutdown,
+                0.0,
+                coordination_token=setup.coordination_token,
+            )
+
+        count_failed.assert_called_once_with(setup.run_id)
+        summary = event_bus.events[-1]
+        assert isinstance(summary, RunSummary)
+        assert summary.status is RunCompletionStatus.INTERRUPTED
+        assert summary.failed == 0
+        assert summary.collector_groups_failed == 2
+    finally:
+        setup.db.close()
 
 
 def test_run_and_resume_coordinators_do_not_construct_terminal_events_directly() -> None:

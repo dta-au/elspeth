@@ -6,11 +6,19 @@ from typing import ClassVar
 from pydantic import ConfigDict
 
 from elspeth.contracts import PluginSchema
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.config import CoalesceSettings
+from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.engine.coalesce_executor import CoalesceExecutor
+from elspeth.engine.tokens import TokenManager
+from tests.fixtures.landscape import leader_token_for
 
 
 class MockCoalesceExecutor(CoalesceExecutor):
@@ -84,3 +92,34 @@ def make_strict_step_resolver(step_map: dict[str, int]) -> StepResolver:
         return _map[node_id]
 
     return resolve
+
+
+def token_manager_leader(manager: TokenManager, run_id: str) -> CoordinationToken:
+    """Read authority from a real TokenManager's durable run seat."""
+    assert isinstance(manager._data_flow, DataFlowRepository)
+    assert isinstance(manager._data_flow._db, LandscapeDB)
+    return leader_token_for(manager._data_flow._db, run_id)
+
+
+def claim_token_for_manager(manager: TokenManager, token: TokenInfo, run_id: str) -> TokenWorkItem:
+    """Claim the real token on the scheduler's terminal cursor for primitive tests.
+
+    These tests exercise TokenManager independently of node traversal. A NULL
+    node cursor is a supported scheduler lane, while the claimed token, row,
+    run, worker and attempt remain real persisted identities.
+    """
+    assert isinstance(manager._data_flow, DataFlowRepository)
+    assert isinstance(manager._data_flow._db, LandscapeDB)
+    leader = leader_token_for(manager._data_flow._db, run_id)
+    return TokenSchedulerRepository(manager._data_flow._db.engine).enqueue_ready_claimed(
+        member_token=leader.membership,
+        token_id=token.token_id,
+        row_id=token.row_id,
+        node_id=None,
+        step_index=0,
+        ingest_sequence=manager._data_flow.resolve_row_ingest_sequence(token.row_id),
+        row_payload_json="{}",
+        lease_owner=leader.worker_id,
+        lease_seconds=60,
+        lineage_path=token.lineage_path,
+    )

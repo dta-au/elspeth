@@ -47,6 +47,7 @@ from elspeth.mcp.types import (
     SinkEffectHistoryReport,
     TokenChildRecord,
     TokenRecord,
+    VerificationDecisionRecord,
 )
 
 
@@ -118,6 +119,9 @@ class LandscapeAnalyzer:
 
     def get_operation_calls(self, operation_id: str) -> list[OperationCallRecord]:
         return queries.get_operation_calls(self._db, self._factory, operation_id)
+
+    def list_verification_decisions(self, run_id: str) -> list[VerificationDecisionRecord]:
+        return queries.list_verification_decisions(self._db, self._factory, run_id)
 
     def explain_token(
         self,

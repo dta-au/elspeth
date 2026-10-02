@@ -14,6 +14,7 @@ phase for domain-specific types before delegating to rfc8785.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from collections.abc import Mapping
@@ -51,9 +52,9 @@ def _normalize_frozen_and_reject_non_finite(obj: Any) -> Any:
             raise ValueError(f"Cannot canonicalize Infinity. Use None for missing values, not Infinity. Got: {obj!r}")
         return obj
     if isinstance(obj, frozenset):
-        raise TypeError(
-            f"frozenset is not JSON-serializable and has no canonical ordering. Use list or tuple for ordered collections. Got: {obj!r}"
-        )
+        # Type only, never the set's repr: its members can be row values, and
+        # this text reaches audit records through every hashing seam.
+        raise TypeError("frozenset is not JSON-serializable and has no canonical ordering. Use list or tuple for ordered collections.")
     # Mapping ABC covers both dict and MappingProxyType. The dict
     # comprehension normalizes MappingProxyType → dict for rfc8785.
     if isinstance(obj, Mapping):
@@ -84,6 +85,72 @@ def canonical_json(obj: Any) -> str:
     normalized = _normalize_frozen_and_reject_non_finite(obj)
     result: bytes = rfc8785.dumps(normalized)
     return result.decode("utf-8")
+
+
+# The largest magnitude an integer may have in canonical JSON: rfc8785 refuses
+# any int beyond it (IntegerDomainError), so it never writes one.
+_CANONICAL_SAFE_INTEGER_MAX = 2**53 - 1
+
+
+def _parse_canonical_integer_literal(literal: str) -> int | float:
+    try:
+        value = int(literal)
+    except ValueError as exc:
+        # CPython raises ValueError for an integer token beyond its decimal
+        # conversion digit limit. Persisted JSON corruption must retain the
+        # same decode-error class as every other invalid numeric literal.
+        raise json.JSONDecodeError("JSON integer literal exceeds decoder limit", literal, 0) from exc
+    if -_CANONICAL_SAFE_INTEGER_MAX <= value <= _CANONICAL_SAFE_INTEGER_MAX:
+        return value
+    # Beyond the safe range only a double can have produced this literal:
+    # RFC 8785 writes an integral double below 1e21 in integer notation
+    # (1e17 -> 100000000000000000), and the encoder refuses such ints.
+    # The literal is that double's shortest round-trip form, so float() of
+    # it is exactly the value that was encoded.
+    double = float(literal)
+    if not math.isfinite(double):
+        raise json.JSONDecodeError("non-finite JSON number", literal, 0)
+    return double
+
+
+def _parse_canonical_float_literal(literal: str) -> float:
+    value = float(literal)
+    if not math.isfinite(value):
+        raise json.JSONDecodeError("non-finite JSON number", literal, 0)
+    return value
+
+
+def _refuse_non_finite_literal(literal: str) -> Any:
+    # The literal is one of NaN / Infinity / -Infinity — never row data.
+    raise json.JSONDecodeError(f"non-finite JSON constant {literal!r} is not canonical JSON", literal, 0)
+
+
+def canonical_json_loads(text: str | bytes) -> Any:
+    """Parse text that ``canonical_json`` produced back into the value it encoded.
+
+    The one inverse of the encoder, for every reader of canonical row
+    material (the sink-effect member rows, their payload-store content, the
+    durable sink-effect plan whose ``safe_evidence`` can carry member rows, a
+    source row's stored payload, a validation error's ``row_data_json``).
+    A plain ``json.loads`` is not an inverse: RFC 8785 serializes numbers as
+    IEEE 754 doubles, printing an integral double in [2**53, 1e21) in integer
+    notation, so ``json.loads`` reads it back as an ``int`` the canonical
+    encoder itself refuses — the round trip of a valid row then fails.
+
+    Integer literals inside ±(2**53-1) stay ``int``: the encoder writes an
+    int and an integral double there identically (``5`` and ``5.0`` both as
+    ``5``), and ``int`` is the established reading of that text. Outside the
+    safe range the literal can only have come from a double, so it is read
+    back as that double. NaN / Infinity never appear in canonical JSON and
+    are refused as a decode error, including numeric literals that overflow
+    to infinity during Python's float conversion.
+    """
+    return json.loads(
+        text,
+        parse_int=_parse_canonical_integer_literal,
+        parse_float=_parse_canonical_float_literal,
+        parse_constant=_refuse_non_finite_literal,
+    )
 
 
 def stable_hash(obj: Any) -> str:

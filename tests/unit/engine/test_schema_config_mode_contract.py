@@ -185,6 +185,7 @@ def test_post_emission_check_raises_on_mode_mismatch() -> None:
         contract.post_emission_check(inputs, outputs)
 
     assert exc_info.value.payload == {
+        "emitted_index": 0,
         "declared_mode": "fixed",
         "observed_mode": "observed",
         "declared_locked": True,

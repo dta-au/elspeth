@@ -56,9 +56,8 @@ adjudications, and limits.
 The campaign is owned by epic `elspeth-1040aa2143` ("State engine — completion to
 1.0"). It superseded milestone `elspeth-4b3d734e3a` on 2026-08-15, which was
 cancelled after all open work was re-parented flat under the epic; its phases
-`elspeth-7152ce00e4` and `elspeth-19149b1cb7` were skipped. Use
-`filigree list --parent elspeth-1040aa2143` — `filigree plan` is milestone-only
-and no longer applies.
+`elspeth-7152ce00e4` and `elspeth-19149b1cb7` were skipped. These identifiers now refer to archived tracker records; current work must
+be triaged separately into GitHub Issues.
 
 The 1,780-cell live lane above is owned by `elspeth-29a7f5a21a`, the slim
 successor to `elspeth-82592e3aa1`. The published 2026-08-15-0537 package still
@@ -66,8 +65,8 @@ names the predecessor because that package is digest-frozen and is not edited
 retroactively; the successor pointer is tracker-side. Making that pointer
 machine-checkable is `elspeth-079c8fb9ab`.
 
-Tracker assignment, status, priority, and dependencies remain live Filigree
-authority rather than evergreen prose.
+GitHub Issues owns current assignment, status, priority, and dependencies.
+The legacy identifiers above are historical references, not GitHub issue numbers.
 
 ## Hard gates
 

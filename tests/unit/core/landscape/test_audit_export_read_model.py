@@ -24,7 +24,7 @@ from elspeth.core.landscape.schema import (
     transform_errors_table,
     validation_errors_table,
 )
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 
 COMPLETED_AT = datetime(2026, 7, 16, 2, 3, 4, 567890, tzinfo=UTC)
 
@@ -124,6 +124,7 @@ def test_public_signed_export_uses_one_snapshot_for_terminal_witness_and_records
             db,
             signing_key=b"snapshot-signing-key",
             signer_key_id="snapshot-signer-v1",
+            compartment_id="test-compartment",
         ).export_run("completed", sign=True)
         first = next(records)
         assert first["record_type"] == "run"
@@ -155,7 +156,7 @@ def test_public_unsigned_record_iterator_uses_one_snapshot(tmp_path: Path) -> No
     db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'public-unsigned-records.db'}")
     try:
         _insert_run(db, run_id="completed", status="completed", completed_at=COMPLETED_AT)
-        records = LandscapeExporter(db).iter_unsigned_run_records("completed")
+        records = LandscapeExporter(db, compartment_id="test-compartment").iter_unsigned_run_records("completed")
         assert next(records)["record_type"] == "run"
 
         with db.engine.begin() as writer:
@@ -185,7 +186,8 @@ def test_public_export_rejects_derivation_config_that_disagrees_with_snapshot_wi
             source_status="completed",
             source_completed_at="2026-07-16T02:03:05.567890Z",
             export_format="json",
-            exporter_version="landscape-exporter-v1",
+            exporter_version="landscape-exporter-auth-v2",
+            compartment_id="test-compartment",
             serialization_version=AUDIT_EXPORT_SERIALIZATION_VERSION,
             chunking_algorithm_version="record-framing-v1",
             include_raw_error_rows=False,
@@ -197,7 +199,7 @@ def test_public_export_rejects_derivation_config_that_disagrees_with_snapshot_wi
         )
 
         with pytest.raises(AuditIntegrityError, match="snapshot-bound terminal witness"):
-            LandscapeExporter(db).derive_run_bundle("completed", derivation_config=config)
+            LandscapeExporter(db, compartment_id="test-compartment").derive_run_bundle("completed", derivation_config=config)
     finally:
         db.close()
 
@@ -228,15 +230,14 @@ def test_export_enumerations_break_timestamp_ties_by_primary_key() -> None:
         factory = make_factory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = register_test_node(factory.data_flow, run.run_id, "tie-source", node_type=NodeType.SOURCE, plugin_name="source")
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id=source,
             row_index=0,
             data={"value": 1},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
-        token = factory.data_flow.create_token(row.row_id)
         tie = COMPLETED_AT
         with db.engine.begin() as writer:
             writer.execute(

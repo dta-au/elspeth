@@ -12,7 +12,7 @@ import hashlib
 import types
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from elspeth.contracts.errors import (
     AuditIntegrityError,
@@ -26,8 +26,43 @@ from elspeth.contracts.type_normalization import (
     ALLOWED_CONTRACT_TYPES,
     CONTRACT_TYPE_MAP,
     classify_runtime_type,
-    require_supported_contract_type,
+    infer_field_type,
 )
+
+if TYPE_CHECKING:
+    from elspeth.contracts.schema import OutputFieldDeclarer
+
+
+def declared_type_admits(declared: type, actual: type) -> bool:
+    """Whether a value classified as ``actual`` satisfies a field declared ``declared``.
+
+    The ONE rule for checking a value against a declared contract type
+    (every per-row check of a declared type goes through
+    ``SchemaContract.validate``), and the rule the build applies to
+    declarations before any row exists: the DAG edge check
+    (``contracts.data._types_compatible``) and the composer's edge mirror
+    (``declared_type_name_admits``) call it, so what the build admits and what
+    a row passes cannot disagree. Exact type, with one widening:
+    an ``int`` satisfies a ``float`` declaration — the numeric tower, and JSON
+    has a single number type — which is also what pydantic's strict mode
+    admits at every input and output schema check. The value is never
+    converted. ``bool`` is not a number here: ``classify_runtime_type(True)``
+    is ``bool``, so ``True`` under ``float`` (or ``int``) is still a mismatch,
+    matching pydantic strict. Nothing else widens: a ``float`` does not
+    satisfy ``int``.
+    """
+    return actual is declared or (declared is float and actual is int)
+
+
+def declared_type_name_admits(declared: str, actual: str) -> bool:
+    """``declared_type_admits`` for two contract type NAMES (``"int"``, ``"float"``, ...).
+
+    For a build-time check that compares declarations as written (the
+    composer's field-type strings) rather than annotations or values. A name
+    outside ``CONTRACT_TYPE_MAP`` is a caller bug (a schema DSL ``any`` must be
+    abstained on before asking), so it raises ``KeyError``.
+    """
+    return declared_type_admits(CONTRACT_TYPE_MAP[declared], CONTRACT_TYPE_MAP[actual])
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +98,52 @@ class FieldContract:
                 f"Invalid python_type '{self.python_type.__name__}' for FieldContract. "
                 f"Valid types: {', '.join(sorted(t.__name__ for t in ALLOWED_CONTRACT_TYPES))}."
             )
+
+    @classmethod
+    def inferred(cls, normalized_name: str, original_name: str, value: Any) -> FieldContract:
+        """Build the contract of a field observed from one value (never required).
+
+        The one builder for every inferred field: a source's first row, a
+        transform's propagated/narrowed output, and a field added by
+        ``SchemaContract.with_field``. The type comes from ``infer_field_type``.
+
+        Raises:
+            ValueError: If value is NaN or Infinity
+        """
+        python_type, nullable = infer_field_type(value)
+        return cls(
+            normalized_name=normalized_name,
+            original_name=original_name,
+            python_type=python_type,
+            required=False,
+            source="inferred",
+            nullable=nullable,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OutputFieldDeclaration:
+    """One row of a transform's output-declaration table (ADR-050): a field's declared contract and who declared it.
+
+    The table (``BaseTransform.output_field_declarations()``) is the ONE
+    authority the runtime stamp rewrites emitted contracts from
+    (``_apply_declared_output_field_contracts``), the engine's value check
+    reads the authorship bit from, and the DAG build publishes on
+    ``NodeInfo.output_field_declarations`` for build-time reasoning about
+    the types a node's rows will carry (the union-coalesce refusal,
+    ``core/dag/guarantees.resolve_guaranteed_field_type``). A reader never
+    re-derives it.
+    """
+
+    contract: FieldContract
+    declared_by: OutputFieldDeclarer
+
+    @property
+    def field_type(self) -> str:
+        """The schema-DSL type token of ``contract.python_type`` (``object`` is ``any``)."""
+        from elspeth.contracts.schema_contract_factory import field_type_name
+
+        return field_type_name(self.contract.python_type)
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,17 +302,13 @@ class SchemaContract:
             ValueError: If value is NaN or Infinity
         """
         # Always check for duplicates - prevents broken O(1) lookup invariant
-        # Per CLAUDE.md: Adding duplicate is a bug in caller code
+        # Adding a duplicate is a bug in caller code — reject it at construction
+        # rather than let it reach the audit trail (see the
+        # engine-patterns-reference skill §Offensive Programming Examples)
         if normalized in self._by_normalized:
             raise TypeError(f"Field '{original}' ({normalized}) already exists in contract")
 
-        new_field = FieldContract(
-            normalized_name=normalized,
-            original_name=original,
-            python_type=require_supported_contract_type(value),
-            required=False,  # Inferred fields are never required
-            source="inferred",
-        )
+        new_field = FieldContract.inferred(normalized, original, value)
         return SchemaContract(
             mode=self.mode,
             fields=(*self.fields, new_field),
@@ -243,7 +320,9 @@ class SchemaContract:
 
         Checks:
         1. Required fields are present
-        2. Field types match (with numpy/pandas normalization)
+        2. Field types match (with numpy/pandas normalization) under
+           ``declared_type_admits``: exact type, except that an ``int`` value
+           satisfies a ``float`` declaration (``bool`` never does)
         3. FIXED mode: No extra fields allowed
 
         Note: Fields with python_type=object ('any' type) skip type validation
@@ -287,7 +366,7 @@ class SchemaContract:
                 # of crashing the pipeline (Tier 3 data should be quarantined).
                 actual_type = classify_runtime_type(value)
                 # type(None) matches None values (for explicitly declared type(None) fields)
-                if actual_type != fc.python_type:
+                if not declared_type_admits(fc.python_type, actual_type):
                     violations.append(
                         TypeMismatchViolation(
                             normalized_name=fc.normalized_name,
@@ -319,7 +398,8 @@ class SchemaContract:
         The hash is truncated to 32 hex characters (128 bits).
 
         IMPORTANT: This hash MUST include ALL fields written by to_checkpoint_format().
-        Per CLAUDE.md Tier 1: integrity checks must detect any mutation of serialized state.
+        Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+        §The Three-Tier Trust Model), Tier 1 integrity checks must detect any mutation of serialized state.
         Missing fields from the hash would allow tampering without detection.
 
         Includes:
@@ -435,7 +515,8 @@ class SchemaContract:
             raise AuditIntegrityError(f"Corrupt SchemaContract checkpoint: missing key {e}. Top-level keys: {sorted(data.keys())}") from e
 
         # Verify integrity (Tier 1 audit requirement)
-        # Per CLAUDE.md: "Bad data in the audit trail = crash immediately"
+        # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model, bad data in the audit trail crashes immediately.
         # to_checkpoint_format() ALWAYS writes version_hash, so missing = corruption
         try:
             expected_hash = data["version_hash"]
@@ -454,43 +535,75 @@ class SchemaContract:
         return contract
 
     def merge_for_batch(self, other: SchemaContract) -> SchemaContract:
-        """Describe a heterogeneous batch/accumulation of sibling row contracts.
+        """Describe a batch of sibling rows from SEVERAL producers (the J1 join).
 
-        Used when N sibling tokens (possibly from different pipeline
-        branches/paths) are bound for one sink and the batch needs a single
-        truthful description:
+        Used at exactly two seams, where N sibling tokens — possibly from
+        different sources, branches or paths — are bound for one sink and the
+        batch needs a single truthful description: ``SinkExecutor``'s batch
+        contract and ``display_headers`` (ADR-050). It is
+        ``elspeth.contracts.union_merge.join_batch_contracts`` applied to
+        ``(self, other)``, and it never raises on a type difference: each
+        producer's contract is a truthful description of its own rows, so a
+        field the producers type differently is described as ``object``
+        (``int`` ⊔ ``float`` = ``object``, ``bool`` ⊔ ``int`` = ``object``,
+        ``object`` absorbs). Nullable is OR, required is AND, a field some
+        member lacks is optional and nullable, mode is the most restrictive,
+        locked is OR, and ``original_name`` falls back to the identity when
+        the carriers disagree, so the result is arrival-order independent.
 
-        - A field is required only if EVERY member requires it (AND): a field
-          some member's contract does not require cannot be promised for every
-          row in the batch.
-        - Fields absent from any member are optional and nullable: those
-          members' rows lack them.
-        - Shared-field nullable is OR (any member may supply None).
-        - Mode: most restrictive wins (FIXED > FLEXIBLE > OBSERVED);
-          locked: True if either is locked.
-
-        NOT for coalesce union merges — use
-        elspeth.contracts.union_merge.merge_union_contracts, which is
-        policy-aware (require_all coalesces need OR-required semantics).
-        This method delegates to the same canonical algorithm with
-        require_all=False.
+        NOT for a coalesce union merge (``merge_union_contracts``, which is
+        policy-aware and RAISES on a type conflict: a union coalesce promises
+        one type to its consumers) and NOT for a node's own recorded output
+        contract (``merge_for_node_evolution``, which raises too: one node's
+        emissions all carry the same declared types).
 
         Args:
-            other: Contract to merge with
+            other: Contract to join with
 
         Returns:
-            New merged SchemaContract
+            The joined SchemaContract
+        """
+        # Deferred import: union_merge imports SchemaContract from this module.
+        from elspeth.contracts.union_merge import join_batch_contracts
+
+        return join_batch_contracts((self, other))
+
+    def merge_for_node_evolution(self, other: SchemaContract) -> SchemaContract:
+        """Evolve a node's recorded output contract with one more emission.
+
+        Used only by the Landscape's node-contract writer
+        (``DataFlowRepository.update_node_output_contract``) for the record in
+        ``nodes.output_contract_json``, and it does not describe a batch: it
+        FOLDS one node's emitted contracts, which may add fields row to row
+        (an observed pass-through field set legitimately varies) but never
+        change a field's type. A source infers and locks its types on the
+        first valid row; a transform declares the type of every field it
+        creates before row 1 and stamps it on every emission (ADR-050). So a
+        type conflict here is not a data fault and not a batch to describe —
+        it is a bug in owned code (an emission that bypassed the stamp, or a
+        source re-recording a different lock), and this method raises.
+
+        Field-set semantics are ``merge_union_contracts`` with
+        ``require_all=False``: a field absent from one emission becomes
+        optional and nullable in the record; nullable is OR.
+
+        Args:
+            other: The newly emitted contract
+
+        Returns:
+            The evolved SchemaContract
 
         Raises:
-            ContractMergeError: If field types conflict
+            ContractMergeError: If a field's type differs between the record
+                and the emission
         """
         # Deferred import: union_merge imports SchemaContract from this module.
         from elspeth.contracts.union_merge import merge_union_contracts
 
         return merge_union_contracts(
-            {"self": self, "other": other},
+            {"recorded": self, "emitted": other},
             require_all=False,
-            branch_order=("self", "other"),
+            branch_order=("recorded", "emitted"),
         )
 
 
@@ -529,7 +642,8 @@ class PipelineRow:
                 f"Non-dict input suggests data corruption on a Tier 1 restore path."
             )
         # Deep-freeze to prevent mutation of nested containers after audit recording.
-        # Per CLAUDE.md Tier 1: audit data must not be modified.
+        # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model, Tier 1 audit data must not be modified.
         self._data = deep_freeze(data)
         self._contract = contract
 
@@ -643,6 +757,27 @@ class PipelineRow:
             return self[key]
         except KeyError:
             return default
+
+    def name_index(self) -> dict[str, str]:
+        """Map every key ``row[key]`` resolves to the data key it reads.
+
+        The same resolution as ``__getitem__``: an original or normalized
+        name the contract knows, when its field is present in the data; in
+        FLEXIBLE or OBSERVED mode, also any key present in the data. A consumer
+        that must not hold the contract (the template sandbox's ``row``) uses
+        this plain index to resolve either spelling.
+        """
+        extras_readable = self._contract.mode in ("FLEXIBLE", "OBSERVED")
+        index: dict[str, str] = {}
+        candidates = [spelling for fc in self._contract.fields for spelling in (fc.normalized_name, fc.original_name)]
+        candidates.extend(self._data)
+        for key in candidates:
+            normalized = self._contract.find_name(key)
+            if normalized is not None and normalized in self._data:
+                index[key] = normalized
+            elif extras_readable and key in self._data:
+                index[key] = key
+        return index
 
     def keys(self) -> list[str]:
         """Return normalized field names (Jinja2 compatibility).

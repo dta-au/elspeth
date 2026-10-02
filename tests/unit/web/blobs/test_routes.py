@@ -27,13 +27,14 @@ from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import guided_operations_table, sessions_table
+from elspeth.web.sessions.models import session_operation_receipts_table, sessions_table
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # ---------------------------------------------------------------------------
 # Test app factory
@@ -52,7 +53,9 @@ def _make_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    session_service = DualFencedSessionServiceHarness(
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
+    session_service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -78,6 +81,7 @@ def _make_app(
         shareable_link_signing_key=b"\x00" * 32,
     )
     app.state.settings = settings
+    wire_test_pipeline_user_authority(app, identity_id=user_id, engine=engine)
     app.state.session_service = session_service
     app.state.blob_service = blob_service
 
@@ -150,14 +154,13 @@ def _insert_session_fork_operation(blob_service: BlobServiceImpl, session_id: st
             )
         values.update(
             settled_at=now,
-            result_kind="session",
             result_session_id=target_session_id,
             response_hash="e" * 64,
         )
     else:
         raise AssertionError(f"unsupported test fork status {status!r}")
     with blob_service._engine.begin() as conn:
-        conn.execute(guided_operations_table.insert().values(**values))
+        conn.execute(session_operation_receipts_table.insert().values(**values))
     return operation_id
 
 
@@ -404,7 +407,7 @@ class TestIDORProtection:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
-        session_service = DualFencedSessionServiceHarness(
+        session_service = FencedSessionServiceHarness(
             engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test"),
@@ -421,6 +424,8 @@ class TestIDORProtection:
         )
 
         def make_app_for_user(uid: str) -> FastAPI:
+            with engine.begin() as conn:
+                ensure_test_identity(conn, identity_id=uid)
             app = FastAPI()
             identity = UserIdentity(user_id=uid, username=uid)
 
@@ -431,6 +436,7 @@ class TestIDORProtection:
             app.state.session_service = session_service
             app.state.blob_service = blob_service
             app.state.settings = settings
+            wire_test_pipeline_user_authority(app, identity_id=uid, engine=engine)
 
             from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 

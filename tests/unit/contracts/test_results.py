@@ -30,6 +30,7 @@ from elspeth.contracts.results import (
     GateResult,
     RowResult,
     TransformResult,
+    failed_barrier_group_results,
 )
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.url import SanitizedDatabaseUrl, SanitizedWebhookUrl
@@ -1250,3 +1251,52 @@ class TestSourceRowExceptionType:
         row = SourceRow.quarantined(row={"id": 1}, error="bad data", destination="errors", source_row_index=0)
         with pytest.raises(ValueError, match="quarantined"):
             row.to_pipeline_row()
+
+
+class TestFailedBarrierGroupResults:
+    """One result per consumed token; exactly one carries the group count."""
+
+    @staticmethod
+    def _tokens(count: int) -> tuple[TokenInfo, ...]:
+        return tuple(
+            TokenInfo(row_id="row-1", token_id=f"tok-{index}", row_data=_wrap_dict_as_pipeline_row({"x": index})) for index in range(count)
+        )
+
+    def test_surfaces_every_consumed_token_and_marks_the_group_once(self) -> None:
+        tokens = self._tokens(3)
+
+        results = failed_barrier_group_results(tokens, exception_type="CoalesceFailure", failure_reason="select_branch_not_arrived")
+
+        assert [result.token.token_id for result in results] == ["tok-0", "tok-1", "tok-2"]
+        assert {(result.outcome, result.path) for result in results} == {(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)}
+        assert [result.counts_failed_barrier for result in results] == [True, False, False]
+        assert {(result.error.exception_type, result.error.message) for result in results if result.error is not None} == {
+            ("CoalesceFailure", "select_branch_not_arrived")
+        }
+
+    def test_zero_consumed_tokens_surface_nothing(self) -> None:
+        assert failed_barrier_group_results((), exception_type="RowUnionFailure", failure_reason="row_union_branch_lost") == ()
+
+    def test_marker_is_refused_outside_failure_unrouted(self) -> None:
+        (token,) = self._tokens(1)
+        with pytest.raises(OrchestrationInvariantError, match="counts_failed_barrier is only valid"):
+            RowResult(
+                token=token,
+                final_data=token.row_data,
+                outcome=TerminalOutcome.SUCCESS,
+                path=TerminalPath.DEFAULT_FLOW,
+                sink_name="out",
+                counts_failed_barrier=True,
+            )
+
+    def test_marker_must_be_a_bool(self) -> None:
+        (token,) = self._tokens(1)
+        not_a_bool: Any = 1
+        with pytest.raises(OrchestrationInvariantError, match="counts_failed_barrier must be bool"):
+            RowResult(
+                token=token,
+                final_data=token.row_data,
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.UNROUTED,
+                counts_failed_barrier=not_a_bool,
+            )

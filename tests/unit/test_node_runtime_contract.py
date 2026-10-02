@@ -64,14 +64,17 @@ def test_frontend_types_track_the_node_24_line() -> None:
 
 def test_ci_and_release_image_build_with_node_24() -> None:
     workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8"))
-    setup_steps = [
-        step
-        for job in workflow["jobs"].values()
+    setup_jobs = [
+        (job_name, step)
+        for job_name, job in workflow["jobs"].items()
         for step in job.get("steps", ())
         if str(step.get("uses", "")).startswith("actions/setup-node@")
     ]
+    setup_steps = [step for _job_name, step in setup_jobs]
 
-    assert len(setup_steps) == 2
+    # The two frontend jobs build and test the app; the dependency audit
+    # needs npm only to read the lockfiles.
+    assert sorted(job_name for job_name, _step in setup_jobs) == ["e2e-frontend", "frontend-unit", "supply-chain-audit"]
     assert {step["uses"] for step in setup_steps} == {f"actions/setup-node@{SETUP_NODE_REVISION}"}
     assert {step["with"]["node-version"] for step in setup_steps} == {"24"}
 
@@ -120,6 +123,7 @@ def test_source_checkout_install_docs_use_locked_toolchains() -> None:
     paths = (
         REPO_ROOT / "README.md",
         REPO_ROOT / "CONTRIBUTING.md",
+        REPO_ROOT / "docs/guides/web-local-development.md",
         REPO_ROOT / "docs/guides/telemetry.md",
         REPO_ROOT / "docs/guides/tier2-tracing.md",
         REPO_ROOT / "docs/guides/troubleshooting.md",
@@ -139,13 +143,16 @@ def test_source_checkout_install_docs_use_locked_toolchains() -> None:
 
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     contributing = (REPO_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    web_local = (REPO_ROOT / "docs/guides/web-local-development.md").read_text(encoding="utf-8")
     first_pipeline = (REPO_ROOT / "docs/guides/your-first-pipeline.md").read_text(encoding="utf-8")
     user_manual = (REPO_ROOT / "docs/guides/user-manual.md").read_text(encoding="utf-8")
     landscape_mcp = (REPO_ROOT / "docs/guides/landscape-mcp-analysis.md").read_text(encoding="utf-8")
     web_scrape = (REPO_ROOT / "docs/reference/web-scrape-transform.md").read_text(encoding="utf-8")
 
-    assert "Node.js 24 and npm 11" in readme
-    assert "npm --prefix src/elspeth/web/frontend ci" in readme
+    assert "uv sync --frozen" in readme
+    assert "[local web setup guide](docs/guides/web-local-development.md)" in readme
+    assert "Node.js 24 and npm 11" in web_local
+    assert "npm --prefix src/elspeth/web/frontend ci" in web_local
     assert "Node.js 24, and npm 11" in contributing
     assert "npm --prefix src/elspeth/web/frontend ci" in contributing
     assert "Python 3.12+" in first_pipeline

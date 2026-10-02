@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
 import networkx as nx
@@ -26,6 +27,8 @@ from elspeth.contracts import (
     RoutingMode,
 )
 from elspeth.contracts.enums import NodeType
+from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.schema import SchemaConfig, get_raw_schema_config
 from elspeth.contracts.types import (
@@ -44,6 +47,7 @@ from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.dag.guarantees import EffectiveGuaranteeVote as _EffectiveGuaranteeVote
 from elspeth.core.dag.models import (
     BranchInfo,
+    EdgeContractError,
     GraphValidationError,
     GraphValidationWarning,
     NodeConfig,
@@ -56,6 +60,7 @@ from elspeth.core.dag.schema_factory import (
 
 if TYPE_CHECKING:
     from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
+    from elspeth.contracts.schema_contract import OutputFieldDeclaration
     from elspeth.core.config import (
         AggregationSettings,
         CoalesceSettings,
@@ -74,6 +79,10 @@ if TYPE_CHECKING:
 # `frozenset()` literal default-argument anti-pattern, which would be unsafe
 # if the type were ever changed to a mutable container.
 _EMPTY_DECLARED_REQUIRED_FIELDS: frozenset[str] = frozenset()
+
+# The empty renamed_input_fields / header_spelled_lookups default: a read-only
+# mapping, so the shared default instance cannot be mutated through one node's NodeInfo.
+_NO_RENAMED_INPUT_FIELDS: Mapping[str, str] = MappingProxyType({})
 
 
 class ExecutionGraph:
@@ -111,6 +120,9 @@ class ExecutionGraph:
         self._route_resolution_map: dict[tuple[NodeID, str], RouteDestination] = {}
         self._pipeline_nodes: list[NodeID] | None = None  # Ordered processing nodes (no source/sinks); None = not yet populated
         self._node_step_map: dict[NodeID, int] = {}  # node_id -> audit step (source=0)
+        # node_id -> declared input fields the build PROVED present on every
+        # arriving row; None until the builder publishes it on the final graph.
+        self._declared_input_proof: Mapping[NodeID, frozenset[str]] | None = None
         self._validation_warnings: tuple[GraphValidationWarning, ...] = ()
         self._group_bindings: GroupBindingRegistry = GroupBindingRegistry(bindings=())
         self._bound_regions: tuple[BoundRegion, ...] = ()
@@ -158,12 +170,20 @@ class ExecutionGraph:
         declared_required_fields: frozenset[str] = _EMPTY_DECLARED_REQUIRED_FIELDS,
         declared_output_fields: frozenset[str] = frozenset(),
         declared_input_fields: frozenset[str] = frozenset(),
+        batch_required_input_fields: frozenset[str] = frozenset(),
         declared_string_input_fields: frozenset[str] = frozenset(),
+        declared_read_fields: frozenset[str] = frozenset(),
+        declared_created_fields: frozenset[str] = frozenset(),
         passes_through_input: bool = False,
         forwards_input_fields: bool = False,
         removed_input_fields: frozenset[str] = frozenset(),
         preserves_input_values: bool = False,
         observed_value_type: str | None = None,
+        output_field_declarations: Mapping[str, OutputFieldDeclaration] | None = None,
+        carried_output_sources: Mapping[str, str] | None = None,
+        field_renames: SourceFieldRenames = NO_SOURCE_RENAMES,
+        renamed_input_fields: Mapping[str, str] = _NO_RENAMED_INPUT_FIELDS,
+        header_spelled_lookups: Mapping[str, str] = _NO_RENAMED_INPUT_FIELDS,
     ) -> None:
         """Add a node to the execution graph.
 
@@ -200,6 +220,10 @@ class ExecutionGraph:
                 compute this as a property over their own options and the
                 `schema:` block never carries those field names
                 (elspeth-ada5a60249). Empty frozenset otherwise.
+            batch_required_input_fields: For AGGREGATION and COLLECTOR nodes
+                only — the batch plugin's ``schema_required_input_fields()``,
+                the fields every buffered row must carry. Read only by the
+                declared-input proof. Empty frozenset otherwise.
             declared_string_input_fields: For TRANSFORM nodes only — the set of
                 fields the transform requires to be present AND string-valued
                 on every arriving row, failing the row closed otherwise.
@@ -207,6 +231,15 @@ class ExecutionGraph:
                 TransformProtocol.declared_string_input_fields; no derivation
                 from schema config for the same reason as its siblings
                 (elspeth-b19dfe41fb). Empty frozenset otherwise.
+            declared_read_fields: For TRANSFORM, AGGREGATION, COLLECTOR and
+                SINK nodes — every name the node's plugin declares it reads
+                from an arriving row (TransformProtocol/SinkProtocol
+                .declared_read_fields). No derivation when omitted: the plugin
+                folds option-projected names in that no config surface carries.
+            declared_created_fields: For TRANSFORM nodes only — every name the
+                transform declares it writes as a field of its own
+                (TransformProtocol.declared_created_fields). Both feed the
+                field-name spelling rule (validate_declared_field_spellings).
             passes_through_input: For TRANSFORM nodes only — True iff the transform
                 unconditionally emits rows containing every input field
                 (ADR-007). Validator walk propagates predecessor guarantees
@@ -238,6 +271,24 @@ class ExecutionGraph:
                 fact holds. Consumed by resolve_guaranteed_field_type's
                 structural source arm (elspeth-e6e552ce34). NodeInfo guards
                 against misuse.
+            output_field_declarations: For the plugin-bearing kinds only —
+                the plugin's ADR-050 stamp table
+                (``output_field_declarations()``), published verbatim. None
+                publishes nothing (a node with no plugin, or a direct caller).
+            carried_output_sources: For the plugin-bearing kinds only — the
+                plugin's carried output name -> copied input field map
+                (``carried_output_sources()``). None publishes nothing.
+            field_renames: For SOURCE nodes only — the source's renames, keyed
+                the way it keys them (SourceProtocol.field_renames), read by
+                the field-name spelling rule's build-time resolution. NodeInfo
+                guards against misuse.
+            renamed_input_fields: For TRANSFORM nodes only — the transform's
+                identity-carrying renames (TransformProtocol.renamed_input_fields),
+                followed by the same resolution. NodeInfo guards against misuse.
+            header_spelled_lookups: For TRANSFORM nodes only — the transform's
+                row lookups by a spelling other than the field it declares
+                (TransformProtocol.header_spelled_lookups), each proved
+                resolvable on an arriving row. NodeInfo guards against misuse.
         """
         self._assert_build_metadata_mutable()
         resolved_config = config or {}
@@ -273,9 +324,17 @@ class ExecutionGraph:
             declared_required_fields=declared_required_fields,
             declared_output_fields=declared_output_fields,
             declared_input_fields=declared_input_fields,
+            batch_required_input_fields=batch_required_input_fields,
             declared_string_input_fields=declared_string_input_fields,
+            declared_read_fields=declared_read_fields,
+            declared_created_fields=declared_created_fields,
             preserves_input_values=preserves_input_values,
             observed_value_type=observed_value_type,
+            output_field_declarations=output_field_declarations if output_field_declarations is not None else {},
+            carried_output_sources=carried_output_sources if carried_output_sources is not None else {},
+            field_renames=field_renames,
+            renamed_input_fields=renamed_input_fields,
+            header_spelled_lookups=header_spelled_lookups,
             passes_through_input=passes_through_input,
             forwards_input_fields=forwards_input_fields,
             removed_input_fields=removed_input_fields,
@@ -287,6 +346,24 @@ class ExecutionGraph:
         self._assert_build_metadata_mutable()
         info = self.get_node_info(node_id)
         self._graph.nodes[node_id]["info"] = replace(info, output_schema_config=schema)
+
+    def set_node_bound_output(
+        self,
+        node_id: str,
+        *,
+        schema: SchemaConfig,
+        output_schema: type[PluginSchema],
+        declarations: Mapping[str, OutputFieldDeclaration],
+    ) -> None:
+        """Publish a plugin's completed graph-bound output declarations."""
+        self._assert_build_metadata_mutable()
+        info = self.get_node_info(node_id)
+        self._graph.nodes[node_id]["info"] = replace(
+            info,
+            output_schema_config=schema,
+            output_schema=output_schema,
+            output_field_declarations=declarations,
+        )
 
     def finalize_node_configs(self) -> None:
         """Deep-freeze mutable node configs after construction is complete."""
@@ -902,6 +979,16 @@ class ExecutionGraph:
         self._assert_build_metadata_mutable()
         self._node_step_map = dict(mapping)
 
+    def set_declared_input_proof(self, proof: Mapping[NodeID, frozenset[str]]) -> None:
+        """Publish the build's declared-input proof (``schema_validation.compute_declared_input_proof``).
+
+        Computed on the FINAL graph — after the rule-9 DIVERT edges — and
+        frozen with the rest of the build metadata, so the runtime classifies
+        a declared-input miss by exactly what this build proved.
+        """
+        self._assert_build_metadata_mutable()
+        self._declared_input_proof = deep_freeze(dict(proof))
+
     def set_validation_warnings(self, warnings: Sequence[GraphValidationWarning]) -> None:
         """Set non-fatal graph construction warnings."""
         self._assert_build_metadata_mutable()
@@ -999,6 +1086,21 @@ class ExecutionGraph:
     def get_node_step_map(self) -> dict[NodeID, int]:
         """Get the builder-assigned node_id -> audit step mapping."""
         return dict(self._node_step_map)
+
+    def get_declared_input_proof(self) -> Mapping[NodeID, frozenset[str]]:
+        """The builder-published declared-input proof: node_id -> fields proved present.
+
+        Raises:
+            OrchestrationInvariantError: the builder never published it. A
+                graph that runs rows without its proof would have to guess
+                every declared-input miss's tier, so there is no empty default.
+        """
+        if self._declared_input_proof is None:
+            raise OrchestrationInvariantError(
+                "ExecutionGraph has no declared-input proof: the builder publishes it on the final graph "
+                "(build_execution_graph) before the build metadata freezes."
+            )
+        return self._declared_input_proof
 
     def get_config_gate_id_map(self) -> dict[GateName, NodeID]:
         """Get explicit gate_name -> node_id mapping for config-driven gates.
@@ -1199,7 +1301,8 @@ class ExecutionGraph:
                 result[branch_name] = first_node
 
         # row_union branches use the same identity-vs-chain shapes with the
-        # union node as the barrier endpoint.
+        # union node as the barrier endpoint. The builder rejects nested forks
+        # inside these branches, including forks closed by an inner coalesce.
         for branch_name, row_union_name in self._branch_to_row_union.items():
             union_nid = self._row_union_id_map[row_union_name]
             is_identity = any(
@@ -1245,10 +1348,10 @@ class ExecutionGraph:
         rejected at build. E1 review round 2 F5 (elspeth-0bd2cde19a,
         2026-08-23) proved both authorable variants build-reject; a
         row_union disjunct here would be dead code claiming coverage it
-        cannot exercise. The SYMMETRIC case — a row_union BRANCH fed by a
-        coalesce — is a live latent gap, tracked separately at
-        elspeth-a01889580f (``get_branch_first_nodes``'s row_union loop,
-        not this predicate).
+        cannot exercise. The symmetric case — a row_union BRANCH fed by a
+        coalesce — is also build-rejected by the nested-fork guard before
+        runtime branch dispatch. The coalesce-feeds-row_union integration
+        regression pins this boundary (elspeth-a01889580f).
         """
         return CoalesceName(input_connection) in self._coalesce_id_map
 
@@ -1508,7 +1611,31 @@ class ExecutionGraph:
         (PHASE 2 cross-plugin validation: edges, coalesce branches, sink
         required fields).
         """
-        schema_validation.validate_edge_compatibility(self)
+        try:
+            schema_validation.validate_edge_compatibility(self)
+        except EdgeContractError as exc:
+            exc.from_config_name = self._config_name_for_node_id(exc.from_node_id)
+            exc.to_config_name = self._config_name_for_node_id(exc.to_node_id)
+            raise
+
+    def _config_name_for_node_id(self, node_id: str) -> str | None:
+        """Recover an authored identity without parsing a compiled node ID."""
+        info = self.get_node_info(node_id)
+        if info.node_type == NodeType.SOURCE:
+            return cast(str, info.config["source_name"]) if "source_name" in info.config else None
+        for mapping in (
+            self._transform_name_id_map,
+            self._config_gate_id_map,
+            self._aggregation_id_map,
+            self._coalesce_id_map,
+            self._row_union_id_map,
+            self._collector_id_map,
+            self._sink_id_map,
+        ):
+            for name, compiled_id in mapping.items():
+                if compiled_id == node_id:
+                    return str(name)
+        return None
 
     def warn_divert_coalesce_interactions(
         self,

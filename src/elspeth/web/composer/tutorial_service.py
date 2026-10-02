@@ -17,7 +17,7 @@ from uuid import UUID
 
 import structlog
 from fastapi import HTTPException, Request
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 
 from elspeth.contracts import CallType
 from elspeth.contracts import errors as contract_errors
@@ -30,7 +30,6 @@ from elspeth.core.landscape.schema import (
     node_states_table,
     operations_table,
     rows_table,
-    runs_table,
     validation_errors_table,
 )
 from elspeth.web.async_workers import run_sync_in_worker
@@ -306,7 +305,38 @@ async def _require_tutorial_launch_readiness(
             status_code=409,
             detail={"error_type": "tutorial_not_ready", "code": code, "detail": detail},
         )
+    pending_interpretations = await session_service.list_interpretation_events(
+        session_id,
+        status="pending",
+        composition_state_id=record.id,
+    )
+    if pending_interpretations:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_type": "tutorial_not_ready",
+                "code": "tutorial_interpretations_pending",
+                "detail": "Review the pending interpretation decisions before running this pipeline.",
+            },
+        )
     return record.id
+
+
+async def get_tutorial_readiness(
+    *,
+    request: Request,
+    user: UserIdentity,
+    session_id: UUID,
+) -> UUID:
+    """Inspect an owned session using the same admission decision as Run."""
+    await verify_session_ownership(session_id, user, request)
+    return await _require_tutorial_launch_readiness(
+        request=request,
+        user=user,
+        session_id=session_id,
+        settings=request.app.state.settings,
+        session_service=request.app.state.session_service,
+    )
 
 
 async def run_tutorial_pipeline(
@@ -440,6 +470,24 @@ async def _run_live_tutorial(
     if run_record.landscape_run_id is None:
         raise TutorialRunIntegrityError(f"Completed tutorial run {run_id} has no Landscape run id")
 
+    # These are ordinary executor outcomes, not proof of a missing artifact:
+    # an empty source or a run whose rows all failed can legitimately publish
+    # no sink output. Report the durable outcome before attempting a preview.
+    # A completed run or a partial success still requires verified artifacts.
+    if run_record.status in {"completed_with_failures", "empty"} and run_record.rows_succeeded == 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_type": "tutorial_live_run_failed",
+                "status": run_record.status,
+                "run_id": str(run_id),
+                "rows_processed": run_record.rows_processed,
+                "rows_succeeded": run_record.rows_succeeded,
+                "rows_failed": run_record.rows_failed,
+                "detail": "The run produced no output rows. Open the run details to review row errors and source results.",
+            },
+        )
+
     projection = await run_sync_in_worker(
         _project_live_tutorial_output,
         settings,
@@ -474,25 +522,12 @@ async def _wait_for_terminal_run(
 
 
 def _project_live_tutorial_output(settings: WebSettings, *, run_id: str, landscape_run_id: str, session_id: str) -> _LiveTutorialProjection:
-    # Despite the read-shaped name this is a WRITER surface: it stamps
-    # ``llm_call_count`` / ``seeded_from_cache`` / ``cache_key`` onto the run
-    # row (Tier-1 contract assertion below) in the same transaction as its
-    # projection SELECTs.  ``write_connection()`` declares the write intent
-    # so the transaction begins ``BEGIN IMMEDIATE`` (ADR-030 §D5) — a
-    # read-then-write shape on a DEFERRED BEGIN is exactly the
-    # SQLITE_BUSY_SNAPSHOT hazard the write-intent discipline closes.
     with (
         open_landscape_db(settings) as db,
-        db.write_connection() as conn,
+        db.read_only_connection() as conn,
     ):
         llm_call_count = _count_calls_for_run(conn, landscape_run_id)
         discarded_row_count = _count_discarded_rows(conn, landscape_run_id)
-        conn.execute(
-            update(runs_table)
-            .where(runs_table.c.run_id == landscape_run_id)
-            # Tier-1 contract assertion: live runs are non-cache-replay identity.
-            .values(llm_call_count=llm_call_count, seeded_from_cache=False, cache_key=None)
-        )
         source_hashes = tuple(
             row.source_data_hash
             for row in conn.execute(
@@ -747,7 +782,7 @@ async def cancel_tutorial_run(
         return TutorialCancelResponse(cancelled=False)
 
     execution_service: ExecutionService = request.app.state.execution_service
-    await execution_service.cancel(active_run.id)
+    await execution_service.cancel(active_run.id, user=user)
     return TutorialCancelResponse(cancelled=True)
 
 

@@ -8,7 +8,8 @@ asserted call-arg equality on those mocks. That verified only that the
 executor *called* the mocks in a particular shape — NOT that the real
 Landscape would have accepted and persisted a valid artifact record.
 
-Per CLAUDE.md the Landscape audit trail is the legal record; mock-shape
+Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model
+the Landscape audit trail is the legal record; mock-shape
 assertions on the audit chain are inadequate confidence. This integration
 test drives the SinkExecutor through its production path with a real
 RecorderFactory / LandscapeDB and verifies the persisted state by querying
@@ -65,15 +66,14 @@ class TestCSVSinkExecutorAuditChain:
 
         # ── Setup: real row + token in the database ──
         row_data = {"id": 1, "name": "Alice"}
-        row = setup.data_flow.create_row(
-            run_id=setup.run_id,
+        row, db_token = setup.data_flow.create_row_with_token(
+            coordination_token=setup.coordination_token,
             source_node_id=setup.source_node_id,
             row_index=0,
             data=row_data,
             source_row_index=0,
             ingest_sequence=0,
         )
-        db_token = setup.data_flow.create_token(row_id=row.row_id)
 
         contract = create_observed_contract(row_data)
         token = TokenInfo(

@@ -13,7 +13,7 @@ An assessment must identify:
 - the manifest path and serialized `schema_version`;
 - the exact commands executed and their results;
 - environmental limitations or unavailable evidence; and
-- the Filigree issues consulted for delivery status and dependencies.
+- the GitHub Issues consulted for delivery status and dependencies.
 
 Evidence is strongest in this order:
 
@@ -70,7 +70,7 @@ unknown. The manifest's derived verdict is authoritative.
 | `unknown` | Adequate current evidence has not been executed or does not exist. |
 | `not_applicable` | The dimension genuinely does not apply to the scenario. |
 
-Every non-pass applicable cell requires a precise reason, a Filigree
+Every non-pass applicable cell requires a precise reason, an issue
 `owner_issue`, and an observable `exit_gate`. `not_applicable` requires a
 narrow reason and no ownership or evidence. Documentary and decision records
 may support a claim, but only `harness` or `pytest` evidence can support
@@ -95,7 +95,7 @@ overrides any average and keeps the overall verdict `not_complete`.
 5. Update the live manifest first: evidence registry, case declarations, cell
    states, ownership, and exit gates must agree in one change.
 6. Run the contract test again and confirm the derived verdict.
-7. Query Filigree for current work status, dependencies, and ownership. Do not
+7. Query GitHub Issues for current work status, dependencies, and ownership. Do not
    copy tracker-maintained case counts into the assessment.
 8. Update the live hub or corpus guide only when navigation, authority
    boundaries, or maintainer guidance changes. Do not restate values derived

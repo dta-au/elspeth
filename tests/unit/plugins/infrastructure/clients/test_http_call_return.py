@@ -8,6 +8,7 @@ from elspeth.contracts import CallStatus
 from elspeth.contracts.audit import Call
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 
 class _CallRecord:
@@ -82,6 +83,7 @@ class TestGetSsrfSafeCallReturn:
         recorder = _ExecutionRecorderDouble(mock_call)
 
         client = AuditedHTTPClient(
+            **mock_item_audit_authority("run-1"),
             execution=recorder,
             state_id="state-1",
             run_id="run-1",

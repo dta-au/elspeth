@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.fixtures.landscape import leader_coordination_token
+
 from elspeth.contracts import NodeStateStatus, NodeType
 from elspeth.contracts.audit import NodeStateCompleted
 from elspeth.contracts.errors import AuditIntegrityError
@@ -23,27 +25,26 @@ class TestRecorderFactoryNodeStates:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=source.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={"value": 42},
         )
@@ -67,22 +68,21 @@ class TestRecorderFactoryNodeStates:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         input_data = {"x": 1, "y": 2}
         output_data = {"x": 1, "y": 2, "z": 3}
@@ -90,7 +90,7 @@ class TestRecorderFactoryNodeStates:
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data=input_data,
         )
@@ -101,6 +101,7 @@ class TestRecorderFactoryNodeStates:
 
         completed = factory.execution.complete_node_state(
             state_id=state.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.COMPLETED,
             output_data=output_data,
             duration_ms=10.5,
@@ -122,32 +123,32 @@ class TestRecorderFactoryNodeStates:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={"x": 1},
         )
 
         completed = factory.execution.complete_node_state(
             state_id=state.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.COMPLETED,
             output_data={"x": 1, "y": 2},
             duration_ms=10.5,
@@ -167,32 +168,32 @@ class TestRecorderFactoryNodeStates:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
 
         completed = factory.execution.complete_node_state(
             state_id=state.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.FAILED,
             error={"reason": "test_error", "message": "Validation failed"},
             duration_ms=5.0,
@@ -224,26 +225,25 @@ class TestRecorderFactoryNodeStates:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
@@ -257,6 +257,7 @@ class TestRecorderFactoryNodeStates:
 
         completed = factory.execution.complete_node_state(
             state_id=state.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.FAILED,
             error=error,
             duration_ms=3.0,
@@ -295,26 +296,25 @@ class TestRecorderFactoryNodeStates:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="gate",
             node_type=NodeType.GATE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
@@ -327,6 +327,7 @@ class TestRecorderFactoryNodeStates:
 
         completed = factory.execution.complete_node_state(
             state_id=state.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.FAILED,
             error=error,
             duration_ms=1.0,
@@ -352,26 +353,25 @@ class TestRecorderFactoryNodeStates:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
@@ -379,6 +379,7 @@ class TestRecorderFactoryNodeStates:
         # Empty output_data={} should succeed, not crash
         completed = factory.execution.complete_node_state(
             state_id=state.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.COMPLETED,
             output_data={},  # Empty dict is valid output
             duration_ms=1.0,
@@ -400,26 +401,25 @@ class TestRecorderFactoryNodeStates:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
@@ -427,6 +427,7 @@ class TestRecorderFactoryNodeStates:
         # Empty error={} should be serialized, not dropped
         completed = factory.execution.complete_node_state(  # type: ignore[call-overload]  # Empty dict tests serialization
             state_id=state.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.FAILED,
             error={},
             duration_ms=1.0,
@@ -444,39 +445,44 @@ class TestRecorderFactoryNodeStates:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         # First attempt fails
         state1 = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
             attempt=0,
         )
-        factory.execution.complete_node_state(state1.state_id, status=NodeStateStatus.FAILED, error={}, duration_ms=1.0)  # type: ignore[call-overload]  # Empty dict tests serialization
+        factory.execution.complete_node_state(
+            state1.state_id,
+            status=NodeStateStatus.FAILED,
+            error={},
+            duration_ms=1.0,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+        )
 
         # Second attempt
         state2 = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
             attempt=1,
@@ -510,33 +516,33 @@ class TestNodeStateIntegrityValidation:
         # Create valid infrastructure
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row_record = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={"test": "value"},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row_record.row_id)
 
         # Create a completed state normally
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={"test": "data"},
         )
         factory.execution.complete_node_state(
             state_id=state.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.COMPLETED,
             output_data={"result": "ok"},
             duration_ms=10.0,
@@ -575,33 +581,33 @@ class TestNodeStateIntegrityValidation:
         # Create valid infrastructure
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row_record = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={"test": "value"},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row_record.row_id)
 
         # Create a failed state normally
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={"test": "data"},
         )
         factory.execution.complete_node_state(
             state_id=state.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.FAILED,
             error={"reason": "test_error", "message": "Something went wrong"},
             duration_ms=5.0,
@@ -648,7 +654,7 @@ class TestNodeStateOrderingWithRetries:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node1 = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_transform_1",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -656,35 +662,35 @@ class TestNodeStateOrderingWithRetries:
             schema_config=DYNAMIC_SCHEMA,
         )
         node2 = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_transform_2",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row_record = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node1.node_id,
             row_index=0,
             data={"test": "value"},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row_record.row_id)
 
         # Create states at step 0 with multiple attempts (simulating retries)
         # Insert OUT OF ORDER to test that ordering is enforced by the query
         state_0_attempt_1 = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node1.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             attempt=1,  # Second attempt first!
             input_data={"test": "data"},
         )
         factory.execution.complete_node_state(
             state_id=state_0_attempt_1.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.FAILED,
             error={"reason": "test_error", "message": "First failure"},
             duration_ms=10.0,
@@ -693,13 +699,14 @@ class TestNodeStateOrderingWithRetries:
         state_0_attempt_0 = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node1.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             attempt=0,  # First attempt second!
             input_data={"test": "data"},
         )
         factory.execution.complete_node_state(
             state_id=state_0_attempt_0.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.COMPLETED,
             output_data={"result": "ok"},
             duration_ms=5.0,
@@ -709,13 +716,14 @@ class TestNodeStateOrderingWithRetries:
         state_1_attempt_0 = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node2.node_id,  # Different node for step 1
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=1,
             attempt=0,
             input_data={"test": "data2"},
         )
         factory.execution.complete_node_state(
             state_id=state_1_attempt_0.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.COMPLETED,
             output_data={"result": "ok2"},
             duration_ms=3.0,
@@ -758,22 +766,21 @@ class TestContextAfterRoundTrip:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="coalesce",
             node_type=NodeType.COALESCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         metadata = CoalesceMetadata.for_merge(
             policy=CoalescePolicy.REQUIRE_ALL,
@@ -791,12 +798,13 @@ class TestContextAfterRoundTrip:
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
         factory.execution.complete_node_state(
             state_id=state.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.COMPLETED,
             output_data={"merged": True},
             duration_ms=50.0,
@@ -826,22 +834,21 @@ class TestContextAfterRoundTrip:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         ctx = PoolExecutionContext(
             pool_config=PoolConfigSnapshot(
@@ -866,12 +873,13 @@ class TestContextAfterRoundTrip:
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
         factory.execution.complete_node_state(
             state_id=state.state_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             status=NodeStateStatus.COMPLETED,
             output_data={"result": "ok"},
             duration_ms=100.0,

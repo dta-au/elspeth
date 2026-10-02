@@ -9,6 +9,7 @@ import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
@@ -100,6 +101,10 @@ def test_tool_batch_admission_accepts_a_real_litellm_tool_call() -> None:
             {"function": SimpleNamespace(name=12, arguments="{}")},
             "Composer tool batch contains malformed provider function metadata",
         ),
+        (
+            {"function": SimpleNamespace(name=" ", arguments="{}")},
+            "Composer tool batch contains blank provider function name",
+        ),
     ),
 )
 def test_tool_batch_admission_still_rejects_malformed_real_litellm_tool_calls(
@@ -178,7 +183,7 @@ async def test_over_cap_identity_violation_precedes_cap_telemetry_and_dispatch(
         ]
     )
 
-    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+    async def _fake_transport(**_kwargs: Any) -> Any:
         return response
 
     handler_calls: list[str] = []
@@ -188,11 +193,12 @@ async def test_over_cap_identity_violation_precedes_cap_telemetry_and_dispatch(
         raise AssertionError("identity-invalid over-cap batch reached tool dispatch")
 
     monkeypatch.setattr(tool_batch_module, "execute_tool", _unexpected_handler)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _fake_transport)
     caught: BaseException | None = None
     try:
         await _run_one_turn(
             fake_composer_service,
-            llm=_fake_llm,
+            llm=None,
             session_id=result_session_id,
         )
     except BaseException as exc:
@@ -201,9 +207,13 @@ async def test_over_cap_identity_violation_precedes_cap_telemetry_and_dispatch(
     assert (
         type(caught),
         str(caught),
+        type(caught.__cause__) if caught is not None else None,
+        str(caught.__cause__) if caught is not None else None,
         observed_value(telemetry.tool_call_cap_exceeded_total),
         handler_calls,
     ) == (
+        provider_gateway._MalformedLLMResponseError,
+        f"LLM tool batch failed admission: {expected_message}",
         AuditIntegrityError,
         expected_message,
         0,
@@ -314,7 +324,7 @@ async def test_bonus_over_cap_raises_shared_cap_error_before_bonus_dispatch(
     )
 
     async def _fake_llm(_messages: Any, _tools: Any) -> Any:
-        return next(responses)
+        return provider_gateway._admit_composer_llm_completion(next(responses))
 
     original_execute_tool = tool_batch_module.execute_tool
     dispatched_names: list[str] = []
@@ -360,7 +370,7 @@ async def test_bonus_exactly_at_cap_keeps_generic_composition_exhaustion(
     )
 
     async def _fake_llm(_messages: Any, _tools: Any) -> Any:
-        return next(responses)
+        return provider_gateway._admit_composer_llm_completion(next(responses))
 
     with pytest.raises(ComposerConvergenceError) as excinfo:
         await _run_one_turn(service, llm=_fake_llm, session_id=result_session_id)

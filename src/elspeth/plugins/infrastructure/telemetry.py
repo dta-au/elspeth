@@ -20,7 +20,7 @@ class WarningLogger(Protocol):
 _logger = structlog.get_logger(__name__)
 
 
-def warn_telemetry_before_start(event: Any, *, logger: WarningLogger = _logger) -> None:
+def warn_telemetry_before_start(event: TelemetryEvent, *, logger: WarningLogger = _logger) -> None:
     """Default telemetry callback before on_start() warns instead of silently dropping."""
     logger.warning(
         "telemetry_emit called before on_start() — event dropped",
@@ -28,7 +28,7 @@ def warn_telemetry_before_start(event: Any, *, logger: WarningLogger = _logger) 
     )
 
 
-def make_warn_telemetry_before_start(logger: WarningLogger) -> Callable[[Any], None]:
+def make_warn_telemetry_before_start(logger: WarningLogger) -> Callable[[TelemetryEvent], None]:
     """Bind the shared pre-start telemetry warning to a module-specific logger."""
     return partial(warn_telemetry_before_start, logger=logger)
 

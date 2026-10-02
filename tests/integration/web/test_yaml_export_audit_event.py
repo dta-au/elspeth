@@ -3,8 +3,8 @@
 Phase 6A Task 7 (UX redesign 2026-05). The pre-existing
 ``GET /api/sessions/{session_id}/state/yaml`` route gains a Tier-1 audit
 write to ``composer_completion_events_table`` with ``event_type='export_yaml'``.
-Sync, crash-on-failure per CLAUDE.md audit primacy — no telemetry-class
-exemption.
+Sync, crash-on-failure per the audit primacy rule (``logging-telemetry-policy``
+skill §Logging Policy) — no telemetry-class exemption.
 """
 
 from __future__ import annotations

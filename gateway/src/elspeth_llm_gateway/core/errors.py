@@ -34,6 +34,7 @@ class GatewayErrorCode(StrEnum):
     UPSTREAM_RATE_LIMITED = "upstream_rate_limited"
     UPSTREAM_TIMEOUT = "upstream_timeout"
     UPSTREAM_UNAVAILABLE = "upstream_unavailable"
+    UPSTREAM_REQUEST_REJECTED = "upstream_request_rejected"
     UPSTREAM_RESPONSE_INVALID = "upstream_response_invalid"
     INTERNAL_ERROR = "internal_error"
 
@@ -51,6 +52,7 @@ HTTP_STATUS: dict[GatewayErrorCode, int] = {
     GatewayErrorCode.UPSTREAM_RATE_LIMITED: 429,
     GatewayErrorCode.UPSTREAM_TIMEOUT: 504,
     GatewayErrorCode.UPSTREAM_UNAVAILABLE: 503,
+    GatewayErrorCode.UPSTREAM_REQUEST_REJECTED: 400,
     GatewayErrorCode.UPSTREAM_RESPONSE_INVALID: 502,
     GatewayErrorCode.INTERNAL_ERROR: 500,
 }
@@ -68,6 +70,7 @@ SAFE_MESSAGE: dict[GatewayErrorCode, str] = {
     GatewayErrorCode.UPSTREAM_RATE_LIMITED: "The upstream service is rate limiting requests.",
     GatewayErrorCode.UPSTREAM_TIMEOUT: "The upstream service did not respond in time.",
     GatewayErrorCode.UPSTREAM_UNAVAILABLE: "The upstream service is currently unavailable.",
+    GatewayErrorCode.UPSTREAM_REQUEST_REJECTED: "The upstream service rejected the request.",
     GatewayErrorCode.UPSTREAM_RESPONSE_INVALID: "The upstream service returned an invalid response.",
     GatewayErrorCode.INTERNAL_ERROR: "An internal error occurred while processing the request.",
 }
@@ -85,6 +88,7 @@ RETRYABLE: dict[GatewayErrorCode, bool] = {
     GatewayErrorCode.UPSTREAM_RATE_LIMITED: True,
     GatewayErrorCode.UPSTREAM_TIMEOUT: True,
     GatewayErrorCode.UPSTREAM_UNAVAILABLE: True,
+    GatewayErrorCode.UPSTREAM_REQUEST_REJECTED: False,
     GatewayErrorCode.UPSTREAM_RESPONSE_INVALID: False,
     GatewayErrorCode.INTERNAL_ERROR: False,
 }

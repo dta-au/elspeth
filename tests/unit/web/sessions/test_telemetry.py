@@ -30,7 +30,7 @@ EXPECTED_METRIC_NAMES = {
     # cleanup (emitted from web/app.py orphan-cleanup sites).
     "execution.orphaned_runs_cancelled_total",
     # ── Phase 8 wire names ──
-    # Mode + per-session + tutorial + completion + B3 cohorts + B5.
+    # Per-session + tutorial + completion + B3 cohorts + B5.
     # NOTE: ``composer.tutorial.replayed_total`` is DELIBERATELY ABSENT
     # (Phase 9 deferred per Decision 2 / Option C). Do NOT add it back
     # without re-opening that decision. ``composer.phase_8.probe_failed_total``
@@ -38,8 +38,6 @@ EXPECTED_METRIC_NAMES = {
     # ``elspeth.web.composer.telemetry_phase8`` (W8-r2 — not a slot on
     # ``_SessionsTelemetry``); covered separately by the Q1 test in
     # ``tests/unit/web/composer/test_telemetry_phase8.py``.
-    "composer.mode.opted_out_total",
-    "composer.mode.opted_in_total",
     "composer.session.switched_total",
     "composer.tutorial.started_total",
     # composer.tutorial.completed_total — registered only by
@@ -78,8 +76,6 @@ def test_telemetry_field_names_match_spec_exactly():
         # ── Phase 8 fields ──
         # Tutorial-replayed slot DELIBERATELY ABSENT (Phase 9 / Decision 2).
         # Probe-failed counter DELIBERATELY ABSENT (W8-r2 module-local).
-        "mode_opted_out_total",
-        "mode_opted_in_total",
         "session_switched_total",
         "tutorial_started_total",
         "session_completed_total",

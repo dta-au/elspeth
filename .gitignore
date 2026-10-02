@@ -65,9 +65,13 @@ docs-archive/
 .claude/worktrees/
 .claude/plans/
 .claude/lanes/
-# lane-manager per-lane state and prove-it claims/verdicts — working state, never public.
+# lane-manager per-lane state — working state, never public.
 .lanes/
-.verify/
+# orchestrator control plane: lane locks, step log, model observations.
+# Tests sit OUTSIDE it so `rm -rf .orchestrator` (a state reset) cannot
+# take them with it; agent tooling is not tested in the tracked tree.
+.orchestrator/
+.orchestrator-tests/
 .claude/handovers/
 .claude/red-team/
 .mcp.json
@@ -84,18 +88,8 @@ docs-archive/
 output/playwright/
 # Codex CLI drops a routine ./error.log in its working dir.
 error.log
-# Filigree issue tracker.
-.filigree/
-# Loomweave (installer-written instance state and generated skill copies).
-.loomweave/loomweave.lock
-.loomweave/.gitignore
-.loomweave/config.json
-.loomweave/instance_id
-loomweave.yaml
-.agents/skills/loomweave-workflow/.fingerprint
-.agents/skills/loomweave-workflow/SKILL.md
-.claude/skills/loomweave-workflow/.fingerprint
-.claude/skills/loomweave-workflow/SKILL.md
+# Private local archives; never publish exported project state.
+/.archives/
 # Retired tooling residue (ADR-043).
 .weft/
 

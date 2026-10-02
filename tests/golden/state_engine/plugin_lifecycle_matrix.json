@@ -265,6 +265,40 @@
       "release_lane": "local"
     },
     {
+      "plugin_key": "sink:power_automate",
+      "kind": "sink",
+      "module": "elspeth.plugins.sinks.power_automate",
+      "qualname": "PowerAutomateSink",
+      "source_path": "src/elspeth/plugins/sinks/power_automate.py",
+      "determinism": "external_call",
+      "execution_model": "sink-batch",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSink",
+        "write": "elspeth.plugins.sinks.power_automate:PowerAutomateSink",
+        "flush": "elspeth.plugins.sinks.power_automate:PowerAutomateSink",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSink",
+        "close": "elspeth.plugins.sinks.power_automate:PowerAutomateSink"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": "member",
+      "sink_effect_modes": [
+        "write"
+      ],
+      "variants": [
+        "sas_url",
+        "service_principal",
+        "managed_identity"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-06",
+        "PB-07",
+        "PB-09"
+      ],
+      "local_fixture": "real-process-http",
+      "release_lane": "local"
+    },
+    {
       "plugin_key": "sink:text",
       "kind": "sink",
       "module": "elspeth.plugins.sinks.text_sink",
@@ -529,6 +563,36 @@
       "release_lane": "local"
     },
     {
+      "plugin_key": "source:power_automate",
+      "kind": "source",
+      "module": "elspeth.plugins.sources.power_automate",
+      "qualname": "PowerAutomateSource",
+      "source_path": "src/elspeth/plugins/sources/power_automate.py",
+      "determinism": "external_call",
+      "execution_model": "source-iterator",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.sources.power_automate:PowerAutomateSource",
+        "load": "elspeth.plugins.sources.power_automate:PowerAutomateSource",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSource",
+        "close": "elspeth.plugins.sources.power_automate:PowerAutomateSource"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "sas_url",
+        "service_principal",
+        "managed_identity"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-01",
+        "PB-09"
+      ],
+      "local_fixture": "real-process-http",
+      "release_lane": "local"
+    },
+    {
       "plugin_key": "source:text",
       "kind": "source",
       "module": "elspeth.plugins.sources.text_source",
@@ -669,6 +733,35 @@
       ],
       "local_fixture": "provider-contract-fake",
       "release_lane": "live-aws"
+    },
+    {
+      "plugin_key": "transform:azure_ai_search",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.azure.ai_search",
+      "qualname": "AzureAISearchTransform",
+      "source_path": "src/elspeth/plugins/transforms/azure/ai_search.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "process": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "on_complete": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "close": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "api-key",
+        "managed-identity"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-provider"
     },
     {
       "plugin_key": "transform:azure_content_safety",
@@ -970,6 +1063,35 @@
         "process": "elspeth.plugins.transforms.batch_paired_preference:BatchPairedPreference",
         "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
         "close": "elspeth.plugins.transforms.batch_paired_preference:BatchPairedPreference"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_rank",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_rank",
+      "qualname": "BatchRank",
+      "source_path": "src/elspeth/plugins/transforms/batch_rank.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_rank:BatchRank",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_rank:BatchRank"
       },
       "source_hash_present": true,
       "sink_effect_capability": null,
@@ -1422,17 +1544,15 @@
       "determinism": "external_call",
       "execution_model": "row-transform",
       "lifecycle_owners": {
-        "on_start": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
-        "process": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
-        "on_complete": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
-        "close": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform"
+        "on_start": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "process": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "on_complete": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
+        "close": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase"
       },
       "source_hash_present": true,
       "sink_effect_capability": null,
       "sink_effect_modes": [],
       "variants": [
-        "azure-search-api-key",
-        "azure-search-managed-identity",
         "chroma-ephemeral",
         "chroma-persistent",
         "chroma-client"

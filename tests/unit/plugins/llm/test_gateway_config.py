@@ -31,6 +31,7 @@ from unittest.mock import Mock
 import pytest
 from pydantic import ValidationError
 
+from elspeth.contracts.enums import RunMode
 from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS as _LLM_PRIVATE_OPTIONS
 from elspeth.core.rate_limit.registry import RateLimitRegistry
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig, GatewayLLMProvider
@@ -44,7 +45,7 @@ def _make_gateway_config(**overrides: Any) -> GatewayConfig:
         "model": "gpt-5-mini",
         "endpoint": "https://gateway.example.com/v1",
         "api_key": "test-bearer-token",
-        "prompt_template": "{{ row }}",
+        "prompt_template": "Classify the input.",
         "schema": _OBSERVED_SCHEMA,
     }
     base.update(overrides)
@@ -227,7 +228,8 @@ class TestGatewayRegistryAndSchema:
         assert len(schema["oneOf"]) == 4
         assert set(schema["discriminator"]["mapping"].keys()) == {"azure", "openrouter", "bedrock", "gateway"}
         gateway_schema = schema["$defs"]["GatewayConfig"]
-        assert set(gateway_schema["required"]) >= {"model", "endpoint", "api_key", "prompt_template"}
+        assert set(gateway_schema["required"]) >= {"model", "endpoint", "api_key"}
+        assert "prompt_template" not in gateway_schema["required"]
 
     def test_get_config_model_dispatches_to_gateway_config(self) -> None:
         assert LLMTransform.get_config_model({"provider": "gateway"}) is GatewayConfig
@@ -261,6 +263,9 @@ def _make_ctx() -> SimpleNamespace:
         landscape=object(),
         telemetry_emit=lambda event: None,
         payload_store=None,
+        llm_call_governance=None,
+        call_mode_session=None,
+        run_mode=RunMode.LIVE,
     )
 
 

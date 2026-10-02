@@ -13,10 +13,12 @@ POST   /api/secrets/{name}/validate -- check whether a secret ref is resolvable
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
 from elspeth.web.secrets.schemas import (
@@ -44,6 +46,21 @@ def create_secrets_router() -> APIRouter:
         settings: WebSettings = request.app.state.settings
         return settings
 
+    def _require_user_secrets_enabled(service: WebSecretService) -> None:
+        """Refuse user-scope writes in locked-down server-only mode.
+
+        Checked before the worker hop so the refusal never touches the store;
+        the service enforces the same rule for every non-HTTP caller.
+        """
+        if not service.user_secrets_enabled:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error_type": "user_secrets_disabled",
+                    "detail": "User-scoped secrets are disabled on this deployment; secrets are configured by an administrator.",
+                },
+            )
+
     def _validated_path_secret_name(name: str) -> str:
         try:
             return validate_secret_name(name)
@@ -53,7 +70,7 @@ def create_secrets_router() -> APIRouter:
     @router.get("", response_model=list[SecretInventoryResponse])
     async def list_secrets(
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> list[SecretInventoryResponse]:
         """List all visible secret references (user + server scopes).
 
@@ -77,7 +94,7 @@ def create_secrets_router() -> APIRouter:
     async def create_secret(
         body: CreateSecretRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> CreateSecretResponse:
         """Create or update a user-scoped secret.
 
@@ -98,6 +115,7 @@ def create_secrets_router() -> APIRouter:
         """
         service = _get_service(request)
         settings = _get_settings(request)
+        _require_user_secrets_enabled(service)
         result = await run_sync_in_worker(
             service.set_user_secret,
             user.user_id,
@@ -114,7 +132,7 @@ def create_secrets_router() -> APIRouter:
     async def delete_secret(
         name: str,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> None:
         """Delete a user-scoped secret.
 
@@ -123,6 +141,7 @@ def create_secrets_router() -> APIRouter:
         name = _validated_path_secret_name(name)
         service = _get_service(request)
         settings = _get_settings(request)
+        _require_user_secrets_enabled(service)
         deleted = await run_sync_in_worker(
             service.delete_user_secret,
             user.user_id,
@@ -136,7 +155,7 @@ def create_secrets_router() -> APIRouter:
     async def validate_secret(
         name: str,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> ValidateSecretResponse:
         """Check whether a named secret reference is resolvable.
 

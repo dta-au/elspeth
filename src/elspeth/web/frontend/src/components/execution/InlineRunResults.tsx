@@ -5,7 +5,7 @@
 // run's progress and outputs. Historical access lives in RunsHistoryDrawer.
 // ============================================================================
 
-import { useEffect, useState } from "react";
+import { type JSX, useEffect, useState } from "react";
 import { Button, Icon } from "@/components/ui";
 import {
   type RunHistoryLoadOutcome,
@@ -483,5 +483,5 @@ export function InlineRunResults({
  */
 function NarrativeResultsBranch({ runId }: { runId: string }): JSX.Element {
   const { narrativeMode } = useNarrativeMode();
-  return narrativeMode ? <NarrativeResults /> : <RunOutputsPanel runId={runId} />;
+  return narrativeMode ? <NarrativeResults runId={runId} /> : <RunOutputsPanel runId={runId} />;
 }

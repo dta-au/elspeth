@@ -13,7 +13,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -23,12 +23,23 @@
         "tier": "common"
       },
       {
+        "default": null,
         "description": "Name of the row field whose value is the absolute URL to fetch. Values MUST include an explicit 'http://' or 'https://' scheme; bare hostnames (e.g. 'www.example.gov.au') are rejected at fetch time by the SSRF guard. If the upstream source emits scheme-less values, normalize them in the source data or add an upstream value_transform that prepends 'https://' before this transform.",
         "kind": "text",
         "label": "URL Field",
         "name": "url_field",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Fixed absolute HTTP(S) URL for every row; exclusive with url_field.",
+        "kind": "text",
+        "label": "URL",
+        "name": "url",
+        "nullable": true,
+        "required": false,
         "tier": "common"
       },
       {
@@ -50,8 +61,88 @@
         "tier": "common"
       },
       {
+        "default": "GET",
+        "description": "HTTP method for fetching the row URL.",
+        "enum": [
+          "GET",
+          "POST"
+        ],
+        "kind": "enum",
+        "label": "Method",
+        "name": "method",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Row field containing a JSON object to send as a POST body.",
+        "kind": "text",
+        "label": "Request JSON Field",
+        "name": "request_json_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Row field containing ordered URL-encoded POST form entries.",
+        "kind": "text",
+        "label": "Request Form Field",
+        "name": "request_form_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Row field containing ordered multipart text entries or payload-store blob references.",
+        "kind": "text",
+        "label": "Request Multipart Field",
+        "name": "request_multipart_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Static URL query parameters sent with each request.",
+        "kind": "json-object",
+        "label": "Query",
+        "name": "query",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Map URL query parameter names to input row field names.",
+        "kind": "json-object",
+        "label": "Query Fields",
+        "name": "query_fields",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Validated static public-page request headers.",
+        "kind": "json-object",
+        "label": "Headers",
+        "name": "headers",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Map validated request header names to input row fields.",
+        "kind": "json-object",
+        "label": "Header Fields",
+        "name": "header_fields",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
         "default": "markdown",
-        "description": "Content extraction format to emit: markdown, plain text, or raw HTML.",
+        "description": "Content extraction format to emit: markdown, plain text, or raw HTML/JSON text.",
         "enum": [
           "markdown",
           "text",
@@ -60,6 +151,45 @@
         "kind": "enum",
         "label": "Format",
         "name": "format",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "page",
+        "description": "Page extraction, strict JSON text, or strict XML text. JSON/XML require format raw.",
+        "enum": [
+          "page",
+          "json",
+          "xml"
+        ],
+        "kind": "enum",
+        "label": "Response Mode",
+        "name": "response_mode",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": [],
+        "description": "Optional exact MIME allowlist that narrows the response mode's accepted types.",
+        "kind": "json-value",
+        "label": "Accepted Mime Types",
+        "name": "accepted_mime_types",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "declared_or_utf8",
+        "description": "Use a supported declared charset or UTF-8 fallback, or require UTF-8.",
+        "enum": [
+          "declared_or_utf8",
+          "utf8_only"
+        ],
+        "kind": "enum",
+        "label": "Charset Policy",
+        "name": "charset_policy",
         "nullable": false,
         "required": false,
         "tier": "common"
@@ -95,6 +225,26 @@
         "label": "Strip Elements",
         "name": "strip_elements",
         "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Bounded CSS-selected or JSON-path result records emitted as a row field. An href column may set resolve_url: true to emit an approved absolute URL; this requires http.allowed_origins.",
+        "kind": "json-value",
+        "label": "Records",
+        "name": "records",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "GET-only bounded next-page discovery; all pages enrich one input row and each fetch is audited.",
+        "kind": "json-object",
+        "label": "Pagination",
+        "name": "pagination",
+        "nullable": true,
         "required": false,
         "tier": "common"
       },

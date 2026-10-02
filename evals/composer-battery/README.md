@@ -1,6 +1,7 @@
 # Composer path-quality battery
 
-Spec: `docs/specs/2026-08-13-composer-battery-design.md` (rev 4).
+Spec: the 2026-08-13 composer-battery design (rev 4) is retrievable from git
+history; the section and errata references below (§1, §3, §6, §7) are to it.
 Plan: implemented; the 2026-08-17 composer-battery plan is retrievable from git history.
 
 The battery fires a fixed operator-voice corpus (`corpus.md`, 18 stratified
@@ -181,7 +182,7 @@ themselves mark the firing degraded.
 `case_flags` — it re-derives the per-case exclusion streak and the 15%
 exclusion flag from the captured bytes, which is the stronger reading.
 `firing.json` remains the record of what the driver saw as it fired.
-Triage reads the ledger; kit defects become Filigree issues by hand.
+Triage reads the ledger; kit defects become GitHub Issues by hand.
 
 `--compare <prev>` prints `compare.recorded_deltas` — a dict keyed by
 recorded-identity field, **`composer_skill_hash` always first**, then every

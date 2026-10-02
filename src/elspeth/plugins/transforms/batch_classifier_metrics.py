@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import Field, field_validator, model_validator
 
@@ -13,11 +13,12 @@ from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 from elspeth.plugins.transforms._scalar_buckets import (
     ScalarBucketKey,
     append_unique_bucket_value,
@@ -29,39 +30,48 @@ from elspeth.plugins.transforms._scalar_buckets import (
 type LabelValue = str | int | bool
 type BatchClassifierMetricsRow = dict[str, object]
 
-_BASE_METRIC_FIELDS = frozenset(
-    {
-        "accuracy",
-        "actual_field",
-        "batch_size",
-        "confusion_matrix",
-        "count",
-        "labels",
-        "macro_f1",
-        "macro_precision",
-        "macro_recall",
-        "micro_f1",
-        "micro_precision",
-        "micro_recall",
-        "missing_count",
-        "per_label",
-        "predicted_field",
-        "summary",
-        "weighted_f1",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050). The field
+# names are configured strings, the counts are ints, and every ratio metric is
+# a float or None: ``_safe_ratio`` returns ``float(...)`` or None where the
+# denominator is zero, and ``_mean_defined`` / ``_weighted_mean_defined``
+# divide floats or return None when nothing is defined (an undefined metric is
+# never fabricated as 0.0). ``labels``, ``confusion_matrix`` and ``per_label``
+# are lists the schema DSL has no type for; ``missing_indices`` is written only
+# when a row was skipped (optional).
+_BASE_METRIC_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("accuracy", "float", nullable=True),
+    FieldDefinition("actual_field", "str"),
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("confusion_matrix", "any"),
+    FieldDefinition("count", "int"),
+    FieldDefinition("labels", "any"),
+    FieldDefinition("macro_f1", "float", nullable=True),
+    FieldDefinition("macro_precision", "float", nullable=True),
+    FieldDefinition("macro_recall", "float", nullable=True),
+    FieldDefinition("micro_f1", "float", nullable=True),
+    FieldDefinition("micro_precision", "float", nullable=True),
+    FieldDefinition("micro_recall", "float", nullable=True),
+    FieldDefinition("missing_count", "int"),
+    FieldDefinition("per_label", "any"),
+    FieldDefinition("predicted_field", "str"),
+    FieldDefinition("summary", "str"),
+    FieldDefinition("weighted_f1", "float", nullable=True),
+    FieldDefinition("missing_indices", "any", required=False),
 )
-_BINARY_METRIC_FIELDS = frozenset(
-    {
-        "binary_f1",
-        "binary_fn",
-        "binary_fp",
-        "binary_precision",
-        "binary_recall",
-        "binary_tn",
-        "binary_tp",
-        "positive_label",
-    }
+# The binary block, written only when ``positive_label`` is configured; the
+# label's own declaration is the configured value's type (``_positive_label_definition``).
+_BINARY_METRIC_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("binary_f1", "float", nullable=True),
+    FieldDefinition("binary_fn", "int"),
+    FieldDefinition("binary_fp", "int"),
+    FieldDefinition("binary_precision", "float", nullable=True),
+    FieldDefinition("binary_recall", "float", nullable=True),
+    FieldDefinition("binary_tn", "int"),
+    FieldDefinition("binary_tp", "int"),
 )
+_BASE_METRIC_FIELDS = frozenset(field.name for field in _BASE_METRIC_CREATED_FIELDS if field.required)
+_BINARY_METRIC_FIELDS = frozenset({*(field.name for field in _BINARY_METRIC_CREATED_FIELDS), "positive_label"})
+_LABEL_FIELD_TYPES: dict[type, Literal["str", "int", "bool"]] = {str: "str", int: "int", bool: "bool"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,9 +175,11 @@ class BatchClassifierMetrics(BaseTransform):
     name = "batch_classifier_metrics"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:43952c04e45c4fed"
+    source_file_hash: str | None = "sha256:39baa56eede74f4a"
     config_model = BatchClassifierMetricsConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use when rows carry actual and predicted scalar labels and each flushed window should emit confusion, "
         "accuracy, precision/recall, and F1 metrics; None pairs are excluded."
@@ -202,6 +214,7 @@ class BatchClassifierMetrics(BaseTransform):
                 issue_code=None,
                 summary="Computes classifier accuracy, confusion counts, and precision/recall/F1 metrics for a batch.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_classifier_metrics under aggregations with a trigger; it emits metric summary rows.",
                     "actual_field and predicted_field must be distinct scalar label fields.",
                     "Set positive_label only for binary metrics; macro, micro, and weighted metrics are always computed.",
@@ -263,6 +276,21 @@ class BatchClassifierMetrics(BaseTransform):
             audit_fields=None,
         )
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed tables above; the binary block only when ``positive_label`` is configured (ADR-050).
+
+        ``positive_label`` is written back exactly as configured, so its type
+        is the configured value's type (``str``, ``int`` or ``bool`` — the
+        config model admits no other), fixed before the first row.
+        """
+        if self._positive_label is None:
+            return _BASE_METRIC_CREATED_FIELDS
+        return (
+            *_BASE_METRIC_CREATED_FIELDS,
+            *_BINARY_METRIC_CREATED_FIELDS,
+            FieldDefinition("positive_label", _LABEL_FIELD_TYPES[type(self._positive_label)]),
+        )
+
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the metric output path for the backward invariant."""
         row = self._augment_invariant_probe_row(
@@ -279,11 +307,19 @@ class BatchClassifierMetrics(BaseTransform):
 
     @staticmethod
     def _validate_label(value: object, *, field_name: str, row_index: int) -> LabelValue:
+        # A wrong-typed label fails the WHOLE batch (elspeth-d5034647f0): a
+        # confusion matrix over the surviving pairs would publish metrics over a
+        # set the operator never specified. A None label is a different fact — a
+        # missing pair, skipped and reported by the caller before this check.
+        # Raised here and converted once in `process` because this helper
+        # returns a value, not a result. No coercion: a float label is rejected,
+        # never rounded or stringified into one of the accepted types.
         if type(value) not in (str, int, bool):
-            raise TypeError(
-                f"Field '{field_name}' must be a scalar label (str, int, or bool), "
-                f"got {type(value).__name__} in row {row_index}. "
-                f"This indicates an upstream validation bug - check source schema or prior transforms."
+            raise BatchRowTypeError(
+                field=field_name,
+                row_index=row_index,
+                expected="a scalar label (str, int, or bool)",
+                found=type(value).__name__,
             )
         return cast(LabelValue, value)
 
@@ -499,22 +535,6 @@ class BatchClassifierMetrics(BaseTransform):
 
         return result, None
 
-    def _output_contract_for(self, results: list[BatchClassifierMetricsRow]) -> SchemaContract:
-        """Build one shared output contract for classifier metric rows."""
-        field_names = list(dict.fromkeys(key for result in results for key in result))
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,
-                required=False,
-                source="inferred",
-            )
-            for key in field_names
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
-
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext
     ) -> TransformResult:
@@ -522,7 +542,17 @@ class BatchClassifierMetrics(BaseTransform):
         if not rows:
             return TransformResult.error({"reason": "empty_batch"}, retryable=False)
 
-        pairs, missing_indices = self._collect_pairs(rows)
+        try:
+            pairs, missing_indices = self._collect_pairs(rows)
+        except BatchRowTypeError as exc:
+            # The batch fails with a value-free reason naming the field, the
+            # expected and found types and the batch row index. The structural
+            # caller owns disposition: an aggregation applies its declared
+            # on_error (AggregationExecutor._complete_error_flush records the
+            # reason; RowProcessor.handle_timeout_flush sends every buffered row
+            # to the on_error sink, or records it discarded), while a collector
+            # turns this into a whole-group failure.
+            return TransformResult.error(exc.as_reason(), retryable=False)
         if not pairs:
             row_errors: list[RowErrorEntry] = [{"row_index": row_index, "reason": "missing_label"} for row_index in missing_indices]
             reason: TransformErrorReason = {
@@ -542,7 +572,7 @@ class BatchClassifierMetrics(BaseTransform):
         if error is not None:
             return error
 
-        output_contract = self._output_contract_for([result])
+        output_contract = self._batch_output_contract(result)
         fields_added = [field.normalized_name for field in output_contract.fields]
         return TransformResult.success(
             PipelineRow(result, output_contract),

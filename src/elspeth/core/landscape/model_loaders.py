@@ -2,9 +2,10 @@
 
 Handles the seam between SQLAlchemy rows (strings) and domain objects
 (strict enum types). This is NOT a trust boundary - if the database
-has bad data, we crash. That's intentional per Data Manifesto.
+has bad data, we crash. That's intentional.
 
-Per Data Manifesto: The audit database is OUR data. Bad data = crash.
+Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+§The Three-Tier Trust Model): the audit database is OUR data. Bad data = crash.
 """
 
 from typing import Any
@@ -52,6 +53,7 @@ from elspeth.contracts.enums import (
     NodeType,
     ReproducibilityGrade,
     RoutingMode,
+    RunMode,
     RunStatus,
     TerminalOutcome,
     TerminalPath,
@@ -123,6 +125,8 @@ class RunLoader:
             settings_json=row.settings_json,
             canonical_version=row.canonical_version,
             status=status,
+            run_mode=RunMode(row.run_mode),
+            replay_from_run_id=row.replay_from_run_id,
             completed_at=row.completed_at,
             # Validate reproducibility_grade on read — crash on invalid values (Tier 1)
             reproducibility_grade=ReproducibilityGrade(row.reproducibility_grade) if row.reproducibility_grade is not None else None,
@@ -171,7 +175,6 @@ class NodeLoader:
             config_hash=row.config_hash,
             config_json=row.config_json,
             registered_at=row.registered_at,
-            schema_hash=row.schema_hash,
             sequence_in_pipeline=row.sequence_in_pipeline,
             schema_mode=row.schema_mode,
             schema_fields=schema_fields,
@@ -215,6 +218,7 @@ class RowLoader:
             source_data_hash=row.source_data_hash,
             created_at=row.created_at,
             source_data_ref=row.source_data_ref,
+            source_contract_json=row.source_contract_json,
         )
 
 
@@ -319,9 +323,14 @@ class CallLoader:
             request_ref=row.request_ref,
             response_hash=row.response_hash,
             response_ref=row.response_ref,
+            source_call_id=row.source_call_id,
             error_json=row.error_json,
             latency_ms=row.latency_ms,
-            resolved_prompt_template_hash=row.resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=row.approved_prompt_artifact_hash,
+            prompt_tokens=row.prompt_tokens,
+            completion_tokens=row.completion_tokens,
+            cached_prompt_tokens=row.cached_prompt_tokens,
+            reasoning_tokens=row.reasoning_tokens,
         )
 
 
@@ -913,6 +922,7 @@ class OperationLoader:
             run_id=row.run_id,
             node_id=row.node_id,
             operation_type=row.operation_type,
+            occurrence_index=row.occurrence_index,
             started_at=row.started_at,
             completed_at=row.completed_at,
             status=row.status,

@@ -577,6 +577,8 @@ def _settings_stub(tmp_path: Path, **overrides: object) -> Any:
         "compartment_id": None,
         "quota_default_tokens_per_day": None,
         "quota_default_storage_bytes": None,
+        "registration_mode": "open",
+        "workflow_governance": "off",
     }
     values.update(overrides)
     settings = SimpleNamespace(**values)
@@ -908,6 +910,13 @@ class TestReadinessFilesystemChecks:
 
 
 class TestReadinessAuthAndReport:
+    _R11_DETAIL = (
+        "workflow_governance=on is refused with auth_provider=local and registration_mode=open (R11): "
+        "one person can hold many local identities, so every author-is-not-approver rule is defeatable; "
+        "set registration_mode=closed or email_verified, or set workflow_governance=off"
+    )
+    _COMPARTMENT_DETAIL = "workflow_governance=on requires compartment_id: library rows and audit metadata carry the compartment marking"
+
     @pytest.mark.parametrize(
         ("provider", "fields", "ok"),
         [
@@ -962,6 +971,75 @@ class TestReadinessAuthAndReport:
         assert check.ok is False
         for registered in ("local", "oidc", "entra", "vanguard", "google"):
             assert registered in check.detail
+
+    def test_r11_refuses_open_local_governance(self, tmp_path: Path) -> None:
+        settings = _settings_stub(tmp_path, workflow_governance="on", compartment_id="compartment-a")
+        assert _check_auth_mode(settings) == ReadinessCheck("auth_mode", False, self._R11_DETAIL)
+
+    @pytest.mark.parametrize("registration_mode", ["closed", "email_verified"])
+    def test_r11_admits_non_open_local_governance(self, tmp_path: Path, registration_mode: str) -> None:
+        settings = _settings_stub(tmp_path, registration_mode=registration_mode, workflow_governance="on", compartment_id="compartment-a")
+        assert _check_auth_mode(settings) == ReadinessCheck("auth_mode", True, "local authentication configured; workflow governance on")
+
+    def test_governance_off_keeps_open_local_ready(self, tmp_path: Path) -> None:
+        assert _check_auth_mode(_settings_stub(tmp_path)) == ReadinessCheck("auth_mode", True, "local authentication configured")
+
+    def test_open_registration_is_inert_under_idp(self, tmp_path: Path) -> None:
+        settings = _settings_stub(
+            tmp_path,
+            auth_provider="oidc",
+            workflow_governance="on",
+            **{**_IDP_COMMON, "sso_issuer": "https://issuer.invalid"},
+        )
+        assert _check_auth_mode(settings) == ReadinessCheck("auth_mode", True, "oidc authentication configured; workflow governance on")
+
+    @pytest.mark.parametrize("compartment_id", [None, "", "   "])
+    def test_governance_requires_compartment(self, tmp_path: Path, compartment_id: str | None) -> None:
+        settings = _settings_stub(tmp_path, registration_mode="closed", workflow_governance="on", compartment_id=compartment_id)
+        assert _check_auth_mode(settings) == ReadinessCheck("auth_mode", False, self._COMPARTMENT_DETAIL)
+
+    def test_governance_compartment_setting_changes_verdict(self, tmp_path: Path) -> None:
+        settings = _settings_stub(tmp_path, registration_mode="closed", workflow_governance="on", compartment_id="compartment-a")
+        assert _check_auth_mode(settings).ok is True
+
+    def test_incomplete_idp_configuration_precedes_governance(self, tmp_path: Path) -> None:
+        settings = _settings_stub(tmp_path, auth_provider="google", workflow_governance="on", **_IDP_COMMON)
+        assert _check_auth_mode(settings).detail.startswith("google configuration incomplete: missing google_hosted_domain")
+
+    @pytest.mark.asyncio
+    async def test_report_refuses_r11_and_logs_auth_mode(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        settings = _settings_stub(tmp_path, workflow_governance="on", compartment_id="compartment-a")
+        session_engine = create_session_engine(f"sqlite:///{tmp_path / 'session.db'}")
+        monkeypatch.setattr(readiness, "probe_session_schema", lambda conn: SchemaState.CURRENT)
+        monkeypatch.setattr(readiness, "probe_landscape_schema", lambda conn: SchemaState.CURRENT)
+        runner = ReadinessProbeRunner()
+        try:
+            with capture_logs() as logs:
+                report = await readiness_report(settings, session_engine, runner, instance_draining=threading.Event())
+        finally:
+            runner.close()
+            session_engine.dispose()
+        assert report.ready is False
+        assert [check.name for check in report.checks] == list(readiness.READINESS_CHECK_NAMES)
+        assert [(check.name, check.detail) for check in report.checks if not check.ok] == [("auth_mode", self._R11_DETAIL)]
+        assert [log for log in logs if log.get("event") == "readiness_check_not_ready"] == [
+            {"event": "readiness_check_not_ready", "log_level": "warning", "check": "auth_mode", "detail": self._R11_DETAIL}
+        ]
+
+    def test_closed_local_fixture_is_ready_for_governance(self, closed_local_app: Any) -> None:
+        settings = closed_local_app.app.state.settings
+        assert (settings.auth_provider, settings.registration_mode, settings.workflow_governance, settings.compartment_id) == (
+            "local",
+            "closed",
+            "on",
+            "test-compartment",
+        )
+        assert _check_auth_mode(settings) == ReadinessCheck("auth_mode", True, "local authentication configured; workflow governance on")
+
+    def test_shared_route_fixture_remains_open_and_off(self, test_client: Any) -> None:
+        settings = test_client.app.state.settings
+        assert (settings.auth_provider, settings.registration_mode, settings.workflow_governance) == ("local", "open", "off")
+        assert _check_auth_mode(settings.model_copy(update={"workflow_governance": "on"})).detail == self._R11_DETAIL
 
     @pytest.mark.asyncio
     async def test_report_has_exact_order_and_unique_names(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

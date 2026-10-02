@@ -25,14 +25,25 @@ carve-out to a terminal that names only the review cards.
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pytest
 
-from elspeth.web.composer import no_tool_policy
-from elspeth.web.composer import service as service_module
+from elspeth.contracts.blobs import BlobNotFoundError
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.blobs.protocol import BlobServiceProtocol
+from elspeth.web.composer import advisor_policy, no_tool_policy
+from elspeth.web.composer import composer_preflight as preflight_module
+from elspeth.web.composer.composition_completion import (
+    _MAX_REPAIR_TURNS,
+    _append_interpretation_review_handoff_message,
+    _replace_advisor_repair_public_result,
+)
 from elspeth.web.composer.no_tool_policy import (
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
     _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER,
@@ -42,13 +53,8 @@ from elspeth.web.composer.no_tool_policy import (
     TrustedSystemNoticeSegment,
     visible_message_segments,
 )
-from elspeth.web.composer.protocol import ComposerResult
-from elspeth.web.composer.service import (
-    ComposerServiceImpl,
-    _announce_staged_review_handoff,
-    _append_interpretation_review_handoff_message,
-    _replace_advisor_repair_public_result,
-)
+from elspeth.web.composer.protocol import ComposerResult, ComposerRuntimePreflightError
+from elspeth.web.composer.service import ComposerServiceImpl, _announce_staged_review_handoff
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.execution.schemas import (
     CHECK_ADVISOR_SIGNOFF,
@@ -60,6 +66,7 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from tests.unit.web.execution.test_validate_blob_inline import _state_with_inline_prompt
 
 from ._helpers import _empty_state, _make_settings, _mock_catalog
 
@@ -76,6 +83,8 @@ def _handoff_result() -> ValidationResult:
             completion_ready=True,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
+                    note=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="llm_classify",
                     component_type="transform",
@@ -108,6 +117,8 @@ def _structural_failure_result() -> ValidationResult:
             completion_ready=False,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
+                    note=None,
                     code="graph_structure",
                     component_id="mapper",
                     component_type="transform",
@@ -212,6 +223,33 @@ def service(tmp_path) -> ComposerServiceImpl:
     )
 
 
+def test_missing_blob_metadata_rejects_composer_preflight_without_content_proof_or_state_commit(tmp_path) -> None:
+    """The BlobNotFoundError adapter maps absence to validation refusal, not success."""
+    session_id = uuid4()
+    state = _state_with_inline_prompt(tmp_path, session_id=session_id)
+    blob_service = MagicMock(spec=BlobServiceProtocol)
+    blob_service.get_blob_sync.side_effect = BlobNotFoundError("missing")
+    owner = ComposerServiceImpl.for_trained_operator(
+        catalog=_mock_catalog(),
+        settings=_make_settings(data_dir=tmp_path),
+        blob_service=blob_service,
+    )._preflight
+    operation = SessionOperationContext(
+        fence=SessionOperationFence(str(session_id), "operation-1", "lease-1", 1),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
+
+    result = owner.runtime_preflight(state, user_id=None, session_id=str(session_id), session_operation_context=operation)
+
+    assert result.is_valid is False
+    assert result.readiness.completion_ready is False
+    assert any(error.error_code == "missing_inline_blob_content" for error in result.errors)
+    blob_service.get_blob_sync.assert_called_once()
+    assert blob_service.get_blob_sync.call_args.args[1] is operation
+    blob_service.read_blob_content_sync.assert_not_called()
+    assert state.version == 1
+
+
 def _handoff_composer_result() -> ComposerResult:
     return ComposerResult(
         message="Done — interpretation review is pending.",
@@ -292,7 +330,7 @@ class TestStagedReviewHandoffAnnouncement:
         runtime_result = _structural_failure_result()
         prose = self._prose()
         return ComposerResult(
-            message=service_module._compose_preflight_failure_message(prose, runtime_result=runtime_result),
+            message=no_tool_policy.compose_preflight_failure_message(prose, runtime_result=runtime_result),
             state=_nonempty_state(),
             runtime_preflight=runtime_result,
             raw_assistant_content=prose,
@@ -323,7 +361,7 @@ class TestStagedReviewHandoffAnnouncement:
         """Replacing the preflight suffix must not drop its repair suggestion.
 
         ``_composer_persisted_validation`` projects preflight errors to
-        ``[error.message]``, so ``ValidationError.suggestion`` reaches no
+        owned message/code/component records, so ``ValidationError.suggestion`` reaches no
         structured surface — the prose suffix is the only place the operator
         can see it. Dropping the tail's suffix without carrying the suggestion
         across would therefore lose it outright.
@@ -343,7 +381,7 @@ class TestStagedReviewHandoffAnnouncement:
         )
         prose = self._prose()
         tail_result = ComposerResult(
-            message=service_module._compose_preflight_failure_message(prose, runtime_result=runtime_result),
+            message=no_tool_policy.compose_preflight_failure_message(prose, runtime_result=runtime_result),
             state=_nonempty_state(),
             runtime_preflight=runtime_result,
             raw_assistant_content=prose,
@@ -405,7 +443,7 @@ class TestStagedReviewHandoffAnnouncement:
 class TestAdvisorRepairPublicResult:
     def test_bare_review_message_without_findings(self) -> None:
         published = _replace_advisor_repair_public_result(_handoff_composer_result())
-        assert published.message == service_module._ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE
+        assert published.message == no_tool_policy.ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE
 
     def test_qualified_message_with_findings(self) -> None:
         published = _replace_advisor_repair_public_result(
@@ -465,15 +503,15 @@ class TestAttemptPreflightRepairHandoffVerification:
         *,
         repair_turns_used: int = 0,
     ) -> tuple[bool, list[dict[str, Any]]]:
-        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
         llm_messages: list[dict[str, Any]] = []
-        fired = await service._attempt_preflight_repair(
+        fired = await service._completion._attempt_preflight_repair(
             state=_nonempty_state(),
             llm_messages=llm_messages,
             user_id="user-1",
             session_id=None,
             last_runtime_preflight=None,
-            runtime_preflight_cache=service._new_runtime_preflight_cache(),
+            runtime_preflight_cache=service._preflight.new_cache(),
             initial_version=1,
             session_scope="session:test",
             recorder=SimpleNamespace(llm_calls=()),
@@ -513,15 +551,15 @@ class TestAttemptPreflightRepairHandoffVerification:
         now triggers the real preflight, and the repair gate fires.
         """
         fake = _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
-        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
         llm_messages: list[dict[str, Any]] = []
-        fired = await service._attempt_preflight_repair(
+        fired = await service._completion._attempt_preflight_repair(
             state=_nonempty_state(version=1),
             llm_messages=llm_messages,
             user_id="user-1",
             session_id=None,
             last_runtime_preflight=None,
-            runtime_preflight_cache=service._new_runtime_preflight_cache(),
+            runtime_preflight_cache=service._preflight.new_cache(),
             initial_version=1,
             session_scope="session:test",
             recorder=SimpleNamespace(llm_calls=()),
@@ -542,20 +580,22 @@ class TestAttemptPreflightRepairHandoffVerification:
         damage, not to tax every chat turn with a dry-run through the engine.
         """
         fake = _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
-        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
         clean_state = MagicMock(spec=CompositionState)
         clean_state.version = 1
         clean_state.validate.return_value = SimpleNamespace(is_valid=True)
-        clean_state.sources = {"source": object()}
+        clean_state.sources = {
+            "source": SourceSpec(plugin="csv", on_success="rows", options={"path": "input.csv"}, on_validation_failure="discard")
+        }
         clean_state.nodes = ()
         clean_state.edges = ()
-        clean_state.outputs = (object(),)
-        result = await service._turn_runtime_preflight(
+        clean_state.outputs = (OutputSpec(name="main", plugin="csv", options={"path": "out.csv"}, on_write_failure="discard"),)
+        result = await service._preflight.turn_runtime_preflight(
             state=clean_state,
             user_id="user-1",
             session_id=None,
             last_runtime_preflight=None,
-            runtime_preflight_cache=service._new_runtime_preflight_cache(),
+            runtime_preflight_cache=service._preflight.new_cache(),
             initial_version=1,
             session_scope="session:test",
             recorder=SimpleNamespace(llm_calls=()),
@@ -572,7 +612,7 @@ class TestAttemptPreflightRepairHandoffVerification:
             service,
             fake,
             monkeypatch,
-            repair_turns_used=service_module._MAX_REPAIR_TURNS,
+            repair_turns_used=_MAX_REPAIR_TURNS,
         )
         assert fired is False
         assert fake.calls == []
@@ -580,13 +620,95 @@ class TestAttemptPreflightRepairHandoffVerification:
 
 
 class TestPendingHandoffOutstandingFindings:
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("same_operation", [False, True])
+    @pytest.mark.parametrize("has_blob", [False, True])
+    @pytest.mark.parametrize("abandon", ["cancel", "timeout"])
+    async def test_cancelled_preflight_coalesces_only_compatible_blob_operation(
+        self, service, monkeypatch, same_operation: bool, has_blob: bool, abandon: str
+    ) -> None:
+        state = _nonempty_state(version=1)
+        if has_blob:
+            state = replace(
+                state,
+                sources={
+                    "source": replace(
+                        state.sources["source"],
+                        options={"path": {"blob_ref": "5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b", "mode": "inline_content"}},
+                    )
+                },
+            )
+        first_context = SessionOperationContext(
+            fence=SessionOperationFence("session:test", "operation-1", "lease-1", 1),
+            operation_kind=SessionOperationKind.COMPOSE,
+        )
+        second_context = (
+            first_context
+            if same_operation
+            else replace(first_context, fence=SessionOperationFence("session:test", "operation-2", "lease-2", 2))
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+        contexts: list[SessionOperationContext | None] = []
+
+        def preflight(*_args: Any, session_operation_context: SessionOperationContext | None = None) -> ValidationResult:
+            contexts.append(session_operation_context)
+            return _structural_failure_result() if session_operation_context == second_context and not same_operation else _valid_result()
+
+        async def controlled_worker(func, *args):
+            result = func(*args)
+            started.set()
+            await release.wait()
+            return result
+
+        monkeypatch.setattr(service._preflight, "runtime_preflight", preflight)
+        monkeypatch.setattr(preflight_module, "run_sync_in_worker", controlled_worker)
+
+        async def check(context: SessionOperationContext, *, deadline: float | None = None) -> ValidationResult:
+            return await service._preflight.cached_runtime_preflight(
+                state,
+                user_id="user-1",
+                session_id="session:test",
+                cache=service._preflight.new_cache(),
+                initial_version=1,
+                session_scope="session:test",
+                session_operation_context=context,
+                deadline=deadline,
+            )
+
+        deadline = asyncio.get_running_loop().time() + 0.1 if abandon == "timeout" else None
+        first = asyncio.create_task(check(first_context, deadline=deadline))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        if abandon == "cancel":
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+        else:
+            with pytest.raises(ComposerRuntimePreflightError):
+                await first
+        second = asyncio.create_task(check(second_context))
+        try:
+            # Let the second caller join/start its worker before releasing the
+            # first worker, whose lifetime survives its cancelled caller.
+            await asyncio.sleep(0)
+            release.set()
+            result = await asyncio.wait_for(second, timeout=5)
+        finally:
+            release.set()
+        if has_blob and not same_operation:
+            assert not result.is_valid
+            assert contexts == [first_context, second_context]
+        else:
+            assert result.is_valid
+            assert contexts == [first_context if has_blob else None]
+
     async def _findings(self, service: ComposerServiceImpl, fake: _RecordingValidatePipeline, monkeypatch) -> ValidationResult | None:
-        monkeypatch.setattr(service_module, "validate_pipeline", fake)
-        return await service._pending_handoff_outstanding_findings(
+        monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
+        return await service._preflight.pending_handoff_outstanding_findings(
             _empty_state(),
             user_id="user-1",
             session_id=None,
-            cache=service._new_runtime_preflight_cache(),
+            cache=service._preflight.new_cache(),
             initial_version=1,
             session_scope="session:test",
             plugin_snapshot=MagicMock(spec=PluginAvailabilitySnapshot),
@@ -611,11 +733,11 @@ class TestPendingHandoffOutstandingFindings:
     async def test_tolerant_and_strict_cache_entries_do_not_collide(self, service, monkeypatch) -> None:
         """One state, one cache: the strict entry must not satisfy the tolerant lookup."""
         fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_structural_failure_result())
-        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
         state = _empty_state()
-        cache = service._new_runtime_preflight_cache()
+        cache = service._preflight.new_cache()
         snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
-        strict = await service._cached_runtime_preflight(
+        strict = await service._preflight.cached_runtime_preflight(
             state,
             user_id="user-1",
             session_id=None,
@@ -624,7 +746,7 @@ class TestPendingHandoffOutstandingFindings:
             session_scope="session:test",
             plugin_snapshot=snapshot,
         )
-        tolerant = await service._cached_runtime_preflight(
+        tolerant = await service._preflight.cached_runtime_preflight(
             state,
             user_id="user-1",
             session_id=None,
@@ -640,18 +762,73 @@ class TestPendingHandoffOutstandingFindings:
         assert all(blocker.code != INTERPRETATION_REVIEW_PENDING_CODE for blocker in tolerant.readiness.blockers)
 
     @pytest.mark.anyio
+    async def test_blob_reference_preflight_rechecks_unchanged_state(self, service, monkeypatch) -> None:
+        """A once-ready upload can become unavailable without a state version change."""
+        state = _nonempty_state(version=1)
+        state = replace(
+            state,
+            sources={
+                "source": replace(
+                    state.sources["source"],
+                    options={
+                        "path": {
+                            "blob_ref": "5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b",
+                            "mode": "inline_content",
+                            "sha256": "a" * 64,
+                        }
+                    },
+                )
+            },
+        )
+        calls = 0
+
+        def changing_preflight(*_args: Any, **_kwargs: Any) -> ValidationResult:
+            nonlocal calls
+            calls += 1
+            return _valid_result() if calls == 1 else _structural_failure_result()
+
+        monkeypatch.setattr(preflight_module, "validate_pipeline", changing_preflight)
+        cache = service._preflight.new_cache()
+        snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
+        first = await service._preflight.reuse_or_recompute_runtime_preflight(
+            state=state,
+            user_id="user-1",
+            session_id=None,
+            last_runtime_preflight=None,
+            runtime_preflight_cache=cache,
+            initial_version=1,
+            session_scope="session:test",
+            llm_calls=(),
+            plugin_snapshot=snapshot,
+        )
+        second = await service._preflight.reuse_or_recompute_runtime_preflight(
+            state=state,
+            user_id="user-1",
+            session_id=None,
+            last_runtime_preflight=first,
+            runtime_preflight_cache=cache,
+            initial_version=1,
+            session_scope="session:test",
+            llm_calls=(),
+            plugin_snapshot=snapshot,
+        )
+        assert calls == 2
+        assert first is not None and first.is_valid
+        assert second is not None and not second.is_valid
+
+    @pytest.mark.anyio
     async def test_preview_and_completion_tolerant_passes_share_one_engine_run(self, service, monkeypatch) -> None:
         """elspeth-229e9e8195: the preview-path tolerant entry (tool_batch wires
         it with the compose loop's shared cache and snapshot) must satisfy the
         completion path's ``_pending_handoff_outstanding_findings`` lookup —
         one engine run per state, not one per surface."""
         fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_structural_failure_result())
-        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
         state = _empty_state()
-        cache = service._new_runtime_preflight_cache()
+        cache = service._preflight.new_cache()
         snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
         # Preview path (tool_batch): strict, then — handoff-shaped — tolerant.
-        await service._cached_runtime_preflight(
+        await service._preflight.cached_runtime_preflight(
             state,
             user_id="user-1",
             session_id=None,
@@ -660,7 +837,7 @@ class TestPendingHandoffOutstandingFindings:
             session_scope="session:test",
             plugin_snapshot=snapshot,
         )
-        preview_tolerant = await service._cached_runtime_preflight(
+        preview_tolerant = await service._preflight.cached_runtime_preflight(
             state,
             user_id="user-1",
             session_id=None,
@@ -672,7 +849,7 @@ class TestPendingHandoffOutstandingFindings:
         )
         assert fake.calls == [False, True]
         # Completion path: same cache, same snapshot — no third engine run.
-        findings = await service._pending_handoff_outstanding_findings(
+        findings = await service._preflight.pending_handoff_outstanding_findings(
             state,
             user_id="user-1",
             session_id=None,
@@ -700,8 +877,8 @@ class TestPlannerPreviewPreflightStructuralCallback:
         )
 
     async def _callbacks(self, service: ComposerServiceImpl, fake: _RecordingValidatePipeline, monkeypatch):
-        monkeypatch.setattr(service_module, "validate_pipeline", fake)
-        return await service._planner_preview_preflight(
+        monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
+        return await service._planning_application._planner_preview_preflight(
             self._nonempty_state(),
             user_id="user-1",
             session_id="session-1",
@@ -740,8 +917,8 @@ class TestPlannerPreviewPreflightStructuralCallback:
                 raise RuntimeError("synthetic tolerant preflight bug")
             return original_call(*args, **kwargs)
 
-        monkeypatch.setattr(service_module, "validate_pipeline", crash_on_tolerant)
-        callbacks = await service._planner_preview_preflight(
+        monkeypatch.setattr(preflight_module, "validate_pipeline", crash_on_tolerant)
+        callbacks = await service._planning_application._planner_preview_preflight(
             self._nonempty_state(),
             user_id="user-1",
             session_id="session-1",
@@ -762,10 +939,10 @@ class TestOutstandingFindingsDetail:
     """
 
     def test_none_findings_mean_pure_handoff(self) -> None:
-        assert service_module._outstanding_findings_detail(None) is None
+        assert advisor_policy.outstanding_findings_detail(None) is None
 
     def test_leading_objection_passes_through(self) -> None:
-        detail = service_module._outstanding_findings_detail(_structural_failure_result())
+        detail = advisor_policy.outstanding_findings_detail(_structural_failure_result())
         assert detail == "consumer requires ['llm_response'], producer guarantees (none - dynamic schema)"
 
     def test_empty_string_error_message_falls_back(self) -> None:
@@ -784,7 +961,7 @@ class TestOutstandingFindingsDetail:
                 ]
             }
         )
-        assert service_module._outstanding_findings_detail(result) == "run validation for details."
+        assert advisor_policy.outstanding_findings_detail(result) == "run validation for details."
 
     def test_empty_string_check_detail_falls_back(self) -> None:
         result = _structural_failure_result().model_copy(
@@ -793,7 +970,7 @@ class TestOutstandingFindingsDetail:
                 "checks": [ValidationCheck(name="graph_structure", passed=False, detail="", affected_nodes=(), outcome_code=None)],
             }
         )
-        assert service_module._outstanding_findings_detail(result) == "run validation for details."
+        assert advisor_policy.outstanding_findings_detail(result) == "run validation for details."
 
 
 class TestTolerantHandoffShapeIsReported:
@@ -813,12 +990,12 @@ class TestTolerantHandoffShapeIsReported:
     @pytest.mark.anyio
     async def test_handoff_shaped_tolerant_result_is_reported_not_confirmed(self, service, monkeypatch) -> None:
         fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_handoff_result())
-        monkeypatch.setattr(service_module, "validate_pipeline", fake)
-        findings = await service._pending_handoff_outstanding_findings(
+        monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
+        findings = await service._preflight.pending_handoff_outstanding_findings(
             _empty_state(),
             user_id="user-1",
             session_id=None,
-            cache=service._new_runtime_preflight_cache(),
+            cache=service._preflight.new_cache(),
             initial_version=1,
             session_scope="session:test",
             plugin_snapshot=MagicMock(spec=PluginAvailabilitySnapshot),
@@ -858,15 +1035,15 @@ class TestCrossTurnRepairLedger:
         version: int = 1,
         state: CompositionState | None = None,
     ) -> tuple[bool, list[dict[str, Any]]]:
-        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
         llm_messages: list[dict[str, Any]] = []
-        fired = await service._attempt_preflight_repair(
+        fired = await service._completion._attempt_preflight_repair(
             state=state if state is not None else _nonempty_state(version=version),
             llm_messages=llm_messages,
             user_id="user-1",
             session_id=None,
             last_runtime_preflight=None,
-            runtime_preflight_cache=cache if cache is not None else service._new_runtime_preflight_cache(),
+            runtime_preflight_cache=cache if cache is not None else service._preflight.new_cache(),
             initial_version=1,
             session_scope="session:test",
             recorder=SimpleNamespace(llm_calls=()),
@@ -894,7 +1071,7 @@ class TestCrossTurnRepairLedger:
         """The ledger bounds campaigns across compose calls, not the in-call budget."""
         fake = _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
         snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
-        cache = service._new_runtime_preflight_cache()
+        cache = service._preflight.new_cache()
         first_fired, _ = await self._attempt_cross_turn(service, fake, monkeypatch, snapshot, cache=cache)
         assert first_fired is True
         second_fired, second_messages = await self._attempt_cross_turn(
@@ -947,14 +1124,14 @@ class TestPendingHandoffVerificationDeadline:
         import asyncio
 
         fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_structural_failure_result())
-        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
         expired = asyncio.get_running_loop().time() - 1.0
-        with pytest.raises(service_module.ComposerRuntimePreflightError):
-            await service._pending_handoff_outstanding_findings(
+        with pytest.raises(ComposerRuntimePreflightError):
+            await service._preflight.pending_handoff_outstanding_findings(
                 _empty_state(),
                 user_id="user-1",
                 session_id=None,
-                cache=service._new_runtime_preflight_cache(),
+                cache=service._preflight.new_cache(),
                 initial_version=1,
                 session_scope="session:test",
                 plugin_snapshot=MagicMock(spec=PluginAvailabilitySnapshot),

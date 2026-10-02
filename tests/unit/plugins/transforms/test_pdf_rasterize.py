@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import shutil
 import tempfile
@@ -24,6 +25,7 @@ from elspeth.plugins.infrastructure.rasterize.protocol import (
     RenderedPage,
 )
 from elspeth.plugins.infrastructure.rasterize.renderer import RenderTimedOut
+from elspeth.plugins.transforms import pdf_rasterize as pdf_rasterize_module
 from elspeth.plugins.transforms.pdf_rasterize import PDFRasterize
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
@@ -181,6 +183,70 @@ def test_worker_contract_violation_text_none_with_extract_text_enabled_is_a_fram
         transform.process(make_pipeline_row({"blob_ref": ref}), make_context())
 
 
+@pytest.mark.parametrize("policy", ["fail_document", "emit_rendered"])
+@pytest.mark.parametrize(
+    ("page_count", "rendered", "refused"),
+    [
+        pytest.param(3, (2, 2), (), id="duplicate-rendered"),
+        pytest.param(3, (1, 1, 3), (), id="duplicate-rendered-same-count"),
+        pytest.param(3, (1, 3), (), id="missing"),
+        pytest.param(3, (), (), id="all-missing"),
+        pytest.param(3, (1, 2, 4), (), id="out-of-range"),
+        pytest.param(3, (0, 2, 3), (), id="zero-page-number"),
+        pytest.param(3, (-1, 2, 3), (), id="negative-page-number"),
+        pytest.param(3, (1, 2, 3), (2,), id="overlap"),
+        pytest.param(3, (1, 2), (2,), id="overlap-same-count"),
+        pytest.param(3, (1, 3), (2, 2), id="duplicate-refused"),
+        pytest.param(3, (1,), (2, 2), id="duplicate-refused-same-count"),
+        pytest.param(3, (1, 2), (4,), id="refused-out-of-range"),
+        pytest.param(3, (), (1, 2), id="refused-incomplete"),
+        pytest.param(0, (1,), (), id="nonempty-zero-count"),
+        pytest.param(-1, (1,), (), id="negative-count"),
+        pytest.param(201, (1,), (), id="over-limit-count"),
+        pytest.param(True, (1,), (), id="boolean-count"),
+        pytest.param(1.0, (1,), (), id="float-count"),
+        pytest.param(1, (True,), (), id="boolean-page"),
+        pytest.param(1, (1.0,), (), id="float-page"),
+        pytest.param(1, (), (True,), id="boolean-refused-page"),
+        pytest.param(1, (), (1.0,), id="float-refused-page"),
+    ],
+)
+def test_invalid_worker_page_partition_fails_before_publishing(
+    store: FilesystemPayloadStore, policy: str, page_count: int, rendered: tuple[int, ...], refused: tuple[int, ...]
+) -> None:
+    ref = store.store(minimal_pdf(3))
+    response = RasterizeResponse(
+        page_count=page_count,
+        rendered=tuple(_page(number) for number in rendered),
+        refused=tuple(RefusedPage(number, PageRefusalKind.RENDER_ERROR, "boom") for number in refused),
+    )
+    renderer = _StubRenderer(response, tuple(PNG for _ in rendered))
+    transform = _transform(store, renderer, on_page_failure=policy)
+    with pytest.raises(FrameworkBugError, match="page partition"):
+        transform.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert not store.exists(hashlib.sha256(PNG).hexdigest())
+    assert renderer.discarded and not renderer.discarded[0].exists()
+
+
+def test_worker_page_partition_is_emitted_in_canonical_order(store: FilesystemPayloadStore) -> None:
+    ref = store.store(minimal_pdf(4))
+    response = RasterizeResponse(
+        page_count=4,
+        rendered=(_page(3, "third"), _page(1, "first")),
+        refused=(RefusedPage(4, PageRefusalKind.RENDER_ERROR, "fourth"), RefusedPage(2, PageRefusalKind.RENDER_ERROR, "second")),
+    )
+    renderer = _StubRenderer(response, (PNG + b"third", PNG + b"first"))
+    result = _transform(store, renderer, on_page_failure="emit_rendered").process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "success"
+    assert [row["page_number"] for row in result.rows] == [1, 3]
+    assert [row["page_text"] for row in result.rows] == ["first", "third"]
+    assert [store.retrieve(row["page_blob_ref"]) for row in result.rows] == [PNG + b"first", PNG + b"third"]
+    assert result.success_reason["metadata"]["refused_pages"] == [
+        {"page_number": 2, "kind": "render_error", "detail": "second"},
+        {"page_number": 4, "kind": "render_error", "detail": "fourth"},
+    ]
+
+
 def test_page_png_path_outside_output_dir_raises_containment_error(store: FilesystemPayloadStore, tmp_path: Path) -> None:
     """A worker-returned png_path outside its own render output_dir is a containment
 
@@ -212,6 +278,175 @@ def test_emitted_page_size_is_the_real_byte_length_not_the_workers_claim(store: 
     assert store.retrieve(result.rows[0]["page_blob_ref"]) == real_bytes
 
 
+NOT_A_PNG = b"NOT_A_PNG"
+
+
+def test_worker_output_over_max_page_bytes_is_refused_before_publishing(store: FilesystemPayloadStore) -> None:
+    """``max_page_bytes`` is a boundary the parent enforces, not a claim the worker makes.
+
+    A worker that wrote ~1 MiB of non-PNG bytes for a 64-byte cap used to succeed:
+    the parent read the whole file, persisted it and labelled it ``image/png``.
+    """
+    ref = store.store(minimal_pdf(1))
+    oversized = NOT_A_PNG * (1024 * 1024 // len(NOT_A_PNG))
+    renderer = _StubRenderer(RasterizeResponse(page_count=1, rendered=(_page(1),), refused=()), (oversized,))
+    result = _transform(store, renderer, max_page_bytes=64).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "error" and result.retryable is False
+    assert result.reason["reason"] == "pdf_page_too_large"
+    assert [(entry["page_number"], entry["kind"]) for entry in result.reason["refused_pages"]] == [(1, "oversize_bytes")]
+    assert not store.exists(hashlib.sha256(oversized).hexdigest())
+
+
+def test_worker_output_that_is_not_a_png_is_refused_before_publishing(store: FilesystemPayloadStore) -> None:
+    ref = store.store(minimal_pdf(1))
+    renderer = _StubRenderer(RasterizeResponse(page_count=1, rendered=(_page(1),), refused=()), (NOT_A_PNG,))
+    result = _transform(store, renderer).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "error" and result.retryable is False
+    assert result.reason["reason"] == "pdf_page_render_failed"
+    assert [(entry["page_number"], entry["kind"]) for entry in result.reason["refused_pages"]] == [(1, "render_error")]
+    assert not store.exists(hashlib.sha256(NOT_A_PNG).hexdigest())
+
+
+def test_a_png_at_exactly_max_page_bytes_publishes_and_one_byte_more_is_refused(store: FilesystemPayloadStore) -> None:
+    """The parent checks discriminate: they refuse a violation, not every page."""
+    ref = store.store(minimal_pdf(1))
+    response = RasterizeResponse(page_count=1, rendered=(_page(1),), refused=())
+    at_cap = _transform(store, _StubRenderer(response, (PNG,)), max_page_bytes=len(PNG))
+    result = at_cap.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "success"
+    assert result.rows[0]["page_size_bytes"] == len(PNG)
+    assert result.rows[0]["page_mime_type"] == "image/png"
+    assert store.retrieve(result.rows[0]["page_blob_ref"]) == PNG
+
+    over_cap = _transform(store, _StubRenderer(response, (PNG + b"\x00",)), max_page_bytes=len(PNG))
+    refused = over_cap.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert refused.status == "error" and refused.reason["reason"] == "pdf_page_too_large"
+    assert not store.exists(hashlib.sha256(PNG + b"\x00").hexdigest())
+
+
+def test_emit_rendered_skips_a_parent_refused_page_and_publishes_the_rest(store: FilesystemPayloadStore) -> None:
+    ref = store.store(minimal_pdf(2))
+    response = RasterizeResponse(page_count=2, rendered=(_page(1, "one"), _page(2, "two")), refused=())
+    renderer = _StubRenderer(response, (PNG + b"one", NOT_A_PNG))
+    result = _transform(store, renderer, on_page_failure="emit_rendered").process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "success"
+    assert [row["page_number"] for row in result.rows] == [1]
+    assert store.retrieve(result.rows[0]["page_blob_ref"]) == PNG + b"one"
+    assert [(entry["page_number"], entry["kind"]) for entry in result.success_reason["metadata"]["refused_pages"]] == [(2, "render_error")]
+    assert not store.exists(hashlib.sha256(NOT_A_PNG).hexdigest())
+
+
+def test_page_bytes_that_change_after_admission_are_never_published(store: FilesystemPayloadStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The check that matters is on the bytes stored, not on an earlier look at the file.
+
+    The render pool's workers outlive the call, so the file the parent admitted is not
+    guaranteed to be the file it later reads. Admission sees a PNG here; the bytes read
+    for storage are not one, and they must not reach the payload store.
+    """
+    ref = store.store(minimal_pdf(1))
+    reads = iter((PNG, NOT_A_PNG))
+    monkeypatch.setattr(pdf_rasterize_module, "_read_page_output", lambda path, max_page_bytes: next(reads))
+    renderer = _StubRenderer(RasterizeResponse(page_count=1, rendered=(_page(1),), refused=()), (PNG,))
+    with pytest.raises(RuntimeError, match="containment breach"):
+        _transform(store, renderer).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert not store.exists(hashlib.sha256(NOT_A_PNG).hexdigest())
+    assert not store.exists(hashlib.sha256(PNG).hexdigest())
+
+
+def test_worker_output_over_max_total_bytes_is_refused_before_publishing(store: FilesystemPayloadStore) -> None:
+    """``max_total_bytes`` is decided by the bytes the parent read, not the worker's own total.
+
+    The stub stands in for a worker that ignored the aggregate limit: every page passes
+    the per-page checks, and together they exceed the cap by one byte.
+    """
+    ref = store.store(minimal_pdf(2))
+    response = RasterizeResponse(page_count=2, rendered=(_page(1), _page(2)), refused=())
+    fits = (PNG + b"one", PNG + b"two")
+    at_cap = _transform(store, _StubRenderer(response, fits), max_total_bytes=sum(map(len, fits)))
+    result = at_cap.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "success"
+    assert [store.retrieve(row["page_blob_ref"]) for row in result.rows] == list(fits)
+
+    over = (PNG + b"ONE", PNG + b"TWO")
+    over_cap = _transform(store, _StubRenderer(response, over), max_total_bytes=sum(map(len, over)) - 1)
+    refused = over_cap.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert refused.status == "error" and refused.retryable is False
+    assert refused.reason["reason"] == "pdf_output_too_large"
+    assert refused.reason["page_count"] == 2
+    assert not any(store.exists(hashlib.sha256(page).hexdigest()) for page in over)
+
+
+def test_page_bytes_that_grow_after_admission_cannot_exceed_max_total_bytes(
+    store: FilesystemPayloadStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-read page can still be a valid PNG within max_page_bytes yet larger than admitted.
+
+    Admission sums two minimal PNGs, exactly the cap; the storage read of page 2 returns a
+    larger, still-admissible PNG that takes the total over it, and that page is never stored.
+    """
+    ref = store.store(minimal_pdf(2))
+    grown = PNG + b"grown-after-admission"
+    reads = iter((PNG, PNG, PNG, grown))
+    monkeypatch.setattr(pdf_rasterize_module, "_read_page_output", lambda path, max_page_bytes: next(reads))
+    renderer = _StubRenderer(RasterizeResponse(page_count=2, rendered=(_page(1), _page(2)), refused=()), (PNG, PNG))
+    with pytest.raises(RuntimeError, match="grew past max_total_bytes"):
+        _transform(store, renderer, max_total_bytes=2 * len(PNG)).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert not store.exists(hashlib.sha256(grown).hexdigest())
+
+
+def test_a_page_file_swapped_for_a_symlink_after_admission_is_never_followed(
+    store: FilesystemPayloadStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Re-checking content is not enough: a link to a PNG outside the render dir passes it.
+
+    Admission resolved and contained the path; the page is then replaced by a symbolic
+    link to an outside PNG before the bytes are read for storage. The storage read must
+    refuse the link (``O_NOFOLLOW``), not publish what it points at.
+    """
+    ref = store.store(minimal_pdf(1))
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(PNG + b"outside-the-render-dir")
+    real_read = pdf_rasterize_module._read_page_output
+    reads: list[Path] = []
+
+    def read_then_swap(path: Path, max_page_bytes: int) -> bytes:
+        reads.append(path)
+        data = real_read(path, max_page_bytes)
+        if len(reads) == 1:  # admission has read the real page; swap it before the storage read
+            path.unlink()
+            path.symlink_to(outside)
+        return data
+
+    monkeypatch.setattr(pdf_rasterize_module, "_read_page_output", read_then_swap)
+    renderer = _StubRenderer(RasterizeResponse(page_count=1, rendered=(_page(1),), refused=()), (PNG,))
+    with pytest.raises(OSError) as raised:
+        _transform(store, renderer).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert raised.value.errno == errno.ELOOP
+    assert len(reads) == 2
+    assert not store.exists(hashlib.sha256(outside.read_bytes()).hexdigest())
+
+
+class _SubclassedResponse(RasterizeResponse):
+    __slots__ = ()
+
+
+def test_an_unknown_render_result_type_is_a_framework_bug_not_a_publish(store: FilesystemPayloadStore, tmp_path: Path) -> None:
+    """Admission is exhaustive over the renderer's result types.
+
+    ``_map_document_result`` dispatches with ``isinstance`` and treats anything that is
+    not a refusal or a timeout as a response, so a result admission did not recognise
+    would reach page publishing with no partition or containment check at all.
+    """
+    ref = store.store(minimal_pdf(1))
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(PNG)
+    page = RenderedPage(page_number=1, png_path=outside, width_px=10, height_px=10, size_bytes=len(PNG), text="")
+    renderer = _StubRenderer(_SubclassedResponse(page_count=5, rendered=(page,), refused=()))
+    with pytest.raises(FrameworkBugError, match="Unknown PDF renderer result type: _SubclassedResponse"):
+        _transform(store, renderer).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert not store.exists(hashlib.sha256(PNG).hexdigest())
+
+
 def test_encrypted_document_is_a_typed_row_error_not_a_crash(store: FilesystemPayloadStore) -> None:
     ref = store.store(ENCRYPTED_PDF_PATH.read_bytes())
     transform = _transform(store, _StubRenderer(DocumentRefusal(kind=DocumentRefusalKind.ENCRYPTED, detail="Incorrect password")))
@@ -225,6 +460,10 @@ def test_encrypted_document_is_a_typed_row_error_not_a_crash(store: FilesystemPa
     ("refusal", "reason"),
     [
         (DocumentRefusal(kind=DocumentRefusalKind.MALFORMED, detail="Data format error"), "pdf_malformed"),
+        (
+            DocumentRefusal(kind=DocumentRefusalKind.OVERSIZE_OUTPUT, detail="rendered output too large", page_count=2),
+            "pdf_output_too_large",
+        ),
         (DocumentRefusal(kind=DocumentRefusalKind.TOO_MANY_PAGES, detail="900 pages", page_count=900), "too_many_rows"),
         (RenderTimedOut(timeout_seconds=120), "render_timeout"),
     ],
@@ -329,6 +568,8 @@ def test_input_validation_precedes_rendering(store: FilesystemPayloadStore) -> N
     assert missing.reason["reason"] == "missing_field"
     bad_ref = transform.process(make_pipeline_row({"blob_ref": "nope"}), make_context())
     assert bad_ref.reason["reason"] == "invalid_input" and bad_ref.reason["error_type"] == "invalid_blob_ref"
+    # An unvalidated ref is arbitrary row text: the reason names the field, never the value.
+    assert "nope" not in repr(bad_ref.reason)
     absent = transform.process(make_pipeline_row({"blob_ref": "0" * 64}), make_context())
     assert absent.reason["reason"] == "blob_not_found"
     not_pdf = transform.process(make_pipeline_row({"blob_ref": store.store(PNG)}), make_context())
@@ -427,7 +668,14 @@ class TestConfig:
 
     @pytest.mark.parametrize(
         ("option", "value"),
-        [("dpi", 301), ("dpi", 35), ("max_page_bytes", 5 * 1024 * 1024 + 1), ("max_pages", 2001), ("on_page_failure", "ignore")],
+        [
+            ("dpi", 301),
+            ("dpi", 35),
+            ("max_page_bytes", 5 * 1024 * 1024 + 1),
+            ("max_total_bytes", 500 * 1024 * 1024 + 1),
+            ("max_pages", 2001),
+            ("on_page_failure", "ignore"),
+        ],
     )
     def test_ceilings_are_hard(self, option: str, value: Any) -> None:
         with pytest.raises(PluginConfigError):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from sqlalchemy import select
 
 from elspeth.contracts import (
     NodeStateCompleted,
@@ -14,11 +15,13 @@ from elspeth.contracts import (
     RoutingMode,
     RoutingSpec,
 )
-from elspeth.contracts.errors import ConfigGateReason
+from elspeth.contracts.errors import ConfigGateReason, SchedulerLeaseLostError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from elspeth.core.landscape.schema import run_workers_table, token_work_items_table
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token, make_recorder_with_run, register_test_node
+from tests.helpers.state_engine import capture_state_engine_image
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -53,8 +56,16 @@ def _setup_with_token(
     run_id: str = "run-1",
 ) -> tuple[LandscapeDB, RecorderFactory, str, str]:
     db, factory = _setup(run_id=run_id)
-    row = factory.data_flow.create_row(run_id, "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-    token = factory.data_flow.create_token("row-1", token_id="tok-1")
+    row, token = factory.data_flow.create_row_with_token(
+        "source-0",
+        0,
+        {"name": "test"},
+        row_id="row-1",
+        source_row_index=0,
+        ingest_sequence=0,
+        coordination_token=leader_coordination_token(factory, run_id),
+        token_id="tok-1",
+    )
     return db, factory, row.row_id, token.token_id
 
 
@@ -64,12 +75,12 @@ def _setup_with_token_and_edge(
 ) -> tuple[LandscapeDB, RecorderFactory, str, str, str]:
     db, factory, row_id, token_id = _setup_with_token(run_id=run_id)
     edge = factory.data_flow.register_edge(
-        run_id,
         "source-0",
         "transform-1",
         "continue",
         RoutingMode.MOVE,
         edge_id="edge-1",
+        coordination_token=leader_coordination_token(factory, run_id),
     )
     return db, factory, row_id, token_id, edge.edge_id
 
@@ -85,9 +96,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"name": "test"},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert isinstance(result, NodeStateOpen)
@@ -99,9 +110,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert type(result) is NodeStateOpen
@@ -112,9 +123,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert result.state_id is not None
@@ -127,10 +138,10 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
             state_id="my-state-id",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert result.state_id == "my-state-id"
@@ -141,9 +152,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"name": "test"},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert result.input_hash is not None
@@ -156,19 +167,19 @@ class TestBeginNodeState:
         result1 = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"a": 1, "b": 2},
             state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         # Use different node to avoid UNIQUE constraint on (token_id, node_id, attempt)
         result2 = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="transform-1",
-            run_id="run-1",
             step_index=1,
             input_data={"a": 1, "b": 2},
             state_id="state-2",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert result1.input_hash == result2.input_hash
@@ -179,19 +190,19 @@ class TestBeginNodeState:
         result1 = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"a": 1},
             state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         # Use different node to avoid UNIQUE constraint on (token_id, node_id, attempt)
         result2 = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="transform-1",
-            run_id="run-1",
             step_index=1,
             input_data={"a": 2},
             state_id="state-2",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert result1.input_hash != result2.input_hash
@@ -202,9 +213,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(result.state_id)
@@ -217,9 +228,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert result.token_id == token_id
@@ -230,9 +241,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert result.node_id == "source-0"
@@ -243,9 +254,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         # run_id is not on the NodeStateOpen dataclass but is persisted in DB.
@@ -260,9 +271,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=3,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert result.step_index == 3
@@ -273,10 +284,10 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
             attempt=2,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert result.attempt == 2
@@ -287,9 +298,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert result.attempt == 0
@@ -300,9 +311,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(result.state_id)
@@ -316,18 +327,18 @@ class TestBeginNodeState:
         state1 = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
             state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         state2 = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="transform-1",
-            run_id="run-1",
             step_index=1,
             input_data={"x": 1},
             state_id="state-2",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert state1.state_id != state2.state_id
@@ -340,9 +351,9 @@ class TestBeginNodeState:
         result = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert result.started_at is not None
@@ -355,15 +366,16 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         result = factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.COMPLETED,
             output_data={"x": 1, "y": 2},
             duration_ms=100,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert isinstance(result, NodeStateCompleted)
@@ -375,15 +387,16 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         result = factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
             error={"reason": "something broke"},
             duration_ms=50,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert isinstance(result, NodeStateFailed)
@@ -395,14 +408,12 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         result = factory.execution.complete_node_state(
-            state.state_id,
-            NodeStateStatus.PENDING,
-            duration_ms=25,
+            state.state_id, NodeStateStatus.PENDING, duration_ms=25, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert isinstance(result, NodeStatePending)
@@ -414,16 +425,14 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         with pytest.raises(ValueError):
             factory.execution.complete_node_state(
-                state.state_id,
-                NodeStateStatus.OPEN,
-                duration_ms=10,
+                state.state_id, NodeStateStatus.OPEN, duration_ms=10, member_token=leader_coordination_token(factory, "run-1").membership
             )
 
     def test_raises_value_error_for_none_duration(self):
@@ -432,9 +441,9 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         with pytest.raises(ValueError):
@@ -442,6 +451,7 @@ class TestCompleteNodeState:
                 state.state_id,
                 NodeStateStatus.COMPLETED,
                 duration_ms=None,
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
     def test_stores_output_hash(self):
@@ -450,15 +460,16 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.COMPLETED,
             output_data={"x": 1, "result": "done"},
             duration_ms=100,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -474,31 +485,33 @@ class TestCompleteNodeState:
         state1 = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
             state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
             state1.state_id,
             NodeStateStatus.COMPLETED,
             output_data={"result": "ok"},
             duration_ms=10,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         state2 = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="transform-1",
-            run_id="run-1",
             step_index=1,
             input_data={"x": 1},
             state_id="state-2",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
             state2.state_id,
             NodeStateStatus.COMPLETED,
             output_data={"result": "ok"},
             duration_ms=20,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched1 = factory.execution.get_node_state(state1.state_id)
@@ -513,9 +526,9 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         error_data = {"reason": "timeout", "code": 504}
         factory.execution.complete_node_state(
@@ -523,6 +536,7 @@ class TestCompleteNodeState:
             NodeStateStatus.FAILED,
             error=error_data,
             duration_ms=5000,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -538,9 +552,9 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         success = {"action": "classified", "confidence": 0.95}
         factory.execution.complete_node_state(
@@ -549,6 +563,7 @@ class TestCompleteNodeState:
             output_data={"x": 1},
             duration_ms=200,
             success_reason=success,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -571,9 +586,9 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         context = PoolExecutionContext(
             pool_config=PoolConfigSnapshot(pool_size=4, max_capacity_retry_seconds=30.0, dispatch_delay_at_completion_ms=10.0),
@@ -593,6 +608,7 @@ class TestCompleteNodeState:
             output_data={"x": 1},
             duration_ms=300,
             context_after=context,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -608,15 +624,16 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.COMPLETED,
             output_data={"x": 1},
             duration_ms=42,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -630,15 +647,16 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         result = factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.COMPLETED,
             output_data={"x": 1},
             duration_ms=10,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert type(result) is NodeStateCompleted
@@ -649,15 +667,16 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         result = factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
             error={"reason": "bad"},
             duration_ms=10,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert type(result) is NodeStateFailed
@@ -668,14 +687,12 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         result = factory.execution.complete_node_state(
-            state.state_id,
-            NodeStateStatus.PENDING,
-            duration_ms=10,
+            state.state_id, NodeStateStatus.PENDING, duration_ms=10, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert type(result) is NodeStatePending
@@ -686,15 +703,16 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.COMPLETED,
             output_data={"result": "ok"},
             duration_ms=100,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -707,15 +725,16 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.COMPLETED,
             output_data={"x": 1},
             duration_ms=100,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -728,15 +747,16 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
             error={"reason": "bad"},
             duration_ms=50,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -749,14 +769,12 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
-            state.state_id,
-            NodeStateStatus.PENDING,
-            duration_ms=25,
+            state.state_id, NodeStateStatus.PENDING, duration_ms=25, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -769,15 +787,16 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.COMPLETED,
             output_data={"x": 1},
             duration_ms=10,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -790,9 +809,9 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         with pytest.raises(ValueError, match="COMPLETED node state requires output_data"):
@@ -801,6 +820,7 @@ class TestCompleteNodeState:
                 NodeStateStatus.COMPLETED,
                 output_data=None,
                 duration_ms=10,
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
     def test_rejects_failed_without_error(self):
@@ -809,9 +829,9 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         with pytest.raises(ValueError, match="FAILED node state requires error"):
@@ -820,6 +840,7 @@ class TestCompleteNodeState:
                 NodeStateStatus.FAILED,
                 error=None,
                 duration_ms=10,
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
     def test_completed_with_valid_output_data_succeeds(self):
@@ -828,9 +849,9 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         result = factory.execution.complete_node_state(
@@ -838,6 +859,7 @@ class TestCompleteNodeState:
             NodeStateStatus.COMPLETED,
             output_data={"x": 1, "result": "ok"},
             duration_ms=10,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         assert isinstance(result, NodeStateCompleted)
 
@@ -847,9 +869,9 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         result = factory.execution.complete_node_state(
@@ -857,6 +879,7 @@ class TestCompleteNodeState:
             NodeStateStatus.FAILED,
             error={"reason": "something broke"},
             duration_ms=10,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         assert isinstance(result, NodeStateFailed)
 
@@ -872,16 +895,14 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         with pytest.raises(ValueError, match="FAILED node state requires error"):
             factory.execution.complete_node_state(
-                state.state_id,
-                NodeStateStatus.FAILED,
-                duration_ms=10,
+                state.state_id, NodeStateStatus.FAILED, duration_ms=10, member_token=leader_coordination_token(factory, "run-1").membership
             )
 
     def test_success_reason_defaults_to_none(self):
@@ -890,15 +911,16 @@ class TestCompleteNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.COMPLETED,
             output_data={"x": 1},
             duration_ms=10,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -913,9 +935,9 @@ class TestGetNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -929,15 +951,16 @@ class TestGetNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.COMPLETED,
             output_data={"x": 1},
             duration_ms=50,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -951,15 +974,16 @@ class TestGetNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
             error={"msg": "oops"},
             duration_ms=10,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -973,14 +997,12 @@ class TestGetNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.complete_node_state(
-            state.state_id,
-            NodeStateStatus.PENDING,
-            duration_ms=5,
+            state.state_id, NodeStateStatus.PENDING, duration_ms=5, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -1000,9 +1022,9 @@ class TestGetNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -1015,9 +1037,9 @@ class TestGetNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="transform-1",
-            run_id="run-1",
             step_index=1,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -1030,9 +1052,9 @@ class TestGetNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=7,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -1045,10 +1067,10 @@ class TestGetNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
             attempt=3,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -1061,9 +1083,9 @@ class TestGetNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -1076,9 +1098,9 @@ class TestGetNodeState:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         fetched = factory.execution.get_node_state(state.state_id)
@@ -1094,15 +1116,13 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         event = factory.execution.record_routing_event(
-            state.state_id,
-            edge_id,
-            RoutingMode.MOVE,
+            state.state_id, edge_id, RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert event is not None
@@ -1115,15 +1135,13 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         event = factory.execution.record_routing_event(
-            state.state_id,
-            edge_id,
-            RoutingMode.MOVE,
+            state.state_id, edge_id, RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert event.event_id is not None
@@ -1136,9 +1154,9 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         event = factory.execution.record_routing_event(
@@ -1146,6 +1164,7 @@ class TestRecordRoutingEvent:
             edge_id,
             RoutingMode.MOVE,
             event_id="my-event-id",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert event.event_id == "my-event-id"
@@ -1156,15 +1175,13 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         event = factory.execution.record_routing_event(
-            state.state_id,
-            edge_id,
-            RoutingMode.MOVE,
+            state.state_id, edge_id, RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert event.routing_group_id is not None
@@ -1177,9 +1194,9 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         event = factory.execution.record_routing_event(
@@ -1187,6 +1204,7 @@ class TestRecordRoutingEvent:
             edge_id,
             RoutingMode.MOVE,
             routing_group_id="group-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert event.routing_group_id == "group-1"
@@ -1197,17 +1215,14 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         reason = _make_gate_reason()
         event = factory.execution.record_routing_event(
-            state.state_id,
-            edge_id,
-            RoutingMode.MOVE,
-            reason=reason,
+            state.state_id, edge_id, RoutingMode.MOVE, reason=reason, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert event.reason_hash is not None
@@ -1220,15 +1235,13 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         event = factory.execution.record_routing_event(
-            state.state_id,
-            edge_id,
-            RoutingMode.MOVE,
+            state.state_id, edge_id, RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert event.reason_hash is None
@@ -1239,15 +1252,13 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         event = factory.execution.record_routing_event(
-            state.state_id,
-            edge_id,
-            RoutingMode.MOVE,
+            state.state_id, edge_id, RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert event.state_id == state.state_id
@@ -1258,16 +1269,13 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         event = factory.execution.record_routing_event(
-            state.state_id,
-            edge_id,
-            RoutingMode.MOVE,
-            ordinal=5,
+            state.state_id, edge_id, RoutingMode.MOVE, ordinal=5, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert event.ordinal == 5
@@ -1278,15 +1286,13 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         event = factory.execution.record_routing_event(
-            state.state_id,
-            edge_id,
-            RoutingMode.MOVE,
+            state.state_id, edge_id, RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert event.ordinal == 0
@@ -1297,15 +1303,13 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         event = factory.execution.record_routing_event(
-            state.state_id,
-            edge_id,
-            RoutingMode.MOVE,
+            state.state_id, edge_id, RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert event.created_at is not None
@@ -1316,15 +1320,13 @@ class TestRecordRoutingEvent:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         event = factory.execution.record_routing_event(
-            state.state_id,
-            edge_id,
-            RoutingMode.COPY,
+            state.state_id, edge_id, RoutingMode.COPY, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         assert event.mode == RoutingMode.COPY
@@ -1336,7 +1338,7 @@ class TestRecordRoutingEvents:
 
         # Register a second edge for the second route
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -1345,27 +1347,38 @@ class TestRecordRoutingEvents:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-2",
             "route_a",
             RoutingMode.COPY,
             edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         routes = [
             RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE),
             RoutingSpec(edge_id="edge-2", mode=RoutingMode.COPY),
         ]
-        events = factory.execution.record_routing_events(state.state_id, routes)
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            routes,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         assert len(events) == 2
 
@@ -1373,36 +1386,47 @@ class TestRecordRoutingEvents:
         _db, factory, _row_id, token_id, _edge_id = _setup_with_token_and_edge()
 
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-2",
             "route_a",
             RoutingMode.COPY,
             edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         routes = [
             RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE),
             RoutingSpec(edge_id="edge-2", mode=RoutingMode.COPY),
         ]
-        events = factory.execution.record_routing_events(state.state_id, routes)
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            routes,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         group_ids = {e.routing_group_id for e in events}
         assert len(group_ids) == 1
@@ -1412,47 +1436,47 @@ class TestRecordRoutingEvents:
         _db, factory, _row_id, token_id, _edge_id = _setup_with_token_and_edge()
 
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-2",
             "route_a",
             RoutingMode.COPY,
             edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink3",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-3",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-3",
             "route_b",
             RoutingMode.COPY,
             edge_id="edge-3",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         routes = [
@@ -1460,7 +1484,18 @@ class TestRecordRoutingEvents:
             RoutingSpec(edge_id="edge-2", mode=RoutingMode.COPY),
             RoutingSpec(edge_id="edge-3", mode=RoutingMode.COPY),
         ]
-        events = factory.execution.record_routing_events(state.state_id, routes)
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            routes,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         ordinals = [e.ordinal for e in events]
         assert ordinals == [0, 1, 2]
@@ -1469,36 +1504,47 @@ class TestRecordRoutingEvents:
         _db, factory, _row_id, token_id, _edge_id = _setup_with_token_and_edge()
 
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-2",
             "route_a",
             RoutingMode.COPY,
             edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         routes = [
             RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE),
             RoutingSpec(edge_id="edge-2", mode=RoutingMode.COPY),
         ]
-        events = factory.execution.record_routing_events(state.state_id, routes)
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            routes,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         edge_ids = [e.edge_id for e in events]
         assert edge_ids == ["edge-1", "edge-2"]
@@ -1507,36 +1553,47 @@ class TestRecordRoutingEvents:
         _db, factory, _row_id, token_id, _edge_id = _setup_with_token_and_edge()
 
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-2",
             "route_a",
             RoutingMode.COPY,
             edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         routes = [
             RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE),
             RoutingSpec(edge_id="edge-2", mode=RoutingMode.COPY),
         ]
-        events = factory.execution.record_routing_events(state.state_id, routes)
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            routes,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         modes = [e.mode for e in events]
         assert modes == [RoutingMode.MOVE, RoutingMode.COPY]
@@ -1545,29 +1602,29 @@ class TestRecordRoutingEvents:
         _db, factory, _row_id, token_id, _edge_id = _setup_with_token_and_edge()
 
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-2",
             "route_a",
             RoutingMode.COPY,
             edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         reason = _make_gate_reason(condition="row['x'] > 0", result="true")
@@ -1579,6 +1636,14 @@ class TestRecordRoutingEvents:
             state.state_id,
             routes,
             reason=reason,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
         )
 
         for event in events:
@@ -1589,29 +1654,29 @@ class TestRecordRoutingEvents:
         _db, factory, _row_id, token_id, _edge_id = _setup_with_token_and_edge()
 
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-2",
             "route_a",
             RoutingMode.COPY,
             edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         reason = _make_gate_reason()
@@ -1623,6 +1688,14 @@ class TestRecordRoutingEvents:
             state.state_id,
             routes,
             reason=reason,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
         )
 
         hashes = {e.reason_hash for e in events}
@@ -1632,36 +1705,47 @@ class TestRecordRoutingEvents:
         _db, factory, _row_id, token_id, _edge_id = _setup_with_token_and_edge()
 
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-2",
             "route_a",
             RoutingMode.COPY,
             edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         routes = [
             RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE),
             RoutingSpec(edge_id="edge-2", mode=RoutingMode.COPY),
         ]
-        events = factory.execution.record_routing_events(state.state_id, routes)
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            routes,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         for event in events:
             assert event.reason_hash is None
@@ -1672,12 +1756,23 @@ class TestRecordRoutingEvents:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
-        events = factory.execution.record_routing_events(state.state_id, [])
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            [],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         assert events == []
 
@@ -1687,13 +1782,24 @@ class TestRecordRoutingEvents:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         routes = [RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE)]
-        events = factory.execution.record_routing_events(state.state_id, routes)
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            routes,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         assert len(events) == 1
         assert events[0].edge_id == "edge-1"
@@ -1704,36 +1810,47 @@ class TestRecordRoutingEvents:
         _db, factory, _row_id, token_id, _edge_id = _setup_with_token_and_edge()
 
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-2",
             "route_a",
             RoutingMode.COPY,
             edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         routes = [
             RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE),
             RoutingSpec(edge_id="edge-2", mode=RoutingMode.COPY),
         ]
-        events = factory.execution.record_routing_events(state.state_id, routes)
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            routes,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         event_ids = [e.event_id for e in events]
         assert len(set(event_ids)) == 2
@@ -1742,36 +1859,47 @@ class TestRecordRoutingEvents:
         _db, factory, _row_id, token_id, _edge_id = _setup_with_token_and_edge()
 
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-2",
             "route_a",
             RoutingMode.COPY,
             edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         routes = [
             RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE),
             RoutingSpec(edge_id="edge-2", mode=RoutingMode.COPY),
         ]
-        events = factory.execution.record_routing_events(state.state_id, routes)
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            routes,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         for event in events:
             assert event.state_id == state.state_id
@@ -1780,36 +1908,47 @@ class TestRecordRoutingEvents:
         _db, factory, _row_id, token_id, _edge_id = _setup_with_token_and_edge()
 
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_edge(
-            "run-1",
             "source-0",
             "sink-2",
             "route_a",
             RoutingMode.COPY,
             edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         routes = [
             RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE),
             RoutingSpec(edge_id="edge-2", mode=RoutingMode.COPY),
         ]
-        events = factory.execution.record_routing_events(state.state_id, routes)
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            routes,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         for event in events:
             assert event.created_at is not None
@@ -1821,9 +1960,9 @@ class TestRecordRoutingEvents:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         payload_store = _RecordingPayloadStore()
@@ -1832,7 +1971,49 @@ class TestRecordRoutingEvents:
         factory.execution.node_states._payload_store = payload_store
 
         reason = {"action": "continue", "match": "default"}
-        events = factory.execution.record_routing_events(state.state_id, routes=[], reason=reason)
+        events = factory.execution.record_routing_events(
+            state.state_id,
+            routes=[],
+            reason=reason,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            ),
+        )
 
         assert events == []
         assert payload_store.stored_payloads == []
+
+
+def test_f10_routing_events_refuse_reclaimed_item() -> None:
+    db, factory, _row_id, token_id, edge_id = _setup_with_token_and_edge()
+    member = leader_coordination_token(factory, "run-1").membership
+    state = factory.execution.begin_node_state(token_id, "source-0", 0, {"value": 1}, member_token=member)
+    item = claim_test_work_item(factory, member_token=member, token_id=token_id, node_id="source-0")
+    with db.write_connection() as conn:
+        conn.execute(
+            token_work_items_table.update()
+            .where(token_work_items_table.c.work_item_id == item.work_item_id)
+            .values(attempt=item.attempt + 1)
+        )
+    before = capture_state_engine_image(db, run_id=member.run_id)
+
+    with pytest.raises(SchedulerLeaseLostError):
+        factory.execution.record_routing_events(
+            state.state_id,
+            [RoutingSpec(edge_id=edge_id, mode=RoutingMode.MOVE)],
+            member_token=member,
+            work_item=item,
+        )
+
+    assert capture_state_engine_image(db, run_id=member.run_id) == before
+    assert factory.query.get_routing_events(state.state_id) == []
+    with db.read_only_connection() as conn:
+        assert (
+            conn.execute(select(run_workers_table.c.status).where(run_workers_table.c.worker_id == member.worker_id)).scalar_one()
+            == "active"
+        )

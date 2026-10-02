@@ -20,29 +20,60 @@ import pytest
 from sqlalchemy import insert, update
 from sqlalchemy.exc import IntegrityError
 
-from elspeth.contracts import NodeType, RunStatus, TerminalOutcome, TerminalPath
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts import (
+    AggregationResultMember,
+    BatchStatus,
+    FrameKind,
+    NodeStateStatus,
+    NodeType,
+    OutputMode,
+    RoutingMode,
+    RunStatus,
+    TerminalOutcome,
+    TerminalPath,
+    TriggerType,
+)
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import AggregationMemberAction, CollectorGroupFailureReason
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    ExecutionError,
     RunLeadershipLostError,
-    RunWorkerEvictedError,
+    RunMembershipLostError,
 )
+from elspeth.contracts.node_state_context import AggregationFlushContext
 from elspeth.contracts.scheduler import BarrierEmission, TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape import database as database_module
+from elspeth.core.landscape.collector_group_failure_holds import collector_group_failure_hold_error
+from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
+    group_records_table,
     run_coordination_table,
     run_workers_table,
     token_work_items_table,
 )
+from elspeth.testing import make_pipeline_row
 from tests.fixtures.landscape import expire_lease, leader_coordination_token, make_factory, make_landscape_db, register_test_node
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 from tests.helpers.tree_gate import iter_gate_sources
+from tests.unit.web.execution.test_service import _execute_lease
+from tests.unit.web.execution.test_service import _live_execute_lease as _live_execute_lease
+from tests.unit.web.execution.test_service import broadcaster as broadcaster
+from tests.unit.web.execution.test_service import mock_loop as mock_loop
+from tests.unit.web.execution.test_service import mock_session_service as mock_session_service
+from tests.unit.web.execution.test_service import mock_settings as mock_settings
+from tests.unit.web.execution.test_service import real_loop as real_loop
+from tests.unit.web.execution.test_service import service as service
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
 RUN_ID = "forbidden-path-run"
@@ -75,13 +106,13 @@ def harness() -> Iterator[_Harness]:
         openrouter_catalog_source="bundled",
     )
     factory.data_flow.register_node(
-        run_id=RUN_ID,
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
         config={},
         node_id=SOURCE_NODE_ID,
         schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+        coordination_token=leader_coordination_token(factory, RUN_ID),
     )
     register_test_node(factory.data_flow, RUN_ID, NODE_ID)
     try:
@@ -97,7 +128,6 @@ def harness() -> Iterator[_Harness]:
 
 def _enqueue(harness: _Harness, name: str, sequence: int) -> tuple[str, str, str]:
     row, token = harness.factory.data_flow.create_row_with_token(
-        run_id=RUN_ID,
         source_node_id=SOURCE_NODE_ID,
         row_index=sequence,
         data={"name": name},
@@ -105,9 +135,10 @@ def _enqueue(harness: _Harness, name: str, sequence: int) -> tuple[str, str, str
         ingest_sequence=sequence,
         row_id=f"row-{name}",
         token_id=f"token-{name}",
+        coordination_token=leader_coordination_token(harness.factory, RUN_ID),
     )
     item = harness.repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=harness.coordination_token.membership,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=NODE_ID,
@@ -120,14 +151,15 @@ def _enqueue(harness: _Harness, name: str, sequence: int) -> tuple[str, str, str
 
 def _claim(harness: _Harness, name: str = "parent", *, owner: str = LEADER) -> tuple[str, str, str]:
     row_id, token_id, work_item_id = _enqueue(harness, name, 0)
-    claimed = harness.repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=60)
+    claimed = harness.repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=owner), lease_owner=owner, lease_seconds=60
+    )
     assert claimed is not None and claimed.work_item_id == work_item_id
     return row_id, token_id, work_item_id
 
 
 def _ready_child(harness: _Harness) -> BarrierEmission:
     row, token = harness.factory.data_flow.create_row_with_token(
-        run_id=RUN_ID,
         source_node_id=SOURCE_NODE_ID,
         row_index=1,
         data={"name": "child"},
@@ -135,6 +167,7 @@ def _ready_child(harness: _Harness) -> BarrierEmission:
         ingest_sequence=1,
         row_id="row-child",
         token_id="token-child",
+        coordination_token=leader_coordination_token(harness.factory, RUN_ID),
     )
     return BarrierEmission(
         token_id=token.token_id,
@@ -148,7 +181,9 @@ def _ready_child(harness: _Harness) -> BarrierEmission:
 
 def _mark_blocked(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierEmission | None) -> object:
     return repo.mark_blocked(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WRONG_OWNER),
         work_item_id=work_item_id,
+        row_payload_json=PAYLOAD,
         queue_key="queue-a",
         barrier_key=None,
         expected_lease_owner=WRONG_OWNER,
@@ -157,6 +192,7 @@ def _mark_blocked(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierE
 
 def _mark_terminal(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierEmission | None) -> object:
     return repo.mark_terminal(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WRONG_OWNER),
         work_item_id=work_item_id,
         expected_lease_owner=WRONG_OWNER,
     )
@@ -164,6 +200,7 @@ def _mark_terminal(repo: TokenSchedulerRepository, work_item_id: str, _: Barrier
 
 def _mark_failed(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierEmission | None) -> object:
     return repo.mark_failed(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WRONG_OWNER),
         work_item_id=work_item_id,
         expected_lease_owner=WRONG_OWNER,
     )
@@ -171,6 +208,7 @@ def _mark_failed(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierEm
 
 def _mark_pending_sink(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierEmission | None) -> object:
     return repo.mark_pending_sink(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WRONG_OWNER),
         work_item_id=work_item_id,
         row_payload_json=PAYLOAD,
         sink_name="sink-a",
@@ -189,6 +227,7 @@ def _mark_terminal_with_ready_children(
 ) -> object:
     assert child is not None
     return repo.mark_terminal_with_ready_children(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WRONG_OWNER),
         work_item_id=work_item_id,
         emitted_ready=(child,),
         expected_lease_owner=WRONG_OWNER,
@@ -202,6 +241,7 @@ def _mark_failed_with_ready_children(
 ) -> object:
     assert child is not None
     return repo.mark_failed_with_ready_children(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WRONG_OWNER),
         work_item_id=work_item_id,
         emitted_ready=(child,),
         expected_lease_owner=WRONG_OWNER,
@@ -215,6 +255,7 @@ def _mark_pending_sink_with_ready_children(
 ) -> object:
     assert child is not None
     return repo.mark_pending_sink_with_ready_children(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WRONG_OWNER),
         work_item_id=work_item_id,
         emitted_ready=(child,),
         row_payload_json=PAYLOAD,
@@ -247,6 +288,7 @@ def test_f04_wrong_owner_cannot_disposition_a_lease(
     disposition: _WrongOwnerDisposition,
     needs_child: bool,
 ) -> None:
+    _register_peer(harness, WRONG_OWNER)
     _row_id, _token_id, work_item_id = _claim(harness)
     child = _ready_child(harness) if needs_child else None
     before = capture_state_engine_image(harness.db, run_id=RUN_ID)
@@ -264,6 +306,7 @@ def test_f04_wrong_owner_cannot_terminalize_pending_sink_debt_without_mutation(
 ) -> None:
     _row_id, token_id, work_item_id = _claim(harness)
     harness.repo.mark_pending_sink(
+        member_token=harness.coordination_token.membership,
         work_item_id=work_item_id,
         row_payload_json=PAYLOAD,
         sink_name="sink-a",
@@ -278,7 +321,6 @@ def test_f04_wrong_owner_cannot_terminalize_pending_sink_debt_without_mutation(
     if batch:
         with pytest.raises(AuditIntegrityError, match="strict owner CAS"):
             harness.repo.mark_pending_sink_terminal_many(
-                run_id=RUN_ID,
                 token_ids=(token_id,),
                 expected_lease_owner=WRONG_OWNER,
                 coordination_token=harness.coordination_token,
@@ -286,7 +328,6 @@ def test_f04_wrong_owner_cannot_terminalize_pending_sink_debt_without_mutation(
     else:
         assert (
             harness.repo.mark_pending_sink_terminal(
-                run_id=RUN_ID,
                 token_id=token_id,
                 expected_lease_owner=WRONG_OWNER,
                 coordination_token=harness.coordination_token,
@@ -306,9 +347,10 @@ def test_f06_inactive_registered_worker_cannot_claim(
 ) -> None:
     _row_id, _token_id, work_item_id = _enqueue(harness, "claim", 0)
     if subtype == "pending_sink":
-        claimed = harness.repo.claim_ready(run_id=RUN_ID, lease_owner=LEADER, lease_seconds=60)
+        claimed = harness.repo.claim_ready(member_token=harness.coordination_token.membership, lease_owner=LEADER, lease_seconds=60)
         assert claimed is not None
         harness.repo.mark_pending_sink(
+            member_token=harness.coordination_token.membership,
             work_item_id=work_item_id,
             row_payload_json=PAYLOAD,
             sink_name="sink-a",
@@ -334,22 +376,32 @@ def test_f06_inactive_registered_worker_cannot_claim(
         )
     before = capture_state_engine_image(harness.db, run_id=RUN_ID)
 
-    claim = harness.repo.claim_ready if subtype == "ready" else harness.repo.claim_pending_sink
-    with pytest.raises(RunWorkerEvictedError) as raised:
-        claim(run_id=RUN_ID, lease_owner=inactive, lease_seconds=60)
-
-    assert raised.value.worker_id == inactive
-    assert raised.value.run_id == RUN_ID
-    assert capture_state_engine_image(harness.db, run_id=RUN_ID) == before
+    if subtype == "ready":
+        with pytest.raises(RunMembershipLostError) as raised:
+            harness.repo.claim_ready(
+                member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=inactive), lease_owner=inactive, lease_seconds=60
+            )
+        assert raised.value.worker_id == inactive
+        assert raised.value.run_id == RUN_ID
+        _assert_only_fence_refusal(harness, before, verb="claim_ready", membership=True)
+    else:
+        with pytest.raises(RunLeadershipLostError):
+            harness.repo.claim_pending_sink(
+                coordination_token=CoordinationToken(run_id=RUN_ID, worker_id=inactive, leader_epoch=1),
+                lease_owner=inactive,
+                lease_seconds=60,
+            )
+        _assert_only_fence_refusal(harness, before, verb="claim_pending_sink")
 
 
 @pytest.mark.parametrize("subtype", ("ready", "pending_sink"))
-def test_f06_absent_worker_claim_is_a_zero_mutation_none(subtype: str, harness: _Harness) -> None:
+def test_f06_absent_worker_claim_is_refused_without_payload_mutation(subtype: str, harness: _Harness) -> None:
     _row_id, _token_id, work_item_id = _enqueue(harness, "claim", 0)
     if subtype == "pending_sink":
-        claimed = harness.repo.claim_ready(run_id=RUN_ID, lease_owner=LEADER, lease_seconds=60)
+        claimed = harness.repo.claim_ready(member_token=harness.coordination_token.membership, lease_owner=LEADER, lease_seconds=60)
         assert claimed is not None
         harness.repo.mark_pending_sink(
+            member_token=harness.coordination_token.membership,
             work_item_id=work_item_id,
             row_payload_json=PAYLOAD,
             sink_name="sink-a",
@@ -361,10 +413,20 @@ def test_f06_absent_worker_claim_is_a_zero_mutation_none(subtype: str, harness: 
         )
     before = capture_state_engine_image(harness.db, run_id=RUN_ID)
 
-    claim = harness.repo.claim_ready if subtype == "ready" else harness.repo.claim_pending_sink
-    assert claim(run_id=RUN_ID, lease_owner="unregistered", lease_seconds=60) is None
-
-    assert capture_state_engine_image(harness.db, run_id=RUN_ID) == before
+    if subtype == "ready":
+        with pytest.raises(AuditIntegrityError, match="unregistered"):
+            harness.repo.claim_ready(
+                member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="unregistered"), lease_owner="unregistered", lease_seconds=60
+            )
+        assert capture_state_engine_image(harness.db, run_id=RUN_ID) == before
+    else:
+        with pytest.raises(RunLeadershipLostError):
+            harness.repo.claim_pending_sink(
+                coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="unregistered", leader_epoch=1),
+                lease_owner="unregistered",
+                lease_seconds=60,
+            )
+        _assert_only_fence_refusal(harness, before, verb="claim_pending_sink")
 
 
 def _register_peer(harness: _Harness, peer: str, *, status: str = "active") -> None:
@@ -468,6 +530,7 @@ def _assert_only_fence_refusal(
     before: StateEngineImage,
     *,
     verb: str,
+    membership: bool = False,
 ) -> None:
     after = capture_state_engine_image(harness.db, run_id=RUN_ID)
     delta = before.diff(after)
@@ -475,7 +538,8 @@ def _assert_only_fence_refusal(
     added = tuple(row for row in after.tables["run_coordination_events"] if row not in before.tables["run_coordination_events"])
     assert len(added) == 1
     assert added[0]["event_type"] == "fence_refusal"
-    assert json.loads(str(added[0]["context_json"])) == {"verb": verb}
+    expected_context = {"verb": verb, "fence": "membership"} if membership else {"verb": verb}
+    assert json.loads(str(added[0]["context_json"])) == expected_context
     assert after.tables["runs"] == before.tables["runs"]
 
 
@@ -498,12 +562,130 @@ def test_f10_stale_leader_cannot_reconcile_source_completions(harness: _Harness)
 
     with pytest.raises(RunLeadershipLostError) as raised:
         harness.factory.execution.reconcile_source_completions_from_scheduler(
-            run_id=RUN_ID,
             coordination_token=harness.coordination_token,
         )
 
     assert raised.value.verb == "reconcile_source_completions_from_scheduler"
     _assert_only_fence_refusal(harness, before, verb="reconcile_source_completions_from_scheduler")
+
+
+@pytest.mark.parametrize(
+    ("disposition", "needs_child"),
+    (
+        pytest.param(_mark_terminal, False, id="terminal"),
+        pytest.param(_mark_failed, False, id="failed"),
+        pytest.param(_mark_blocked, False, id="blocked"),
+        pytest.param(_mark_pending_sink, False, id="pending-sink"),
+        pytest.param(_mark_terminal_with_ready_children, True, id="terminal-children"),
+        pytest.param(_mark_failed_with_ready_children, True, id="failed-children"),
+        pytest.param(_mark_pending_sink_with_ready_children, True, id="pending-sink-children"),
+    ),
+)
+def test_f10_evicted_member_cannot_disposition_owned_work(
+    harness: _Harness, disposition: _WrongOwnerDisposition, needs_child: bool
+) -> None:
+    _register_peer(harness, WRONG_OWNER)
+    _, _, work_item_id = _claim(harness, owner=WRONG_OWNER)
+    child = _ready_child(harness) if needs_child else None
+    with harness.db.engine.begin() as conn:
+        conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == WRONG_OWNER).values(status="evicted", evicted_at=NOW))
+    before = capture_state_engine_image(harness.db, run_id=RUN_ID)
+    with pytest.raises(RunMembershipLostError):
+        disposition(harness.repo, work_item_id, child)
+    verb = "_transition_with_ready_children" if needs_child else "_transition"
+    _assert_only_fence_refusal(harness, before, verb=verb, membership=True)
+
+
+def test_f10_evicted_member_cannot_record_routing_event(harness: _Harness) -> None:
+    _, token_id, _ = _claim(harness)
+    state = harness.factory.execution.begin_node_state(token_id, NODE_ID, 1, {}, member_token=harness.coordination_token.membership)
+    with harness.db.engine.begin() as conn:
+        conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == LEADER).values(status="evicted", evicted_at=NOW))
+    before = capture_state_engine_image(harness.db, run_id=RUN_ID)
+    with pytest.raises(RunMembershipLostError):
+        harness.factory.execution.record_routing_event(
+            state.state_id, "unreached-edge", RoutingMode.MOVE, member_token=harness.coordination_token.membership
+        )
+    _assert_only_fence_refusal(harness, before, verb="record_routing_event", membership=True)
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_stale_admission_refusal_leader_refuses_before_cleanup(request, tmp_path, monkeypatch, stale) -> None:
+    """A superseded reconciliation token cannot clean blobs or acknowledge Sessions."""
+    from contextlib import nullcontext
+    from unittest.mock import create_autospec
+    from uuid import UUID, uuid4
+
+    from sqlalchemy import select
+
+    from elspeth.contracts.blobs import BlobFinalizationResult
+    from elspeth.contracts.coordination import mint_worker_id
+    from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+    from elspeth.core.landscape.schema import metadata, run_coordination_events_table
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from tests.fixtures.landscape import leader_token_for
+
+    execution_service = request.getfixturevalue("service")
+    sessions = request.getfixturevalue("mock_session_service")
+    loop = request.getfixturevalue("real_loop")
+    execution_service._blob_service = create_autospec(BlobServiceImpl, instance=True)
+    execution_service._blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+    acquire = RunCoordinationRepository.acquire_reconciliation_leadership
+    before = {}
+    prior_event_seqs = set()
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path}/refusal.db") as db:
+        factory = RecorderFactory(db)
+        run = factory.run_lifecycle.begin_run({}, "v1", run_id=str(uuid4()))
+        owner = leader_token_for(db, run.run_id)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=owner)
+        factory.run_coordination.release_seat(token=owner)
+
+        def supersede_before_return(repository, **kwargs):
+            token = acquire(repository, **kwargs)
+            repository.release_seat(token=token)
+            acquire(
+                repository,
+                run_id=run.run_id,
+                worker_id=mint_worker_id(run.run_id),
+                window_seconds=30,
+                expected_status=RunStatus.FAILED,
+            )
+            with db.engine.connect() as connection:
+                for table in metadata.tables.values():
+                    if table is not run_coordination_events_table:
+                        before[table.name] = connection.execute(select(table)).all()
+                prior_event_seqs.update(connection.execute(select(run_coordination_events_table.c.seq)).scalars())
+            return token
+
+        if stale:
+            monkeypatch.setattr(RunCoordinationRepository, "acquire_reconciliation_leadership", supersede_before_return)
+        monkeypatch.setattr("elspeth.web.execution.service.open_landscape_db", lambda _settings: nullcontext(db))
+        if stale:
+            with pytest.raises(RunLeadershipLostError) as raised:
+                loop.run_until_complete(execution_service._settle_admission_refusal(UUID(run.run_id), _execute_lease()))
+            assert raised.value.verb == "web_admission_refusal_reconciliation"
+            with pytest.raises(RunLeadershipLostError):
+                loop.run_until_complete(_execute_lease().close())
+            assert _execute_lease().closed
+            with db.engine.connect() as connection:
+                for table in metadata.tables.values():
+                    if table is not run_coordination_events_table:
+                        assert connection.execute(select(table)).all() == before[table.name], table.name
+                additions = [
+                    row for row in connection.execute(select(run_coordination_events_table)).all() if row.seq not in prior_event_seqs
+                ]
+            assert len(additions) == 2
+            assert all(row.event_type == "fence_refusal" for row in additions)
+            assert {json.loads(row.context_json)["verb"] for row in additions} == {
+                "web_admission_refusal_reconciliation",
+                "release_seat",
+            }
+            execution_service._blob_service.finalize_run_output_blobs.assert_not_called()
+            sessions.session_operation_authority.mutate.assert_not_called()
+        else:
+            loop.run_until_complete(execution_service._settle_admission_refusal(UUID(run.run_id), _execute_lease()))
+            execution_service._blob_service.finalize_run_output_blobs.assert_awaited_once()
+            sessions.session_operation_authority.mutate.assert_called_once()
 
 
 def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None:
@@ -514,11 +696,11 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
     This architecture gate binds that evidence to the complete live caller
     inventory so adding a fenced verb requires adding stale-authority evidence.
 
-    BOTH fences are in scope (ADR-030 D4, restored by the ADR-048 amendment of
-    2026-09-07): ``fenced_leader_transaction`` (and its ``fenced_write``
-    wrapper) and ``fenced_member_transaction``. Leaving the member fence out
-    of this scan would let a future membership-fenced verb ship with no
-    refusal evidence at all — a fence that has become a formality.
+    All three authority scopes are explicit: leader transactions (including
+    ``fenced_write``), member transactions (including the heartbeat helper),
+    and claimed-item transactions. Each scope has its own exact verb set and
+    requires its own refusal exception; a member refusal cannot stand in for
+    evidence that a stale item claim is rejected.
 
     Each verb declares HOW its refusal is evidenced, because not every fenced
     verb propagates. A verb called from a ``finally`` arm reifies the refusal
@@ -528,6 +710,49 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
     one layer down. Every other verb must still assert the exception.
     """
     expected = {
+        "allocate_call_index",
+        "fork_token",
+        "record_call",
+        "record_call_payload_refs",
+        "record_verification_decision",
+        "record_routing_events",
+        "record_token_outcome",
+        "record_transform_error",
+        "_transition",
+        "_transition_with_ready_children",
+        "allocate_operation_call_index",
+        "begin_node_state",
+        "begin_node_states_many",
+        "begin_operation",
+        "claim_pending_sink",
+        "claim_ready",
+        "coalesce_tokens",
+        "collect_tokens",
+        "complete_aggregation_failure",
+        "complete_aggregation_result",
+        "complete_batch",
+        "complete_collector_failure",
+        "complete_node_state",
+        "complete_operation",
+        "create_batch",
+        "create_token",
+        "enqueue_ready",
+        "enqueue_ready_claimed",
+        "expand_token",
+        "finalize_coalesce_effect",
+        "record_completed_node_state",
+        "record_empty_expansion",
+        "record_operation_call",
+        "record_operation_call_payload_refs",
+        "record_routing_event",
+        "record_token_outcome_leader",
+        "record_validation_error",
+        "register_edge",
+        "register_node",
+        "retry_batch",
+        "update_batch_status",
+        "update_grade_after_purge",
+        "update_node_output_contract",
         "depart_worker",
         "release_seat",
         "worker_heartbeat",
@@ -547,6 +772,7 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "finalize",
         "heartbeat_lease",
         "ingest_row_with_initial_claim",
+        "ingest_quarantine_row_with_pending_sink",
         "mark_pending_sink_terminal",
         "mark_pending_sink_terminal_many",
         "mark_response_lost",
@@ -558,6 +784,8 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "record_secret_resolutions",
         "record_source_field_resolution",
         "recover_expired_leases",
+        "requeue_undecided_failed_work",
+        "verify_resume_coverage",
         "register_candidate",
         "register_verified_candidate",
         "reserve",
@@ -570,8 +798,40 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "terminalize_pending_sinks_with_terminal_outcomes",
         "update_run_source_contract",
         "update_run_status",
+        "web_terminal_reconciliation",
+        "web_admission_refusal_reconciliation",
+        "run-start-reset-prepared",
+        "run-start-effects",
     }
+    member_verbs = {
+        "update_node_output_contract",
+        "expand_token",
+        "record_empty_expansion",
+        "begin_node_state",
+        "complete_node_state",
+        "record_routing_event",
+        "worker_heartbeat",
+        "depart_worker",
+        "record_readiness_check",
+        "_transition",
+        "_transition_with_ready_children",
+        "claim_ready",
+        "heartbeat_lease",
+        "enqueue_ready",
+        "enqueue_ready_claimed",
+    }
+    item_verbs = {
+        "fork_token",
+        "allocate_call_index",
+        "record_call_payload_refs",
+        "record_call",
+        "record_token_outcome",
+        "record_routing_events",
+        "record_transform_error",
+    }
+    actual_items: set[str] = set()
     actual: set[str] = set()
+    actual_members: set[str] = set()
     for parsed in iter_gate_sources(ROOT / "src/elspeth"):
         for node in ast.walk(parsed.tree):
             if not isinstance(node, ast.Call):
@@ -582,6 +842,8 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             if function_name not in {
                 "fenced_leader_transaction",
                 "fenced_member_transaction",
+                "fenced_heartbeat_transaction",
+                "fenced_item_transaction",
                 "fenced_write",
                 "_fenced_or_plain_write",
             }:
@@ -589,9 +851,149 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             for keyword in node.keywords:
                 if keyword.arg == "verb" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
                     actual.add(keyword.value.value)
+                    if function_name in {"fenced_member_transaction", "fenced_heartbeat_transaction"}:
+                        actual_members.add(keyword.value.value)
+                    if function_name == "fenced_item_transaction":
+                        actual_items.add(keyword.value.value)
     assert actual == expected
+    assert actual_members == member_verbs
+    assert actual_items == item_verbs
 
     retained_tests = {
+        "web_admission_refusal_reconciliation": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_stale_admission_refusal_leader_refuses_before_cleanup",
+        ),
+        "web_terminal_reconciliation": (
+            "tests/unit/web/execution/test_recovery_coordinator.py",
+            "test_stale_reconciliation_leader_refuses_before_projection",
+        ),
+        "run-start-reset-prepared": (
+            "tests/unit/core/landscape/test_run_start_admission.py",
+            "test_stale_leader_cannot_change_start_admission_or_setup",
+        ),
+        "run-start-effects": (
+            "tests/unit/core/landscape/test_run_start_admission.py",
+            "test_stale_leader_cannot_change_start_admission_or_setup",
+        ),
+        "allocate_call_index": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_item_cannot_allocate_or_record_calls"),
+        "fork_token": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_reclaimed_item_refuses_without_payload_mutation"),
+        "record_call": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_item_cannot_allocate_or_record_calls"),
+        "record_call_payload_refs": (
+            "tests/unit/core/landscape/test_call_recording.py",
+            "test_f10_call_payload_refs_refuse_reclaimed_item",
+        ),
+        "record_verification_decision": (
+            "tests/unit/core/landscape/test_call_mode_persistence.py",
+            "test_verification_decision_requires_current_live_leader_before_write",
+        ),
+        "record_routing_events": (
+            "tests/unit/core/landscape/test_node_state_recording.py",
+            "test_f10_routing_events_refuse_reclaimed_item",
+        ),
+        "record_token_outcome": (
+            "tests/unit/core/landscape/test_data_flow_fencing.py",
+            "test_reclaimed_item_refuses_without_payload_mutation",
+        ),
+        "record_transform_error": (
+            "tests/unit/core/landscape/test_data_flow_fencing.py",
+            "test_reclaimed_item_refuses_without_payload_mutation",
+        ),
+        "_transition": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f10_evicted_member_cannot_disposition_owned_work",
+        ),
+        "_transition_with_ready_children": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f10_evicted_member_cannot_disposition_owned_work",
+        ),
+        "allocate_operation_call_index": (
+            "tests/unit/core/landscape/test_execution_authority.py",
+            "test_stale_leader_cannot_mutate_operation",
+        ),
+        "begin_node_state": (
+            "tests/unit/core/landscape/test_execution_authority.py",
+            "test_departed_member_cannot_begin_or_complete_state",
+        ),
+        "begin_node_states_many": (
+            "tests/unit/core/landscape/test_execution_authority.py",
+            "test_stale_leader_cannot_create_execution_records",
+        ),
+        "begin_operation": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_leader_cannot_create_execution_records"),
+        "claim_pending_sink": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f06_inactive_registered_worker_cannot_claim",
+        ),
+        "claim_ready": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f06_inactive_registered_worker_cannot_claim",
+        ),
+        "coalesce_tokens": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_coalesce_materialization_is_leader_fenced"),
+        "collect_tokens": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_collector_release_is_leader_fenced"),
+        "complete_aggregation_failure": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f10_aggregation_failure_requires_current_leader",
+        ),
+        "complete_aggregation_result": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f10_aggregation_result_requires_current_leader",
+        ),
+        "complete_batch": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_leader_cannot_mutate_batch"),
+        "complete_collector_failure": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f10_collector_failure_requires_current_leader",
+        ),
+        "complete_node_state": (
+            "tests/unit/core/landscape/test_execution_authority.py",
+            "test_departed_member_cannot_begin_or_complete_state",
+        ),
+        "complete_operation": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_leader_cannot_mutate_operation"),
+        "create_batch": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_leader_cannot_create_execution_records"),
+        "create_token": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_stale_epoch_refuses_without_payload_mutation"),
+        "enqueue_ready": ("tests/unit/core/landscape/test_finalize_follower_departure.py", "test_evicted_leader_raises"),
+        "enqueue_ready_claimed": (
+            "tests/unit/core/landscape/test_coordination_fence_constructs.py",
+            "test_absent_or_evicted_identity_is_refused_with_full_zero_mutation",
+        ),
+        "expand_token": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_evicted_member_refuses_without_payload_mutation"),
+        "finalize_coalesce_effect": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_coalesce_finalization_is_leader_fenced"),
+        "record_completed_node_state": (
+            "tests/unit/core/landscape/test_execution_authority.py",
+            "test_stale_leader_cannot_create_execution_records",
+        ),
+        "record_empty_expansion": (
+            "tests/unit/core/landscape/test_data_flow_fencing.py",
+            "test_evicted_member_refuses_without_payload_mutation",
+        ),
+        "record_operation_call": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_leader_cannot_mutate_operation"),
+        "record_operation_call_payload_refs": (
+            "tests/unit/core/landscape/test_execution_authority.py",
+            "test_operation_call_rechecks_authority_after_payload_storage",
+        ),
+        "record_routing_event": (
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f10_evicted_member_cannot_record_routing_event",
+        ),
+        "record_token_outcome_leader": (
+            "tests/unit/core/landscape/test_data_flow_fencing.py",
+            "test_stale_epoch_refuses_without_payload_mutation",
+        ),
+        "record_validation_error": (
+            "tests/unit/core/landscape/test_data_flow_fencing.py",
+            "test_stale_epoch_refuses_without_payload_mutation",
+        ),
+        "register_edge": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_stale_epoch_refuses_without_payload_mutation"),
+        "register_node": ("tests/unit/core/landscape/test_data_flow_fencing.py", "test_stale_epoch_refuses_without_payload_mutation"),
+        "retry_batch": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_leader_cannot_mutate_batch"),
+        "update_batch_status": ("tests/unit/core/landscape/test_execution_authority.py", "test_stale_leader_cannot_mutate_batch"),
+        "update_grade_after_purge": (
+            "tests/unit/core/landscape/test_reproducibility.py",
+            "test_purge_grade_requires_current_export_authority",
+        ),
+        "update_node_output_contract": (
+            "tests/unit/core/landscape/test_data_flow_fencing.py",
+            "test_evicted_member_refuses_without_payload_mutation",
+        ),
         "adopt_blocked_barrier_item": (
             "tests/unit/core/landscape/test_scheduler_repository_adopt_barrier_item.py",
             "test_stale_token_refused_with_fence_refusal_and_zero_mutation",
@@ -619,6 +1021,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_ingest_woken_mid_ingest_atomic_rollback",
         ),
+        "ingest_quarantine_row_with_pending_sink": (
+            "tests/unit/core/landscape/test_quarantine_ingest.py",
+            "test_stale_leader_epoch_refuses_the_repository_verb_with_no_mutation",
+        ),
         "mark_pending_sink_terminal": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_mark_pending_sink_terminal_refused",
@@ -634,6 +1040,14 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "recover_expired_leases": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_recover_expired_leases_refused",
+        ),
+        "requeue_undecided_failed_work": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_requeue_undecided_failed_work_refused",
+        ),
+        "verify_resume_coverage": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_verify_resume_coverage_refused",
         ),
         # The audit-export registry CAS (ADR-048): its stale-token evidence
         # lives beside the export-bundle derivation machinery it needs to
@@ -668,8 +1082,8 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             "test_run_lifecycle_verb_refused",
         ),
         "record_readiness_check": (
-            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
-            "test_run_lifecycle_verb_refused",
+            "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
+            "test_f10_readiness_refuses_lost_membership",
         ),
         "record_run_source": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
@@ -776,14 +1190,26 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         assert len(matches) == 1, f"F-10 verb {verb!r} must bind one retained test function {test_name!r}"
         test_source = ast.unparse(matches[0])
         local_functions = {node.name: node for node in ast.walk(test_tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        named_matrices = {
+            target.id: node.value
+            for node in test_tree.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name) and isinstance(node.value, (ast.List, ast.Tuple))
+        }
         reachable_calls: set[str] = set()
-        pending = [matches[0]]
-        visited: set[str] = set()
+        pending: list[ast.AST] = [matches[0]]
+        visited: set[int] = set()
         while pending:
             function = pending.pop()
-            if function.name in visited:
+            if id(function) in visited:
                 continue
-            visited.add(function.name)
+            visited.add(id(function))
+            for reference in (node for node in ast.walk(function) if isinstance(node, ast.Name)):
+                if reference.id in local_functions:
+                    pending.append(local_functions[reference.id])
+                if reference.id in named_matrices:
+                    pending.append(named_matrices[reference.id])
             for call in (node for node in ast.walk(function) if isinstance(node, ast.Call)):
                 call_name = (
                     call.func.id if isinstance(call.func, ast.Name) else call.func.attr if isinstance(call.func, ast.Attribute) else None
@@ -793,14 +1219,89 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
                 reachable_calls.add(call_name)
                 if call_name in local_functions:
                     pending.append(local_functions[call_name])
-        assert verb in reachable_calls, f"F-10 test {test_name!r} no longer invokes {verb!r}, directly or through a local helper"
+        source_entry_points = {
+            "web_admission_refusal_reconciliation": (
+                "src/elspeth/web/execution/service.py",
+                "_settle_admission_refusal",
+            ),
+            "web_terminal_reconciliation": (
+                "src/elspeth/web/execution/recovery.py",
+                "_reconcile_resumable_terminal",
+            ),
+            "run-start-reset-prepared": (
+                "src/elspeth/core/landscape/run_start_admission.py",
+                "reset_prepared_initialization",
+            ),
+            "run-start-effects": (
+                "src/elspeth/core/landscape/run_start_admission.py",
+                "mark_executing",
+            ),
+            "_transition": ("src/elspeth/core/landscape/scheduler/dispositions.py", "mark_terminal"),
+            "_transition_with_ready_children": (
+                "src/elspeth/core/landscape/scheduler/dispositions.py",
+                "mark_terminal_with_ready_children",
+            ),
+            "record_operation_call_payload_refs": ("src/elspeth/core/landscape/execution/calls.py", "record_operation_call"),
+            "record_call_payload_refs": ("src/elspeth/core/landscape/execution/calls.py", "record_call"),
+        }
+        if verb in source_entry_points:
+            source_path, entry = source_entry_points[verb]
+            assert entry in reachable_calls
+            source_tree = ast.parse((ROOT / source_path).read_text())
+            methods = {node.name: node for node in ast.walk(source_tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            source_pending = [methods[entry]]
+            source_seen: set[str] = set()
+            source_verbs: set[str] = set()
+            while source_pending:
+                method = source_pending.pop()
+                if method.name in source_seen:
+                    continue
+                source_seen.add(method.name)
+                for call in (node for node in ast.walk(method) if isinstance(node, ast.Call)):
+                    if (
+                        isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "self"
+                        and call.func.attr in methods
+                    ):
+                        source_pending.append(methods[call.func.attr])
+                    for keyword in call.keywords:
+                        if keyword.arg == "verb" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
+                            source_verbs.add(keyword.value.value)
+            assert verb in source_verbs, f"{entry} no longer reaches the source fence for {verb}"
+        else:
+            assert verb in reachable_calls, f"F-10 test {test_name!r} no longer invokes {verb!r}, directly or through a local helper"
         if verb in reified_refusal_verbs:
             assert "_fence_refusals" in reachable_calls, (
                 f"F-10 test {test_name!r} no longer reads back {verb!r}'s durable fence_refusal evidence; "
                 "a verb that swallows its refusal has no other proof the fence fired"
             )
         else:
-            assert "pytest.raises(RunLeadershipLostError)" in test_source, f"F-10 test {test_name!r} no longer asserts stale-token refusal"
+            if verb in item_verbs:
+                error = "SchedulerLeaseLostError"
+            elif verb in member_verbs and verb != "heartbeat_lease":
+                error = "RunMembershipLostError"
+            else:
+                error = "RunLeadershipLostError"
+            if verb == "enqueue_ready_claimed":
+                # This matrix also covers absent registration (AuditIntegrityError).
+                assert "AuditIntegrityError if caller_status is None else RunMembershipLostError" in test_source
+                assert "pytest.raises(expected_error)" in test_source
+            else:
+                assert f"pytest.raises({error})" in test_source, f"F-10 test {test_name!r} no longer asserts {error}"
+    # The shared heartbeat verb label has a leader-scoped sink-effect writer
+    # and a member-scoped scheduler writer; retain independent refusal proof.
+    heartbeat_tree = ast.parse((ROOT / "tests/unit/core/landscape/test_coordination_fence_constructs.py").read_text())
+    heartbeat = next(
+        node
+        for node in ast.walk(heartbeat_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "test_non_active_owner_is_refused_with_zero_durable_mutation"
+    )
+    assert "pytest.raises(RunMembershipLostError)" in ast.unparse(heartbeat)
+    assert any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "heartbeat_lease"
+        for node in ast.walk(heartbeat)
+    )
 
 
 def test_f12_waiting_state_is_rejected_by_storage_without_mutation(harness: _Harness) -> None:
@@ -842,3 +1343,198 @@ def test_f12_waiting_is_unreachable_from_scheduler_and_restore_code() -> None:
                 if isinstance(node, ast.Attribute) and node.attr == "WAITING":
                     offenders.append(f"{file_path.relative_to(ROOT)}:{node.lineno}:attribute")
     assert offenders == []
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["current-leader", "stale-leader"])
+def test_f10_aggregation_result_requires_current_leader(harness: _Harness, stale: bool) -> None:
+    register_test_node(harness.factory.data_flow, RUN_ID, "aggregation-1", node_type=NodeType.AGGREGATION)
+    _, token_id, _ = _enqueue(harness, "aggregation-member", 0)
+    execution = harness.factory.execution
+    state = execution.begin_node_state(token_id, "aggregation-1", 1, {"value": 1}, member_token=harness.coordination_token.membership)
+    batch = execution.create_batch("aggregation-1", coordination_token=harness.coordination_token)
+    with fenced_leader_transaction(
+        harness.db.engine, token=harness.coordination_token, window_seconds=300, verb="test_aggregation_receipt_setup"
+    ) as conn:
+        add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token_id, ordinal=0, expected_run_id=RUN_ID)
+        record_buffered_outcome_guarded(conn, run_id=RUN_ID, token_id=token_id, batch_id=batch.batch_id, recorded_at=datetime.now(UTC))
+    execution.update_batch_status(
+        batch.batch_id, BatchStatus.EXECUTING, state_id=state.state_id, coordination_token=harness.coordination_token
+    )
+    context = AggregationFlushContext(
+        trigger_type=TriggerType.END_OF_SOURCE.value,
+        buffer_size=1,
+        batch_id=batch.batch_id,
+        flush_index=1,
+        rows_seen_total=1,
+        row_start=1,
+        row_end=1,
+        is_end_of_source=True,
+    )
+    members = (AggregationResultMember(TokenRef(token_id=token_id, run_id=RUN_ID), AggregationMemberAction.DROP_FILTERED),)
+    if stale:
+        before = _depose_leader(harness)
+        with pytest.raises(RunLeadershipLostError) as raised:
+            execution.complete_aggregation_result(
+                batch_id=batch.batch_id,
+                coordination_token=harness.coordination_token,
+                aggregation_node_id="aggregation-1",
+                state_id=state.state_id,
+                trigger_type=TriggerType.END_OF_SOURCE,
+                output_mode=OutputMode.TRANSFORM,
+                output_rows=(),
+                output_shape="empty",
+                output_hash=stable_hash([]),
+                members=members,
+                expansion_parent_token_id=None,
+                duration_ms=1.0,
+                success_reason=None,
+                context_after=context,
+            )
+        assert raised.value.verb == "complete_aggregation_result"
+        _assert_only_fence_refusal(harness, before, verb="complete_aggregation_result")
+    else:
+        receipt = execution.complete_aggregation_result(
+            batch_id=batch.batch_id,
+            coordination_token=harness.coordination_token,
+            aggregation_node_id="aggregation-1",
+            state_id=state.state_id,
+            trigger_type=TriggerType.END_OF_SOURCE,
+            output_mode=OutputMode.TRANSFORM,
+            output_rows=(),
+            output_shape="empty",
+            output_hash=stable_hash([]),
+            members=members,
+            expansion_parent_token_id=None,
+            duration_ms=1.0,
+            success_reason=None,
+            context_after=context,
+        )
+        assert receipt.batch_id == batch.batch_id
+        assert receipt.members == members
+        completed_state = execution.get_node_state(state.state_id)
+        completed_batch = execution.get_batch(batch.batch_id)
+        assert completed_state is not None and completed_state.status is NodeStateStatus.COMPLETED
+        assert completed_batch is not None and completed_batch.status is BatchStatus.COMPLETED
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["current-leader", "stale-leader"])
+def test_f10_aggregation_failure_requires_current_leader(harness: _Harness, stale: bool) -> None:
+    """A batch's FAILED verdict (transform_errors + state + batch, one transaction) needs the current leader."""
+    register_test_node(harness.factory.data_flow, RUN_ID, "aggregation-1", node_type=NodeType.AGGREGATION)
+    _, token_id, _ = _enqueue(harness, "aggregation-member", 0)
+    execution = harness.factory.execution
+    state = execution.begin_node_state(token_id, "aggregation-1", 1, {"value": 1}, member_token=harness.coordination_token.membership)
+    batch = execution.create_batch("aggregation-1", coordination_token=harness.coordination_token)
+    with fenced_leader_transaction(
+        harness.db.engine, token=harness.coordination_token, window_seconds=300, verb="test_aggregation_failure_setup"
+    ) as conn:
+        add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token_id, ordinal=0, expected_run_id=RUN_ID)
+        record_buffered_outcome_guarded(conn, run_id=RUN_ID, token_id=token_id, batch_id=batch.batch_id, recorded_at=datetime.now(UTC))
+    execution.update_batch_status(batch.batch_id, BatchStatus.EXECUTING, coordination_token=harness.coordination_token)
+
+    def record_verdict() -> None:
+        execution.complete_aggregation_failure(
+            batch_id=batch.batch_id,
+            coordination_token=harness.coordination_token,
+            aggregation_node_id="aggregation-1",
+            state_id=state.state_id,
+            trigger_type=TriggerType.END_OF_SOURCE,
+            members=((TokenRef(token_id=token_id, run_id=RUN_ID), make_pipeline_row({"value": 1})),),
+            reason={"reason": "batch_failed", "error": "flush failed"},
+            destination="discard",
+            divert_edge_id=None,
+            duration_ms=1.0,
+        )
+
+    if stale:
+        before = _depose_leader(harness)
+        with pytest.raises(RunLeadershipLostError) as raised:
+            record_verdict()
+        assert raised.value.verb == "complete_aggregation_failure"
+        _assert_only_fence_refusal(harness, before, verb="complete_aggregation_failure")
+    else:
+        record_verdict()
+        failed_state = execution.get_node_state(state.state_id)
+        failed_batch = execution.get_batch(batch.batch_id)
+        assert failed_state is not None and failed_state.status is NodeStateStatus.FAILED
+        assert failed_batch is not None and failed_batch.status is BatchStatus.FAILED
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["current-leader", "stale-leader"])
+def test_f10_collector_failure_requires_current_leader(harness: _Harness, stale: bool) -> None:
+    """A collector group's FAILED verdict (flush state + every member hold, one transaction) needs the current leader."""
+    register_test_node(harness.factory.data_flow, RUN_ID, "collector-1", node_type=NodeType.COLLECTOR)
+    execution = harness.factory.execution
+    member = harness.coordination_token.membership
+    _, opener_id, _ = _enqueue(harness, "collector-opener", 0)
+    _, first_id, _ = _enqueue(harness, "collector-member-a", 1)
+    _, second_id, _ = _enqueue(harness, "collector-member-b", 2)
+    with harness.db.engine.begin() as conn:
+        conn.execute(
+            insert(group_records_table).values(
+                run_id=RUN_ID,
+                group_id="g-1",
+                kind=FrameKind.EXPAND.value,
+                opener_token_id=opener_id,
+                member_count=2,
+                created_at=NOW,
+            )
+        )
+    flush = execution.begin_node_state(opener_id, "collector-1", 1, {"batch_rows": []}, member_token=member)
+    holds = [
+        execution.begin_node_state(token_id, "collector-1", 1, {"value": 1}, member_token=member) for token_id in (first_id, second_id)
+    ]
+    hold_error = collector_group_failure_hold_error(
+        group_id="g-1", failure_reason=CollectorGroupFailureReason.COLLECTOR_TRANSFORM_ERROR, lost_members=()
+    )
+
+    def record_verdict() -> None:
+        execution.complete_collector_failure(
+            coordination_token=harness.coordination_token,
+            group_id="g-1",
+            collector_node_id="collector-1",
+            failure_reason=CollectorGroupFailureReason.COLLECTOR_TRANSFORM_ERROR,
+            flush_state_id=flush.state_id,
+            flush_error=ExecutionError(exception="{'reason': 'deliberate'}", exception_type="TransformError"),
+            flush_duration_ms=1.0,
+            member_holds=tuple(
+                (TokenRef(token_id=token_id, run_id=RUN_ID), hold.state_id, 1.0)
+                for token_id, hold in zip((first_id, second_id), holds, strict=True)
+            ),
+            hold_error=hold_error,
+        )
+
+    if stale:
+        before = _depose_leader(harness)
+        with pytest.raises(RunLeadershipLostError) as raised:
+            record_verdict()
+        assert raised.value.verb == "complete_collector_failure"
+        _assert_only_fence_refusal(harness, before, verb="complete_collector_failure")
+    else:
+        record_verdict()
+        for state_id in (flush.state_id, *(hold.state_id for hold in holds)):
+            failed = execution.get_node_state(state_id)
+            assert failed is not None and failed.status is NodeStateStatus.FAILED
+
+
+@pytest.mark.parametrize("status", ["departed", "evicted"])
+def test_f10_readiness_refuses_lost_membership(harness: _Harness, status: str) -> None:
+    member = harness.coordination_token.membership
+    with harness.db.engine.begin() as conn:
+        conn.execute(
+            update(run_workers_table)
+            .where(run_workers_table.c.worker_id == member.worker_id)
+            .values(status=status, evicted_at=datetime.now(UTC) if status == "evicted" else None)
+        )
+    before = capture_state_engine_image(harness.db, run_id=RUN_ID)
+    with pytest.raises(RunMembershipLostError) as raised:
+        harness.factory.run_lifecycle.record_readiness_check(
+            member_token=member,
+            name="search",
+            collection="documents",
+            reachable=True,
+            count=2,
+            message="ready",
+        )
+    assert raised.value.verb == "record_readiness_check"
+    _assert_only_fence_refusal(harness, before, verb="record_readiness_check", membership=True)

@@ -8,10 +8,8 @@ Covers all branches per the spec:
 
 from __future__ import annotations
 
-from elspeth.plugins.infrastructure.clients.json_utils import (
-    contains_non_finite,
-    parse_json_strict,
-)
+from elspeth.contracts.json_parser import parse_json_strict
+from elspeth.plugins.infrastructure.clients.json_utils import contains_non_finite
 
 
 class TestContainsNonFinite:
@@ -172,6 +170,11 @@ class TestParseJsonStrict:
         assert parsed is None
         assert error is not None
         assert "Duplicate" in error
+
+    def test_excessive_nesting_returns_parse_error(self) -> None:
+        parsed, error = parse_json_strict("[" * 10_000 + "0" + "]" * 10_000)
+        assert parsed is None
+        assert error is not None
 
     def test_unique_keys_still_accepted(self) -> None:
         """Normal JSON with unique keys still parses fine (regression check)."""

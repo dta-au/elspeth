@@ -16,11 +16,13 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from elspeth.plugins.infrastructure.templates import ALL_FIELDS, DeclaredFields
 from elspeth.plugins.transforms.llm.multi_query import (
     OutputFieldConfig,
     OutputFieldType,
     QuerySpec,
 )
+from elspeth.testing import make_pipeline_row
 
 # =============================================================================
 # Strategies
@@ -126,7 +128,7 @@ class TestQuerySpecContextProperties:
         values = data.draw(st.lists(string_values, min_size=n_fields, max_size=n_fields))
 
         # Build row from column_names -> values
-        row = dict(zip(column_names, values, strict=False))
+        row = make_pipeline_row(dict(zip(column_names, values, strict=False)))
 
         # Build input_fields mapping: template_var -> column_name
         input_fields = dict(zip(template_vars, column_names, strict=False))
@@ -136,7 +138,7 @@ class TestQuerySpecContextProperties:
             input_fields=MappingProxyType(input_fields),
         )
 
-        ctx = spec.build_template_context(row)
+        ctx = spec.build_template_context(row, ALL_FIELDS)
 
         # Each template variable should map to the correct row value
         for template_var, column_name in input_fields.items():
@@ -146,18 +148,23 @@ class TestQuerySpecContextProperties:
     @given(data=st.data())
     @settings(max_examples=50)
     def test_context_includes_source_row(self, data: st.DataObject) -> None:
-        """Property: Context['source_row'] contains the full original row."""
+        """Property: Context['source_row'] is the row projected to the declaration (ADR-051).
+
+        ``[]`` (ALL_FIELDS) keeps the whole row; a declared list keeps exactly
+        the declared columns the row carries.
+        """
         column_name = data.draw(field_names)
+        other = data.draw(field_names.filter(lambda name: name != column_name))
         value = data.draw(string_values)
-        row = {column_name: value}
+        row = make_pipeline_row({column_name: value, other: "undeclared"})
 
         spec = QuerySpec(
             name="test_query",
             input_fields=MappingProxyType({"var": column_name}),
         )
 
-        ctx = spec.build_template_context(row)
-        assert ctx["source_row"] == row
+        assert dict(spec.build_template_context(row, ALL_FIELDS)["source_row"]) == {column_name: value, other: "undeclared"}
+        assert dict(spec.build_template_context(row, DeclaredFields(frozenset({column_name})))["source_row"]) == {column_name: value}
 
     def test_missing_column_raises_key_error(self) -> None:
         """Property: Missing row column raises KeyError."""
@@ -167,7 +174,7 @@ class TestQuerySpecContextProperties:
         )
 
         with pytest.raises(KeyError):
-            spec.build_template_context({"other_field": "value"})
+            spec.build_template_context(make_pipeline_row({"other_field": "value"}), ALL_FIELDS)
 
     @given(
         n_fields=st.integers(min_value=1, max_value=5),
@@ -178,7 +185,7 @@ class TestQuerySpecContextProperties:
         """Property: Context has named variables and source_row only."""
         template_vars = data.draw(st.lists(field_names, min_size=n_fields, max_size=n_fields, unique=True))
         column_names = data.draw(st.lists(field_names, min_size=n_fields, max_size=n_fields, unique=True))
-        row = dict.fromkeys(column_names, "v")
+        row = make_pipeline_row(dict.fromkeys(column_names, "v"))
 
         input_fields = dict(zip(template_vars, column_names, strict=False))
 
@@ -187,7 +194,7 @@ class TestQuerySpecContextProperties:
             input_fields=MappingProxyType(input_fields),
         )
 
-        ctx = spec.build_template_context(row)
+        ctx = spec.build_template_context(row, ALL_FIELDS)
 
         expected_keys = set(template_vars) | {"source_row"}
         assert set(ctx.keys()) == expected_keys

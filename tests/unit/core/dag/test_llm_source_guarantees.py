@@ -10,9 +10,12 @@ The composer's raw-level guarantee synthesis
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 from elspeth.contracts.schema import SchemaConfig, get_raw_producer_guaranteed_fields
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.config import SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.guarantees import get_effective_guaranteed_fields
@@ -39,6 +42,23 @@ def _llm_source_options(**overrides: Any) -> dict[str, Any]:
 class _UsageConsumerTransform:
     """Stub consumer requiring one of the LLM source's guaranteed metadata fields."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     name = "usage_consumer"
     input_schema = None
     output_schema = None
@@ -50,6 +70,8 @@ class _UsageConsumerTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         self.config: dict[str, Any] = {
@@ -61,6 +83,12 @@ class _UsageConsumerTransform:
 
 class _CollectorSink:
     name = "collector"
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     input_schema = None
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_write_failure = "discard"

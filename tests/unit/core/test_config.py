@@ -13,6 +13,7 @@ from pydantic import BaseModel, ValidationError
 def _complete_audit_export_config(**overrides: object) -> dict[str, object]:
     config: dict[str, object] = {
         "enabled": True,
+        "compartment_id": "test-compartment",
         "sink": "audit_archive",
         "format": "csv",
         "signing_mode": "unsigned",
@@ -530,6 +531,20 @@ class TestLandscapeExportSettings:
         assert settings.export.enabled is False
         assert settings.export.format == "csv"
         assert settings.export.sign is False
+        assert settings.export.serialization_version == "audit-export-v3"
+
+    @pytest.mark.parametrize("version", ["audit-export-v2", "audit-export-v4"])
+    def test_landscape_export_rejects_unsupported_serialization(self, version: str) -> None:
+        from elspeth.core.config import LandscapeExportSettings
+
+        with pytest.raises(ValidationError, match="serialization_version"):
+            LandscapeExportSettings(serialization_version=version)
+
+    def test_landscape_export_accepts_current_serialization(self) -> None:
+        from elspeth.core.config import LandscapeExportSettings
+
+        settings = LandscapeExportSettings(serialization_version="audit-export-v3")
+        assert settings.serialization_version == "audit-export-v3"
 
     def test_landscape_export_config_with_sink(self) -> None:
         """Export config should accept sink reference."""
@@ -5875,3 +5890,20 @@ class TestLoadSettingsYamlDocumentShape:
         config_file.write_text(doc)
         with pytest.raises(ValueError, match="must be a YAML mapping"):
             load_settings(config_file)
+
+
+def test_web_scrape_auth_requires_exact_env_reference_for_file_settings(tmp_path: Path) -> None:
+    from elspeth.config_loading import _reject_web_scrape_auth_literal, load_settings
+
+    base = {"transforms": [{"plugin": "web_scrape", "options": {"auth": {"credential": "literal-token"}}}]}
+    with pytest.raises(ValueError, match=r"web_scrape auth\.credential must be an exact environment secret reference"):
+        _reject_web_scrape_auth_literal(base)
+    config_path = tmp_path / "settings.yaml"
+    config_path.write_text("transforms:\n  - plugin: web_scrape\n    options:\n      auth:\n        credential: literal-token\n")
+    with pytest.raises(ValueError, match=r"web_scrape auth\.credential must be an exact environment secret reference"):
+        load_settings(config_path)
+    base["transforms"][0]["options"]["auth"]["credential"] = "${WEB_SEARCH_TOKEN}"
+    _reject_web_scrape_auth_literal(base)
+    base["transforms"][0]["options"]["auth"]["credential"] = "${WEB_SEARCH_TOKEN:-fallback}"
+    with pytest.raises(ValueError, match="exact environment secret reference"):
+        _reject_web_scrape_auth_literal(base)

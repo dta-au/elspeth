@@ -18,10 +18,11 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.canonical import stable_hash
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobNotFoundError, BlobRecord
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.sessions.engine import create_session_engine
@@ -31,11 +32,14 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     sessions_table,
 )
+from elspeth.web.sessions.proposal_authority import _pipeline_private_arguments_hash
+from elspeth.web.sessions.proposal_projection import project_composition_proposal
 from elspeth.web.sessions.protocol import CompositionStateData, ProposalStateConflictError
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.fixtures.identities import ensure_test_identity
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -46,12 +50,14 @@ def engine():
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return eng
 
 
 @pytest.fixture
 def service(engine):
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -60,6 +66,7 @@ def service(engine):
 
 def _insert_session(conn, session_id: str) -> None:
     created_at = datetime.now(UTC)
+    ensure_test_identity(conn, identity_id="alice")
     conn.execute(
         insert(sessions_table).values(
             id=session_id,
@@ -165,12 +172,8 @@ def _pipeline_plan_result(
     proposal = PipelineProposal.create(
         pipeline=pipeline if pipeline is not None else {"sources": {}, "nodes": [], "edges": [], "outputs": []},
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
     return PipelinePlanResult(
         proposal=proposal,
@@ -216,6 +219,33 @@ def _row_union_pipeline(branch_order: tuple[str, ...]) -> dict[str, object]:
     }
 
 
+def _coalesce_pipeline(branch_order: tuple[str, ...]) -> dict[str, object]:
+    connections = {
+        "a": "a_in",
+        "b": "b_in",
+        "c": "c_in",
+    }
+    return {
+        "source": {"plugin": "csv", "on_success": "rows", "options": {"path": "cases.csv"}, "on_validation_failure": "discard"},
+        "nodes": [
+            {
+                "id": "merge",
+                "node_type": "coalesce",
+                "plugin": None,
+                "input": "a_in",
+                "on_success": "merge_out",
+                "on_error": None,
+                "options": {},
+                "branches": {alias: connections[alias] for alias in branch_order},
+                "policy": "require_all",
+                "merge": "union",
+            }
+        ],
+        "edges": [],
+        "outputs": [],
+    }
+
+
 def test_session_preferences_columns_exist(engine) -> None:
     columns = {column["name"] for column in inspect(engine).get_columns("sessions")}
     assert {"trust_mode", "density_default", "interpretation_review_disabled"} <= columns
@@ -253,7 +283,8 @@ def test_composition_proposal_status_is_closed(engine) -> None:
             )
 
 
-def test_proposal_event_type_is_closed(engine) -> None:
+@pytest.mark.parametrize("event_type", ["proposal.maybe", "proposal.rebased"])
+def test_proposal_event_type_is_closed(engine, event_type: str) -> None:
     session_id = str(uuid4())
     with engine.begin() as conn:
         _insert_session(conn, session_id)
@@ -263,7 +294,7 @@ def test_proposal_event_type_is_closed(engine) -> None:
                     id=str(uuid4()),
                     session_id=session_id,
                     proposal_id=None,
-                    event_type="proposal.maybe",
+                    event_type=event_type,
                     actor="user:alice",
                     payload={"status": "unknown"},
                     created_at=datetime.now(UTC),
@@ -445,17 +476,22 @@ async def test_three_field_proposal_created_event_is_rejected_not_compatibly_rea
         await service.get_authoritative_composition_proposal(
             session_id=session_id,
             proposal_id=proposal.id,
-            reviewed_facts=None,
         )
 
 
 @pytest.mark.asyncio
-async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_restores(service) -> None:
+@pytest.mark.parametrize("inline_presence", ["absent", "null"])
+async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_restores(service, inline_presence) -> None:
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    plan = _pipeline_plan_result()
-    public_arguments = _pipeline_public_arguments()
+    source = {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"}
+    if inline_presence == "null":
+        source["inline_blob"] = None
+    pipeline = {"source": source, "nodes": [], "edges": [], "outputs": []}
+    plan = _pipeline_plan_result(pipeline=pipeline)
+    public_arguments = redact_tool_call_arguments("set_pipeline", pipeline, telemetry=NoopRedactionTelemetry())
+    assert ("inline_blob" in public_arguments["source"]) is (inline_presence == "null")
 
     async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
         row = await service.create_pipeline_composition_proposal(
@@ -478,6 +514,18 @@ async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_r
     assert row.tool_arguments_hash == stable_hash(plan.proposal.pipeline)
     assert row.pipeline_metadata is not None
     assert row.pipeline_metadata.draft_hash == plan.proposal.draft_hash
+    projected = project_composition_proposal(row)
+    assert projected.pipeline_metadata is not None
+    assert projected.pipeline_metadata.model_dump() == {
+        "draft_hash": row.pipeline_metadata.draft_hash,
+        "base": deep_thaw(row.pipeline_metadata.base),
+        "repair_count": row.pipeline_metadata.repair_count,
+        "skill_hash": row.pipeline_metadata.skill_hash,
+        "audit_payload_hash": row.pipeline_metadata.audit_payload_hash,
+        "custody_result": row.pipeline_metadata.custody_result,
+    }
+    assert not hasattr(row.pipeline_metadata, "surface")
+    assert not hasattr(row.pipeline_metadata, "reviewed_anchor_hash")
     events = await service.list_proposal_events(session_id)
     assert len(events) == 1
     assert set(events[0].payload) == {
@@ -485,32 +533,27 @@ async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_r
         "tool_call_id",
         "tool_name",
         "status",
-        "surface",
         "draft_hash",
         "base",
-        "reviewed_anchor_hash",
         "repair_count",
         "skill_hash",
-        "covered_deferred_intent_ids",
-        "supersedes_draft_hash",
-        "supersedes_proposal_id",
         "custody_result",
         "private_arguments_hash",
         "provenance_hash",
         "audit_payload_hash",
     }
-    assert events[0].payload["schema"] == "pipeline_proposal_created.v1"
+    assert events[0].payload["schema"] == "pipeline_proposal_created.v2"
     assert events[0].payload["base"] == {"kind": "absent"}
 
     restored = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
-        reviewed_facts={},
     )
     assert restored.row == row
+    assert ("inline_blob" in restored.row.arguments_redacted_json["source"]) is (inline_presence == "null")
     assert restored.proposal == plan.proposal
     assert restored.custody_result == "not_required"
-    assert restored.supersedes_proposal_id is None
+    assert not hasattr(restored, "supersedes_proposal_id")
 
 
 @pytest.mark.asyncio
@@ -550,7 +593,74 @@ async def test_authoritative_pipeline_restore_rejects_non_first_row_union_order_
         await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
             proposal_id=row.id,
-            reviewed_facts={},
+        )
+
+
+async def _create_coalesce_proposal(service, session_id: UUID, pipeline: dict[str, object]):
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        return await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=_pipeline_plan_result(pipeline=pipeline),
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_redacted_json=redact_tool_call_arguments("set_pipeline", pipeline, telemetry=NoopRedactionTelemetry()),
+            actor="composer-web:user-alice",
+            composer_model_identifier="planner-model",
+            composer_model_version="planner-model-v1",
+            composer_provider="provider",
+            session_operation_context=context,
+        )
+
+
+@pytest.mark.asyncio
+async def test_authoritative_pipeline_restore_rejects_non_first_coalesce_order_tampering(service) -> None:
+    """A row-only reorder of coalesce map branches is caught by the first re-derived binding.
+
+    ``_pipeline_private_arguments_hash`` is checked before the row's
+    ``tool_arguments_hash``, and both go through the authority projection.
+    """
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    row = await _create_coalesce_proposal(service, session_id, _coalesce_pipeline(("a", "b", "c")))
+
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(composition_proposals_table)
+            .where(composition_proposals_table.c.id == str(row.id))
+            .values(arguments_json=_coalesce_pipeline(("a", "c", "b")))
+        )
+
+    with pytest.raises(AuditIntegrityError, match="private arguments binding mismatch"):
+        await service.get_authoritative_pipeline_proposal(
+            session_id=session_id,
+            proposal_id=row.id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_authoritative_pipeline_restore_rejects_coalesce_reorder_against_the_row_tool_arguments_hash(service) -> None:
+    """With the event's private-arguments hash re-sealed, the row ``tool_arguments_hash`` still binds order."""
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    row = await _create_coalesce_proposal(service, session_id, _coalesce_pipeline(("a", "b", "c")))
+    tampered = _coalesce_pipeline(("a", "c", "b"))
+
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(composition_proposals_table).where(composition_proposals_table.c.id == str(row.id)).values(arguments_json=tampered)
+        )
+        event = conn.execute(select(proposal_events_table).where(proposal_events_table.c.proposal_id == str(row.id))).one()
+        payload = dict(event.payload)
+        payload["private_arguments_hash"] = _pipeline_private_arguments_hash(tampered)
+        conn.execute(update(proposal_events_table).where(proposal_events_table.c.id == event.id).values(payload=payload))
+
+    with pytest.raises(AuditIntegrityError, match="pipeline proposal row arguments hash mismatch"):
+        await service.get_authoritative_pipeline_proposal(
+            session_id=session_id,
+            proposal_id=row.id,
         )
 
 
@@ -564,14 +674,11 @@ async def test_authoritative_pipeline_restore_rejects_non_first_row_union_order_
         ("row_rationale", "tampered rationale"),
         ("row_affects", ["tampered"]),
         ("row_provenance", "tampered-provider"),
-        ("event_surface", "guided_full"),
         ("event_draft_hash", "0" * 64),
-        ("event_base", {"kind": "present", "state_id": str(uuid4()), "composition_content_hash": "0" * 64}),
-        ("event_anchor", "0" * 64),
+        ("event_base", {"kind": "present", "state_id": "00000000-0000-4000-8000-000000000001", "composition_content_hash": "0" * 64}),
         ("event_repair_count", 1),
         ("event_skill_hash", "0" * 64),
-        ("event_covered_ids", [str(uuid4())]),
-        ("event_supersedes_hash", "0" * 64),
+        ("event_unexpected_field", "unexpected"),
         ("event_custody", "created"),
         ("event_private_hash", "0" * 64),
         ("event_provenance_hash", "0" * 64),
@@ -632,14 +739,11 @@ async def test_authoritative_pipeline_restore_rejects_every_tampered_binding(ser
             event = conn.execute(select(proposal_events_table).where(proposal_events_table.c.proposal_id == str(row.id))).one()
             payload = dict(event.payload)
             field = {
-                "event_surface": "surface",
                 "event_draft_hash": "draft_hash",
                 "event_base": "base",
-                "event_anchor": "reviewed_anchor_hash",
                 "event_repair_count": "repair_count",
                 "event_skill_hash": "skill_hash",
-                "event_covered_ids": "covered_deferred_intent_ids",
-                "event_supersedes_hash": "supersedes_draft_hash",
+                "event_unexpected_field": "unexpected_authority_field",
                 "event_custody": "custody_result",
                 "event_private_hash": "private_arguments_hash",
                 "event_provenance_hash": "provenance_hash",
@@ -652,7 +756,6 @@ async def test_authoritative_pipeline_restore_rejects_every_tampered_binding(ser
         await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
             proposal_id=row.id,
-            reviewed_facts={},
         )
 
 
@@ -686,7 +789,6 @@ async def test_authoritative_pipeline_restore_requires_one_same_session_creation
         await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
             proposal_id=row.id,
-            reviewed_facts={},
         )
     assert row.audit_event_id is not None
     with service._engine.begin() as conn:
@@ -696,13 +798,12 @@ async def test_authoritative_pipeline_restore_requires_one_same_session_creation
             .values(audit_event_id=str(row.audit_event_id))
         )
 
-    restored = await service.get_authoritative_pipeline_proposal(session_id=session_id, proposal_id=row.id, reviewed_facts={})
+    restored = await service.get_authoritative_pipeline_proposal(session_id=session_id, proposal_id=row.id)
     assert restored.proposal == _pipeline_plan_result().proposal
     with pytest.raises(KeyError):
         await service.get_authoritative_pipeline_proposal(
             session_id=other_session_id,
             proposal_id=row.id,
-            reviewed_facts={},
         )
 
     with service._engine.begin() as conn:
@@ -723,7 +824,6 @@ async def test_authoritative_pipeline_restore_requires_one_same_session_creation
         await service.get_authoritative_pipeline_proposal(
             session_id=session_id,
             proposal_id=row.id,
-            reviewed_facts={},
         )
 
 
@@ -858,9 +958,9 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
             )
 
         if winner == "proposal":
-            from elspeth.web.sessions import service as service_module
+            from elspeth.web.sessions import mutation_capabilities
 
-            original_validate = service_module.validate_proposal_blob_references
+            original_validate = mutation_capabilities.validate_proposal_blob_references
 
             def blocked_validate(*args, **kwargs):
                 entered.set()
@@ -868,9 +968,9 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
                     raise AssertionError("proposal race barrier timed out")
                 return original_validate(*args, **kwargs)
 
-            monkeypatch.setattr(service_module, "validate_proposal_blob_references", blocked_validate)
+            monkeypatch.setattr(mutation_capabilities, "validate_proposal_blob_references", blocked_validate)
             proposal_task = asyncio.create_task(create_proposal())
-            assert await asyncio.to_thread(entered.wait, 5)
+            assert await run_sync_in_worker(entered.wait, 5)
             delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
             await asyncio.sleep(0)
             release.set()
@@ -882,9 +982,9 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
             assert await blob_service.get_blob(blob.id, session_operation_context=context) == blob
             return
 
-        from elspeth.web.blobs import service as blob_service_module
+        from elspeth.web.coordination import repository as coordination_repository
 
-        original_pending = blob_service_module.pending_proposal_reference_id
+        original_pending = coordination_repository.pending_proposal_reference_id
 
         def blocked_pending(*args, **kwargs):
             entered.set()
@@ -892,9 +992,9 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
                 raise AssertionError("delete race barrier timed out")
             return original_pending(*args, **kwargs)
 
-        monkeypatch.setattr(blob_service_module, "pending_proposal_reference_id", blocked_pending)
+        monkeypatch.setattr(coordination_repository, "pending_proposal_reference_id", blocked_pending)
         delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
-        assert await asyncio.to_thread(entered.wait, 5)
+        assert await run_sync_in_worker(entered.wait, 5)
         proposal_task = asyncio.create_task(create_proposal())
         await asyncio.sleep(0)
         release.set()
@@ -908,14 +1008,8 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_reject_composition_proposal_raises_conflict_only_for_a_terminal_row(service) -> None:
-    """Pin the raise contract the route-level auto-reject sentinel depends on.
-
-    A missing row is ``KeyError`` (corruption of our own data, never
-    swallowed); a row that exists but is no longer pending is
-    ``ProposalStateConflictError``, the benign status race the accept route
-    suppresses before surfacing the validation failure as 422.
-    """
+async def test_reject_composition_proposal_exact_replay_and_conflicting_actor(service) -> None:
+    """An exact retry returns the original receipt; another actor conflicts."""
     session_id = (await service.create_session("alice", "Reject contract", "local")).id
     async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
         proposal = await service.create_composition_proposal(
@@ -947,16 +1041,37 @@ async def test_reject_composition_proposal_raises_conflict_only_for_a_terminal_r
             session_operation_context=context,
         )
         assert rejected.status == "rejected"
+        replayed = await service.reject_composition_proposal(
+            session_id=session_id,
+            proposal_id=proposal.id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+        assert replayed == rejected
         with pytest.raises(ProposalStateConflictError, match="must be pending to reject; got 'rejected'"):
+            await service.reject_composition_proposal(
+                session_id=session_id,
+                proposal_id=proposal.id,
+                actor="system:auto_reject_validation_failed:user:alice",
+                session_operation_context=context,
+            )
+
+    events = await service.list_proposal_events(session_id)
+    assert [event.event_type for event in events] == ["proposal.created", "proposal.rejected"]
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(proposal_events_table)
+            .where(proposal_events_table.c.id == str(rejected.audit_event_id))
+            .values(payload={"status": "tampered"})
+        )
+    async with _session_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as context:
+        with pytest.raises(AuditIntegrityError, match="terminal binding mismatch"):
             await service.reject_composition_proposal(
                 session_id=session_id,
                 proposal_id=proposal.id,
                 actor="user:alice",
                 session_operation_context=context,
             )
-
-    events = await service.list_proposal_events(session_id)
-    assert [event.event_type for event in events] == ["proposal.created", "proposal.rejected"]
 
 
 @pytest.mark.asyncio

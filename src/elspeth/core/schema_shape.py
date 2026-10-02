@@ -38,6 +38,14 @@ from sqlalchemy.sql.schema import Constraint, Table
 from elspeth.contracts.trust_boundary import trust_boundary
 
 if TYPE_CHECKING:
+    from sqlalchemy.engine.interfaces import (
+        ReflectedCheckConstraint,
+        ReflectedColumn,
+        ReflectedForeignKeyConstraint,
+        ReflectedIndex,
+        ReflectedPrimaryKeyConstraint,
+        ReflectedUniqueConstraint,
+    )
     from sqlalchemy.sql.ddl import ExecutableDDLElement
 
 
@@ -611,20 +619,32 @@ def collect_metadata_shape_issues(
     """
 
     issues: list[SchemaShapeIssue] = []
+    table_names = sorted({metadata.tables[name].name for name in present_tables if name in metadata.tables})
+    # Reflect each object family once for this validation. Per-table queries
+    # multiply network roundtrips and can exhaust the readiness deadline even
+    # on a healthy database. These snapshots live only for this invocation;
+    # the next probe reflects again, including changes made after startup.
+    columns = inspector.get_multi_columns(filter_names=table_names) if table_names else {}
+    primary_keys = inspector.get_multi_pk_constraint(filter_names=table_names) if table_names else {}
+    foreign_keys = inspector.get_multi_foreign_keys(filter_names=table_names) if table_names else {}
+    checks = inspector.get_multi_check_constraints(filter_names=table_names) if table_names else {}
+    unique_constraints = inspector.get_multi_unique_constraints(filter_names=table_names) if table_names else {}
+    indexes = inspector.get_multi_indexes(filter_names=table_names) if table_names else {}
     text_builtin_proof = _proven_pg_catalog_text_builtin_calls(inspector, dialect)
     for table_name in sorted(present_tables):
         if table_name not in metadata.tables:
             issues.append(SchemaShapeIssue(f"{table_name} metadata table mismatch", "declared table", "missing"))
             continue
         table = metadata.tables[table_name]
-        _collect_column_issues(issues, inspector, table, dialect)
+        key = (None, table.name)
+        _collect_column_issues(issues, columns[key], primary_keys[key], table, dialect)
         _collect_sqlite_table_option_issues(issues, inspector, table, dialect)
-        _collect_foreign_key_issues(issues, inspector, table, dialect)
-        _collect_check_issues(issues, inspector, table, dialect, text_builtin_proof)
-        _collect_unique_constraint_issues(issues, inspector, table, dialect)
+        _collect_foreign_key_issues(issues, foreign_keys[key], table, dialect)
+        _collect_check_issues(issues, checks[key], table, dialect, text_builtin_proof)
+        _collect_unique_constraint_issues(issues, unique_constraints[key], table, dialect)
         _collect_index_issues(
             issues,
-            inspector,
+            indexes[key],
             table,
             dialect,
             text_builtin_proof=text_builtin_proof,
@@ -875,18 +895,17 @@ def _text_builtin_identity_rows_on_connection(connection: Connection) -> list[An
 
 def _collect_column_issues(
     issues: list[SchemaShapeIssue],
-    inspector: Inspector,
+    inspected_columns: Sequence[ReflectedColumn],
+    pk: ReflectedPrimaryKeyConstraint,
     table: Table,
     dialect: Dialect,
 ) -> None:
     table_name = table.name
-    inspected_columns = inspector.get_columns(table_name)
     expected_names = tuple(column.name for column in table.columns)
     actual_names = tuple(str(column["name"]) for column in inspected_columns)
     if expected_names != actual_names:
         issues.append(SchemaShapeIssue(f"{table_name} column mismatch", expected_names, actual_names))
 
-    pk = inspector.get_pk_constraint(table_name)
     raw_pk_columns = pk["constrained_columns"]
     actual_pk = frozenset(str(name) for name in cast("Sequence[object]", raw_pk_columns))
     columns_by_name = {str(column["name"]): column for column in inspected_columns}
@@ -1024,7 +1043,7 @@ def _parse_postgres_identifier(value: str) -> tuple[str, ...] | None:
 
 def _collect_foreign_key_issues(
     issues: list[SchemaShapeIssue],
-    inspector: Inspector,
+    foreign_keys: Sequence[ReflectedForeignKeyConstraint],
     table: Table,
     dialect: Dialect,
 ) -> None:
@@ -1033,7 +1052,7 @@ def _collect_foreign_key_issues(
         for constraint in table.foreign_key_constraints
         if _ddl_object_applies_to_dialect(constraint, dialect)
     )
-    actual = Counter(_actual_foreign_key_shape(fk, dialect) for fk in inspector.get_foreign_keys(table.name))
+    actual = Counter(_actual_foreign_key_shape(fk, dialect) for fk in foreign_keys)
     if expected != actual:
         issues.append(
             SchemaShapeIssue(
@@ -1121,7 +1140,7 @@ def _actual_foreign_key_shape(fk: Mapping[str, Any], dialect: Dialect) -> _Forei
 
 def _collect_check_issues(
     issues: list[SchemaShapeIssue],
-    inspector: Inspector,
+    checks: Sequence[ReflectedCheckConstraint],
     table: Table,
     dialect: Dialect,
     text_builtin_proof: _TextBuiltinProof,
@@ -1134,7 +1153,7 @@ def _collect_check_issues(
         expected[(_optional_string(constraint.name), _expected_expression_ast(sql, dialect, table))] += 1
 
     actual: Counter[tuple[str | None, _Ast]] = Counter()
-    for reflected in inspector.get_check_constraints(table.name):
+    for reflected in checks:
         raw_name = reflected["name"]
         name = _optional_string(raw_name)
         actual[(name, _expression_ast(str(reflected["sqltext"]), dialect, table))] += 1
@@ -1166,7 +1185,7 @@ def _collect_check_issues(
 
 def _collect_unique_constraint_issues(
     issues: list[SchemaShapeIssue],
-    inspector: Inspector,
+    unique_constraints: Sequence[ReflectedUniqueConstraint],
     table: Table,
     dialect: Dialect,
 ) -> None:
@@ -1183,7 +1202,7 @@ def _collect_unique_constraint_issues(
         if type(constraint) is UniqueConstraint and _ddl_object_applies_to_dialect(constraint, dialect)
     )
     actual: Counter[_UniqueConstraintShape] = Counter()
-    for reflected in inspector.get_unique_constraints(table.name):
+    for reflected in unique_constraints:
         raw_column_names = reflected["column_names"]
         shape = (
             frozenset(str(column) for column in cast("Sequence[object]", raw_column_names)),
@@ -1202,7 +1221,7 @@ def _collect_unique_constraint_issues(
 
 def _collect_index_issues(
     issues: list[SchemaShapeIssue],
-    inspector: Inspector,
+    indexes: Sequence[ReflectedIndex],
     table: Table,
     dialect: Dialect,
     *,
@@ -1220,7 +1239,7 @@ def _collect_index_issues(
 
     actual_unique: dict[str, _IndexShape] = {}
     actual_ordinary: dict[str, _IndexShape] = {}
-    for reflected in inspector.get_indexes(table.name):
+    for reflected in indexes:
         if "duplicates_constraint" in reflected and reflected["duplicates_constraint"]:
             continue
         name = reflected["name"]

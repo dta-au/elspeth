@@ -21,6 +21,7 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolRecorder,
     ComposerToolStatus,
+    ToolArgumentErrorCategory,
 )
 from elspeth.core.canonical import canonical_json, stable_hash
 
@@ -100,6 +101,7 @@ def test_arg_error_invocation_shape() -> None:
         status=ComposerToolStatus.ARG_ERROR,
         error_class="ToolArgumentError",
         error_message="'plugin' must be a string, got int",
+        error_category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         version_after=None,
         result_canonical=None,
         result_hash=None,
@@ -109,6 +111,89 @@ def test_arg_error_invocation_shape() -> None:
     assert d["version_after"] is None
     assert d["result_canonical"] is None
     assert d["result_hash"] is None
+    # The category is persisted as its plain string value, exactly like status.
+    assert d["error_category"] == "model_validation"
+    assert type(d["error_category"]) is str
+
+
+def test_arg_error_without_category_is_rejected() -> None:
+    """An ARG_ERROR record must say which closed category rejected the call."""
+    with pytest.raises(ValueError, match="error_category"):
+        _make_invocation(
+            status=ComposerToolStatus.ARG_ERROR,
+            error_class="ToolArgumentError",
+            error_message="m",
+            version_after=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [ComposerToolStatus.SUCCESS, ComposerToolStatus.CANCELLED, ComposerToolStatus.PLUGIN_CRASH],
+)
+def test_category_on_a_non_arg_error_status_is_rejected(status: ComposerToolStatus) -> None:
+    """A category describes an argument rejection; no other status may carry one."""
+    with pytest.raises(ValueError, match="error_category"):
+        _make_invocation(status=status, error_category=ToolArgumentErrorCategory.SEMANTIC_RULE)
+
+
+def test_category_must_be_the_owned_enum() -> None:
+    """A bare string with a category's value is not the owned closed type."""
+    with pytest.raises(TypeError, match="error_category"):
+        _make_invocation(
+            status=ComposerToolStatus.ARG_ERROR,
+            error_class="ToolArgumentError",
+            error_message="m",
+            version_after=None,
+            error_category="semantic_rule",
+        )
+
+
+def test_non_arg_error_to_dict_carries_null_category() -> None:
+    assert _make_invocation().to_dict()["error_category"] is None
+
+
+# --- Wire facts (S1 T5, D16/C23) --------------------------------------------
+# ``strict_sent`` mirrors the ``strict`` key sent for the tool (``True``,
+# ``False`` for an explicit ``strict:false``, ``None`` when no key was sent).
+# ``wire_conformant`` is ``None`` exactly where no arguments were decoded.
+# There is no implication between them.
+
+
+def test_wire_facts_default_to_none() -> None:
+    inv = _make_invocation()
+    assert inv.strict_sent is None
+    assert inv.wire_conformant is None
+
+
+@pytest.mark.parametrize("strict_sent", [True, False, None])
+@pytest.mark.parametrize("wire_conformant", [True, False, None])
+def test_wire_facts_accept_every_exact_bool_or_none_pair(strict_sent: bool | None, wire_conformant: bool | None) -> None:
+    """Includes ``strict_sent=None`` with ``wire_conformant=False``: a decoded call on the ``none`` dialect."""
+    inv = _make_invocation(strict_sent=strict_sent, wire_conformant=wire_conformant)
+    assert inv.strict_sent is strict_sent
+    assert inv.wire_conformant is wire_conformant
+
+
+@pytest.mark.parametrize("field_name", ["strict_sent", "wire_conformant"])
+@pytest.mark.parametrize("value", [1, 0, "true", "false"], ids=["int-1", "int-0", "str-true", "str-false"])
+def test_wire_facts_must_be_exact_bool_or_none(field_name: str, value: object) -> None:
+    with pytest.raises(TypeError, match=field_name):
+        _make_invocation(**{field_name: value})
+
+
+def test_to_dict_carries_the_wire_facts() -> None:
+    d = _make_invocation(strict_sent=False, wire_conformant=True).to_dict()
+    assert d["strict_sent"] is False
+    assert d["wire_conformant"] is True
+
+
+def test_to_dict_carries_null_wire_facts_rather_than_omitting_them() -> None:
+    d = _make_invocation().to_dict()
+    assert "strict_sent" in d
+    assert d["strict_sent"] is None
+    assert "wire_conformant" in d
+    assert d["wire_conformant"] is None
 
 
 def test_plugin_crash_invocation_shape() -> None:

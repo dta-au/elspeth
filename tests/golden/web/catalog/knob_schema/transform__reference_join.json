@@ -13,7 +13,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -42,7 +42,7 @@
         "tier": "common"
       },
       {
-        "description": "How to parse reference_content. Never inferred \u2014 a blob carries no reliable type.",
+        "description": "How to parse reference_content. Never inferred \u2014 a blob carries no reliable type. CSV cells remain strings, including numeric-looking cells; JSON numbers retain numeric types.",
         "enum": [
           "csv",
           "json"
@@ -73,7 +73,7 @@
         "tier": "common"
       },
       {
-        "description": "Map of output field name to an expression over the matched entry, bound as 'ref' (for example \"ref['description']\" or \"ref['tax']['rate']\").",
+        "description": "Map of output field name to an expression over the matched entry, bound as 'ref' (for example \"ref['description']\" or \"ref['tax']['rate']\"). A stored result cannot be a set because it has no canonical order; build a list instead.",
         "kind": "json-object",
         "label": "Output",
         "name": "output",

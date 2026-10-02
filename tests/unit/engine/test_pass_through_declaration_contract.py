@@ -161,8 +161,9 @@ def test_applies_to_rejects_non_bool_passes_through_input(value: object) -> None
 
 
 def test_applies_to_on_plugin_missing_attribute_crashes() -> None:
-    """CLAUDE.md offensive programming: plugin missing passes_through_input is
-    a framework bug; must crash loudly, not silently return False."""
+    """Offensive programming (``engine-patterns-reference`` skill §Offensive Programming
+    Examples): a plugin missing passes_through_input is a framework bug; it must
+    crash loudly, not silently return False."""
     c = PassThroughDeclarationContract()
 
     class _NoAttr:
@@ -361,7 +362,8 @@ def test_contract_claims_both_dispatch_sites() -> None:
 def test_batch_flush_check_raises_on_divergence() -> None:
     """The batch-flush site uses BatchFlushInputs; contract's logic parallels
     post_emission_check but reads ``effective_input_fields`` as the caller-
-    computed intersection of every buffered token's contract."""
+    computed intersection of every buffered token's effective input fields
+    (contract fields the payload carries)."""
     from elspeth.contracts.declaration_contracts import BatchFlushInputs, BatchFlushOutputs
 
     c = PassThroughDeclarationContract()

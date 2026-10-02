@@ -8,44 +8,9 @@ get inferred types, or remove fields (narrowing the contract).
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
-from elspeth.contracts.type_normalization import UNSUPPORTED_CONTRACT_TYPE, normalize_type_for_contract
-
-
-def _infer_new_field_contract(name: str, value: Any) -> FieldContract:
-    """Build an inferred contract field for transform-created output data.
-
-    Unsupported checkpoint-incompatible types are retained as object so the
-    row data and contract cannot diverge. Non-finite floats intentionally
-    propagate ValueError from normalize_type_for_contract(); they are invalid
-    audit material and must fail consistently across propagation paths.
-    """
-    normalized_type = normalize_type_for_contract(value)
-    python_type: type
-    if normalized_type is UNSUPPORTED_CONTRACT_TYPE:
-        python_type = object
-    else:
-        python_type = cast(type, normalized_type)
-
-    # Null-like values normalize to type(None), but for inference that means
-    # "type unknown, field is nullable" — not "field is always NoneType".
-    # Use object+nullable to avoid order-dependent contracts that break on
-    # subsequent rows with real values.
-    nullable = False
-    if python_type is type(None):
-        python_type = object
-        nullable = True
-
-    return FieldContract(
-        normalized_name=name,
-        original_name=name,
-        python_type=python_type,
-        required=False,
-        source="inferred",
-        nullable=nullable,
-    )
 
 
 def propagate_contract(
@@ -77,7 +42,7 @@ def propagate_contract(
 
     for name, value in output_row.items():
         if name not in existing_names:
-            new_fields.append(_infer_new_field_contract(name, value))
+            new_fields.append(FieldContract.inferred(name, name, value))
 
     if not new_fields:
         return input_contract
@@ -153,7 +118,7 @@ def narrow_contract_to_output(
             output_fields.append(existing_field)
             continue
 
-        output_fields.append(_infer_new_field_contract(name, value))
+        output_fields.append(FieldContract.inferred(name, name, value))
 
     return SchemaContract(
         mode=input_contract.mode,

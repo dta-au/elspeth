@@ -28,6 +28,7 @@ from elspeth.contracts import (
     RunStatus,
 )
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import CANONICAL_VERSION, canonical_json, stable_hash
 from elspeth.core.landscape.database import LandscapeDB
@@ -51,7 +52,7 @@ def _begin_run(factory: RecorderFactory) -> Run:
 def _register_source(factory: RecorderFactory, run_id: str) -> Node:
     """Register a minimal source node for tests that need one."""
     return factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         plugin_name="csv_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -96,7 +97,7 @@ class TestRecorderCrashesOnInvalidEnums:
 
         with pytest.raises((AttributeError, TypeError, ValueError)):
             landscape_factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=leader_coordination_token(landscape_factory, run.run_id),
                 plugin_name="test_plugin",
                 node_type="not_a_valid_type",  # type: ignore[arg-type]
                 plugin_version="1.0",
@@ -113,7 +114,7 @@ class TestRecorderCrashesOnInvalidEnums:
 
         with pytest.raises((AttributeError, TypeError, ValueError)):
             landscape_factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=leader_coordination_token(landscape_factory, run.run_id),
                 plugin_name="test_plugin",
                 node_type=NodeType.TRANSFORM,
                 plugin_version="1.0",
@@ -130,18 +131,19 @@ class TestRecorderCrashesOnInvalidEnums:
         """
         run = _begin_run(landscape_factory)
         source: Node = _register_source(landscape_factory, run.run_id)
-        row = landscape_factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = landscape_factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(landscape_factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"x": 1},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = landscape_factory.data_flow.create_token(row.row_id)
 
         with pytest.raises((AttributeError, TypeError, ValueError)):
-            landscape_factory.data_flow.record_token_outcome(
+            landscape_factory.data_flow.record_token_outcome_leader(
+                coordination_token=leader_coordination_token(landscape_factory, run.run_id),
+                path=TerminalPath.DEFAULT_FLOW,
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome="bogus_terminal",  # type: ignore[arg-type]
                 sink_name="output",
@@ -174,7 +176,7 @@ class TestRecorderCrashesOnNullAuditFields:
 
         with pytest.raises(LandscapeRecordError) as exc_info:
             landscape_factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=leader_coordination_token(landscape_factory, run.run_id),
                 plugin_name=None,  # type: ignore[arg-type]
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0",
@@ -192,7 +194,7 @@ class TestRecorderCrashesOnNullAuditFields:
         """
         run = _begin_run(landscape_factory)
         node = landscape_factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(landscape_factory, run.run_id),
             plugin_name="test_plugin",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -204,26 +206,17 @@ class TestRecorderCrashesOnNullAuditFields:
         assert node.config_hash is not None
         assert len(node.config_hash) > 0
 
-    def test_null_run_id_in_register_node_crashes(self, landscape_db: LandscapeDB, landscape_factory: RecorderFactory) -> None:
-        """register_node with None as run_id must crash.
-
-        The nodes table has run_id NOT NULL with a FK to runs; repository writes
-        surface DB rejection as LandscapeRecordError.
-        """
+    def test_null_run_id_in_node_record_crashes(self, landscape_db: LandscapeDB, landscape_factory: RecorderFactory) -> None:
+        """The database rejects NULL run identity even if a caller bypasses the typed authority."""
         from sqlalchemy.exc import IntegrityError
 
-        from elspeth.core.landscape.errors import LandscapeRecordError
-
-        with pytest.raises(LandscapeRecordError) as exc_info:
-            landscape_factory.data_flow.register_node(
-                run_id=None,  # type: ignore[arg-type]
-                plugin_name="test_plugin",
-                node_type=NodeType.SOURCE,
-                plugin_version="1.0",
-                config={},
-                schema_config=DYNAMIC_SCHEMA,
-            )
-        assert isinstance(exc_info.value.__cause__, IntegrityError)
+        run = _begin_run(landscape_factory)
+        node = _register_source(landscape_factory, run.run_id)
+        with landscape_db.engine.connect() as conn:
+            valid = dict(conn.execute(select(nodes_table).where(nodes_table.c.node_id == node.node_id)).mappings().one())
+        invalid = {**valid, "node_id": "null-run-node", "run_id": None}
+        with pytest.raises(IntegrityError, match=r"nodes\.run_id"), landscape_db.engine.begin() as conn:
+            conn.execute(nodes_table.insert().values(**invalid))
 
 
 # ===================================================================
@@ -266,8 +259,8 @@ class TestRecorderCrashesOnWrongTypes:
         source: Node = _register_source(landscape_factory, run.run_id)
 
         with pytest.raises((TypeError, ValueError)):
-            landscape_factory.data_flow.create_row(
-                run_id=run.run_id,
+            landscape_factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(landscape_factory, run.run_id),
                 source_node_id=source.node_id,
                 row_index=0,
                 data={"bad": {1, 2, 3}},  # Sets are not JSON-serializable
@@ -318,7 +311,7 @@ class TestRecorderPositiveAuditIntegrity:
         config = {"path": "data.csv", "delimiter": ","}
 
         node = landscape_factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(landscape_factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="2.1.0",
@@ -352,8 +345,8 @@ class TestRecorderPositiveAuditIntegrity:
         source: Node = _register_source(landscape_factory, run.run_id)
         data = {"customer_id": "C-123", "amount": 99.95, "currency": "USD"}
 
-        row = landscape_factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = landscape_factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(landscape_factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=data,
@@ -383,8 +376,8 @@ class TestRecorderPositiveAuditIntegrity:
         """
         run = _begin_run(landscape_factory)
         source: Node = _register_source(landscape_factory, run.run_id)
-        row = landscape_factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, token = landscape_factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(landscape_factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"x": 1},
@@ -402,7 +395,6 @@ class TestRecorderPositiveAuditIntegrity:
         assert row.created_at.tzinfo is not None, "row.created_at must be timezone-aware"
 
         # Token timestamp
-        token = landscape_factory.data_flow.create_token(row.row_id)
         assert token.created_at.tzinfo is not None, "token.created_at must be timezone-aware"
 
 
@@ -428,7 +420,7 @@ class TestRecorderHashIntegrity:
         config = {"model": "gpt-4", "temperature": 0.7, "max_tokens": 100}
 
         node = landscape_factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(landscape_factory, run.run_id),
             plugin_name="llm_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -471,8 +463,8 @@ class TestRecorderHashIntegrity:
             "tags": ["premium", "verified"],
         }
 
-        row = landscape_factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = landscape_factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(landscape_factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=data,

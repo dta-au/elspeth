@@ -69,6 +69,7 @@ describe("YamlView", () => {
       activeSessionId: null,
       compositionState: null,
       compositionProposals: [],
+      staleProposalIds: [],
       // Reset the export sidecar binding (setState merges); the binding tests
       // below would otherwise leak their stashed value across cases.
       exportedYamlBlobBinding: null,
@@ -98,13 +99,28 @@ describe("YamlView", () => {
     expect(screen.getByText(/Pending YAML change/)).toBeInTheDocument();
     expect(screen.getByText(/not been applied yet/i)).toBeInTheDocument();
     expect(
-      screen.getByRole("button", {
-        name: "Accept YAML proposal: Replace the pipeline.",
+      screen.queryByRole("button", {
+        name: /accept.*proposal/i,
       }),
-    ).toBeEnabled();
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /reject.*proposal/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/Awaiting your decision/)).toBeInTheDocument();
   });
 
-  it("does not fetch YAML for a metadata-only guided exit state", async () => {
+  it("preserves stale YAML proposal details without suggesting it can be accepted", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionProposals: [makeProposal()],
+      staleProposalIds: ["proposal-1"],
+    });
+    render(<YamlView />);
+    expect(screen.getByText(/Pending YAML change: Replace the pipeline/)).toBeInTheDocument();
+    expect(screen.getByText(/Stale proposal/)).toBeInTheDocument();
+    expect(screen.queryByText(/Awaiting your decision/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /accept|reject/i })).not.toBeInTheDocument();
+  });
+
+  it("does not fetch YAML for a metadata-only composition state", async () => {
     const { fetchYaml } = await import("@/api/client");
     vi.mocked(fetchYaml).mockResolvedValue({
       yaml: "source:\n  plugin: text\n",
@@ -123,7 +139,7 @@ describe("YamlView", () => {
     expect(fetchYaml).not.toHaveBeenCalled();
   });
 
-  it("shows a validation-blocked alert when YAML export returns 409", async () => {
+  it("preserves the validation reason when YAML export returns 409", async () => {
     const { fetchYaml } = await import("@/api/client");
     vi.mocked(fetchYaml).mockRejectedValue({
       status: 409,
@@ -138,7 +154,7 @@ describe("YamlView", () => {
     render(<YamlView />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "YAML export is blocked by validation errors.",
+      "Failed to load YAML.",
     );
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Current composition state is invalid. Fix validation errors before exporting YAML.",
@@ -146,6 +162,25 @@ describe("YamlView", () => {
     expect(
       screen.queryByText("YAML will appear here once your pipeline has components."),
     ).not.toBeInTheDocument();
+  });
+
+  it("allows retrying a busy export without claiming pipeline invalidity", async () => {
+    const { fetchYaml } = await import("@/api/client");
+    vi.mocked(fetchYaml)
+      .mockRejectedValueOnce({ status: 409, detail: "Session operation is already active" })
+      .mockResolvedValueOnce({ yaml: "source:\n  plugin: text\n" });
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState() });
+    render(<YamlView />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Session operation is already active");
+    expect(alert).not.toHaveTextContent("validation errors");
+    await userEvent.click(screen.getByRole("button", { name: "Retry YAML export" }));
+
+    await screen.findByRole("button", { name: "Copy YAML to clipboard" });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(fetchYaml).toHaveBeenCalledTimes(2);
+    expect(fetchYaml).toHaveBeenLastCalledWith("session-1");
   });
 
   it("clears stale YAML controls while refetching after a composition version change", async () => {
@@ -304,38 +339,27 @@ describe("YamlView", () => {
     expect(screen.getByText(/Replace the pipeline/)).toBeInTheDocument();
   });
 
-  it("keeps pending YAML proposal actions visible when current YAML export is invalid", async () => {
+  it("keeps a read-only proposal summary when current YAML export is invalid", async () => {
     const { fetchYaml } = await import("@/api/client");
     vi.mocked(fetchYaml).mockRejectedValue({
       status: 409,
       detail: "Current composition state is invalid.",
     });
-    const acceptProposal = vi.fn();
-    const rejectProposal = vi.fn();
-
     useSessionStore.setState({
       activeSessionId: "session-1",
       compositionState: makeState(),
       compositionProposals: [makeProposal()],
-      acceptProposal,
-      rejectProposal,
     });
 
     render(<YamlView />);
-    const user = userEvent.setup();
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "YAML export is blocked by validation errors.",
+      "Failed to load YAML.",
     );
     expect(screen.getByText(/Pending YAML change/)).toBeInTheDocument();
 
-    await user.click(
-      screen.getByRole("button", {
-        name: "Accept YAML proposal: Replace the pipeline.",
-      }),
-    );
-
-    expect(acceptProposal).toHaveBeenCalledWith("proposal-1");
+    expect(screen.queryByRole("button", { name: /accept|reject/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/Awaiting your decision/)).toBeInTheDocument();
   });
 
   // ── source_blob_ids sidecar capture (for the import round-trip) ─────────────
@@ -405,7 +429,7 @@ describe("YamlView", () => {
     });
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "YAML export is blocked by validation errors.",
+      "Failed to load YAML.",
     );
     expect(useSessionStore.getState().exportedYamlBlobBinding).toBeNull();
   });

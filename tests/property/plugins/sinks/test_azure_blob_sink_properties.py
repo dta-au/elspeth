@@ -43,6 +43,8 @@ class _Blob:
 
 
 class _Container:
+    account_name = "property-account"
+
     def get_blob_client(self, *_args: object, **_kwargs: object) -> _Blob:
         return _Blob()
 

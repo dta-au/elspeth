@@ -13,9 +13,11 @@ _PLUGIN_SPECIFIC_SECRET_REF_FIELDS: dict[tuple[str, str], frozenset[str]] = {
 
 def allowed_secret_ref_fields(component_type: str, plugin_name: str) -> frozenset[str]:
     """Return plugin-specific non-heuristic fields that may carry secret refs."""
-    key = (component_type, plugin_name)
-    if key in _PLUGIN_SPECIFIC_SECRET_REF_FIELDS:
-        return _PLUGIN_SPECIFIC_SECRET_REF_FIELDS[key]
+    # This policy projection runs before plugin-identity admission, so compare
+    # against known names without hashing an unvalidated authored value.
+    for (allowed_type, allowed_name), fields in _PLUGIN_SPECIFIC_SECRET_REF_FIELDS.items():
+        if component_type == allowed_type and plugin_name == allowed_name:
+            return fields
     return frozenset()
 
 

@@ -13,7 +13,7 @@ Source: staged bundle `elspeth-600360c72e-rebind-abd70f32f` (bound to abd70f32f,
 
 - Own worktree (`.claude/worktrees/tier-<bucket>`), `PYTHONPATH=<wt>/src:<wt>/elspeth-lints/src`, verify `elspeth.__file__` AND `elspeth_lints.__file__` before trusting a result. `pytest -n 2` max per lane.
 - Read `docs/agents/recent-code-hints.md` and ADR-032 first. Preference order per finding: (a) **remove** it with a correct code change (nominal `isinstance` on an owned type, membership-form reads, explicit error paths, `@trust_boundary` on honest Tier-3 parse sites); (b) if genuinely policy-correct, write a rationale that names the flagged pattern and why it is right *at this site*. Never blanket, never alias, never reorder to dodge a fingerprint.
-- Evidence: `elspeth-lints check --rules trust_tier.tier_model --root src/elspeth` corpus **count** before/after (whole tree, not `tail`), scoped tests green, and the wave-merge full suite. Deliverable = commit(s) + sidecar + a Filigree comment on the bucket issue listing removed vs. rationalised keys.
+- Evidence: `elspeth-lints check --rules trust_tier.tier_model --root src/elspeth` corpus **count** before/after (whole tree, not `tail`), scoped tests green, and the wave-merge full suite. Deliverable = commit(s) + sidecar + a legacy issue tracker comment on the bucket issue listing removed vs. rationalised keys.
 - Model: `fable` for buckets touching auth/secrets/redaction/sessions.service/sinks/infra clients/AWS+Textract; `opus` otherwise. Adjust freely.
 
 ## Buckets (≤5,000 LOC each, a file is never split; 5 files exceed the cap alone)

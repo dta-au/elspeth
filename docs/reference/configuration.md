@@ -93,8 +93,53 @@ Nested environment variables use double underscore: `ELSPETH_LANDSCAPE__URL`.
 | Mode | Behavior |
 |------|----------|
 | `live` | Execute normally, make real external calls |
-| `replay` | Use recorded responses from a previous run |
-| `verify` | Compare new results against a previous run |
+| `replay` | Reconstruct audited source rows and external responses from `replay_from`; execute the pipeline without contacting those providers or publishing configured sinks |
+| `verify` | Read current sources and call providers, compare source rows and stable call response fields with `replay_from`, and publish no configured sinks |
+
+Replay and verify require a completed, compatible source run with retained
+payloads and call evidence. The runtime rejects missing or ambiguous evidence,
+changed graph or plugin implementations, and capabilities it cannot safely
+run in the selected mode. Both modes write a new Landscape audit run. They
+require `replay_from` to be a string; quote an all-digit run ID in YAML so the
+YAML parser does not turn it into an integer. They compare canonical rows at
+each sink boundary, including node, role, ingest
+sequence, disposition, and payload hash; this does not compare serialized sink
+bytes or external artifacts. A mismatch makes verify fail with exit code 2
+and a `verification_mismatch` event. Replay and verify must run with
+`concurrency.max_workers: 1`; the source live run may use a different worker
+count, including the default of 4.
+
+Verification uses a fixed, non-configurable response comparison policy. It
+ignores only these fields:
+
+| Call evidence | Fields excluded from comparison |
+|---------------|---------------------------------|
+| LLM | `raw_response.id` and `raw_response.created` |
+| HTTP and HTTP redirect | `Date` headers, matched case-insensitively in both `headers` and `transport.headers` |
+| HTTP POST to a path ending in `/chat/completions`, with a parsed JSON body containing a `choices` array | In addition to `Date`: `body.id`, `body.created`, `body_size`, `transport.body_b64`, and case-insensitive `Content-Length` headers in both header representations |
+
+All other response fields are compared, including `x-request-id`, `Set-Cookie`,
+`cf-ray`, rate-limit headers, and `system_fingerprint`. Changes to these fields
+produce a mismatch even when the returned content is unchanged. Generic HTTP
+JSON responses retain `id`, `created`, body size, body bytes, and `Content-Length`
+in the comparison. Both complete raw responses remain in the audit trail;
+inspect them to distinguish metadata drift from content changes. The call
+verification mismatch error also states this policy (in the `error` field of
+the JSON `verification_mismatch` event).
+
+Replay and verify retain `sink_write` operations as durable records of virtual
+sink processing. The operation name does not imply external publication. Its
+sink effect records `descriptor_mode: no_publication`,
+`publication_performed: false`, and `publication_evidence_kind: virtual`.
+The effect's member records retain the rows used for the sink-boundary
+comparison. Any virtual artifact descriptor identifies audit evidence, not a
+file written to the configured sink. Read the effect's publication fields
+alongside the operation when determining whether a sink wrote externally.
+
+Dependency runs, collection probes,
+commencement gates, audit export, remote telemetry, and remote Key Vault
+secrets are refused in these modes until they have an explicit replay or verify
+contract.
 
 ---
 
@@ -186,6 +231,14 @@ operator-owned `credential_ref`. A server-scoped profile resolves only through
 the server store; a user-scoped profile resolves only through that principal's
 store. Web-authored pipeline state stores the opaque profile alias, not the
 provider, model, endpoint, or credential binding.
+
+For profiled LLM sources and transforms, `temperature` belongs to the
+operator's LLM profile. An omitted profile setting adds no temperature option;
+an explicit number from `0.0` to `2.0` is forwarded, and explicit `null` omits
+the parameter from the provider request. Authored profiled nodes cannot set or
+override it, including with `null`. Unprofiled YAML nodes can still configure
+temperature directly. Use explicit sampling only for a deployment that
+supports it; deployment aliases do not identify model capabilities.
 
 `ELSPETH_WEB__DEFAULT_LLM_PROFILE` must name a configured profile or the
 service refuses to start — so renaming or removing a profile this still points
@@ -369,6 +422,7 @@ consulted.
 |-------|------|----------|---------|-------------|
 | `auth_provider` | string | No | `"local"` | `local`, `entra`, `google`, `oidc`, or `vanguard`. Selects the profile that decides every other rule in this section |
 | `registration_mode` | string | No | `"open"` | `open`, `email_verified`, or `closed`. Governs **local** self-registration only. Under any identity provider it is accepted and inert: an SSO first login is always pending an administrator regardless of this value |
+| `workflow_governance` | string | No | `"off"` | `off` or `on`. Declares the workflow-governance mode for later approval, review, and library authorities. With `on`, readiness refuses local authentication with `registration_mode: open` (R11) and requires a valid `compartment_id`. The configured value remains `on` when readiness fails |
 | `dev_admin_user` | string | `local` only | - | Names the one local-auth user granted the in-app user-management surface (`/api/auth/admin/users`). Unset removes that surface entirely. Setting it under any identity provider refuses at load: `dev_admin_user requires auth_provider=local; IdP deployments must not carry it`. A blank value is refused too |
 
 `registration_mode: email_verified` on a non-local host (anything other than
@@ -384,14 +438,22 @@ consulted.
 | `sso_client_secret` | secret | Yes (every IdP) | - | The client secret for that registration. Held server-side only; never sent to the browser. Supply by reference from a secret store, never as an environment literal |
 | `sso_transaction_secret` | secret | Yes (every IdP) | - | Seals the login transaction cookie carrying the PKCE verifier, state, and nonce. Independent of `secret_key`, so rotating one does not invalidate the other. Generate with `openssl rand -base64 32` and place the value in a secret store; supply by reference, never as an environment literal |
 | `public_base_url` | string | Yes (every IdP) | - | This deployment's externally visible origin. Must be a bare origin — scheme, host, and optional port, with no path, query, or fragment — and must be public HTTPS unless it is an HTTP loopback address for local development. A trailing slash is stripped |
-| `compartment_id` | string | Yes (every IdP) | - | Operator-declared marking for this container's identities and artifacts. Validated non-blank; no runtime path reads it in this release |
-| `quota_default_tokens_per_day` | int | Yes (every IdP) | - | Daily LLM token allowance written into each identity's quota policy row at activation. Must be greater than 0 |
-| `quota_default_storage_bytes` | int | Yes (every IdP) | - | Blob storage allowance written into the same row. Must be greater than 0 |
+| `compartment_id` | string | Yes (every IdP; also when workflow governance is on) | - | Operator-declared marking for this container's identities and artifacts. It must match `[a-z0-9][a-z0-9-]{0,62}`; readiness requires it when workflow governance is on because library rows and audit metadata carry the marking |
+| `quota_default_tokens_per_day` | int | Yes (every IdP; also whenever any `quota_*` setting is configured) | - | Daily LLM token allowance written into each identity's quota policy row at activation. Must be greater than 0 |
+| `quota_default_storage_bytes` | int | Yes (every IdP; also whenever any `quota_*` setting is configured) | - | Blob storage allowance written into the same row. Must be greater than 0 |
 
 The two quota defaults are required rather than defaulted because an activated
 identity spends the container's shared LLM credential: without a policy row
 there is no ceiling to enforce. An administrator may override either number per
 identity afterwards.
+
+There is no separate switch for the quota system: configuring **any** of the four
+`quota_*` settings turns it on, and the server then refuses to start unless
+**both** per-identity defaults are set. A policy row stores a value for tokens
+and for storage, and an administrator sets one at a time, so the value they do
+not type for a person's first cap comes from these defaults. A local-auth
+deployment with none of the four configured runs with quotas off: usage is
+still shown in People & access, and no personal cap can be stored.
 
 A blank value is never treated as a value. `sso_client_id`, `sso_issuer`,
 `entra_tenant_id`, `google_hosted_domain`, `compartment_id` and the four
@@ -502,10 +564,14 @@ stating it can still break the glass.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `sso_admin_subjects` | JSON array of strings | No | `[]` | Provider `sub` claims that may seed the first `admin` role at first login, and **only** while the container has zero active human admins. The gate is a live count re-evaluated at every login, not a record that a bootstrap has happened, so the list **re-arms** if the container ever returns to zero active human admins. Delete it once the first administrator is activated. Entries are matched exactly and are not validated at load |
-| `quota_container_tokens_per_day` | int | No | - | Optional container-wide token ceiling, distinct from the per-identity default. Must be greater than 0. Validated only; no runtime path reads it in this release |
-| `quota_container_storage_bytes` | int | No | - | Optional container-wide storage ceiling. Must be greater than 0. Validated only; no runtime path reads it in this release |
-| `identity_dormancy_days` | int | No | `90` | Intended dormancy window for an activated identity. Must be greater than 0. Validated only; no runtime path reads it in this release |
-| `identity_pending_retention_days` | int | No | `90` | Intended retention for a never-activated pending identity before it is purged. Must be greater than 0. Validated only; no runtime path reads it in this release |
+| `quota_container_tokens_per_day` | int | No | - | Optional container-wide token ceiling, distinct from the per-identity default. Must be greater than 0. Configuring it turns the quota system on, so both `quota_default_*` settings are then required. Enforced for every chargeable LLM operation when configured |
+| `quota_container_storage_bytes` | int | No | - | Optional container-wide storage ceiling. Must be greater than 0. Configuring it turns the quota system on, so both `quota_default_*` settings are then required. Validated only; no runtime path reads it in this release |
+| `identity_dormancy_days` | int | No | `90` | Dormancy window for an activated identity (R9). A login by an `active` identity whose previous login is **older than** this many days drops it back to `pending` with `disable_reason='dormant'`, writes an `identity_disabled` audit row, and refuses the login at the admission gate; an administrator must re-activate it. A re-pend takes the identity's **admission**, not its roles, quota or org-tree edges — the same posture R3's rebound disable takes — so re-activating it restores the access it already held, whichever role the administrator picks (including `none`), and the `identity_activated` audit row names those retained roles in its metadata. Use `POST /api/auth/admin/roles/{role_id}/revoke` to remove one; activation is not a way to strip authority. Exactly this many days is still admitted. An identity that has never logged in (`last_login_at` is NULL — a pre-provisioned row) is not dormant, and becomes measurable from its second login. The **last active human administrator is exempt** (D34): they are not re-pended and their login proceeds, so a single-admin container cannot walk itself to zero administrators by being left alone; the exemption writes its own `auth_events` row (`identity_disabled` with `outcome='failure'` and `failure_category='dormancy_last_admin_exempt'`). Must be greater than 0 |
+| `identity_pending_retention_days` | int | No | `90` | Retention for a never-activated pending identity. `POST /api/auth/admin/identities/purge-pending` reads this configured value, deletes at most 200 rows strictly older than the database-time cutoff, and records the exact deleted identities in the authentication audit trail. The request cannot override the setting. Must be greater than 0 |
+
+Dormancy applies to both local and SSO identities. Administrator reactivation
+starts a fresh dormancy window: the later of the previous login and activation
+must exceed the configured number of days before the identity is re-pended.
 
 An SSO first login lands **pending** and is activated by an administrator. The
 provider verified who the person is; it did not decide whether this container
@@ -743,6 +809,15 @@ on_validation_failure: quarantine  # quarantine or discard
 | `flexible` | At least these fields must be present (extras allowed) |
 | `observed` | Infer schema from data (no explicit field definitions) |
 
+An `observed` or `flexible` schema infers its contract from the first valid
+row and holds at most 1024 fields in total. A `csv` source whose header (or
+`columns`) is wider is refused at header read, before any row is ingested: the
+run fails with "CSV header has N fields; observed and flexible schemas infer
+at most 1024". To load it, declare
+the schema with `mode: fixed` and list every column (a fixed schema rejects
+undeclared columns, so it cannot list only the ones you need), or remove
+columns before ingest.
+
 ### Schema Contracts (DAG Validation)
 
 For observed schemas that still have field requirements, use contract fields:
@@ -765,6 +840,40 @@ schema:
 | `required_fields` | Fields the consumer requires in input (for observed schemas) |
 
 The DAG validates at construction time that upstream `guaranteed_fields` satisfy downstream `required_fields`. For explicit schemas (`mode: fixed` or `flexible`), declared fields are implicitly guaranteed.
+
+### Field names in declarations
+
+Every source normalizes its external headers to lowercase identifiers: spaces
+and punctuation become `_`, a leading digit gains a `_` prefix and a Python
+keyword a `_` suffix (`Name` → `name`, `First Name` → `first_name`, `class` →
+`class_`). Rows are keyed by that normalized name; a source `field_mapping`
+value is used as written.
+
+A row LOOKUP resolves either spelling: an expression or template reading
+`row['First Name']`, and a `field_mapper` mapping source, find `first_name`.
+A DECLARATION does not. A name a node commits to before any row exists — a
+transform, aggregation or sink `schema` field, `required_fields`,
+`required_input_fields`, a column option such as `url_field`, `query_field`,
+`blob_ref_field`, `value_field` or `group_by`, a `type_coerce` conversion's
+`field`, a sink's custom `headers` key or dataverse `field_mapping` key, and a
+created name such as a `value_transform` target or a `field_mapper` rename
+target — must use the name rows carry. A declaration spelled by the header of
+a field the row carries is refused with the source's remedy (`headers are
+normalized to lowercase identifiers ('Name' -> 'name'). Declare 'name'`):
+
+- at `elspeth validate` / build time wherever the upstream's declared schema
+  proves it (a read needs a `fixed` upstream; a created name any upstream that
+  declares its fields);
+- otherwise per row: a transform or aggregation routes every such row to
+  `on_error` with the reason `declared_field_is_header_spelling` (a read) or
+  `target_is_header_spelling` (a created name), naming only the configured
+  spelling and its normalized form; a sink, whose seam routes no contract
+  violation, ends the run with every token's outcome recorded.
+
+A created name that is not a spelling of an arriving field (`Total`, or
+`sci__rag_context` from an upstream `rag_retrieval`) is unaffected, and so is
+a rename that removes the field it respells (`field_mapper` `{name: Name}`
+restores the header as the key).
 
 ---
 
@@ -968,8 +1077,8 @@ transforms:
           expression: "row['first_name'] + ' ' + row['last_name']"
 ```
 
-The split is not stylistic. `field_mapper` accepts `mapping` (singular),
-`select_only`, and `strict` — there is no `computed` key, and because plugin
+The split is not stylistic. `field_mapper` accepts `mapping` (singular) and
+`select_only` — there is no `computed` key, and because plugin
 options are validated with `extra: forbid`, an unknown key is a hard
 configuration failure rather than an ignored one. Computing a value is
 `value_transform`'s job: an ordered list of `operations`, each with a `target`
@@ -1000,7 +1109,7 @@ transforms:
       # ... other options
 ```
 
-For template-based transforms (like LLM transforms), use `elspeth.core.templates.extract_jinja2_fields()` to discover which fields your template references:
+For template-based transforms (like LLM transforms) the declaration is also what the template can see: the template's `row` holds exactly the declared fields (see **Template variables** below). Use `elspeth.core.templates.extract_jinja2_fields()` to discover which fields your template references:
 
 ```python
 from elspeth.core.templates import extract_jinja2_fields
@@ -1031,9 +1140,10 @@ Options common to all providers:
 | `provider` | `azure` \| `openrouter` \| `bedrock` | **Yes** | — | Provider variant |
 | `prompt_template` | string | **Yes** | — | Jinja2 prompt template |
 | `model` | string | provider-dependent | — | Model identifier; required for `openrouter` and `bedrock`, defaulted from `deployment_name` for `azure` |
+| `pricing_model` | string or null | No | (none) | LiteLLM catalogue identity used for cost calculation without changing the routed model. For profile-bound nodes, configure this in the operator's `llm_profiles` entry; it cannot be overridden in node options |
 | `system_prompt` | string | No | (none) | Optional system message |
-| `temperature` | float | No | `0.0` | Sampling temperature, `0.0`–`2.0`; the default is the deterministic setting |
-| `max_tokens` | int | No | (provider default) | Maximum response tokens; must be > 0 |
+| `temperature` | float or null | No | Azure: `null`; other providers: `0.0` | Sampling temperature, `0.0`–`2.0`. Azure omits it by default for compatibility with reasoning deployments. Set an explicit value for a model that supports adjustable temperature; `null` omits the parameter and uses the provider default |
+| `max_tokens` | int | No | (provider default) | Maximum response tokens; must be > 0. The `azure` provider sends it as `max_completion_tokens`, which also counts reasoning tokens |
 | `response_field` | string | No | `llm_response` | Row field for the model response; must be a valid Python identifier |
 | `queries` | list or mapping | No | (none) | Multi-query specs; omit for single-query mode |
 | `lookup` | mapping | No | (none) | Lookup data made available to the template |
@@ -1047,6 +1157,182 @@ Options common to all providers:
 | `recovery_step_ms` | int | No | `50` | Delay reduction applied after a success |
 | `max_capacity_retry_seconds` | int | No | `3600` | Per-row ceiling on retrying capacity errors |
 
+Pipeline Jinja templates reject power expressions (`**`). An `{% autoescape %}`
+block accepts only a literal `true` or `false`; an expression in that position
+is rejected during configuration validation.
+
+Configuration validation also rejects a template whose own text makes it fail
+on every row, so `elspeth validate` and the composer report it instead of the
+run failing each row: an unknown filter or test name, including one inside
+`{% if %}` or an inline `if` and one given by name to `map`, `select`,
+`reject`, `selectattr` or `rejectattr`; and `truncate` arguments written as
+literals that break its preconditions (a `length` shorter than `end`, a
+negative `leeway`, a literal of the wrong type such as `end=None`). The same
+checks apply to a RAG `query_template`.
+
+A template failure that depends on the row fails that row with
+`template_rendering_failed`. The reason names only the kind of failure, for
+example `Template rendering failed: KeyError (message withheld: it can quote
+row data)`, because Python's and Jinja's own messages can quote row values. A
+template that uses up its CPU allowance fails the row with `Template exceeded
+the CPU limit`.
+
+Templates render in two reusable worker processes. The limits apply to the
+render only, never to waiting for or starting a worker:
+
+- **All workers busy.** A row waits for a free worker. Waiting never fails the
+  row, however many rows are queued.
+- **Worker start.** A new worker may take up to 60 seconds to start. That time
+  is not charged to any row. A worker that does not start in time stops the
+  run as an ELSPETH failure, because starting a worker is not row work.
+- **Render time.** The 5-second wall clock starts when the row's request
+  reaches a running worker. A render that exceeds it fails the row with
+  `Template exceeded the execution time limit`.
+- **Render CPU.** A render may use 2 CPU seconds, counted from when the worker
+  receives the row's request until it replies. The time a worker waits between
+  rows is not charged to any row. Under a finite hard CPU limit (`ulimit -t`),
+  a reused worker whose total CPU leaves less than a render's 2 seconds is
+  replaced by a new worker before the row renders. If even a new worker would
+  get less, the run stops as an ELSPETH failure.
+- **Worker lost.** A worker ended by a signal the row did not cause (the
+  kernel's out-of-memory killer, an operator's `kill`, a crash) raises a
+  retryable error, `Template worker was stopped by signal N`. The run's
+  [retry settings](#retry-settings) retry the row on a new worker, in
+  `elspeth run` and on a follower started with `elspeth join` alike, and the
+  row goes to `on_error` only when the retries are used up. A multi-query LLM
+  node with a `pool_size` above 1 retries the one query itself within
+  `max_capacity_retry_seconds`. A worker that exits with no signal and no
+  reply stops the run as an ELSPETH failure.
+
+Stopping a run with Ctrl-C (SIGINT) or SIGTERM lets a template render already
+in progress finish. systemd's default stop sends SIGTERM to every process in
+the service, render workers included. The render worker ignores both signals
+and leaves the stop to the run, which stops after its in-flight rows.
+
+**Template variables.** A `prompt_template` sees two variables, `row` and
+`lookup` (the configured lookup mapping). `row` holds the field values the node
+declares in `required_input_fields`, and nothing else
+([ADR-051](../architecture/adr/051-a-template-sees-only-its-declared-fields.md)):
+
+| `required_input_fields` | `row` holds |
+|---|---|
+| a list, e.g. `[note, amount_usd]` | exactly those fields the row carries |
+| `[]` (the opt-out) | every field of the row |
+| omitted | no field |
+
+The row is narrowed to the declaration before the template runs, so a field
+the node does not declare cannot reach the prompt through any template form.
+Within that:
+
+- `row.name` and `row['name']` read a declared field by its normalized name,
+  and `row['Original Header']` or `row['Name']` reads it by the source's
+  original header. Configuration admits a read spelled as a header of a
+  declared field (its normalized form is declared); whether a row's header is
+  spelled that way is data, so a row whose header is spelled otherwise fails
+  that row at render (`template_rendering_failed`, naming the spelling).
+- `row.get('name')` returns a declared field, or `None` when the row does not
+  carry it; `'name' in row` is `False` then.
+- `{% for name in row %}`, `row | length`, `row | list`, `row | dictsort`,
+  `row | items`, `row | tojson`, `dict(row)` and `**row` see the declared
+  fields the row carries, and so does every other builtin filter applied to
+  the row: it sees the same mapping `dict(row)` holds.
+- `{{ row }}` prints that mapping, e.g. `{'note': 'first', 'amount_usd': 5}`,
+  and `row | reverse` the list of field names in reverse order. A filter that
+  returns a lazy sequence (`row | items`, `row | map(...)`) prints its
+  iterator, as it does for any value: end it with `| list` to print the
+  elements.
+
+`row` has fields and one method, `get`. Every other attribute or item lookup
+on `row` reads a field of that name: `row.keys` and `row.items` are fields,
+not methods, so `row.keys()` calls the value of a field named `keys`. For the
+field names use `row | list`, for name and value pairs `row | items | list`
+or `row | dictsort`, and for a mapping `dict(row)`. `row.contract`, `row.to_dict`
+and `row.to_checkpoint_format` are reserved names, not fields: read a column
+with one of those names as `row['contract']`. The row object, its schema
+contract and their methods are not reachable from a template. A lookup of a
+declared field the row does not carry fails that row with
+`template_rendering_failed` (`Undefined variable: the row has no field ...`).
+
+Reading a field the node does not declare fails the row with
+`template_rendering_failed` and its own reason, `Undeclared field: the template
+reads 'secret', a field this node does not declare in required_input_fields`.
+That includes `'secret' in row`, `row.get('secret', 'default')` and
+`row.secret is defined`: a template cannot test for an undeclared field, only
+for a declared field the row may not carry. The reason names the field only
+when the template spells it out.
+
+Configuration validation reports the reads it can see before the run, so they
+do not fail every row: a literal read of an undeclared field (`row.secret` with
+`required_input_fields: [note]`), and a computed key (`row[k]`, `row.get(k)`,
+`row | attr(k)`), which names no field `required_input_fields` could cover. It
+follows a row through aliases, containers, loops and macro arguments (a
+declared parameter, its default, and the extra arguments a macro body reads as
+`varargs` or `kwargs`). Validation follows each variable through every
+assignment at once, not in template order, so a variable that is reassigned to
+a container holding itself (`{% set a = {'k': row} %}` then
+`{% set a = {'k': a} %}`) cannot be followed and is rejected as
+`carrier-limit`; give the second value its own name. `required_input_fields: []`
+opts out of these checks, and the template then sees the whole row.
+
+Configuration also refuses a template that uses its row as an object, under
+every declaration, `[]` included, because no declaration makes it work: a
+call on a row field (`row.keys()`, `row.items()`, `row['keys']()`,
+`row.note()`, calling an element of the row, `(row | first)()`, calling row
+data — a field's value, an item or element of it, what a builtin filter or a
+method builds from it, an operator over it, or a name every binding of which
+is row data (`row.tags[0]()`, `(row.tags | select | first)()`,
+`(row.note | upper)()`, `row.note.upper()()`,
+`{% set m = row.tags %}{{ m[0]() }}`) — and calling
+what `row.get('note')` returns, `row.get('note')()`, also when its default is
+a row field, `row.get('note', row.id)()`),
+`row.get` without a call (`{{ row.get }}`,
+`{% set g = row.get %}`), and a reserved name in attribute form
+(`row.contract`, `row.to_dict()`, `row | attr('contract')`). A method on a
+value is not a row call: a field's value has its own methods
+(`row.note.upper()`), and so does a value a builtin or a filter builds from
+the whole row (`dict(row).items()`, `(row | list).count('note')`,
+`(row | tojson).upper()`), which validates under `required_input_fields: []`.
+Under a declared list the field check reads that method name as a field
+(`dict(row).items` reads `items`) and refuses it unless it is declared, and a
+multi-query template refuses these under every declaration. On a dict built
+from the row, a name that is not a dict method reads a field, so
+`dict(row).note()` is refused like `row.note()`. At render, a
+reserved name the configuration check cannot follow fails the row with
+`template_rendering_failed` (`Reserved row name: ...`). With
+`required_input_fields` omitted, a single-query template that uses `row` as a
+whole (`{{ row }}`, `row | dictsort`, `dict(row)`) is refused: its row would
+hold no field.
+
+In a multi-query template, `row` holds the query's `input_fields` variables and
+`row.source_row`, the same view of the row narrowed to `required_input_fields`.
+The same rules apply to reads through `row.source_row`, and a
+`row.source_row.<column>` read must be listed in `required_input_fields`
+itself: an `image_inputs` column is not in `row.source_row`. A query's `row`
+is a plain mapping, so an `input_fields` variable may not be named
+`source_row` or like a mapping method (`items`, `keys`, `values`, `get`,
+`copy`, ...): `row.items` would find the method, not the variable.
+
+The `<response_field>_variables_hash` an LLM node records is the SHA-256 of
+what its template could see: the declared field values (for a query, its
+variables and its `row.source_row`).
+
+**RAG query templates.** A `query_template` on `rag_retrieval` or
+`azure_ai_search` sees `query` (the `query_field` value) and `row`, and the
+rules above apply with one difference: `query_field` is always declared,
+because the node reads it by its own option.
+
+| `required_input_fields` | the query template's `row` holds |
+|---|---|
+| a list, e.g. `[topic]` | those fields and `query_field` |
+| `[]` (the opt-out) | every field of the row |
+| omitted | `query_field` only |
+
+Configuration refuses a literal read outside that set, a computed key, a name
+other than `query` or `row`, and fields declared beyond `query_field` when
+the template never reads `row`; under every declaration it refuses the row
+used as an object, as above. Declare only the fields the query uses: the
+query field needs no declaration.
+
 `provider: azure` adds:
 
 | Option | Type | Required | Default | Description |
@@ -1054,7 +1340,7 @@ Options common to all providers:
 | `deployment_name` | string | **Yes** | — | Azure OpenAI deployment name; also the default `model` |
 | `endpoint` | string | **Yes** | — | Azure OpenAI endpoint URL |
 | `api_key` | string | **Yes** | — | Azure OpenAI API key |
-| `api_version` | string | No | `2024-10-21` | Azure API version |
+| `api_version` | string | No | `2024-10-21` | Azure API version. A dated version must be `2024-09-01-preview` or later — the first to define `max_completion_tokens`, which the provider always sends |
 | `tracing` | mapping | No | (none) | Optional plugin-internal tracing (`langfuse` or `azure_ai`) |
 
 `provider: bedrock` adds:
@@ -1122,8 +1408,15 @@ Each `output_fields` entry:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `suffix` | string | **Yes** | Column suffix; the output column is `<query_name>_<suffix>` |
-| `type` | `string` \| `integer` \| `number` \| `boolean` \| `enum` | **Yes** | Declared type, enforced against the response |
+| `type` | `string` \| `integer` \| `number` \| `boolean` \| `enum` | **Yes** | Declared type, enforced against the response and declared as the output column's row type |
 | `values` | list of strings | For `enum` only | Allowed values; required for `enum` and rejected for every other type |
+
+Each `type` is bound to one row type, which is the output column's declared
+type downstream: `integer` → int, `number` → float, `boolean` → bool,
+`string` and `enum` → str. JSON has one number type, so the response is parsed
+into that type: an `integer` returned as `5.0` arrives as `5` (a non-integral
+value such as `3.5` fails the row), and a `number` returned as `7` arrives as
+`7.0`. A boolean is never accepted as a number.
 
 A per-query `template` may not contain `{{interpretation:...}}` tokens —
 interpretation review rewrites only the node-level `prompt_template`, so a token
@@ -1209,6 +1502,7 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | `batch_stats` | Compute statistics over a batch, optionally one row per `group_by` value |
 | `batch_replicate` | Batch deaggregation; configure as an aggregation with `output_mode: transform` |
 | `batch_distribution_profile` | Numeric-only batch distribution statistics; use `batch_top_k` for categorical counts/frequencies |
+| `batch_rank` | Add each row's rank and percentile of a numeric field within its batch, keeping every row; the batch plugin `output_mode: passthrough` accepts |
 | `report_assemble` | Assemble a batch of text rows into one report/text row with pagination metadata |
 | `web_scrape` | HTML content extraction with SSRF prevention |
 | `llm` | Unified LLM transform (azure/openrouter/bedrock providers, single/multi-query) |
@@ -1219,14 +1513,35 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | `aws_textract_document_analysis` | Extract text, tables, forms, and layout from S3-hosted documents through Amazon Textract |
 | `aws_textract_inline_analysis` | Synchronously analyze payload-store documents (managed blobs) through Amazon Textract `AnalyzeDocument` |
 | `pdf_rasterize` | Render each page of a payload-store PDF into a PNG payload, one output row per page — the on-ramp for multipage PDFs into `aws_textract_inline_analysis` |
-| `rag_retrieval` | Enriches rows with retrieval-augmented context from search providers |
+| `azure_ai_search` | Azure RAG: enriches rows with ranked, cited context from an existing Azure AI Search index ([example](../../examples/azure_search_rag/README.md)) |
+| `rag_retrieval` | Enriches rows with retrieval-augmented context from a Chroma collection |
 | `reference_join` | Add named fields to a row by matching one of its values against a key in a reference table bound as configuration (`reference_file` on the CLI, an `inline_content` blob on the web) — fixed at run start, never read at row time |
 
 ### AWS Bedrock LLM
 
-Bedrock uses LiteLLM with the ordinary AWS default credential chain. On ECS,
-grant Bedrock permissions to the task role; do not put access keys in plugin
-configuration.
+Bedrock uses LiteLLM. With no credential option set it authenticates through
+the ordinary AWS default credential chain — on ECS, grant Bedrock permissions
+to the task role and configure no keys at all. That remains the recommended
+deployment shape.
+
+Where a task role is not available, the `bedrock` provider (on both the `llm`
+transform and the `llm` source) accepts exactly one explicit credential:
+
+| Option | Meaning |
+| ------ | ------- |
+| `api_key` | An Amazon Bedrock API key, sent as a bearer token. Mutually exclusive with the three options below. |
+| `aws_access_key_id`, `aws_secret_access_key` | A static IAM credential pair; required together. |
+| `aws_session_token` | Optional; only alongside the pair, for temporary credentials. |
+
+Supply these as references, never literals: `${AWS_BEARER_TOKEN_BEDROCK}`
+expansion in batch/CLI settings, or a `{secret_ref: NAME}` marker in the web
+Composer (each destination must be authorised by
+`ELSPETH_WEB__SECRET_WIRING_ALLOWLIST`). Credential values are fingerprinted,
+never stored, and never enter the recorded LLM call. A value beginning
+`os.environ/` is refused. See
+[LLM profiles](environment-variables.md) for the profile form, which supports
+the API key only, and for the caveat that a process-level
+`AWS_BEARER_TOKEN_BEDROCK` takes precedence over IAM signing.
 
 ```yaml
 transforms:
@@ -1813,7 +2128,7 @@ aggregations:
     plugin: batch_stats
     input: enriched
     on_success: output
-    on_error: discard           # Sink name for batch errors, or 'discard'
+    on_error: discard           # Sink for every row of a failed batch, or 'discard'
     trigger:
       count: 100              # Fire after 100 rows
       timeout_seconds: 3600   # Or after 1 hour
@@ -1833,8 +2148,8 @@ aggregations:
 | `plugin` | string | **Yes** | Aggregation plugin name |
 | `input` | string | **Yes** | Connection name to receive data from |
 | `on_success` | string | No | Where successful output rows go (sink name or connection name) |
-| `on_error` | string | **Yes** | Sink name for rows that fail batch processing, or `discard` |
-| `trigger` | object | **Yes** | When to flush the batch |
+| `on_error` | string | **Yes** | Where the rows of a FAILED batch go. A batch fails as a whole: when the batch transform returns an error, EVERY buffered row is written to this sink with its original values (each recorded `on_error_routed` with the batch reason), or with `discard` each row is recorded quarantined without being written. A plugin contract violation raised before the flush records anything (for example a buffered row that fails the aggregation's typed `schema`) fails the batch the same way; any other exception the batch transform raises still aborts the run. |
+| `trigger` | object | No | When to flush the batch early; omit for end-of-source only |
 | `output_mode` | string | No | `passthrough` or `transform` (default: `transform`) |
 | `expected_output_count` | int | No | For `transform` mode: validate output row count |
 | `options` | object | No | Plugin-specific configuration |
@@ -1862,9 +2177,17 @@ aggregations:
 
 Omit `trigger` to emit a single report covering all source rows at end-of-source.
 
+`report_assemble` is aggregation-only. Its pagination fields come from the
+aggregation flush window, and a collector's end-of-group flush has no window, so
+`elspeth validate` refuses it under `collectors:`. It also refuses any
+batch-aware plugin under `transforms:`, because a batch plugin processes a list
+of rows and cannot run one row at a time.
+
 ### Trigger Configuration
 
-At least one trigger type is required:
+Every trigger type is optional. Configure any combination for early flushes, or
+omit `trigger` (or use `{}`) to flush only at end of source, which is always
+checked:
 
 | Trigger | Type | Description |
 |---------|------|-------------|
@@ -1890,7 +2213,21 @@ trigger:
 | Mode | Behavior |
 |------|----------|
 | `transform` | Batch applies transform function to produce results (default) |
-| `passthrough` | Batch releases all accepted rows unchanged |
+| `passthrough` | Each buffered row continues as its own token, carrying the row the plugin returned for it |
+
+`passthrough` carries only a plugin whose flush emits exactly one row per
+buffered row, in order (the plugin class declares
+`flush_emits_one_row_per_buffered_row`). One shipped batch plugin does:
+`batch_rank`, which adds each row's rank and percentile within the batch and
+emits every buffered row, an unranked one (null or non-finite value) included
+([example](../../examples/batch_rank_passthrough/README.md)). Every other
+shipped batch plugin reduces the batch (`batch_stats`, `report_assemble`, …),
+replicates rows (`batch_replicate`) or skips rows (`batch_outlier_annotator`
+skips a null or non-finite value), so `elspeth validate` and the composer
+refuse it under `passthrough`, with "Use output_mode: transform".
+A plugin that declares the capability and then returns another shape is a
+plugin bug: every row of the batch is recorded failed and the run aborts
+(exit 4).
 
 For N→1 aggregation (e.g., computing statistics), use `transform` mode with `expected_output_count: 1` to validate cardinality.
 
@@ -1957,7 +2294,7 @@ When `merge: union` is used and two or more branches emit the same field name, `
 |-------|----------|
 | `last_wins` *(default)* | The last branch in declaration order wins. Matches the historical behavior of union merges. |
 | `first_wins` | The first branch in declaration order wins. |
-| `fail` | Raise `CoalesceCollisionError` the moment any field collides. No merged row is produced. Field origins and contributing branch names are still written to the failed node state. |
+| `fail` | Any field two arriving branches both carry fails that row's merge group: no merged row is produced, each consumed branch row is recorded `FAILED` with the closed reason `union_field_collision`, and field origins and contributing branch names are written to each failed node state. The run continues with the next row. A collision that is certain from config — every merge the arrival policy can perform sees two branches that both *guarantee* the same field (for example fields a `fixed` source forwards on every branch) — is refused at build, before any row is read. |
 
 > **Note on `fail`:** Collision detection is **name-based**, not value-based. Two branches that both emit a field called `id` with the *same* value still trigger `fail` — the executor does not compare values to decide whether the overlap is "real." If your branches share trivially-identical fields (like an `id` carried unchanged through both transforms), use `last_wins` or `first_wins` instead, or rename the shared fields out of one branch.
 
@@ -1981,7 +2318,7 @@ coalesce:
       - entity_path
     policy: require_all          # branch-level arrival policy
     merge: union
-    union_collision_policy: fail  # field-level collision policy — abort on overlap
+    union_collision_policy: fail  # field-level collision policy — fail the row's group on overlap
     on_success: output
 ```
 
@@ -2090,6 +2427,7 @@ landscape:
     sink: audit_archive
     format: json
     signing_mode: hmac_sha256
+    authentication_policy: required
     signer_key_id: audit-export-2026-q3-v1
     signing_secret_ref: ELSPETH_AUDIT_EXPORT_SIGNING_KEY
     signer_rotation_policy: multi_version
@@ -2134,7 +2472,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 38
+### Landscape schema epoch 49
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -2181,16 +2519,50 @@ longer covers `recorded_at`. Events are stamped from database time, which is
 whole-second on SQLite and one shared transaction timestamp on PostgreSQL, so
 `(recorded_at, event_id)` tied and replayed in hash order, and two identical
 transitions of one work item inside one second collided on the old primary
-key. See the
+key. Epoch 39 adds immutable web run-start permit binding and recoverable
+pre-effect admission state. Epoch 40 adds nullable call token measures and
+quota-policy/secret-wiring admission evidence in the same prepared window as
+Sessions epoch 55. Epoch 41 replaces the fallback-template digest with the
+approved prompt artifact anchor, paired with session epoch 57. Epoch 42 requires
+admission evidence v2 with token quota usage and limits; its decoder rejects
+stored v1 evidence, requiring recreation even with an unchanged table layout.
+Epoch 43 gives every digest column a shape CHECK, paired with session epoch 63;
+SQLite ignores a declared `VARCHAR` width, so the width alone admitted any text.
+Epoch 44 records run mode and source-run lineage, links replayed calls to their
+source calls, stores verification decisions, and assigns fenced occurrence
+indices to operations created under the run leader. See the
 [sink-effect recovery runbook](../runbooks/sink-effect-recovery.md).
+Epoch 45 adds an immutable collector-group failure verdict per group so the
+run result can count structural failures independently of failed rows. The
+verdict's `failure_reason` is the closed `CollectorGroupFailureReason`
+vocabulary under a CHECK (`ck_collector_group_failures_failure_reason`), and
+each failed member's hold names its `group_id`. A Landscape store created by
+an earlier 0.8.1 pre-release build lacks that CHECK and is refused at startup
+even though it reports epoch 46; recreate it.
+Epoch 46 stores each valid source row's exact contract in `rows.source_contract_json`.
+Replay and verify use that row-level evidence when sparse sources add fields
+after the first row; older Landscape stores must be recreated.
+Epoch 47 gives verification exports an index ordered by run, recorded time,
+and call ID, and indexes node states by run for corrupt verdict ownership
+checks. Populated epoch-46 stores must be recreated.
+Epoch 48 writes a durable PENDING_SINK work item for every source-quarantined
+row in the transaction that records it, so resume re-drives quarantined rows
+like every other sink-bound token and never re-derives a source row. The
+`run_coordination_events.event_type` CHECK admits `resume_refused`, the
+value-free record of a resume refused because an undecided token has no
+covering scheduler work. Epoch-47 stores must be recreated.
+Epoch 49 admits `pending_identities_purged` to the closed authentication audit
+event vocabulary. The explicit administrator purge records the configured
+retention window and the exact identities deleted in each bounded batch.
+Epoch-48 stores must be recreated.
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-38, either automatically at startup or through an operator migration command.
+49, either automatically at startup or through an operator migration command.
 Stop and uninstall the old deployment, archive or export evidence when policy
 requires it, delete/recreate the Landscape database, then reinstall and
 initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
 remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-38 database.
+an older epoch must not be rolled back over an epoch-49 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.
@@ -2244,12 +2616,14 @@ compatibility record rather than relying on a structural probe alone.
 | `enabled` | bool | `false` | Enable audit trail export after run |
 | `sink` | string | - | Sink name to export to (required when enabled) |
 | `format` | string | `csv` | Export format: `csv`, `json` |
-| `signing_mode` | string | `unsigned` | `unsigned` or `hmac_sha256` |
+| `signing_mode` | string | required when enabled | `unsigned` or `hmac_sha256`; disabled export settings retain the `unsigned` model default, while every enabled export must state the decision |
+| `authentication_policy` | string | `optional` | `required` refuses an unsigned export at configuration parsing; `optional` permits an explicitly unsigned export |
 | `signer_key_id` | string | `UNSIGNED` | Credential-free public signer key ID/version recorded in snapshot identity |
 | `signing_secret_ref` | string | - | Exact environment-variable name containing the HMAC key; required for `hmac_sha256` |
 | `signer_rotation_policy` | string | `multi_version` | `multi_version` allows a new signer identity for a new snapshot; `single_export` refuses a different signer identity for the same export lineage |
-| `exporter_version` | string | `landscape-exporter-v1` | Export implementation identity |
-| `serialization_version` | string | `audit-export-v2` | Canonical record serialization identity |
+| `exporter_version` | string | `landscape-exporter-auth-v2` | The only supported closed export format |
+| `compartment_id` | string | required when enabled | Deployment marking matching `[a-z0-9][a-z0-9-]{0,62}`, required for every enabled export, signed or unsigned, including resume. Web execution uses the operator's `WebSettings.compartment_id`, overriding pipeline-authored values; CLI export settings must supply it explicitly |
+| `serialization_version` | string | `audit-export-v3` | Canonical record serialization identity |
 | `chunking_algorithm_version` | string | `record-framing-v1` | Chunk-boundary algorithm identity |
 | `include_raw_error_rows` | bool | `false` | Include bounded raw error rows when policy permits |
 | `total_record_limit` | int | required when enabled | Maximum records derived for one snapshot |
@@ -2266,20 +2640,81 @@ compatibility record rather than relying on a structural probe alone.
 | `content_store.retention_days` | int | required | Retention period |
 | `content_store.durability` | string | required | `fsync` or `replicated` |
 
-Enabled export is deliberately all-explicit: total capacity must fit within
-`chunk_limit × per_chunk_*_limit`, and the spool must already be a private
-directory. Content-store retention never authorizes deletion of referenced
-snapshot objects.
+Auth-v2 binds `compartment_id` into the `audit_export_config.public_config` record and its public configuration hash for every export. With `signing_mode: hmac_sha256`, the marking is also covered by the signed manifest and record signatures. `landscape-exporter-auth-v1` is not accepted for new exports, verification, or resume. The cryptographic derivation algorithm label remains `audit-export-derivation-v1`; it is a separate version domain.
+
+Enabled export is deliberately all-explicit: `signing_mode` must be present,
+total capacity must fit within `chunk_limit × per_chunk_*_limit`, and the spool
+must already be a private directory. Set `authentication_policy: required` in
+deployments where an unsigned export must fail closed before a run starts.
+Content-store retention never authorizes deletion of referenced snapshot
+objects.
 
 **Signing and rotation:** `signer_key_id` is a public, credential-free identity
 that includes the operator's key version. It participates in snapshot identity,
 so rotating a key means selecting a new key ID and secret reference together.
-`multi_version` preserves verification of old snapshots under their recorded
-IDs; `single_export` refuses an identity change within that export lineage.
+`multi_version` preserves verification of prior auth-v2 snapshots under their
+recorded signer IDs; `single_export` refuses an identity change within that
+export lineage.
 The value of `signing_secret_ref` is only the environment variable name. Key
 bytes, secret values, hashes of weak key material, and low-entropy key-derived identifiers
 are never persisted. See [Environment
 Variables](environment-variables.md) for secret provisioning.
+
+### Verify a delivered audit export
+
+`elspeth audit-export verify` is the supported database-independent verifier
+for delivered JSON and CSV exports. It rederives the canonical manifest,
+record chain, chunk boundaries, snapshot identity, content hashes and HMAC
+authentication. A CSV delivery is a directory containing
+`audit_records.v3.jsonl`, `audit_manifest.v2.json`, and one deterministic CSV
+projection per record type; verification authenticates the portable record
+stream and then checks every delivered CSV byte and the exact file set against
+that stream.
+
+The verifier opens each delivered regular file once with no-follow,
+nonblocking semantics, copies it through verifier-owned byte limits into
+private temporary storage, and checks source descriptor and path identity
+during that capture. Parsing, graph derivation, signature checks, and CSV
+projection comparison use only those captured bytes. A successful result
+includes `artifact_digest`: for JSON this is the SHA-256 of the exact captured
+file; for CSV it is the canonical directory-bundle hash binding the sorted
+relative names, content hashes, sizes, and bundle schema.
+
+Success authenticates that private snapshot. It does not freeze, lock, or
+certify the source pathname after capture. A downstream process that later
+reads the source must keep it under stable custody or run verification again
+and require the same `artifact_digest` immediately before use.
+
+Verification requires authentication by default. Map every retained public
+signer ID to the environment variable containing its historical HMAC key:
+
+```bash
+elspeth audit-export verify ./exports/run-123.jsonl \
+  --key-ref audit-export-2026-q2-v1=ELSPETH_AUDIT_EXPORT_2026_Q2_KEY \
+  --key-ref audit-export-2026-q3-v1=ELSPETH_AUDIT_EXPORT_2026_Q3_KEY
+
+elspeth audit-export verify ./exports/run-123-csv \
+  --key-ref audit-export-2026-q3-v1=ELSPETH_AUDIT_EXPORT_2026_Q3_KEY \
+  --json
+```
+
+The verifier reads the signer ID from the authenticated export and resolves
+that exact mapping. It has no current-key fallback. Keep each signer mapping
+and key available for at least as long as exports signed by it are retained;
+duplicate mappings and unknown signer IDs fail closed. Key bytes are read from
+the named environment variables and never accepted on the command line.
+
+For a deliberately unsigned legacy or development export, an operator must opt
+into an integrity-only result:
+
+```bash
+elspeth audit-export verify ./exports/unsigned.jsonl --allow-unsigned
+```
+
+The result says `authenticated: false`. HMAC proves possession of a shared
+secret; it does not provide public-key non-repudiation. Success exits 0,
+verification or input failure exits 1 with a stable result code, and command
+usage errors exit 2.
 
 ### Sink-effect resource and transport bounds
 
@@ -2818,6 +3253,41 @@ retry:
 | `exponential_base` | float | `2.0` | Exponential backoff base |
 
 Delay calculation: `min(initial_delay * base^attempt, max_delay)`
+
+A follower started with `elspeth join` applies these settings too. Admission
+requires the follower's settings to hash equal to the run's, so a transient
+failure is retried the same way whichever process claimed the row, and each
+attempt is recorded as its own node state.
+
+**Retry time and the row's lease.** A row's attempts and backoff waits run
+inside one claim. The claim's lease (300 seconds) is refreshed after an
+attempt only once a heartbeat interval (60 seconds) has passed since the last
+refresh, so a stretch without a refresh can reach almost the heartbeat
+interval plus one attempt plus one backoff wait. Another worker reclaims a live
+worker's row only when a stretch outlasts the lease plus the stall budget
+(300 + 600 seconds). The reclaimed row then runs again from its node under a
+new attempt number, and its external calls are made again, so keep
+`max_delay_seconds` plus your slowest attempt well under 15 minutes.
+`max_delay_seconds` has no upper bound. A follower waiting out a backoff
+notices that its leader has gone or that the run has finished only when the
+wait ends, at most `max_delay_seconds` later.
+
+**An error that is neither retryable nor a row error.** When a transform
+raises something the row did not cause and no retry covers (a plugin bug or
+an ELSPETH failure), the run stops and that row is left without an outcome.
+The run is never recorded as completed over such a row. If the run had
+finished reading its source before it stopped, then after you fix the cause,
+`elspeth resume` processes the row again from the node where its work started,
+under a new attempt number. A row that already has an outcome, including one
+routed to `on_error`, is not processed again. As with a reclaimed row,
+external calls the failed attempt made may be made again.
+
+The source has been read to the end when, for example, the error came after
+an aggregation or collector that holds rows until the end of the source, or on
+an `elspeth join` follower while the leader finished reading. If the source
+was still being read, resume refuses with `source lifecycle is incomplete`,
+because unread source rows may exist. In that case, start a fresh run. See
+[Resume Failed Run](../runbooks/resume-failed-run.md#a-row-raised-an-unexpected-error).
 
 ---
 

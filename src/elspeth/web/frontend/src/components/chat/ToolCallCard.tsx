@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 
 import type { CompositionProposal, CompositionState, ToolCall } from "@/types/api";
 import { Button } from "@/components/ui";
-import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { ArgumentFields, buildProposalDiff, ProposalChanges } from "./ProposalDiff";
+import { proposalEffectLabel } from "./proposalEffectLabel";
+import { proposalBaseChanged } from "./actionableProposals";
 import {
   TOOL_CALL_DESCRIPTIONS,
   describeToolCall,
@@ -57,9 +58,6 @@ interface ToolCallCardProps {
    */
   currentState?: CompositionState | null;
   isStale?: boolean;
-  isBusy?: boolean;
-  onAccept: (proposalId: string) => void;
-  onReject: (proposalId: string) => void;
 }
 
 export function ToolCallCard({
@@ -67,17 +65,14 @@ export function ToolCallCard({
   proposal,
   currentState = null,
   isStale = false,
-  isBusy = false,
-  onAccept,
-  onReject,
 }: ToolCallCardProps) {
-  const [rejectConfirmOpen, setRejectConfirmOpen] = useState(false);
+  const baseChanged = proposal !== null && proposalBaseChanged(proposal, currentState);
   // Fragment-level before/after projection of the proposal against the
   // current pipeline. null = not derivable (unknown tool, malformed args, no
   // state) → structured argument fields render instead. Computed before the
   // no-proposal early return to keep hooks unconditional.
   const diffEntries = useMemo(() => {
-    if (proposal === null || proposal.status !== "pending" || isStale) {
+    if (proposal === null || proposal.status !== "pending" || isStale || baseChanged) {
       return null;
     }
     return buildProposalDiff(
@@ -85,7 +80,7 @@ export function ToolCallCard({
       proposal.arguments_redacted_json,
       currentState,
     );
-  }, [proposal, isStale, currentState]);
+  }, [proposal, isStale, baseChanged, currentState]);
   if (!proposal) {
     // Proposal-less calls carry a server-derived outcome stamped by
     // GET /messages from the Tier-1 tool rows (elspeth-f5e6723133). In
@@ -113,33 +108,42 @@ export function ToolCallCard({
         ? toolCall.applied_state_version
         : null;
     return (
-      <div
-        className={`tool-call-ribbon${outcome ? ` tool-call-ribbon--${outcome}` : ""}`}
-      >
-        <ToolCallInfo
-          toolName={toolCall.function.name}
-          describedById={`tool-call-info-${toolCall.id}`}
-        />
-        <span className="tool-call-ribbon-text">
-          {prefix}: {sentence ?? toolCall.function.name}
-          {qualifier}
-        </span>
-        {sentence !== undefined && (
-          <code className="tool-call-ribbon-name">{toolCall.function.name}</code>
+      <>
+        <div
+          className={`tool-call-ribbon${outcome ? ` tool-call-ribbon--${outcome}` : ""}`}
+        >
+          <ToolCallInfo
+            toolName={toolCall.function.name}
+            describedById={`tool-call-info-${toolCall.id}`}
+          />
+          <span className="tool-call-ribbon-text">
+            {prefix}: {sentence ?? toolCall.function.name}
+            {qualifier}
+          </span>
+          {sentence !== undefined && (
+            <code className="tool-call-ribbon-name">{toolCall.function.name}</code>
+          )}
+          {appliedVersion !== null && (
+            <code
+              className="tool-call-ribbon-version"
+              title={`Pipeline advanced to version ${appliedVersion}`}
+            >
+              v{appliedVersion}
+            </code>
+          )}
+        </div>
+        {outcome === "rejected" && toolCall.rejection !== undefined && (
+          <details className="tool-call-details">
+            <summary>Validation issue</summary>
+            <ul>
+              {toolCall.rejection.guidance.map((guidance) => <li key={guidance}>{guidance}</li>)}
+            </ul>
+          </details>
         )}
-        {appliedVersion !== null && (
-          <code
-            className="tool-call-ribbon-version"
-            title={`Pipeline advanced to version ${appliedVersion}`}
-          >
-            v{appliedVersion}
-          </code>
-        )}
-      </div>
+      </>
     );
   }
 
-  const isPending = proposal.status === "pending";
   const proposalSentence: string | undefined =
     TOOL_CALL_DESCRIPTIONS[proposal.tool_name];
   const headingPrefix =
@@ -173,7 +177,7 @@ export function ToolCallCard({
       </p>
       {proposal.affects.length > 0 && (
         <p className="tool-call-affects">
-          <strong>Affects:</strong> {proposal.affects.join(", ")}
+          <strong>Affects:</strong> {proposal.affects.map(proposalEffectLabel).join(", ")}
         </p>
       )}
       {/* Primary change surface (elspeth-10f76f9250): a before/after diff of
@@ -192,46 +196,13 @@ export function ToolCallCard({
           aria-label="Tool call arguments (scrollable)"
         >{JSON.stringify(proposal.arguments_redacted_json, null, 2)}</pre>
       </details>
+      {baseChanged && !isStale && (
+        <p>This proposal targets an earlier pipeline state. Its arguments are shown without a current-state comparison; the server will check whether it can still be accepted.</p>
+      )}
       {isStale && (
         <p className="tool-call-stale">
           Stale proposal. Ask the composer to rebase or revise this proposal.
         </p>
-      )}
-      {isPending && !isStale && (
-        <div className="tool-call-actions">
-          <Button
-            variant="primary"
-            onClick={() => onAccept(proposal.id)}
-            aria-label={`Accept proposal: ${proposal.summary}`}
-            disabled={isBusy}
-            className="btn-small"
-          >
-            Accept
-          </Button>
-          <Button
-            variant="danger"
-            onClick={() => setRejectConfirmOpen(true)}
-            aria-label={`Reject proposal: ${proposal.summary}`}
-            disabled={isBusy}
-            className="btn-small"
-          >
-            Reject
-          </Button>
-        </div>
-      )}
-      {rejectConfirmOpen && proposal && (
-        <ConfirmDialog
-          title="Reject proposal"
-          message="The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."
-          confirmLabel="Reject proposal"
-          cancelLabel="Keep open"
-          variant="danger"
-          onConfirm={() => {
-            onReject(proposal.id);
-            setRejectConfirmOpen(false);
-          }}
-          onCancel={() => setRejectConfirmOpen(false)}
-        />
       )}
     </article>
   );

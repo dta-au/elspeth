@@ -10,7 +10,7 @@
 // YAML (elspeth-59631ec7f7 ruling).
 // ============================================================================
 
-import type { ReactNode } from "react";
+import type { JSX, ReactNode } from "react";
 
 import { pluginDisplayName } from "./pluginDisplayName";
 

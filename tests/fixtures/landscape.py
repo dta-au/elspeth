@@ -13,6 +13,7 @@ Factory hierarchy:
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -20,20 +21,28 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import event, insert, select
+from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
+from sqlalchemy.engine import Engine, ExecutionContext
+from sqlalchemy.engine.interfaces import ExecuteStyle
+from sqlalchemy.pool import Pool
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.payload_store import PayloadStore
+from elspeth.contracts.results import RowResult
+from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.query_repository import QueryRepository
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
-from elspeth.core.landscape.schema import run_workers_table
+from elspeth.core.landscape.scheduler.work_items import item_from_mapping
+from elspeth.core.landscape.schema import run_workers_table, token_work_items_table
 from tests.fixtures.stores import MockPayloadStore
 
 # Shared default for schema_config across all factory-created nodes
@@ -86,6 +95,74 @@ def expire_worker(engine: Any, worker_id: str, *, seconds_ago: float = 1.0) -> N
     with engine.begin() as conn:
         lapsed = read_landscape_transaction_time(conn) - timedelta(seconds=seconds_ago)
         conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == worker_id).values(heartbeat_expires_at=lapsed))
+
+
+@contextmanager
+def lowered_sqlite_variable_limit(monkeypatch: pytest.MonkeyPatch, limit: int) -> Iterator[None]:
+    """Every SQLite connection opened inside refuses a statement over ``limit`` binds.
+
+    A Landscape statement must not bind a parameter per row, token or item
+    (SQLite refuses above 32,766, PostgreSQL above 65,535). Lowering the ceiling
+    lets a test prove the bound with a few hundred rows: any statement whose
+    bind count grows with the collection is refused by SQLite itself.
+    SQLAlchemy pages its own multi-row INSERTs by the dialect's declared
+    maximum (32,700), so that page is lowered to the same ceiling. Only pools
+    created inside the block are affected.
+    """
+
+    def _lower(dbapi_connection: sqlite3.Connection, _record: object) -> None:
+        dbapi_connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, limit)
+
+    monkeypatch.setattr(SQLiteDialect_pysqlite, "insertmanyvalues_max_parameters", limit)
+    event.listen(Pool, "connect", _lower)
+    try:
+        yield
+    finally:
+        event.remove(Pool, "connect", _lower)
+
+
+@dataclass
+class StatementBinds:
+    """The most parameters one statement execution bound inside ``record_statement_binds``."""
+
+    max_binds: int = 0
+    statement: str = ""
+    executions: int = 0
+
+
+@contextmanager
+def record_statement_binds() -> Iterator[StatementBinds]:
+    """Record the largest bind count of any one statement execution, on every engine, inside the block.
+
+    The dialect-agnostic half of the bind-budget proof: SQLite's ceiling can be
+    lowered (``lowered_sqlite_variable_limit``), PostgreSQL's cannot, so a test
+    asserts on the count recorded here instead. An ``executemany`` counts one
+    row's parameter set (its statement is fixed-size). A SQLAlchemy
+    insertmanyvalues page is not counted: the driver pages it by the dialect's
+    own ceiling, so it cannot outgrow the database. ``executions`` counts the
+    recorded executions, so a caller can prove the listener fired.
+    """
+    seen = StatementBinds()
+
+    def _record(
+        _conn: object, _cursor: object, statement: str, parameters: Any, context: ExecutionContext | None, executemany: bool
+    ) -> None:
+        if context is not None and context.execute_style is ExecuteStyle.INSERTMANYVALUES:
+            return
+        if executemany:
+            binds = max((len(row) for row in parameters), default=0)
+        else:
+            binds = 0 if parameters is None else len(parameters)
+        seen.executions += 1
+        if binds > seen.max_binds:
+            seen.max_binds = binds
+            seen.statement = " ".join(statement.split())[:300]
+
+    event.listen(Engine, "before_cursor_execute", _record)
+    try:
+        yield seen
+    finally:
+        event.remove(Engine, "before_cursor_execute", _record)
 
 
 def expire_lease(engine: Any, work_item_id: str, *, seconds_ago: float = 1.0) -> datetime:
@@ -465,6 +542,67 @@ def leader_coordination_token(factory: RecorderFactory, run_id: str) -> Coordina
     return CoordinationToken(run_id=run_id, worker_id=leader.leader_worker_id, leader_epoch=leader.leader_epoch)
 
 
+def leader_member_token(factory: RecorderFactory, run_id: str) -> WorkerMembershipToken:
+    """Read the current leader's actual worker registration."""
+    leader = leader_coordination_token(factory, run_id)
+    return member_token_for(factory._db.engine, worker_id=leader.worker_id, run_id=run_id)
+
+
+def claim_test_work_item(
+    factory: RecorderFactory,
+    *,
+    member_token: WorkerMembershipToken,
+    token_id: str,
+    node_id: str | None,
+    step_index: int = 0,
+    lease_seconds: int = 300,
+) -> TokenWorkItem:
+    """Claim existing test data through the scheduler for item-scoped audit writes.
+
+    New claims carry an empty audit-fixture payload, not a resumable runtime
+    row. Runtime execution tests must enqueue their real serialized payload.
+    An existing exact claim is verified without renewing or recovering it.
+    """
+    token = factory.query.get_token_for_run(member_token.run_id, token_id)
+    assert token is not None, f"token {token_id!r} does not belong to run {member_token.run_id!r}"
+    row = factory.query.get_row(token.row_id)
+    assert row is not None and row.run_id == member_token.run_id
+    assert row.ingest_sequence is not None
+    with factory._db.engine.connect() as conn:
+        existing = (
+            conn.execute(
+                select(token_work_items_table).where(
+                    token_work_items_table.c.run_id == member_token.run_id,
+                    token_work_items_table.c.token_id == token_id,
+                    token_work_items_table.c.node_id == node_id,
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if existing is None:
+        item = factory.scheduler.enqueue_ready_claimed(
+            member_token=member_token,
+            token_id=token_id,
+            row_id=token.row_id,
+            node_id=node_id,
+            step_index=step_index,
+            ingest_sequence=row.ingest_sequence,
+            row_payload_json="{}",
+            lease_owner=member_token.worker_id,
+            lease_seconds=lease_seconds,
+            lineage_path=token.lineage_path,
+        )
+    else:
+        item = item_from_mapping(existing)
+    assert item.status is TokenWorkStatus.LEASED, f"existing claim is {item.status}, not LEASED"
+    assert item.lease_owner == member_token.worker_id, "existing claim belongs to another worker"
+    assert item.step_index == step_index, "existing claim has a different step index"
+    with fenced_item_transaction(factory._db.engine, member_token=member_token, work_item=item, verb="claim_test_work_item"):
+        pass
+    return item
+
+
 def register_test_worker(
     db: LandscapeDB,
     *,
@@ -556,6 +694,7 @@ def make_recorder_with_run(
     canonical_version: str = "v1",
     payload_store: PayloadStore | None = None,
     leader_worker_id: str | None = None,
+    db: LandscapeDB | None = None,
 ) -> RecorderSetup:
     """Create LandscapeDB + RecorderFactory + run + source node in one call.
 
@@ -579,8 +718,12 @@ def make_recorder_with_run(
         leader_worker_id: Optional registered leader worker identity. Tests that
             drive fenced scheduler claim verbs with a fixed lease owner should
             pass that same value here.
+        db: An existing database to begin the run in, such as a PostgreSQL
+            target for a ``testcontainer`` suite. Defaults to a fresh
+            in-memory SQLite database.
     """
-    db = make_landscape_db()
+    if db is None:
+        db = make_landscape_db()
     factory = make_factory(db, payload_store=payload_store)
 
     # Build kwargs, only passing explicit IDs if provided
@@ -596,7 +739,7 @@ def make_recorder_with_run(
     run = factory.run_lifecycle.begin_run(**begin_kwargs)
 
     register_kwargs: dict[str, Any] = {
-        "run_id": run.run_id,
+        "coordination_token": leader_coordination_token(factory, run.run_id),
         "plugin_name": source_plugin_name,
         "node_type": NodeType.SOURCE,
         "plugin_version": "1.0",
@@ -643,7 +786,7 @@ def register_test_node(
     Returns the node_id for convenience.
     """
     node = data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_token_for(data_flow._db, run_id),
         plugin_name=plugin_name,
         node_type=node_type,
         plugin_version="1.0",
@@ -727,3 +870,60 @@ def assert_stamped_between(
     lower = (start if start.tzinfo is not None else start.replace(tzinfo=UTC)) + offset - tolerance
     upper = (end if end.tzinfo is not None else end.replace(tzinfo=UTC)) + offset + tolerance
     assert lower <= actual_utc <= upper, f"stamp {actual_utc.isoformat()} is outside [{lower.isoformat()}, {upper.isoformat()}]"
+
+
+def ingest_quarantine_row_for_test(
+    factory: RecorderFactory,
+    *,
+    run_id: str,
+    source_node_id: str,
+    row: object,
+    error: str,
+    validation_error_id: str | None = None,
+    sink_name: str = "quarantine_sink",
+    quarantine_edge_id: str | None = None,
+    row_index: int = 0,
+    source_row_index: int = 0,
+    ingest_sequence: int = 0,
+) -> RowResult:
+    """Drive the production fenced source-quarantine ingest against a real Landscape.
+
+    Calls the ONE composition the processor uses (``engine.tokens.
+    ingest_source_quarantine``). Without ``quarantine_edge_id`` it registers a
+    sink node named ``sink_name`` and the source's ``__quarantine__`` DIVERT
+    edge first — the graph the DAG builder records for ``on_validation_failure``.
+    """
+    from elspeth.contracts import RoutingMode
+    from elspeth.contracts.types import NodeID
+    from elspeth.engine.tokens import ingest_source_quarantine
+
+    leader = leader_coordination_token(factory, run_id)
+    if quarantine_edge_id is None:
+        sink = factory.data_flow.register_node(
+            plugin_name=sink_name,
+            node_type=NodeType.SINK,
+            plugin_version="1.0",
+            config={},
+            node_id=f"sink_{sink_name}",
+            schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+            coordination_token=leader,
+        )
+        quarantine_edge_id = factory.data_flow.register_edge(
+            source_node_id, sink.node_id, "__quarantine__", RoutingMode.DIVERT, coordination_token=leader
+        ).edge_id
+    return ingest_source_quarantine(
+        scheduler=factory.scheduler,
+        data_flow=factory.data_flow,
+        execution=factory.execution,
+        coordination_token=leader,
+        source_node_id=NodeID(source_node_id),
+        row_index=row_index,
+        source_row_index=source_row_index,
+        ingest_sequence=ingest_sequence,
+        row=row,
+        validation_error_id=validation_error_id,
+        quarantine_sink=sink_name,
+        quarantine_error=error,
+        quarantine_edge_id=quarantine_edge_id,
+        terminal_step_index=1,
+    )

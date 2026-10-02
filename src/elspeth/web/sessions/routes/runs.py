@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Annotated
 
 from elspeth.web.execution.schemas import RunAccounting, RunAccountingCorruption
 
@@ -22,8 +23,8 @@ from ._helpers import (
     _run_accounting_integrity_http,
     _validate_run_status_accounting_for_list,
     _verify_session_ownership,
-    get_current_user,
     load_run_accounting_for_settings,
+    require_pipeline_user,
     run_sync_in_worker,
 )
 
@@ -37,7 +38,7 @@ def register_run_routes(router: APIRouter) -> None:
     async def list_session_runs(
         session_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> list[RunResponse]:
         """List all runs for a session, newest first."""
         session = await _verify_session_ownership(session_id, user, request)
@@ -140,7 +141,7 @@ def register_run_routes(router: APIRouter) -> None:
         session_id: UUID,
         run_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> RunAuditStoryResponse:
         """Return the Landscape-backed audit story for a run."""
         session = await _verify_session_ownership(session_id, user, request)

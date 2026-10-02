@@ -6,11 +6,19 @@
 // authenticated REST and consumed once by the backend.
 //
 // Close code discrimination:
-//   1000 (normal)   -- run terminal, do NOT reconnect, poll REST
-//   1006 (abnormal) -- network drop, auto-reconnect with backoff
-//   1011 (internal) -- server error, do NOT reconnect, poll REST
-//   4001 (auth)     -- ticket/auth failure, do NOT reconnect, trigger logout
+//   1000 (normal)    -- run terminal, do NOT reconnect, poll REST
+//   1006 (abnormal)  -- network drop, auto-reconnect with backoff
+//   1011 (internal)  -- server defect, do NOT reconnect, poll REST
+//   4001 (auth)      -- ticket/auth failure, do NOT reconnect, trigger logout
 //   4004 (not found) -- run unavailable/not owned, do NOT reconnect
+//   4503 (backend)   -- the run is fine, the server could not read it just
+//                       now; auto-reconnect with backoff exactly as for 1006
+//
+// 1011 and 4503 both mean "the read failed", and the server alone can tell
+// them apart -- a momentary database outage is worth re-opening the socket
+// for, a malformed query or a corrupt row is not. Before 4503 existed both
+// closed 1011 with the same reason string, so no client could distinguish
+// them (polling audit 2026-09-22, finding 1).
 //
 // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (capped).
 // ============================================================================
@@ -25,6 +33,26 @@ import type {
 } from "@/types/index";
 
 /**
+ * Close codes the run-progress WebSocket may send, mirroring
+ * `web/execution/websocket_close.RunStreamCloseCode`. Pinned against it by
+ * `tests/unit/web/execution/test_run_stream_close_codes.py`, which also
+ * requires every member to have its own named `case` arm below -- the
+ * `default` arm reconnects, so a code the client forgot is absorbed silently
+ * and looks exactly like a deliberate decision.
+ *
+ * 1006 is absent on purpose: the browser synthesises it when a connection
+ * dies without a close frame, so no server ever sends it. Its `case` arm is
+ * handled separately and must stay out of this map.
+ */
+export const RUN_STREAM_CLOSE_CODE = {
+  NORMAL: 1000,
+  INTERNAL_ERROR: 1011,
+  AUTH_FAILED: 4001,
+  RUN_UNAVAILABLE: 4004,
+  BACKEND_UNAVAILABLE: 4503,
+} as const;
+
+/**
  * Callback handlers for WebSocket lifecycle events.
  *
  * - onProgress: Non-terminal row count update.
@@ -34,7 +62,17 @@ import type {
  * - onCancelled: Terminal. Pipeline was cancelled.
  * - onFailed: Terminal. Pipeline aborted due to unrecoverable error.
  * - onConnected: Socket opened, including after a reconnect.
- * - onDisconnected: Abnormal close entered the reconnect loop.
+ * - onDisconnected: An abnormal close (1006) or a transient backend failure
+ *   (4503) entered the reconnect loop. The socket owns recovery; the caller
+ *   only reflects the gap in the UI.
+ * - onStreamEnded: Close codes 1000 and 1011. The stream is over and nothing
+ *   will reconnect, yet the run may still be live (a terminal event lost to a
+ *   server-side failure, or a normal close whose terminal event never
+ *   arrived). The caller owns recovery from here — poll GET /api/runs. This is
+ *   deliberately NOT raised for the terminal refusals (4001, 4004), which have
+ *   their own callbacks and for which polling would be pointless, nor for
+ *   4503, where the socket is reconnecting and a REST poll would duplicate
+ *   the recovery the transport is already performing.
  * - onAuthFailure: Close code 4001. Ticket or session auth failed.
  *   Caller should trigger authStore.logout(). No reconnect attempt.
  * - onRunUnavailable: Close code 4004. Run not found or not owned.
@@ -48,6 +86,7 @@ export interface WebSocketCallbacks {
   onFailed: (event: RunEvent, data: RunEventFailed) => void;
   onConnected?: () => void;
   onDisconnected?: () => void;
+  onStreamEnded?: () => void;
   onAuthFailure: () => void;
   onRunUnavailable?: () => void;
 }
@@ -86,13 +125,14 @@ export function connectToRun(
 ): WebSocketConnection {
   let socket: WebSocket | null = null;
   let closed = false;
+  let lastSequence = 0;
   let reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   function buildWsUrl(ticket: string): string {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const host = window.location.host;
-    return `${protocol}//${host}/ws/runs/${runId}?ticket=${encodeURIComponent(ticket)}`;
+    return `${protocol}//${host}/ws/runs/${runId}?ticket=${encodeURIComponent(ticket)}&after_sequence=${lastSequence}`;
   }
 
   function errorStatus(error: unknown): number | null {
@@ -153,17 +193,26 @@ export function connectToRun(
       return;
     }
 
-    socket = new WebSocket(buildWsUrl(ticket));
+    const currentSocket = new WebSocket(buildWsUrl(ticket));
+    socket = currentSocket;
 
-    socket.onopen = (): void => {
-      // Reset backoff on successful connection
-      reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+    currentSocket.onopen = (): void => {
+      if (closed || socket !== currentSocket) return;
       callbacks.onConnected?.();
     };
 
-    socket.onmessage = (messageEvent: MessageEvent): void => {
+    currentSocket.onmessage = (messageEvent: MessageEvent): void => {
+      if (closed || socket !== currentSocket) return;
       const event: RunEvent = JSON.parse(messageEvent.data as string);
+      if (event.event_sequence != null) {
+        if (!Number.isSafeInteger(event.event_sequence) || event.event_sequence < 1) return;
+        if (event.event_sequence <= lastSequence) return;
+      }
       dispatchEvent(event);
+      if (event.event_sequence != null) lastSequence = event.event_sequence;
+      // A handshake can succeed while the backend cannot read a single run
+      // event (4503). Only a delivered event proves this stream is healthy.
+      reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
 
       // Terminal events: stop reconnecting. The server will close
       // the connection with code 1000 after sending a terminal event.
@@ -172,43 +221,60 @@ export function connectToRun(
       }
     };
 
-    socket.onerror = (): void => {
+    currentSocket.onerror = (): void => {
       // The onerror event fires before onclose. Actual handling
       // (reconnect vs. stop) is determined by the close code in onclose.
       // No action needed here beyond the implicit close that follows.
     };
 
-    socket.onclose = (closeEvent: CloseEvent): void => {
-      if (closed) return;
+    currentSocket.onclose = (closeEvent: CloseEvent): void => {
+      if (closed || socket !== currentSocket) return;
+      socket = null;
 
       switch (closeEvent.code) {
-        case 1000:
+        case RUN_STREAM_CLOSE_CODE.NORMAL:
           // Normal closure -- run reached terminal state.
           // Do NOT reconnect. The caller should poll GET /api/runs/{id}
-          // for the final status if they haven't received a terminal event.
+          // for the final status if they haven't received a terminal event,
+          // which is what onStreamEnded hands it the cue to do.
           closed = true;
+          callbacks.onStreamEnded?.();
           return;
 
         case 1006:
-          // Abnormal closure -- network drop or server restart.
+          // Abnormal closure -- network drop or server restart. Browser
+          // synthesised: no server sends 1006, which is why it is the one
+          // arm here with no RUN_STREAM_CLOSE_CODE member.
           // Auto-reconnect with exponential backoff.
           scheduleReconnect();
           return;
 
-        case 1011:
-          // Internal error -- server-side failure.
-          // Do NOT reconnect. The caller should poll REST for status.
-          closed = true;
+        case RUN_STREAM_CLOSE_CODE.BACKEND_UNAVAILABLE:
+          // The run is fine; this server could not read it just now. Treat it
+          // exactly like 1006 and reconnect. A ticket mint during the same
+          // outage fails too, but connect() re-schedules on any non-401/404
+          // ticket rejection, so the backoff ladder survives it.
+          scheduleReconnect();
           return;
 
-        case 4001:
+        case RUN_STREAM_CLOSE_CODE.INTERNAL_ERROR:
+          // Server defect -- an integrity or accounting refusal, or a backend
+          // failure no reconnect can clear. Do NOT reconnect: re-opening
+          // re-runs the same failing read. The run itself may still be
+          // advancing, so hand recovery to the caller's REST poll rather than
+          // leaving the stream silently dead.
+          closed = true;
+          callbacks.onStreamEnded?.();
+          return;
+
+        case RUN_STREAM_CLOSE_CODE.AUTH_FAILED:
           // Auth failure -- ticket invalid/expired or session auth failed.
           // Do NOT reconnect. Trigger logout to redirect to LoginPage.
           closed = true;
           callbacks.onAuthFailure();
           return;
 
-        case 4004:
+        case RUN_STREAM_CLOSE_CODE.RUN_UNAVAILABLE:
           // Run unavailable -- not found or not owned by this user.
           // Do NOT reconnect. Surface the unavailable run to the caller.
           closed = true;

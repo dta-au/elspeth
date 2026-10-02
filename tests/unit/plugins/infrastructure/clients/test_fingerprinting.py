@@ -9,6 +9,8 @@ Covers all branches exhaustively per the spec:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import urllib.parse
 from unittest.mock import patch
@@ -172,6 +174,42 @@ class TestFingerprintHeaders:
         result = fingerprint_headers({})
         assert result == {}
 
+    def test_configured_row_header_requires_key_outside_dev_mode(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k not in ("ELSPETH_FINGERPRINT_KEY", "ELSPETH_ALLOW_RAW_SECRETS")}
+        with patch.dict(os.environ, env, clear=True), pytest.raises(FrameworkBugError, match="ELSPETH_FINGERPRINT_KEY"):
+            fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
+
+    @pytest.mark.parametrize("allow_raw", ["false", "true"])
+    def test_configured_row_header_hmac_binds_value_without_exposure(self, allow_raw: str) -> None:
+        env = dict(os.environ)
+        env["ELSPETH_FINGERPRINT_KEY"] = "test-key-for-fingerprinting"
+        env["ELSPETH_ALLOW_RAW_SECRETS"] = allow_raw
+        with patch.dict(os.environ, env, clear=True):
+            first = fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
+            second = fingerprint_headers({"Accept-Language": "en-NZ"}, force_fingerprint_names=frozenset({"accept-language"}))
+            repeated = fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
+            os.environ["ELSPETH_FINGERPRINT_KEY"] = "different-test-fingerprint-key"
+            changed_key = fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
+        expected = hmac.new(b"test-key-for-fingerprinting", b"en-AU", hashlib.sha256).hexdigest()
+        assert first["Accept-Language"] == f"<fingerprint:{expected}>"
+        assert repeated == first
+        assert first != second
+        assert first != changed_key
+        assert "en-AU" not in str(first)
+
+    @pytest.mark.parametrize("key", [None, ""])
+    @pytest.mark.parametrize("value", ["0000", "0001"])
+    @pytest.mark.parametrize("name", ["X-Requested-With", "Authorization"])
+    def test_configured_header_dev_mode_requires_hmac_key(self, key: str | None, value: str, name: str) -> None:
+        """Development mode must not expose enumerable values through an unkeyed hash."""
+        env = {k: v for k, v in os.environ.items() if k != "ELSPETH_FINGERPRINT_KEY"}
+        env["ELSPETH_ALLOW_RAW_SECRETS"] = "true"
+        if key is not None:
+            env["ELSPETH_FINGERPRINT_KEY"] = key
+        with patch.dict(os.environ, env, clear=True), pytest.raises(FrameworkBugError, match="ELSPETH_FINGERPRINT_KEY") as error:
+            fingerprint_headers({name: value}, force_fingerprint_names=frozenset({name.casefold()}))
+        assert value not in str(error.value)
+
 
 class TestFilterResponseHeaders:
     """Branch coverage for filter_response_headers()."""
@@ -218,6 +256,25 @@ class TestFilterResponseHeaders:
         assert "password" not in persisted
         assert "!!!!" not in persisted
         assert "FRAGMENT_SECRET" not in persisted
+
+    def test_link_header_preserves_simple_page_links_for_replay(self) -> None:
+        link = '</search?SearchText=Acme&page=2>; rel="next", </search?SearchText=Acme&page=3>; rel="last"'
+        assert filter_response_headers({"Link": link}) == {"Link": link}
+
+    @pytest.mark.parametrize(
+        "link",
+        [
+            '<https://example.test/search?token=RAW_SECRET>; rel="next"',
+            '<https://example.test/search?page=2>; rel="next"; title="RAW_SECRET"',
+            '<https://user:RAW_SECRET@example.test/search?page=2>; rel="next"',
+            '<https://example.test/search?page=2#RAW_SECRET>; rel="next"',
+            '<https://example.test/search?cursor=RAW_SECRET>; rel="next"',
+        ],
+    )
+    def test_link_header_redacts_non_replay_safe_values(self, link: str) -> None:
+        result = filter_response_headers({"Link": link})
+        assert result == {"Link": "<redacted-http-link>"}
+        assert "RAW_SECRET" not in str(result)
 
 
 class TestFingerprintQueryBounds:

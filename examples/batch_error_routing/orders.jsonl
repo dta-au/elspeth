@@ -1,0 +1,12 @@
+{"order_id": "A-001", "region": "north", "amount": 120}
+{"order_id": "A-002", "region": "south", "amount": 85}
+{"order_id": "A-003", "region": "east", "amount": 240}
+{"order_id": "A-004", "region": "west", "amount": 60}
+{"order_id": "A-005", "region": "north", "amount": 310}
+{"order_id": "A-006", "region": "south", "amount": 95}
+{"order_id": "A-007", "region": "east", "amount": 150}
+{"order_id": "A-008", "region": "west", "amount": "1,250.00"}
+{"order_id": "A-009", "region": "north", "amount": 70}
+{"order_id": "A-010", "region": "south", "amount": 205}
+{"order_id": "A-011", "region": "east", "amount": 130}
+{"order_id": "A-012", "region": "west", "amount": 45}

@@ -28,9 +28,10 @@ if TYPE_CHECKING:
     from elspeth.contracts.contexts import LifecycleContext, SinkContext, SourceContext, TransformContext
     from elspeth.contracts.data import PluginSchema
     from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
+    from elspeth.contracts.field_spelling import SourceFieldRenames
     from elspeth.contracts.plugin_assistance import PluginAssistance
     from elspeth.contracts.results import SourceRow, TransformResult
-    from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+    from elspeth.contracts.schema_contract import OutputFieldDeclaration, PipelineRow, SchemaContract
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.contracts.sink_effects import (
         ResolvedSinkEffectMode,
@@ -203,6 +204,18 @@ class SourceProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
     # whose observed values carry format-native types (json, database) stay
     # None. Consumed by resolve_guaranteed_field_type's structural source arm.
     observed_value_type: ClassVar[str | None]
+
+    # The renames this source applies: its validated ``field_mapping`` and what
+    # it matches the mapping keys against — the normalized external name
+    # (headered CSV, JSON object keys, Dataverse attributes) or, for headerless
+    # CSV, the configured column name as written. Rows are keyed by
+    # ``mapping.get(k, k)`` (``resolve_field_names``), so a declaration whose
+    # ``k`` this source renames names the rename TARGET. Read by the field-name
+    # spelling rule's build-time resolution
+    # (``contracts.field_spelling.FieldNameResolution.of_source``) on
+    # both the DAG builder and the Web Composer's source probe.
+    @property
+    def field_renames(self) -> "SourceFieldRenames": ...
 
     # Plugin-computed output contract, recorded by
     # BaseSource._initialize_declared_guaranteed_fields(). The DAG builder
@@ -393,6 +406,16 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # placement unless they explicitly set this True.
     supports_row_mode_when_batch_aware: bool
 
+    # True when the plugin reads ``ctx.aggregation_batch``, which only an
+    # aggregation flush supplies; runtime_factory refuses it as a collector.
+    requires_aggregation_batch_context: bool
+
+    # True when every successful flush emits exactly one row per buffered row
+    # (success_multi, buffered order, no quarantined_indices): the only shape
+    # output_mode: passthrough carries. runtime_factory and the composer refuse
+    # a passthrough aggregation of a plugin that does not declare it.
+    flush_emits_one_row_per_buffered_row: bool
+
     # Token creation flag for deaggregation
     # When True, process() may return TransformResult.success_multi(rows)
     # and new tokens will be created for each output row.
@@ -417,6 +440,27 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # through the named subtraction; a fixed contract is a firewall.
     forwards_input_fields: bool
     removed_input_fields: frozenset[str]
+
+    # Identity-carrying renames (field-name spelling rule): source spelling ->
+    # new name, for every field process() moves to a new key while its output
+    # contract carries the field's recorded original name onto that key
+    # (``narrow_contract_to_output(renamed_fields=...)``), so a lookup of any
+    # spelling of the old field reads the new one. The source is a LOOKUP
+    # (it may be a header spelling). Read by the build-time name resolution
+    # (``FieldNameResolution.then_renamed``) in the DAG validator and the Web
+    # Composer's mirror; empty for a transform that renames nothing.
+    renamed_input_fields: Mapping[str, str]
+
+    # Header-spelled row lookups (field-name spelling rule): literal ->
+    # declared field for every row lookup the node makes by a spelling other
+    # than the field it declares (a template's row['Name'] under
+    # required_input_fields [name], a multi-query input_fields column).
+    # Configuration admits such a lookup because a row may carry the field
+    # under that spelling; the build and the Web Composer refuse one no
+    # arriving row can resolve (``field_spelling.unreachable_spelled_lookups``:
+    # a field a transform upstream created fresh records only its own name).
+    # Empty for a node that looks every field up by its declared name.
+    header_spelled_lookups: Mapping[str, str]
 
     # Value-preservation declaration (elspeth-e6e552ce34). The presence flags
     # above say which fields survive; this one says the plugin never CHANGES a
@@ -447,10 +491,45 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # Fields the transform requires to be present AND string-valued on every
     # arriving row, failing the row closed otherwise. Set at construction by
     # the text-scanning family from their own scan-field options; empty
-    # frozenset for everything else. Consumed only at build time by
-    # validate_transform_string_typed_input_fields — there is no runtime
-    # dispatch, the plugins enforce the contract in their own process paths.
+    # frozenset for everything else. The type claim is consumed only at build
+    # time by validate_transform_string_typed_input_fields — there is no
+    # runtime type dispatch, the plugins enforce it in their own process
+    # paths. The names are also read declarations (declared_read_fields), so
+    # the field-name spelling rule governs them.
     declared_string_input_fields: frozenset[str]
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        """Names this transform declares it reads from an arriving row (field-name spelling rule).
+
+        See ``BaseTransform.declared_read_fields``; ``contracts.field_spelling``
+        is the rule.
+        """
+        ...
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        """Names this transform declares it writes as fields of its own (field-name spelling rule).
+
+        See ``BaseTransform.declared_created_fields``.
+        """
+        ...
+
+    def output_field_declarations(self) -> dict[str, "OutputFieldDeclaration"]:
+        """The ADR-050 stamp table: every stamped field's declared contract and its declarer.
+
+        See ``BaseTransform.output_field_declarations``. The DAG build
+        publishes it on ``NodeInfo.output_field_declarations``.
+        """
+        ...
+
+    def carried_output_sources(self) -> dict[str, str]:
+        """Each carried output name mapped to the input field whose value it copies.
+
+        See ``BaseTransform.carried_output_sources``. The DAG build publishes
+        it on ``NodeInfo.carried_output_sources``.
+        """
+        ...
 
     # Runtime preflight opt-in. The orchestrator checks this explicit flag
     # instead of probing for optional methods, preserving a closed lifecycle
@@ -625,6 +704,16 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # placement unless they explicitly set this True.
     supports_row_mode_when_batch_aware: bool
 
+    # True when the plugin reads ``ctx.aggregation_batch``, which only an
+    # aggregation flush supplies; runtime_factory refuses it as a collector.
+    requires_aggregation_batch_context: bool
+
+    # True when every successful flush emits exactly one row per buffered row
+    # (success_multi, buffered order, no quarantined_indices): the only shape
+    # output_mode: passthrough carries. runtime_factory and the composer refuse
+    # a passthrough aggregation of a plugin that does not declare it.
+    flush_emits_one_row_per_buffered_row: bool
+
     # Token creation flag for deaggregation
     # When True, process() may return TransformResult.success_multi(rows)
     # and new tokens will be created for each output row.
@@ -643,6 +732,16 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # input field even though whole rows may be dropped.
     forwards_input_fields: bool
     removed_input_fields: frozenset[str]
+
+    # Identity-carrying renames (field-name spelling rule). See
+    # TransformProtocol above for the contract; every batch-aware conformer
+    # inherits BaseTransform's empty default (none renames a field).
+    renamed_input_fields: Mapping[str, str]
+
+    # Header-spelled row lookups (field-name spelling rule). See
+    # TransformProtocol above for the contract; every batch-aware conformer
+    # inherits BaseTransform's empty default (none renders a row template).
+    header_spelled_lookups: Mapping[str, str]
 
     # Value-preservation declaration (elspeth-e6e552ce34). See
     # TransformProtocol above for the contract. The two protocols must not
@@ -666,7 +765,8 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # Fail-closed string-scan declaration surface (elspeth-b19dfe41fb).
     # Mirrors TransformProtocol: the batch-aware Azure safety pair populates
     # this from its named `fields` list, and the builder projects it when the
-    # plugin is wired as a row-mode transform. Build-time consumer only.
+    # plugin is wired as a row-mode transform. The type claim has a build-time
+    # consumer only; the names are read declarations (declared_read_fields).
     declared_string_input_fields: frozenset[str]
 
     # Runtime preflight opt-in. The orchestrator checks this explicit flag
@@ -682,6 +782,33 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
         """Return the transform's static output guarantee surface.
 
         See :meth:`TransformProtocol.effective_static_contract`.
+        """
+        ...
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        """Names this batch transform declares it reads from every buffered row (field-name spelling rule).
+
+        See ``BaseTransform.declared_read_fields``. The flush preflight
+        (``engine.executors.batch_contract_validation``) checks every buffered
+        row against it.
+        """
+        ...
+
+    def output_field_declarations(self) -> dict[str, "OutputFieldDeclaration"]:
+        """The ADR-050 stamp table; see :meth:`TransformProtocol.output_field_declarations`."""
+        ...
+
+    def carried_output_sources(self) -> dict[str, str]:
+        """Carried output name -> copied input field; see :meth:`TransformProtocol.carried_output_sources`."""
+        ...
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        """Return the fields every buffered row must carry before ``process`` runs.
+
+        The transform's ``schema.required_fields``, including the columns it
+        folds in from its own options. Batch-only: the flush preflight
+        (``engine.executors.batch_contract_validation``) is its one consumer.
         """
         ...
 
@@ -815,6 +942,15 @@ class SinkProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
     # Sinks that declare required fields have them checked BEFORE write().
     # Empty frozenset = no required-field check = all fields optional.
     declared_required_fields: frozenset[str]
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        """Names this sink declares it reads from an arriving row (field-name spelling rule).
+
+        See ``BaseSink.declared_read_fields``; checked by the build and by
+        ``SinkExecutor`` before the write.
+        """
+        ...
 
     # Write failure routing — injected by runtime_factory from SinkSettings.
     # "discard" = drop failed rows with audit record, else = failsink name.

@@ -14,45 +14,63 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
 type BatchEffectSizeRow = dict[str, object]
 
-_EFFECT_SIZE_OUTPUT_FIELDS = frozenset(
-    {
-        "baseline_count",
-        "baseline_mean",
-        "baseline_missing_count",
-        "baseline_non_finite_count",
-        "baseline_stdev",
-        "baseline_total_count",
-        "baseline_variant",
-        "batch_size",
-        "cohens_d",
-        "hedges_g",
-        "mean_delta",
-        "pooled_stdev",
-        "score_field",
-        "variant",
-        "variant_count",
-        "variant_field",
-        "variant_mean",
-        "variant_missing_count",
-        "variant_non_finite_count",
-        "variant_stdev",
-        "variant_total_count",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050). The
+# field names are configured strings and the counts are ints. The variant
+# labels are the values as they appear in the rows, carried from the data, so
+# they are ``any``. Only int and float scores reach the arithmetic
+# (``_stats_for_group`` fails the batch on any other type), so the means and the
+# delta are true-division floats; a standard deviation is undefined at n=1,
+# the pooled one when both groups are singletons, and Cohen's d / Hedges' g
+# whenever the pooled dispersion is undefined or zero — each is emitted None
+# then, never a fabricated 0.0 (B4.5). The ``*_indices`` lists are written
+# only when a row of that group was skipped (optional) and are lists the
+# schema DSL has no type for.
+_EFFECT_SIZE_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("baseline_count", "int"),
+    FieldDefinition("baseline_mean", "float"),
+    FieldDefinition("baseline_missing_count", "int"),
+    FieldDefinition("baseline_non_finite_count", "int"),
+    FieldDefinition("baseline_stdev", "float", nullable=True),
+    FieldDefinition("baseline_total_count", "int"),
+    FieldDefinition("baseline_variant", "any"),
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("cohens_d", "float", nullable=True),
+    FieldDefinition("hedges_g", "float", nullable=True),
+    FieldDefinition("mean_delta", "float"),
+    FieldDefinition("pooled_stdev", "float", nullable=True),
+    FieldDefinition("score_field", "str"),
+    FieldDefinition("variant", "any"),
+    FieldDefinition("variant_count", "int"),
+    FieldDefinition("variant_field", "str"),
+    FieldDefinition("variant_mean", "float"),
+    FieldDefinition("variant_missing_count", "int"),
+    FieldDefinition("variant_non_finite_count", "int"),
+    FieldDefinition("variant_stdev", "float", nullable=True),
+    FieldDefinition("variant_total_count", "int"),
+    FieldDefinition("baseline_missing_indices", "any", required=False),
+    FieldDefinition("baseline_non_finite_indices", "any", required=False),
+    FieldDefinition("variant_missing_indices", "any", required=False),
+    FieldDefinition("variant_non_finite_indices", "any", required=False),
 )
+_EFFECT_SIZE_OUTPUT_FIELDS = frozenset(field.name for field in _EFFECT_SIZE_CREATED_FIELDS if field.required)
 
 
 @dataclass(frozen=True, slots=True)
 class _VariantStats:
     value: Any
+    # Batch index of the group's first row: the value-free handle an audit
+    # reason uses to name the group (the variant label is row data).
+    first_row_index: int
     total_count: int
     values: tuple[int | float, ...]
     missing_indices: tuple[int, ...]
@@ -115,9 +133,11 @@ class BatchEffectSize(BaseTransform):
     name = "batch_effect_size"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e62f3d946b8a4518"
+    source_file_hash: str | None = "sha256:25b1137eb7c4a6e3"
     config_model = BatchEffectSizeConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = "Use for Cohen's d and Hedges' g comparisons between unpaired numeric variants present in one flushed batch."
     usage_when_not_to_use: str = (
         "Not for hypothesis testing or matched observations: it does not establish statistical significance and is not a paired analysis."
@@ -148,6 +168,7 @@ class BatchEffectSize(BaseTransform):
                 issue_code=None,
                 summary="Computes Cohen's d and Hedges' g between baseline and variant score groups.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_effect_size under aggregations with a trigger; it summarizes complete batch groups.",
                     "variant_field and score_field must differ; baseline_variant defaults to the first-seen variant.",
                     "score_field must be finite numeric data; missing and non-finite scores are counted and may make a group invalid.",
@@ -205,6 +226,10 @@ class BatchEffectSize(BaseTransform):
             audit_fields=None,
         )
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed table above: the same fields on every effect-size row (ADR-050)."""
+        return _EFFECT_SIZE_CREATED_FIELDS
+
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the effect-size output path for the backward invariant."""
         baseline = self._augment_invariant_probe_row(probe, field_name=self._variant_field, value="baseline")
@@ -244,6 +269,7 @@ class BatchEffectSize(BaseTransform):
         groups: list[tuple[Any, list[tuple[int, PipelineRow]]]] = []
         for row_index, row in enumerate(rows):
             variant_value = row[self._variant_field]
+            require_scalar_group_key(variant_value, field=self._variant_field, row_index=row_index)
             for existing_value, grouped_rows in groups:
                 if same_scalar_bucket_value(variant_value, existing_value):
                     grouped_rows.append((row_index, row))
@@ -263,11 +289,20 @@ class BatchEffectSize(BaseTransform):
                 missing_indices.append(row_index)
                 continue
 
+            # type() rather than isinstance() so a bool is rejected, not read as 0/1.
             if type(raw_value) not in (int, float):
-                raise TypeError(
-                    f"Field '{self._score_field}' must be numeric (int or float), "
-                    f"got {type(raw_value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                # BATCH-level failure, not a skip. The missing and non-finite
+                # branches either side skip-and-report deliberately; a wrong
+                # TYPE fails the whole batch (ruling elspeth-d5034647f0) rather
+                # than publishing an effect size over a set the operator never
+                # specified. No coercion: a str that is not a number is not a
+                # number. Raised here because this helper returns values;
+                # `process` converts it to the batch's returned error.
+                raise BatchRowTypeError(
+                    field=self._score_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(raw_value).__name__,
                 )
 
             if type(raw_value) is float and not math.isfinite(raw_value):
@@ -278,6 +313,7 @@ class BatchEffectSize(BaseTransform):
 
         return _VariantStats(
             value=variant_value,
+            first_row_index=grouped_rows[0][0],
             total_count=len(grouped_rows),
             values=tuple(values),
             missing_indices=tuple(missing_indices),
@@ -290,10 +326,14 @@ class BatchEffectSize(BaseTransform):
             row_errors.append({"row_index": row_index, "reason": "missing_value"})
         for row_index in stats.non_finite_indices:
             row_errors.append({"row_index": row_index, "reason": "non_finite_value"})
+        # The group is named by its field and its rows' batch indices, never by
+        # its variant label: the label is row data, and an audit reason records
+        # the row INDEX, never the row body.
         reason: TransformErrorReason = {
             "reason": "validation_failed",
             "cause": "baseline_has_no_finite_scores" if baseline else "variant_has_no_finite_scores",
-            "group_value": stats.value,
+            "group_by": self._variant_field,
+            "field": self._score_field,
             "total_count": stats.total_count,
             "valid_count": 0,
             "skipped_count": stats.missing_count + stats.non_finite_count,
@@ -365,11 +405,17 @@ class BatchEffectSize(BaseTransform):
                 hedges_g = cohens_d * (1 - (3 / hedges_denominator))
                 hedges_g = self._require_finite(hedges_g, operation="hedges_g")
         except OverflowError as exc:
+            # Groups named by the batch index of their first row, not by their
+            # variant labels (row data; see _no_finite_score_error).
             reason: TransformErrorReason = {
                 "reason": "float_overflow",
                 "operation": str(exc) or "effect_size",
-                "group_value": variant.value,
-                "value": str(baseline.value),
+                "group_by": self._variant_field,
+                "field": self._score_field,
+                "error": (
+                    f"overflow comparing the variant group first seen in row {variant.first_row_index} "
+                    f"with the baseline group first seen in row {baseline.first_row_index}"
+                ),
             }
             return {}, TransformResult.error(reason, retryable=False)
 
@@ -407,22 +453,6 @@ class BatchEffectSize(BaseTransform):
 
         return result, None
 
-    def _output_contract_for(self, results: list[BatchEffectSizeRow]) -> SchemaContract:
-        """Build one shared output contract for effect size rows."""
-        field_names = list(dict.fromkeys(key for result in results for key in result))
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,
-                required=False,
-                source="inferred",
-            )
-            for key in field_names
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
-
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext
     ) -> TransformResult:
@@ -434,8 +464,18 @@ class BatchEffectSize(BaseTransform):
         if non_finite_variant_error is not None:
             return non_finite_variant_error
 
-        grouped = self._group_rows(rows)
-        stats_by_variant = [self._stats_for_group(variant_value, grouped_rows) for variant_value, grouped_rows in grouped]
+        try:
+            grouped = self._group_rows(rows)
+            stats_by_variant = [self._stats_for_group(variant_value, grouped_rows) for variant_value, grouped_rows in grouped]
+        except BatchRowTypeError as exc:
+            # The whole batch fails with a recorded, value-free reason naming
+            # the field, the required and found types, and the batch row. The
+            # structural caller owns disposition: an aggregation applies its
+            # declared on_error (AggregationExecutor._complete_error_flush
+            # records the reason; RowProcessor.handle_timeout_flush sends every
+            # buffered row to the on_error sink, or records it discarded), and
+            # a collector turns it into a whole-group failure.
+            return TransformResult.error(exc.as_reason(), retryable=False)
 
         if len(stats_by_variant) < 2:
             return TransformResult.error(
@@ -447,33 +487,30 @@ class BatchEffectSize(BaseTransform):
                 retryable=False,
             )
 
-        if self._baseline_variant is not None and not any(
-            same_scalar_bucket_value(stats.value, self._baseline_variant) for stats in stats_by_variant
-        ):
-            return TransformResult.error(
-                {
-                    "reason": "validation_failed",
-                    "cause": "baseline_variant_missing",
-                    "expected": str(self._baseline_variant),
-                    "message": f"Baseline variant {self._baseline_variant!r} was not present in the batch.",
-                    "errors": [str(stats.value) for stats in stats_by_variant],
-                },
-                retryable=False,
+        if self._baseline_variant is None:
+            # First-seen variant is the baseline.
+            baseline = stats_by_variant[0]
+        else:
+            configured_baseline = next(
+                (stats for stats in stats_by_variant if same_scalar_bucket_value(stats.value, self._baseline_variant)),
+                None,
             )
-
-        baseline_value = self._baseline_variant if self._baseline_variant is not None else stats_by_variant[0].value
-        baseline = next((stats for stats in stats_by_variant if same_scalar_bucket_value(stats.value, baseline_value)), None)
-        if baseline is None:
-            return TransformResult.error(
-                {
-                    "reason": "validation_failed",
-                    "cause": "baseline_variant_missing",
-                    "expected": str(baseline_value),
-                    "message": f"Baseline variant {baseline_value!r} was not present in the batch.",
-                    "errors": [str(stats.value) for stats in stats_by_variant],
-                },
-                retryable=False,
-            )
+            if configured_baseline is None:
+                # `expected` and `message` carry the CONFIGURED baseline, which
+                # is config, not row data. The variants the batch did contain
+                # are row data, so only their count is recorded.
+                return TransformResult.error(
+                    {
+                        "reason": "validation_failed",
+                        "cause": "baseline_variant_missing",
+                        "group_by": self._variant_field,
+                        "expected": str(self._baseline_variant),
+                        "message": f"Baseline variant {self._baseline_variant!r} was not present in the batch.",
+                        "count": len(stats_by_variant),
+                    },
+                    retryable=False,
+                )
+            baseline = configured_baseline
         if baseline.count == 0:
             return self._no_finite_score_error(baseline, baseline=True)
 
@@ -488,7 +525,7 @@ class BatchEffectSize(BaseTransform):
                 return error
             results.append(effect)
 
-        output_contract = self._output_contract_for(results)
+        output_contract = self._batch_output_contract(key for result in results for key in result)
         fields_added = [field.normalized_name for field in output_contract.fields]
         pipeline_rows = [PipelineRow(result, output_contract) for result in results]
 

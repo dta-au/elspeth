@@ -54,6 +54,8 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs.service import content_hash as _content_hash
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
@@ -64,6 +66,7 @@ from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.session_fences import seed_session_operation_fence
 from tests.unit.evals.conftest import _clean_advisor_checkpoint
 
@@ -119,7 +122,7 @@ class _FakeLLMResponse:
     choices: list[_FakeChoice]
 
 
-def _llm_response(content: str | None = None, tool_calls: list[dict[str, Any]] | None = None) -> _FakeLLMResponse:
+def _llm_response(content: str | None = None, tool_calls: list[dict[str, Any]] | None = None) -> _AdmittedLLMCompletion:
     fakes: list[_FakeTC] | None = None
     if tool_calls:
         fakes = [
@@ -132,7 +135,8 @@ def _llm_response(content: str | None = None, tool_calls: list[dict[str, Any]] |
             )
             for tc in tool_calls
         ]
-    return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMsg(content=content, tool_calls=fakes))])
+    response = _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMsg(content=content, tool_calls=fakes))])
+    return _admit_composer_llm_completion(response)
 
 
 # --------------------------------------------------------------------------
@@ -194,6 +198,8 @@ def _session_engine() -> tuple[Any, str, SessionServiceImpl, SessionOperationCon
     session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
+        grant_test_pipeline_user(conn, identity_id="test-user")
         conn.execute(
             sessions_table.insert().values(
                 id=session_id,
@@ -289,10 +295,10 @@ def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bypass real availability check (no API key needed in tests)."""
     from elspeth.web.composer.service import ComposerAvailability
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(**kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=str(kwargs["model"]), provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.fixture(autouse=True)
@@ -319,7 +325,8 @@ def _composer_to_thread_uses_test_worker(monkeypatch: pytest.MonkeyPatch) -> Non
 # source schema to mode=observed; turn 4 claims completion → the mandatory
 # llm_prompt_template interpretation review re-prompts (turn 5) → GREEN. The
 # authored prompt_template now requires an interpretation review, adding a second
-# forced repair turn on top of the schema fix (5 calls / 2 repair turns).
+# forced repair turn on top of the schema fix. A sixth, tools-disabled call
+# explains the pending reviews without spending another repair turn.
 # --------------------------------------------------------------------------
 
 
@@ -380,6 +387,7 @@ class TestCsvClassifierScenario:
                                     "provider": "openrouter",
                                     "model": "anthropic/claude-3.5-sonnet",
                                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                                    "system_prompt": "You classify support tickets by urgency. Return only the urgency label.",
                                     "prompt_template": "Classify {{ row['subject'] }}",
                                     "response_field": "urgency",
                                     "schema": {"mode": "observed"},
@@ -409,14 +417,22 @@ class TestCsvClassifierScenario:
         )
         # Turn 2: claim completion → proof gate fires
         turn2 = _llm_response(content="All set.", tool_calls=None)
-        # Turn 3: repair — switch source schema to observed mode
+        # Turn 3: repair — switch to observed mode while preserving the complete
+        # field guarantee verified from the seeded CSV's only row.
         turn3 = _llm_response(
             content=None,
             tool_calls=[
                 {
                     "id": "call_repair",
                     "name": "patch_source_options",
-                    "arguments": {"patch": {"schema": {"mode": "observed"}}},
+                    "arguments": {
+                        "patch": {
+                            "schema": {
+                                "mode": "observed",
+                                "guaranteed_fields": ["ticket_id", "customer_name", "subject", "body", "received_at"],
+                            }
+                        }
+                    },
                 },
             ],
         )
@@ -446,26 +462,29 @@ class TestCsvClassifierScenario:
                 },
             ],
         )
+        review_reply = "The source schema now preserves all ticket columns. Please review the classifier's model and prompt."
+        turn_review_reply = _llm_response(content=review_reply)
 
         empty = _empty_state()
         # NOTE: _runtime_preflight is deliberately NOT patched. An always-pass
         # patch would mask the truth that a model-bearing pipeline ends compose()
         # at is_valid=false (reviews surfaced, pending out-of-loop resolution).
         # The REAL preflight is what makes is_valid honest here.
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            # Five LLM calls / two forced repair turns (Branch B terminal state):
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+            # Six LLM calls / two forced repair turns (Branch B terminal state):
             #   1. set_pipeline (fixed schema omitting four observed columns)
             #   2. claim completion → REPAIR 1 (preflight: schema omits columns)
             #   3. patch_source_options → schema=observed
             #   4. claim completion → REPAIR 2 (orphan gate: llm_model_choice on
             #      'classifier' has no pending review event)
             #   5. request_interpretation_review (llm_model_choice) → pending event
-            #      and immediate terminal user-action handoff. Both interpretation
+            #      and terminal user-action handoff. Both interpretation
             #      reviews (llm_prompt_template auto-surfaced + llm_model_choice
             #      surfaced) are now RESOLVABLE, with zero orphans. The terminal
             #      preflight is invalid-but-pending, so the finalize path SKIPS the
             #      "runtime preflight failed" suffix → clean message, is_valid=false.
-            mock_llm.side_effect = [turn1, turn2, turn3, turn4, turn_surface_model_choice]
+            #   6. tools-disabled explanation of the pending review, not a repair.
+            mock_llm.side_effect = [turn1, turn2, turn3, turn4, turn_surface_model_choice, turn_review_reply]
             result = await service.compose(
                 "Classify these tickets",
                 [],
@@ -477,7 +496,9 @@ class TestCsvClassifierScenario:
 
         # Convergence behaviour: two forced repair turns (schema-mode repair +
         # the orphan-gate repair that surfaces the llm_model_choice review).
-        assert mock_llm.call_count == 5, f"expected 5 LLM calls, got {mock_llm.call_count}"
+        assert mock_llm.call_count == 6, f"expected 6 LLM calls, got {mock_llm.call_count}"
+        assert mock_llm.call_args_list[-1].args[1] == []
+        assert review_reply in result.message
         assert result.repair_turns_used == 2, f"expected 2 repair turns, got {result.repair_turns_used}"
 
         # The terminal state is the honest Branch-B converged shape: a model-
@@ -505,7 +526,7 @@ class TestCsvClassifierScenario:
         scenario = _load_scenario("csv-classifier")
         assistant_messages = [{"role": "assistant", "content": result.message or ""}]
         state_dict = _state_dict_for_scoring(result)
-        verdict = score(scenario, assistant_messages, state_dict)
+        verdict = score(scenario, assistant_messages, state_dict, state_origin="mocked_harness")
 
         assert verdict["verdict"] == "GREEN", (
             f"csv-classifier did not score GREEN. red={verdict['red_reasons']} amber={verdict['amber_reasons']}"
@@ -627,8 +648,8 @@ class TestNumericGateScenario:
         passing_preflight = _passing_preflight()
         empty = _empty_state()
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2]
             result = await service.compose(
@@ -650,6 +671,7 @@ class TestNumericGateScenario:
             scenario,
             [{"role": "assistant", "content": result.message or ""}],
             state_dict,
+            state_origin="mocked_harness",
         )
         assert verdict["verdict"] == "GREEN", (
             f"numeric-gate did not score GREEN. red={verdict['red_reasons']} amber={verdict['amber_reasons']}"
@@ -811,8 +833,8 @@ class TestNumericGateScenario:
         passing_preflight = _passing_preflight()
         empty = _empty_state()
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2, turn3, turn4]
             result = await service.compose(
@@ -833,6 +855,7 @@ class TestNumericGateScenario:
             scenario,
             [{"role": "assistant", "content": result.message or ""}],
             state_dict,
+            state_origin="mocked_harness",
         )
         assert verdict["verdict"] == "GREEN", (
             f"numeric-gate repair flow did not score GREEN. red={verdict['red_reasons']} amber={verdict['amber_reasons']}"
@@ -990,8 +1013,8 @@ class TestUrlTextSmokeScenario:
         passing_preflight = _passing_preflight()
         empty = _empty_state()
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2, turn3, turn4]
             result = await service.compose(
@@ -1010,7 +1033,7 @@ class TestUrlTextSmokeScenario:
         scenario = _load_scenario("url-text-smoke")
         assistant_messages = [{"role": "assistant", "content": result.message or ""}]
         state_dict = _state_dict_for_scoring(result)
-        verdict = score(scenario, assistant_messages, state_dict)
+        verdict = score(scenario, assistant_messages, state_dict, state_origin="mocked_harness")
 
         assert verdict["verdict"] == "GREEN", (
             f"url-text-smoke did not score GREEN. red={verdict['red_reasons']} amber={verdict['amber_reasons']}"
@@ -1153,8 +1176,11 @@ class TestPreflightRepairContinue:
             user_id: str | None = None,
             session_id: str | None = None,
             plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+            *,
+            session_operation_context: SessionOperationContext | None = None,
+            allow_pending_interpretation_placeholders: bool = False,
         ) -> ValidationResult:
-            del user_id, session_id, plugin_snapshot
+            del user_id, session_id, plugin_snapshot, session_operation_context, allow_pending_interpretation_placeholders
             sink_path = state.outputs[0].options.get("path") if state.outputs else None
             if sink_path == _BROKEN_SINK_PATH:
                 return _preflight_invalid_for_placeholder_sink()
@@ -1162,10 +1188,10 @@ class TestPreflightRepairContinue:
 
         empty = _empty_state()
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", side_effect=_content_aware_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", side_effect=_content_aware_preflight),
             patch.object(
-                service,
+                service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
                 new=_clean_advisor_checkpoint,
             ),

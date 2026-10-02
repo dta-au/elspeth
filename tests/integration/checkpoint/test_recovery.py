@@ -27,6 +27,7 @@ from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import insert_crashed_leader_seat, leader_coordination_token, leader_token_for, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
@@ -106,7 +107,7 @@ class TestCheckpointRecoveryIntegration:
         return graph
 
     def test_full_checkpoint_recovery_cycle(self, test_env: dict[str, Any], mock_graph: ExecutionGraph) -> None:
-        """Complete cycle: run -> checkpoint -> crash -> recover -> complete."""
+        """Recovery inspection cycle: run -> checkpoint -> crash -> can_resume -> resume point."""
         checkpoint_mgr = test_env["checkpoint_manager"]
         recovery_mgr = test_env["recovery_manager"]
         db = test_env["db"]
@@ -126,10 +127,6 @@ class TestCheckpointRecoveryIntegration:
         # 4. Get resume point
         resume_point = recovery_mgr.get_resume_point(run_id, mock_graph)
         assert resume_point is not None
-
-        # 5. Get unprocessed rows (setup creates 5 rows 0-4, checkpoint at sequence 2)
-        unprocessed = recovery_mgr.get_unprocessed_rows(run_id)
-        assert len(unprocessed) == 2  # rows 3 and 4
 
     def test_checkpoint_sequence_ordering(self, test_env: dict[str, Any], mock_graph: ExecutionGraph) -> None:
         """Verify checkpoints are ordered by sequence number."""
@@ -260,7 +257,7 @@ class TestCheckpointRecoveryIntegration:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="sha256-rfc8785-v1",
                     status=RunStatus.FAILED,
@@ -281,7 +278,7 @@ class TestCheckpointRecoveryIntegration:
                     node_type=NodeType.TRANSFORM,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="x",
+                    config_hash=fake_sha256("x"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -298,7 +295,7 @@ class TestCheckpointRecoveryIntegration:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="src_x",
+                    config_hash=fake_sha256("src_x"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -310,7 +307,7 @@ class TestCheckpointRecoveryIntegration:
                     source_name="primary",
                     plugin_name="test_source",
                     lifecycle_state="loaded",
-                    config_hash="src_x",
+                    config_hash=fake_sha256("src_x"),
                     schema_json="{}",
                     schema_contract_json=contract_json,
                     schema_contract_hash=contract_hash,
@@ -331,7 +328,7 @@ class TestCheckpointRecoveryIntegration:
                         row_index=i,
                         source_row_index=i,
                         ingest_sequence=i,
-                        source_data_hash=f"hash{i}",
+                        source_data_hash=fake_sha256(f"hash{i}"),
                         created_at=now,
                     )
                 )
@@ -419,7 +416,7 @@ class TestCheckpointTopologyHashAtomicity:
         # Register nodes in database
         schema_config = SchemaConfig(mode="observed", fields=None)
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source",
             plugin_name="test",
             node_type=NodeType.SOURCE,
@@ -429,7 +426,7 @@ class TestCheckpointTopologyHashAtomicity:
             schema_config=schema_config,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="transform_a",
             plugin_name="test",
             node_type=NodeType.TRANSFORM,
@@ -440,15 +437,14 @@ class TestCheckpointTopologyHashAtomicity:
         )
 
         # Create row for checkpoint
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id="source",
             row_index=0,
             data={"test": "data"},
             source_row_index=0,
             ingest_sequence=0,
         )
-        factory.data_flow.create_token(row_id=row.row_id)
 
         # Compute expected hash for current graph state
         # BUG-COMPAT-01: CheckpointManager now uses full topology hash (not upstream-only)
@@ -502,7 +498,7 @@ class TestCheckpointTopologyHashAtomicity:
         # Register source node
         schema_config = SchemaConfig(mode="observed", fields=None)
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source",
             plugin_name="test",
             node_type=NodeType.SOURCE,
@@ -513,15 +509,14 @@ class TestCheckpointTopologyHashAtomicity:
         )
 
         # Create row/token
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id="source",
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        factory.data_flow.create_token(row_id=row.row_id)
 
         with pytest.raises(TypeError, match="draft must be CheckpointDraft"):
             checkpoint_mgr.create_checkpoint(
@@ -600,22 +595,21 @@ class TestResumeCheckpointCleanup:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
             )
 
         # Create row and token
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id="source",
             row_index=0,
             data={"id": 1},
             source_row_index=0,
             ingest_sequence=0,
         )
-        factory.data_flow.create_token(row_id=row.row_id)
 
         # Create checkpoint
         checkpoint = _create_checkpoint(
@@ -701,7 +695,7 @@ class TestCanResumeErrorHandling:
         # Register nodes
         schema_config = SchemaConfig(mode="observed", fields=None)
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source",
             plugin_name="test",
             node_type=NodeType.SOURCE,
@@ -711,7 +705,7 @@ class TestCanResumeErrorHandling:
             schema_config=schema_config,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="transform",
             plugin_name="test",
             node_type=NodeType.TRANSFORM,
@@ -722,10 +716,14 @@ class TestCanResumeErrorHandling:
         )
 
         # Create row/token
-        row = factory.data_flow.create_row(
-            run_id=run.run_id, source_node_id="source", row_index=0, data={}, source_row_index=0, ingest_sequence=0
+        factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
+            source_node_id="source",
+            row_index=0,
+            data={},
+            source_row_index=0,
+            ingest_sequence=0,
         )
-        factory.data_flow.create_token(row_id=row.row_id)
 
         # Mark run as failed
         factory.run_lifecycle.update_run_status(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))

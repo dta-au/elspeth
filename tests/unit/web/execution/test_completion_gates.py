@@ -9,10 +9,20 @@ docs-archive/specs/2026-08-01-composer-completion-gate-persistence-design.md.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
+from elspeth.web.composer.advisor_decision import (
+    AdvisorBlockCause,
+    AdvisorGateBlocked,
+    AdvisorGatePassed,
+    AdvisorSignoffGateFact,
+)
+from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.state import (
     CompositionState,
+    EdgeSpec,
     NodeSpec,
     OutputSpec,
     PipelineMetadata,
@@ -22,13 +32,13 @@ from elspeth.web.execution._validation_ledger import CORE_VALIDATION_CHECK_NAMES
 from elspeth.web.execution.completion_gates import (
     ADVISOR_SIGNOFF_PENDING_DETAIL,
     COMPLETION_GATES_META_KEY,
-    AdvisorSignoffGateFact,
     CompletionGateFacts,
+    advisor_block_covers_unchanged_graph,
     completion_gate_fingerprint,
     completion_gates_meta_from_facts,
-    completion_gates_meta_value,
     merge_completion_gates,
     parse_completion_gates,
+    resolve_completion_gate_facts,
 )
 from elspeth.web.execution.schemas import (
     ADVISOR_SIGNOFF_BLOCKED_CODE,
@@ -46,6 +56,7 @@ from elspeth.web.execution.schemas import (
     ValidationReadinessBlocker,
     ValidationResult,
 )
+from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
 
 # ── Fixture builders ────────────────────────────────────────────────────
 
@@ -150,6 +161,8 @@ def _failed_ledger_result() -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     code=CHECK_PLUGIN_ENABLEMENT,
+                    suggestion=None,
+                    note=None,
                     component_id="source",
                     component_type="source",
                     detail="Plugin enablement failed.",
@@ -179,25 +192,197 @@ def test_stale_graph_completion_advisory_detail_is_evidence_scoped() -> None:
 _BLOCKED_DETAIL = "The advisor sign-off could not be obtained; the pipeline cannot complete."
 
 
-def _signoff_blocked_result() -> ValidationResult:
-    """A green build whose completion is withheld by the advisor gate (R2-F14 shape)."""
-    return ValidationResult(
-        is_valid=True,
+@pytest.mark.parametrize("cause", list(AdvisorBlockCause))
+@pytest.mark.parametrize("changed_graph", [False, True])
+def test_persisted_advisor_fact_preserves_pending_handoff_until_reviews_resolve(cause, changed_graph) -> None:
+    state = _make_state()
+    fact = AdvisorSignoffGateFact(
+        detail=_BLOCKED_DETAIL,
+        suggestion="Review the advisor finding.",
+        for_graph=completion_gate_fingerprint(state),
+        note=None,
+        cause=cause,
+    )
+    persisted = completion_gates_meta_from_facts(CompletionGateFacts(advisor_signoff=fact))
+    reloaded = parse_completion_gates({COMPLETION_GATES_META_KEY: persisted})
+    if changed_graph:
+        state = _make_state(node_options={"operations": [{"target": "y", "expression": "2"}]})
+    handoff = ValidationResult(
+        is_valid=False,
         checks=[],
         errors=[],
         readiness=ValidationReadiness(
             authoring_valid=True,
-            execution_ready=True,
-            completion_ready=False,
+            execution_ready=False,
+            completion_ready=True,
             blockers=[
                 ValidationReadinessBlocker(
-                    code=ADVISOR_SIGNOFF_BLOCKED_CODE,
-                    component_id="pipeline",
-                    component_type="pipeline",
-                    detail=_BLOCKED_DETAIL,
+                    code=INTERPRETATION_REVIEW_PENDING_CODE,
+                    component_id="map_fields",
+                    component_type="transform",
+                    detail="Interpretation review pending.",
+                    suggestion=None,
+                    note=None,
                 )
             ],
         ),
+    )
+    projected = merge_completion_gates(handoff, reloaded, state)
+    assert is_pending_interpretation_handoff(projected)
+    assert projected.readiness == handoff.readiness
+    assert projected.is_valid is False
+    assert projected.errors == handoff.errors
+    assert len(_advisor_checks(projected)) == 1
+    assert _advisor_checks(projected)[0].passed is False
+    assert "completion remains withheld" not in _advisor_checks(projected)[0].detail.lower()
+    assert "cannot complete" not in _advisor_checks(projected)[0].detail.lower()
+    assert merge_completion_gates(projected, reloaded, state) == projected
+    assert completion_gates_meta_from_facts(resolve_completion_gate_facts(reloaded, None, state)) == persisted
+    assert advisor_block_covers_unchanged_graph(reloaded, state, initial_version=state.version) is (
+        cause is AdvisorBlockCause.GRAPH_REJECTED and not changed_graph
+    )
+    # Resolving interpretation reviews does not implicitly clear the advisor.
+    ready = merge_completion_gates(_green_result(), reloaded, state)
+    assert ready.readiness.completion_ready is False
+    assert ready.readiness.execution_ready is True
+    assert [blocker.code for blocker in ready.readiness.blockers] == [ADVISOR_SIGNOFF_BLOCKED_CODE]
+    clean = resolve_completion_gate_facts(reloaded, AdvisorGatePassed(completion_gate_fingerprint(state)), state)
+    assert merge_completion_gates(handoff, clean, state) == handoff
+    assert merge_completion_gates(_green_result(), clean, state).readiness.completion_ready is True
+
+
+def test_advisor_suggestion_survives_reload_and_clears_on_graph_change() -> None:
+    from elspeth.web.composer.advisor_policy import advisor_signoff_pending_validation
+
+    state = _make_state()
+    result = advisor_signoff_pending_validation(
+        _green_result(), reason="unavailable", findings="Model unavailable.", category="other", step_ids=(), note=None
+    )
+    suggestion = (
+        "The advisor model was unavailable after retry; check the advisor model configuration. "
+        "Validation and the advisory review run again on your next message."
+    )
+    assert result.readiness.blockers[0].suggestion == suggestion
+    facts = parse_completion_gates(
+        {COMPLETION_GATES_META_KEY: completion_gates_meta_from_facts(_facts_from_blocked_validation(result, state))}
+    )
+    reloaded = merge_completion_gates(_green_result(), facts, state)
+    assert reloaded.readiness.blockers[0].suggestion == suggestion
+    changed = _make_state(node_options={"operations": [{"target": "y", "expression": "2"}]})
+    assert merge_completion_gates(_green_result(), facts, changed).readiness.blockers[0].suggestion is None
+    clean = parse_completion_gates(
+        {
+            COMPLETION_GATES_META_KEY: completion_gates_meta_from_facts(
+                resolve_completion_gate_facts(facts, AdvisorGatePassed(completion_gate_fingerprint(state)), state)
+            )
+        }
+    )
+    assert merge_completion_gates(_green_result(), clean, state).readiness.blockers == []
+
+
+@pytest.mark.parametrize("value", [7, {}, [], True])
+def test_persisted_advisor_suggestion_rejects_malformed_values(value: object) -> None:
+    with pytest.raises(ValueError, match="suggestion"):
+        parse_completion_gates(
+            {
+                COMPLETION_GATES_META_KEY: {
+                    "schema_version": 2,
+                    "advisor_signoff": {
+                        "cause": "graph_rejected",
+                        "status": "blocked",
+                        "detail": "Review blocked",
+                        "for_graph": "graph",
+                        "note": None,
+                        "suggestion": value,
+                    },
+                }
+            }
+        )
+
+
+def test_persisted_advisor_suggestion_is_required() -> None:
+    with pytest.raises(ValueError, match="suggestion"):
+        parse_completion_gates(
+            {
+                COMPLETION_GATES_META_KEY: {
+                    "schema_version": 2,
+                    "advisor_signoff": {
+                        "cause": "graph_rejected",
+                        "status": "blocked",
+                        "detail": "Review blocked",
+                        "for_graph": "graph",
+                        "note": None,
+                    },
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize("reason", ["flagged_no_repair", "flagged_final_pass", "flagged_unrepairable"])
+def test_advisor_readiness_never_publishes_model_findings(reason: str) -> None:
+    from elspeth.web.composer.advisor_policy import (
+        advisor_signoff_blocked_validation,
+        advisor_signoff_pending_validation,
+        advisor_signoff_unverified_validation,
+    )
+
+    findings = "PRIVATE_PROVIDER_FINDING credential-shaped-content"
+    results = [
+        advisor_signoff_blocked_validation(reason=reason, findings=findings, category="other", step_ids=(), note=None),
+        advisor_signoff_unverified_validation(reason=reason, findings=findings, category="other", step_ids=(), note=None),
+        advisor_signoff_pending_validation(_green_result(), reason=reason, findings=findings, category="other", step_ids=(), note=None),
+    ]
+    for result in results:
+        blocker = result.readiness.blockers[0]
+        assert blocker.suggestion
+        assert findings not in result.model_dump_json()
+        if result.errors:
+            assert blocker.suggestion == result.errors[0].suggestion
+
+
+@pytest.mark.parametrize("reason", ["flagged_no_repair", "flagged_final_pass", "flagged_unrepairable"])
+def test_advisor_note_reaches_only_the_blocker_note_field(reason: str) -> None:
+    """Ruling 2026-09-22 (elspeth-032ec69c41) narrows R2-F13: the advisor's
+    bounded note IS published — in ``blockers[].note`` and nowhere else. The
+    raw ``findings_text`` stays off every surface, note included: the note is
+    the parser's sanitised extract, not the fenced reply."""
+    from elspeth.web.composer.advisor_policy import (
+        advisor_signoff_blocked_validation,
+        advisor_signoff_pending_validation,
+        advisor_signoff_unverified_validation,
+    )
+
+    findings = "PRIVATE_PROVIDER_FINDING credential-shaped-content"
+    note = "The merge step cannot route failures; pick per-branch sinks or a partial-arrival policy."
+    results = [
+        advisor_signoff_blocked_validation(reason=reason, findings=findings, category="error_handling", step_ids=(), note=note),
+        advisor_signoff_unverified_validation(reason=reason, findings=findings, category="error_handling", step_ids=(), note=note),
+        advisor_signoff_pending_validation(
+            _green_result(), reason=reason, findings=findings, category="error_handling", step_ids=(), note=note
+        ),
+    ]
+    for result in results:
+        (blocker,) = [b for b in result.readiness.blockers if b.code == ADVISOR_SIGNOFF_BLOCKED_CODE]
+        assert blocker.note == note
+        assert findings not in result.model_dump_json()
+        # Every surface other than the note field is still free of the words.
+        assert note not in blocker.detail
+        assert note not in (blocker.suggestion or "")
+        assert all(note not in check.detail for check in result.checks)
+        assert all(note not in error.message and note not in (error.suggestion or "") for error in result.errors)
+
+
+def _facts_from_blocked_validation(result: ValidationResult, state: CompositionState) -> CompletionGateFacts:
+    """Bind presentation fields explicitly for read-side projection tests."""
+    (blocker,) = [item for item in result.readiness.blockers if item.code == ADVISOR_SIGNOFF_BLOCKED_CODE]
+    return CompletionGateFacts(
+        AdvisorSignoffGateFact(
+            detail=blocker.detail,
+            suggestion=blocker.suggestion,
+            for_graph=completion_gate_fingerprint(state),
+            note=blocker.note,
+            cause=AdvisorBlockCause.GRAPH_REJECTED,
+        )
     )
 
 
@@ -208,9 +393,11 @@ class TestFingerprint:
     def test_stable_across_identical_graphs(self) -> None:
         assert completion_gate_fingerprint(_make_state()) == completion_gate_fingerprint(_make_state())
 
-    def test_metadata_change_does_not_rotate(self) -> None:
-        renamed = _make_state(metadata=PipelineMetadata(name="Renamed", description="new words"))
-        assert completion_gate_fingerprint(_make_state()) == completion_gate_fingerprint(renamed)
+    @pytest.mark.parametrize("patch", [{"name": "Renamed"}, {"description": "new words"}])
+    def test_reviewed_metadata_change_rotates(self, patch: dict[str, str]) -> None:
+        state = _make_state()
+        changed = state.with_metadata(patch)
+        assert completion_gate_fingerprint(state) != completion_gate_fingerprint(changed)
 
     def test_version_change_does_not_rotate(self) -> None:
         assert completion_gate_fingerprint(_make_state()) == completion_gate_fingerprint(_make_state(version=5))
@@ -224,22 +411,23 @@ class TestFingerprint:
 
 
 class TestWriter:
-    def test_blocked_preflight_produces_fact(self) -> None:
+    def test_blocked_decision_produces_fact(self) -> None:
         state = _make_state()
-        value = completion_gates_meta_value(_signoff_blocked_result(), state)
+        facts = _blocked_facts_for(state)
+        assert facts.advisor_signoff is not None
+        effective = resolve_completion_gate_facts(None, AdvisorGateBlocked(facts.advisor_signoff), state)
+        value = completion_gates_meta_from_facts(effective)
         assert value == {
+            "schema_version": 2,
             "advisor_signoff": {
                 "status": "blocked",
                 "detail": _BLOCKED_DETAIL,
+                "cause": "graph_rejected",
+                "suggestion": None,
                 "for_graph": completion_gate_fingerprint(state),
-            }
+                "note": None,
+            },
         }
-
-    def test_clean_preflight_produces_empty(self) -> None:
-        assert completion_gates_meta_value(_green_result(), _make_state()) == {}
-
-    def test_none_preflight_produces_empty(self) -> None:
-        assert completion_gates_meta_value(None, _make_state()) == {}
 
 
 # ── Tier-1 parse ────────────────────────────────────────────────────────
@@ -249,26 +437,29 @@ class TestParse:
     def test_noncanonical_mapping_cannot_supply_a_persisted_signoff(self) -> None:
         from collections import UserDict
 
-        signoff = UserDict({"status": "blocked", "detail": "d", "for_graph": "f"})
+        signoff = UserDict({"status": "blocked", "detail": "d", "for_graph": "f", "note": None})
         with pytest.raises(ValueError, match="expected a dict"):
-            parse_completion_gates({COMPLETION_GATES_META_KEY: {"advisor_signoff": signoff}})
+            parse_completion_gates({COMPLETION_GATES_META_KEY: {"schema_version": 2, "advisor_signoff": signoff}})
 
     def test_absent_meta_is_none(self) -> None:
         assert parse_completion_gates(None) is None
         assert parse_completion_gates({"repair_turns_used": 0}) is None
 
     def test_empty_mapping_is_no_gates(self) -> None:
-        facts = parse_completion_gates({COMPLETION_GATES_META_KEY: {}})
+        facts = parse_completion_gates({COMPLETION_GATES_META_KEY: {"schema_version": 2}})
         assert facts == CompletionGateFacts(advisor_signoff=None)
 
     def test_roundtrip(self) -> None:
         state = _make_state()
-        meta = {COMPLETION_GATES_META_KEY: completion_gates_meta_value(_signoff_blocked_result(), state)}
+        meta = {COMPLETION_GATES_META_KEY: completion_gates_meta_from_facts(_blocked_facts_for(state))}
         facts = parse_completion_gates(meta)
         assert facts is not None
         assert facts.advisor_signoff == AdvisorSignoffGateFact(
+            cause=AdvisorBlockCause.GRAPH_REJECTED,
             detail=_BLOCKED_DETAIL,
+            suggestion=None,
             for_graph=completion_gate_fingerprint(state),
+            note=None,
         )
 
     @pytest.mark.parametrize(
@@ -276,18 +467,23 @@ class TestParse:
         [
             None,
             "not-a-mapping",
-            {"unknown_gate": {}},
-            {"advisor_signoff": None},
-            {"advisor_signoff": "not-a-mapping"},
-            {"advisor_signoff": {"status": "cleared", "detail": "d", "for_graph": "f"}},
-            {"advisor_signoff": {"status": "blocked", "detail": "", "for_graph": "f"}},
-            {"advisor_signoff": {"status": "blocked", "detail": "d", "for_graph": ""}},
-            {"advisor_signoff": {"status": "blocked", "detail": 7, "for_graph": "f"}},
-            {"advisor_signoff": {"status": "blocked", "detail": "d"}},
+            {"schema_version": 2, "unknown_gate": {}},
+            {"schema_version": 2, "advisor_signoff": None},
+            {"schema_version": 2, "advisor_signoff": "not-a-mapping"},
         ],
     )
     def test_malformed_raises(self, raw: object) -> None:
         with pytest.raises(ValueError, match="Tier 1"):
+            parse_completion_gates({COMPLETION_GATES_META_KEY: raw})
+
+    @pytest.mark.parametrize(
+        ("field", "bad"),
+        [("status", "cleared"), ("detail", ""), ("for_graph", ""), ("detail", 7)],
+    )
+    def test_malformed_signoff_field_raises(self, field: str, bad: object) -> None:
+        envelope = completion_gates_meta_from_facts(_blocked_facts_for(_make_state()))
+        raw = {**envelope, "advisor_signoff": {**envelope["advisor_signoff"], field: bad}}
+        with pytest.raises(ValueError, match=field):
             parse_completion_gates({COMPLETION_GATES_META_KEY: raw})
 
 
@@ -300,23 +496,28 @@ class TestMetaFromFacts:
         the property the recovery-save carry-forward relies on."""
         envelope = {
             COMPLETION_GATES_META_KEY: {
+                "schema_version": 2,
                 "advisor_signoff": {
+                    "cause": "graph_rejected",
                     "status": "blocked",
                     "detail": "The advisor sign-off could not be obtained.",
+                    "suggestion": "Retry advisory review.",
                     "for_graph": "fingerprint-abc",
-                }
+                    "note": None,
+                },
             }
         }
         facts = parse_completion_gates(envelope)
         serialized = completion_gates_meta_from_facts(facts)
+        assert serialized["schema_version"] == 2
         assert serialized == envelope[COMPLETION_GATES_META_KEY]
         assert parse_completion_gates({COMPLETION_GATES_META_KEY: serialized}) == facts
 
     def test_none_facts_serialize_empty(self) -> None:
-        assert completion_gates_meta_from_facts(None) == {}
+        assert completion_gates_meta_from_facts(None) == {"schema_version": 2}
 
     def test_no_signoff_fact_serializes_empty(self) -> None:
-        assert completion_gates_meta_from_facts(CompletionGateFacts(advisor_signoff=None)) == {}
+        assert completion_gates_meta_from_facts(CompletionGateFacts(advisor_signoff=None)) == {"schema_version": 2}
 
 
 # ── Read-side merge ─────────────────────────────────────────────────────
@@ -336,8 +537,11 @@ class TestMerge:
         state = _make_state()
         facts = CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                cause=AdvisorBlockCause.GRAPH_REJECTED,
                 detail=_BLOCKED_DETAIL,
+                suggestion=None,
                 for_graph=completion_gate_fingerprint(state),
+                note=None,
             )
         )
         merged = merge_completion_gates(_green_result(), facts, state)
@@ -359,8 +563,11 @@ class TestMerge:
         current = _make_state(node_options={"operations": [{"target": "y", "expression": "2"}]})
         facts = CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                cause=AdvisorBlockCause.GRAPH_REJECTED,
                 detail=_BLOCKED_DETAIL,
+                suggestion=None,
                 for_graph=completion_gate_fingerprint(blocked_for),
+                note=None,
             )
         )
         merged = merge_completion_gates(_green_result(), facts, current)
@@ -386,6 +593,8 @@ class TestMerge:
                 blockers=[
                     ValidationReadinessBlocker(
                         code="state_exists",
+                        suggestion=None,
+                        note=None,
                         component_id=None,
                         component_type=None,
                         detail="No composition state exists for this session.",
@@ -395,8 +604,11 @@ class TestMerge:
         )
         facts = CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                cause=AdvisorBlockCause.GRAPH_REJECTED,
                 detail=_BLOCKED_DETAIL,
+                suggestion=None,
                 for_graph=completion_gate_fingerprint(state),
+                note=None,
             )
         )
         merged = merge_completion_gates(base, facts, state)
@@ -410,8 +622,11 @@ class TestMerge:
         base = _failed_ledger_result()
         facts = CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                cause=AdvisorBlockCause.GRAPH_REJECTED,
                 detail=_BLOCKED_DETAIL,
+                suggestion=None,
                 for_graph=completion_gate_fingerprint(state),
+                note=None,
             )
         )
 
@@ -437,8 +652,11 @@ class TestMerge:
         state = _make_state()
         facts = CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                cause=AdvisorBlockCause.GRAPH_REJECTED,
                 detail=_BLOCKED_DETAIL,
+                suggestion=None,
                 for_graph=completion_gate_fingerprint(state),
+                note=None,
             )
         )
 
@@ -449,3 +667,324 @@ class TestMerge:
         assert len(_advisor_checks(twice)) == 1
         assert sum(blocker.code == ADVISOR_SIGNOFF_BLOCKED_CODE for blocker in twice.readiness.blockers) == 1
         _assert_canonical_check_order(twice)
+
+
+def _blocked_facts_for(state: CompositionState, *, note: str | None = None) -> CompletionGateFacts:
+    return CompletionGateFacts(
+        advisor_signoff=AdvisorSignoffGateFact(
+            cause=AdvisorBlockCause.GRAPH_REJECTED,
+            detail=_BLOCKED_DETAIL,
+            suggestion=None,
+            for_graph=completion_gate_fingerprint(state),
+            note=note,
+        )
+    )
+
+
+def test_note_survives_reload_and_reaches_validate() -> None:
+    """Ruling 2026-09-22: the note the blocking turn showed is the note /validate shows on the same graph."""
+    from elspeth.web.composer.advisor_policy import advisor_signoff_pending_validation
+
+    state = _make_state()
+    result = advisor_signoff_pending_validation(
+        _green_result(),
+        reason="flagged_final_pass",
+        findings="FLAGGED: choose per-branch sinks",
+        category="error_handling",
+        step_ids=(),
+        note="choose per-branch sinks",
+    )
+    assert result.readiness.blockers[0].note == "choose per-branch sinks"
+    facts = parse_completion_gates(
+        {COMPLETION_GATES_META_KEY: completion_gates_meta_from_facts(_facts_from_blocked_validation(result, state))}
+    )
+    assert facts is not None and facts.advisor_signoff is not None
+    assert facts.advisor_signoff.note == "choose per-branch sinks"
+    reloaded = merge_completion_gates(_green_result(), facts, state)
+    assert reloaded.readiness.blockers[0].note == "choose per-branch sinks"
+    # The carry-forward writer keeps it too.
+    carried = parse_completion_gates({COMPLETION_GATES_META_KEY: completion_gates_meta_from_facts(facts)})
+    assert carried is not None and carried.advisor_signoff is not None
+    assert carried.advisor_signoff.note == "choose per-branch sinks"
+    # A changed graph gets the pending wording and no note: the words applied
+    # to a graph that no longer exists.
+    changed = _make_state(node_options={"operations": [{"target": "y", "expression": "2"}]})
+    assert merge_completion_gates(_green_result(), facts, changed).readiness.blockers[0].note is None
+
+
+def test_gate_fact_without_note_key_is_rejected() -> None:
+    """Tier 1: an envelope missing the key is writer drift or corruption, never a default."""
+    legacy = {
+        COMPLETION_GATES_META_KEY: {
+            "schema_version": 2,
+            "advisor_signoff": {"status": "blocked", "detail": "d", "suggestion": None, "for_graph": "f"},
+        }
+    }
+    with pytest.raises(ValueError, match="note is required"):
+        parse_completion_gates(legacy)
+
+
+def test_gate_fact_note_null_round_trips() -> None:
+    state = _make_state()
+    facts = _blocked_facts_for(state, note=None)
+    parsed = parse_completion_gates({COMPLETION_GATES_META_KEY: completion_gates_meta_from_facts(facts)})
+    assert parsed is not None and parsed.advisor_signoff is not None
+    assert parsed.advisor_signoff.note is None
+    assert merge_completion_gates(_green_result(), parsed, state).readiness.blockers[0].note is None
+
+
+@pytest.mark.parametrize("bad", ["", 7, b"x"], ids=["empty", "int", "bytes"])
+def test_gate_fact_note_must_be_a_non_empty_string_or_null(bad: object) -> None:
+    envelope = {
+        COMPLETION_GATES_META_KEY: {
+            "schema_version": 2,
+            "advisor_signoff": {"status": "blocked", "detail": "d", "suggestion": None, "for_graph": "f", "note": bad},
+        }
+    }
+    with pytest.raises(ValueError, match="note must be"):
+        parse_completion_gates(envelope)
+
+
+def test_block_covers_an_unchanged_graph_it_was_recorded_for() -> None:
+    state = _make_state(version=3)
+    facts = _blocked_facts_for(state)
+    assert advisor_block_covers_unchanged_graph(facts, state, initial_version=state.version) is True
+
+
+def test_block_does_not_cover_a_turn_that_changed_the_version() -> None:
+    state = _make_state(version=3)
+    facts = _blocked_facts_for(state)
+    assert advisor_block_covers_unchanged_graph(facts, state, initial_version=state.version - 1) is False
+
+
+def test_block_covers_is_false_without_a_fact() -> None:
+    state = _make_state(version=3)
+    assert advisor_block_covers_unchanged_graph(None, state, initial_version=state.version) is False
+    no_gate = CompletionGateFacts(advisor_signoff=None)
+    assert advisor_block_covers_unchanged_graph(no_gate, state, initial_version=state.version) is False
+
+
+def test_block_does_not_cover_a_different_graph() -> None:
+    state = _make_state(version=3)
+    blocked = _blocked_facts_for(state).advisor_signoff
+    assert blocked is not None
+    stale = CompletionGateFacts(advisor_signoff=replace(blocked, for_graph="0" * 64))
+    assert advisor_block_covers_unchanged_graph(stale, state, initial_version=state.version) is False
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_advisor_recovery_rejects_unversioned_envelope(blocked: bool) -> None:
+    envelope = completion_gates_meta_from_facts(_blocked_facts_for(_make_state()) if blocked else None)
+    unversioned = {key: value for key, value in envelope.items() if key != "schema_version"}
+    with pytest.raises(ValueError, match="schema_version"):
+        parse_completion_gates({COMPLETION_GATES_META_KEY: unversioned})
+
+
+def test_advisor_recovery_rejects_old_causeless_envelope() -> None:
+    envelope = completion_gates_meta_from_facts(_blocked_facts_for(_make_state()))
+    unversioned = {"advisor_signoff": {key: value for key, value in envelope["advisor_signoff"].items() if key != "cause"}}
+    with pytest.raises(ValueError, match="schema_version"):
+        parse_completion_gates({COMPLETION_GATES_META_KEY: unversioned})
+
+
+@pytest.mark.parametrize("cause", ["graph_rejected", "unavailable", "malformed", "message_rejected"])
+def test_advisor_recovery_v2_roundtrip(cause: str) -> None:
+    state = _make_state()
+    envelope = {
+        "schema_version": 2,
+        "advisor_signoff": {
+            "status": "blocked",
+            "detail": "Review blocked",
+            "suggestion": None,
+            "for_graph": completion_gate_fingerprint(state),
+            "note": None,
+            "cause": cause,
+        },
+    }
+    facts = parse_completion_gates({COMPLETION_GATES_META_KEY: envelope})
+    assert completion_gates_meta_from_facts(facts) == envelope
+    assert advisor_block_covers_unchanged_graph(facts, state, initial_version=state.version) == (cause == "graph_rejected")
+
+
+@pytest.mark.parametrize("bad_version", [1, 3, True, 2.0, "2", None])
+def test_advisor_recovery_unknown_or_malformed_version_raises(bad_version: object) -> None:
+    with pytest.raises(ValueError, match="schema_version"):
+        parse_completion_gates({COMPLETION_GATES_META_KEY: {"schema_version": bad_version}})
+
+
+@pytest.mark.parametrize("cause", ["unknown", "legacy_unknown", "", None, 2, True, {}, []])
+def test_advisor_recovery_invalid_current_cause_raises(cause: object) -> None:
+    envelope = completion_gates_meta_from_facts(_blocked_facts_for(_make_state()))
+    raw = {**envelope, "advisor_signoff": {**envelope["advisor_signoff"], "cause": cause}}
+    with pytest.raises(ValueError, match="cause"):
+        parse_completion_gates({COMPLETION_GATES_META_KEY: raw})
+
+
+def test_advisor_recovery_missing_current_cause_raises() -> None:
+    envelope = completion_gates_meta_from_facts(_blocked_facts_for(_make_state()))
+    raw = {**envelope, "advisor_signoff": {k: v for k, v in envelope["advisor_signoff"].items() if k != "cause"}}
+    with pytest.raises(ValueError, match="cause"):
+        parse_completion_gates({COMPLETION_GATES_META_KEY: raw})
+
+
+def test_advisor_recovery_unversioned_cause_is_rejected() -> None:
+    envelope = completion_gates_meta_from_facts(_blocked_facts_for(_make_state()))
+    with pytest.raises(ValueError, match="schema_version"):
+        parse_completion_gates({COMPLETION_GATES_META_KEY: {"advisor_signoff": envelope["advisor_signoff"]}})
+
+
+def test_advisor_recovery_frozen_envelope() -> None:
+    from types import MappingProxyType
+
+    facts = _blocked_facts_for(_make_state())
+    envelope = completion_gates_meta_from_facts(facts)
+    signoff = dict(envelope["advisor_signoff"])
+    frozen = MappingProxyType({"schema_version": 2, "advisor_signoff": MappingProxyType(signoff)})
+    parsed = parse_completion_gates(MappingProxyType({COMPLETION_GATES_META_KEY: frozen}))
+    assert parsed == facts
+
+
+def test_advisor_recovery_empty_envelope_roundtrips() -> None:
+    facts = parse_completion_gates({COMPLETION_GATES_META_KEY: {"schema_version": 2}})
+    assert facts == CompletionGateFacts(advisor_signoff=None)
+    assert completion_gates_meta_from_facts(facts) == {"schema_version": 2}
+
+
+def test_advisor_recovery_no_decision_preserves_even_stale_fact() -> None:
+    state = _make_state()
+    facts = _blocked_facts_for(state)
+    changed = _make_state(node_options={"operations": [{"target": "y", "expression": "2"}]})
+    assert resolve_completion_gate_facts(facts, None, changed) is facts
+    assert resolve_completion_gate_facts(None, None, state) == CompletionGateFacts(advisor_signoff=None)
+
+
+def test_advisor_recovery_pass_clears_and_block_replaces_fact() -> None:
+    state = _make_state()
+    prior = _blocked_facts_for(state)
+    assert prior.advisor_signoff is not None
+    clean = AdvisorGatePassed(for_graph=completion_gate_fingerprint(state))
+    assert resolve_completion_gate_facts(prior, clean, state) == CompletionGateFacts(advisor_signoff=None)
+    replacement = replace(prior.advisor_signoff, cause=AdvisorBlockCause.UNAVAILABLE, detail="Provider unavailable")
+    assert resolve_completion_gate_facts(prior, AdvisorGateBlocked(replacement), state) == CompletionGateFacts(replacement)
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_advisor_recovery_rejects_decision_for_other_graph(blocked: bool) -> None:
+    state = _make_state()
+    facts = _blocked_facts_for(state)
+    assert facts.advisor_signoff is not None
+    decision = AdvisorGateBlocked(replace(facts.advisor_signoff, for_graph="different")) if blocked else AdvisorGatePassed("different")
+    with pytest.raises(ValueError, match="fingerprint"):
+        resolve_completion_gate_facts(facts, decision, state)
+
+
+def test_advisor_recovery_changes_compare_effective_facts() -> None:
+    from elspeth.web.execution.completion_gates import completion_gate_decision_changes
+
+    state = _make_state()
+    prior = _blocked_facts_for(state)
+    assert prior.advisor_signoff is not None
+    assert not completion_gate_decision_changes(prior, None, state)
+    assert not completion_gate_decision_changes(prior, AdvisorGateBlocked(prior.advisor_signoff), state)
+    assert completion_gate_decision_changes(None, AdvisorGateBlocked(prior.advisor_signoff), state)
+    assert completion_gate_decision_changes(prior, AdvisorGatePassed(completion_gate_fingerprint(state)), state)
+    assert not completion_gate_decision_changes(None, AdvisorGatePassed(completion_gate_fingerprint(state)), state)
+    different = replace(prior.advisor_signoff, cause=AdvisorBlockCause.UNAVAILABLE)
+    assert completion_gate_decision_changes(prior, AdvisorGateBlocked(different), state)
+    with pytest.raises(ValueError, match="fingerprint"):
+        completion_gate_decision_changes(prior, AdvisorGatePassed("different"), state)
+
+
+# ── Order-semantic maps bind the advisor fingerprint ─────────────────────
+#
+# Mapping-form coalesce and row_union branches and the multi-source
+# ``sources`` map are order-semantic at runtime, so an advisor verdict on one
+# order must not be carried onto another.
+
+
+def _structural_node(node_type: str, branch_order: tuple[str, ...]) -> NodeSpec:
+    return NodeSpec(
+        id="merge",
+        node_type=node_type,
+        plugin=None,
+        input="a_in",
+        on_success="merge_out",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches={alias: f"{alias}_in" for alias in branch_order},
+        policy="require_all" if node_type == "coalesce" else None,
+        merge="union" if node_type == "coalesce" else None,
+        timeout_seconds=30.0,
+    )
+
+
+def _source_spec(name: str) -> SourceSpec:
+    return SourceSpec(plugin="csv", on_success=f"{name}_rows", options={"path": f"{name}.csv"}, on_validation_failure="discard")
+
+
+def _ordered_state(kind: str, order: tuple[str, ...], *, version: int = 1) -> CompositionState:
+    if kind == "sources":
+        return CompositionState(
+            sources={name: _source_spec(name) for name in order},
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=version,
+        )
+    return CompositionState(
+        sources={},
+        nodes=(_structural_node(kind, order),),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=version,
+    )
+
+
+_ORDERED_KINDS = ("coalesce", "row_union", "sources")
+
+
+@pytest.mark.parametrize("kind", _ORDERED_KINDS)
+def test_fingerprint_binds_order_semantic_map_order(kind: str) -> None:
+    assert completion_gate_fingerprint(_ordered_state(kind, ("a", "b", "c"))) != completion_gate_fingerprint(
+        _ordered_state(kind, ("a", "c", "b"))
+    )
+
+
+@pytest.mark.parametrize("kind", _ORDERED_KINDS)
+def test_block_does_not_cover_a_reordered_graph(kind: str) -> None:
+    reviewed = _ordered_state(kind, ("a", "b", "c"), version=3)
+    reordered = _ordered_state(kind, ("a", "c", "b"), version=3)
+    facts = _blocked_facts_for(reviewed)
+    assert advisor_block_covers_unchanged_graph(facts, reviewed, initial_version=3) is True
+    assert advisor_block_covers_unchanged_graph(facts, reordered, initial_version=3) is False
+
+
+@pytest.mark.parametrize("kind", _ORDERED_KINDS)
+def test_merge_downgrades_a_carried_fact_when_only_the_order_changed(kind: str) -> None:
+    reviewed = _ordered_state(kind, ("a", "b", "c"))
+    reordered = _ordered_state(kind, ("a", "c", "b"))
+    facts = _blocked_facts_for(reviewed, note="reviewer note")
+    assert merge_completion_gates(_green_result(), facts, reviewed).readiness.blockers[0].detail == _BLOCKED_DETAIL
+    downgraded = merge_completion_gates(_green_result(), facts, reordered).readiness.blockers[0]
+    assert downgraded.detail == ADVISOR_SIGNOFF_PENDING_DETAIL
+    assert downgraded.note is None
+
+
+def test_fingerprint_binds_output_and_edge_list_order() -> None:
+    """Characterization: list-valued parts were already ordered and still are."""
+    outputs = (
+        OutputSpec(name="first", plugin="json", options={}, on_write_failure="discard"),
+        OutputSpec(name="second", plugin="json", options={}, on_write_failure="discard"),
+    )
+    edges = (
+        EdgeSpec(id="e1", from_node="source", to_node="first", edge_type="on_success", label=None),
+        EdgeSpec(id="e2", from_node="source", to_node="second", edge_type="on_success", label=None),
+    )
+    base = _make_state()
+    assert completion_gate_fingerprint(replace(base, outputs=outputs)) != completion_gate_fingerprint(replace(base, outputs=outputs[::-1]))
+    assert completion_gate_fingerprint(replace(base, edges=edges)) != completion_gate_fingerprint(replace(base, edges=edges[::-1]))

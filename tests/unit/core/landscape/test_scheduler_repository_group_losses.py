@@ -18,10 +18,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, select
+from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts import NodeType, RunStatus
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import GroupLossSpec
@@ -36,7 +37,8 @@ from elspeth.core.landscape.schema import (
     token_lineage_frames_table,
     tokens_table,
 )
-from tests.fixtures.landscape import expire_leader_seat, make_landscape_db
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.fixtures.landscape import expire_leader_seat, lowered_sqlite_variable_limit, make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-group-loss-1"
@@ -75,7 +77,7 @@ def _seed_run_and_nodes(db: LandscapeDB) -> None:
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=_NOW,
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=RunStatus.RUNNING.value,
@@ -92,7 +94,7 @@ def _seed_run_and_nodes(db: LandscapeDB) -> None:
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="cfg",
+                    config_hash=fake_sha256("cfg"),
                     config_json="{}",
                     registered_at=_NOW,
                 )
@@ -109,7 +111,7 @@ def _seed_row_and_token(db: LandscapeDB, *, row_id: str, token_id: str, source_r
                 row_index=source_row_index,
                 source_row_index=source_row_index,
                 ingest_sequence=source_row_index,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=_NOW,
             )
         )
@@ -159,7 +161,7 @@ def seeded_claimed_item(db: LandscapeDB, seat_token: CoordinationToken):
     repo = TokenSchedulerRepository(db.engine)
     _seed_row_and_token(db, row_id="row-claim", token_id="tok-claim", source_row_index=10)
     repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
         token_id="tok-claim",
         row_id="row-claim",
         node_id=NODE_ID,
@@ -167,7 +169,7 @@ def seeded_claimed_item(db: LandscapeDB, seat_token: CoordinationToken):
         ingest_sequence=10,
         row_payload_json=_payload_json(),
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
+    claimed = repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER), lease_owner=WORKER, lease_seconds=60)
     assert claimed is not None
     return db, repo, claimed
 
@@ -206,7 +208,7 @@ def test_takeover_read_returns_full_table_regardless_of_adopted_epoch(seeded_run
         record_group_loss(conn, run_id=run_id, spec=_spec(member_key="path_a"), recorded_by="w1", now=_NOW)
         record_group_loss(conn, run_id=run_id, spec=_spec(member_key="path_b", token_id="tok_b"), recorded_by="w1", now=_NOW)
     unadopted = repo.list_unadopted_group_losses(run_id=run_id)
-    repo.adopt_group_losses(run_id=run_id, loss_ids=[unadopted[0].loss_id], coordination_token=seat_token)
+    repo.adopt_group_losses(loss_ids=[unadopted[0].loss_id], coordination_token=seat_token)
     assert len(repo.list_unadopted_group_losses(run_id=run_id)) == 1
     assert len(repo.list_group_losses(run_id=run_id)) == 2  # FULL table
 
@@ -225,7 +227,7 @@ def test_adopt_group_losses_does_not_remark_an_already_adopted_row_under_a_new_e
         record_group_loss(conn, run_id=run_id, spec=_spec(), recorded_by="w1", now=_NOW)
     unadopted = repo.list_unadopted_group_losses(run_id=run_id)
     loss_id = unadopted[0].loss_id
-    marked_first = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], coordination_token=seat_token)
+    marked_first = repo.adopt_group_losses(loss_ids=[loss_id], coordination_token=seat_token)
     assert marked_first == 1
 
     # The adopt refreshed the seat from the DATABASE clock (ADR-047), so the
@@ -236,7 +238,7 @@ def test_adopt_group_losses_does_not_remark_an_already_adopted_row_under_a_new_e
         run_id=run_id, worker_id=f"{WORKER}-takeover", window_seconds=80.0
     )
     assert new_epoch_token.leader_epoch != seat_token.leader_epoch
-    marked_second = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], coordination_token=new_epoch_token)
+    marked_second = repo.adopt_group_losses(loss_ids=[loss_id], coordination_token=new_epoch_token)
     assert marked_second == 0
 
 
@@ -295,6 +297,7 @@ def test_mark_failed_records_every_staged_group_loss_in_one_transaction(seeded_c
         _spec(group_id="eg_outer", member_key=claimed.token_id, token_id=claimed.token_id, closer_name="page_stitcher"),
     )
     repo.mark_failed(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
         work_item_id=claimed.work_item_id,
         expected_lease_owner=claimed.lease_owner,
         group_losses=losses,
@@ -305,3 +308,44 @@ def test_mark_failed_records_every_staged_group_loss_in_one_transaction(seeded_c
         ("page_stitcher", "eg_outer", claimed.token_id),
     }
     assert all(loss.recorded_by for loss in ledger)
+
+
+# --- Bound-parameter budget (elspeth-5887 X2) ---------------------------------
+# One batch may name every lost member of an expansion, and a resume adopts
+# every recorded loss of the run, so neither statement may bind a list that
+# grows with the loss count. SQLite here refuses a statement over 99 binds,
+# with the shared budget lowered to 60.
+
+
+def test_recording_and_adopting_many_group_losses_binds_a_bounded_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.core.landscape import bind_budget
+    from elspeth.core.landscape.scheduler.group_losses import record_group_losses
+
+    monkeypatch.setattr(bind_budget, "BIND_BUDGET_PER_STATEMENT", 60)
+    members = 120
+    with lowered_sqlite_variable_limit(monkeypatch, 99):
+        db = make_landscape_db()
+        _seed_run_and_nodes(db)
+        for index in range(members):
+            _seed_row_and_token(db, row_id=f"row-{index}", token_id=f"tok_{index}", source_row_index=index)
+        seat = register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, window_seconds=80.0)
+        # Control: this connection refuses a statement that binds one parameter per member.
+        with db.engine.connect() as conn, pytest.raises(OperationalError, match="too many SQL variables"):
+            conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.token_id.in_([f"tok_{index}" for index in range(members)])))
+
+        with db.engine.begin() as conn:
+            recorded = record_group_losses(
+                conn,
+                run_id=RUN_ID,
+                specs=[_spec(member_key=f"member_{index:03d}", token_id=f"tok_{index}") for index in range(members)],
+                recorded_by="w1",
+                now=_NOW,
+            )
+        repo = GroupLossRepository(db.engine)
+        unadopted = repo.list_unadopted_group_losses(run_id=RUN_ID)
+        adopted = repo.adopt_group_losses(loss_ids=[loss.loss_id for loss in unadopted], coordination_token=seat)
+
+        assert recorded == members
+        assert len(unadopted) == members
+        assert adopted == members
+        assert repo.list_unadopted_group_losses(run_id=RUN_ID) == []

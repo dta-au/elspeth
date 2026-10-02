@@ -36,6 +36,7 @@ import structlog
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError, RowUnionFailureReason
 from elspeth.contracts.identity import innermost_fork_frame, pop_fork_frame
@@ -80,6 +81,13 @@ class RowUnionOutcome:
             by the executor — the caller MUST NOT record them again.
         late_arrival: True when this failure is the late-arrival arm (token
             arrived after its group already released/failed).
+        first_failure_evidence: Late-arrival arm only. True when this
+            straggler's FAILED node_state is the FIRST durable failure
+            evidence of its group — the group was closed by a branch loss
+            before any sibling arrived, so nothing was written at the barrier.
+            The live ``rows_coalesce_failed`` counts that group here, exactly
+            once (the audit derive's unit is a (node, fork group) pair with a
+            FAILED state).
     """
 
     held: bool
@@ -89,8 +97,11 @@ class RowUnionOutcome:
     row_union_name: str | None = None
     outcomes_recorded: bool = False
     late_arrival: bool = False
+    first_failure_evidence: bool = False
 
     def __post_init__(self) -> None:
+        if self.first_failure_evidence and not self.late_arrival:
+            raise OrchestrationInvariantError("RowUnionOutcome: first_failure_evidence is only valid on a late-arrival outcome")
         if self.held and (self.released_tokens or self.failure_reason is not None):
             raise OrchestrationInvariantError("RowUnionOutcome: held=True excludes released_tokens/failure_reason")
         if self.released_tokens and self.failure_reason is not None:
@@ -130,7 +141,7 @@ class RowUnionExecutor:
     Example:
         executor = RowUnionExecutor(execution, span_factory, run_id, step_resolver, data_flow=data_flow, ...)
         executor.register_row_union(settings, node_id)
-        outcome = executor.accept(token, "variant_union")
+        outcome = executor.accept(token, "variant_union", coordination_token=coordination_token)
         if outcome.released_tokens:
             # The whole group continues downstream as one indivisible unit.
             ...
@@ -171,6 +182,12 @@ class RowUnionExecutor:
         # generic late-arrival message.
         self._completed_keys: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._max_completed_keys = max_completed_keys
+        # Groups closed by a branch loss before any sibling arrived: no FAILED
+        # node_state exists at the barrier yet, so the first straggler's
+        # late-arrival state is the group's failure evidence
+        # (``RowUnionOutcome.first_failure_evidence``). Bounded with
+        # ``_completed_keys`` (an evicted key is dropped here too).
+        self._failed_without_member_state: set[tuple[str, str]] = set()
         # Recent branch losses for §E.5 replay dedup, bounded like the
         # completion cache. Durable storage remains the source of truth.
         # (row_union_name, fork_group_id, branch_name)
@@ -207,6 +224,7 @@ class RowUnionExecutor:
         self,
         *,
         entries: Sequence[RowUnionRestoreEntry],
+        coordination_token: CoordinationToken,
     ) -> tuple[RowUnionOutcome, ...]:
         """Restore adopted pending groups from durable scheduler and audit rows.
 
@@ -290,17 +308,17 @@ class RowUnionExecutor:
         outcomes: list[RowUnionOutcome] = []
         for key, closed_reason in closed_keys.items():
             failure_reason = "late_arrival_after_release" if closed_reason == _CLOSED_BY_RELEASE else closed_reason
-            outcomes.append(self._fail_pending(self._settings[key[0]], key, failure_reason))
+            outcomes.append(self._fail_pending(self._settings[key[0]], key, failure_reason, coordination_token=coordination_token))
             # _fail_pending recaches the key under the residual's failure
             # reason; the GROUP's closure predates the residual — keep it.
             self._mark_completed(key, closed_reason)
         for key in durable_loss_keys:
-            outcomes.append(self._fail_pending(self._settings[key[0]], key, "row_union_branch_lost"))
+            outcomes.append(self._fail_pending(self._settings[key[0]], key, "row_union_branch_lost", coordination_token=coordination_token))
         for key in tuple(self._pending):
             settings = self._settings[key[0]]
             pending = self._pending[key]
             if set(pending.branches) == set(settings.branches):
-                outcomes.append(self._execute_release(settings=settings, key=key, pending=pending))
+                outcomes.append(self._execute_release(settings=settings, key=key, pending=pending, coordination_token=coordination_token))
         return tuple(outcomes)
 
     def restore_branch_losses(self, losses: Sequence[tuple[str, str, str]]) -> None:
@@ -316,6 +334,7 @@ class RowUnionExecutor:
         self,
         *,
         entries: Sequence[RowUnionRestoreEntry],
+        coordination_token: CoordinationToken,
     ) -> RowUnionOutcome:
         """Finish a release whose node-state writes preceded scheduler commit.
 
@@ -359,6 +378,7 @@ class RowUnionExecutor:
         for entry in by_branch.values():
             if entry.state_id is not None:
                 self._execution.complete_node_state(
+                    member_token=coordination_token.membership,
                     state_id=entry.state_id,
                     status=NodeStateStatus.COMPLETED,
                     output_data=entry.token.row_data.to_dict(),
@@ -383,6 +403,7 @@ class RowUnionExecutor:
         token: TokenInfo,
         row_union_name: str,
         *,
+        coordination_token: CoordinationToken,
         arrival_time: float | None = None,
     ) -> RowUnionOutcome:
         """Accept a fork-branch token at a row_union barrier.
@@ -423,7 +444,9 @@ class RowUnionExecutor:
                 step,
                 # Cached with its true reason by whichever arm of the test
                 # above fired — see restore_from_journal's closed-key loop.
+                key=key,
                 closed_reason=self._completed_keys[key],
+                coordination_token=coordination_token,
             )
         if key in self._recorded_loss_groups or self._barrier_restore_reads.has_group_loss(
             run_id=self._run_id, closer_name=row_union_name, group_id=fork_group_id
@@ -434,7 +457,9 @@ class RowUnionExecutor:
                 settings,
                 node_id,
                 step,
+                key=key,
                 closed_reason=_CLOSED_BY_BRANCH_LOSS,
+                coordination_token=coordination_token,
             )
 
         if key not in self._pending:
@@ -457,7 +482,7 @@ class RowUnionExecutor:
         state = self._execution.begin_node_state(
             token_id=token.token_id,
             node_id=node_id,
-            run_id=self._run_id,
+            member_token=coordination_token.membership,
             step_index=step,
             input_data=token.row_data.to_dict(),
             attempt=token.resume_attempt_offset,
@@ -466,7 +491,7 @@ class RowUnionExecutor:
         pending.branches[token.branch_name] = _BranchEntry(token=token, arrival_time=now, state_id=state.state_id)
 
         if set(pending.branches.keys()) == set(settings.branches.keys()):
-            return self._execute_release(settings=settings, key=key, pending=pending)
+            return self._execute_release(settings=settings, key=key, pending=pending, coordination_token=coordination_token)
 
         return RowUnionOutcome(held=True, row_union_name=row_union_name)
 
@@ -510,6 +535,7 @@ class RowUnionExecutor:
         settings: RowUnionSettings,
         key: tuple[str, str],
         pending: _PendingRowUnion,
+        coordination_token: CoordinationToken,
     ) -> RowUnionOutcome:
         """Release the full group in declared branch order.
 
@@ -523,6 +549,7 @@ class RowUnionExecutor:
         for branch_name in settings.branches:
             entry = pending.branches[branch_name]
             self._execution.complete_node_state(
+                member_token=coordination_token.membership,
                 state_id=entry.state_id,
                 status=NodeStateStatus.COMPLETED,
                 output_data=entry.token.row_data.to_dict(),
@@ -547,6 +574,7 @@ class RowUnionExecutor:
         key: tuple[str, str],
         failure_reason: str,
         *,
+        coordination_token: CoordinationToken,
         is_timeout: bool = False,
     ) -> RowUnionOutcome:
         """Fail every held token in a pending group and clean up (fail-closed)."""
@@ -563,12 +591,14 @@ class RowUnionExecutor:
         )
         for entry in pending.branches.values():
             self._execution.complete_node_state(
+                member_token=coordination_token.membership,
                 state_id=entry.state_id,
                 status=NodeStateStatus.FAILED,
                 error=error,
                 duration_ms=(now - entry.arrival_time) * 1000,
             )
-            self._data_flow.record_token_outcome(
+            self._data_flow.record_token_outcome_leader(
+                coordination_token=coordination_token,
                 ref=TokenRef(token_id=entry.token.token_id, run_id=self._run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
@@ -593,6 +623,8 @@ class RowUnionExecutor:
         node_id: NodeID,
         step: int,
         *,
+        key: tuple[str, str],
+        coordination_token: CoordinationToken,
         closed_reason: str = _CLOSED_BY_RELEASE,
     ) -> RowUnionOutcome:
         """Fail-closed arm for a token arriving after its group closed.
@@ -604,11 +636,13 @@ class RowUnionExecutor:
         non-release closure must carry the group's true closure reason.
         """
         failure_reason = "late_arrival_after_release" if closed_reason == _CLOSED_BY_RELEASE else closed_reason
+        first_failure_evidence = key in self._failed_without_member_state
+        self._failed_without_member_state.discard(key)
         error_hash = compute_error_hash(failure_reason)
         state = self._execution.begin_node_state(
             token_id=token.token_id,
             node_id=node_id,
-            run_id=self._run_id,
+            member_token=coordination_token.membership,
             step_index=step,
             input_data=token.row_data.to_dict(),
             attempt=token.resume_attempt_offset,
@@ -620,12 +654,14 @@ class RowUnionExecutor:
             branches_arrived=(),
         )
         self._execution.complete_node_state(
+            member_token=coordination_token.membership,
             state_id=state.state_id,
             status=NodeStateStatus.FAILED,
             error=error,
             duration_ms=0,
         )
-        self._data_flow.record_token_outcome(
+        self._data_flow.record_token_outcome_leader(
+            coordination_token=coordination_token,
             ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
@@ -638,13 +674,14 @@ class RowUnionExecutor:
             row_union_name=settings.name,
             outcomes_recorded=True,
             late_arrival=True,
+            first_failure_evidence=first_failure_evidence,
         )
 
     # ------------------------------------------------------------------
     # Timeouts / flush / branch loss
     # ------------------------------------------------------------------
 
-    def check_timeouts(self, row_union_name: str) -> list[RowUnionOutcome]:
+    def check_timeouts(self, row_union_name: str, *, coordination_token: CoordinationToken) -> list[RowUnionOutcome]:
         """Fail every pending group of this barrier that exceeded its timeout."""
         if row_union_name not in self._settings:
             raise OrchestrationInvariantError(f"row_union '{row_union_name}' not registered")
@@ -657,14 +694,17 @@ class RowUnionExecutor:
             for key, pending in self._pending.items()
             if key[0] == row_union_name and (now - pending.first_arrival) > settings.timeout_seconds
         ]
-        return [self._fail_pending(settings, key, "row_union_timeout", is_timeout=True) for key in timed_out]
+        return [
+            self._fail_pending(settings, key, "row_union_timeout", is_timeout=True, coordination_token=coordination_token)
+            for key in timed_out
+        ]
 
-    def flush_pending(self) -> list[RowUnionOutcome]:
+    def flush_pending(self, *, coordination_token: CoordinationToken) -> list[RowUnionOutcome]:
         """End-of-source flush: fail every incomplete group closed (v1)."""
         outcomes: list[RowUnionOutcome] = []
         for key in list(self._pending.keys()):
             settings = self._settings[key[0]]
-            outcomes.append(self._fail_pending(settings, key, "row_union_incomplete_at_flush"))
+            outcomes.append(self._fail_pending(settings, key, "row_union_incomplete_at_flush", coordination_token=coordination_token))
         return outcomes
 
     def has_recorded_branch_loss(self, row_union_name: str, fork_group_id: str, branch_name: str) -> bool:
@@ -677,6 +717,8 @@ class RowUnionExecutor:
         fork_group_id: str,
         lost_branch: str,
         reason: str,
+        *,
+        coordination_token: CoordinationToken,
     ) -> RowUnionOutcome | None:
         """Notify that a forked branch will never arrive (error-routed).
 
@@ -702,6 +744,7 @@ class RowUnionExecutor:
             # Nothing held yet: mark the group dead so future arrivals
             # fail closed instead of holding forever.
             self._mark_completed(key, _CLOSED_BY_BRANCH_LOSS)
+            self._failed_without_member_state.add(key)
             slog.info(
                 "row_union branch lost before any sibling arrived; group marked dead",
                 row_union=row_union_name,
@@ -711,7 +754,7 @@ class RowUnionExecutor:
             )
             return None
         settings = self._settings[row_union_name]
-        return self._fail_pending(settings, key, "row_union_branch_lost")
+        return self._fail_pending(settings, key, "row_union_branch_lost", coordination_token=coordination_token)
 
     # ------------------------------------------------------------------
     # Internals
@@ -747,7 +790,8 @@ class RowUnionExecutor:
         """Mark a group closed, with its cause, under bounded memory."""
         self._completed_keys[key] = reason
         while len(self._completed_keys) > self._max_completed_keys:
-            self._completed_keys.popitem(last=False)
+            evicted_key, _reason = self._completed_keys.popitem(last=False)
+            self._failed_without_member_state.discard(evicted_key)
 
     def _remember_branch_loss(self, row_union_name: str, fork_group_id: str, branch_name: str) -> None:
         """Cache recent loss identities for replay dedup and fast group checks."""

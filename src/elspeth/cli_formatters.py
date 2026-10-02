@@ -61,13 +61,17 @@ def create_console_formatters(prefix: str = "Run") -> dict[type, Callable[..., N
             routed_summary = f" | →{event.routed_success + event.routed_failure:,} routed"
             if dest_str:
                 routed_summary += f" ({dest_str})"
+        collector_group_summary = ""
+        if event.collector_groups_failed:
+            group_label = "group" if event.collector_groups_failed == 1 else "groups"
+            collector_group_summary = f" | {event.collector_groups_failed:,} collector {group_label} failed"
         typer.echo(
             f"\n{symbol} {prefix} {event.status.value.upper()}: "
             f"{event.total_rows:,} rows processed | "
             f"✓{event.succeeded:,} succeeded | "
             f"✗{event.failed:,} failed | "
             f"⚠{event.quarantined:,} quarantined"
-            f"{routed_summary} | "
+            f"{routed_summary}{collector_group_summary} | "
             f"{event.duration_seconds:.2f}s total"
         )
 
@@ -143,6 +147,7 @@ def create_json_formatters() -> dict[type, Callable[..., None]]:
                     "succeeded": event.succeeded,
                     "failed": event.failed,
                     "quarantined": event.quarantined,
+                    "collector_groups_failed": event.collector_groups_failed,
                     "routed_success": event.routed_success,
                     "routed_failure": event.routed_failure,
                     "routed_destinations": dict(event.routed_destinations),

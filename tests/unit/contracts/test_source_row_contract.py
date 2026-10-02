@@ -45,16 +45,10 @@ class TestSourceRowContractInvariant:
         assert source_row_index_param.kind is inspect.Parameter.KEYWORD_ONLY
         assert source_row_index_param.default is inspect.Parameter.empty
 
-    def test_valid_without_contract_raises(self) -> None:
-        """SourceRow.valid() without contract raises TypeError.
-
-        Bug fix: elspeth-a27e71979f. Previously, contract=None was accepted
-        for valid rows, causing a crash later at tokenization. The invariant
-        is now enforced in __post_init__ instead of failing later at
-        to_pipeline_row().
-        """
-        with pytest.raises(TypeError, match="contract"):
-            SourceRow.valid({"id": 1})  # type: ignore[call-arg]
+    def test_non_quarantined_row_rejects_missing_contract_at_construction(self) -> None:
+        """The construction guard rejects contract=None before tokenization."""
+        with pytest.raises(ValueError, match=r"^Valid SourceRow must have a contract\."):
+            SourceRow(row={"id": 1}, is_quarantined=False, contract=None, source_row_index=0)
 
     def test_valid_with_contract(self, sample_contract: SchemaContract) -> None:
         """SourceRow.valid() with contract succeeds and carries the contract reference."""

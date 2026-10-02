@@ -20,7 +20,7 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import RunStatus
-from elspeth.contracts.checkpoint import CheckpointDraft
+from elspeth.contracts.checkpoint import CheckpointDraft, ResumeRefusalCause
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import AbandonRefusedError
 from elspeth.core.checkpoint import CheckpointManager
@@ -72,12 +72,12 @@ def _leaderless_run(
     token_ids: list[str] = []
     for index in range(token_count):
         _row, token = setup.factory.data_flow.create_row_with_token(
-            setup.run_id,
             setup.source_node_id,
             index,
             {"value": index},
             source_row_index=index,
             ingest_sequence=index,
+            coordination_token=setup.coordination_token,
         )
         token_ids.append(token.token_id)
     register_test_worker(setup.db, run_id=setup.run_id, worker_id=_FOLLOWER_WORKER_ID)
@@ -152,6 +152,7 @@ class TestInspectLeaderlessRun:
         assert preflight.run_status is None
         assert preflight.refusal is not None
         assert "not found" in preflight.refusal
+        assert preflight.refusal_cause is ResumeRefusalCause.RUN_NOT_FOUND
 
     def test_live_seat_is_refused_and_names_the_leader(self) -> None:
         setup, _token_ids = _leaderless_run(expire_seat=False)
@@ -163,6 +164,7 @@ class TestInspectLeaderlessRun:
         assert preflight.refusal is not None
         assert _LEADER_WORKER_ID in preflight.refusal
         assert "elspeth join" in preflight.refusal
+        assert preflight.refusal_cause is ResumeRefusalCause.LEADER_LIVE
 
     @pytest.mark.parametrize("terminal", [RunStatus.INTERRUPTED, RunStatus.FAILED, RunStatus.COMPLETED])
     def test_terminal_run_is_refused(self, terminal: RunStatus) -> None:
@@ -178,6 +180,7 @@ class TestInspectLeaderlessRun:
         assert preflight.run_status is terminal
         assert preflight.refusal is not None
         assert terminal.value in preflight.refusal
+        assert preflight.refusal_cause is ResumeRefusalCause.RUN_NOT_RUNNING
 
 
 class TestAbandonLeaderlessRun:
@@ -231,6 +234,7 @@ class TestAbandonLeaderlessRun:
             abandon_leaderless_run(setup.db, setup.run_id)
 
         assert exc_info.value.run_id == setup.run_id
+        assert exc_info.value.cause is ResumeRefusalCause.LEADER_LIVE
         assert _LEADER_WORKER_ID in exc_info.value.reason
         assert _run_status(setup) is RunStatus.RUNNING
         assert _abandoned_token_ids(setup) == []
@@ -257,8 +261,9 @@ class TestAbandonLeaderlessRun:
 
         monkeypatch.setattr("elspeth.engine.orchestrator.abandon.inspect_leaderless_run", inspect_then_revive)
 
-        with pytest.raises(NonResumableRunError):
+        with pytest.raises(NonResumableRunError) as exc_info:
             abandon_leaderless_run(setup.db, setup.run_id)
 
+        assert exc_info.value.cause is ResumeRefusalCause.LEADER_LIVE
         assert _run_status(setup) is RunStatus.RUNNING
         assert _abandoned_token_ids(setup) == []

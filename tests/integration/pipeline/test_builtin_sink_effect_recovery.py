@@ -36,15 +36,14 @@ def _tokens(
 ) -> list[TokenInfo]:
     result: list[TokenInfo] = []
     for index, row_data in enumerate(rows):
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        row, durable = factory.data_flow.create_row_with_token(
             source_node_id=source_id,
             row_index=index,
             data=row_data,
             source_row_index=index,
             ingest_sequence=index,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
-        durable = factory.data_flow.create_token(row.row_id)
         result.append(
             TokenInfo(
                 row_id=row.row_id,
@@ -212,7 +211,9 @@ def test_csv_primary_routes_one_diversion_through_linked_json_failsink(tmp_path:
         factory, run_id, source_id = _begin(db)
         primary_id = _register_sink(factory, run_id, name="output", plugin_name="csv")
         failsink_id = _register_sink(factory, run_id, name="quarantine", plugin_name="json")
-        edge = factory.data_flow.register_edge(run_id, primary_id, failsink_id, "__failsink__", RoutingMode.DIVERT)
+        edge = factory.data_flow.register_edge(
+            primary_id, failsink_id, "__failsink__", RoutingMode.DIVERT, coordination_token=leader_coordination_token(factory, run_id)
+        )
         accepted, diverted = _tokens(
             factory,
             run_id=run_id,

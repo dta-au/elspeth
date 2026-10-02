@@ -31,7 +31,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from sqlalchemy import select
 
-from elspeth.contracts.enums import CallStatus, CallType, Determinism, NodeStateStatus, NodeType, RunStatus
+from elspeth.contracts.enums import CallStatus, CallType, Determinism, NodeStateStatus, NodeType
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.reproducibility import (
@@ -47,7 +47,8 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db
 
 # =============================================================================
 # Strategies for reproducibility testing
@@ -98,20 +99,11 @@ _RUN_COUNTER = count()
 
 def _create_run(db: LandscapeDB) -> str:
     run_id = f"run-{next(_RUN_COUNTER):06d}"
-    now = _REFERENCE_TIME
-    with db.write_connection() as conn:
-        conn.execute(
-            runs_table.insert().values(
-                run_id=run_id,
-                started_at=now,
-                config_hash=stable_hash({"run_id": run_id}),
-                settings_json="{}",
-                canonical_version="sha256-rfc8785-v1",
-                status=RunStatus.RUNNING,
-                openrouter_catalog_sha256="0" * 64,
-                openrouter_catalog_source="bundled",
-            )
-        )
+    make_factory(db).run_lifecycle.begin_run(
+        run_id=run_id,
+        config={"run_id": run_id},
+        canonical_version="sha256-rfc8785-v1",
+    )
     return run_id
 
 
@@ -195,7 +187,7 @@ def _insert_purged_call(
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="src_hash",
+                source_data_hash=fake_sha256("src_hash"),
                 created_at=now,
             )
         )
@@ -216,8 +208,8 @@ def _insert_purged_call(
                 step_index=0,
                 attempt=0,
                 status=NodeStateStatus.COMPLETED.value,
-                input_hash="in_hash",
-                output_hash="out_hash",
+                input_hash=fake_sha256("in_hash"),
+                output_hash=fake_sha256("out_hash"),
                 started_at=now,
             )
         )
@@ -229,8 +221,8 @@ def _insert_purged_call(
                 call_index=0,
                 call_type=CallType.HTTP.value,
                 status=CallStatus.SUCCESS.value,
-                request_hash="req_hash",
-                response_hash="resp_hash",  # Proof the payload once existed
+                request_hash=fake_sha256("req_hash"),
+                response_hash=fake_sha256("resp_hash"),  # Proof the payload once existed
                 response_ref=None,  # NULL = payload has been purged
                 created_at=now,
             )
@@ -397,7 +389,7 @@ class TestGradeDegradationProperties:
         with make_landscape_db() as db:
             run_id = _create_run(db)
             _set_run_grade(db, run_id, grade)
-            update_grade_after_purge(db, run_id)
+            update_grade_after_purge(db, coordination_token=leader_token_for(db, run_id))
 
             # update_grade_after_purge only downgrades REPLAY_REPRODUCIBLE when
             # replay-critical payloads (nondeterministic node responses) have been purged.
@@ -415,10 +407,10 @@ class TestGradeDegradationProperties:
             run_id = _create_run(db)
             _set_run_grade(db, run_id, grade)
 
-            update_grade_after_purge(db, run_id)
+            update_grade_after_purge(db, coordination_token=leader_token_for(db, run_id))
             once = _get_run_grade(db, run_id)
 
-            update_grade_after_purge(db, run_id)
+            update_grade_after_purge(db, coordination_token=leader_token_for(db, run_id))
             twice = _get_run_grade(db, run_id)
 
             assert once == twice
@@ -439,7 +431,7 @@ class TestGradeDegradationProperties:
         with make_landscape_db() as db:
             run_id = _create_run(db)
             _set_run_grade(db, run_id, grade)
-            update_grade_after_purge(db, run_id)
+            update_grade_after_purge(db, coordination_token=leader_token_for(db, run_id))
             result = _get_run_grade(db, run_id)
 
         assert hierarchy[result] <= hierarchy[grade]
@@ -466,7 +458,7 @@ class TestClassificationDegradationInteractionProperties:
 
             grade = compute_grade(db, run_id)
             _set_run_grade(db, run_id, grade)
-            update_grade_after_purge(db, run_id)
+            update_grade_after_purge(db, coordination_token=leader_token_for(db, run_id))
 
             assert _get_run_grade(db, run_id) == ReproducibilityGrade.FULL_REPRODUCIBLE
 
@@ -489,6 +481,6 @@ class TestClassificationDegradationInteractionProperties:
 
             grade = compute_grade(db, run_id)
             _set_run_grade(db, run_id, grade)
-            update_grade_after_purge(db, run_id)
+            update_grade_after_purge(db, coordination_token=leader_token_for(db, run_id))
 
             assert _get_run_grade(db, run_id) == ReproducibilityGrade.ATTRIBUTABLE_ONLY

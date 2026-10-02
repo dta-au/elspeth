@@ -46,3 +46,13 @@ def test_non_empty_message_is_byte_identical_to_inline_hash() -> None:
         assert compute_error_hash(msg) == inline
         # exception_type is ignored for non-empty messages (does not perturb the hash).
         assert compute_error_hash(msg, exception_type="X") == inline
+
+
+def test_non_string_message_is_not_treated_as_empty() -> None:
+    class FalseyMessage(str):
+        def __bool__(self) -> bool:
+            return False
+
+    message = FalseyMessage("non-empty")
+    expected = hashlib.sha256(b"non-empty").hexdigest()[:16]
+    assert compute_error_hash(message) == expected

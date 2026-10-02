@@ -39,7 +39,6 @@ Dimension = Literal[
     "recovery",
     "concurrency",
     "freeform",
-    "guided",
     "round_trip",
     "scale",
 ]
@@ -56,7 +55,7 @@ RecoveryKind = Literal[
 ]
 RecoveryFaultKind = Literal["sink_effect"]
 RecoveryFaultSeam = Literal["before_effect"]
-GraphNodeType = Literal["aggregation", "coalesce", "gate", "queue", "row_union", "sink", "source", "transform"]
+GraphNodeType = Literal["aggregation", "coalesce", "collector", "gate", "queue", "row_union", "sink", "source", "transform"]
 
 EXPECTED_DIMENSIONS: tuple[Dimension, ...] = (
     "config",
@@ -67,7 +66,6 @@ EXPECTED_DIMENSIONS: tuple[Dimension, ...] = (
     "recovery",
     "concurrency",
     "freeform",
-    "guided",
     "round_trip",
     "scale",
 )
@@ -1115,14 +1113,9 @@ class TerminalEquivalenceProjection(ClosedModel):
         return self
 
 
-class ExpectedRunError(ClosedModel):
-    exception_type: Literal["CoalesceCollisionError"]
-
-
 class RunExpectation(ClosedModel):
     kind: Literal["exact"]
     status: Literal["completed", "completed_with_failures", "empty", "failed"]
-    expected_error: ExpectedRunError | None = None
     sink_outputs: tuple[SinkOutputProjection, ...]
     rows_processed: Count
     rows_succeeded: Count
@@ -1133,8 +1126,6 @@ class RunExpectation(ClosedModel):
 
     @model_validator(mode="after")
     def _validate_exact_counts(self) -> Self:
-        if self.expected_error is not None and self.status != "failed":
-            raise ValueError("expected_error requires status=failed")
         sink_names = tuple(output.sink_name for output in self.sink_outputs)
         if sink_names != tuple(sorted(sink_names)) or len(set(sink_names)) != len(sink_names):
             raise ValueError("sink_outputs must contain unique sorted sink names")
@@ -1469,7 +1460,6 @@ class RuntimeEvidence(ClosedModel):
     output_rows: Count = 0
     sink_outputs: tuple[SinkOutputProjection, ...] = ()
     durable_projection: StableRunProjection | None = None
-    observed_error: ExpectedRunError | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -1494,10 +1484,6 @@ class RuntimeEvidence(ClosedModel):
             or any(count != 0 for count in (self.rows_processed, self.rows_succeeded, self.rows_failed, self.output_rows))
         ):
             raise ValueError("unattempted runtime forbids run identity, status, and non-zero counters")
-        if self.observed_error is not None and self.status != "failed":
-            raise ValueError("observed_error requires status=failed")
-        if self.observed_error is not None and self.kind != "exact":
-            raise ValueError("observed_error requires kind=exact")
         if self.sink_outputs and self.durable_projection is None:
             raise ValueError("runtime sink outputs require a durable projection")
         if self.kind == "exact" and self.durable_projection is None:
@@ -1518,7 +1504,7 @@ class RuntimeEvidence(ClosedModel):
                 raise ValueError("runtime rows_failed must equal projected failed terminal dispositions")
             if self.output_rows != sum(len(output.rows) for output in self.sink_outputs):
                 raise ValueError("runtime output_rows must equal exact sink output row count")
-        if not self.attempted and (self.sink_outputs or self.durable_projection is not None or self.observed_error is not None):
+        if not self.attempted and (self.sink_outputs or self.durable_projection is not None):
             raise ValueError("unattempted runtime forbids exact projection evidence")
         return self
 
@@ -1526,7 +1512,7 @@ class RuntimeEvidence(ClosedModel):
     def _serialize_runtime(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = cast(dict[str, object], handler(self))
         if self.kind != "exact":
-            for field in ("kind", "sink_outputs", "durable_projection", "observed_error"):
+            for field in ("kind", "sink_outputs", "durable_projection"):
                 data.pop(field)
         return data
 
@@ -2204,13 +2190,13 @@ class ScenarioRunEvidence(ClosedModel):
             if self.audit.source_operation_count != source_operation_count:
                 raise ValueError("audit source_operation_count must match exact durable projection")
             if self.audit.kind == "exact":
-                if self.runtime.observed_error is not None:
-                    raise ValueError("observed expected-error runtime requires portable export unavailable_by_policy")
+                if self.runtime.status == "failed":
+                    raise ValueError("failed runtime requires portable export unavailable_by_policy")
                 if self.runtime.durable_projection != self.audit.portable_projection:
                     raise ValueError("exact durable and portable projections must match")
             elif self.audit.kind == "unavailable_by_policy":
-                if self.runtime.status != "failed" or self.runtime.observed_error is None:
-                    raise ValueError("portable export unavailable_by_policy requires failed runtime with observed error")
+                if self.runtime.status != "failed":
+                    raise ValueError("portable export unavailable_by_policy requires failed runtime")
                 assert self.audit.portable_export_unavailable is not None
                 if self.audit.portable_export_unavailable.run_status != self.runtime.status:
                     raise ValueError("portable export refusal status must match runtime status")

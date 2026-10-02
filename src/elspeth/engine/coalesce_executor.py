@@ -19,6 +19,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.barrier_scalars import CoalescePendingScalars
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
 from elspeth.contracts.coalesce_metadata import ArrivalOrderEntry, CoalesceMetadata
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.engine import CoalesceParentCompletion
 from elspeth.contracts.enums import GroupSettlementReason, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
@@ -28,6 +29,8 @@ from elspeth.contracts.errors import (
     ContractMergeError,
     ExecutionError,
     OrchestrationInvariantError,
+    RunLeadershipLostError,
+    RunMembershipLostError,
 )
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
@@ -50,6 +53,13 @@ if TYPE_CHECKING:
 slog = structlog.get_logger(__name__)
 
 
+UNION_FIELD_COLLISION_REASON = "union_field_collision"
+"""Closed failure reason of a coalesce group failed by a union field collision
+under ``union_collision_policy: fail``. Value-free: the collided names (row-
+derived keys under observed schemas) live only in the structured collision
+record on each FAILED hold's ``context_after``."""
+
+
 @dataclass(frozen=True, slots=True)
 class CoalesceOutcome:
     """Result of a coalesce accept operation.
@@ -68,6 +78,14 @@ class CoalesceOutcome:
             release context instead of the standard group-failure consumption.
         join_group_id: Merge-event identity of the coalesce, set iff
             merged_token is set.
+        first_failure_evidence: Late-arrival arm only. True when this
+            straggler's FAILED node_state is the FIRST durable failure
+            evidence of its group — the group failed closed with ZERO arrived
+            members (a loss or timeout before any arrival), so nothing was
+            written at the barrier when it failed. The audit derive counts a
+            failed barrier per (node, fork group) pair with a FAILED state, so
+            this straggler is where the live ``rows_coalesce_failed`` must
+            count that group, exactly once.
     """
 
     held: bool
@@ -78,8 +96,11 @@ class CoalesceOutcome:
     coalesce_name: str | None = None
     late_arrival: bool = False
     join_group_id: str | None = None
+    first_failure_evidence: bool = False
 
     def __post_init__(self) -> None:
+        if self.first_failure_evidence and not self.late_arrival:
+            raise OrchestrationInvariantError("CoalesceOutcome: first_failure_evidence is only valid on a late-arrival outcome")
         # Validate mutual exclusivity of states
         if self.held:
             if self.merged_token is not None:
@@ -455,7 +476,7 @@ class CoalesceExecutor:
 
         # Accept tokens as they arrive
         for token in arriving_tokens:
-            outcome = executor.accept(token, "coalesce_name")
+            outcome = executor.accept(token, "coalesce_name", coordination_token=coordination_token)
             if outcome.merged_token:
                 # Merged token continues through pipeline
                 work_queue.append(outcome.merged_token)
@@ -533,6 +554,14 @@ class CoalesceExecutor:
         # Maximum completed keys to retain (prevents OOM in long-running pipelines).
         # Configurable to match source cardinality and memory budget.
         self._max_completed_keys: int = max_completed_keys
+        # FAILED keys whose failure consumed no arrived member, so no FAILED
+        # node_state exists at the barrier yet: the first straggler's
+        # late-arrival state becomes the group's failure evidence
+        # (``CoalesceOutcome.first_failure_evidence``). Bounded with
+        # ``_completed_keys`` — an evicted key is dropped here too, and a
+        # straggler rediscovered through the Landscape fallback then reports
+        # False (the one tolerated rows_coalesce_failed corner: audit exceeds live).
+        self._failed_without_member_state: set[tuple[str, str]] = set()
 
     def register_coalesce(
         self,
@@ -686,6 +715,7 @@ class CoalesceExecutor:
         # a failed restore leaves the executor's in-memory state intact).
         self._pending.clear()
         self._completed_keys.clear()
+        self._failed_without_member_state.clear()
         for completed_key in restored.completed_keys:
             # The restorer enumerates COMPLETED keys (merged OR failed); the
             # flavor is resolved lazily by the late-arrival arm's released-
@@ -762,13 +792,15 @@ class CoalesceExecutor:
         # Eviction is harmless: Landscape fallback in accept() catches
         # late arrivals for evicted keys.
         while len(self._completed_keys) > self._max_completed_keys:
-            self._completed_keys.popitem(last=False)
+            evicted_key, _flavor = self._completed_keys.popitem(last=False)
+            self._failed_without_member_state.discard(evicted_key)
 
     def accept(
         self,
         token: TokenInfo,
         coalesce_name: str,
         *,
+        coordination_token: CoordinationToken,
         arrival_time: float | None = None,
     ) -> CoalesceOutcome:
         """Accept a token at a coalesce point.
@@ -850,6 +882,8 @@ class CoalesceExecutor:
             # durable discriminator is a status-COMPLETED node_state at the
             # closer (a failed closure sets completed_at too).
             merged = self._completed_keys[key]
+            first_failure_evidence = key in self._failed_without_member_state
+            self._failed_without_member_state.discard(key)
             if merged is None:
                 merged = self._barrier_restore_reads.has_released_group_for_node(
                     run_id=self._run_id, node_id=str(node_id), group_id=fork_group_id
@@ -861,7 +895,7 @@ class CoalesceExecutor:
             state = self._execution.begin_node_state(
                 token_id=token.token_id,
                 node_id=node_id,
-                run_id=self._run_id,
+                member_token=coordination_token.membership,
                 step_index=step,
                 input_data=token.row_data.to_dict(),  # Recorder expects dict
                 attempt=token.resume_attempt_offset,
@@ -876,6 +910,7 @@ class CoalesceExecutor:
                 member_disposition=failure_reason,
             )
             self._execution.complete_node_state(
+                member_token=coordination_token.membership,
                 state_id=state.state_id,
                 status=NodeStateStatus.FAILED,
                 error=error,
@@ -902,6 +937,7 @@ class CoalesceExecutor:
                 ),
                 coalesce_name=coalesce_name,
                 late_arrival=True,
+                first_failure_evidence=first_failure_evidence,
             )
 
         if key not in self._pending:
@@ -932,7 +968,7 @@ class CoalesceExecutor:
         state = self._execution.begin_node_state(
             token_id=token.token_id,
             node_id=node_id,
-            run_id=self._run_id,
+            member_token=coordination_token.membership,
             step_index=step,
             input_data=token.row_data.to_dict(),  # Recorder expects dict
             attempt=token.resume_attempt_offset,
@@ -947,6 +983,7 @@ class CoalesceExecutor:
         # Check if merge conditions are met
         if self._should_merge(settings, pending):
             return self._execute_merge(
+                coordination_token=coordination_token,
                 settings=settings,
                 node_id=node_id,
                 pending=pending,
@@ -1044,9 +1081,11 @@ class CoalesceExecutor:
         step: int,
         failure_reason: str,
         *,
+        coordination_token: CoordinationToken,
         is_timeout: bool = False,
         select_branch: str | None = None,
         metadata: CoalesceMetadata | None = None,
+        context_after: CoalesceMetadata | None = None,
     ) -> CoalesceOutcome:
         """Fail all arrived tokens in a pending coalesce and clean up.
 
@@ -1066,6 +1105,11 @@ class CoalesceExecutor:
                 to CoalesceFailureReason).
             metadata: Pre-built CoalesceMetadata. When provided, used instead of
                 the default CoalesceMetadata.for_failure() construction.
+            context_after: Written as each FAILED hold's ``context_after``.
+                Only the union-collision failure passes it (its collision
+                record — field origins and the collided names — whose audit
+                readers query exactly that location); every other failure
+                arm records no context, as before.
 
         Returns:
             CoalesceOutcome with failure_reason set. The caller terminalizes
@@ -1093,10 +1137,12 @@ class CoalesceExecutor:
         )
         for _branch_name, entry in pending.branches.items():
             self._execution.complete_node_state(
+                member_token=coordination_token.membership,
                 state_id=entry.state_id,
                 status=NodeStateStatus.FAILED,
                 error=error,
                 duration_ms=(now - entry.arrival_time) * 1000,
+                context_after=context_after,
             )
             # Terminal write retired (WS3 Task 6, spec §6.1 item 1): this
             # arm no longer calls record_token_outcome directly for the
@@ -1107,6 +1153,8 @@ class CoalesceExecutor:
 
         del self._pending[key]
         self._mark_completed(key, merged=False)
+        if not consumed_tokens:
+            self._failed_without_member_state.add(key)
 
         if metadata is None:
             metadata = CoalesceMetadata.for_failure(
@@ -1135,13 +1183,16 @@ class CoalesceExecutor:
         step: int,
         key: tuple[str, str],
         coalesce_name: str,
+        *,
+        coordination_token: CoordinationToken,
     ) -> CoalesceOutcome:
         """Execute the merge and create merged token."""
         now = self._clock.monotonic()
 
         # ─────────────────────────────────────────────────────────────────────
         # Defensive check: crash if any token has no contract
-        # Per CLAUDE.md: "Bad data in the audit trail = crash immediately"
+        # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model: "Bad data in the audit trail = crash immediately"
         # A token with None contract is a bug in upstream code (fork/transform).
         # ─────────────────────────────────────────────────────────────────────
         for branch, entry in pending.branches.items():
@@ -1162,6 +1213,7 @@ class CoalesceExecutor:
                 key,
                 step,
                 failure_reason="select_branch_not_arrived",
+                coordination_token=coordination_token,
                 select_branch=settings.select_branch,
                 metadata=CoalesceMetadata.for_select_not_arrived(
                     policy=CoalescePolicy(settings.policy),
@@ -1172,11 +1224,12 @@ class CoalesceExecutor:
             )
 
         completed_state_ids: set[str] = set()
-        # Captured so the failure cleanup handler can persist value-independent
-        # collision provenance (union_field_origins, union_field_collisions) to the audit trail
-        # when CoalesceCollisionError is raised under union_collision_policy=fail,
-        # or when any other exception happens after metadata was built. Stays None
-        # for early failures (e.g., contract merge) where no metadata exists yet.
+        # Captured so the failure cleanup handler can persist the merge's
+        # value-independent provenance (union_field_origins) to the audit trail
+        # when an exception happens after metadata was built. Stays None for
+        # failures before the plan exists. (A union collision under
+        # union_collision_policy=fail never reaches the cleanup: it is a routed
+        # group failure above, recording its collision record itself.)
         metadata_for_audit: CoalesceMetadata | None = None
         try:
             try:
@@ -1197,6 +1250,28 @@ class CoalesceExecutor:
                     key=key,
                     step=step,
                     failure_reason=f"contract_type_conflict: {e}",
+                    coordination_token=coordination_token,
+                )
+            except CoalesceCollisionError as collision:
+                # union_collision_policy=fail met a field name two ARRIVED
+                # branches both carry. A collision certain from config (two
+                # branches that both guarantee the name) is refused at build
+                # (``certain_union_collisions``); what reaches here depends on
+                # the rows' observed fields, so it is a row fault: the group
+                # fails and every consumed token terminates, the run goes on.
+                # The reason is a closed, value-free token (under observed
+                # schemas the collided names are row-derived keys); which
+                # fields collided and which branch carried each stays in the
+                # structured collision record on every FAILED hold
+                # (context_after), where the explain/MCP readers find it.
+                return self._fail_pending(
+                    settings=settings,
+                    key=key,
+                    step=step,
+                    failure_reason=UNION_FIELD_COLLISION_REASON,
+                    coordination_token=coordination_token,
+                    metadata=collision.metadata,
+                    context_after=collision.metadata,
                 )
             coalesce_metadata = plan.metadata
             metadata_for_audit = coalesce_metadata
@@ -1226,7 +1301,7 @@ class CoalesceExecutor:
                 parents=list(consumed_tokens),
                 merged_data=merged_data,
                 node_id=node_id,
-                run_id=self._run_id,
+                coordination_token=coordination_token,
                 parent_completions=parent_completions,
             )
             completed_state_ids.update(item.state_id for item in parent_completions)
@@ -1257,6 +1332,9 @@ class CoalesceExecutor:
                 coalesce_name=coalesce_name,
                 join_group_id=join_group_id,
             )
+        except (RunLeadershipLostError, RunMembershipLostError):
+            # A refused authority must leave the old attempt for takeover.
+            raise
         except AuditIntegrityError:
             # If the audit database is already compromised, don't write more
             # records to it — leaving node states as pending is more honest
@@ -1264,8 +1342,6 @@ class CoalesceExecutor:
             # recording any further FAILED states to the untrustworthy DB.
             raise
         except Exception as merge_exc:
-            if metadata_for_audit is None and isinstance(merge_exc, CoalesceCollisionError):
-                metadata_for_audit = merge_exc.metadata
             # Generate error_hash once for all branches (consistent audit trail).
             error_hash = compute_error_hash(str(merge_exc), exception_type=type(merge_exc).__name__)
 
@@ -1275,11 +1351,11 @@ class CoalesceExecutor:
                 # (Happy path already recorded COALESCED outcome for these.)
                 if entry.state_id in completed_state_ids:
                     continue
-                # Pass metadata_for_audit so union_collision_policy=fail's
-                # collision provenance (field origins + contributing branches) reaches
+                # Pass metadata_for_audit so the built merge's provenance reaches
                 # the Landscape audit trail via context_after. None is acceptable for
-                # early failures (e.g., contract merge) where no metadata exists.
+                # failures before the plan was built.
                 self._execution.complete_node_state(
+                    member_token=coordination_token.membership,
                     state_id=entry.state_id,
                     status=NodeStateStatus.FAILED,
                     output_data={},
@@ -1308,7 +1384,8 @@ class CoalesceExecutor:
                 # for this token here, so WS5/6 resume sees only these terminals
                 # (no replayable loss), and Task 8 escalation must NOT expect one
                 # from this arm.
-                self._data_flow.record_token_outcome(
+                self._data_flow.record_token_outcome_leader(
+                    coordination_token=coordination_token,
                     ref=TokenRef(token_id=entry.token.token_id, run_id=self._run_id),
                     outcome=TerminalOutcome.FAILURE,
                     path=TerminalPath.UNROUTED,
@@ -1353,6 +1430,7 @@ class CoalesceExecutor:
         key: tuple[str, str],
         coalesce_name: str,
         *,
+        coordination_token: CoordinationToken,
         is_timeout: bool = False,
     ) -> CoalesceOutcome:
         """Resolve a pending coalesce by dispatching on policy.
@@ -1384,6 +1462,7 @@ class CoalesceExecutor:
         )
         if decision.action is CoalesceAction.MERGE:
             return self._execute_merge(
+                coordination_token=coordination_token,
                 settings=settings,
                 node_id=node_id,
                 pending=pending,
@@ -1398,12 +1477,15 @@ class CoalesceExecutor:
                 step,
                 failure_reason=decision.require_failure_reason(),
                 is_timeout=is_timeout,
+                coordination_token=coordination_token,
             )
         raise RuntimeError("unreachable: decide_coalesce never returns WAIT for TIMEOUT/FLUSH")
 
     def check_timeouts(
         self,
         coalesce_name: str,
+        *,
+        coordination_token: CoordinationToken,
     ) -> list[CoalesceOutcome]:
         """Check for timed-out pending coalesces and merge them.
 
@@ -1455,12 +1537,13 @@ class CoalesceExecutor:
                     key=key,
                     coalesce_name=coalesce_name,
                     is_timeout=True,
+                    coordination_token=coordination_token,
                 )
             )
 
         return results
 
-    def flush_pending(self) -> list[CoalesceOutcome]:
+    def flush_pending(self, *, coordination_token: CoordinationToken) -> list[CoalesceOutcome]:
         """Flush all pending coalesces (called at end-of-source or shutdown).
 
         For best_effort policy: merges whatever arrived.
@@ -1501,6 +1584,7 @@ class CoalesceExecutor:
                     settings=settings,
                     node_id=node_id,
                     pending=pending,
+                    coordination_token=coordination_token,
                     step=step,
                     key=key,
                     coalesce_name=coalesce_name,
@@ -1512,6 +1596,7 @@ class CoalesceExecutor:
         # detection is no longer needed. This prevents O(rows) memory accumulation
         # in long-running pipelines.
         self._completed_keys.clear()
+        self._failed_without_member_state.clear()
 
         return results
 
@@ -1544,6 +1629,8 @@ class CoalesceExecutor:
         fork_group_id: str,
         lost_branch: str,
         reason: str,
+        *,
+        coordination_token: CoordinationToken,
     ) -> CoalesceOutcome | None:
         """Notify that a branch was error-routed and will never arrive.
 
@@ -1598,7 +1685,7 @@ class CoalesceExecutor:
                 first_arrival=self._clock.monotonic(),
                 lost_branches={lost_branch: reason},
             )
-            return self._evaluate_after_loss(settings, key, step)
+            return self._evaluate_after_loss(settings, key, step, coordination_token=coordination_token)
 
         pending = self._pending[key]
 
@@ -1619,13 +1706,15 @@ class CoalesceExecutor:
 
         # Record the loss and re-evaluate
         pending.lost_branches[lost_branch] = reason
-        return self._evaluate_after_loss(settings, key, step)
+        return self._evaluate_after_loss(settings, key, step, coordination_token=coordination_token)
 
     def _evaluate_after_loss(
         self,
         settings: CoalesceSettings,
         key: tuple[str, str],
         step: int,
+        *,
+        coordination_token: CoordinationToken,
     ) -> CoalesceOutcome | None:
         """Re-evaluate merge conditions after a branch loss notification.
 
@@ -1653,12 +1742,13 @@ class CoalesceExecutor:
         )
         if decision.action is CoalesceAction.MERGE:
             node_id = self._node_ids[settings.name]
-            return self._execute_merge(settings, node_id, pending, step, key, settings.name)
+            return self._execute_merge(settings, node_id, pending, step, key, settings.name, coordination_token=coordination_token)
         if decision.action is CoalesceAction.FAIL:
             return self._fail_pending(
                 settings,
                 key,
                 step,
                 failure_reason=decision.require_failure_reason(),
+                coordination_token=coordination_token,
             )
         return None  # WAIT — still waiting for remaining branches

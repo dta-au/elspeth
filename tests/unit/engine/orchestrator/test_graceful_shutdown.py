@@ -360,16 +360,15 @@ class TestCheckpointInterruptedProgress:
         finally:
             db.close()
 
-    def test_pending_sink_terminalization_uses_per_token_scheduler_handoff(self) -> None:
-        """Generated sink tokens must not be terminalized as scheduler work.
+    def test_every_written_sink_batch_terminalizes_its_scheduler_handoffs(self) -> None:
+        """Every sink-bound token has a durable PENDING_SINK handoff, so every written batch terminalizes.
 
-        A sink batch may mix scheduler-backed tokens with tokens generated after
-        a scheduler barrier. Only tokens with a recorded PENDING_SINK handoff
-        should be closed by the post-sink callback. Post-split
-        (elspeth-107a29d02e) this discrimination lives in write_pending_to_sinks,
-        which composes a scheduler-terminalization callback only for groups whose
-        pending outcome carries scheduler_pending_sink — so the caller must supply
-        the scheduler_terminalizer for terminalization to occur at all.
+        ``_route_to_sink`` refuses a sink-bound result without a handoff (QR:
+        the drain, barrier completions — coalesce merges included — and the
+        fenced source-quarantine ingest all park first), so
+        write_pending_to_sinks composes the scheduler-terminalization callback
+        for every group with a pending outcome; the caller supplies the
+        scheduler_terminalizer. Two tokens of one grouped batch are both closed.
         """
         from elspeth.contracts import PendingOutcome, TokenInfo
         from elspeth.contracts.barrier_scalars import BarrierScalars
@@ -386,7 +385,7 @@ class TestCheckpointInterruptedProgress:
             orchestrator._checkpoints._checkpoint_config = _checkpoint_config(enabled=False)
 
             sink = _SinkSlice()
-            config = SimpleNamespace(sinks={"output": sink}, sink_effect_modes={"output": "write"})
+            config = SimpleNamespace(sinks={"output": sink}, sink_effect_modes={"output": "write"}, sink_effect_bindings={})
 
             processor = _BarrierScalarsProcessor(BarrierScalars(aggregation={}, coalesce={}))
             from elspeth.contracts.coordination import CoordinationToken
@@ -396,27 +395,17 @@ class TestCheckpointInterruptedProgress:
                 coordination_token=CoordinationToken(run_id="run-x", worker_id="test-leader", leader_epoch=1),
             )
 
-            scheduler_token = TokenInfo(row_id="row-1", token_id="tok-scheduler", row_data=make_row({"value": 1}))
-            generated_token = TokenInfo(row_id="row-2", token_id="tok-generated", row_data=make_row({"value": 2}))
+            first_token = TokenInfo(row_id="row-1", token_id="tok-a", row_data=make_row({"value": 1}))
+            second_token = TokenInfo(row_id="row-2", token_id="tok-b", row_data=make_row({"value": 2}))
             pending_tokens = {
                 "output": [
                     (
-                        generated_token,
-                        PendingOutcome(
-                            outcome=TerminalOutcome.SUCCESS,
-                            path=TerminalPath.COALESCED,
-                            scheduler_pending_sink=False,
-                            join_group_id="join-1",
-                        ),
+                        first_token,
+                        PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.COALESCED, join_group_id="join-1"),
                     ),
                     (
-                        scheduler_token,
-                        PendingOutcome(
-                            outcome=TerminalOutcome.SUCCESS,
-                            path=TerminalPath.COALESCED,
-                            scheduler_pending_sink=True,
-                            join_group_id="join-1",
-                        ),
+                        second_token,
+                        PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.COALESCED, join_group_id="join-1"),
                     ),
                 ]
             }
@@ -443,7 +432,7 @@ class TestCheckpointInterruptedProgress:
                     scheduler_terminalizer=processor,
                 )
 
-            assert processor.terminalized_batches == [("tok-scheduler",)]
+            assert sorted(token_id for batch in processor.terminalized_batches for token_id in batch) == ["tok-a", "tok-b"]
         finally:
             db.close()
 

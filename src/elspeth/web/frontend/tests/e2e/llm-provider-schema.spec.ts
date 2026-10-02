@@ -12,7 +12,8 @@
 // Where a path cannot fully execute yet, the body uses
 // `test.skip(!<has-feature>, "<bug-id> gap — see elspeth-XXXXXXXXXX")` so
 // the gap is CI-visible (skip is reported in the run summary) rather than
-// silently suppressed by `test.fixme`. Per CLAUDE.md No-Legacy: no
+// silently suppressed by `test.fixme`. Per CONTRIBUTING.md §Code Standards
+// (no legacy shims): no
 // `// removed for X` placeholder comments — the skip line documents the
 // gap inline. When the bug fixes land, delete the corresponding flag and
 // the `test.skip` call.
@@ -22,8 +23,6 @@ import {
   authedContext,
   createSession,
   deleteSession,
-  getDefaultMode,
-  setDefaultMode,
   setShowAdvanced,
   tokenFromStorageState,
 } from "./helpers/api";
@@ -43,14 +42,7 @@ test.describe("llm-provider-schema — catalog must enforce the operator-profile
     const token = tokenFromStorageState(await page.context().storageState());
     const ctx = await authedContext(token);
     const session = await createSession(ctx, "llm-provider-schema-test-1");
-    // A fresh session opens in the account's default_mode, and a guided build
-    // hides the plugin catalog (catalogAvailable = !guidedBuildActive), so the
-    // Ctrl+Shift+P shortcut is a no-op there. An earlier live spec's
-    // "Switch to guided" leaves the shared E2E account on guided; state the
-    // freeform precondition here and restore whatever was there afterwards.
-    const priorMode = await getDefaultMode(ctx);
     try {
-      await setDefaultMode(ctx, "freeform");
       // Since a0d256676 the catalog's Schema view renders only with the
       // show_advanced preference on; seed it before the drawer mounts and
       // reset it in the finally so sibling specs inherit the default.
@@ -89,7 +81,6 @@ test.describe("llm-provider-schema — catalog must enforce the operator-profile
       }
     } finally {
       await setShowAdvanced(ctx, false);
-      await setDefaultMode(ctx, priorMode);
       await deleteSession(ctx, session.id);
       await ctx.dispose();
     }

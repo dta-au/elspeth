@@ -47,7 +47,8 @@ def test_load_config_happy_path_uses_defaults_for_optional_vars():
     assert config.oauth_scopes == ("read", "write")
     assert config.oauth_fixed_lifetime_seconds is None
     assert config.refresh_skew_seconds == 60
-    assert config.request_timeout_seconds == 60.0
+    assert config.oauth_token_timeout_seconds == 60.0
+    assert config.request_timeout_seconds == 300.0
     assert config.max_body_bytes == 1_048_576
     assert config.max_response_bytes == 4_194_304
     assert config.bounds.max_messages == 50
@@ -79,6 +80,7 @@ def test_known_env_matches_declared_variable_names():
         "OAUTH_SCOPES",
         "OAUTH_FIXED_LIFETIME_SECONDS",
         "REFRESH_SKEW_SECONDS",
+        "OAUTH_TOKEN_TIMEOUT_SECONDS",
         "REQUEST_TIMEOUT_SECONDS",
         "MAX_BODY_BYTES",
         "MAX_RESPONSE_BYTES",
@@ -295,6 +297,11 @@ def test_numeric_override_applies():
     assert config.refresh_skew_seconds == 120
 
 
+def test_oauth_token_timeout_seconds_override_applies():
+    config = load_config(_env(ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_TIMEOUT_SECONDS="12.5"))
+    assert config.oauth_token_timeout_seconds == 12.5
+
+
 def test_invalid_int_env_var_rejected():
     with pytest.raises(ConfigError) as exc_info:
         load_config(_env(ELSPETH_LLM_GATEWAY_REFRESH_SKEW_SECONDS="not-an-int"))
@@ -358,6 +365,12 @@ def test_request_timeout_seconds_zero_rejected():
     with pytest.raises(ConfigError) as exc_info:
         load_config(_env(ELSPETH_LLM_GATEWAY_REQUEST_TIMEOUT_SECONDS="0"))
     assert "out_of_range:ELSPETH_LLM_GATEWAY_REQUEST_TIMEOUT_SECONDS" in exc_info.value.errors
+
+
+def test_oauth_token_timeout_seconds_zero_rejected():
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(_env(ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_TIMEOUT_SECONDS="0"))
+    assert "out_of_range:ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_TIMEOUT_SECONDS" in exc_info.value.errors
 
 
 def test_refresh_skew_seconds_zero_accepted():

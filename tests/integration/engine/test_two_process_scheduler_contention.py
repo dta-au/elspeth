@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -37,22 +38,23 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import Connection, insert, select
 
 import elspeth
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import DEFAULT_RUN_HEARTBEAT_SECONDS
-from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import _SQLITE_PRAGMA_INVARIANTS_FILE, LandscapeDB
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     nodes_table,
     rows_table,
-    runs_table,
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.integration.engine import _scheduler_contention_worker as worker
 
 WORKER_PATH = Path(worker.__file__).resolve()
@@ -116,19 +118,10 @@ def _seed_database(db_path: Path, *, now: datetime) -> None:
     db = LandscapeDB(f"sqlite:///{db_path}")
     try:
         engine = db.engine
+        factory = make_factory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=RUN_ID)
+        leader = leader_coordination_token(factory, RUN_ID)
         with engine.begin() as conn:
-            conn.execute(
-                insert(runs_table).values(
-                    run_id=RUN_ID,
-                    started_at=now,
-                    config_hash="config",
-                    settings_json="{}",
-                    canonical_version="v1",
-                    status="running",
-                    openrouter_catalog_sha256="0" * 64,
-                    openrouter_catalog_source="bundled",
-                )
-            )
             for node_id, node_type, plugin in (
                 ("source-a", NodeType.SOURCE, "csv"),
                 ("normalize", NodeType.TRANSFORM, "identity"),
@@ -141,7 +134,7 @@ def _seed_database(db_path: Path, *, now: datetime) -> None:
                         node_type=node_type.value,
                         plugin_version="1.0",
                         determinism="deterministic",
-                        config_hash="config",
+                        config_hash=fake_sha256("config"),
                         config_json="{}",
                         registered_at=now,
                     )
@@ -162,7 +155,7 @@ def _seed_database(db_path: Path, *, now: datetime) -> None:
                         row_index=ingest_sequence,
                         source_row_index=ingest_sequence,
                         ingest_sequence=ingest_sequence,
-                        source_data_hash=f"hash-{row_id}",
+                        source_data_hash=fake_sha256(f"hash-{row_id}"),
                         created_at=now,
                     )
                 )
@@ -175,7 +168,7 @@ def _seed_database(db_path: Path, *, now: datetime) -> None:
                     )
                 )
             repo.enqueue_ready(
-                run_id=RUN_ID,
+                member_token=leader.membership,
                 token_id=token_id,
                 row_id=row_id,
                 node_id="normalize",
@@ -254,6 +247,15 @@ def _spawn_children(
                             str(metrics),
                             "--min-recovered",
                             str(MIN_RECOVERED_PER_HAMMER),
+                            "--min-claims",
+                            str(MIN_CLAIMS_PER_HAMMER),
+                            "--expire-claims",
+                            *[
+                                argument
+                                for peer in hammer_owners
+                                if peer != owner
+                                for argument in ("--peer-recovered-file", str(tmp_path / f"ready-{peer}.recovered"))
+                            ],
                         ],
                         env=env,
                         stdout=log_handle,
@@ -284,7 +286,7 @@ def _spawn_children(
                 raise AssertionError(
                     f"{role} {owner} did not finish within {JOIN_TIMEOUT_SECONDS}s: "
                     f"a hammer stops only once it has reaped {MIN_RECOVERED_PER_HAMMER} peer lease(s), "
-                    f"so its peer never claimed:\n{log.read_text()}"
+                    f"and every peer has observed a committed recovery:\n{log.read_text()}"
                 ) from None
             # A1 (exit codes): exit 1 is harness-internal failure, never a
             # recorded contention error — those land in the artifact.
@@ -463,6 +465,134 @@ def test_two_process_claim_hammer_with_dashboard_reads(tmp_path: Path) -> None:
         duration_seconds=3.0,
         hammer_owners=("contender-a", "contender-b"),
     )
+
+
+@pytest.mark.timeout(120)
+def test_short_window_hammer_completes_claim_progress_floor_before_exit(tmp_path: Path) -> None:
+    """A short measurement window cannot bypass the worker's A9 claim floor."""
+    db_path = tmp_path / "audit.db"
+    _seed_database(db_path, now=datetime.now(UTC))
+    go_file = tmp_path / "go"
+    go_file.touch()
+    metrics = tmp_path / "metrics.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WORKER_PATH),
+            "--db-url",
+            f"sqlite:///{db_path}",
+            "--role",
+            worker.ROLE_HAMMER,
+            "--owner",
+            "late-contender",
+            "--run-id",
+            RUN_ID,
+            "--ready-file",
+            str(tmp_path / "ready"),
+            "--go-file",
+            str(go_file),
+            "--duration-seconds",
+            "0.001",
+            "--metrics-out",
+            str(metrics),
+            "--min-recovered",
+            "0",
+            "--min-claims",
+            str(MIN_CLAIMS_PER_HAMMER),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(metrics.read_text())["claims"] >= MIN_CLAIMS_PER_HAMMER
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("fail_first_claim", [False, True])
+@pytest.mark.parametrize("fail_first_expiry", [False, True])
+def test_post_window_progress_wait_allows_an_independent_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_first_claim: bool, fail_first_expiry: bool
+) -> None:
+    """A finished hammer must yield outside its transaction while meeting its claim floor."""
+    db_path = tmp_path / "audit.db"
+    _seed_database(db_path, now=datetime.now(UTC))
+    go_file = tmp_path / "go"
+    go_file.touch()
+    args = worker._parse_args(
+        [
+            "--db-url",
+            f"sqlite:///{db_path}",
+            "--role",
+            worker.ROLE_HAMMER,
+            "--owner",
+            "deadline-contender",
+            "--run-id",
+            RUN_ID,
+            "--ready-file",
+            str(tmp_path / "ready"),
+            "--go-file",
+            str(go_file),
+            "--duration-seconds",
+            "1",
+            "--metrics-out",
+            str(tmp_path / "metrics.json"),
+            "--min-recovered",
+            "0",
+            "--min-claims",
+            str(MIN_CLAIMS_PER_HAMMER),
+            "--expire-claims",
+        ]
+    )
+    clock = 0.0
+    attempts = 0
+    independent_writes = 0
+    expirations = 0
+    original_claim = TokenSchedulerRepository.claim_ready
+    original_expiry_time = worker.read_landscape_transaction_time
+
+    def claim(repo: TokenSchedulerRepository, **kwargs: Any) -> TokenWorkItem | None:
+        nonlocal clock, attempts
+        if attempts == 0:
+            assert independent_writes == 0, "the active measurement window must still hammer without pacing"
+        attempts += 1
+        clock = 2.0  # The first claim exhausts the measurement window deterministically.
+        if fail_first_claim and attempts == 1:
+            raise sqlite3.OperationalError("injected acquisition failure")
+        return original_claim(repo, **kwargs)
+
+    def expiry_time(conn: Connection) -> datetime:
+        nonlocal expirations
+        expirations += 1
+        if fail_first_expiry and expirations == 1:
+            raise sqlite3.OperationalError("injected fixture expiry failure")
+        return original_expiry_time(conn)
+
+    def let_peer_write(seconds: float) -> None:
+        nonlocal independent_writes
+        assert clock >= 1.0 and seconds > 0
+        # A real second connection must acquire the writer lock at each yield;
+        # sleeping inside a transaction would fail immediately with timeout=0.
+        with sqlite3.connect(db_path, timeout=0) as peer:
+            peer.execute("BEGIN IMMEDIATE")
+            peer.execute("UPDATE runs SET status = status WHERE run_id = ?", (RUN_ID,))
+        independent_writes += 1
+
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(worker.time, "sleep", let_peer_write)
+    monkeypatch.setattr(TokenSchedulerRepository, "claim_ready", claim)
+    monkeypatch.setattr(worker, "read_landscape_transaction_time", expiry_time)
+    artifact = worker._run_hammer(args)
+
+    assert artifact["claims"] == MIN_CLAIMS_PER_HAMMER
+    assert independent_writes > 0, "post-window progress polling monopolized the writer without yielding"
+    expected_error_verbs = ([worker.VERB_CLAIM] if fail_first_claim else []) + ([worker.VERB_EXPIRE] if fail_first_expiry else [])
+    assert [error["where"] for error in artifact["errors"]] == expected_error_verbs
+    recorded_claims = [record for record in artifact["write_txns"] if record["verb"] == worker.VERB_CLAIM]
+    assert len(recorded_claims) == attempts, "failed acquisitions must remain in latency evidence"
+    recorded_expirations = [record for record in artifact["write_txns"] if record["verb"] == worker.VERB_EXPIRE]
+    assert len(recorded_expirations) == artifact["claims"], "fixture writes must remain in latency evidence"
+    assert all("hold_ms" in record and record["begin_stmt"] == "BEGIN IMMEDIATE" for record in recorded_expirations)
 
 
 @pytest.mark.timeout(120)

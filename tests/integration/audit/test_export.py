@@ -16,7 +16,8 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
-from elspeth.contracts import NodeStateStatus, NodeType, RoutingMode, RunStatus
+from elspeth.contracts import NodeStateStatus, NodeType, RoutingMode, RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from tests.fixtures.landscape import leader_coordination_token
 
@@ -36,6 +37,7 @@ def _audit_export_config(*, signed: bool) -> dict[str, object]:
         "signer_key_id": "integration-test-key-v1" if signed else "UNSIGNED",
         "signing_secret_ref": "ELSPETH_SIGNING_KEY" if signed else None,
         "signer_rotation_policy": "multi_version",
+        "compartment_id": "test-compartment",
         "total_record_limit": 10_000,
         "total_byte_limit": 10_000_000,
         "chunk_limit": 100,
@@ -140,6 +142,30 @@ class TestLandscapeExport:
         record_types = {r["record_type"] for r in records}
         assert "run" in record_types, "Missing run record"
         assert "row" in record_types, "Missing row records"
+
+    def test_cli_signed_export_includes_deployment_auth_history(
+        self, export_settings_yaml: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from elspeth.cli import app
+        from elspeth.core.landscape.database import LandscapeDB
+        from tests.unit.core.landscape.test_auth_event_export import _event
+
+        config = yaml.safe_load(export_settings_yaml.read_text())
+        config["landscape"]["export"] = _audit_export_config(signed=True)
+        config["landscape"]["export"]["auth_events"] = "deployment_snapshot"
+        export_settings_yaml.write_text(yaml.safe_dump(config))
+        monkeypatch.setenv("ELSPETH_SIGNING_KEY", "controlled-export-test-signing-key")
+        with LandscapeDB.from_url(config["landscape"]["url"]) as db:
+            _event(db, "prior-role-grant")
+        result = runner.invoke(app, ["run", "-s", str(export_settings_yaml), "--execute"])
+        assert result.exit_code == 0, result.output
+        records = _read_audit_records(tmp_path / "audit_export.json")
+        events = [record for record in records if record["record_type"] == "auth_event"]
+        assert [record["event_id"] for record in events] == ["prior-role-grant"]
+        coverage = next(record for record in records if record["record_type"] == "auth_event_coverage")
+        assert coverage["policy"] == "deployment_snapshot"
+        assert coverage["selected_count"] == 1
+        assert all("signature" in record for record in records)
 
     def test_export_contains_all_record_types(self, export_settings_yaml: Path, tmp_path: Path) -> None:
         """Export should contain run, node, row, token, and node_state records."""
@@ -281,11 +307,12 @@ class TestSignedExportDeterminism:
 
         # Create a run with multiple records of each type
         run = factory.run_lifecycle.begin_run(config={"test": True}, canonical_version="v1")
+        authority = leader_coordination_token(factory, run.run_id)
 
         # Multiple nodes
         for i in range(3):
             factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=authority,
                 node_id=f"node_{i}",
                 plugin_name="test",
                 node_type=NodeType.TRANSFORM,
@@ -297,7 +324,7 @@ class TestSignedExportDeterminism:
         # Multiple edges
         for i in range(2):
             factory.data_flow.register_edge(
-                run_id=run.run_id,
+                coordination_token=authority,
                 from_node_id=f"node_{i}",
                 to_node_id=f"node_{i + 1}",
                 label="continue",
@@ -306,34 +333,44 @@ class TestSignedExportDeterminism:
 
         # Multiple rows with tokens
         for i in range(3):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
+                coordination_token=authority,
                 source_node_id="node_0",
                 row_index=i,
                 data={"value": i * 10},
                 source_row_index=i,
                 ingest_sequence=i,
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             state = factory.execution.begin_node_state(
                 token_id=token.token_id,
                 node_id="node_0",
-                run_id=run.run_id,
+                member_token=authority.membership,
                 step_index=0,
                 input_data={"x": i},
             )
             factory.execution.complete_node_state(
                 state.state_id,
+                member_token=authority.membership,
                 status=NodeStateStatus.COMPLETED,
                 output_data={"result": i * 20},
                 duration_ms=5.0,
+            )
+            # Every token of a successful run carries its outcome (QR-4).
+            factory.data_flow.record_token_outcome_leader(
+                TokenRef(token_id=token.token_id, run_id=run.run_id),
+                TerminalOutcome.SUCCESS,
+                TerminalPath.DEFAULT_FLOW,
+                coordination_token=authority,
+                sink_name="default",
             )
 
         factory.run_lifecycle.complete_run(status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Export the SAME run twice with signing
         signing_key = b"test-determinism-key-12345"
-        exporter = LandscapeExporter(db, signing_key=signing_key, signer_key_id="integration-test-key-v1")
+        exporter = LandscapeExporter(
+            db, signing_key=signing_key, signer_key_id="integration-test-key-v1", compartment_id="test-compartment"
+        )
 
         final_hashes = []
         for _ in range(2):

@@ -323,8 +323,7 @@ Open <http://127.0.0.1:8451> and sign in with `demo` / `demo12345`.
 ### Step 5: Create a Browser-Authored Version
 
 1. Use the session switcher and choose **+ New session**.
-2. Keep the default guided mode, or choose **Switch to guided** if your
-   account default is freeform.
+2. Open the Composer chat.
 3. Upload `examples/threshold_gate/input.csv` through the **Files** panel with
    **Upload**.
 4. Tell the composer:
@@ -340,7 +339,7 @@ Open <http://127.0.0.1:8451> and sign in with `demo` / `demo12345`.
    as the CLI example: `id: int`, `name: str`, `amount: int`, `category: str`.
 6. When validation passes, use **Run pipeline**.
 
-The completion bar also exposes **Save for review**. If you want to compare the
+The completion bar also exposes **Share inspect link**. If you want to compare the
 browser-authored configuration with `examples/threshold_gate/settings.yaml`,
 open **Export YAML** from the command palette (`Ctrl+Shift+Y`).
 
@@ -764,7 +763,7 @@ condition: "row['amount'] > 1000"
 Now that you've built your first pipeline:
 
 1. **Add an LLM transform** - See `examples/openrouter_sentiment/` for LLM classification
-2. **Try guided browser authoring** - See [User Manual: Web Composer](user-manual.md#web-composer-guided-mode)
+2. **Try browser authoring** - See [User Manual: Web Composer](user-manual.md#web-composer)
 3. **Share a browser-authored pipeline for review** - See [Sharing Pipelines](sharing-pipelines.md)
 4. **Export the audit trail** - Add `landscape.export` to create signed exports
 5. **Build a custom plugin** - See [PLUGIN.md](../../PLUGIN.md) for plugin development
@@ -810,7 +809,7 @@ elspeth web --host 127.0.0.1 --port 8451
 | `Upload` | Add a session-scoped source file |
 | `Run pipeline` | Execute the validated composition |
 | `Export YAML` | Inspect or download generated YAML |
-| `Save for review` | Create a shareable read-only review link when validation passes |
+| `Share inspect link` | Create a shareable read-only review link when validation passes |
 
 ### Docker Commands
 

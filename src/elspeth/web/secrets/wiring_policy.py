@@ -22,6 +22,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.validation import validate_secret_name
 
 SecretWiringComponentType = Literal["source", "transform", "sink"]
@@ -54,6 +55,16 @@ class SecretWiringPolicy:
     """The server-authored destination allowlist, in declaration order."""
 
     rules: tuple[SecretWiringRule, ...]
+
+    @property
+    def canonical_hash(self) -> str:
+        """Bind effective destinations without retaining secret names in evidence."""
+        return stable_hash(
+            {
+                "schema_version": 1,
+                "rules": sorted({(rule.secret, rule.component_type, rule.plugin, rule.option_key) for rule in self.rules}),
+            }
+        )
 
     def authorizes(
         self,

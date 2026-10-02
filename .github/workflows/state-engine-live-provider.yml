@@ -63,7 +63,7 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
-          version: "0.5"
+          version: "0.10.2"
           enable-cache: false
           prune-cache: true
       - name: Assert protected default-branch baseline
@@ -174,7 +174,7 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
-          version: "0.5"
+          version: "0.10.2"
           enable-cache: false
           prune-cache: true
       - name: Assert protected default-branch baseline
@@ -268,7 +268,7 @@ jobs:
         with: {python-version: "3.13"}
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
-        with: {version: "0.5", enable-cache: false, prune-cache: true}
+        with: {version: "0.10.2", enable-cache: false, prune-cache: true}
       - name: Assert protected default-branch baseline
         run: |
           set -euo pipefail
@@ -335,7 +335,7 @@ jobs:
         with: {python-version: "3.13"}
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
-        with: {version: "0.5", enable-cache: false, prune-cache: true}
+        with: {version: "0.10.2", enable-cache: false, prune-cache: true}
       - name: Assert protected default-branch baseline
         run: |
           set -euo pipefail
@@ -380,12 +380,12 @@ jobs:
           - source:llm@bedrock
           - source:llm@gateway
           - source:llm@openrouter
+          - transform:azure_ai_search@api-key
+          - transform:azure_ai_search@managed-identity
           - transform:llm@azure
           - transform:llm@bedrock
           - transform:llm@gateway
           - transform:llm@openrouter
-          - transform:rag_retrieval@azure-search-api-key
-          - transform:rag_retrieval@azure-search-managed-identity
           - transform:rag_retrieval@chroma-client
           - transform:rag_retrieval@chroma-ephemeral
           - transform:rag_retrieval@chroma-persistent
@@ -427,7 +427,7 @@ jobs:
         with: {python-version: "3.13"}
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
-        with: {version: "0.5", enable-cache: false, prune-cache: true}
+        with: {version: "0.10.2", enable-cache: false, prune-cache: true}
       - name: Assert protected default-branch baseline
         run: |
           set -euo pipefail

@@ -72,13 +72,13 @@ def test_batch_replicate_returns_contract_with_multi_row_output():
         f"Contract should include all output fields. Expected {expected_fields}, got {contract_field_names}"
     )
 
-    # Verify field metadata is preserved from input contracts where possible.
-    # copy_index is a new field added by the transform, so it gets int type.
-    # Input fields preserve their original contract metadata.
+    # Input fields preserve their original contract metadata; copy_index is
+    # the field the transform creates and carries the plugin's DECLARATION
+    # (int, ADR-050) rather than a type inferred from this batch's values.
     for field in result.rows[0].contract.fields:
         if field.normalized_name == "copy_index":
             assert field.python_type is int, "copy_index should have int type"
-            assert field.source == "inferred", "copy_index should be inferred"
+            assert field.source == "declared", "copy_index is declared by the plugin"
         else:
             assert field.source == "inferred", f"Field {field.normalized_name} should be inferred"
 

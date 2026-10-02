@@ -63,6 +63,15 @@ def record_advisor_checkpoint_pass(
     verdict: AdvisorCheckpointTelemetryVerdict,
     source: AdvisorCheckpointVerdictSource,
     findings_hash: str,
+    provider_attempts: int,
+    first_attempt_schema_valid: bool | None,
+    first_attempt_accepted: bool | None,
+    format_reprompt_sent: bool,
+    step_ids_offered: int | None,
+    step_ids_kept: int | None,
+    note_present: bool | None,
+    url_redactions: int | None,
+    email_redactions: int | None,
 ) -> None:
     """Event and metric increment mirroring one persisted checkpoint pass.
 
@@ -82,12 +91,23 @@ def record_advisor_checkpoint_pass(
             verdict=verdict,
             source=source,
             findings_hash=findings_hash,
+            provider_attempts=provider_attempts,
+            first_attempt_schema_valid=first_attempt_schema_valid,
+            first_attempt_accepted=first_attempt_accepted,
+            format_reprompt_sent=format_reprompt_sent,
+            step_ids_offered=step_ids_offered,
+            step_ids_kept=step_ids_kept,
+            note_present=note_present,
+            url_redactions=url_redactions,
+            email_redactions=email_redactions,
         )
     except contract_errors.TIER_1_ERRORS:
         raise
     except Exception as exc:
         _acknowledge_telemetry_failure(operation="checkpoint_pass_event", error_type=type(exc).__name__)
     try:
+        # Exact conformance counts belong to the event above. Metric
+        # dimensions stay bounded and never contain model-controlled counts.
         _ADVISOR_CHECKPOINT_PASSES_COUNTER.add(1, {"phase": phase, "verdict": verdict, "source": source})
     except contract_errors.TIER_1_ERRORS:
         raise

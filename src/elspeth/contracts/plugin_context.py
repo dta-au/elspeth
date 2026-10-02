@@ -19,16 +19,25 @@ from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.contexts import RateLimitRegistryProtocol
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import CallType as CallTypeEnum
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.node_state_context import AggregationBatchContext
+from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary
 
 if TYPE_CHECKING:
-    from elspeth.contracts import Call, CallStatus, CallType, TransformErrorReason
+    from elspeth.contracts import Call, CallStatus, CallType, SourceRow, TransformErrorReason
     from elspeth.contracts.audit_protocols import PluginAuditWriter
+    from elspeth.contracts.call_data import CallPayload
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
-    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.errors import ContractViolation
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.payload_store import PayloadStore
@@ -46,11 +55,11 @@ logger = logging.getLogger(__name__)
     invariant=(
         "Missing or malformed usage is observed as unknown by TokenUsage.from_dict; "
         "returns None when no valid usage field exists, preserving partial known counts without inventing zero counts. "
-        "The caller records the original response independently; this helper only projects telemetry metadata."
+        "The caller records the original response independently; this helper projects audit and telemetry metadata."
     ),
 )
 def _observed_response_token_usage(response_data: Mapping[str, object]) -> TokenUsage | None:
-    """Project optional provider usage independently of audit recording."""
+    """Project optional provider usage without changing the raw response."""
     from elspeth.contracts.token_usage import TokenUsage
 
     usage = TokenUsage.from_dict(response_data.get("usage"))
@@ -105,17 +114,26 @@ class PluginContext:
 
     run_id: str
     _config: Mapping[str, Any] = field(repr=False)
+    run_mode: RunMode = RunMode.LIVE
+    replay_from: str | None = None
+    call_mode_session: CallModeSession | None = None
+    audited_sources: Mapping[str, object] | None = None
+    verified_sources: Mapping[str, tuple[SourceRow, ...]] | None = None
 
     # === Audit & Infrastructure ===
     landscape: PluginAuditWriter | None = None
-    # The run's current leader token, carried BY VALUE from the executor that
-    # built this context (ADR-048 §3). A plugin never constructs one; a
-    # context without one cannot write to the Landscape.
+    # Authority travels by value from the executor (ADR-048). Leaders also
+    # have membership; followers carry only their admitted membership.
+    # Writer-less contexts support inspection; audit methods require the
+    # concrete authority for their scope and never silently skip a write.
     coordination_token: CoordinationToken | None = None
+    member_token: WorkerMembershipToken | None = None
+    work_item: TokenWorkItem | None = None
     payload_store: PayloadStore | None = None
     rate_limit_registry: RateLimitRegistryProtocol | None = None
     concurrency_config: RuntimeConcurrencyConfig | None = None
     shutdown_event: threading.Event | None = None
+    llm_call_governance: LLMCallGovernance | None = None
 
     # Additional metadata
     node_id: str | None = field(default=None)
@@ -161,7 +179,7 @@ class PluginContext:
     # Callback to emit telemetry events for external calls.
     # Always present - when telemetry is disabled, orchestrator sets this to a no-op.
     # Plugins ALWAYS call this after successful Landscape recording - no None checks.
-    telemetry_emit: Callable[[Any], None] = field(default=lambda event: None)
+    telemetry_emit: Callable[[TelemetryEvent], None] = field(default=lambda event: None)
 
     # Validation errors that must later be linked to a persisted quarantine row.
     # Entries are (match_key, error_id), where match_key hashes the raw row payload
@@ -177,6 +195,7 @@ class PluginContext:
         rate_limit_registry: RateLimitRegistryProtocol | None = None,
         concurrency_config: RuntimeConcurrencyConfig | None = None,
         shutdown_event: threading.Event | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
         node_id: str | None = None,
         token: TokenInfo | None = None,
         batch_token_ids: tuple[str, ...] | None = None,
@@ -184,10 +203,17 @@ class PluginContext:
         contract: SchemaContract | None = None,
         state_id: str | None = None,
         operation_id: str | None = None,
-        telemetry_emit: Callable[[Any], None] | None = None,
+        telemetry_emit: Callable[[TelemetryEvent], None] | None = None,
         coordination_token: CoordinationToken | None = None,
+        member_token: WorkerMembershipToken | None = None,
+        work_item: TokenWorkItem | None = None,
         _pending_quarantine_validation_errors: list[tuple[str, str]] | None = None,
         _config: Mapping[str, Any] | None = None,
+        run_mode: RunMode = RunMode.LIVE,
+        replay_from: str | None = None,
+        call_mode_session: CallModeSession | None = None,
+        audited_sources: Mapping[str, object] | None = None,
+        verified_sources: Mapping[str, tuple[SourceRow, ...]] | None = None,
     ) -> None:
         if config is not None and _config is not None:
             raise TypeError("PluginContext accepts either config or _config, not both")
@@ -196,6 +222,19 @@ class PluginContext:
             raise TypeError("PluginContext missing required argument: 'config'")
 
         self.run_id = run_id
+        if type(run_mode) is not RunMode:
+            raise TypeError("PluginContext.run_mode must be a RunMode")
+        if run_mode is not RunMode.LIVE and not replay_from:
+            raise ValueError("PluginContext.replay_from is required for replay/verify mode")
+        self.run_mode = run_mode
+        self.replay_from = replay_from
+        if run_mode is not RunMode.LIVE and call_mode_session is None:
+            raise ValueError("PluginContext.call_mode_session is required for replay/verify mode")
+        if call_mode_session is not None and call_mode_session.mode is not run_mode:
+            raise ValueError("PluginContext.call_mode_session mode disagrees with run_mode")
+        self.call_mode_session = call_mode_session
+        self.audited_sources = audited_sources
+        self.verified_sources = verified_sources
         # Deep-freeze config so plugins cannot mutate the run configuration
         # after the audit snapshot (settings_json, config_hash) is recorded.
         # PluginContext is not frozen (checkpoint/token need mutation), but
@@ -203,10 +242,23 @@ class PluginContext:
         self._config = deep_freeze(raw_config)
         self.landscape = landscape
         self.coordination_token = coordination_token
+        if coordination_token is not None and type(coordination_token) is not CoordinationToken:
+            raise TypeError("coordination_token must be a CoordinationToken")
+        if member_token is not None and type(member_token) is not WorkerMembershipToken:
+            raise TypeError("member_token must be a WorkerMembershipToken")
+        if coordination_token is not None:
+            if member_token is not None and member_token != coordination_token.membership:
+                raise FrameworkBugError("PluginContext leader and member identities disagree")
+            member_token = coordination_token.membership
+        if member_token is not None and member_token.run_id != run_id:
+            raise FrameworkBugError("PluginContext membership belongs to a different run")
+        self.member_token = member_token
+        self.work_item = work_item
         self.payload_store = payload_store
         self.rate_limit_registry = rate_limit_registry
         self.concurrency_config = concurrency_config
         self.shutdown_event = shutdown_event
+        self.llm_call_governance = llm_call_governance
         self.node_id = node_id
         self.token = token
         self.batch_token_ids = batch_token_ids
@@ -234,6 +286,7 @@ class PluginContext:
             rate_limit_registry=self.rate_limit_registry,
             concurrency_config=self.concurrency_config,
             shutdown_event=self.shutdown_event,
+            llm_call_governance=self.llm_call_governance,
             node_id=self.node_id,
             token=self.token,
             batch_token_ids=self.batch_token_ids,
@@ -243,7 +296,69 @@ class PluginContext:
             operation_id=self.operation_id,
             telemetry_emit=self.telemetry_emit,
             coordination_token=self.coordination_token,
+            member_token=self.member_token,
+            work_item=self.work_item,
             _pending_quarantine_validation_errors=self._pending_quarantine_validation_errors,
+            run_mode=self.run_mode,
+            replay_from=self.replay_from,
+            call_mode_session=self.call_mode_session,
+            audited_sources=self.audited_sources,
+            verified_sources=self.verified_sources,
+        )
+
+    def require_coordination_token(self) -> CoordinationToken:
+        """Return the executor's leader authority, refusing a read-only context."""
+        if not isinstance(self.coordination_token, CoordinationToken):
+            raise FrameworkBugError("Plugin audit write requires the executor's leader token")
+        return self.coordination_token
+
+    def require_member_token(self) -> WorkerMembershipToken:
+        """Return the worker's admitted authority without acquiring or inventing it."""
+        if not isinstance(self.member_token, WorkerMembershipToken):
+            raise FrameworkBugError("Plugin audit write requires the executor's member token")
+        return self.member_token
+
+    def require_work_item(self) -> TokenWorkItem:
+        """Return the actual scheduler claim bound to this plugin invocation."""
+        if not isinstance(self.work_item, TokenWorkItem):
+            raise FrameworkBugError("Row audit write requires the executor's claimed work item")
+        return self.work_item
+
+    def allocate_call_index(self) -> int:
+        """Allocate a row call index using this context's exact worker claim."""
+        if self.landscape is None or self.state_id is None:
+            raise FrameworkBugError("Row call index allocation requires a node-state audit parent")
+        return self.landscape.allocate_call_index(
+            self.state_id,
+            member_token=self.require_member_token(),
+            work_item=self.require_work_item(),
+        )
+
+    def record_row_call(
+        self,
+        *,
+        call_index: int,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        latency_ms: float | None = None,
+        source_call_id: str | None = None,
+    ) -> Call:
+        """Record a row call under this context's exact node state and claim."""
+        if self.landscape is None or self.state_id is None:
+            raise FrameworkBugError("Row call recording requires a node-state audit parent")
+        return self.landscape.record_call(
+            state_id=self.state_id,
+            call_index=call_index,
+            call_type=call_type,
+            status=status,
+            request_data=request_data,
+            response_data=response_data,
+            latency_ms=latency_ms,
+            source_call_id=source_call_id,
+            member_token=self.require_member_token(),
+            work_item=self.require_work_item(),
         )
 
     def record_readiness_check(
@@ -255,7 +370,7 @@ class PluginContext:
         count: int | None,
         message: str,
     ) -> None:
-        """Record a provider readiness check under the run's leader token (ADR-048 §3).
+        """Record provider readiness under the worker's admitted membership.
 
         The token is forwarded by value from the executor that built this
         context; a context without one cannot write, and that is the intended
@@ -263,12 +378,12 @@ class PluginContext:
         """
         from elspeth.contracts import FrameworkBugError
 
-        if self.landscape is None or self.coordination_token is None:
+        if self.landscape is None or self.member_token is None:
             raise FrameworkBugError(
-                f"record_readiness_check() called without landscape or leader token. "
+                f"record_readiness_check() called without landscape or member token. "
                 f"Context state: run_id={self.run_id}, node_id={self.node_id}, "
                 f"landscape={'set' if self.landscape is not None else 'None'}, "
-                f"coordination_token={'set' if self.coordination_token is not None else 'None'}. "
+                f"member_token={'set' if self.member_token is not None else 'None'}. "
                 f"This is a framework bug — the executor must inject both before plugin on_start()."
             )
         self.landscape.record_readiness_check(
@@ -277,7 +392,7 @@ class PluginContext:
             reachable=reachable,
             count=count,
             message=message,
-            coordination_token=self.coordination_token,
+            member_token=self.require_member_token(),
         )
 
     @staticmethod
@@ -312,9 +427,9 @@ class PluginContext:
     ) -> Call | None:
         """Record an external API call to the audit trail and emit telemetry.
 
-        Provides a convenient way for plugins to record external calls
-        without managing call indices manually. Routes to the appropriate
-        recorder method based on whether state_id or operation_id is set.
+        Records source/sink operation calls without manually managing call
+        indices. Row calls are recorded by audited clients with their
+        member token and claimed work item.
 
         After recording to Landscape (the legal record), emits an
         ExternalCallCompleted telemetry event for operational visibility.
@@ -332,7 +447,7 @@ class PluginContext:
             The recorded Call, or None if landscape not configured
 
         Raises:
-            FrameworkBugError: If neither or both of state_id and operation_id are set
+            FrameworkBugError: If the context lacks an operation parent or leader authority
         """
         from elspeth.contracts import FrameworkBugError
 
@@ -344,88 +459,25 @@ class PluginContext:
                 f"This is a framework bug — orchestrator must inject landscape before plugin execution."
             )
 
-        # Enforce XOR: exactly one of state_id or operation_id must be set
-        has_state = self.state_id is not None
-        has_operation = self.operation_id is not None
-
-        if has_state and has_operation:
-            raise FrameworkBugError(
-                f"record_call() called with BOTH state_id and operation_id set. "
-                f"state_id={self.state_id}, operation_id={self.operation_id}. "
-                f"This is a framework bug - context should have exactly one parent."
-            )
-
-        if not has_state and not has_operation:
-            raise FrameworkBugError(
-                f"record_call() called without state_id or operation_id. "
-                f"Context state: run_id={self.run_id}, node_id={self.node_id}. "
-                f"This is a framework bug - context should have been set by orchestrator/executor."
-            )
-
-        # Route to appropriate recorder method
-        if has_state:
-            # Delegate call_index allocation to centralized PluginAuditWriter.
-            # This ensures UNIQUE(state_id, call_index) when mixing ctx.record_call()
-            # with audited clients (AuditedLLMClient, AuditedHTTPClient), which also
-            # use recorder.allocate_call_index().
-            if self.state_id is None:
-                raise FrameworkBugError("record_call has_state=True but state_id is None")
-            call_index = self.landscape.allocate_call_index(self.state_id)
-
-            recorded_call = self.landscape.record_call(
-                state_id=self.state_id,
-                call_index=call_index,
-                call_type=call_type,
-                status=status,
-                request_data=RawCallPayload(request_data),
-                response_data=RawCallPayload(response_data) if response_data is not None else None,
-                error=RawCallPayload(error) if error is not None else None,
-                latency_ms=latency_ms,
-            )
-            parent_id: str = self.state_id
-        else:
-            # Operation call - recorder handles call index allocation
-            if self.operation_id is None:
-                raise FrameworkBugError("record_call has_operation=True but operation_id is None")
-            recorded_call = self.landscape.record_operation_call(
-                operation_id=self.operation_id,
-                call_type=call_type,
-                status=status,
-                request_data=RawCallPayload(request_data),
-                response_data=RawCallPayload(response_data) if response_data is not None else None,
-                error=RawCallPayload(error) if error is not None else None,
-                latency_ms=latency_ms,
-            )
-            parent_id = self.operation_id
-
-        # Resolve token_id from authoritative state_id lookup BEFORE telemetry.
-        # This is a data integrity check — FrameworkBugError must NOT be swallowed
-        # by the telemetry error handler below.
-        # Resolve from state_id, not from self.token_id which may be stale.
-        token_id = None
-        if has_state:
-            if self.state_id is None:
-                raise FrameworkBugError("record_call has_state=True but state_id is None (token_id lookup)")
-            node_state = self.landscape.get_node_state(self.state_id)
-            if node_state is None:
-                raise FrameworkBugError(
-                    f"record_call() has state_id={self.state_id} but get_node_state() "
-                    f"returned None. This is a framework bug — state_id should always "
-                    f"resolve to a valid node_state."
-                )
-            token_id = node_state.token_id
-            # Validate that ctx.token (if set) is consistent with the authoritative source
-            if self.token is not None and self.token.token_id != token_id:
-                raise FrameworkBugError(
-                    f"record_call() token mismatch: ctx.token.token_id={self.token.token_id} "
-                    f"but node_state.token_id={token_id} for state_id={self.state_id}. "
-                    f"This is a framework bug — ctx.token is out of sync with state_id."
-                )
+        if self.state_id is not None or self.operation_id is None:
+            raise FrameworkBugError("PluginContext.record_call requires an operation parent; row clients own row-call recording")
+        token_usage = _observed_response_token_usage(response_data) if call_type == CallTypeEnum.LLM and response_data is not None else None
+        recorded_call = self.landscape.record_operation_call(
+            operation_id=self.operation_id,
+            call_type=call_type,
+            status=status,
+            request_data=RawCallPayload(request_data),
+            response_data=RawCallPayload(response_data) if response_data is not None else None,
+            error=RawCallPayload(error) if error is not None else None,
+            latency_ms=latency_ms,
+            coordination_token=self.require_coordination_token(),
+            token_usage=token_usage if token_usage is not None else TokenUsage.unknown(),
+        )
+        parent_id = self.operation_id
 
         # Emit telemetry AFTER successful Landscape recording
         # Wrapped in try/except to prevent telemetry failures from affecting callers
         try:
-            from elspeth.contracts.enums import CallType as CallTypeEnum
             from elspeth.contracts.events import ExternalCallCompleted
 
             # Pass data directly to RawCallPayload. No defensive copy needed:
@@ -435,13 +487,6 @@ class PluginContext:
             # (Existing test: test_request_payload_snapshot_is_immutable_after_call)
             request_snapshot = request_data
             response_snapshot = response_data
-
-            # Extract token usage for LLM calls if available.
-            # Keep external metadata observation separate from the audit-writing
-            # method: the response remains untrusted even after recording it.
-            token_usage = None
-            if call_type == CallTypeEnum.LLM and response_snapshot is not None:
-                token_usage = _observed_response_token_usage(response_snapshot)
 
             # Wrap data in RawCallPayload for typed telemetry payload.
             # RawCallPayload.__init__ calls deep_freeze(), creating an independent
@@ -457,9 +502,9 @@ class PluginContext:
                     timestamp=datetime.now(UTC),
                     run_id=self.run_id,
                     # Use correct field based on context type
-                    state_id=self.state_id if has_state else None,
-                    operation_id=self.operation_id if has_operation else None,
-                    token_id=token_id,
+                    state_id=None,
+                    operation_id=self.operation_id,
+                    token_id=None,
                     call_type=call_type,
                     provider=provider,
                     status=status,
@@ -583,7 +628,7 @@ class PluginContext:
 
         # Record to landscape audit trail
         error_id = self.landscape.record_validation_error(
-            run_id=self.run_id,
+            coordination_token=self.require_coordination_token(),
             node_id=self.node_id,
             row_data=row,
             error=error,
@@ -636,6 +681,8 @@ class PluginContext:
             )
 
         error_id = self.landscape.record_transform_error(
+            member_token=self.require_member_token(),
+            work_item=self.require_work_item(),
             ref=TokenRef(token_id=token_id, run_id=self.run_id),
             transform_id=transform_id,
             row_data=row,
@@ -669,6 +716,7 @@ def plugin_context_scope(
     contract: SchemaContract | None | _ContextScopeUnset = _CONTEXT_SCOPE_UNSET,
     state_id: str | None | _ContextScopeUnset = _CONTEXT_SCOPE_UNSET,
     operation_id: str | None | _ContextScopeUnset = _CONTEXT_SCOPE_UNSET,
+    work_item: TokenWorkItem | None | _ContextScopeUnset = _CONTEXT_SCOPE_UNSET,
 ) -> Iterator[PluginContext]:
     """Temporarily assign executor-owned metadata on a shared plugin context.
 
@@ -684,6 +732,7 @@ def plugin_context_scope(
     previous_contract = ctx.contract
     previous_state_id = ctx.state_id
     previous_operation_id = ctx.operation_id
+    previous_work_item = ctx.work_item
 
     if not isinstance(node_id, _ContextScopeUnset):
         ctx.node_id = node_id
@@ -699,6 +748,8 @@ def plugin_context_scope(
         ctx.state_id = state_id
     if not isinstance(operation_id, _ContextScopeUnset):
         ctx.operation_id = operation_id
+    if not isinstance(work_item, _ContextScopeUnset):
+        ctx.work_item = work_item
 
     try:
         yield ctx
@@ -717,3 +768,5 @@ def plugin_context_scope(
             ctx.state_id = previous_state_id
         if not isinstance(operation_id, _ContextScopeUnset):
             ctx.operation_id = previous_operation_id
+        if not isinstance(work_item, _ContextScopeUnset):
+            ctx.work_item = previous_work_item

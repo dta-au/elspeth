@@ -12,7 +12,9 @@ import type { CompositionState, ValidationResult } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
 import { compositionContentEqual } from "@/lib/compositionContent";
 import {
-  humaniseValidationMessage,
+  humaniseExecutionError,
+  humaniseValidationWarning,
+  type HumanisedFinding,
   makePhraseFor,
   stepPrefixPhrase,
 } from "@/lib/validationHumaniser";
@@ -27,23 +29,6 @@ let previousSessionIds: Set<string> = new Set();
 let initialized = false;
 let unsubscribe: (() => void) | null = null;
 
-/**
- * Last composition each version-keyed subscriber acted on, so a version bump
- * that authored NOTHING can be recognised and skipped (elspeth-986801d218 —
- * a post-completion guided chat persists a byte-identical state row, and
- * clearing + re-validating on it flipped the completed heading off "Pipeline
- * ready" for the round trip).
- *
- * ONE SNAPSHOT PER SUBSCRIBER, never a shared one. Zustand fires listeners in
- * registration order on a single `setState`: the version-clear subscriber
- * (registered first) would advance a shared snapshot to the current state and
- * the auto-validate subscriber (registered second) would then compare the
- * current state against itself, find it equal, and never validate again.
- *
- * Both must be reset in `_resetSubscriptionsForTesting()` AND in
- * `resetPerUserState()` — a snapshot surviving a logout / user switch would
- * suppress the first real change of the next identity.
- */
 interface CompositionSnapshot {
   sessionId: string | null;
   version: number;
@@ -157,6 +142,7 @@ function validationFingerprint(result: ValidationResult | null): string | null {
       component_type: err.component_type ?? null,
       component_id: err.component_id ?? null,
       message: err.message,
+      error_code: err.error_code ?? null,
       suggestion: err.suggestion ?? null,
     })),
     warnings: (result.warnings ?? []).map((warn) => ({
@@ -185,12 +171,11 @@ function validationFingerprint(result: ValidationResult | null): string | null {
  * (elspeth-ede84df6b3). Pass `null` when the caller has none.
  */
 function humanisedValidationBullet(
-  message: string,
+  finding: HumanisedFinding,
   componentId: string | null,
   componentType: string | null,
   phraseFor: (componentId: string | null, componentType?: string | null) => string,
 ): string {
-  const finding = humaniseValidationMessage(message, phraseFor);
   const prefix = stepPrefixPhrase(finding, componentId, componentType, phraseFor);
   return prefix !== null
     ? `- **${prefix}:** ${finding.headline}`
@@ -279,12 +264,6 @@ export function initStoreSubscriptions(): void {
   previousSessionIds = new Set(useSessionStore.getState().sessions.map((s) => s.id));
 
   unsubscribe = useSessionStore.subscribe((state) => {
-    // Version-change clears validation — UNLESS the new version carries the
-    // same authored content as the one it replaced. A content-equal bump
-    // (a post-completion guided chat's byte-identical settlement row) leaves
-    // the existing verdict exactly as true as it was; clearing it would blank
-    // the run gate's readiness and read on screen as "Pipeline updated" until
-    // a redundant re-validate landed.
     const composition = state.compositionState;
     const currentVersion = composition?.version ?? null;
     if (previousVersion !== null && currentVersion !== previousVersion) {
@@ -397,22 +376,6 @@ export function initStoreSubscriptions(): void {
       const count = result.readiness.blockers.filter(
         (blocker) => blocker.code === "interpretation_review_pending",
       ).length;
-      // Button names come from `characterisePendingControls` /
-      // `pendingControlsInstruction` (acknowledgementLabels.ts), the SAME
-      // rule ChatInput's placeholder uses, so this note cannot drift from
-      // the rendered controls or from the sibling surface
-      // (elspeth-0a9f77dd75). Any set that rule cannot characterise — a mix
-      // that includes a prompt card, or an empty/stale pending map (the
-      // events stream in on a separate fetch that can lag validation) —
-      // returns null and falls back to neutral wording that names no control
-      // at all. The invariant is one-way: never name a control the pending
-      // card(s) do not render.
-      //
-      // Not tutorial-aware, and does not need to be: the stack additionally
-      // suppresses amend in tutorial mode (AcknowledgementStack `showAmend={
-      // !isTutorial && …}`), but this note is injected into sessionStore
-      // `messages`, which only the FREEFORM ChatPanel branch renders — the
-      // tutorial/guided column renders `guidedSession.chat_history` instead.
       const pendingMap =
         useInterpretationEventsStore.getState().pendingBySession[
           sessionStore.activeSessionId ?? ""
@@ -454,7 +417,7 @@ export function initStoreSubscriptions(): void {
       const lines = ["**Validation failed** — fix the following errors before running:"];
       for (const err of result.errors) {
         lines.push(
-          humanisedValidationBullet(err.message, err.component_id ?? null, err.component_type ?? null, phraseFor),
+          humanisedValidationBullet(humaniseExecutionError(err, phraseFor), err.component_id ?? null, err.component_type ?? null, phraseFor),
         );
       }
       sessionStore.injectSystemMessage(lines.join("\n"), VALIDATION_MSG_ID);
@@ -464,7 +427,7 @@ export function initStoreSubscriptions(): void {
       const lines = ["**Validation passed with warnings:**"];
       for (const warn of result.warnings) {
         lines.push(
-          humanisedValidationBullet(warn.message, warn.component_id ?? null, warn.component_type ?? null, phraseFor),
+          humanisedValidationBullet(humaniseValidationWarning(warn), warn.component_id ?? null, warn.component_type ?? null, phraseFor),
         );
       }
       sessionStore.injectSystemMessage(lines.join("\n"), VALIDATION_MSG_ID);

@@ -91,6 +91,17 @@ export type InterpretationSource =
   | "auto_interpreted_no_surfaces";
 
 /**
+ * What raised a review surface. Mirrors the backend
+ * ``InterpretationSurfaceOrigin`` closed enum. Only ``composer_llm`` surfaces
+ * carry LLM provenance; the server routes consulted no LLM.
+ */
+export type InterpretationSurfaceOrigin =
+  | "composer_llm"
+  | "state_revert"
+  | "yaml_import"
+  | "e2e_seed";
+
+/**
  * Class of LLM-authored assumption surfaced for review.
  *
  * Mirrors the Python `InterpretationKind` StrEnum.  CLOSED LIST — adding
@@ -182,10 +193,14 @@ export interface InterpretationEvent {
   // Mirrors ProposalEventRecord.actor: originator:role:id or system:{component}.
   actor: string;
   interpretation_source: InterpretationSource;
+  // What raised the surface. Null for rows with no surface (session-marker
+  // opt-out rows and auto_interpreted_no_surfaces rows). The server always
+  // sends the key; it is optional here because no component reads it yet.
+  surface_origin?: InterpretationSurfaceOrigin | null;
   // ── LLM provenance bound to the draft author ─────────────────────────────
-  // Null for session-marker opt-out rows (no LLM was consulted).
-  // Required for user_approved, auto_interpreted_no_surfaces, and
-  // surface-specific opt-out rows.
+  // Null when no LLM was consulted: session-marker opt-out rows, and surfaces
+  // a server route raised (surface_origin other than "composer_llm").
+  // Required for auto_interpreted_no_surfaces rows.
   model_identifier: string | null;
   model_version: string | null;
   provider: string | null;
@@ -201,9 +216,9 @@ export interface InterpretationEvent {
   // between surfacing and resolution).
   runtime_model_identifier_at_resolve: string | null;
   runtime_model_version_at_resolve: string | null;
-  // Cross-DB hash anchor (Option A): hex SHA-256 of the resolved
-  // prompt-template string.  Null until resolved; null for opt-out rows.
-  resolved_prompt_template_hash: string | null;
+  // Cross-DB hash anchor: SHA-256 of the versioned effective prompt artifact,
+  // including system text and ordered query names/templates.
+  approved_prompt_artifact_hash: string | null;
 }
 
 // ── Endpoint envelopes ───────────────────────────────────────────────────────

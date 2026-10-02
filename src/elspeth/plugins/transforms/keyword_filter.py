@@ -218,7 +218,7 @@ class KeywordFilter(BaseTransform):
     name = "keyword_filter"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a68d02cbefd06922"
+    source_file_hash: str | None = "sha256:3377cd14f8dd007e"
     config_model = KeywordFilterConfig
     usage_when_to_use: str = (
         "Use for regex content screening when a pattern match must return an error for the node's "
@@ -362,9 +362,11 @@ class KeywordFilter(BaseTransform):
                         retryable=False,
                     )
 
-        # No matches - pass through unchanged
+        # No matches - pass through unchanged, under the node's declared
+        # contract: the ONE stamp writes the operator's declared fields onto
+        # it (ADR-050 Decision 2).
         return TransformResult.success(
-            self._align_output_row_contract(row),
+            PipelineRow(row.to_dict(), self._align_output_contract(self._apply_declared_output_field_contracts(row.contract))),
             success_reason={"action": "filtered"},
         )
 

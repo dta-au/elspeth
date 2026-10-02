@@ -2,7 +2,7 @@
 
 Index of the documentation shipped in this repository.
 
-**Framework status:** `0.8.0`
+**Framework status:** `0.8.1`
 **Archive note:** current release, architecture, contract, guide, reference, and
 runbook docs remain visible here. Implemented plans, superseded specs, generated
 review sidecars, and other internal work product are removed from active public
@@ -22,6 +22,7 @@ history.
 | Investigating audit data | [Landscape MCP Analysis](guides/landscape-mcp-analysis.md) and [Architecture Overview](../ARCHITECTURE.md) |
 | Developing plugins | [Data Trust and Error Handling](guides/data-trust-and-error-handling.md), [Plugin Development Guide](../PLUGIN.md), then [Plugin Protocol](contracts/plugin-protocol.md) |
 | Contributing to the codebase | [Contributing](../CONTRIBUTING.md) |
+| Developing a web or agent head | [Application API design](specs/application-api-design.md) — authoritative future seam and required reference-client conformance — then [Local web development](guides/web-local-development.md) |
 | Evaluating ELSPETH | [Composer Guide](release/composer-guide.md), [Platform Architecture](release/platform-architecture.md), and [Audit and Lineage Guarantees](release/guarantees.md) |
 | Reviewing delivery confidence and decisions | [Project Control](project-control/README.md) — the control registers are maintained by the project but not published in the repository |
 
@@ -42,6 +43,7 @@ explains the arrangement and how to request them.
 Current architecture and design references.
 
 - [Repository Directory Strategy](repository-structure.md) — purpose of every top-level folder and where new files belong
+- [Application API Design](specs/application-api-design.md) — single future-facing spec for API hardening, retained reference UI conformance, ARGO, agentic chassis, web ownership and the internal compiler seam
 - [Maintainer Toolchain](maintainer/toolchain.md) — how the maintainer's own agents work (tracker, code map, delegation); not a requirement for contributors
 - [Architecture Overview](../ARCHITECTURE.md) — C4 model, data flows, and system-level orientation
 - [System Overview](architecture/overview.md) — compatibility pointer to the maintained root architecture overview
@@ -134,3 +136,7 @@ Audience-facing release and evaluation documents. See the
 Intentional point-in-time documents are retained through git history and, for
 maintainers, optional local ignored archives. They are not part of the active
 public docs index because they describe superseded implementation details.
+
+The currently selected supporting assessment and historical catalogs used as
+live executable fixtures remain active. Their frozen baseline is not a current
+source certification, and a date alone does not make them superseded.

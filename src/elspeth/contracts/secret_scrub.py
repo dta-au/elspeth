@@ -1,228 +1,39 @@
-"""Secret-scrubbing for DeclarationContractViolation payloads (ADR-010 §Decision 3).
-
-The Landscape audit trail is a legal record. Arbitrary Mapping[str, Any] payloads
-(allowed by the DeclarationContractViolation signature) could carry API keys,
-connection strings, or OAuth tokens from plugin ``config.options``. This helper
-redacts values matching known secret patterns BEFORE the payload is handed to
-``to_audit_dict``.
-
-Coverage is best-effort: new secret formats need new patterns here. This is
-the last line of defence, not the first — contract authors SHOULD structure
-payloads so they never carry secrets (see per-contract TypedDict payload_schema).
-"""
+"""Audit credential scrubbing backed by the shared credential classifier."""
 
 from __future__ import annotations
 
-import re
-from collections.abc import Mapping, Set
-from typing import Any, Final, cast
-from urllib.parse import parse_qs, urlparse
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Final, cast
 
-from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.contracts.url import SENSITIVE_PARAMS
-
-# Public so consumers that must NOT treat two scrubbed strings as the same
-# fact (failure-attribution correlation) can recognise the constant instead of
-# re-spelling it. Whole-string replacement means every secret-bearing message
-# collapses to this one value; equality of two scrubbed strings is therefore
-# not evidence they came from the same failure.
-REDACTED_SECRET_TEXT: Final[str] = "<redacted-secret>"
-_REDACTED = REDACTED_SECRET_TEXT
-
-# Heuristic patterns. Order matters — longer / more specific first.
-#
-# ADR-010 §Payload-schema enforcement H5 Layer 2 additions — closed-set blind spots:
-#  - Azure SAS ``sig=`` parameter. The whole-string redaction rule means any
-#    URI containing a SAS signature has the entire URI replaced — structure
-#    (container name, blob path) would otherwise leak alongside the
-#    authenticator.
-#  - Database connection strings. Both ODBC-style (``Password=x;``) and
-#    URL-style (``postgres(ql)?://u:p@h``, ``mysql://u:p@h``). The ODBC
-#    match is case-insensitive because real-world conn strings mix case
-#    (``PWD=``, ``password=``); the URL schemes are case-sensitive per RFC
-#    3986 §3.1 so left as-is.
-#  - Basic-auth URLs. The ``user:pass@`` discriminator is required so plain
-#    HTTPS endpoints (Landscape resource URIs, example.com links) do not
-#    get nuked in triage payloads — see ``test_plain_https_url_without
-#    _credentials_passes_through``.
-#  - Common hosted-service credentials: fine-grained GitHub PATs and app
-#    tokens, Google API keys, newer Slack token prefixes, and Azure storage
-#    account keys (64 raw bytes serialized as 88-character base64).
-_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key
-    re.compile(r"sk-or-v1-[A-Za-z0-9_-]{20,}"),  # OpenRouter API key
-    re.compile(r"sk-[A-Za-z0-9]{20,}"),  # OpenAI / generic "sk-" key
-    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),  # GitHub fine-grained PAT
-    re.compile(r"gh[osr]_[A-Za-z0-9]{36,}"),  # GitHub OAuth/server/refresh token
-    re.compile(r"AIza[0-9A-Za-z_-]{35}"),  # Google API key
-    re.compile(r"xox[abpr]-[A-Za-z0-9-]{10,}"),  # Slack token
-    re.compile(r"xapp-[A-Za-z0-9-]{10,}"),  # Slack app token
-    re.compile(r"xoxe-[A-Za-z0-9-]{10,}"),  # Slack workspace token
-    re.compile(r"ghp_[A-Za-z0-9]{36,}"),  # GitHub PAT
-    re.compile(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}"),  # JWT
-    re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),  # PEM
-    re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{86}==(?=$|[^A-Za-z0-9+/=])"),  # Azure storage account key
-    # Azure SAS signature — the ``sig=`` parameter value is the authenticator.
-    re.compile(r"sig=[A-Za-z0-9%/+=]{20,}"),
-    # ODBC-style conn-string password field; case-insensitive because
-    # Password=, PASSWORD=, pwd=, PWD= all appear in the wild.
-    re.compile(r"(?i)(?:password|pwd)=[^;\s]+"),
-    # URL-style DB connection strings with embedded credentials.
-    re.compile(r"postgres(?:ql)?://[^:/\s]+:[^@/\s]+@"),
-    re.compile(r"mysql://[^:/\s]+:[^@/\s]+@"),  # secret-scan: allow-this-line
-    re.compile(r"mongodb(?:\+srv)?://[^:/\s]+:[^@/\s]+@"),
-    # Basic-auth HTTP(S) URLs — require the ``user:pass@`` discriminator so
-    # credential-free endpoint URIs are NOT redacted.
-    re.compile(r"https?://[^:/\s]+:[^@/\s]+@"),
-    # Low-entropy key/value secret disclosures in freeform violation messages.
-    re.compile(
-        r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|"
-        r"auth[_-]?token|id[_-]?token|bearer[_-]?token|client[_-]?secret|"
-        r"private[_-]?key|secret[_-]?key|connection[_-]?string|authorization|"
-        r"password|passwd|pwd|credentials?)\s*[:=]\s*['\"]?[^'\"\s,;)}\]]+"
-    ),
+from elspeth.contracts.credential_material import (
+    REDACTED_CREDENTIAL_TEXT,
+    scrub_credential_material,
 )
 
-_HTTP_URL_CANDIDATE_RE = re.compile(r"https?://[^\s'\"<>]+")
+if TYPE_CHECKING:
+    from elspeth.contracts.errors import TransformErrorReason
 
-# Key-name match is case-insensitive and separator-insensitive (see
-# ``_is_secret_key_name``). Every entry must be lowercase here.
-#
-# ADR-010 §Payload-schema enforcement H5 Layer 2 additions: bearer/session tokens
-# carried under non-``authorization`` keys, and connection-string keys
-# whose value may carry credentials even if the string itself doesn't
-# happen to match a regex above.
-_SECRET_KEY_NAMES: frozenset[str] = frozenset(
-    {
-        # Existing 2A set.
-        "api_key",
-        "apikey",
-        "secret",
-        "token",
-        "password",
-        "passwd",
-        "authorization",
-        "credentials",
-        # H5 additions — bearer / session / refresh families.
-        "access_token",
-        "refresh_token",
-        "session_token",
-        "auth_token",
-        "x_auth_token",
-        "id_token",
-        "bearer_token",
-        "auth_cookie",
-        "client_secret",
-        "secret_key",
-        "private_key",
-        "x_api_key",
-        "proxy_authorization",
-        # H5 additions — connection / SAS families.
-        "sas_token",
-        "connection_string",
-        "conn_string",
-    }
-)
-_SECRET_KEY_NAMES_NORMALIZED: frozenset[str] = frozenset(name.replace("_", "").replace("-", "") for name in _SECRET_KEY_NAMES)
+# Stable public sentinel retained for audit readers.
+REDACTED_SECRET_TEXT: Final[str] = REDACTED_CREDENTIAL_TEXT
+_CREDENTIAL_SCRUB_FAILURE: Final[dict[str, str]] = {"_redaction_status": "credential_scrub_failure"}
 
 
 def scrub_payload_for_audit(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a deep-copied, secret-redacted version of ``payload``.
-
-    - Key names matching ``_SECRET_KEY_NAMES`` (case-insensitive) are redacted
-      regardless of value.
-    - String values matching any pattern in ``_PATTERNS`` are replaced entirely.
-    - Nested mappings and sequences are walked recursively.
-    """
-    # _scrub_value on a Mapping always returns a dict comprehension.
-    # cast() tells mypy the return type without adding a runtime isinstance check.
-    return cast(dict[str, Any], _scrub_value(payload, parent_key=None))
+    """Return a deep-copied credential-redacted audit payload."""
+    scrubbed = scrub_credential_material(payload)
+    if type(scrubbed) is dict:
+        return cast(dict[str, Any], scrubbed)
+    return dict(_CREDENTIAL_SCRUB_FAILURE)
 
 
 def scrub_text_for_audit(text: str) -> str:
-    """Return a secret-redacted version of freeform audit text.
-
-    Uses the same whole-string replacement rules as payload string values so
-    persisted exception messages do not bypass the audit scrubber.
-    """
-    return cast(str, _scrub_value(text, parent_key=None))
+    """Return fixed-sentinel text when the shared classifier recognizes it."""
+    return cast(str, scrub_credential_material(text))
 
 
-@trust_boundary(
-    tier=3,
-    source=(
-        "an audit payload value being scrubbed before persistence — provider responses, exception "
-        "payloads, and other heterogeneous external content ELSPETH does not own"
-    ),
-    source_param="value",
-    suppresses=("R5",),
-    invariant=(
-        "returns a redacted deep copy for recognized str/Mapping/list/tuple/Set shapes and passes every "
-        "other value through unchanged; a non-str mapping key cannot name a secret and is walked with no "
-        "parent-key match; never raises on malformed input"
-    ),
-    non_raising=True,
-)
-def _scrub_value(value: Any, *, parent_key: str | None) -> Any:
-    if parent_key is not None and _is_secret_key_name(parent_key):
-        return _REDACTED
-    if isinstance(value, Mapping):
-        return {k: _scrub_value(v, parent_key=k if isinstance(k, str) else None) for k, v in value.items()}
-    if isinstance(value, str):
-        if _contains_sensitive_http_url(value):
-            return _REDACTED
-        for pattern in _PATTERNS:
-            if pattern.search(value):
-                # Replace the whole string — partial redaction leaks structure.
-                return _REDACTED
-        return value
-    if isinstance(value, (list, tuple)):
-        return [_scrub_value(item, parent_key=None) for item in value]
-    if isinstance(value, Set):
-        return sorted(
-            (_scrub_value(item, parent_key=None) for item in value),
-            key=repr,
-        )
-    return value
-
-
-def _is_secret_key_name(key: str) -> bool:
-    return key.lower().replace("_", "").replace("-", "") in _SECRET_KEY_NAMES_NORMALIZED
-
-
-def _contains_sensitive_http_url(value: str) -> bool:
-    return any(_parsed_http_url_contains_sensitive_parts(candidate) for candidate in _http_url_candidates(value))
-
-
-def _http_url_candidates(value: str) -> tuple[str, ...]:
-    parsed = urlparse(value)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-        standalone: tuple[str, ...] = ()
-    else:
-        standalone = (value,)
-
-    embedded = tuple(candidate for match in _HTTP_URL_CANDIDATE_RE.finditer(value) if (candidate := match.group(0).rstrip(".,;:!?)]}")))
-    return standalone + embedded
-
-
-def _parsed_http_url_contains_sensitive_parts(value: str) -> bool:
-    parsed = urlparse(value)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-        return False
-    if parsed.username is not None or parsed.password is not None:
-        return True
-    query_params = parse_qs(parsed.query, keep_blank_values=True)
-    if any(_base_param_name(key.lower()) in SENSITIVE_PARAMS for key in query_params):
-        return True
-    fragment_params = parse_qs(parsed.fragment, keep_blank_values=True)
-    return any(_base_param_name(key.lower()) in SENSITIVE_PARAMS for key in fragment_params)
-
-
-def _base_param_name(key: str) -> str:
-    bracket = key.find("[")
-    if bracket != -1:
-        key = key[:bracket]
-    dot = key.find(".")
-    if dot != -1:
-        key = key[:dot]
-    return key
+def scrub_transform_error_reason(reason: TransformErrorReason) -> TransformErrorReason:
+    """Return ``reason`` with credential-bearing control evidence redacted."""
+    scrubbed = scrub_payload_for_audit(reason)
+    if scrubbed == reason:
+        return reason
+    return cast("TransformErrorReason", scrubbed)

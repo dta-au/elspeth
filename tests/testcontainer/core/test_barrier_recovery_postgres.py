@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import select
+from tests.fixtures.landscape import leader_coordination_token
 from tests.fixtures.plugins import CollectSink
 from tests.helpers.postgres_target import postgres_test_target
 from tests.integration.pipeline.test_aggregation_recovery import (
@@ -76,7 +77,7 @@ def test_postgres_recovers_completed_coalesce_effect_without_remerge(
         leader_worker_id="seeder",
     )
     factory.data_flow.register_node(
-        run_id="test-run",
+        coordination_token=leader_coordination_token(factory, "test-run"),
         plugin_name="test-source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -105,7 +106,7 @@ def test_postgres_recovers_completed_coalesce_effect_without_remerge(
     assert _work_item_row(db, "tok-branch-a")["status"] == TokenWorkStatus.BLOCKED.value
     assert _work_item_row(db, "tok-branch-b")["status"] == TokenWorkStatus.BLOCKED.value
 
-    _usurp_seat(db, clock)
+    _usurp_seat(db)
     executor_b = _real_coalesce_executor(factory, clock, policy="require_all")
     _coalesce_processor(
         factory,

@@ -19,6 +19,7 @@ from typing import Annotated, Any
 import pytest
 from pydantic import BaseModel, ConfigDict
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.tier_registry import _TIER_1_ERRORS_VIEW
 from elspeth.web.composer.redaction import (
@@ -46,15 +47,14 @@ _TYPE_DRIVEN_TOOL_RESULT_TOOLS = (
 )
 
 _EXTERNAL_SCALAR_CANARY = "RAW_RESPONSE_CANARY_/private/operator/path_sk-secret"
+# The classes the web ARG_ERROR producers raise, measured by the producer census
+# in test_error_class_producer_census.py (S0 trimmed the hand labels and the
+# classes no reachable input produces).
 _KNOWN_ARG_ERROR_CLASSES = (
-    "CanonicalizationError",
-    "FloatDomainError",
     "IntegerDomainError",
     "JSONDecodeError",
     "JsonBoundaryError",
-    "MissingRequiredPaths",
     "ToolArgumentError",
-    "TypeError",
     "ValidationError",
     "ValueError",
 )
@@ -103,10 +103,23 @@ def _tool_result_canary_response(*, success: bool) -> dict[str, Any]:
 def test_arg_error_projection_preserves_every_known_producer_class(error_class: str) -> None:
     result = redact_arg_error_response(
         error_class=error_class,
+        error_category=ToolArgumentErrorCategory.SEMANTIC_RULE,
         error_message="fixed producer diagnostic",
     )
 
     assert result["error_class"] == error_class
+    assert result["error_category"] == "semantic_rule"
+
+
+@pytest.mark.parametrize("error_class", ["MissingRequiredPaths", "TypeError", "FloatDomainError", "CanonicalizationError"])
+def test_arg_error_projection_redacts_classes_no_producer_raises(error_class: str) -> None:
+    result = redact_arg_error_response(
+        error_class=error_class,
+        error_category=ToolArgumentErrorCategory.SEMANTIC_RULE,
+        error_message="fixed producer diagnostic",
+    )
+
+    assert result["error_class"] == "<redacted-arg-error-class>"
 
 
 def test_every_type_driven_manifest_entry_declares_a_response_model() -> None:
@@ -253,6 +266,14 @@ def test_repair_argument_summary_never_exposes_arbitrary_key_names(tool_name: st
     assert key_canary not in json.dumps(result, sort_keys=True)
 
 
+# ``data`` is a declared known response key for upsert_node, so the projection
+# budget now degrades only that key (per-key sentinel) instead of replacing the
+# whole row with the ``response_projection_limit`` stub. The DoS properties
+# these tests pin — no recursion, no amplification, a tiny output — are
+# unchanged.
+_PER_KEY_PROJECTION_LIMIT = {"data": "<redacted-response-projection-limit>"}
+
+
 def test_declarative_projection_rejects_excessive_depth_without_recursion() -> None:
     nested: object = "leaf"
     for _ in range(1200):
@@ -264,7 +285,7 @@ def test_declarative_projection_rejects_excessive_depth_without_recursion() -> N
         telemetry=NoopRedactionTelemetry(),
     )
 
-    assert result == {"_redaction_status": "response_projection_limit"}
+    assert result == _PER_KEY_PROJECTION_LIMIT
 
 
 def test_declarative_projection_rejects_excessive_width_without_amplification() -> None:
@@ -274,7 +295,7 @@ def test_declarative_projection_rejects_excessive_width_without_amplification() 
         telemetry=NoopRedactionTelemetry(),
     )
 
-    assert result == {"_redaction_status": "response_projection_limit"}
+    assert result == _PER_KEY_PROJECTION_LIMIT
     assert len(json.dumps(result)) < 256
 
 
@@ -285,7 +306,7 @@ def test_declarative_projection_rejects_excessive_total_nodes() -> None:
         telemetry=NoopRedactionTelemetry(),
     )
 
-    assert result == {"_redaction_status": "response_projection_limit"}
+    assert result == _PER_KEY_PROJECTION_LIMIT
 
 
 def test_type_driven_projection_rejects_oversized_validation_list_before_model_validation() -> None:
@@ -357,7 +378,6 @@ def test_existing_response_models_scrub_free_form_failure_and_diagnostic_text() 
         },
         "affected_nodes": [_EXTERNAL_SCALAR_CANARY],
         "version": 3,
-        "data": {"error": _EXTERNAL_SCALAR_CANARY},
     }
     review_response = {
         "success": True,
@@ -704,14 +724,13 @@ def test_get_blob_content_redacts_tool_result_failure_envelope() -> None:
         },
         "affected_nodes": [],
         "version": 2,
-        "data": {"error": "Blob 'blob-1' not found."},
     }
 
     result = redact_tool_call_response("get_blob_content", response, telemetry=NoopRedactionTelemetry())
 
     assert result["success"] is False
     assert result["version"] == 2
-    assert result["data"]["error"] == "<redacted-response-text>"
+    assert "data" not in result
     assert "blob-1" not in json.dumps(result, sort_keys=True)
 
 

@@ -13,8 +13,11 @@ from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.testing import make_field
 from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.unit.engine.conftest import claim_token_for_manager, token_manager_leader
 from tests.unit.engine.conftest import make_test_step_resolver as _make_step_resolver
 
 
@@ -60,12 +63,12 @@ class TestTokenManager:
         manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver())
 
         token_info = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 42}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         assert token_info.row_id is not None
@@ -85,12 +88,12 @@ class TestTokenManager:
             patch.object(factory.data_flow, "create_token", wraps=factory.data_flow.create_token) as create_token,
         ):
             token_info = manager.create_initial_token(
-                run_id=run_id,
                 source_node_id=source_node_id,
                 row_index=5,
                 source_row=_make_source_row({"value": 42}),
                 source_row_index=7,
                 ingest_sequence=11,
+                coordination_token=token_manager_leader(manager, run_id),
             )
 
         assert token_info.row_id is not None
@@ -106,19 +109,20 @@ class TestTokenManager:
 
         manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver())
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 42}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         children, _fork_group_id = manager.fork_token(
             parent_token=initial,
             branches=["stats", "classifier"],
             node_id=NodeID("gate_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
         )
 
         assert len(children) == 2
@@ -140,19 +144,20 @@ class TestTokenManagerCoalesce:
         manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver())
 
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 42}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         children, _fork_group_id = manager.fork_token(
             parent_token=initial,
             branches=["stats", "classifier"],
             node_id=NodeID("gate_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
         )
 
         stats_token = children[0].with_updated_data(
@@ -166,7 +171,7 @@ class TestTokenManagerCoalesce:
             parents=[stats_token, classifier_token],
             merged_data=_make_pipeline_row({"value": 42, "mean": 10.5, "label": "A"}),
             node_id=NodeID("coalesce_node"),
-            run_id=run_id,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         assert merged.token_id is not None
@@ -189,7 +194,7 @@ class TestTokenManagerCoalesceValidation:
                 parents=[],
                 merged_data=_make_pipeline_row({"value": 1}),
                 node_id=NodeID("coalesce_node"),
-                run_id=_run_id,
+                coordination_token=token_manager_leader(manager, _run_id),
             )
 
     def test_coalesce_tokens_mismatched_row_ids_raises(self) -> None:
@@ -200,20 +205,20 @@ class TestTokenManagerCoalesceValidation:
 
         # Create two separate source rows (different row_ids)
         token_a = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         token_b = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=1,
             source_row=_make_source_row({"value": 2}),
             source_row_index=1,
             ingest_sequence=1,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         assert token_a.row_id != token_b.row_id
@@ -223,7 +228,7 @@ class TestTokenManagerCoalesceValidation:
                 parents=[token_a, token_b],
                 merged_data=_make_pipeline_row({"value": 1}),
                 node_id=NodeID("coalesce_node"),
-                run_id=run_id,
+                coordination_token=token_manager_leader(manager, run_id),
             )
 
 
@@ -250,20 +255,20 @@ class TestCoalesceMismatchedRowIdsMutationKill:
         manager, _factory, run_id, source_node_id = _make_manager_context()
 
         token_a = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         token_b = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=1,
             source_row=_make_source_row({"value": 2}),
             source_row_index=1,
             ingest_sequence=1,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         with pytest.raises(OrchestrationInvariantError, match=token_a.row_id):
@@ -271,7 +276,7 @@ class TestCoalesceMismatchedRowIdsMutationKill:
                 parents=[token_a, token_b],
                 merged_data=_make_pipeline_row({"value": 1}),
                 node_id=NodeID("coalesce_node"),
-                run_id=run_id,
+                coordination_token=token_manager_leader(manager, run_id),
             )
 
     def test_mismatched_row_id_less_than_reference_detected(self) -> None:
@@ -283,20 +288,20 @@ class TestCoalesceMismatchedRowIdsMutationKill:
         manager, _factory, run_id, source_node_id = _make_manager_context()
 
         token_a = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         token_b = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=1,
             source_row=_make_source_row({"value": 2}),
             source_row_index=1,
             ingest_sequence=1,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         # Order so that parents[1].row_id < parents[0].row_id
@@ -314,7 +319,7 @@ class TestCoalesceMismatchedRowIdsMutationKill:
                 parents=[first, second],
                 merged_data=_make_pipeline_row({"value": 1}),
                 node_id=NodeID("coalesce_node"),
-                run_id=run_id,
+                coordination_token=token_manager_leader(manager, run_id),
             )
 
 
@@ -330,19 +335,20 @@ class TestTokenManagerForkIsolation:
         manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
 
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"payload": {"x": 1, "y": 2}, "items": [1, 2, 3]}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         children, _fork_group_id = manager.fork_token(
             parent_token=initial,
             branches=["branch_a", "branch_b"],
             node_id=NodeID("gate_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
         )
 
         child_a = children[0]
@@ -364,12 +370,12 @@ class TestTokenManagerForkIsolation:
 
         manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         custom_data = _make_pipeline_row({"nested": {"key": "original"}})
@@ -377,8 +383,9 @@ class TestTokenManagerForkIsolation:
             parent_token=initial,
             branches=["a", "b"],
             node_id=NodeID("gate_node"),
-            run_id=run_id,
             row_data=custom_data,
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
         )
 
         dict_0 = children[0].row_data.to_dict()
@@ -400,12 +407,12 @@ class TestTokenManagerExpandIsolation:
         manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
 
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"original": "data"}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         expanded_rows = [
@@ -418,7 +425,7 @@ class TestTokenManagerExpandIsolation:
             expanded_rows=expanded_rows,
             output_contract=_make_observed_contract(*expanded_rows[0].keys()),
             node_id=NodeID("gate_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         child_a = children[0]
@@ -440,12 +447,12 @@ class TestTokenManagerExpandIsolation:
 
         manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         shared_metadata = {"version": 1, "tags": ["a", "b"]}
@@ -459,7 +466,7 @@ class TestTokenManagerExpandIsolation:
             expanded_rows=expanded_rows,
             output_contract=_make_observed_contract(*expanded_rows[0].keys()),
             node_id=NodeID("gate_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         dict_0 = children[0].row_data.to_dict()
@@ -478,12 +485,12 @@ class TestTokenManagerExpandIsolation:
 
         manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         expanded_rows = [
@@ -496,7 +503,7 @@ class TestTokenManagerExpandIsolation:
             expanded_rows=expanded_rows,
             output_contract=_make_observed_contract(*expanded_rows[0].keys()),
             node_id=NodeID("gate_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         dict_0 = children[0].row_data.to_dict()
@@ -517,20 +524,21 @@ class TestTokenManagerEdgeCases:
 
         manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 42}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         children, _fork_group_id = manager.fork_token(
             parent_token=initial,
             branches=["branch_a"],
             node_id=NodeID("gate_node"),
-            run_id=run_id,
             row_data=_make_pipeline_row({"value": 42, "forked": True}),
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
         )
 
         assert children[0].row_data.to_dict() == {"value": 42, "forked": True}
@@ -543,19 +551,20 @@ class TestTokenManagerEdgeCases:
 
         manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"x": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         children, _fork_group_id = manager.fork_token(
             parent_token=initial,
             branches=["my_branch"],
             node_id=NodeID("gate_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
         )
 
         updated = children[0].with_updated_data(
@@ -572,19 +581,20 @@ class TestTokenManagerEdgeCases:
 
         manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"x": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         forked_children, fork_group_id = manager.fork_token(
             parent_token=initial,
             branches=["stats_branch"],
             node_id=NodeID("gate_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
         )
         forked_token = forked_children[0]
 
@@ -609,12 +619,12 @@ class TestTokenManagerEdgeCases:
 
         manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"original": "data"}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         expanded_children, expand_group_id = manager.expand_token(
@@ -622,7 +632,7 @@ class TestTokenManagerEdgeCases:
             expanded_rows=[{"id": 1}, {"id": 2}],
             output_contract=_make_observed_contract("id"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
         expanded_token = expanded_children[0]
 
@@ -643,20 +653,20 @@ class TestTokenManagerEdgeCases:
         manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
 
         token1 = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"id": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         token2 = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=1,
             source_row=_make_source_row({"id": 2}),
             source_row_index=1,
             ingest_sequence=1,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         assert token1.row_id != token2.row_id
@@ -674,19 +684,20 @@ class TestTokenManagerStepInPipeline:
 
         manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver({"fork_gate": 2}))
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 42}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         children, _fork_group_id = manager.fork_token(
             parent_token=initial,
             branches=["a", "b"],
             node_id=NodeID("fork_gate"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
         )
 
         token_a = factory.query.get_token(children[0].token_id)
@@ -704,26 +715,27 @@ class TestTokenManagerStepInPipeline:
 
         manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver({"gate_node": 1, "coalesce_node": 3}))
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"value": 42}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         children, _fork_group_id = manager.fork_token(
             parent_token=initial,
             branches=["a", "b"],
             node_id=NodeID("gate_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
         )
 
         merged, _join_group_id = manager.coalesce_tokens(
             parents=children,
             merged_data=_make_pipeline_row({"value": 42, "merged": True}),
             node_id=NodeID("coalesce_node"),
-            run_id=run_id,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         merged_token = factory.query.get_token(merged.token_id)
@@ -743,12 +755,12 @@ class TestTokenManagerExpand:
         manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver())
 
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"original": "data"}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         expanded_rows = [
@@ -762,7 +774,7 @@ class TestTokenManagerExpand:
             expanded_rows=expanded_rows,
             output_contract=_make_observed_contract(*expanded_rows[0].keys()),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         assert len(children) == 3
@@ -791,19 +803,20 @@ class TestTokenManagerExpand:
         manager = TokenManager(setup.data_flow, step_resolver=_make_step_resolver())
 
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         forked, _fork_group_id = manager.fork_token(
             parent_token=initial,
             branches=["stats_branch"],
             node_id=NodeID("gate_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
         )
         parent = forked[0]
 
@@ -812,7 +825,7 @@ class TestTokenManagerExpand:
             expanded_rows=[{"a": 1}, {"a": 2}],
             output_contract=_make_observed_contract("a"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         assert all(c.branch_name == "stats_branch" for c in children)
@@ -825,12 +838,12 @@ class TestTokenManagerExpand:
 
         manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver({"expand_node": 5}))
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"x": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         children, _expand_group_id = manager.expand_token(
@@ -838,7 +851,7 @@ class TestTokenManagerExpand:
             expanded_rows=[{"a": 1}, {"a": 2}],
             output_contract=_make_observed_contract("a"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         for child in children:
@@ -884,20 +897,20 @@ class TestTokenManagerRegisterExpandGroup:
 
         manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver(), group_bindings=registry)
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"x": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         children, expand_group_id = manager.expand_token(
             parent_token=parent,
             expanded_rows=[{"a": 1}, {"a": 2}],
             output_contract=_make_observed_contract("a"),
-            node_id=NodeID("transform_explode_abc"),  # the declared opener's node_id
-            run_id=run_id,
+            node_id=NodeID("transform_explode_abc"),
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         minted_frame = children[0].lineage_path[-1]
@@ -914,20 +927,20 @@ class TestTokenManagerRegisterExpandGroup:
 
         manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver(), group_bindings=registry)
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"x": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         children, _expand_group_id = manager.expand_token(
             parent_token=parent,
             expanded_rows=[{"a": 1}],
             output_contract=_make_observed_contract("a"),
-            node_id=NodeID("plain_batch_transform"),  # NOT a declared scope opener
-            run_id=run_id,
+            node_id=NodeID("plain_batch_transform"),
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         minted_frame = children[0].lineage_path[-1]
@@ -945,12 +958,12 @@ class TestTokenManagerRegisterExpandGroup:
 
         manager = TokenManager(factory.data_flow, step_resolver=_make_step_resolver())
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"x": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         children, _expand_group_id = manager.expand_token(
@@ -958,7 +971,7 @@ class TestTokenManagerRegisterExpandGroup:
             expanded_rows=[{"a": 1}],
             output_contract=_make_observed_contract("a"),
             node_id=NodeID("transform_explode_abc"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
         assert len(children) == 1
 
@@ -967,11 +980,12 @@ class TestTokenManagerBoundaryPaths:
     """Coverage for error guards and quarantine/resume token paths."""
 
     def test_source_identity_parameters_are_required_by_signature(self) -> None:
+        from elspeth.engine.processor import RowProcessor
         from elspeth.engine.tokens import TokenManager
 
         # Iterate the method objects themselves: a renamed or deleted method is a
         # NameError at collection instead of a silently skipped signature check.
-        for method in (TokenManager.create_initial_token, TokenManager.create_quarantine_token):
+        for method in (TokenManager.create_initial_token, RowProcessor.ingest_quarantined_row):
             signature = inspect.signature(method)
             type_hints = get_type_hints(method)
             for parameter_name in ("source_row_index", "ingest_sequence"):
@@ -980,101 +994,49 @@ class TestTokenManagerBoundaryPaths:
                 assert parameter.default is inspect.Parameter.empty
                 assert type_hints[parameter_name] is int
 
-    def test_create_initial_token_requires_contract(self) -> None:
-        # Since elspeth-a27e71979f, SourceRow.__post_init__ rejects contract=None
-        # at construction time, so the engine's guard is now unreachable via
-        # normal construction. Verify the earlier guard fires instead.
-        with pytest.raises(TypeError, match="contract"):
-            SourceRow.valid({"value": 42})
+    def test_source_row_rejects_missing_contract_before_token_creation(self) -> None:
+        """Construction rejects a missing contract before TokenManager can consume it."""
+        with pytest.raises(ValueError, match=r"^Valid SourceRow must have a contract\."):
+            SourceRow(row={"value": 42}, is_quarantined=False, contract=None, source_row_index=0)
 
-    def test_create_quarantine_token_rejects_non_quarantined_source_row(self) -> None:
-        manager, _factory, run_id, source_node_id = _make_manager_context()
+    def test_quarantine_pipeline_row_preserves_dict_payload(self) -> None:
+        from elspeth.engine.tokens import quarantine_pipeline_row
 
-        with pytest.raises(OrchestrationInvariantError, match="requires a quarantined"):
-            manager.create_quarantine_token(
-                run_id=run_id,
-                source_node_id=source_node_id,
-                row_index=0,
-                source_row=_make_source_row({"value": 42}),
-                source_row_index=0,
-                ingest_sequence=0,
-            )
+        row = quarantine_pipeline_row({"raw": "invalid"})
 
-    def test_create_quarantine_token_preserves_dict_payload(self) -> None:
-        manager, _factory, run_id, source_node_id = _make_manager_context()
+        assert row.to_dict() == {"raw": "invalid"}
+        assert row.contract.mode == "OBSERVED"
+        assert row.contract.fields == ()
+        assert row.contract.locked is False
 
-        token = manager.create_quarantine_token(
-            run_id=run_id,
-            source_node_id=source_node_id,
-            row_index=0,
-            source_row=SourceRow.quarantined(
-                row={"raw": "invalid"},
-                error="bad data",
-                destination="quarantine",
-                source_row_index=0,
-            ),
-            source_row_index=0,
-            ingest_sequence=0,
-        )
+    def test_quarantine_pipeline_row_normalises_a_dict_subclass(self) -> None:
+        from collections import OrderedDict
 
-        assert token.row_data.to_dict() == {"raw": "invalid"}
-        assert token.row_data.contract.mode == "OBSERVED"
-        assert token.row_data.contract.fields == ()
-        assert token.row_data.contract.locked is False
+        from elspeth.engine.tokens import quarantine_pipeline_row
 
-    def test_create_quarantine_token_wraps_non_dict_payload(self) -> None:
-        manager, _factory, run_id, source_node_id = _make_manager_context()
+        row = quarantine_pipeline_row(OrderedDict([("a", 1)]))
 
-        token = manager.create_quarantine_token(
-            run_id=run_id,
-            source_node_id=source_node_id,
-            row_index=0,
-            source_row=SourceRow.quarantined(
-                row=["not", "a", "dict"],
-                error="bad row type",
-                destination="quarantine",
-                source_row_index=0,
-            ),
-            source_row_index=0,
-            ingest_sequence=0,
-        )
+        assert type(row.to_dict()) is dict
+        assert row.to_dict() == {"a": 1}
 
-        assert token.row_data.to_dict() == {"_raw": ["not", "a", "dict"]}
-        assert token.row_data.contract.mode == "OBSERVED"
+    def test_quarantine_pipeline_row_wraps_non_dict_payload(self) -> None:
+        from elspeth.engine.tokens import quarantine_pipeline_row
 
-    def test_create_token_for_existing_row_creates_new_token(self) -> None:
-        manager, factory, run_id, source_node_id = _make_manager_context()
+        row = quarantine_pipeline_row(["not", "a", "dict"])
 
-        original = manager.create_initial_token(
-            run_id=run_id,
-            source_node_id=source_node_id,
-            row_index=0,
-            source_row=_make_source_row({"id": 1}),
-            source_row_index=0,
-            ingest_sequence=0,
-        )
-        restored_row = _make_pipeline_row({"id": 1, "restored": True})
-
-        resumed = manager.create_token_for_existing_row(
-            row_id=original.row_id,
-            row_data=restored_row,
-        )
-
-        assert resumed.row_id == original.row_id
-        assert resumed.token_id != original.token_id
-        assert resumed.row_data is restored_row
-        assert factory.query.get_token(resumed.token_id) is not None
+        assert row.to_dict() == {"_raw": ["not", "a", "dict"]}
+        assert row.contract.mode == "OBSERVED"
 
     def test_expand_token_requires_locked_output_contract(self) -> None:
         manager, factory, run_id, source_node_id = _make_manager_context()
 
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"x": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         unlocked_contract = SchemaContract(mode="OBSERVED", fields=(), locked=False)
 
@@ -1088,7 +1050,7 @@ class TestTokenManagerBoundaryPaths:
                 expanded_rows=[{"value": 1}],
                 output_contract=unlocked_contract,
                 node_id=NodeID("expand_node"),
-                run_id=run_id,
+                member_token=token_manager_leader(manager, run_id).membership,
             )
 
         tokens_after = factory.query.get_all_tokens_for_run(run_id)
@@ -1108,12 +1070,12 @@ class TestExpandTokenParentOutcome:
         manager, factory, run_id, source_node_id = _make_manager_context()
 
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"x": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         # Deliberately omit parent_path — ordinary expansion is the default.
@@ -1122,7 +1084,7 @@ class TestExpandTokenParentOutcome:
             expanded_rows=[{"a": 1}, {"a": 2}],
             output_contract=_make_observed_contract("a"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         outcome = factory.data_flow.get_token_outcome(parent.token_id)
@@ -1141,29 +1103,29 @@ class TestExpandTokenParentOutcome:
             plugin_name="batch-aggregator",
         )
         batch = factory.execution.create_batch(
-            run_id=run_id,
-            aggregation_node_id=aggregation_node_id,
-            batch_id="batch-expand",
+            aggregation_node_id=aggregation_node_id, batch_id="batch-expand", coordination_token=token_manager_leader(manager, run_id)
         )
 
         parent = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=_make_source_row({"x": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
-        factory.execution.add_batch_member(batch.batch_id, parent.token_id, 0)
+        leader = token_manager_leader(manager, run_id)
+        with fenced_leader_transaction(factory.data_flow._db.engine, token=leader, window_seconds=60, verb="test_batch_expansion") as conn:
+            add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=parent.token_id, ordinal=0, expected_run_id=leader.run_id)
 
         _children, _expand_group_id = manager.expand_token(
             parent_token=parent,
             expanded_rows=[{"a": 1}],
             output_contract=_make_observed_contract("a"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
             parent_path=TerminalPath.BATCH_CONSUMED,
             parent_batch_id=batch.batch_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         outcome = factory.data_flow.get_token_outcome(parent.token_id)
@@ -1197,12 +1159,12 @@ class TestExpandTokenStrictZip:
         manager = TokenManager(data_flow, step_resolver=_make_step_resolver())
 
         parent = manager.create_initial_token(
-            run_id=setup.run_id,
             source_node_id=setup.source_node_id,
             row_index=0,
             source_row=_make_source_row({"x": 1}),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, setup.run_id),
         )
 
         # Create fake Token objects the data_flow would return
@@ -1226,56 +1188,5 @@ class TestExpandTokenStrictZip:
                 expanded_rows=[{"a": 1}, {"a": 2}, {"a": 3}],
                 output_contract=_make_observed_contract("a"),
                 node_id=NodeID("expand_node"),
-                run_id=setup.run_id,
+                member_token=token_manager_leader(manager, setup.run_id).membership,
             )
-
-
-class TestCreateQuarantineTokenFlag:
-    """Kill mutant: ``quarantined=True`` → ``quarantined=False``.
-
-    Quarantined rows must be recorded with quarantined=True so the
-    audit trail distinguishes quarantined data from normal rows.
-    Without this flag, quarantined rows with NaN/Infinity would
-    fail canonical hashing instead of being safely stored.
-    """
-
-    def test_quarantine_token_passes_quarantined_flag_to_data_flow(self) -> None:
-        """create_quarantine_token must pass quarantined=True to data_flow.create_row.
-
-        Kill mutant: quarantined=True → quarantined=False.
-
-        When quarantined=True, the data_flow uses repr_hash fallback for
-        data containing NaN/Infinity. If the mutant flips it to False,
-        canonical hashing crashes on NaN data.
-        """
-        manager, factory, run_id, source_node_id = _make_manager_context()
-
-        # Data with NaN — only works if quarantined=True (repr_hash fallback)
-        quarantine_row = SourceRow.quarantined(
-            {"bad_data": float("nan")},
-            error="NaN value",
-            destination="quarantine_sink",
-            source_row_index=0,
-        )
-
-        # This must NOT raise — quarantined=True enables repr_hash fallback
-        token_info = manager.create_quarantine_token(
-            run_id=run_id,
-            source_node_id=source_node_id,
-            row_index=0,
-            source_row=quarantine_row,
-            source_row_index=0,
-            ingest_sequence=0,
-        )
-
-        assert token_info.row_id is not None
-        assert token_info.token_id is not None
-
-        # Verify the row was actually stored (proof quarantined=True worked)
-        row_record = factory.query.get_row(token_info.row_id)
-        assert row_record is not None
-        assert row_record.source_data_hash is not None, (
-            "Quarantined row must have a hash (via repr_hash fallback). "
-            "If quarantined=False mutant was active, create_row would have "
-            "crashed on NaN during canonical hashing."
-        )

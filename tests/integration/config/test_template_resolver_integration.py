@@ -8,14 +8,20 @@ These tests verify the full integration of:
 4. extract_jinja2_fields_with_names for field discovery
 5. Hash stability across access styles
 
-Per CLAUDE.md Test Path Integrity: These tests use production code paths
+Per the ``engine-patterns-reference`` skill §Test Path Integrity: these tests use production code paths
 (SchemaContract, PipelineRow, PromptTemplate, extract_jinja2_fields_with_names)
 rather than manual construction.
 """
 
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.core.templates import extract_jinja2_fields_with_names
+from elspeth.plugins.infrastructure.templates import DeclaredFields, TemplateRow
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
+
+
+def _template_row(data: dict[str, object], contract: SchemaContract) -> TemplateRow:
+    """The row as a node declaring every contract field sees it: both spellings of each (ADR-051)."""
+    return TemplateRow.project(PipelineRow(data, contract), DeclaredFields(frozenset(fc.normalized_name for fc in contract.fields)))
 
 
 class TestSourceToTemplateDualName:
@@ -57,7 +63,7 @@ class TestSourceToTemplateDualName:
         template = PromptTemplate("Amount: {{ row[\"'Amount USD'\"] }}")
 
         # Render with contract
-        result = template.render(data, contract=contract)
+        result = template.render(_template_row(data, contract))
 
         # Verify template renders correctly using original name
         assert result == "Amount: 100"
@@ -82,7 +88,7 @@ class TestSourceToTemplateDualName:
 
         # Template using normalized name
         template = PromptTemplate("Amount: {{ row.amount_usd }}")
-        result = template.render(data, contract=contract)
+        result = template.render(_template_row(data, contract))
 
         assert result == "Amount: 100"
 
@@ -106,7 +112,7 @@ class TestSourceToTemplateDualName:
 
         # Template using bracket notation with normalized name
         template = PromptTemplate('Amount: {{ row["amount_usd"] }}')
-        result = template.render(data, contract=contract)
+        result = template.render(_template_row(data, contract))
 
         assert result == "Amount: 100"
 
@@ -117,8 +123,8 @@ class TestPipelineRowTemplateAccess:
     def test_pipeline_row_template_access(self) -> None:
         """Test PipelineRow works with PromptTemplate.render().
 
-        PipelineRow provides dual-name access. When passed to a template
-        via the contract parameter, both access styles should work.
+        PipelineRow provides dual-name access. Projected to the node's
+        declaration (ADR-051), both access styles work.
         """
         # Create contract
         contract = SchemaContract(
@@ -149,8 +155,7 @@ class TestPipelineRowTemplateAccess:
         # Create template using both access styles
         template = PromptTemplate('Product: {{ row["Product Name"] }}, Price: {{ row.unit_price }}')
 
-        # Render with contract - uses the underlying data dict
-        result = template.render(pipeline_row.to_dict(), contract=contract)
+        result = template.render(TemplateRow.project(pipeline_row, DeclaredFields(frozenset({"product_name", "unit_price"}))))
 
         assert result == "Product: Widget, Price: 9.99"
 
@@ -173,7 +178,7 @@ class TestPipelineRowTemplateAccess:
         data = {"field_a": "value"}
         template = PromptTemplate('Value: {{ row["Field A"] }}')
 
-        rendered = template.render_with_metadata(data, contract=contract)
+        rendered = template.render_with_metadata(_template_row(data, contract), contract=contract)
 
         assert rendered.prompt == "Value: value"
         assert rendered.contract_hash is not None
@@ -242,11 +247,11 @@ class TestHashStabilityAcrossAccessStyles:
 
         # Template using original name
         template_original = PromptTemplate("Amount: {{ row[\"'Amount USD'\"] }}")
-        result_original = template_original.render(data, contract=contract)
+        result_original = template_original.render(_template_row(data, contract))
 
         # Template using normalized name
         template_normalized = PromptTemplate("Amount: {{ row.amount_usd }}")
-        result_normalized = template_normalized.render(data, contract=contract)
+        result_normalized = template_normalized.render(_template_row(data, contract))
 
         # Results are identical
         assert result_original == result_normalized
@@ -273,8 +278,8 @@ class TestHashStabilityAcrossAccessStyles:
         template_original = PromptTemplate("Amount: {{ row[\"'Amount USD'\"] }}")
         template_normalized = PromptTemplate("Amount: {{ row.amount_usd }}")
 
-        rendered_original = template_original.render_with_metadata(data, contract=contract)
-        rendered_normalized = template_normalized.render_with_metadata(data, contract=contract)
+        rendered_original = template_original.render_with_metadata(_template_row(data, contract), contract=contract)
+        rendered_normalized = template_normalized.render_with_metadata(_template_row(data, contract), contract=contract)
 
         # Variables hash is based on the data dict, not the template
         assert rendered_original.variables_hash == rendered_normalized.variables_hash
@@ -437,7 +442,7 @@ Amount: {{ row.amount_usd }}
             "is_premium": True,
         }
 
-        result_premium = template.render(premium_data, contract=contract)
+        result_premium = template.render(_template_row(premium_data, contract))
 
         assert "Customer: Alice" in result_premium
         assert "Amount: 500" in result_premium
@@ -450,7 +455,7 @@ Amount: {{ row.amount_usd }}
             "is_premium": False,
         }
 
-        result_standard = template.render(standard_data, contract=contract)
+        result_standard = template.render(_template_row(standard_data, contract))
 
         assert "Customer: Bob" in result_standard
         assert "Amount: 100" in result_standard
@@ -487,7 +492,7 @@ Quantity: {{ row.item_count }}"""
 
         data = {"item_count": 5, "item_name": "Widget"}
 
-        result = template.render(data, contract=contract)
+        result = template.render(_template_row(data, contract))
 
         assert "Item: Widget" in result
         assert "Quantity: 5" in result
@@ -520,7 +525,7 @@ Quantity: {{ row.item_count }}"""
 
         data = {"price": 19.999, "description": "premium widget"}
 
-        result = template.render(data, contract=contract)
+        result = template.render(_template_row(data, contract))
 
         assert "Price: 20.0" in result
         assert "Description: PREMIUM WIDGET" in result
@@ -565,15 +570,15 @@ Order {{ row["Priority Level"] }} priority
 
         # High value pending
         data1 = {"status": "pending", "amount": 5000, "priority": "normal"}
-        result1 = template.render(data1, contract=contract)
+        result1 = template.render(_template_row(data1, contract))
         assert "High value pending order" in result1
 
         # Standard pending
         data2 = {"status": "pending", "amount": 100, "priority": "normal"}
-        result2 = template.render(data2, contract=contract)
+        result2 = template.render(_template_row(data2, contract))
         assert "Standard pending order" in result2
 
         # Non-pending shows priority
         data3 = {"status": "shipped", "amount": 100, "priority": "high"}
-        result3 = template.render(data3, contract=contract)
+        result3 = template.render(_template_row(data3, contract))
         assert "Order high priority" in result3

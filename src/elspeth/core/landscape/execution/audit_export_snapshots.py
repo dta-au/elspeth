@@ -17,7 +17,9 @@ from sqlalchemy.exc import IntegrityError
 from elspeth.contracts.advisory_locks import ELSPETH_AUDIT_EXPORT_LOCK_CLASSID
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.audit_export import (
+    AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
     AUDIT_EXPORT_DERIVATION_VERSION,
+    AuditExportAuthEventCoverageValidator,
     AuditExportContentDescriptor,
     AuditExportContentStoreResolver,
     AuditExportSnapshotCandidate,
@@ -31,7 +33,7 @@ from elspeth.contracts.audit_export import (
 )
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.hashing import canonical_json, canonical_json_loads
 from elspeth.contracts.sink_effects import (
     AuditExportSignedManifestInput,
     AuditExportSigningMode,
@@ -66,10 +68,14 @@ def _verify_snapshot_graph(
 ) -> None:
     """Recompute the complete cryptographic graph from registered bytes."""
 
+    if snapshot.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+        raise AuditIntegrityError("audit-export snapshot exporter_version must be landscape-exporter-auth-v2")
+
     snapshot_chunks: list[dict[str, ClosedAuditExportJSON]] = []
     chain = hashlib.sha256()
     cumulative_records = 0
     cumulative_bytes = 0
+    coverage = AuditExportAuthEventCoverageValidator(_timestamp(snapshot.source_completed_at))
     for chunk in chunks:
         content = resolve_registered(chunk.content_ref)
         content_hash = H(content)
@@ -82,7 +88,9 @@ def _verify_snapshot_graph(
             if not frame.endswith(b"\n") or frame == b"\n":
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains an incomplete record frame")
             try:
-                emitted = json.loads(frame[:-1])
+                # Frames are canonical_json bytes; read them with its inverse so
+                # an integral double beyond 2**53 re-encodes byte-identically.
+                emitted = canonical_json_loads(frame[:-1])
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains invalid JSON") from exc
             if type(emitted) is not dict or ("record_type" in emitted and emitted["record_type"] == "manifest"):
@@ -110,6 +118,10 @@ def _verify_snapshot_graph(
                 except Exception as exc:
                     raise AuditIntegrityError("audit-export snapshot record HMAC verification failed") from exc
                 chain.update(signature.encode("ascii"))
+            try:
+                coverage.observe(emitted)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise AuditIntegrityError("audit-export snapshot auth event coverage is invalid") from exc
             record_count += 1
         _expect_graph_value(record_count, chunk.record_count, f"chunk {chunk.ordinal} record_count")
         cumulative_records += record_count
@@ -126,6 +138,12 @@ def _verify_snapshot_graph(
                 "size_bytes": len(content),
             }
         )
+
+    try:
+        coverage.finish()
+    except ValueError as exc:
+        raise AuditIntegrityError("audit-export snapshot auth event coverage is invalid") from exc
+    _expect_graph_value(coverage.public_config_hash, snapshot.public_export_config_hash, "public_export_config_hash")
 
     public_key_payload: dict[str, ClosedAuditExportJSON] = {
         "export_format": snapshot.export_format.value,
@@ -540,6 +558,17 @@ class AuditExportSnapshotRepository:
     def _assert_exact_key(snapshot: AuditExportSnapshot, key: AuditExportSnapshotRegistryKey) -> None:
         if AuditExportSnapshotRegistryKey.from_snapshot(snapshot) != key:
             raise AuditIntegrityError("audit-export registry key matched a winner with divergent exact shaping fields")
+
+    @staticmethod
+    def has_unsupported_version_for_run(connection: Connection, run_id: str) -> bool:
+        """Detect historical snapshots before version-scoped v2 lineage lookup."""
+        table = audit_export_snapshots_table.c
+        row = connection.execute(
+            select(table.snapshot_id)
+            .where(table.source_run_id == run_id, table.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION)
+            .limit(1)
+        ).first()
+        return row is not None
 
     def find_winner(
         self,

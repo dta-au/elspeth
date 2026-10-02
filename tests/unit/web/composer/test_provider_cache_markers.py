@@ -20,6 +20,7 @@ not a downstream integration miss.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -29,7 +30,10 @@ from elspeth.web.composer.llm_response_parsing import (
     apply_anthropic_cache_markers,
     supports_anthropic_prompt_cache_markers,
 )
-from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
+from tests.unit.web.composer._helpers import (
+    _composer_service_with_session,
+    _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
+)
 
 
 class TestSupportsAnthropicPromptCacheMarkers:
@@ -207,26 +211,22 @@ class TestToolListOrderIsCacheKeyContract:
         )
 
     def test_litellm_tools_preserves_definition_order(self) -> None:
-        """``_get_litellm_tools`` is a list comprehension over ``get_tool_definitions``;
+        """``composer_loop_tool_definitions`` is a list comprehension over ``get_tool_definitions``;
         order must be preserved (modulo the advisor-toggle filter, which is
         allowed to drop ``request_advisor_hint`` when disabled but must never
         reorder the remaining tools).
 
         The cache-key invariant is "the relative order of tools that DO appear
-        in ``_get_litellm_tools`` matches the relative order in
+        in ``composer_loop_tool_definitions`` matches the relative order in
         ``get_tool_definitions``." Set inequality (one filtered out) is fine;
         order swap (cache-invalidating reorder) is not.
         """
-        from elspeth.web.composer.service import ComposerServiceImpl
+        from elspeth.contracts.composer_llm_audit import ToolContractDialect
+        from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
         from elspeth.web.composer.tools import get_tool_definitions
-        from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
-
-        catalog = _mock_catalog()
-        settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
 
         defn_names = [d["name"] for d in get_tool_definitions()]
-        tool_names = [t["function"]["name"] for t in service._get_litellm_tools()]
+        tool_names = [t["function"]["name"] for t in composer_loop_tool_definitions(ToolContractDialect.NONE)]
 
         # Subsequence-order invariant: every tool emitted is in the definition
         # list, and the indices form a strictly increasing sequence (i.e., no
@@ -234,7 +234,7 @@ class TestToolListOrderIsCacheKeyContract:
         defn_index = {name: i for i, name in enumerate(defn_names)}
         emitted_positions = [defn_index[name] for name in tool_names]
         assert emitted_positions == sorted(emitted_positions), (
-            f"_get_litellm_tools reordered tools relative to get_tool_definitions; "
+            f"composer_loop_tool_definitions reordered tools relative to get_tool_definitions; "
             f"emitted positions={emitted_positions}, names={tool_names}"
         )
         # Every emitted name must come from definitions (no tool fabricated
@@ -242,13 +242,12 @@ class TestToolListOrderIsCacheKeyContract:
         assert set(tool_names).issubset(set(defn_names))
 
     def test_only_web_set_pipeline_is_enveloped_without_changing_cache_marker_placement(self) -> None:
-        from elspeth.web.composer.service import ComposerServiceImpl
+        from elspeth.contracts.composer_llm_audit import ToolContractDialect
+        from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
         from elspeth.web.composer.tools import get_tool_definitions
-        from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
 
         definitions = get_tool_definitions()
-        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-        tools = service._get_litellm_tools()
+        tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
 
         assert [tool["function"]["name"] for tool in tools] == [definition["name"] for definition in definitions]
         for definition, tool in zip(definitions, tools, strict=True):
@@ -307,7 +306,6 @@ class TestCacheMarkersWiredAtCallSite:
 
         from elspeth.web.composer.service import (
             ComposerAvailability,
-            ComposerServiceImpl,
         )
         from tests.unit.web.composer._helpers import (
             FakeChoice,
@@ -326,60 +324,61 @@ class TestCacheMarkersWiredAtCallSite:
 
         catalog = _mock_catalog()
         settings = _make_settings(composer_model="anthropic/claude-sonnet-4.5")
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         # Bypass availability check (no real Anthropic API key needed).
         service._availability = ComposerAvailability(available=True, model=service._model, provider="test")
         state = _empty_state()
-        captured: dict[str, Any] = {}
+        captured: list[dict[str, Any]] = []
 
         text_response = _make_llm_response(content="Done.")
         anthropic_response = _Resp(choices=text_response.choices, usage={"prompt_tokens": 10, "completion_tokens": 2})
 
         async def fake_acompletion(**kwargs: Any) -> Any:
-            captured.update(kwargs)
+            captured.append(deepcopy(kwargs))
             return anthropic_response
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new=fake_acompletion,
         ):
-            result = await service.compose("Build a CSV pipeline.", [], state)
+            result = await service.compose("Build a CSV pipeline.", [], state, session_id=session_id)
 
-        # The stable system prompt MUST carry cache_control after the transform.
-        sent_messages = captured["messages"]
-        system_messages = [m for m in sent_messages if m.get("role") == "system"]
-        assert len(system_messages) == 1
-        stable_system_msg = system_messages[0]
-        catalog_context_msg = sent_messages[1]
-        state_context_msg = sent_messages[-2]
-        assert stable_system_msg["cache_control"] == {"type": "ephemeral"}
-        assert "Current pipeline state" not in stable_system_msg["content"]
-        # Cache-layout contract (elspeth-a79f1b2e6b): the deployment-constant
-        # catalog message is breakpointed; the session-varying state message
-        # rides after history, unmarked; the last message carries the sliding
-        # tail marker for the append-only tool loop.
-        assert catalog_context_msg["role"] == "user"
-        assert catalog_context_msg["content"].startswith("Deployment plugin catalog and authoring aids")
-        assert "AUTHORITATIVE REFERENCE DATA" in catalog_context_msg["content"]
-        assert catalog_context_msg["cache_control"] == {"type": "ephemeral"}
-        assert state_context_msg["role"] == "user"
-        assert state_context_msg["content"].startswith("Current pipeline state and session progress")
-        assert "UNTRUSTED DATA" in state_context_msg["content"]
-        assert "cache_control" not in state_context_msg
-        assert sent_messages[-1]["cache_control"] == {"type": "ephemeral"}
+        assert len(captured) == len(result.llm_calls) == 2
+        assert result.repair_turns_used == 1
+        for request, call in zip(captured, result.llm_calls, strict=True):
+            # Cache markers must survive the neutral rootless retry as well
+            # as the initial call. The state stays in its original position;
+            # the sliding tail advances past the prior assistant response.
+            sent_messages = request["messages"]
+            system_messages = [m for m in sent_messages if m.get("role") == "system"]
+            assert len(system_messages) == 1
+            stable_system_msg = system_messages[0]
+            catalog_context_msg = sent_messages[1]
+            state_context_msg = sent_messages[2]
+            assert stable_system_msg["cache_control"] == {"type": "ephemeral"}
+            assert "Current pipeline state" not in stable_system_msg["content"]
+            assert catalog_context_msg["role"] == "user"
+            assert catalog_context_msg["content"].startswith("Deployment plugin catalog and authoring aids")
+            assert "AUTHORITATIVE REFERENCE DATA" in catalog_context_msg["content"]
+            assert catalog_context_msg["cache_control"] == {"type": "ephemeral"}
+            assert state_context_msg["role"] == "user"
+            assert state_context_msg["content"].startswith("Current pipeline state and session progress")
+            assert "UNTRUSTED DATA" in state_context_msg["content"]
+            assert "cache_control" not in state_context_msg
+            assert sent_messages[-1]["cache_control"] == {"type": "ephemeral"}
+            assert all("cache_control" not in message for message in sent_messages[2:-1])
 
-        # The trailing tool MUST carry cache_control after the transform.
-        sent_tools = captured["tools"]
-        assert sent_tools[-1]["cache_control"] == {"type": "ephemeral"}
-        # Other tools are NOT marked (Anthropic caches up to and including the marker).
-        for non_trailing in sent_tools[:-1]:
-            assert "cache_control" not in non_trailing
+            sent_tools = request["tools"]
+            assert sent_tools[-1]["cache_control"] == {"type": "ephemeral"}
+            for non_trailing in sent_tools[:-1]:
+                assert "cache_control" not in non_trailing
 
-        transmitted_names = tuple(tool["function"]["name"] for tool in sent_tools)
-        call = result.llm_calls[0]
-        assert "splice_transform" in transmitted_names
-        assert call.declared_tool_names == transmitted_names
-        assert call.tools_spec_hash == stable_hash(sent_tools)
+            transmitted_names = tuple(tool["function"]["name"] for tool in sent_tools)
+            assert "splice_transform" in transmitted_names
+            assert call.declared_tool_names == transmitted_names
+            assert call.tools_spec_hash == stable_hash(sent_tools)
+            assert call.messages_hash == stable_hash(sent_messages)
+        assert len(captured[1]["messages"]) == len(captured[0]["messages"]) + 2
 
     @pytest.mark.asyncio
     async def test_openai_model_does_not_emit_cache_control(self) -> None:
@@ -393,7 +392,6 @@ class TestCacheMarkersWiredAtCallSite:
 
         from elspeth.web.composer.service import (
             ComposerAvailability,
-            ComposerServiceImpl,
         )
         from tests.unit.web.composer._helpers import (
             FakeChoice,
@@ -413,35 +411,39 @@ class TestCacheMarkersWiredAtCallSite:
         catalog = _mock_catalog()
         # Default _make_settings model is gpt-5.5 (OpenAI-shape).
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         service._availability = ComposerAvailability(available=True, model=service._model, provider="test")
         state = _empty_state()
-        captured: dict[str, Any] = {}
+        captured: list[dict[str, Any]] = []
 
         text_response = _make_llm_response(content="Done.")
         oai_response = _Resp(choices=text_response.choices, usage={"prompt_tokens": 10, "completion_tokens": 2})
 
         async def fake_acompletion(**kwargs: Any) -> Any:
-            captured.update(kwargs)
+            captured.append(deepcopy(kwargs))
             return oai_response
 
         with patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new=fake_acompletion,
         ):
-            await service.compose("Build a CSV pipeline.", [], state)
+            result = await service.compose("Build a CSV pipeline.", [], state, session_id=session_id)
 
-        sent_messages = captured["messages"]
-        system_messages = [m for m in sent_messages if m.get("role") == "system"]
-        assert len(system_messages) == 1
-        for message in sent_messages:
-            assert "cache_control" not in message
-        assert sent_messages[1]["role"] == "user"
-        assert sent_messages[1]["content"].startswith("Deployment plugin catalog and authoring aids")
-        assert "AUTHORITATIVE REFERENCE DATA" in sent_messages[1]["content"]
-        assert sent_messages[-2]["content"].startswith("Current pipeline state and session progress")
-        assert "cache_control" not in sent_messages[1]
+        assert len(captured) == len(result.llm_calls) == 2
+        assert result.repair_turns_used == 1
+        for request, call in zip(captured, result.llm_calls, strict=True):
+            sent_messages = request["messages"]
+            system_messages = [m for m in sent_messages if m.get("role") == "system"]
+            assert len(system_messages) == 1
+            for message in sent_messages:
+                assert "cache_control" not in message
+            assert sent_messages[1]["role"] == "user"
+            assert sent_messages[1]["content"].startswith("Deployment plugin catalog and authoring aids")
+            assert "AUTHORITATIVE REFERENCE DATA" in sent_messages[1]["content"]
+            assert sent_messages[2]["content"].startswith("Current pipeline state and session progress")
 
-        sent_tools = captured["tools"]
-        for tool in sent_tools:
-            assert "cache_control" not in tool
+            sent_tools = request["tools"]
+            for tool in sent_tools:
+                assert "cache_control" not in tool
+            assert call.messages_hash == stable_hash(sent_messages)
+        assert len(captured[1]["messages"]) == len(captured[0]["messages"]) + 2

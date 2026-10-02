@@ -10,10 +10,13 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from elspeth.contracts import Determinism, TransformResult
+from elspeth.contracts import CallType, Determinism, TransformResult
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.engine.batch_adapter import ExceptionResult
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
 from elspeth.plugins.infrastructure.clients.llm import ContentPolicyError, LLMClientError
@@ -23,6 +26,7 @@ from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row, make_row
 from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import make_factory
+from tests.fixtures.mock_audit import mock_audit_authority
 
 from .conftest import chaosllm_openrouter_http_responses, chaosllm_openrouter_httpx_response
 
@@ -48,7 +52,8 @@ class RecordedAuditCall:
     latency_ms: float | None = None
     request_ref: str | None = None
     response_ref: str | None = None
-    resolved_prompt_template_hash: str | None = None
+    approved_prompt_artifact_hash: str | None = None
+    token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE
 
 
 @dataclass
@@ -60,10 +65,10 @@ class InMemoryAuditWriter:
     _state_call_indexes: dict[str, int] = field(default_factory=dict)
     _operation_call_indexes: dict[str, int] = field(default_factory=dict)
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         return self._allocate(self._state_call_indexes, state_id)
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         return self._allocate(self._operation_call_indexes, operation_id)
 
     def record_call(
@@ -77,10 +82,15 @@ class InMemoryAuditWriter:
         error: Any | None = None,
         latency_ms: float | None = None,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> RecordedAuditCall:
+        assert source_call_id is None
         call = RecordedAuditCall(
             state_id=state_id,
             operation_id=None,
@@ -93,7 +103,8 @@ class InMemoryAuditWriter:
             latency_ms=latency_ms,
             request_ref=request_ref,
             response_ref=response_ref,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+            token_usage=token_usage,
         )
         self.calls.append(call)
         return call
@@ -108,13 +119,17 @@ class InMemoryAuditWriter:
         error: Any | None = None,
         latency_ms: float | None = None,
         *,
+        coordination_token: CoordinationToken,
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> RecordedAuditCall:
+        assert source_call_id is None
         if call_index is None:
-            call_index = self.allocate_operation_call_index(operation_id)
+            call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
         call = RecordedAuditCall(
             state_id=None,
             operation_id=operation_id,
@@ -127,7 +142,8 @@ class InMemoryAuditWriter:
             latency_ms=latency_ms,
             request_ref=request_ref,
             response_ref=response_ref,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+            token_usage=token_usage,
         )
         self.operation_calls.append(call)
         return call
@@ -546,6 +562,7 @@ class TestLLMTransformOpenRouterPipelining:
         """Create plugin context with landscape, state_id, and token."""
         token = make_token("row-1")
         return make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -556,7 +573,7 @@ class TestLLMTransformOpenRouterPipelining:
         """Create and initialize LLMTransform (OpenRouter) with pipelining."""
         t = LLMTransform(_openrouter_config())
         # Initialize with recorder reference
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         t.on_start(init_ctx)
         # Connect output port
         t.connect_output(collector, max_pending=10)
@@ -566,6 +583,7 @@ class TestLLMTransformOpenRouterPipelining:
 
     def test_successful_api_call_emits_enriched_row(
         self,
+        audit_writer: InMemoryAuditWriter,
         ctx: PluginContext,
         transform: LLMTransform,
         collector: CollectorOutputPort,
@@ -593,6 +611,9 @@ class TestLLMTransformOpenRouterPipelining:
             "prompt_tokens": 10,
             "completion_tokens": 25,
         }
+        assert [call.call_type for call in audit_writer.calls] == [CallType.HTTP, CallType.LLM]
+        assert audit_writer.calls[0].token_usage == UNKNOWN_TOKEN_USAGE
+        assert audit_writer.calls[1].token_usage == TokenUsage(prompt_tokens=10, completion_tokens=25)
         assert result.success_reason is not None
         assert "llm_response_template_hash" in result.success_reason["metadata"]
         assert "llm_response_variables_hash" in result.success_reason["metadata"]
@@ -621,6 +642,32 @@ class TestLLMTransformOpenRouterPipelining:
         assert result.reason is not None
         assert result.reason["reason"] == "template_rendering_failed"
         assert "template_hash" in result.reason
+
+    def test_approved_prompt_artifact_reaches_semantic_call(
+        self,
+        audit_writer: InMemoryAuditWriter,
+        ctx: PluginContext,
+        collector: CollectorOutputPort,
+        chaosllm_server,
+    ) -> None:
+        from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
+
+        artifact_hash = approved_prompt_artifact_hash(prompt_template="{{ row.text }}", system_prompt=None)
+        transform = LLMTransform(
+            _openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}", approved_prompt_artifact_hash=artifact_hash)
+        )
+        transform.on_start(make_context(**mock_audit_authority("test-run"), landscape=audit_writer))
+        transform.connect_output(collector, max_pending=10)
+        response = _create_mock_response(chaosllm_server, content="hello")
+        try:
+            with mock_httpx_client(chaosllm_server, response=response):
+                transform.accept(make_pipeline_row({"text": "hello"}), ctx)
+                transform.flush_batch_processing(timeout=10.0)
+            semantic_calls = [call for call in audit_writer.calls if call.call_type is CallType.LLM]
+            assert len(semantic_calls) == 1
+            assert semantic_calls[0].approved_prompt_artifact_hash == artifact_hash
+        finally:
+            transform.close()
 
     def test_http_error_400_returns_error_result(
         self, ctx: PluginContext, transform: LLMTransform, collector: CollectorOutputPort, chaosllm_server
@@ -775,8 +822,9 @@ class TestLLMTransformOpenRouterPipelining:
     ) -> None:
         """Missing state_id causes exception propagation, not error result.
 
-        Per CLAUDE.md crash-on-exception policy: a missing state_id is a bug
-        in calling code (our internal code, not user data), so it should crash
+        Per docs/guides/data-trust-and-error-handling.md §The Decision Test: a
+        missing state_id is a bug in code we control (our internal code, not
+        user data), so it should crash
         rather than be converted to an error result.
 
         BatchTransformMixin wraps such exceptions in ExceptionResult for
@@ -786,6 +834,7 @@ class TestLLMTransformOpenRouterPipelining:
         """
         token = make_token("row-1")
         ctx = PluginContext(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             config={},
             landscape=audit_writer,
@@ -814,12 +863,13 @@ class TestLLMTransformOpenRouterPipelining:
                 system_prompt="You are a helpful assistant.",
             )
         )
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -873,12 +923,13 @@ class TestLLMTransformOpenRouterPipelining:
                 response_field="analysis",
             )
         )
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -961,7 +1012,7 @@ class TestLLMTransformOpenRouterPipelining:
     def test_connect_output_cannot_be_called_twice(self, collector: CollectorOutputPort, audit_writer: InMemoryAuditWriter) -> None:
         """connect_output() raises if called more than once."""
         transform = LLMTransform(_openrouter_config(prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
@@ -1002,12 +1053,13 @@ class TestLLMTransformOpenRouterIntegration:
                 """,
             )
         )
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1041,12 +1093,13 @@ class TestLLMTransformOpenRouterIntegration:
     ) -> None:
         """Empty usage dict from API is handled."""
         transform = LLMTransform(_openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1076,6 +1129,8 @@ class TestLLMTransformOpenRouterIntegration:
         assert result.status == "success"
         assert result.row is not None
         assert result.row["llm_response_usage"] == {}
+        assert [call.call_type for call in audit_writer.calls] == [CallType.HTTP, CallType.LLM]
+        assert all(call.token_usage == UNKNOWN_TOKEN_USAGE for call in audit_writer.calls)
 
     def test_connection_error_raises_network_error(
         self, audit_writer: InMemoryAuditWriter, collector: CollectorOutputPort, chaosllm_server
@@ -1087,12 +1142,13 @@ class TestLLMTransformOpenRouterIntegration:
         from elspeth.plugins.infrastructure.clients.llm import NetworkError
 
         transform = LLMTransform(_openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1125,12 +1181,13 @@ class TestLLMTransformOpenRouterIntegration:
         assert isinstance(transform._config, OpenRouterConfig)
         assert transform._config.timeout_seconds == 120.0
 
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1156,12 +1213,13 @@ class TestLLMTransformOpenRouterIntegration:
         empty choices, which the strategy catches as 'llm_call_failed'.
         """
         transform = LLMTransform(_openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1203,12 +1261,13 @@ class TestLLMTransformOpenRouterIntegration:
         as a non-retryable 'llm_call_failed'.
         """
         transform = LLMTransform(_openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1249,12 +1308,13 @@ class TestLLMTransformOpenRouterIntegration:
         missing choices, which the strategy catches as 'llm_call_failed'.
         """
         transform = LLMTransform(_openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1294,12 +1354,13 @@ class TestLLMTransformOpenRouterIntegration:
         malformed response structure, which the strategy catches as 'llm_call_failed'.
         """
         transform = LLMTransform(_openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1340,12 +1401,13 @@ class TestLLMTransformOpenRouterIntegration:
         invalid JSON, which the strategy catches as 'llm_call_failed'.
         """
         transform = LLMTransform(_openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1391,12 +1453,13 @@ class TestOpenRouterTemplateFeatures:
                 lookup={"categories": ["positive", "negative"]},
             )
         )
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1432,12 +1495,13 @@ class TestOpenRouterTemplateFeatures:
                 lookup={"tones": {"formal": "professional", "casual": "friendly"}},
             )
         )
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1471,12 +1535,13 @@ class TestOpenRouterTemplateFeatures:
                 lookup={"cats": ["A", "B", "C"]},
             )
         )
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1514,12 +1579,13 @@ class TestOpenRouterTemplateFeatures:
                 prompt_template_source="prompts/analysis.j2",
             )
         )
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1554,12 +1620,13 @@ class TestOpenRouterTemplateFeatures:
                 lookup_source="prompts/lookups.yaml",
             )
         )
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1605,12 +1672,13 @@ class TestOpenRouterTemplateFeatures:
                 # No lookup configured
             )
         )
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1655,12 +1723,13 @@ Text: {{ row.text }}""",
                 },
             )
         )
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1695,12 +1764,13 @@ Text: {{ row.text }}""",
                 prompt_template_source="prompts/requires_field.j2",
             )
         )
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             token=token,
             landscape=audit_writer,
@@ -1735,7 +1805,7 @@ class TestOpenRouterConcurrency:
     ) -> None:
         """Multiple rows are emitted in submission order (FIFO)."""
         transform = LLMTransform(_openrouter_config(prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
@@ -1751,6 +1821,7 @@ class TestOpenRouterConcurrency:
                 for i, row in enumerate(rows):
                     token = make_token(f"row-{i}")
                     ctx = make_context(
+                        **mock_audit_authority("test-run"),
                         state_id=f"state-{i}",
                         token=token,
                         landscape=audit_writer,
@@ -1777,6 +1848,7 @@ class TestOpenRouterConcurrency:
         assert transform._recorder is None
 
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             state_id="test-state-id",
             landscape=audit_writer,
         )
@@ -1788,7 +1860,7 @@ class TestOpenRouterConcurrency:
     def test_close_clears_recorder(self, audit_writer: InMemoryAuditWriter, collector: CollectorOutputPort) -> None:
         """close() clears factory reference."""
         transform = LLMTransform(_openrouter_config(prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
@@ -1823,12 +1895,13 @@ class TestOpenRouterNanRejection:
         response = _create_mock_response(chaosllm_server, raw_body=nan_body, status_code=200, headers={"content-type": "application/json"})
 
         transform = LLMTransform(_openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test"),
             run_id="test",
             state_id="test-state",
             token=token,
@@ -1857,12 +1930,13 @@ class TestOpenRouterNanRejection:
         response = _create_mock_response(chaosllm_server, raw_body=inf_body, status_code=200, headers={"content-type": "application/json"})
 
         transform = LLMTransform(_openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test"),
             run_id="test",
             state_id="test-state",
             token=token,
@@ -1904,12 +1978,12 @@ class TestOpenRouterNanRejection:
         )
 
         transform = LLMTransform(_openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
-        ctx = make_context(run_id="test", state_id="test-state", token=token, landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test"), run_id="test", state_id="test-state", token=token, landscape=audit_writer)
 
         try:
             with mock_httpx_client(chaosllm_server, response=response):
@@ -1959,12 +2033,13 @@ class TestOpenRouterMalformedUtf8:
         )
 
         transform = LLMTransform(_openrouter_config(model="openai/gpt-4", prompt_template="{{ row.text }}"))
-        init_ctx = make_context(landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test-run"), landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
         ctx = make_context(
+            **mock_audit_authority("test"),
             run_id="test",
             state_id="test-state",
             token=token,
@@ -2035,8 +2110,13 @@ class TestOpenRouterRuntimePreflightValidation:
             ({"model": _OPENROUTER_MODEL, "choices": [{"message": {}}]}, LLMClientError, "Malformed response structure"),
             (
                 {"model": _OPENROUTER_MODEL, "choices": [{"message": {"content": None}}]},
-                ContentPolicyError,
+                LLMClientError,
                 "null content",
+            ),
+            (
+                {"model": _OPENROUTER_MODEL, "choices": [{"message": {"content": None}, "finish_reason": "content_filter"}]},
+                ContentPolicyError,
+                "provider refused or filtered",
             ),
             (
                 {"model": _OPENROUTER_MODEL, "choices": [{"message": {"content": 123}}]},
@@ -2045,7 +2125,7 @@ class TestOpenRouterRuntimePreflightValidation:
             ),
             (
                 {"model": _OPENROUTER_MODEL, "choices": [{"message": {"content": "   "}, "finish_reason": "stop"}]},
-                ContentPolicyError,
+                LLMClientError,
                 "empty content",
             ),
             (
@@ -2069,4 +2149,5 @@ class TestOpenRouterRuntimePreflightValidation:
             provider.runtime_preflight(
                 operation_id="op-preflight",
                 model=_OPENROUTER_MODEL,
+                coordination_token=mock_audit_authority()["coordination_token"],
             )

@@ -3,9 +3,7 @@
 Repair feedback crosses the planner's message-redaction boundary as structured
 facts keyed by a closed ``error_code`` — ``contract`` / ``row_union_schema`` /
 ``coalesce_union_type`` details and ``connectivity`` facts on the freeform
-surface (``pipeline_planner._allowlisted_candidate_feedback``), and the raw
-``connectivity`` dict of a ``GuidedCandidateBindingRejected`` on the guided
-surface (``pipeline_planner._binding_rejection_feedback``). A fact key is only
+surface (``pipeline_planner._allowlisted_candidate_feedback``). A fact key is only
 usable if the ``(explanation, suggested_fix)`` that
 ``tools.generation.explain_validation_code(code)`` resolves names it: a key the
 model is never told how to read cannot repair anything, and
@@ -15,8 +13,7 @@ cc2b19ce4 noticed (elspeth-68721c71d7).
 Both sides are DERIVED, never hand-listed: the shipped key set comes from the
 live TypedDicts plus the constructor keywords at every producer site (a
 ``NotRequired`` key a site never passes can never reach the planner from it)
-and from the AST of every guided rejection site; the taught set comes from the
-catalogue itself. The only curated input is the fence fixture
+and the taught set comes from the catalogue itself. The only curated input is the fence fixture
 (``planner_teaching_fence.json``): keys deliberately left untaught, each with a
 reason a reviewer can check. A fence entry that has since become taught, or
 whose key no longer ships, is itself a failure — the fence must not outlive
@@ -28,29 +25,23 @@ from __future__ import annotations
 import ast
 import json
 import re
-import typing
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import NamedTuple, TypedDict
 
 import pytest
-
-from elspeth.web.composer import pipeline_planner, state
-from elspeth.web.composer.guided import planning as guided_planning
-from elspeth.web.composer.pipeline_planner import route_destination_fact_keys
-from elspeth.web.composer.reviewed_output_projection import ReviewedOutputProjectionConflict
-from elspeth.web.composer.tools import generation
-from tests.unit.web.composer._teaching_gate_support import (
+from scripts.cicd.composer_teaching import (
     _call_name,
     _display,
-    _enclosing_function,
-    _is_cast,
-    _is_dict_literal,
     _literal_str,
     _typed_keys,
     composer_python_files,
     is_quoted_leaf,
 )
+
+from elspeth.web.composer import pipeline_planner, state
+from elspeth.web.composer.pipeline_planner import route_destination_fact_keys
+from elspeth.web.composer.tools import generation
 
 FENCE_PATH = Path(__file__).with_name("planner_teaching_fence.json")
 
@@ -69,7 +60,6 @@ _DETAIL_CONSTRUCTORS: dict[str, str] = {
     "coalesce_union_type": state.CoalesceUnionTypeDetail.__name__,
 }
 _ENTRY_CONSTRUCTORS = frozenset({"ValidationEntry", "_err"})
-_GUIDED_CONSTRUCTORS = frozenset({"GuidedCandidateBindingRejected", "_guided_delta_rejection"})
 # Positional layout shared by ``ValidationEntry(component, message, severity, error_code, ...)``
 # and ``state._err`` (same order).
 _ERROR_CODE_POSITION = 3
@@ -88,7 +78,7 @@ class _ProbeOuter(TypedDict):
 
 
 class ShippedKey(NamedTuple):
-    surface: str  # "freeform" | "guided"
+    surface: str  # "freeform"
     code: str
     key: str  # dotted path from the entry, e.g. "contract.missing_fields", "connectivity.delta_member"
     site: str
@@ -152,7 +142,7 @@ def _detail_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
             if not is_entry and not (callee == "replace" and carries_detail):
                 continue
             site = f"{_display(path)}:{node.lineno}"
-            # Fail CLOSED, as the guided walker does: a ``**spread`` or a detail
+            # Fail CLOSED: a ``**spread`` or a detail
             # passed positionally could carry a payload this walker cannot see.
             if any(kw.arg is None for kw in node.keywords):
                 raise AssertionError(f"{site}: entry built with a **spread; the gate cannot derive its detail keys")
@@ -242,70 +232,9 @@ def _connectivity_sites() -> Iterator[ShippedKey]:
         yield ShippedKey("freeform", "coalesce_branch_unreachable", key, "state.py:coalesce_reachability_facts")
 
 
-def _resolve_guided_code(expr: ast.AST | None, site: str) -> str:
-    code = _literal_str(expr)
-    if code is not None:
-        return code
-    if isinstance(expr, ast.Attribute) and expr.attr == "error_code":
-        # ``projection_conflict.error_code`` — a Literal-typed field on the conflict type.
-        hints = typing.get_type_hints(ReviewedOutputProjectionConflict)
-        (literal,) = typing.get_args(hints["error_code"])
-        return str(literal)
-    raise AssertionError(f"{site}: cannot derive error_code for a guided rejection ({ast.unparse(expr) if expr else 'missing'})")
-
-
-def _guided_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
-    """Every ``connectivity`` key a guided binder rejection can ship, per raise site."""
-    for path in files:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            name = _call_name(node)
-            if name not in _GUIDED_CONSTRUCTORS:
-                continue
-            site = f"{_display(path)}:{node.lineno}"
-            keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg}
-            facts: ast.expr | None
-            if name == "_guided_delta_rejection":
-                code = _resolve_guided_code(node.args[0] if node.args else keywords.get("error_code"), site)
-                facts = keywords.get("facts", ast.Dict(keys=[], values=[]))
-            else:
-                if _enclosing_function(tree, node.lineno) == "_guided_delta_rejection":
-                    continue  # the helper's own body forwards its ``facts`` argument; the call sites carry the literals
-                code = _resolve_guided_code(keywords.get("error_code"), site)
-                facts = keywords.get("connectivity")
-            if not isinstance(facts, ast.Dict):
-                raise AssertionError(
-                    f"{site}: connectivity facts are not a dict literal ({ast.unparse(facts) if facts else 'missing'}); the gate cannot derive their keys"
-                )
-            if facts.keys:
-                # ``_binding_rejection_feedback`` attaches the dict only when non-empty, so an empty
-                # literal ships no envelope either.
-                yield ShippedKey("guided", code, "connectivity", site)
-            for key_node, value_node in zip(facts.keys, facts.values, strict=True):
-                key = _literal_str(key_node)
-                if key is None:
-                    raise AssertionError(f"{site}: non-literal connectivity key {ast.unparse(key_node) if key_node else '**'}")
-                if any(_is_cast(inner) for inner in ast.walk(value_node)):
-                    # A cast launders a nested record past the value type; the
-                    # constructor's nominal check is the runtime close, this is
-                    # the review-time tripwire (final red-team, fourth round).
-                    raise AssertionError(f"{site}: connectivity['{key}'] carries a cast; fact values are built, never cast")
-                if any(_is_dict_literal(inner) for inner in ast.walk(value_node)):
-                    # A nested record ships its inner keys just as the envelope
-                    # does, and this walker enumerates one level. Refuse a dict
-                    # ANYWHERE in the value — under ``cast(...)``, in a list or
-                    # tuple, or via ``dict(...)`` — rather than under-report
-                    # (final red-team F1, both rounds): ship a typed record the
-                    # freeform walker recurses through, or flatten the facts.
-                    raise AssertionError(f"{site}: connectivity['{key}'] carries a nested dict; the gate cannot derive its inner keys")
-                yield ShippedKey("guided", code, f"connectivity.{key}", site)
-
-
 def shipped_keys(files: Iterable[Path] | None = None) -> list[ShippedKey]:
     paths = composer_python_files() if files is None else list(files)
-    return [*_detail_sites(paths), *_connectivity_sites(), *_guided_sites(paths)]
+    return [*_detail_sites(paths), *_connectivity_sites()]
 
 
 def is_taught(code: str, key: str, explain=generation.explain_validation_code) -> bool:
@@ -347,7 +276,7 @@ def test_every_shipped_fact_key_is_taught_or_fenced() -> None:
     lines = [f"{surface} {code} {key}  <- {', '.join(sites)}" for (surface, code, key), sites in sorted(unexplained.items())]
     assert not unexplained, (
         f"{len(unexplained)} repair-feedback key(s) reach the planner with guidance that never names them. "
-        "Teach each key in tools/generation.py (_VALIDATION_ERROR_PATTERNS entry for its code) or fence it with a "
+        "Teach each key in tools/generation.py (a direct guidance record for its code) or fence it with a "
         "checkable reason in planner_teaching_fence.json:\n" + "\n".join(lines)
     )
 
@@ -407,23 +336,6 @@ def test_is_taught_requires_the_quoted_form_not_a_bare_or_super_string() -> None
     assert not is_taught("x", "row_union_schema.branches[].fields[].name", explain)  # 'field_type' is not 'name'
 
 
-def test_gate_derives_a_new_guided_key_from_the_ast(tmp_path: Path) -> None:
-    """A fresh fact key at a guided raise site must surface as untaught, with no list to update."""
-    module = tmp_path / "planning_probe.py"
-    module.write_text(
-        "def f():\n"
-        "    raise _guided_delta_rejection('guided_delta_authority_violation', facts={'delta_member': 'x', 'brand_new_fact': 1})\n"
-        "def g():\n"
-        "    raise GuidedCandidateBindingRejected('m', error_code='guided_route_target_unknown', connectivity={'declared_sinks': [], 'another_new_fact': 2})\n",
-        encoding="utf-8",
-    )
-    untaught = untaught_keys([module])
-    assert ("guided", "guided_delta_authority_violation", "connectivity.brand_new_fact") in untaught
-    assert ("guided", "guided_route_target_unknown", "connectivity.another_new_fact") in untaught
-    # and a key the catalogue already names is NOT reported
-    assert ("guided", "guided_route_target_unknown", "connectivity.declared_sinks") not in untaught
-
-
 def test_gate_derives_a_new_typed_detail_key_from_the_constructor_keywords(tmp_path: Path) -> None:
     """Only keys a site actually passes to the detail constructor count as shipped from that site."""
     module = tmp_path / "state_probe.py"
@@ -458,64 +370,6 @@ def test_gate_derives_a_detail_from_aliased_constructors(tmp_path: Path, prelude
     )
     shipped = {(s.code, s.key) for s in _detail_sites([module])}
     assert shipped == {("sink_locked_extras", "contract"), ("sink_locked_extras", "contract.producer")}
-
-
-def test_guided_fact_values_have_no_mapping_arm() -> None:
-    """The guided facts value type refuses a nested record however it is built.
-
-    The walker enumerates one level and an AST walk cannot bound a mapping
-    reached through a name or a helper call (final red-team, third round):
-    the TYPE is the close. Pinned from the live signature, not a copy.
-    """
-    hints = typing.get_type_hints(guided_planning._guided_delta_rejection)
-    (mapping, _none) = typing.get_args(hints["facts"])
-    _key, value = typing.get_args(mapping)
-    arms = typing.get_args(value)
-    assert arms, "facts value must be a union of closed label types"
-    for arm in arms:
-        origin = typing.get_origin(arm) or arm
-        assert origin is not dict and not (isinstance(origin, type) and issubclass(origin, Mapping)), arm
-        assert not typing.is_typeddict(arm), arm
-    assert list[str] in arms and str in arms
-
-
-def test_gate_refuses_a_guided_site_it_cannot_derive(tmp_path: Path) -> None:
-    module = tmp_path / "opaque_probe.py"
-    module.write_text(
-        "def f(facts):\n    raise GuidedCandidateBindingRejected('m', error_code='guided_route_target_unknown', connectivity=facts)\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(AssertionError, match="cannot derive their keys"):
-        list(_guided_sites([module]))
-
-
-@pytest.mark.parametrize(
-    ("value", "reason"),
-    [
-        ("{'inner_untaught': 1}", "nested dict"),
-        ("cast(JsonValue, {'inner_untaught': 1})", "carries a cast"),
-        ("cast(GuidedFactValue, nested_record)", "carries a cast"),
-        ("[{'inner_untaught': 1}]", "nested dict"),
-        ("({'inner_untaught': 1},)", "nested dict"),
-        ("dict(inner_untaught=1)", "nested dict"),
-        ("{k: 1 for k in ('inner_untaught',)}", "nested dict"),
-    ],
-    ids=["literal", "cast-wrapped", "cast-of-name", "in-list", "in-tuple", "dict-call", "comprehension"],
-)
-def test_gate_refuses_a_nested_dict_value_at_a_guided_site(tmp_path: Path, value: str, reason: str) -> None:
-    """Inner keys of a dict value would ship untaught and unenumerated; the walker refuses a dict anywhere in the value.
-
-    The first fix refused only a bare literal; ``cast(JsonValue, {...})`` — the
-    house-style wrapper every real site uses — a list, a tuple and ``dict(...)``
-    all slipped past it (final red-team F1, second round).
-    """
-    module = tmp_path / "nested_probe.py"
-    module.write_text(
-        f"def f():\n    raise _guided_delta_rejection('guided_delta_authority_violation', facts={{'extra': {value}}})\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(AssertionError, match=reason):
-        list(_guided_sites([module]))
 
 
 @pytest.mark.parametrize(
@@ -597,10 +451,3 @@ def test_connectivity_sites_enumerate_every_coalesce_reachability_key() -> None:
     expected = {"connectivity", *_typed_keys(state.CoalesceReachabilityFactDict, "connectivity.")}
     assert coalesce == expected
     assert len(expected) > 2, "the coalesce payload has nested keys; an envelope-only set means the walker regressed"
-
-
-def test_every_guided_site_is_derivable() -> None:
-    """Every guided raise site in the tree carries a literal code and a dict-literal fact set."""
-    sites = list(_guided_sites([Path(guided_planning.__file__)]))
-    assert sites, "no guided rejection sites found — the walker or the constructor names drifted"
-    assert all(s.surface == "guided" for s in sites)

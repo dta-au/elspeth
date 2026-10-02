@@ -7,16 +7,18 @@ resolve_queries() normalization, and provider-specific config classes.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.multi_query import QueryDefinition
+from elspeth.testing import make_pipeline_row
 
 
 def _mapping_defs(defs: dict[str, dict[str, Any]]) -> dict[str, QueryDefinition]:
@@ -40,6 +42,15 @@ _OPENROUTER_MODEL = "anthropic/claude-3.5-sonnet"
 
 class TestLLMConfigBase:
     """Tests for LLMConfig base class changes."""
+
+    def test_config_validation_rejects_constant_power_template(self) -> None:
+        with pytest.raises(ValidationError, match="Invalid Jinja2 template"):
+            LLMConfig(
+                provider="azure",
+                prompt_template="{{ (3**(3**15)) % 7 }}",
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=[],
+            )
 
     def test_model_optional_defaults_to_none(self) -> None:
         """model field is optional and defaults to None."""
@@ -99,7 +110,7 @@ class TestLLMConfigBase:
         )
         assert config.queries is None
 
-    def test_resolved_prompt_template_hash_must_match_prompt_template(self) -> None:
+    def test_approved_prompt_artifact_hash_must_match_prompt_template(self) -> None:
         """Phase 5b runtime anchor refuses prompt/hash drift at config load."""
         resolved_template = "Rate how innovative this is."
         config = LLMConfig(
@@ -107,17 +118,17 @@ class TestLLMConfigBase:
             prompt_template=resolved_template,
             schema_config=_OBSERVED_SCHEMA,
             required_input_fields=[],
-            resolved_prompt_template_hash=stable_hash(resolved_template),
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash(prompt_template=resolved_template, system_prompt=None),
         )
-        assert config.resolved_prompt_template_hash == stable_hash(resolved_template)
+        assert config.approved_prompt_artifact_hash == approved_prompt_artifact_hash(prompt_template=resolved_template, system_prompt=None)
 
-        with pytest.raises(ValidationError, match="resolved_prompt_template_hash"):
+        with pytest.raises(ValidationError, match="approved_prompt_artifact_hash"):
             LLMConfig(
                 provider="azure",
                 prompt_template="Rate how boring this is.",
                 schema_config=_OBSERVED_SCHEMA,
                 required_input_fields=[],
-                resolved_prompt_template_hash=stable_hash(resolved_template),
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash(prompt_template=resolved_template, system_prompt=None),
             )
 
     def test_missing_required_input_fields_error_names_composer_options_repair(self) -> None:
@@ -192,6 +203,83 @@ class TestLLMConfigBase:
         assert "dynamic row field access" in message
         assert "map(attribute=expr)" in message
 
+    @pytest.mark.parametrize(
+        "template",
+        (
+            "{{ row.note }} {{ row | dictsort }}",
+            "{% for k, v in row | items %}{{ v }}{% endfor %}{{ row.note }}",
+            "{{ row.note }} {{ dict(row) }}",
+            "{{ row.note }} {{ '%(secret)s' % row }}",
+            "{{ row.note }} {{ '{0[secret]}'.format(row) }}",
+            "{% set c = [row] %}{{ row.note }} {{ c | map('dictsort') | list }}",
+            "{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ row.note }} {{ m(row) }}",
+            "{% macro m() %}{{ kwargs.r | dictsort }}{% endmacro %}{{ row.note }} {{ m(r=row) }}",
+            "{% macro m() %}{{ caller(*varargs) }}{% endmacro %}{{ row.note }} {% call(x) m(row) %}{{ x | dictsort }}{% endcall %}",
+        ),
+    )
+    def test_whole_row_value_is_not_a_configuration_question(self, template: str) -> None:
+        """A whole row used as a value holds only the declared fields at render (ADR-051), so configuration admits it.
+
+        The runtime projection is the confidentiality guarantee
+        (tests/unit/plugins/infrastructure/test_template_projection.py); the
+        static analysis stays the early error for reads it can name.
+        """
+        config = LLMConfig(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4.6",
+            prompt_template=template,
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=["note"],
+        )
+        assert config.required_input_fields == ["note"]
+
+    @pytest.mark.parametrize(
+        "template",
+        (
+            "{% macro m() %}{{ varargs[0].secret }}{% endmacro %}{{ row.note }} {{ m(row) }}",
+            "{% macro m() %}{{ kwargs.r.secret }}{% endmacro %}{{ row.note }} {{ m(r=row) }}",
+            "{% macro m() %}{{ caller(x=row) }}{% endmacro %}{{ row.note }} {% call(x) m() %}{{ x.secret }}{% endcall %}",
+        ),
+    )
+    def test_field_read_through_an_implicit_macro_argument_must_be_declared(self, template: str) -> None:
+        """A field read through ``varargs``, ``kwargs`` or a ``caller`` keyword is a read of that field (S0 fix round 2)."""
+        with pytest.raises(ValidationError) as exc_info:
+            LLMConfig(
+                provider="openrouter",
+                model="anthropic/claude-sonnet-4.6",
+                prompt_template=template,
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=["note"],
+            )
+
+        assert "LLM prompt_template reads 'secret' under 'row'" in str(exc_info.value)
+
+    def test_self_holding_carrier_rejected_even_with_declared_fields(self) -> None:
+        """An alias too deep to follow cannot be audited against the declared fields (S0 fix round 2)."""
+        with pytest.raises(ValidationError) as exc_info:
+            LLMConfig(
+                provider="openrouter",
+                model="anthropic/claude-sonnet-4.6",
+                prompt_template="{% set a = {'k': row} %}{% set a = {'k': a} %}{{ row.note }} {{ a.k.k.note }}",
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=["note"],
+            )
+
+        message = str(exc_info.value)
+        assert "dynamic row field access (carrier-limit via a variable or macro argument that holds itself, too deep to follow)" in message
+        assert "options.required_input_fields: []" in message
+
+    def test_whole_row_value_admitted_with_explicit_opt_out(self) -> None:
+        config = LLMConfig(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4.6",
+            prompt_template="{{ row.note }} {{ row | dictsort }}",
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=[],
+        )
+
+        assert config.required_input_fields == []
+
     def test_row_derived_map_attribute_filter_rejected_even_with_declared_selector(self) -> None:
         """Declaring the selector field is not enough when it chooses another field."""
         with pytest.raises(ValidationError) as exc_info:
@@ -219,8 +307,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row|attr(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     def test_row_alias_map_attribute_filter_rejected_even_with_declared_selector(self) -> None:
         """A local alias for row cannot hide map(attribute=alias.field)."""
@@ -249,8 +337,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row|attr(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     def test_with_row_alias_map_attribute_filter_rejected_even_with_declared_selector(self) -> None:
         """A with-block alias for row cannot hide map(attribute=alias.field)."""
@@ -279,8 +367,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -301,8 +389,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     def test_container_carried_row_get_alias_dynamic_key_rejected_even_with_declared_selector(self) -> None:
         """Carrier-held row.get with row-derived keys remains dynamic."""
@@ -316,8 +404,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -337,8 +425,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     def test_namespace_assigned_row_alias_dynamic_get_rejected_even_with_declared_selector(self) -> None:
         """Namespace attribute assignment can carry row itself."""
@@ -356,13 +444,14 @@ class TestLLMConfigBase:
         assert "row.get(expr)" in message
 
     @pytest.mark.parametrize(
-        "template",
+        ("template", "refusal"),
         (
-            "{% set d = {'inner': {'r': row}} %}{{ d['inner']['r'].get(row.selector) }}",
-            "{% set xs = [row.get] %}{{ xs[0](row.selector) }}",
+            ("{% set d = {'inner': {'r': row}} %}{{ d['inner']['r'].get(row.selector) }}", "dynamic row field access"),
+            # Naming row.get without a call is refused under every declaration.
+            ("{% set xs = [row.get] %}{{ xs[0](row.selector) }}", "uses its row as an object"),
         ),
     )
-    def test_nested_or_list_carried_row_access_rejected_even_with_declared_selector(self, template: str) -> None:
+    def test_nested_or_list_carried_row_access_rejected_even_with_declared_selector(self, template: str, refusal: str) -> None:
         """Nested row-object and list API carriers cannot hide row.get."""
         with pytest.raises(ValidationError) as exc_info:
             LLMConfig(
@@ -374,8 +463,7 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert refusal in message
 
     def test_loop_target_from_row_get_alias_collection_rejected_even_with_declared_selector(self) -> None:
         """Loop targets over row.get collections inherit API alias guards."""
@@ -389,8 +477,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -421,8 +509,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -447,8 +535,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         ("template", "required_fields"),
@@ -488,8 +576,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row.get(expr)" in message
+        assert "uses its row as an object" in message
+        assert "row.get without a call" in message
 
     @pytest.mark.parametrize(
         ("template", "required_fields"),
@@ -525,8 +613,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -547,8 +635,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_scalar_row_value_collection_alias_allowed_when_declared(self) -> None:
         """A list of declared row values is not a list of row objects."""
@@ -585,8 +673,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize("template", ("{{ row._data }}", "{{ row.__class__ }}", "{{ row.contract }}"))
     def test_pipeline_row_private_or_api_attr_rejected(self, template: str) -> None:
@@ -600,8 +688,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_row_scalar_alias_map_attribute_filter_rejected_even_with_declared_selector(self) -> None:
         """A row-derived scalar alias cannot choose map(attribute=...)."""
@@ -629,8 +717,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_macro_row_arg_to_dict_rejected(self) -> None:
         """A macro parameter called with row cannot expose the full row."""
@@ -643,8 +731,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_macro_row_arg_map_attribute_rejected_even_with_declared_selector(self) -> None:
         """A macro parameter called with row cannot hide map(attribute=alias.field)."""
@@ -673,8 +761,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_row_expression_dynamic_get_rejected_even_with_declared_selector(self) -> None:
         """A row-valued expression cannot hide row.get(expr)."""
@@ -711,8 +799,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_for_loop_row_collection_alias_rejected(self) -> None:
         """A collection alias containing row cannot hide a row loop target."""
@@ -725,8 +813,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_macro_default_row_arg_rejected(self) -> None:
         """A macro default bound to row cannot hide full-row access."""
@@ -739,8 +827,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_macro_alias_row_arg_rejected(self) -> None:
         """Calling a macro through an alias cannot hide full-row access."""
@@ -753,8 +841,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_callblock_caller_row_arg_rejected(self) -> None:
         """A caller parameter passed row by a macro cannot hide full-row access."""
@@ -767,8 +855,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
         ("template", "required_fields"),
@@ -800,8 +888,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_carried_callblock_macro_alias_rejected(self) -> None:
         """Callblock macros invoked through carriers cannot hide full-row access."""
@@ -817,8 +905,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     def test_row_to_checkpoint_format_rejected_without_required_input_fields(self) -> None:
         """row.to_checkpoint_format() exposes serialized row data and must fail closed."""
@@ -831,18 +919,18 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
-        "template",
+        ("template", "refusal"),
         (
-            "{% set xs = [row] %}{{ xs[0].get(row.selector) }}",
-            "{{ [row][0].to_dict() }}",
-            "{{ [row][0]._data }}",
+            ("{% set xs = [row] %}{{ xs[0].get(row.selector) }}", "dynamic row field access"),
+            ("{{ [row][0].to_dict() }}", "uses its row as an object"),
+            ("{{ [row][0]._data }}", "uses its row as an object"),
         ),
     )
-    def test_indexed_row_collection_receiver_rejected(self, template: str) -> None:
+    def test_indexed_row_collection_receiver_rejected(self, template: str, refusal: str) -> None:
         """Indexing a known row collection cannot hide row API or dynamic access."""
         with pytest.raises(ValidationError) as exc_info:
             LLMConfig(
@@ -853,7 +941,7 @@ class TestLLMConfigBase:
                 required_input_fields=["selector"],
             )
 
-        assert "dynamic row field access" in str(exc_info.value)
+        assert refusal in str(exc_info.value)
 
     @pytest.mark.parametrize(
         "template",
@@ -924,8 +1012,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -946,18 +1034,18 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
-        "template",
+        ("template", "refusal"),
         (
-            "{{ (row if true else row).to_dict() }}",
-            "{{ (row or {}).get(row.selector) }}",
-            "{{ (row|default({})).to_dict() }}",
+            ("{{ (row if true else row).to_dict() }}", "uses its row as an object"),
+            ("{{ (row or {}).get(row.selector) }}", "dynamic row field access"),
+            ("{{ (row|default({})).to_dict() }}", "uses its row as an object"),
         ),
     )
-    def test_generic_row_expression_receiver_rejected(self, template: str) -> None:
+    def test_generic_row_expression_receiver_rejected(self, template: str, refusal: str) -> None:
         """Generic expressions that may yield row cannot hide row API access."""
         with pytest.raises(ValidationError) as exc_info:
             LLMConfig(
@@ -968,7 +1056,7 @@ class TestLLMConfigBase:
                 required_input_fields=["selector"],
             )
 
-        assert "dynamic row field access" in str(exc_info.value)
+        assert refusal in str(exc_info.value)
 
     @pytest.mark.parametrize(
         "template",
@@ -1032,8 +1120,8 @@ class TestLLMConfigBase:
             )
 
         message = str(exc_info.value)
-        assert "dynamic row field access" in message
-        assert "row API" in message
+        assert "uses its row as an object" in message
+        assert "row.contract, row.to_dict, row.to_checkpoint_format" in message
 
     @pytest.mark.parametrize(
         "template",
@@ -1054,7 +1142,7 @@ class TestLLMConfigBase:
                 required_input_fields=["selector"],
             )
 
-        assert "dynamic row field access" in str(exc_info.value)
+        assert "uses its row as an object" in str(exc_info.value)
 
     @pytest.mark.parametrize(
         "template",
@@ -1194,10 +1282,53 @@ class TestRequiredInputFieldsAppearInTemplate:
             )
 
         message = str(exc_info.value)
-        assert "does not interpolate any row.* fields" in message
+        assert "prompt_template never reads 'row', so no declared field reaches the prompt" in message
         assert "['content', 'url']" in message
         assert "{{ row.url }}" in message
         assert "{{ row.content }}" in message
+        # The remedy never points at the whole-row opt-out: under ADR-051 ``[]``
+        # is the one setting that shows the template every column.
+        assert "[]" not in message
+        assert "remove options.required_input_fields" in message
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            pytest.param("{% for row in [1] %}{% endfor %}Rate this.", id="loop-variable"),
+            pytest.param("{% set row = 'x' %}{{ row }}", id="set-variable"),
+            pytest.param("{% macro m(row) %}{{ row }}{% endmacro %}{{ m('x') }}", id="macro-parameter"),
+        ],
+    )
+    def test_a_row_the_template_binds_itself_is_not_a_read_of_the_row(self, template: str) -> None:
+        """A local ``row`` never carries a declared field, so the declaration still goes unused."""
+        with pytest.raises(ValidationError, match="prompt_template never reads 'row'"):
+            LLMConfig(
+                provider="openrouter",
+                model="anthropic/claude-sonnet-4.6",
+                prompt_template=template,
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=["note"],
+            )
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            pytest.param("{{ row | dictsort }}", id="dictsort"),
+            pytest.param("{{ row | tojson }}", id="tojson"),
+            pytest.param("{% for k, v in row | items %}{{ k }}={{ v }} {% endfor %}", id="items"),
+            pytest.param("{% macro m() %}{{ row.note }}{% endmacro %}{{ m() }}", id="macro-body"),
+        ],
+    )
+    def test_a_whole_row_form_with_a_declared_list_is_admitted(self, template: str) -> None:
+        """ADR-051: the template's row holds exactly the declared fields, so a whole-row form interpolates them."""
+        config = LLMConfig(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4.6",
+            prompt_template=template,
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=["note"],
+        )
+        assert config.required_input_fields == ["note"]
 
     def test_declared_fields_with_matching_row_interpolation_accepted(self) -> None:
         """Canonical case: every declared field appears as a row.* reference."""
@@ -1561,12 +1692,16 @@ class TestQuerySpec:
             name="q1",
             input_fields=MappingProxyType({"text_content": "text", "category_name": "category"}),
         )
-        row = {"text": "hello world", "category": "science", "extra": "ignored"}
-        ctx = spec.build_template_context(row)
+        from elspeth.plugins.infrastructure.templates import DeclaredFields, TemplateRow
+
+        row = make_pipeline_row({"text": "hello world", "category": "science", "extra": "ignored"})
+        ctx = spec.build_template_context(row, DeclaredFields(frozenset({"text", "category"})))
 
         assert ctx["text_content"] == "hello world"
         assert ctx["category_name"] == "science"
-        assert ctx["source_row"] is row
+        # source_row is the row projected to the node's declaration (ADR-051): 'extra' is not in it.
+        assert type(ctx["source_row"]) is TemplateRow
+        assert dict(ctx["source_row"]) == {"text": "hello world", "category": "science"}
 
     def test_build_template_context_missing_field_raises(self) -> None:
         from elspeth.plugins.transforms.llm.multi_query import QuerySpec
@@ -1575,8 +1710,10 @@ class TestQuerySpec:
             name="q1",
             input_fields=MappingProxyType({"text_content": "text"}),
         )
+        from elspeth.plugins.infrastructure.templates import ALL_FIELDS
+
         with pytest.raises(KeyError, match="text"):
-            spec.build_template_context({"other": "value"})
+            spec.build_template_context(make_pipeline_row({"other": "value"}), ALL_FIELDS)
 
     def test_input_fields_is_deeply_immutable(self) -> None:
         """input_fields dict must be truly immutable — shared across rows."""
@@ -2038,15 +2175,17 @@ class TestTemplateVariableBindings:
     def test_single_prompt_undeclared_reference_raises_at_render_today(self) -> None:
         """Pins the runtime consequence the rejection claims, so the message cannot drift.
 
-        Without this the message's "fails the whole node at render" is an
-        unverified assertion, and an ``| default()``-style change to the
-        sandbox would silently make it false.
+        Without this the message's "every row fails the whole node at render
+        with 'Undeclared field'" is an unverified assertion: the row a template
+        sees holds only the declared fields (ADR-051), so the undeclared read
+        fails even on a row that carries the column.
         """
-        from elspeth.plugins.infrastructure.templates import TemplateError
+        from elspeth.plugins.infrastructure.templates import DeclaredFields, TemplateError, TemplateRow
         from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
-        with pytest.raises(TemplateError, match="Undefined variable"):
-            PromptTemplate("Rate: {{ row.case_study }}").render({"case_study_1": "x"})
+        row = TemplateRow.project(make_pipeline_row({"case_study": "x", "case_study_1": "y"}), DeclaredFields(frozenset({"case_study_1"})))
+        with pytest.raises(TemplateError, match=r"^Undeclared field: the template reads 'case_study'"):
+            PromptTemplate("Rate: {{ row.case_study }}").render(row)
 
     def test_single_prompt_original_header_literal_accepted_against_normalized_declaration(self) -> None:
         """``row["Original Header"]`` resolves through ``SchemaContract.find_name``.
@@ -2071,21 +2210,41 @@ class TestTemplateVariableBindings:
             self._single('Rate: {{ row["Original Header"] }}', required_input_fields=["something_else"])
         assert "declare as 'original_header'" in str(exc_info.value)
 
-    def test_single_prompt_case_variant_reference_rejected(self) -> None:
-        """``{{ row.Name }}`` against a declared ``name`` resolves only by accident.
+    @pytest.mark.parametrize("template", ["Hello {{ row.Name }}", "Hello {{ row['Name'] }}", "Hello {{ row.get('Name', '') }}"])
+    def test_single_prompt_header_spelling_of_a_declared_field_accepted(self, template: str) -> None:
+        """``{{ row.Name }}`` under a declared ``name`` reads ``name`` by its header spelling (ADR-051 (b), S-02).
 
-        ``SchemaContract.find_name`` is an exact match on ``normalized_name`` OR
-        ``original_name``, and config time knows neither: the same YAML renders
-        or fails 100% of rows depending on a CSV header's capitalization that no
-        validator ever sees. An earlier version bridged this through
-        ``normalize_field_name`` and so also silenced plain typos of the
-        declared name (``a__b`` for ``a_b``) — the very class this check exists
-        for. The surviving advice is the message's first remedy: rewrite the
-        reference to ``row.name``.
+        The template row resolves a declared field by its canonical and its
+        recorded original name, so a source whose header is ``Name`` delivers
+        it; a row whose header is spelled otherwise fails that row at render.
         """
+        assert self._single(template, required_input_fields=["name"]).prompt_template == template
+
+    def test_header_spelled_lookups_are_published_for_the_build(self) -> None:
+        """Each spelling config admits is published (literal -> declared field): the build proves a row can carry it."""
+        config = self._single(
+            "{{ row['Name'] }} {{ row.score }} {{ row['Score_Text'] }}", required_input_fields=["name", "score", "score_text"]
+        )
+        assert config.header_spelled_row_lookups() == {"Name": "name", "Score_Text": "score_text"}
+
+    def test_the_opt_out_publishes_no_lookup(self) -> None:
+        assert self._single("{{ row['Name'] }}", required_input_fields=[]).header_spelled_row_lookups() == {}
+
+    def test_multi_query_columns_and_source_row_reads_are_published(self) -> None:
+        config = LLMConfig(
+            provider="azure",
+            prompt_template="Assess {{ row.text }} {{ row.source_row['Topic'] }}",
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=["name", "topic"],
+            queries={"q1": {"input_fields": {"text": "Name"}}},
+        )
+        assert config.header_spelled_row_lookups() == {"Name": "name", "Topic": "topic"}
+
+    def test_single_prompt_spelling_of_an_undeclared_field_rejected(self) -> None:
+        """A spelling of a field the node does not declare is still an undeclared read."""
         with pytest.raises(ValidationError, match="required_input_fields does not declare") as exc_info:
-            self._single("Hello {{ row.Name }}", required_input_fields=["name"])
-        assert "'Name'" in str(exc_info.value)
+            self._single("Hello {{ row.Title }}", required_input_fields=["name"])
+        assert "'Title'" in str(exc_info.value)
 
     def test_single_prompt_keyword_literal_accepted(self) -> None:
         """``row["class"]`` cannot be declared — ``class`` is a Python keyword — so
@@ -2104,31 +2263,68 @@ class TestTemplateVariableBindings:
         and breaks the run.
         """
         with pytest.raises(ValidationError) as exc_info:
-            self._single("Hello {{ row.Name }}", required_input_fields=["name"])
+            self._single("Hello {{ row.title }}", required_input_fields=["name"])
         message = str(exc_info.value)
         assert message.index("Rewrite each reference") < message.index("Add a name to options.required_input_fields")
         assert "ONLY if the upstream producer guarantees that exact name" in message
-        assert "fails every row at run time" in message
+        assert "refused when the pipeline is validated" in message
 
-    def test_declaring_an_unguaranteed_read_name_is_accepted_here_and_fails_at_run_time(self) -> None:
-        """Pins the fact the remedy ordering rests on, so it cannot drift silently."""
-        from elspeth.contracts.errors import DeclaredRequiredInputFieldsViolation
-        from elspeth.engine.executors.declared_required_fields import verify_declared_required_fields
+    def test_declaring_an_unguaranteed_read_name_is_refused_when_the_pipeline_is_validated(self, tmp_path: Path) -> None:
+        """Pins the fact the remedy's warning rests on, so it cannot drift silently.
 
-        # Config time accepts the "just declare what you read" repair...
+        The plugin config accepts the "just declare what you read" repair, but
+        the pipeline's validation refuses it: an explicit required_input_fields
+        name the producer does not guarantee fails Phase 1 (it used to be
+        accepted and fail every row at run time).
+        """
+        import yaml
+        from typer.testing import CliRunner
+
+        from elspeth.cli import app
+
         self._single("Hello {{ row.Name }}", required_input_fields=["Name"])
 
-        # ...and the engine then rejects every row whose key is the normalized name.
-        with pytest.raises(DeclaredRequiredInputFieldsViolation):
-            verify_declared_required_fields(
-                declared_input_fields=frozenset({"Name"}),
-                effective_input_fields=frozenset({"name"}),
-                plugin_name="llm",
-                node_id="n1",
-                run_id="r1",
-                row_id="row1",
-                token_id="t1",
-            )
+        (tmp_path / "in.csv").write_text("Name\nAda\n")
+        sink = {
+            "plugin": "json",
+            "on_write_failure": "discard",
+            "options": {"path": str(tmp_path / "out.jsonl"), "format": "jsonl", "schema": {"mode": "observed"}},
+        }
+        settings = {
+            "sources": {
+                "src": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "options": {"path": str(tmp_path / "in.csv"), "on_validation_failure": "discard", "schema": {"mode": "observed"}},
+                }
+            },
+            "transforms": [
+                {
+                    "name": "greet",
+                    "plugin": "llm",
+                    "input": "rows",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": {
+                        "provider": "openrouter",
+                        "model": "openai/gpt-4o",
+                        "api_key": "placeholder-not-a-key",  # secret-scan: allow-this-line
+                        "prompt_template": "Hello {{ row.Name }}",
+                        "required_input_fields": ["Name"],
+                        "schema": {"mode": "observed"},
+                    },
+                }
+            ],
+            "sinks": {"out": sink},
+            "landscape": {"url": f"sqlite:///{tmp_path / 'audit.db'}"},
+        }
+        (tmp_path / "settings.yaml").write_text(yaml.safe_dump(settings, sort_keys=False))
+
+        result = CliRunner().invoke(app, ["validate", "-s", str(tmp_path / "settings.yaml")])
+
+        assert result.exit_code == 1, result.output
+        assert "Traceback" not in result.output
+        assert "'Name'" in result.output
 
     def test_single_prompt_declaration_opt_out_suppresses_the_check(self) -> None:
         """``required_input_fields: []`` is the documented opt-out and must keep working."""
@@ -2261,6 +2457,40 @@ class TestTemplateVariableBindings:
         message = str(exc_info.value)
         assert "'broken_query'" in message
 
+    def test_shared_node_template_analysis_does_not_scale_with_query_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Queries without a template override all render the one node-level
+        prompt_template; validating them must parse it a constant number of
+        times, not once per query per validator (#230: O(queries x template)
+        CPU amplification on an authenticated YAML import)."""
+        from elspeth.core import templates
+
+        template = "Assess {{ row.input_1 }} against {{ row.source_row.column_0 }}"
+        original_extract = templates.extract_jinja2_field_usage
+        shared_template_calls = 0
+
+        def counting_extract(candidate: str, *args: Any, **kwargs: Any) -> Any:
+            nonlocal shared_template_calls
+            if candidate == template:
+                shared_template_calls += 1
+            return original_extract(candidate, *args, **kwargs)
+
+        monkeypatch.setattr(templates, "extract_jinja2_field_usage", counting_extract)
+
+        def calls_for(query_count: int) -> int:
+            nonlocal shared_template_calls
+            shared_template_calls = 0
+            config = LLMConfig(
+                provider="azure",
+                prompt_template=template,
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=[f"column_{index}" for index in range(query_count)],
+                queries={f"query_{index}": {"input_fields": {"input_1": f"column_{index}"}} for index in range(query_count)},
+            )
+            config.header_spelled_row_lookups()
+            return shared_template_calls
+
+        assert calls_for(1) == calls_for(50)
+
     def test_from_dict_wraps_binding_error_as_plugin_config_error(self) -> None:
         """The web/probe path must see the redacted-safe §5.3 category, not a
         bare ValueError escaping as a 500."""
@@ -2275,3 +2505,15 @@ class TestTemplateVariableBindings:
         }
         with pytest.raises(PluginConfigError, match="input_fields binds only"):
             LLMConfig.from_dict(bad, plugin_name="llm")
+
+
+def test_the_only_field_an_llm_transform_writes_as_any_is_the_usage_mapping() -> None:
+    """LLMConfig refuses every authored scalar over a written-``any`` field because that field is the usage mapping.
+
+    If another written field ever becomes ``any``, that refusal's reason (and
+    message) would be false for it: this pin makes the change re-decide it.
+    """
+    from elspeth.plugins.transforms.llm import _OUTPUT_FIELD_TYPE_TO_SCHEMA, _SUFFIX_SCHEMA_TYPES
+
+    assert {suffix for suffix, field_type in _SUFFIX_SCHEMA_TYPES.items() if field_type == "any"} == {"_usage"}
+    assert "any" not in _OUTPUT_FIELD_TYPE_TO_SCHEMA.values()

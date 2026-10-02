@@ -1,0 +1,56 @@
+# The public ABN Lookup results page is one example of a fixed destination.
+# Its search term comes from each input row. This config requires live internet
+# access and should be run only for an operator-approved small canary.
+sources:
+  primary:
+    plugin: csv
+    on_success: searches
+    options:
+      path: examples/fixed_web_search/input.csv
+      schema:
+        mode: fixed
+        fields:
+          - 'id: int'
+          - 'search_text: str'
+      on_validation_failure: discard
+transforms:
+  - name: search_page
+    plugin: web_scrape
+    input: searches
+    on_success: results
+    on_error: search_failures
+    options:
+      url: https://abr.business.gov.au/Search/ResultsActive
+      query_fields: {SearchText: search_text}
+      content_field: result_html
+      fingerprint_field: result_fingerprint
+      format: raw
+      http:
+        abuse_contact: examples@example.com
+        scraping_reason: Operator-approved public ABN Lookup search canary
+        timeout: 20
+        allowed_hosts: public_only
+        allowed_origins:
+          - https://abr.business.gov.au
+      schema: {mode: observed}
+sinks:
+  results:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/fixed_web_search/output/abn_results.jsonl
+      schema: {mode: observed}
+      format: jsonl
+  search_failures:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/fixed_web_search/output/abn_failures.jsonl
+      schema: {mode: observed}
+      format: jsonl
+landscape:
+  url: sqlite:///examples/fixed_web_search/runs/abn_audit.db
+payload_store:
+  base_path: examples/fixed_web_search/runs/abn_payloads
+concurrency:
+  max_workers: 1

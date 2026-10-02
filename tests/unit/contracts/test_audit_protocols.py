@@ -12,13 +12,16 @@ from elspeth.contracts.audit_protocols import CallRecorder, PluginAuditWriter
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import MissingFieldViolation, SinkDiversionReason, TransformErrorReason
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.plugin_audit_writer import PluginAuditWriterAdapter
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
 
 _TOKEN = CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1)
+_WORK_ITEM = MagicMock(spec=TokenWorkItem)
 
 
 def _public_method_names(cls: type[object]) -> set[str]:
@@ -90,10 +93,10 @@ class TestCallRecordingRoutesToExecution:
         execution, _data_flow, _run_lifecycle = repos
         execution.allocate_call_index.return_value = 42
 
-        result = writer.allocate_call_index("state-1")
+        result = writer.allocate_call_index("state-1", member_token=_TOKEN.membership, work_item=_WORK_ITEM)
 
         assert result == 42
-        execution.allocate_call_index.assert_called_once_with("state-1")
+        execution.allocate_call_index.assert_called_once_with("state-1", member_token=_TOKEN.membership, work_item=_WORK_ITEM)
         # DataFlowRepository does not have allocate_call_index — if it
         # routed there, the adapter would have crashed.
 
@@ -118,6 +121,8 @@ class TestCallRecordingRoutesToExecution:
             12.5,
             request_ref="blob-request",
             response_ref="blob-response",
+            member_token=_TOKEN.membership,
+            work_item=_WORK_ITEM,
         )
 
         assert result is sentinel.call
@@ -132,12 +137,16 @@ class TestCallRecordingRoutesToExecution:
             12.5,
             request_ref="blob-request",
             response_ref="blob-response",
+            member_token=_TOKEN.membership,
+            work_item=_WORK_ITEM,
             # Phase 5b Task 9: cross-DB hash anchor; None unless the caller
             # is an LLM transform downstream of a resolved interpretation
             # event. The PluginAuditWriter adapter unconditionally forwards
             # the kwarg so the LLM transform plugin path can pass-through
             # without per-call-site adapter changes.
-            resolved_prompt_template_hash=None,
+            approved_prompt_artifact_hash=None,
+            token_usage=UNKNOWN_TOKEN_USAGE,
+            source_call_id=None,
         )
 
 
@@ -154,24 +163,24 @@ class TestErrorRecordingRoutesToDataFlow:
         violation = MissingFieldViolation(normalized_name="field", original_name="Field")
 
         result = writer.record_validation_error(
-            "run-1",
             "node-1",
             {"field": "value"},
             "bad data",
             "strict",
             "sink-1",
             contract_violation=violation,
+            coordination_token=_TOKEN,
         )
 
         assert result == "err-1"
         data_flow.record_validation_error.assert_called_once_with(
-            "run-1",
             "node-1",
             {"field": "value"},
             "bad data",
             "strict",
             "sink-1",
             contract_violation=violation,
+            coordination_token=_TOKEN,
         )
 
 
@@ -215,6 +224,7 @@ class TestOperationCallRoutesToExecution:
             3.25,
             request_ref="op-request-ref",
             response_ref=None,
+            coordination_token=_TOKEN,
         )
 
         assert result is sentinel.call
@@ -229,9 +239,12 @@ class TestOperationCallRoutesToExecution:
             call_index=None,
             request_ref="op-request-ref",
             response_ref=None,
+            coordination_token=_TOKEN,
             # Phase 5b Task 9: cross-DB hash anchor; None unless the caller
             # is an LLM operation downstream of a resolved interpretation.
-            resolved_prompt_template_hash=None,
+            approved_prompt_artifact_hash=None,
+            token_usage=UNKNOWN_TOKEN_USAGE,
+            source_call_id=None,
         )
 
 
@@ -256,6 +269,7 @@ class TestRoutingEventRoutesToExecution:
             routing_group_id="group-1",
             ordinal=2,
             reason_ref="reason-blob",
+            member_token=_TOKEN.membership,
         )
 
         assert result is sentinel.event
@@ -268,6 +282,7 @@ class TestRoutingEventRoutesToExecution:
             routing_group_id="group-1",
             ordinal=2,
             reason_ref="reason-blob",
+            member_token=_TOKEN.membership,
         )
 
     def test_record_routing_events_routes_to_execution(
@@ -280,10 +295,12 @@ class TestRoutingEventRoutesToExecution:
         routes = [RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE)]
         reason: SinkDiversionReason = {"diversion_reason": "bulk route"}
 
-        result = writer.record_routing_events("state-1", routes, reason)
+        result = writer.record_routing_events("state-1", routes, reason, member_token=_TOKEN.membership, work_item=_WORK_ITEM)
 
         assert result == [sentinel.event]
-        execution.record_routing_events.assert_called_once_with("state-1", routes, reason)
+        execution.record_routing_events.assert_called_once_with(
+            "state-1", routes, reason, member_token=_TOKEN.membership, work_item=_WORK_ITEM
+        )
 
 
 class TestTransformErrorRoutesToDataFlow:
@@ -299,10 +316,14 @@ class TestTransformErrorRoutesToDataFlow:
 
         ref = TokenRef(token_id="tok-1", run_id="run-1")
         reason = TransformErrorReason(reason="api_error", error_type="ValueError", message="bad")
-        result = writer.record_transform_error(ref, "xform-1", {"field": "val"}, reason, "sink-1")
+        result = writer.record_transform_error(
+            ref, "xform-1", {"field": "val"}, reason, "sink-1", member_token=_TOKEN.membership, work_item=_WORK_ITEM
+        )
 
         assert result == "err-1"
-        data_flow.record_transform_error.assert_called_once_with(ref, "xform-1", {"field": "val"}, reason, "sink-1")
+        data_flow.record_transform_error.assert_called_once_with(
+            ref, "xform-1", {"field": "val"}, reason, "sink-1", member_token=_TOKEN.membership, work_item=_WORK_ITEM
+        )
 
 
 class TestContractMethodsRouteToDataFlow:
@@ -316,9 +337,9 @@ class TestContractMethodsRouteToDataFlow:
         _execution, data_flow, _run_lifecycle = repos
 
         contract = _sample_contract()
-        writer.update_node_output_contract("run-1", "node-1", contract)
+        writer.update_node_output_contract("node-1", contract, member_token=_TOKEN.membership)
 
-        data_flow.update_node_output_contract.assert_called_once_with("run-1", "node-1", contract)
+        data_flow.update_node_output_contract.assert_called_once_with("node-1", contract, member_token=_TOKEN.membership)
 
     def test_get_node_contracts_routes_to_data_flow(
         self,
@@ -350,7 +371,7 @@ class TestReadinessCheckRoutesToRunLifecycle:
             reachable=True,
             count=42,
             message="OK",
-            coordination_token=_TOKEN,
+            member_token=_TOKEN.membership,
         )
 
         run_lifecycle.record_readiness_check.assert_called_once_with(
@@ -359,7 +380,7 @@ class TestReadinessCheckRoutesToRunLifecycle:
             reachable=True,
             count=42,
             message="OK",
-            coordination_token=_TOKEN,
+            member_token=_TOKEN.membership,
         )
 
 

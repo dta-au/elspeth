@@ -23,7 +23,7 @@ import pytest
 from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts import BatchStatus, NodeType, RunStatus
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -47,6 +47,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import landscape_database_now, make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 
@@ -76,7 +77,7 @@ def token(db: LandscapeDB) -> CoordinationToken:
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=NOW,
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=RunStatus.RUNNING.value,
@@ -93,7 +94,7 @@ def token(db: LandscapeDB) -> CoordinationToken:
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="cfg",
+                    config_hash=fake_sha256("cfg"),
                     config_json="{}",
                     registered_at=NOW,
                 )
@@ -149,13 +150,13 @@ def _seed_blocked_barrier_hold(db: LandscapeDB, *, sequence: int, barrier_key: s
                 row_index=sequence,
                 source_row_index=sequence,
                 ingest_sequence=sequence,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=NOW,
             )
         )
         conn.execute(insert(tokens_table).values(token_id=token_id, row_id=row_id, run_id=RUN_ID, created_at=NOW))
     repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
         token_id=token_id,
         row_id=row_id,
         node_id=NODE_ID,
@@ -163,10 +164,12 @@ def _seed_blocked_barrier_hold(db: LandscapeDB, *, sequence: int, barrier_key: s
         ingest_sequence=sequence,
         row_payload_json=_payload_json(),
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
+    claimed = repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER), lease_owner=WORKER, lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
     repo.mark_blocked(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
         work_item_id=claimed.work_item_id,
+        row_payload_json=claimed.row_payload_json,
         queue_key=None,
         barrier_key=barrier_key,
         expected_lease_owner=WORKER,
@@ -204,13 +207,13 @@ def _seed_blocked_collector_hold(db: LandscapeDB, *, sequence: int, collector_na
                 row_index=sequence,
                 source_row_index=sequence,
                 ingest_sequence=sequence,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=NOW,
             )
         )
         conn.execute(insert(tokens_table).values(token_id=token_id, row_id=row_id, run_id=RUN_ID, created_at=NOW))
     repo.queue.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
         token_id=token_id,
         row_id=row_id,
         node_id=NODE_ID,
@@ -219,10 +222,12 @@ def _seed_blocked_collector_hold(db: LandscapeDB, *, sequence: int, collector_na
         row_payload_json=_payload_json(),
         collector_name=collector_name,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
+    claimed = repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER), lease_owner=WORKER, lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
     repo.mark_blocked(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
         work_item_id=claimed.work_item_id,
+        row_payload_json=claimed.row_payload_json,
         queue_key=None,
         barrier_key=collector_barrier_key(collector_name, "g-1"),
         expected_lease_owner=WORKER,
@@ -255,13 +260,13 @@ def test_facade_enqueue_ready_forwards_collector_name(db: LandscapeDB, token: Co
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash=f"hash-{row_id}",
+                source_data_hash=fake_sha256(f"hash-{row_id}"),
                 created_at=NOW,
             )
         )
         conn.execute(insert(tokens_table).values(token_id=token_id, row_id=row_id, run_id=RUN_ID, created_at=NOW))
     repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
         token_id=token_id,
         row_id=row_id,
         node_id=NODE_ID,
@@ -309,7 +314,6 @@ ADOPT_NOW = NOW + timedelta(seconds=30)
 def _adopt(db: LandscapeDB, token: CoordinationToken, *, token_id: str, work_item_id: str, aggregation: bool = True, **overrides):  # type: ignore[no-untyped-def]
     repo = TokenSchedulerRepository(db.engine)
     kwargs = {
-        "run_id": RUN_ID,
         "work_item_id": work_item_id,
         "token_id": token_id,
         "barrier_key": BARRIER_KEY,
@@ -402,7 +406,6 @@ class TestAdoption:
 
         repo = TokenSchedulerRepository(db.engine)
         result = repo.adopt_blocked_barrier_item(
-            run_id=RUN_ID,
             work_item_id=work_item_id,
             token_id=token_id,
             barrier_key="coalesce:merge",
@@ -428,7 +431,6 @@ class TestAdoption:
 
         repo = TokenSchedulerRepository(db.engine)
         adopt_kwargs = {
-            "run_id": RUN_ID,
             "work_item_id": work_item_id,
             "token_id": token_id,
             "barrier_key": collector_barrier_key("stitch", "g-1"),
@@ -509,7 +511,6 @@ class TestAdoptionRefusals:
         token_id, work_item_id, _blocked_at = _seed_blocked_barrier_hold(db, sequence=0)
         # Terminalize it out from under the (hypothetical) intake listing.
         repo.mark_blocked_barrier_terminal(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             token_ids=(token_id,),
             coordination_token=token,

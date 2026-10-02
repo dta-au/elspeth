@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import NotRequired, TypedDict
+from dataclasses import replace
+from typing import Annotated, NotRequired, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from elspeth.contracts.blobs import BlobRecord
+from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -16,41 +18,46 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobNotFoundError, BlobServiceProtocol
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
-from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.compartments import compartment_ingress_record, compartment_marking_header
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.state import CompositionState, SourceSpec
 from elspeth.web.composer.yaml_generator import (
     PUBLIC_EXPORT_REBIND_GUIDANCE,
     PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX,
     public_export_redaction,
     public_export_redaction_header,
-    reattach_guided_blob_refs_for_public_export,
 )
 from elspeth.web.composer.yaml_importer import (
     MAX_RUNTIME_YAML_IMPORT_CHARS,
     RuntimeYamlImportError,
     composition_state_from_runtime_yaml,
 )
+from elspeth.web.coordination.composer_progress_authority import (
+    ComposerProgressIdentityInactive,
+    ComposerProgressSessionUnavailable,
+)
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.interpretation_state import InterpretationReviewSite, parse_interpretation_requirements
 from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, managed_blob_directory, resolve_data_path
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
+from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
 from elspeth.web.sessions.protocol import (
-    GuidedCompositionStateResult,
-    GuidedOperationResult,
-    GuidedOperationSettlementConflictError,
+    OperationReceiptResult,
+    OperationReceiptSettlementConflictError,
+    SessionRecord,
+    StateRevertReceiptResult,
 )
-from elspeth.web.sessions.routes.guided_operations import (
-    GuidedOperationExpired,
-    GuidedOperationLease,
-    guided_operation_lease_guard,
-    guided_response_hash,
-    raise_guided_operation_failure,
-    reserve_or_replay_guided_operation,
+from elspeth.web.sessions.routes.operation_receipts import (
+    OperationReceiptExpired,
+    OperationReceiptLease,
+    operation_receipt_lease_guard,
+    raise_operation_receipt_failure,
+    reserve_or_replay_operation_receipt,
 )
 
 from .._helpers import (
-    GUIDED_CUSTODY_REVERT_REFUSED_DETAIL,
     UTC,
     UUID,
     Any,
@@ -75,26 +82,36 @@ from .._helpers import (
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
     _log_last_resort_diagnostic,
-    _named_guided_custody_projection,
     _record_composer_runtime_preflight_telemetry,
     _request_plugin_policy_context,
     _runtime_preflight_for_state,
     _state_data_from_composer_state,
     _state_from_record,
     _state_response,
+    _validation_entry_responses,
     _verify_session_ownership,
     datetime,
     generate_public_yaml,
-    get_current_user,
+    merge_composer_meta_updates,
     record_session_completed,
     record_session_switched,
+    require_pipeline_user,
     slog,
 )
 
 router = APIRouter()
 
-_STATE_REVERT_SURFACE_PROVENANCE = "state_revert"
-_E2E_SEED_SURFACE_PROVENANCE = "e2e_seed"
+
+class LibraryForkFacts(TypedDict):
+    entry_id: str
+    payload_digest: str
+    published_from_session_id: str | None
+    compartment_id: str
+    version: int
+
+
+class LibraryForkMetaUpdates(TypedDict):
+    library_fork: LibraryForkFacts
 
 
 async def _surface_reverted_interpretation_reviews(
@@ -110,14 +127,13 @@ async def _surface_reverted_interpretation_reviews(
     # revert compatibility instead of turning this additive repair into a 500.
     if state_record.metadata_ is None:
         return
-    from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+    from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
 
     # The replay joiner released the operation's session lease before this
-    # post-verification repair runs, and the settling caller's guided lease
+    # post-verification repair runs, and the settling caller's receipt lease
     # guard has already closed by the time it reaches here, so the repair
     # writes hold their own short COMPOSE authority (fenced by analogy with
-    # the settling attempt). Same wrapper as the guided RESPOND repair hook
-    # in ``routes/composer/guided.py::_repair_replayed_surfacing_debt``.
+    # the settling attempt).
     async with await SessionOperationLease.acquire(
         service.session_operation_authority,
         session_id=session_id,
@@ -130,10 +146,13 @@ async def _surface_reverted_interpretation_reviews(
             sessions_service=service,
             session_id=str(session_id),
             current_state_id=str(state_record.id),
-            model_identifier=_STATE_REVERT_SURFACE_PROVENANCE,
-            model_version=_STATE_REVERT_SURFACE_PROVENANCE,
-            provider=_STATE_REVERT_SURFACE_PROVENANCE,
-            composer_skill_hash=_STATE_REVERT_SURFACE_PROVENANCE,
+            # The revert consults no LLM: the origin names the route and the
+            # LLM provenance stays empty rather than carrying a label.
+            surface_origin=InterpretationSurfaceOrigin.STATE_REVERT,
+            model_identifier=None,
+            model_version=None,
+            provider=None,
+            composer_skill_hash=None,
             only_missing_evidence=True,
             session_operation_context=repair_lease.context,
         )
@@ -467,6 +486,12 @@ async def _state_with_imported_source_blobs(
             raise HTTPException(status_code=404, detail="Blob not found") from None
         if blob.session_id != session_id:
             raise HTTPException(status_code=404, detail="Blob not found")
+        # Ownership first so a missing blob and another session's blob stay
+        # indistinguishable (404). A pending or error blob has no settled
+        # bytes to bind: the export side of this round trip and the blob
+        # download/preview routes already refuse a non-ready blob.
+        if blob.status != "ready":
+            raise HTTPException(status_code=409, detail="Blob is not ready")
 
         source = sources[source_name]
         options = dict(source.options)
@@ -490,7 +515,6 @@ async def _state_with_imported_source_blobs(
         outputs=state.outputs,
         metadata=state.metadata,
         version=state.version,
-        guided_session=state.guided_session,
     )
 
 
@@ -501,12 +525,24 @@ async def _state_with_imported_source_blobs(
 async def get_composer_progress(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> ComposerProgressSnapshot:
     """Return the latest provider-safe composer progress for a session."""
     session = await _verify_session_ownership(session_id, user, request)
     registry = _get_composer_progress_registry(request)
-    return await registry.get_latest(str(session.id))
+    # The durable authority re-checks committed identity and ownership inside
+    # its own snapshot, so access revoked or a session archived between the
+    # checks above and that read is denied there. Answer as the next request
+    # would be answered anyway: the opaque 401 the per-request token check
+    # gives a revoked principal (auth/session_token.py), and the
+    # non-disclosing 404 the ownership check gives. Never a server error for
+    # an expected concurrent access change.
+    try:
+        return await registry.get_latest(str(session.id), user.user_id)
+    except ComposerProgressIdentityInactive:
+        raise HTTPException(status_code=401, detail="Invalid token") from None
+    except ComposerProgressSessionUnavailable:
+        raise HTTPException(status_code=404, detail="Session not found") from None
 
 
 @router.get(
@@ -516,7 +552,7 @@ async def get_composer_progress(
 async def get_composer_preferences(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> ComposerPreferencesResponse:
     session = await _verify_session_ownership(session_id, user, request)
     service: SessionServiceProtocol = request.app.state.session_service
@@ -532,7 +568,7 @@ async def update_composer_preferences(
     session_id: UUID,
     body: UpdateComposerPreferencesRequest,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> ComposerPreferencesResponse:
     session = await _verify_session_ownership(session_id, user, request)
     service: SessionServiceProtocol = request.app.state.session_service
@@ -581,7 +617,7 @@ async def update_composer_preferences(
 async def get_current_state(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> CompositionStateResponse | None:
     """Get the current (highest-version) composition state."""
     session = await _verify_session_ownership(session_id, user, request)
@@ -590,8 +626,14 @@ async def get_current_state(
     state = await service.get_current_state(session.id)
     if state is None:
         return None
-    with _named_guided_custody_projection():
-        return _state_response(state, policy_catalog=catalog)
+    response = _state_response(state, policy_catalog=catalog)
+    # Suggestions belong to this graph version, so reload recomputes the
+    # same Stage-1 advice used after composing.
+    composition = _state_from_record(state)
+    validation = await run_sync_in_worker(composition.validate)
+    response.validation_warnings = _validation_entry_responses(validation.warnings)
+    response.validation_suggestions = _validation_entry_responses(validation.suggestions)
+    return response
 
 
 @router.get(
@@ -601,7 +643,7 @@ async def get_current_state(
 async def get_state_versions(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> list[CompositionStateResponse]:
@@ -625,7 +667,7 @@ async def revert_state(
     session_id: UUID,
     body: RevertStateRequest,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> CompositionStateResponse:
     """Revert the pipeline to a prior composition state version (R1).
 
@@ -634,13 +676,12 @@ async def revert_state(
     """
     session = await _verify_session_ownership(session_id, user, request)
     service = request.app.state.session_service
-    catalog, _snapshot = _request_plugin_policy_context(request, user)
 
     async def _replay(result: object) -> CompositionStateResponse:
         """Project the stored response for an already-terminal revert.
 
         MUST stay side-effect-free. This runs BEFORE the response-hash
-        integrity check in reserve_or_replay_guided_operation, so anything
+        integrity check in reserve_or_replay_operation_receipt, so anything
         written here would mutate audit-primary interpretation_events under a
         projection not yet proven to match the stored response -- inserting
         new review rows and superseding existing pending ones, then failing
@@ -648,16 +689,17 @@ async def revert_state(
         still owe is repaired in _repair_reverted_surfacing_debt, which runs
         only after that check.
         """
-        if type(result) is not GuidedCompositionStateResult:
+        if type(result) is not StateRevertReceiptResult:
             raise AuditIntegrityError("State revert replay has a non-state result locator")
         replay_state = await service.get_state_in_session(result.state_id, session.id)
-        with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
-            return _state_response(replay_state, policy_catalog=catalog)
+        # Receipt replay commits to durable state only. Live policy findings
+        # can change independently; GET /state reports the current policy.
+        return _state_response(replay_state)
 
-    async def _repair_reverted_surfacing_debt(result: GuidedOperationResult) -> None:
+    async def _repair_reverted_surfacing_debt(result: OperationReceiptResult) -> None:
         """Repair the post-commit surfacing this revert's settlement owed.
 
-        revert_state_for_guided_operation terminalizes the operation in the
+        revert_state_for_operation_receipt terminalizes the operation in the
         same transaction that writes the reverted state, but the surfacing
         pass runs after it. An attempt that dies in between leaves the
         operation terminal, so every retry lands here -- and without this the
@@ -674,7 +716,7 @@ async def revert_state(
         here rather than closed over from _replay: after_verified receives the
         same locator replay does, not the record replay fetched.
         """
-        if type(result) is not GuidedCompositionStateResult:
+        if type(result) is not StateRevertReceiptResult:
             raise AuditIntegrityError("State revert replay has a non-state result locator")
         replay_state = await service.get_state_in_session(result.state_id, session.id)
         await _surface_reverted_interpretation_reviews(
@@ -687,7 +729,7 @@ async def revert_state(
     # probe -- the very path whose settlement may have died between the
     # revert transaction and its surfacing pass -- so leaving the repair off
     # it would make the H1 repair dead on exactly the path that owes it.
-    pending = await reserve_or_replay_guided_operation(
+    pending = await reserve_or_replay_operation_receipt(
         service=service,
         session_id=session.id,
         kind="state_revert",
@@ -697,7 +739,7 @@ async def revert_state(
         reserve_if_absent=False,
         takeover_expired=False,
     )
-    if pending is not None and not isinstance(pending, (GuidedOperationLease, GuidedOperationExpired)):
+    if pending is not None and not isinstance(pending, (OperationReceiptLease, OperationReceiptExpired)):
         return pending
 
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
@@ -716,7 +758,7 @@ async def revert_state(
         if expected_current is None:
             raise AuditIntegrityError("State revert session unexpectedly has no current checkpoint")
 
-    reserved = await reserve_or_replay_guided_operation(
+    reserved = await reserve_or_replay_operation_receipt(
         service=service,
         session_id=session.id,
         kind="state_revert",
@@ -726,33 +768,32 @@ async def revert_state(
     )
     if reserved is None:  # pragma: no cover - reserve_if_absent defaults true
         raise AuditIntegrityError("State revert operation was not reserved")
-    if not isinstance(reserved, GuidedOperationLease):
+    if not isinstance(reserved, OperationReceiptLease):
         return reserved
 
-    lease_guard = guided_operation_lease_guard(service=service, lease=reserved)
+    lease_guard = operation_receipt_lease_guard(service=service, lease=reserved)
     try:
         async with compose_lock:
             try:
-                with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
-                    new_state = await service.revert_state_for_guided_operation(
-                        reserved.fence,
-                        state_id=body.state_id,
-                        expected_current_state_id=expected_current.id,
-                        expected_current_state_version=expected_current.version,
-                        actor="composer_route",
-                        response_hash_factory=lambda record: guided_response_hash(_state_response(record, policy_catalog=catalog)),
-                        session_operation_context=reserved.session_operation_context,
-                    )
+                new_state = await service.revert_state_for_operation_receipt(
+                    reserved.fence,
+                    state_id=body.state_id,
+                    expected_current_state_id=expected_current.id,
+                    expected_current_state_version=expected_current.version,
+                    actor="composer_route",
+                    response_hash_factory=lambda record: operation_receipt_response_hash(_state_response(record)),
+                    session_operation_context=reserved.session_operation_context,
+                )
             except ValueError:
                 raise HTTPException(status_code=404, detail="State not found") from None
-            except GuidedOperationSettlementConflictError:
-                failure = await service.fail_guided_operation(
+            except OperationReceiptSettlementConflictError:
+                failure = await service.fail_operation_receipt(
                     reserved.fence,
                     failure_code="stale_conflict",
                     actor="composer_route",
                     session_operation_context=reserved.session_operation_context,
                 )
-                raise_guided_operation_failure(failure)
+                raise_operation_receipt_failure(failure)
     finally:
         await lease_guard.finish_active_exception()
 
@@ -762,8 +803,7 @@ async def revert_state(
         state_record=new_state,
     )
 
-    with _named_guided_custody_projection(GUIDED_CUSTODY_REVERT_REFUSED_DETAIL):
-        return _state_response(new_state, policy_catalog=catalog)
+    return _state_response(new_state)
 
 
 _IMPORT_REVIEW_DEBT_TIMEOUT_DETAIL = "Review-debt check did not complete within the configured bound; import aborted."
@@ -790,7 +830,7 @@ async def _review_debt_sites_off_loop(
     reaches the detail. The worker's own exceptions propagate unchanged, so
     each caller's malformed-metadata arm still sees the classes it handles.
     """
-    from elspeth.web.composer.service import unsurfaceable_pending_interpretation_review_sites
+    from elspeth.web.composer.interpretation_surfacing import unsurfaceable_pending_interpretation_review_sites
 
     try:
         return await asyncio.wait_for(
@@ -809,11 +849,33 @@ async def import_state_yaml(
     session_id: UUID,
     body: ImportStateYamlRequest,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> CompositionStateResponse:
     """Seed a session's composition state from exported runtime YAML."""
     session = await _verify_session_ownership(session_id, user, request)
+    return await seed_state_from_runtime_yaml(session=session, body=body, request=request, user=user)
+
+
+async def seed_state_from_runtime_yaml(
+    *,
+    session: SessionRecord,
+    body: ImportStateYamlRequest,
+    request: Request,
+    user: UserIdentity,
+    composer_meta_updates: LibraryForkMetaUpdates | None = None,
+) -> CompositionStateResponse:
+    """Seed through the YAML import validators, stamping exact text ingress.
+
+    Library forks use this same path and attach their source provenance to
+    the first state write. No second state or alternate graph importer exists.
+    """
     service: SessionServiceProtocol = request.app.state.session_service
+    # Everything that can raise before the body runs is resolved BEFORE the
+    # lease exists: the lease self-renews until closed, and only the
+    # try/finally below closes it, so a raise between acquire and that try
+    # would refuse every later COMPOSE writer on this session until restart.
+    catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
+    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
     lease = await SessionOperationLease.acquire(
         service.session_operation_authority,
         session_id=session.id,
@@ -821,14 +883,19 @@ async def import_state_yaml(
         owner_instance_id=service.session_operation_owner_instance_id,
         lease_seconds=service.session_operation_lease_seconds,
     )
-    catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
-    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
     try:
         async with compose_lock:
             try:
                 imported_state = composition_state_from_runtime_yaml(body.yaml)
             except RuntimeYamlImportError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            secret_service = request.app.state.scoped_secret_resolver
+            env_ref_names = frozenset(item.name for item in secret_service.list_refs(str(user.user_id)))
+            require_no_credential_material_in_state(
+                imported_state,
+                surface="composer_yaml_import",
+                env_ref_names=env_ref_names,
+            )
             _reject_imported_plugin_policy(imported_state, catalog, plugin_snapshot)
             imported_state = await _state_with_imported_source_blobs(
                 imported_state,
@@ -849,15 +916,16 @@ async def import_state_yaml(
             )
             _reject_fabricated_secret_literals(
                 imported_state,
-                secret_service=request.app.state.scoped_secret_resolver,
+                secret_service=secret_service,
                 user_id=str(user.user_id),
             )
             _reject_malformed_interpretation_requirements(imported_state)
+            _reject_resolved_interpretation_requirements(imported_state)
             # Import must be atomic with respect to review recoverability. Reuse
             # the generic Composer surfacer's own pure site-to-writer mapping so a
             # pending site that cannot become a consumable event is rejected before
             # the composition state is saved.
-            from elspeth.web.composer.service import prepare_pending_interpretation_event_drafts_for_state
+            from elspeth.web.composer.interpretation_surfacing import prepare_pending_interpretation_event_drafts_for_state
 
             try:
                 unsurfaceable_sites = await _review_debt_sites_off_loop(
@@ -899,10 +967,17 @@ async def import_state_yaml(
             )
             interpretation_drafts = prepare_pending_interpretation_event_drafts_for_state(
                 imported_state,
-                model_identifier=_YAML_IMPORT_SURFACE_PROVENANCE,
-                model_version=_YAML_IMPORT_SURFACE_PROVENANCE,
-                provider=_YAML_IMPORT_SURFACE_PROVENANCE,
-                composer_skill_hash=_YAML_IMPORT_SURFACE_PROVENANCE,
+                surface_origin=InterpretationSurfaceOrigin.YAML_IMPORT,
+                model_identifier=None,
+                model_version=None,
+                provider=None,
+                composer_skill_hash=None,
+            )
+            ingress = compartment_ingress_record(body.yaml, own_compartment_id=request.app.state.settings.compartment_id)
+            seed_meta_updates = {"ingress": ingress} if composer_meta_updates is None else {**composer_meta_updates, "ingress": ingress}
+            state_data = replace(
+                state_data,
+                composer_meta=merge_composer_meta_updates(state_data.composer_meta, seed_meta_updates),
             )
             response_state = await service.save_composition_state_with_interpretations(
                 session.id,
@@ -911,13 +986,9 @@ async def import_state_yaml(
                 interpretations=interpretation_drafts,
                 session_operation_context=lease.context,
             )
-            with _named_guided_custody_projection():
-                return _state_response(response_state, policy_catalog=catalog)
+            return _state_response(response_state, policy_catalog=catalog)
     finally:
         await lease.close()
-
-
-_YAML_IMPORT_SURFACE_PROVENANCE = "yaml_import"
 
 
 def _reject_malformed_interpretation_requirements(state: CompositionState) -> None:
@@ -953,6 +1024,44 @@ def _reject_malformed_interpretation_requirements(state: CompositionState) -> No
             ) from exc
 
 
+def _reject_resolved_interpretation_requirements(state: CompositionState) -> None:
+    """Refuse hand-written ``status: resolved`` review rows in pasted YAML.
+
+    A resolved row is resolver-owned evidence: it records that the user
+    accepted a card, citing the interpretation event that did so. Pasted YAML
+    carries no such event, and the run gate (``materialize_state_for_execution``)
+    trusts a coherent resolved row without consulting the events table, so
+    admitting one would let the document approve its own prompt and model
+    reviews and persist review evidence for events that never happened. The
+    Composer tool path refuses the same "resolver-owned status 'resolved'" at
+    admission; this is that refusal at the paste-facing import boundary.
+
+    Refused rather than demoted to a pending shell: legitimate exports never
+    carry requirement rows (``strip_authoring_options``), so a resolved row is
+    always hand-written, and silently rewriting pasted input would hide that.
+    Hand-written PENDING rows stay importable. Must run after
+    ``_reject_malformed_interpretation_requirements`` so every row parses.
+    Audit hygiene: name the component, never echo row content.
+    """
+    components = [
+        *((f"Source '{source_name}'", source.options) for source_name, source in state.sources.items()),
+        *((f"Node '{node.id}'", node.options) for node in state.nodes),
+    ]
+    for component, options in components:
+        requirements = parse_interpretation_requirements(options)
+        if requirements is None:
+            continue
+        if any(requirement["status"] != "pending" for requirement in requirements):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{component} carries a hand-written interpretation_requirements entry with status "
+                    "'resolved'. Imported YAML may stage pending review requirements only; remove the "
+                    "resolved entry and re-import, then resolve the review cards in this session."
+                ),
+            )
+
+
 @router.post(
     "/{session_id}/state/e2e-seed",
     response_model=CompositionStateResponse,
@@ -961,7 +1070,7 @@ def _reject_malformed_interpretation_requirements(state: CompositionState) -> No
 async def seed_state_for_e2e(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> CompositionStateResponse:
     """Test-only state seed endpoint for Playwright-managed E2E runs."""
     if not request.app.state.settings.e2e_state_seed_enabled:
@@ -970,6 +1079,13 @@ async def seed_state_for_e2e(
     session = await _verify_session_ownership(session_id, user, request)
     catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
     service: SessionServiceProtocol = request.app.state.session_service
+    # Body parse and lock lookup precede the self-renewing lease for the same
+    # reason as import_state_yaml: only the try/finally below closes it.
+    try:
+        body = SeedCompositionStateRequest.model_validate(await request.json())
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid seed request JSON") from exc
+    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
     lease = await SessionOperationLease.acquire(
         service.session_operation_authority,
         session_id=session.id,
@@ -977,14 +1093,6 @@ async def seed_state_for_e2e(
         owner_instance_id=service.session_operation_owner_instance_id,
         lease_seconds=service.session_operation_lease_seconds,
     )
-
-    try:
-        body = SeedCompositionStateRequest.model_validate(await request.json())
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        await lease.close()
-        raise HTTPException(status_code=400, detail="Invalid seed request JSON") from exc
-
-    compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
     try:
         async with compose_lock:
             try:
@@ -1008,7 +1116,7 @@ async def seed_state_for_e2e(
                 user_id=str(user.user_id),
             )
             _reject_malformed_interpretation_requirements(seeded_state)
-            from elspeth.web.composer.service import prepare_pending_interpretation_event_drafts_for_state
+            from elspeth.web.composer.interpretation_surfacing import prepare_pending_interpretation_event_drafts_for_state
 
             try:
                 unsurfaceable_sites = await _review_debt_sites_off_loop(
@@ -1037,10 +1145,11 @@ async def seed_state_for_e2e(
             )
             interpretation_drafts = prepare_pending_interpretation_event_drafts_for_state(
                 seeded_state,
-                model_identifier=_E2E_SEED_SURFACE_PROVENANCE,
-                model_version=_E2E_SEED_SURFACE_PROVENANCE,
-                provider=_E2E_SEED_SURFACE_PROVENANCE,
-                composer_skill_hash=_E2E_SEED_SURFACE_PROVENANCE,
+                surface_origin=InterpretationSurfaceOrigin.E2E_SEED,
+                model_identifier=None,
+                model_version=None,
+                provider=None,
+                composer_skill_hash=None,
             )
             state_record = await service.save_composition_state_with_interpretations(
                 session.id,
@@ -1049,33 +1158,9 @@ async def seed_state_for_e2e(
                 interpretations=interpretation_drafts,
                 session_operation_context=lease.context,
             )
-            with _named_guided_custody_projection():
-                return _state_response(state_record, policy_catalog=catalog)
+            return _state_response(state_record, policy_catalog=catalog)
     finally:
         await lease.close()
-
-
-def _reattach_guided_blob_refs(state: CompositionState) -> CompositionState:
-    """Reconstitute the ``blob_ref`` stripped from a guided blob-backed source's
-    committed options, using schema-8 GuidedSession ``reviewed_sources`` as the
-    authoritative signal (elspeth-b5ee205720).
-
-    The manual set_source commit strips ``blob_ref`` from guided sources (it
-    cannot prove ``path == storage_path``); it survives only in the persisted
-    reviewed source snapshot. Public-YAML storage-path omission and live custody
-    verification both key off ``source.options["blob_ref"]``, so without this a
-    guided blob source leaks its absolute storage path or bypasses verification.
-    Reattaching here lets the existing ``blob_ref``-keyed export machinery treat
-    guided sources exactly like freeform blob-bound ones while verifying custody
-    before public export. Mirrors the snapshot cross-reference in
-    ``redact_guided_snapshot_storage_paths``; never mutates ``state``.
-
-    Private-path snapshots use stable source name plus exact path equality. Public
-    ``blob:<uuid>`` snapshots use the stable source name plus canonical blob identity;
-    ``_verified_yaml_export_blob_ids`` then proves the live session, status, ID, and
-    private storage path before either export artifact is returned.
-    """
-    return reattach_guided_blob_refs_for_public_export(state)
 
 
 async def _require_yaml_export_preflight(
@@ -1181,7 +1266,7 @@ async def _verified_yaml_export_blob_ids(
 async def get_state_yaml(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> StateYamlResponse:
     """Get YAML representation of the current composition state (M1).
 
@@ -1223,16 +1308,8 @@ async def get_state_yaml(
                 session_id=session.id,
                 plugin_snapshot=plugin_snapshot,
             )
-        # elspeth-b5ee205720: reconstitute blob_ref for guided blob-backed sources
-        # (stripped from committed options; retained only in the GuidedSession
-        # snapshot) so public-YAML path omission and live custody verification treat
-        # them as blob-bound. Kept
-        # AFTER preflight: blob_ref is extra=forbid for plugin configs and must not
-        # reach plugin instantiation. Preflight ran on the raw `state`; export uses
-        # the reattached copy.
-        export_state = _reattach_guided_blob_refs(state)
         source_blob_ids = await _verified_yaml_export_blob_ids(
-            export_state,
+            state,
             request=request,
             session_id=session.id,
             session_operation_context=lease.context,
@@ -1243,7 +1320,8 @@ async def get_state_yaml(
         # lives here rather than in ``generate_public_yaml`` because the MCP,
         # share, and acceptance-import consumers of that function must keep bare
         # bytes (see its docstring).
-        yaml_str = public_export_redaction_header(export_state) + generate_public_yaml(export_state)
+        compartment_header = compartment_marking_header(request.app.state.settings.compartment_id)
+        yaml_str = compartment_header + public_export_redaction_header(state) + generate_public_yaml(state)
 
         # Audit-first and fence-first: a failed or stale COMPOSE authority
         # returns no YAML and emits no completion telemetry.
@@ -1268,7 +1346,7 @@ async def get_state_yaml(
         )
 
         response: StateYamlResponse = {"yaml": yaml_str}
-        export_redaction = public_export_redaction(export_state)
+        export_redaction = public_export_redaction(state)
         if export_redaction["sources"] or export_redaction["outputs"]:
             response["redaction"] = {
                 "stripped_source_options": export_redaction["sources"],

@@ -711,3 +711,123 @@ def test_fresh_snapshot_detects_request_scoped_credential_deletion_without_resta
     assert llm_id not in after.available
     assert dict(after.usable_profile_aliases)[llm_id] == ()
     assert before.snapshot_hash != after.snapshot_hash
+
+
+_SEARCH_PLUGIN = PluginId("transform", "azure_ai_search")
+_SEARCH_MI_PROFILE = {
+    "alias": "policies",
+    "endpoint": "https://svc-a.search.windows.net",
+    "auth": "managed_identity",
+    "indexes": ["approved-documents"],
+}
+_SEARCH_KEY_PROFILE = {
+    "alias": "contracts",
+    "endpoint": "https://svc-b.search.windows.net",
+    "auth": "api_key",
+    "credential_ref": "SEARCH_B_KEY",
+    "indexes": "any",
+}
+
+
+def test_azure_ai_search_without_a_profile_is_profile_unavailable_not_raw_authorable() -> None:
+    snapshot = _build(_settings(plugin_allowlist=(str(_SEARCH_PLUGIN),)))
+
+    assert _SEARCH_PLUGIN not in snapshot.available
+    assert PluginAvailability(_SEARCH_PLUGIN, PluginUnavailableReason.PROFILE_UNAVAILABLE) in snapshot.unavailable
+
+
+def test_azure_ai_search_api_key_profile_needs_its_server_secret() -> None:
+    settings = _settings(
+        plugin_allowlist=(str(_SEARCH_PLUGIN),),
+        azure_search_profiles=(_SEARCH_KEY_PROFILE,),
+        server_secret_allowlist=("SEARCH_B_KEY",),
+    )
+
+    missing = _build(settings)
+    held = _build(settings, inventory=_Inventory(server=frozenset({"SEARCH_B_KEY"})))
+
+    assert _SEARCH_PLUGIN not in missing.available
+    assert dict(missing.usable_profile_aliases)[_SEARCH_PLUGIN] == ()
+    assert _SEARCH_PLUGIN in held.available
+    assert dict(held.usable_profile_aliases)[_SEARCH_PLUGIN] == ("contracts",)
+    assert dict(held.selected_profile_aliases)[_SEARCH_PLUGIN] == "contracts"
+
+
+def test_azure_ai_search_managed_identity_profile_needs_azure_identity_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.util
+
+    settings = _settings(plugin_allowlist=(str(_SEARCH_PLUGIN),), azure_search_profiles=(_SEARCH_MI_PROFILE,))
+    assert dict(_build(settings).usable_profile_aliases)[_SEARCH_PLUGIN] == ("policies",)
+
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *args: None if name == "azure.identity" else real_find_spec(name, *args))
+    without_package = _build(settings)
+
+    assert _SEARCH_PLUGIN not in without_package.available
+    assert dict(without_package.usable_profile_aliases)[_SEARCH_PLUGIN] == ()
+
+
+@pytest.mark.parametrize("api_key", [False, True], ids=["managed-identity", "api-key"])
+def test_azure_search_availability_without_azure_namespace(monkeypatch: pytest.MonkeyPatch, api_key: bool) -> None:
+    import importlib.util
+    import sys
+    from importlib.machinery import ModuleSpec
+    from types import ModuleType
+
+    profile = _SEARCH_KEY_PROFILE if api_key else _SEARCH_MI_PROFILE
+    settings = _settings(
+        plugin_allowlist=(str(_SEARCH_PLUGIN),),
+        azure_search_profiles=(profile,),
+        server_secret_allowlist=("SEARCH_B_KEY",),
+    )
+    inventory = _Inventory(server=frozenset({"SEARCH_B_KEY"}))
+    with monkeypatch.context() as installed:
+        for name in ("azure", "azure.identity"):
+            module = ModuleType(name)
+            module.__spec__ = ModuleSpec(name, loader=None, is_package=True)
+            installed.setitem(sys.modules, name, module)
+        assert _SEARCH_PLUGIN in _build(settings, inventory=inventory).available
+
+    # Exercise the real import machinery: a missing parent raises for a dotted
+    # lookup, unlike the existing missing-child test's stub returning None.
+    monkeypatch.setitem(sys.modules, "azure", None)
+    monkeypatch.delitem(sys.modules, "azure.identity", raising=False)
+    with pytest.raises(ModuleNotFoundError):
+        importlib.util.find_spec("azure.identity")
+
+    snapshot = _build(settings, inventory=inventory)
+
+    if api_key:
+        assert _SEARCH_PLUGIN in snapshot.available
+        assert dict(snapshot.usable_profile_aliases)[_SEARCH_PLUGIN] == ("contracts",)
+    else:
+        assert _SEARCH_PLUGIN not in snapshot.available
+        assert dict(snapshot.usable_profile_aliases)[_SEARCH_PLUGIN] == ()
+        assert PluginAvailability(_SEARCH_PLUGIN, PluginUnavailableReason.PROFILE_UNAVAILABLE) in snapshot.unavailable
+    assert PluginId("source", "csv") in snapshot.available
+
+
+def test_several_azure_search_profiles_are_all_usable_with_no_house_default() -> None:
+    snapshot = _build(
+        _settings(
+            plugin_allowlist=(str(_SEARCH_PLUGIN),),
+            azure_search_profiles=(_SEARCH_MI_PROFILE, _SEARCH_KEY_PROFILE),
+            server_secret_allowlist=("SEARCH_B_KEY",),
+        ),
+        inventory=_Inventory(server=frozenset({"SEARCH_B_KEY"})),
+    )
+
+    assert dict(snapshot.usable_profile_aliases)[_SEARCH_PLUGIN] == ("contracts", "policies")
+    assert dict(snapshot.selected_profile_aliases)[_SEARCH_PLUGIN] is None
+
+
+def test_rotating_the_search_key_moves_the_binding_generation_fingerprint() -> None:
+    settings = _settings(
+        plugin_allowlist=(str(_SEARCH_PLUGIN),),
+        azure_search_profiles=(_SEARCH_KEY_PROFILE,),
+        server_secret_allowlist=("SEARCH_B_KEY",),
+    )
+    before = _build(settings, inventory=_Inventory(server=frozenset({"SEARCH_B_KEY"}), server_generations={"SEARCH_B_KEY": "g1"}))
+    after = _build(settings, inventory=_Inventory(server=frozenset({"SEARCH_B_KEY"}), server_generations={"SEARCH_B_KEY": "g2"}))
+
+    assert before.binding_generation_fingerprint != after.binding_generation_fingerprint

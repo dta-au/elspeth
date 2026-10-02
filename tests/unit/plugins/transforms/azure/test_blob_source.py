@@ -8,10 +8,10 @@ import pytest
 from azure.core.exceptions import ResourceNotFoundError
 
 from elspeth.contracts import SourceRow
+from elspeth.contracts.field_spelling import NORMALIZATION_ALGORITHM_VERSION
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.sources.azure_blob_source import AzureBlobSource
-from elspeth.plugins.sources.field_normalization import NORMALIZATION_ALGORITHM_VERSION
 from tests.fixtures.factories import make_operation_context
 
 # Dynamic schema config for tests - DataPluginConfig requires schema
@@ -38,13 +38,16 @@ class _BlobDownloadDouble:
     def __init__(self, *, data: bytes | None = None, read_error: BaseException | None = None) -> None:
         self._data = data
         self._read_error = read_error
+        self._offset = 0
 
-    def readall(self) -> bytes:
+    def read(self, size: int) -> bytes:
         if self._read_error is not None:
             raise self._read_error
         if self._data is None:
             raise AssertionError("Blob download double has no data")
-        return self._data
+        chunk = self._data[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
 
 
 class _BlobClientDouble:

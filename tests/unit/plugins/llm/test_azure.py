@@ -1,16 +1,21 @@
 # tests/plugins/llm/test_azure.py
 """Tests for Azure OpenAI LLM provider via unified LLMTransform."""
 
+import json
 import threading
 from collections.abc import Generator
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 from elspeth.contracts import Determinism, TransformResult
+from elspeth.contracts.call_data import LLMCallResponse
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.engine.batch_adapter import ExceptionResult
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
 from elspeth.plugins.infrastructure.clients.llm import RateLimitError
@@ -20,11 +25,126 @@ from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import make_factory
+from tests.fixtures.mock_audit import mock_audit_authority
 
 from .conftest import chaosllm_azure_openai_client
 
 # Common schema config for dynamic field handling (accepts any fields)
 DYNAMIC_SCHEMA = {"mode": "observed"}
+
+
+@pytest.mark.parametrize("multi_query", [False, True])
+@pytest.mark.parametrize("temperature", ["omitted", None, 0.0, 0.7])
+@pytest.mark.parametrize("pricing_model", [None, "azure/gpt-4o"])
+def test_missing_cost_with_dated_model_does_not_block_transform(
+    multi_query: bool, temperature: str | float | None, pricing_model: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+    import litellm
+    import openai
+
+    from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS, LLMProfileSettings, RuntimeLLMProfile, lower_llm_profile_options
+
+    requests: list[dict[str, Any]] = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "azure-response",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-2099-01-01",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": '{"score":1}' if multi_query else "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+            },
+        )
+
+    def forbidden(**kwargs: Any) -> None:
+        pytest.fail("Azure transform must not require a LiteLLM price lookup")
+
+    def calculate(**kwargs: Any) -> tuple[float, float]:
+        assert pricing_model is not None
+        assert kwargs["model"] == pricing_model
+        assert kwargs["prompt_tokens"] == 100
+        assert kwargs["completion_tokens"] == 20
+        return 0.01, 0.02
+
+    sdk = openai.AzureOpenAI(
+        api_key="probe-key",
+        azure_endpoint="https://probe.openai.azure.com",
+        api_version="2024-10-21",
+        http_client=httpx.Client(transport=httpx.MockTransport(reply)),
+    )
+    monkeypatch.setattr(openai, "AzureOpenAI", lambda **kwargs: sdk)
+    monkeypatch.setattr(litellm, "cost_per_token", calculate if pricing_model is not None else forbidden)
+    monkeypatch.setattr(litellm, "completion_cost", forbidden)
+    config = _make_azure_config(deployment_name="private-production-deployment", prompt_template="{{ row.text }}")
+    if multi_query:
+        config["queries"] = {
+            name: {"input_fields": {"text": "text"}, "output_fields": [{"suffix": "score", "type": "integer"}]}
+            for name in ("first", "second")
+        }
+    profile = RuntimeLLMProfile.from_settings(
+        "production",
+        LLMProfileSettings(
+            provider="azure",
+            model="private-production-deployment",
+            pricing_model=pricing_model,
+            deployment_name="private-production-deployment",
+            endpoint="https://probe.openai.azure.com",
+            credential_scope="server",
+            credential_ref="AZURE_PROBE_KEY",
+            **({"temperature": temperature} if temperature != "omitted" else {}),
+        ),
+    )
+    config, _ = lower_llm_profile_options(
+        "production", profile, {key: value for key, value in config.items() if key not in LLM_PROFILE_PRIVATE_FIELDS}
+    )
+    assert config["api_key"] == {"secret_ref": "AZURE_PROBE_KEY", "secret_scope": "server"}
+    config["api_key"] = "probe-key"
+    writer = _FakeAuditWriter()
+    collector = CollectorOutputPort()
+    transform = LLMTransform(config)
+    try:
+        transform.on_start(make_context(**mock_audit_authority("test"), run_id="test", landscape=writer))
+        transform.connect_output(collector, max_pending=10)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=make_token("row-1"), landscape=writer)
+        transform.accept(make_pipeline_row({"text": "hello"}), ctx)
+        transform.flush_batch_processing(timeout=10)
+        assert len(collector.results) == 1
+        result = collector.results[0][1]
+        assert result.status == "success"
+        assert result.row is not None
+        expected_calls = 2 if multi_query else 1
+        assert len(requests) == expected_calls
+        assert writer.record_call.call_count == expected_calls
+        assert all(request["model"] == "private-production-deployment" for request in requests)
+        assert all("pricing_model" not in request for request in requests)
+        for call in writer.record_call.calls:
+            response_payload = call["response_data"]
+            assert isinstance(response_payload, LLMCallResponse)
+            assert response_payload.model == "gpt-4o-2099-01-01"
+            assert response_payload.pricing_model == (pricing_model or "private-production-deployment")
+            assert response_payload.provider_cost == (0.03 if pricing_model is not None else None)
+            assert response_payload.provider_cost_source == ("litellm.cost_per_token" if pricing_model is not None else "not_available")
+        for request in requests:
+            if temperature is None or temperature == "omitted":
+                assert "temperature" not in request
+            else:
+                assert request["temperature"] == temperature
+        for prefix in ("first_", "second_") if multi_query else ("",):
+            assert result.row[f"{prefix}llm_response_model"] == "gpt-4o-2099-01-01"
+            assert result.row[f"{prefix}llm_response_usage"] == {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+    finally:
+        transform.close()
 
 
 class _RecordCallSpy:
@@ -33,12 +153,14 @@ class _RecordCallSpy:
     def __init__(self) -> None:
         self.called = False
         self.call_count = 0
+        self.calls: list[dict[str, object]] = []
         self._lock = threading.Lock()
 
     def __call__(self, *args: object, **kwargs: object) -> SimpleNamespace:
         with self._lock:
             self.called = True
             self.call_count += 1
+            self.calls.append(kwargs)
         return SimpleNamespace(
             call_id=f"call-{self.call_count}",
             call_index=kwargs.get("call_index", self.call_count - 1),
@@ -57,10 +179,10 @@ class _FakeAuditWriter:
         self._operation_call_indices: dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         return self._next_index(self._call_indices, state_id)
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         return self._next_index(self._operation_call_indices, operation_id)
 
     def get_node_state(self, _state_id: str) -> SimpleNamespace:
@@ -142,6 +264,14 @@ def _make_azure_config(**overrides: object) -> dict[str, object]:
 
 class TestAzureOpenAIConfig:
     """Tests for AzureOpenAIConfig validation."""
+
+    def test_api_key_is_absent_from_config_representations(self) -> None:
+        credential = "azure-runtime-repr-test-value"
+        config = AzureOpenAIConfig.from_dict(_make_azure_config(api_key=credential))
+        assert credential not in repr(config)
+        assert credential not in str(config)
+        assert config.api_key == credential
+        assert config.model_dump()["api_key"] == credential
 
     def test_config_requires_deployment_name(self) -> None:
         """AzureOpenAIConfig requires deployment_name."""
@@ -270,10 +400,25 @@ class TestAzureOpenAIConfig:
                 "prompt_template": "{{ row.text }}",
                 "schema": DYNAMIC_SCHEMA,
                 "required_input_fields": [],  # Explicit opt-out for this test
-                "api_version": "2023-12-01-preview",
+                "api_version": "2025-01-01-preview",
             }
         )
-        assert config.api_version == "2023-12-01-preview"
+        assert config.api_version == "2025-01-01-preview"
+
+    @pytest.mark.parametrize("api_version", ["2024-02-01", "2023-12-01-preview", "2024-08-01-preview"])
+    def test_api_version_older_than_max_completion_tokens_is_rejected(self, api_version: str) -> None:
+        """Older API versions answer max_completion_tokens with an HTTP 400 the audit trail scrubs."""
+        with pytest.raises(PluginConfigError, match="max_completion_tokens"):
+            AzureOpenAIConfig.from_dict(_make_azure_config(api_version=api_version))
+
+    @pytest.mark.parametrize("api_version", ["2024-09-01-preview", "2024-10-21", "2025-01-01-preview", "preview"])
+    def test_api_version_at_or_after_the_floor_is_accepted(self, api_version: str) -> None:
+        config = AzureOpenAIConfig.from_dict(_make_azure_config(api_version=api_version))
+        assert config.api_version == api_version
+
+    def test_temperature_null_is_accepted(self) -> None:
+        config = AzureOpenAIConfig.from_dict(_make_azure_config(temperature=None))
+        assert config.temperature is None
 
     def test_config_inherits_llm_config_defaults(self) -> None:
         """Config inherits defaults from LLMConfig."""
@@ -289,7 +434,7 @@ class TestAzureOpenAIConfig:
             }
         )
         # Inherited from LLMConfig
-        assert config.temperature == 0.0
+        assert config.temperature is None
         assert config.max_tokens is None
         assert config.system_prompt is None
         assert config.response_field == "llm_response"
@@ -332,13 +477,13 @@ class TestLLMTransformAzureInit:
         transform = LLMTransform(
             _make_azure_config(
                 prompt_template="{{ row.text }}",
-                api_version="2023-12-01-preview",
+                api_version="2025-01-01-preview",
             )
         )
         assert isinstance(transform._config, AzureOpenAIConfig)
         assert transform._config.endpoint == "https://my-resource.openai.azure.com"
         assert transform._config.api_key == "azure-api-key"
-        assert transform._config.api_version == "2023-12-01-preview"
+        assert transform._config.api_version == "2025-01-01-preview"
         assert transform._config.deployment_name == "my-gpt4o-deployment"
 
     def test_model_set_to_deployment_name(self) -> None:
@@ -410,14 +555,14 @@ class TestLLMTransformAzurePipelining:
     def ctx(self, audit_writer: _FakeAuditWriter) -> PluginContext:
         """Create plugin context with landscape, state_id, and token."""
         token = make_token("row-1")
-        return make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        return make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
     @pytest.fixture
     def transform(self, collector: CollectorOutputPort, audit_writer: _FakeAuditWriter) -> Generator[LLMTransform, None, None]:
         """Create and initialize LLMTransform with Azure provider and pipelining."""
         t = LLMTransform(_make_azure_config(prompt_template="Analyze: {{ row.text }}"))
         # Initialize with factory reference
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         t.on_start(init_ctx)
         # Connect output port
         t.connect_output(collector, max_pending=10)
@@ -558,8 +703,9 @@ class TestLLMTransformAzurePipelining:
     ) -> None:
         """Missing state_id causes exception propagation, not error result.
 
-        Per CLAUDE.md crash-on-exception policy: a missing state_id is a bug
-        in calling code (our internal code, not user data), so it should crash
+        Per docs/guides/data-trust-and-error-handling.md §The Decision Test: a
+        missing state_id is a bug in code we control (our internal code, not
+        user data), so it should crash
         rather than be converted to an error result.
 
         BatchTransformMixin wraps such exceptions in ExceptionResult for
@@ -569,6 +715,7 @@ class TestLLMTransformAzurePipelining:
         """
         token = make_token("row-1")
         ctx = PluginContext(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             config={},
             landscape=audit_writer,
@@ -590,6 +737,7 @@ class TestLLMTransformAzurePipelining:
     def test_process_row_missing_token_raises_runtime_error(self, audit_writer: _FakeAuditWriter, transform: LLMTransform) -> None:
         """Direct _process_row call with missing token must crash explicitly."""
         ctx = PluginContext(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             config={},
             landscape=audit_writer,
@@ -613,12 +761,12 @@ class TestLLMTransformAzurePipelining:
                 system_prompt="You are a helpful assistant.",
             )
         )
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
-        ctx = make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
         try:
             with chaosllm_azure_openai_client(chaosllm_server) as mock_client:
@@ -641,7 +789,7 @@ class TestLLMTransformAzurePipelining:
         collector: CollectorOutputPort,
         chaosllm_server,
     ) -> None:
-        """Temperature and max_tokens are passed to Azure client."""
+        """Temperature and max_tokens reach the Azure client, the budget as max_completion_tokens."""
         transform = LLMTransform(
             _make_azure_config(
                 prompt_template="{{ row.text }}",
@@ -649,12 +797,12 @@ class TestLLMTransformAzurePipelining:
                 max_tokens=500,
             )
         )
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
-        ctx = make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
         try:
             with chaosllm_azure_openai_client(chaosllm_server) as mock_client:
@@ -664,7 +812,8 @@ class TestLLMTransformAzurePipelining:
                 call_args = mock_client.chat.completions.create.call_args
                 assert call_args.kwargs["model"] == "my-gpt4o-deployment"
                 assert call_args.kwargs["temperature"] == 0.7
-                assert call_args.kwargs["max_tokens"] == 500
+                assert call_args.kwargs["max_completion_tokens"] == 500
+                assert "max_tokens" not in call_args.kwargs
         finally:
             transform.close()
 
@@ -681,12 +830,12 @@ class TestLLMTransformAzurePipelining:
                 response_field="analysis",
             )
         )
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
-        ctx = make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
         try:
             with chaosllm_azure_openai_client(
@@ -730,7 +879,7 @@ class TestLLMTransformAzurePipelining:
     def test_connect_output_cannot_be_called_twice(self, collector: CollectorOutputPort, audit_writer: _FakeAuditWriter) -> None:
         """connect_output() raises if called more than once."""
         transform = LLMTransform(_make_azure_config(prompt_template="{{ row.text }}"))
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
@@ -756,6 +905,7 @@ class TestLLMTransformAzurePipelining:
                 azure_endpoint="https://my-resource.openai.azure.com",
                 api_key="azure-api-key",
                 api_version="2024-10-21",
+                max_retries=0,
             )
 
 
@@ -797,12 +947,12 @@ class TestLLMTransformAzureIntegration:
                 """,
             )
         )
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
-        ctx = make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
         try:
             with chaosllm_azure_openai_client(chaosllm_server) as mock_client:
@@ -835,12 +985,12 @@ class TestLLMTransformAzureIntegration:
     ) -> None:
         """LLM calls are recorded via AuditedLLMClient."""
         transform = LLMTransform(_make_azure_config(prompt_template="{{ row.text }}"))
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
-        ctx = make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
         try:
             with chaosllm_azure_openai_client(chaosllm_server):
@@ -874,7 +1024,7 @@ class TestLLMTransformAzureConcurrency:
     ) -> None:
         """Multiple rows are emitted in submission order (FIFO)."""
         transform = LLMTransform(_make_azure_config(prompt_template="{{ row.text }}"))
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
@@ -889,6 +1039,7 @@ class TestLLMTransformAzureConcurrency:
                 for i, row in enumerate(rows):
                     token = make_token(f"row-{i}")
                     ctx = make_context(
+                        **mock_audit_authority("test-run"),
                         run_id="test-run",
                         state_id=f"state-{i}",
                         token=token,
@@ -915,7 +1066,7 @@ class TestLLMTransformAzureConcurrency:
         # Verify _recorder starts as None
         assert transform._recorder is None
 
-        ctx = make_context(state_id="test-state-id", landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", landscape=audit_writer)
         transform.on_start(ctx)
 
         # Verify factory was captured
@@ -924,7 +1075,7 @@ class TestLLMTransformAzureConcurrency:
     def test_close_clears_recorder(self, audit_writer: _FakeAuditWriter, collector: CollectorOutputPort) -> None:
         """close() clears factory reference."""
         transform = LLMTransform(_make_azure_config(prompt_template="{{ row.text }}"))
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 

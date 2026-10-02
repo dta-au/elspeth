@@ -3,18 +3,42 @@
 BatchReplicate replicates rows based on a copies field. It is batch-aware,
 meaning it receives lists of rows when aggregation triggers fire.
 
-Contract enforcement tests verify that wrong types raise TypeError per
-the Tier 2 trust model - transforms must not coerce pipeline data types.
+Contract enforcement tests verify that a wrongly-typed copies value is never
+coerced: it fails the whole batch with a recorded, value-free reason
+(elspeth-d5034647f0), which the aggregation's on_error then routes.
 """
 
 import pytest
 
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
 
 # Common schema config for dynamic field handling (accepts any fields)
 DYNAMIC_SCHEMA = {"mode": "observed"}
+
+
+def _assert_wrong_type_batch_failure(result: TransformResult, *, found: str, row_index: int, value_text: str | None) -> None:
+    """The returned-error shape of a wrongly-typed copies value (template: 890a6aca7).
+
+    ``value_text`` is the offending value's rendering, which must be absent
+    from the reason; None where the value has no rendering beyond its type
+    name (a null is fully described by ``NoneType``).
+    """
+    assert result.status == "error"
+    assert result.retryable is False
+    assert result.rows is None and result.row is None
+    assert result.reason is not None
+    assert result.reason["reason"] == "invalid_input"
+    assert result.reason["error_type"] == "wrong_type"
+    assert result.reason["field"] == "copies"
+    assert result.reason["expected"] == "int"
+    assert result.reason["actual_type"] == found
+    assert result.reason["error"] == f"must be int, got {found} in row {row_index}"
+    # The offending VALUE is row content and must not reach the audit trail.
+    if value_text is not None:
+        assert value_text not in repr(sorted(result.reason.items()))
 
 
 class TestBatchReplicateHappyPath:
@@ -113,9 +137,10 @@ class TestBatchReplicateHappyPath:
 class TestBatchReplicateTypeEnforcement:
     """Contract enforcement tests - transforms must not coerce types.
 
-    Per CLAUDE.md Tier 2 trust model and docs/contracts/plugin-protocol.md:
-    Transforms receive pipeline data that should already be type-validated.
-    Wrong types indicate upstream bugs and must raise TypeError, not be coerced.
+    A present copies value of the wrong type is row data (an observed upstream
+    does not type it), so it is never coerced and never aborts the run: the
+    whole batch fails with a reason naming the batch row index, the field, the
+    expected and the found type, and never the value (elspeth-d5034647f0).
     """
 
     @pytest.fixture
@@ -123,8 +148,8 @@ class TestBatchReplicateTypeEnforcement:
         """Create minimal plugin context."""
         return make_context()
 
-    def test_string_copies_raises_type_error(self, ctx: PluginContext) -> None:
-        """String value in copies field raises TypeError (no coercion)."""
+    def test_string_copies_fails_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
+        """A str copies value fails the batch (no coercion: "3" is not 3)."""
         from elspeth.plugins.transforms.batch_replicate import BatchReplicate
 
         transform = BatchReplicate(
@@ -134,13 +159,21 @@ class TestBatchReplicateTypeEnforcement:
             }
         )
 
-        rows = [make_pipeline_row({"id": 1, "copies": "3"})]  # String "3" instead of int 3
+        rows = [
+            make_pipeline_row({"id": 1, "copies": 2}),
+            make_pipeline_row({"id": 2, "copies": "SENTINEL-copies-3"}),  # str instead of int
+            make_pipeline_row({"id": 3, "copies": 1}),
+        ]
 
-        with pytest.raises(TypeError, match="must be int, got str"):
-            transform.process(rows, ctx)
+        _assert_wrong_type_batch_failure(
+            transform.process(rows, ctx),
+            found="str",
+            row_index=1,
+            value_text="SENTINEL-copies-3",
+        )
 
-    def test_float_copies_raises_type_error(self, ctx: PluginContext) -> None:
-        """Float value in copies field raises TypeError (no coercion)."""
+    def test_float_copies_fails_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
+        """A float copies value fails the batch (no coercion)."""
         from elspeth.plugins.transforms.batch_replicate import BatchReplicate
 
         transform = BatchReplicate(
@@ -150,13 +183,17 @@ class TestBatchReplicateTypeEnforcement:
             }
         )
 
-        rows = [make_pipeline_row({"id": 1, "copies": 3.5})]  # Float instead of int
+        rows = [make_pipeline_row({"id": 1, "copies": 2}), make_pipeline_row({"id": 2, "copies": 3.25})]
 
-        with pytest.raises(TypeError, match="must be int, got float"):
-            transform.process(rows, ctx)
+        _assert_wrong_type_batch_failure(transform.process(rows, ctx), found="float", row_index=1, value_text="3.25")
 
-    def test_none_copies_raises_type_error(self, ctx: PluginContext) -> None:
-        """None value in copies field raises TypeError."""
+    def test_none_copies_fails_the_whole_batch(self, ctx: PluginContext) -> None:
+        """A present None copies value fails the batch.
+
+        batch_replicate has no missing-value branch: an ABSENT copies field is
+        the missing case (default_copies). A present null is a wrong type, and
+        no skip branch is invented for it (ruling default B6).
+        """
         from elspeth.plugins.transforms.batch_replicate import BatchReplicate
 
         transform = BatchReplicate(
@@ -166,16 +203,15 @@ class TestBatchReplicateTypeEnforcement:
             }
         )
 
-        rows = [make_pipeline_row({"id": 1, "copies": None})]
+        rows = [make_pipeline_row({"id": 1}), make_pipeline_row({"id": 2, "copies": None})]
 
-        with pytest.raises(TypeError, match="must be int, got NoneType"):
-            transform.process(rows, ctx)
+        _assert_wrong_type_batch_failure(transform.process(rows, ctx), found="NoneType", row_index=1, value_text=None)
 
-    def test_bool_true_copies_raises_type_error(self, ctx: PluginContext) -> None:
-        """Bool True in copies field raises TypeError (not silently treated as 1).
+    def test_bool_true_copies_fails_the_whole_batch(self, ctx: PluginContext) -> None:
+        """Bool True in copies field fails the batch (not silently treated as 1).
 
         Python's isinstance(True, int) returns True because bool is a subclass
-        of int. The fix uses `type(x) is int` for strict type checking, so
+        of int. The guard uses `type(x) is int` for strict type checking, so
         True/False are rejected as distinct logical types.
         """
         from elspeth.plugins.transforms.batch_replicate import BatchReplicate
@@ -189,11 +225,10 @@ class TestBatchReplicateTypeEnforcement:
 
         rows = [make_pipeline_row({"id": 1, "copies": True})]
 
-        with pytest.raises(TypeError, match="must be int, got bool"):
-            transform.process(rows, ctx)
+        _assert_wrong_type_batch_failure(transform.process(rows, ctx), found="bool", row_index=0, value_text="True")
 
-    def test_bool_false_copies_raises_type_error(self, ctx: PluginContext) -> None:
-        """Bool False in copies field raises TypeError (not silently treated as 0).
+    def test_bool_false_copies_fails_the_whole_batch(self, ctx: PluginContext) -> None:
+        """Bool False in copies field fails the batch (not silently treated as 0).
 
         Without strict type checking, False would be treated as 0 copies,
         which would then be quarantined as invalid (< 1). The bug is that
@@ -210,8 +245,7 @@ class TestBatchReplicateTypeEnforcement:
 
         rows = [make_pipeline_row({"id": 1, "copies": False})]
 
-        with pytest.raises(TypeError, match="must be int, got bool"):
-            transform.process(rows, ctx)
+        _assert_wrong_type_batch_failure(transform.process(rows, ctx), found="bool", row_index=0, value_text="False")
 
     def test_zero_copies_returns_error_when_all_invalid(self, ctx: PluginContext) -> None:
         """All rows with zero copies returns error result (no valid output to expand)."""
@@ -284,11 +318,18 @@ class TestBatchReplicateTypeEnforcement:
         entry = result.success_reason["metadata"]["quarantined"][0]
         assert entry["reason"] == "invalid_copies"
         assert entry["row_index"] == 0
-        assert entry["value"] == -1  # the offending copies count is fine; it is not row content
-        assert "row_data" not in entry  # the full row body must NOT leak into the audit record
+        assert entry["field"] == "copies"
+        # Neither the row body nor the offending copies VALUE is recorded: the
+        # count is row content like any other field (elspeth-d5034647f0).
+        assert set(entry) == {"reason", "field", "row_index"}
 
-    def test_error_message_indicates_upstream_bug(self, ctx: PluginContext) -> None:
-        """Error message explicitly indicates upstream validation bug."""
+    def test_wrong_type_reason_states_the_disposition_not_an_upstream_bug(self, ctx: PluginContext) -> None:
+        """The reason records the batch failure; it no longer blames an "upstream bug".
+
+        A wrongly-typed copies value is row data under an observed upstream,
+        so the reason carries no "upstream validation bug" diagnosis and no
+        value — only which row, which field, expected and found.
+        """
         from elspeth.plugins.transforms.batch_replicate import BatchReplicate
 
         transform = BatchReplicate(
@@ -300,8 +341,12 @@ class TestBatchReplicateTypeEnforcement:
 
         rows = [make_pipeline_row({"id": 1, "copies": "invalid"})]
 
-        with pytest.raises(TypeError, match="upstream validation bug"):
-            transform.process(rows, ctx)
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert "upstream" not in repr(result.reason)
+        assert result.reason["error"] == "must be int, got str in row 0"
 
 
 class TestBatchReplicateConfigValidation:
@@ -505,16 +550,32 @@ class TestBatchReplicateDeepCopy:
         second = result.rows[1].to_dict()
         assert "injected" not in second["meta"]
 
-    def test_runtime_collision_on_copy_index_raises_plugin_contract_violation(self, ctx: PluginContext) -> None:
-        """Observed batches must reject incoming copy_index instead of overwriting it."""
-        from elspeth.contracts.errors import PluginContractViolation
+    def test_runtime_collision_on_copy_index_fails_the_whole_batch(self, ctx: PluginContext) -> None:
+        """An incoming copy_index fails the batch instead of being overwritten.
+
+        Under an observed upstream only the row data decides whether
+        copy_index arrives, so the collision is a row fault routed like any
+        failed batch (ruling on elspeth-d90495084c), not a run abort. The
+        reason names the batch row and the colliding field, never its value.
+        """
         from elspeth.plugins.transforms.batch_replicate import BatchReplicate
 
         transform = BatchReplicate({"schema": DYNAMIC_SCHEMA, "copies_field": "copies", "include_copy_index": True})
-        rows = [make_pipeline_row({"id": 1, "copies": 2, "copy_index": "source-value"})]
+        rows = [
+            make_pipeline_row({"id": 1, "copies": 2}),
+            make_pipeline_row({"id": 2, "copies": 2, "copy_index": "SENTINEL-copy-index-9"}),
+        ]
 
-        with pytest.raises(PluginContractViolation, match=r"would overwrite existing input fields \['copy_index'\]"):
-            transform.process(rows, ctx)
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "field_collision"
+        assert result.reason["collisions"] == ["copy_index"]
+        assert result.reason["error"] == "would overwrite existing input fields ['copy_index'] in row 1"
+        assert "SENTINEL-copy-index-9" not in repr(sorted(result.reason.items()))
 
 
 class TestBatchReplicateDeclaredOutputFields:
@@ -705,3 +766,41 @@ class TestBatchReplicateContractPreservation:
         copy_idx_field = result.rows[0].contract.get_field("copy_index")
         assert copy_idx_field is not None
         assert copy_idx_field.python_type is int
+
+    def test_mixed_batch_keeps_the_optional_copies_field_optional(self, ctx: PluginContext) -> None:
+        """A row without copies_field shares the source's contract, where copies is optional.
+
+        An observed source records every field ``required=False`` and hands
+        that one contract to every row, whether or not the row carries the
+        field. The replica of a row without ``copies`` carries no ``copies``,
+        and the emitted contract says so truthfully: the field stays optional.
+        The pass-through cross-check therefore has nothing to object to
+        (elspeth-5887fb7928 S4; the engine half is in
+        ``tests/unit/engine/test_cross_check_flush_output.py``).
+        """
+        from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+        from elspeth.plugins.transforms.batch_replicate import BatchReplicate
+
+        transform = BatchReplicate({"schema": DYNAMIC_SCHEMA, "copies_field": "copies", "default_copies": 1})
+        source_contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                FieldContract(normalized_name="id", original_name="id", python_type=int, required=False, source="inferred"),
+                FieldContract(normalized_name="copies", original_name="copies", python_type=int, required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        rows = [PipelineRow({"id": 1, "copies": 2}, source_contract), PipelineRow({"id": 2}, source_contract)]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "success"
+        assert result.rows is not None
+        assert [row.to_dict() for row in result.rows] == [
+            {"id": 1, "copies": 2, "copy_index": 0},
+            {"id": 1, "copies": 2, "copy_index": 1},
+            {"id": 2, "copy_index": 0},
+        ]
+        copies_field = result.rows[0].contract.get_field("copies")
+        assert copies_field is not None
+        assert copies_field.required is False

@@ -307,7 +307,7 @@ class BlobCSVExpand(BaseTransform):
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f21d43dc7385e82e"
+    source_file_hash: str | None = "sha256:645858af23f9cf25"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
@@ -531,8 +531,20 @@ class BlobCSVExpand(BaseTransform):
                     f"row {index} has fields {sorted(row_keys)}"
                 )
 
+        # Every CSV column is a field this transform CREATES, and a headered
+        # CSV names them in the data, not the config. Their type is fixed by
+        # this code before row 1 regardless — a CSV cell is text — so each
+        # column is declared ``str`` on emission (ADR-050); a column declared
+        # in ``columns`` or the operator's schema keeps that declaration. A
+        # column absent from another blob's rows folds into the node record
+        # as optional, so it is declared optional and nullable here.
+        created_columns = tuple(
+            FieldDefinition(name=column, field_type="str", required=False, nullable=True)
+            for column in output_rows[0]
+            if column not in base and column != self._row_index_field
+        )
         output_contract = narrow_contract_to_output(input_contract=row.contract, output_row=output_rows[0])
-        output_contract = self._apply_declared_output_field_contracts(output_contract)
+        output_contract = self._apply_declared_output_field_contracts(output_contract, dynamic_created_fields=created_columns)
         output_contract = self._align_output_contract(output_contract)
 
         metadata: dict[str, Any] = {}
@@ -592,7 +604,6 @@ class BlobCSVExpand(BaseTransform):
                 _csv_error_reason(
                     "invalid_input",
                     field=self._blob_ref_field,
-                    blob_ref=blob_ref,
                     error_type="invalid_blob_ref",
                     error="payload-store hash must be 64 lowercase hex characters",
                 )

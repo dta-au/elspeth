@@ -234,6 +234,8 @@ class TestTextSource:
         assert rows[0].is_quarantined is False
         assert rows[0].row == {"value": 123}
         assert rows[1].is_quarantined is True
+        # The declared field keeps its name; the value and pydantic's msg never appear.
+        assert rows[1].quarantine_error == "1 validation error: value: [int_parsing]"
 
     def test_has_plugin_version(self) -> None:
         from elspeth.plugins.sources.text_source import TextSource

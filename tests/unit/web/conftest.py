@@ -46,6 +46,8 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions import models
 from elspeth.web.sessions.engine import create_session_engine
@@ -54,8 +56,9 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -87,6 +90,7 @@ def _make_session(
     ``auth_provider_type`` values.
     """
     now = created_at or datetime.now(UTC)
+    ensure_test_identity(conn, identity_id=user_id, provider=auth_provider_type)
     conn.execute(
         insert(models.sessions_table).values(
             id=session_id,
@@ -99,17 +103,15 @@ def _make_session(
     )
 
 
-@pytest.fixture
-def test_client(tmp_path: Path) -> TestClient:
-    """Sync ASGI test client with app state exposing ``sessions_service``."""
-
+def _route_client(tmp_path: Path, settings: WebSettings) -> TestClient:
+    """Build a route test app with one in-memory session service."""
     eng = create_session_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         eng,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -117,6 +119,18 @@ def test_client(tmp_path: Path) -> TestClient:
     )
     app = FastAPI()
     identity = UserIdentity(user_id="alice", username="alice")
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
+        conn.execute(
+            insert(models.identity_roles_table).values(
+                role_id=str(uuid4()),
+                identity_id="alice",
+                role="user",
+                scope=None,
+                granted_by_identity_id="alice",
+                granted_at=datetime.now(UTC),
+            )
+        )
 
     async def mock_user() -> UserIdentity:
         return identity
@@ -148,14 +162,11 @@ def test_client(tmp_path: Path) -> TestClient:
     # (matches production wiring in ``web/app.py:579``).
     app.state.sessions_telemetry = service._telemetry
     app.state.session_engine = eng
-    app.state.settings = WebSettings(
-        data_dir=tmp_path,
-        composer_max_composition_turns=15,
-        composer_max_discovery_turns=10,
-        composer_timeout_seconds=85.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=SecretBytes(b"\x00" * 32),
+    app.state.identity_authority = RepositoryIdentityAuthority(
+        eng,
+        lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply,
     )
+    app.state.settings = settings
     app.state.composer_service = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.execution_service = None
@@ -166,6 +177,47 @@ def test_client(tmp_path: Path) -> TestClient:
     client.app.state.phase3_engine = eng
     client.app.state.phase3_sessions_service = service
     return client
+
+
+@pytest.fixture
+def test_client(tmp_path: Path) -> TestClient:
+    """The shared open-local route fixture, with governance disabled."""
+    return _route_client(
+        tmp_path,
+        WebSettings(
+            data_dir=tmp_path,
+            composer_max_composition_turns=15,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=SecretBytes(b"\x00" * 32),
+        ),
+    )
+
+
+@pytest.fixture
+def closed_local_settings(tmp_path: Path) -> WebSettings:
+    """A governance-on local deployment safe under R11."""
+    return WebSettings(
+        data_dir=tmp_path,
+        auth_provider="local",
+        registration_mode="closed",
+        workflow_governance="on",
+        compartment_id="test-compartment",
+        quota_default_tokens_per_day=100_000,
+        quota_default_storage_bytes=1_000_000,
+        composer_max_composition_turns=15,
+        composer_max_discovery_turns=10,
+        composer_timeout_seconds=85.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=SecretBytes(b"\x00" * 32),
+    )
+
+
+@pytest.fixture
+def closed_local_app(tmp_path: Path, closed_local_settings: WebSettings) -> TestClient:
+    """The same route app as ``test_client`` with closed local governance."""
+    return _route_client(tmp_path, closed_local_settings)
 
 
 @pytest.fixture

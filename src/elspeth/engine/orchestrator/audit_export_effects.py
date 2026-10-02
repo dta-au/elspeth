@@ -18,6 +18,7 @@ from uuid import uuid4
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.audit_export import (
+    AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
     AUDIT_EXPORT_DERIVATION_VERSION,
     AuditExportContentDescriptor,
     AuditExportContentStore,
@@ -164,6 +165,8 @@ def _derivation_config(
         serialization_version=config.serialization_version,
         chunking_algorithm_version=config.chunking_algorithm_version,
         include_raw_error_rows=config.include_raw_error_rows,
+        auth_events=config.auth_events,
+        compartment_id=config.compartment_id,
         per_chunk_byte_limit=_required_limit(config.per_chunk_byte_limit, "per_chunk_byte_limit"),
         per_chunk_record_limit=_required_limit(config.per_chunk_record_limit, "per_chunk_record_limit"),
         signing_mode=config.signing_mode,
@@ -330,6 +333,9 @@ def prepare_audit_export_snapshot(
     """
     if type(config) is not LandscapeExportSettings:
         raise TypeError("config must be exact LandscapeExportSettings")
+    if config.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+        raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+    config.public_snapshot_config()
     run_id = coordination_token.run_id
     # No isinstance gate on AuditExportContentStore: it is a runtime_checkable
     # Protocol, so the check admits any object carrying the right attribute names
@@ -352,6 +358,8 @@ def prepare_audit_export_snapshot(
     witness: AuditExportTerminalWitness | None = None
     spool: BinaryIO | None = None
     with open_export_read_transaction(db.engine) as read_model:
+        if snapshots.has_unsupported_version_for_run(read_model.connection, run_id):
+            raise ValueError("audit-export lineage contains unsupported exporter_version")
         for existing_signer_key_id in snapshots.find_lineage_signer_key_ids(read_model.connection, key):
             config.assert_signer_rotation_allowed(existing_signer_key_id=existing_signer_key_id)
         winner = snapshots.find_winner(read_model.connection, key)
@@ -362,6 +370,8 @@ def prepare_audit_export_snapshot(
                 db,
                 signing_key=signing_key,
                 include_raw_error_rows=config.include_raw_error_rows,
+                auth_events=config.auth_events,
+                compartment_id=config.compartment_id,
                 read_model=read_model,
                 signer_key_id=config.signer_key_id,
                 export_format=config.format,

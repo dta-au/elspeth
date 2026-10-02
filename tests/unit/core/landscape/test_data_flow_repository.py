@@ -17,13 +17,13 @@ Covers all 3 former mixin domains:
 from __future__ import annotations
 
 import json
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import Insert, select
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts import (
@@ -35,14 +35,17 @@ from elspeth.contracts.audit import (
     DISCARD_SINK_NAME,
     TokenRef,
 )
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import BatchStatus, NodeStateStatus, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, TransformErrorReason
 from elspeth.contracts.hashing import repr_hash
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape.data_flow.errors import insert_batch_transform_errors_on
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.model_loaders import (
@@ -52,17 +55,22 @@ from elspeth.core.landscape.model_loaders import (
     TransformErrorLoader,
     ValidationErrorLoader,
 )
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
+    node_states_table,
     rows_table,
     token_outcomes_table,
     token_parents_table,
     tokens_table,
+    transform_errors_table,
 )
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from elspeth.testing import make_pipeline_row
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
-_ERROR_HASH = "a" * 64
+_ERROR_HASH = "a" * 16
 
 # Minimal contract for tests that only care about token lifecycle, not contract content.
 _MINIMAL_CONTRACT = SchemaContract(mode="OBSERVED", fields=(), locked=True)
@@ -110,31 +118,31 @@ def _make_repo(
     factory = make_factory(db)
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
     factory.data_flow.register_node(
-        run_id=run_id,
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
         config={},
         node_id="source-0",
         schema_config=_DYNAMIC_SCHEMA,
+        coordination_token=_test_leader(factory.data_flow, run_id),
     )
     factory.data_flow.register_node(
-        run_id=run_id,
         plugin_name="transform",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
         config={},
         node_id="transform-1",
         schema_config=_DYNAMIC_SCHEMA,
+        coordination_token=_test_leader(factory.data_flow, run_id),
     )
     factory.data_flow.register_node(
-        run_id=run_id,
         plugin_name="csv_sink",
         node_type=NodeType.SINK,
         plugin_version="1.0",
         config={},
         node_id="sink-0",
         schema_config=_DYNAMIC_SCHEMA,
+        coordination_token=_test_leader(factory.data_flow, run_id),
     )
     return db, repo, factory
 
@@ -150,7 +158,71 @@ def _create_test_row(
     """Create a row for tests that deliberately use same source/run indexes."""
     kwargs.setdefault("source_row_index", row_index)
     kwargs.setdefault("ingest_sequence", row_index)
-    return repo.create_row(run_id, source_node_id, row_index, data, **kwargs)
+    row, _token = repo.create_row_with_token(source_node_id, row_index, data, coordination_token=_test_leader(repo, run_id), **kwargs)
+    return row
+
+
+def _test_db(repo: DataFlowRepository) -> LandscapeDB:
+    assert isinstance(repo._db, LandscapeDB)
+    return repo._db
+
+
+def _test_leader(repo: DataFlowRepository, run_id: str) -> CoordinationToken:
+    return leader_token_for(_test_db(repo), run_id)
+
+
+def _test_claim(repo: DataFlowRepository, ref: TokenRef) -> TokenWorkItem:
+    row_id, run_id = repo._resolve_token_ownership(ref.token_id)
+    factory = make_factory(_test_db(repo))
+    return factory.scheduler.enqueue_ready_claimed(
+        member_token=_test_leader(repo, run_id).membership,
+        token_id=ref.token_id,
+        row_id=row_id,
+        node_id="transform-1",
+        step_index=0,
+        ingest_sequence=repo.resolve_row_ingest_sequence(row_id),
+        row_payload_json="{}",
+        lease_owner=_test_leader(repo, run_id).worker_id,
+        lease_seconds=60,
+    )
+
+
+def _state_member(factory: RecorderFactory, state_id: str) -> WorkerMembershipToken:
+    db = _test_db(factory.data_flow)
+    with db.read_only_connection() as conn:
+        run_id = conn.execute(select(node_states_table.c.run_id).where(node_states_table.c.state_id == state_id)).scalar_one()
+    return leader_token_for(db, run_id).membership
+
+
+def _link_error_on(repo: DataFlowRepository, *, run_id: str, error_id: str, row_id: str) -> None:
+    """Exercise the live quarantine linkage relay on a leader-owned connection."""
+    with fenced_leader_transaction(_test_db(repo).engine, token=_test_leader(repo, run_id), window_seconds=60, verb="test_link") as conn:
+        repo.errors.link_validation_error_to_row_on(conn, run_id=run_id, error_id=error_id, row_id=row_id)
+
+
+def _register_artifact_on(factory: RecorderFactory, **kwargs: Any):
+    """Build outcome witnesses through the live sink artifact repository."""
+    token = _test_leader(factory.data_flow, kwargs["run_id"])
+    with fenced_leader_transaction(_test_db(factory.data_flow).engine, token=token, window_seconds=60, verb="test_artifact") as conn:
+        return factory.execution.artifacts.register_artifact(conn=conn, **kwargs)
+
+
+def _intercept_insert(monkeypatch: pytest.MonkeyPatch, table_name: str, *, zero_rowcount: bool) -> list[str]:
+    """Inject at the named payload INSERT, leaving both authority fences intact."""
+    original_execute = Connection.execute
+    intercepted: list[str] = []
+
+    def execute(conn: Connection, stmt: Any, *args: Any, **kwargs: Any):
+        result = original_execute(conn, stmt, *args, **kwargs)
+        if isinstance(stmt, Insert) and stmt.table.name == table_name:
+            intercepted.append(table_name)
+            if zero_rowcount:
+                return _RowcountResult(rowcount=0)
+            raise RuntimeError("Injected failure after payload INSERT")
+        return result
+
+    monkeypatch.setattr(Connection, "execute", execute)
+    return intercepted
 
 
 def _make_repo_with_token(
@@ -164,8 +236,10 @@ def _make_repo_with_token(
     """
     db, repo, factory = _make_repo(run_id=run_id, payload_store=payload_store)
     row = _create_test_row(repo, run_id, "source-0", 0, {"name": "test"}, row_id="row-1")
-    token = repo.create_token("row-1", token_id="tok-1")
-    factory.execution.create_batch(run_id=run_id, aggregation_node_id="transform-1", batch_id="batch-1")
+    token = repo.create_token("row-1", token_id="tok-1", coordination_token=_test_leader(repo, repo._resolve_run_id_for_row("row-1")))
+    factory.execution.create_batch(
+        aggregation_node_id="transform-1", batch_id="batch-1", coordination_token=_test_leader(factory.data_flow, run_id)
+    )
     return db, repo, factory, row.row_id, token.token_id
 
 
@@ -180,17 +254,19 @@ def _record_completed_sink_state_with_artifact(
     state = factory.execution.begin_node_state(
         token_id=token_id,
         node_id=sink_node_id,
-        run_id=run_id,
         step_index=0,
         input_data={},
+        member_token=_test_leader(factory.data_flow, run_id).membership,
     )
     factory.execution.complete_node_state(
         state_id=state.state_id,
         status=NodeStateStatus.COMPLETED,
         output_data={"written": True},
         duration_ms=1.0,
+        member_token=_state_member(factory, state.state_id),
     )
-    artifact = factory.execution.register_artifact(
+    artifact = _register_artifact_on(
+        factory,
         run_id=run_id,
         state_id=state.state_id,
         sink_node_id=sink_node_id,
@@ -239,29 +315,29 @@ def _invalid_constraint_fields(pair: tuple[TerminalOutcome | None, TerminalPath]
 
 
 class TestCreateRow:
-    """Tests for DataFlowRepository.create_row — the row ingestion entry point."""
+    """Source-row guarantees exercised through the live atomic row/token writer."""
 
     def test_creates_row_with_canonical_hash(self) -> None:
         """create_row hashes data using stable_hash (canonical)."""
         _db, repo, _fac = _make_repo()
         data = {"name": "Alice", "value": 42}
-        row = repo.create_row("run-1", "source-0", 0, data, source_row_index=0, ingest_sequence=0)
+        row = _create_test_row(repo, "run-1", "source-0", 0, data, source_row_index=0, ingest_sequence=0)
         assert row.source_data_hash == stable_hash(data)
 
     def test_row_id_is_auto_generated_when_not_supplied(self) -> None:
         _db, repo, _fac = _make_repo()
-        row = repo.create_row("run-1", "source-0", 0, {"x": 1}, source_row_index=0, ingest_sequence=0)
+        row = _create_test_row(repo, "run-1", "source-0", 0, {"x": 1}, source_row_index=0, ingest_sequence=0)
         assert row.row_id is not None
         assert len(row.row_id) > 0
 
     def test_row_id_is_used_when_supplied(self) -> None:
         _db, repo, _fac = _make_repo()
-        row = repo.create_row("run-1", "source-0", 0, {"x": 1}, source_row_index=0, ingest_sequence=0, row_id="custom-id")
+        row = _create_test_row(repo, "run-1", "source-0", 0, {"x": 1}, source_row_index=0, ingest_sequence=0, row_id="custom-id")
         assert row.row_id == "custom-id"
 
     def test_row_index_is_stored(self) -> None:
         _db, repo, _fac = _make_repo()
-        row = repo.create_row("run-1", "source-0", 5, {"x": 1}, source_row_index=7, ingest_sequence=11)
+        row = _create_test_row(repo, "run-1", "source-0", 5, {"x": 1}, source_row_index=7, ingest_sequence=11)
         assert row.row_index == 5
 
     def test_create_row_requires_source_scoped_and_ingest_identity(self) -> None:
@@ -272,7 +348,7 @@ class TestCreateRow:
             AuditIntegrityError,
             match=r"run_id='run-1'.*row_id='row-explicit'.*source_node_id='source-0'.*source_row_index.*ingest_sequence",
         ):
-            repo.create_row("run-1", "source-0", 5, {"x": 1}, row_id="row-explicit")
+            repo.create_row_with_token("source-0", 5, {"x": 1}, row_id="row-explicit", coordination_token=_test_leader(repo, "run-1"))
 
     def test_rows_table_insert_with_only_legacy_row_index_raises(self) -> None:
         """The schema must not copy row_index into source_row_index/ingest_sequence."""
@@ -286,7 +362,7 @@ class TestCreateRow:
                     run_id="run-1",
                     source_node_id="source-0",
                     row_index=5,
-                    source_data_hash="hash",
+                    source_data_hash=fake_sha256("hash"),
                     created_at=now,
                 )
             )
@@ -302,7 +378,7 @@ class TestCreateRow:
                     row_id="row-no-position",
                     run_id="run-1",
                     source_node_id="source-0",
-                    source_data_hash="hash",
+                    source_data_hash=fake_sha256("hash"),
                     created_at=now,
                 )
             )
@@ -315,7 +391,6 @@ class TestCreateToken:
         db, repo, _fac = _make_repo()
 
         row, token = repo.create_row_with_token(
-            "run-1",
             "source-0",
             5,
             {"x": 1},
@@ -323,6 +398,7 @@ class TestCreateToken:
             ingest_sequence=11,
             row_id="row-fast",
             token_id="tok-fast",
+            coordination_token=_test_leader(repo, "run-1"),
         )
 
         assert row.row_id == "row-fast"
@@ -361,12 +437,11 @@ class TestCreateToken:
             AuditIntegrityError,
             match=r"run_id='run-1'.*row_id='row-explicit'.*source_node_id='source-0'.*source_row_index.*ingest_sequence",
         ):
-            repo.create_row_with_token("run-1", "source-0", 5, {"x": 1}, row_id="row-explicit")
+            repo.create_row_with_token("source-0", 5, {"x": 1}, row_id="row-explicit", coordination_token=_test_leader(repo, "run-1"))
 
     def test_create_row_with_token_rolls_back_row_when_token_insert_fails(self) -> None:
         db, repo, _fac = _make_repo()
         repo.create_row_with_token(
-            "run-1",
             "source-0",
             0,
             {"x": 1},
@@ -374,11 +449,11 @@ class TestCreateToken:
             ingest_sequence=0,
             row_id="row-ok",
             token_id="tok-dup",
+            coordination_token=_test_leader(repo, "run-1"),
         )
 
         with pytest.raises(IntegrityError):
             repo.create_row_with_token(
-                "run-1",
                 "source-0",
                 1,
                 {"x": 2},
@@ -386,6 +461,7 @@ class TestCreateToken:
                 ingest_sequence=1,
                 row_id="row-rolled-back",
                 token_id="tok-dup",
+                coordination_token=_test_leader(repo, "run-1"),
             )
 
         with db.read_only_connection() as conn:
@@ -395,14 +471,16 @@ class TestCreateToken:
     def test_creates_token_linked_to_row(self) -> None:
         _db, repo, _fac = _make_repo()
         row = _create_test_row(repo, "run-1", "source-0", 0, {"x": 1}, row_id="row-1")
-        token = repo.create_token("row-1")
+        token = repo.create_token("row-1", coordination_token=_test_leader(repo, repo._resolve_run_id_for_row("row-1")))
         assert token.row_id == row.row_id
         assert token.token_id is not None
 
     def test_token_id_is_used_when_supplied(self) -> None:
         _db, repo, _fac = _make_repo()
         _create_test_row(repo, "run-1", "source-0", 0, {"x": 1}, row_id="row-1")
-        token = repo.create_token("row-1", token_id="custom-tok")
+        token = repo.create_token(
+            "row-1", token_id="custom-tok", coordination_token=_test_leader(repo, repo._resolve_run_id_for_row("row-1"))
+        )
         assert token.token_id == "custom-tok"
 
 
@@ -411,21 +489,23 @@ class TestRecordTokenOutcomeTwoAxis:
 
     def test_facords_completed_outcome(self) -> None:
         _db, repo, _fac, _row, tok = _make_repo_with_token()
-        outcome_id = repo.record_token_outcome(
+        outcome_id = repo.record_token_outcome_leader(
             ref=TokenRef(token_id=tok, run_id="run-1"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink-0",
+            coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
         )
         assert outcome_id.startswith("out_")
 
     def test_roundtrip_via_get_token_outcome(self) -> None:
         _db, repo, _fac, _row, tok = _make_repo_with_token()
-        repo.record_token_outcome(
+        repo.record_token_outcome_leader(
             ref=TokenRef(token_id=tok, run_id="run-1"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink-0",
+            coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
         )
         fetched = repo.get_token_outcome(tok)
         assert fetched is not None
@@ -436,11 +516,12 @@ class TestRecordTokenOutcomeTwoAxis:
 
     def test_record_buffered(self) -> None:
         _db, repo, _fac, _row, tok = _make_repo_with_token()
-        repo.record_token_outcome(
+        repo.record_token_outcome_leader(
             ref=TokenRef(token_id=tok, run_id="run-1"),
             outcome=None,
             path=TerminalPath.BUFFERED,
             batch_id="batch-1",
+            coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
         )
 
         fetched = repo.get_token_outcome(tok)
@@ -453,30 +534,33 @@ class TestRecordTokenOutcomeTwoAxis:
     def test_record_illegal_pair_crashes(self) -> None:
         _db, repo, _fac, _row, tok = _make_repo_with_token()
         with pytest.raises(ValueError, match=r"Unhandled \(outcome, path\) pair"):
-            repo.record_token_outcome(
+            repo.record_token_outcome_leader(
                 ref=TokenRef(token_id=tok, run_id="run-1"),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.UNROUTED,
                 sink_name="sink-0",
+                coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
             )
 
     def test_record_default_flow_requires_sink_name(self) -> None:
         _db, repo, _fac, _row, tok = _make_repo_with_token()
         with pytest.raises(ValueError, match="sink_name"):
-            repo.record_token_outcome(
+            repo.record_token_outcome_leader(
                 ref=TokenRef(token_id=tok, run_id="run-1"),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
+                coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
             )
 
     def test_record_filter_dropped_requires_no_extra_fields(self) -> None:
         _db, repo, _fac, _row, tok = _make_repo_with_token()
         with pytest.raises(ValueError, match="forbids sink_name"):
-            repo.record_token_outcome(
+            repo.record_token_outcome_leader(
                 ref=TokenRef(token_id=tok, run_id="run-1"),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.FILTER_DROPPED,
                 sink_name="sink-0",
+                coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
             )
 
     # test_record_expand_parent_requires_expand_group_id retired (D2 flip):
@@ -489,34 +573,37 @@ class TestRecordTokenOutcomeTwoAxis:
     def test_record_sink_discarded_requires_exact_discard_sink_name(self) -> None:
         _db, repo, _fac, _row, tok = _make_repo_with_token()
         with pytest.raises(ValueError, match=DISCARD_SINK_NAME):
-            repo.record_token_outcome(
+            repo.record_token_outcome_leader(
                 ref=TokenRef(token_id=tok, run_id="run-1"),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.SINK_DISCARDED,
                 sink_name="not-discard",
                 error_hash=_ERROR_HASH,
+                coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
             )
 
     def test_record_default_flow_rejects_error_hash(self) -> None:
         _db, repo, _fac, _row, tok = _make_repo_with_token()
         with pytest.raises(ValueError, match="forbids error_hash"):
-            repo.record_token_outcome(
+            repo.record_token_outcome_leader(
                 ref=TokenRef(token_id=tok, run_id="run-1"),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="sink-0",
                 error_hash=_ERROR_HASH,
+                coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
             )
 
     def test_record_buffered_rejects_sink_name(self) -> None:
         _db, repo, _fac, _row, tok = _make_repo_with_token()
         with pytest.raises(ValueError, match="forbids sink_name"):
-            repo.record_token_outcome(
+            repo.record_token_outcome_leader(
                 ref=TokenRef(token_id=tok, run_id="run-1"),
                 outcome=None,
                 path=TerminalPath.BUFFERED,
                 batch_id="batch-1",
                 sink_name="sink-0",
+                coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
             )
 
     @pytest.mark.parametrize("pair", tuple(_TERMINAL_PAIR_FIELD_CONSTRAINTS))
@@ -535,11 +622,12 @@ class TestRecordTokenOutcomeTwoAxis:
                 token_id=tok,
             )
 
-        outcome_id = repo.record_token_outcome(
+        outcome_id = repo.record_token_outcome_leader(
             ref=TokenRef(token_id=tok, run_id="run-1"),
             outcome=outcome,
             path=path,
             **fields,
+            coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
         )
 
         assert outcome_id.startswith("out_")
@@ -548,32 +636,30 @@ class TestRecordTokenOutcomeTwoAxis:
         _db, repo, _fac, _row, tok = _make_repo_with_token()
 
         with pytest.raises(AuditIntegrityError, match=r"I1c.*node_id"):
-            repo.record_token_outcome(
+            repo.record_token_outcome_leader(
                 ref=TokenRef(token_id=tok, run_id="run-1"),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
                 sink_name="sink-0",
                 error_hash=_ERROR_HASH,
+                coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
             )
 
     def test_record_failsink_fallback_rejects_missing_artifact_witness(self) -> None:
         _db, repo, fac, _row, tok = _make_repo_with_token()
         state = fac.execution.begin_node_state(
-            token_id=tok,
-            node_id="sink-0",
-            run_id="run-1",
-            step_index=0,
-            input_data={},
+            token_id=tok, node_id="sink-0", step_index=0, input_data={}, member_token=_test_leader(fac.data_flow, "run-1").membership
         )
         fac.execution.complete_node_state(
             state_id=state.state_id,
             status=NodeStateStatus.COMPLETED,
             output_data={"written": True},
             duration_ms=1.0,
+            member_token=_state_member(fac, state.state_id),
         )
 
         with pytest.raises(AuditIntegrityError, match=r"I1c.*artifact"):
-            repo.record_token_outcome(
+            repo.record_token_outcome_leader(
                 ref=TokenRef(token_id=tok, run_id="run-1"),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
@@ -581,40 +667,42 @@ class TestRecordTokenOutcomeTwoAxis:
                 sink_node_id="sink-0",
                 artifact_id="missing-artifact",
                 error_hash=_ERROR_HASH,
+                coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
             )
 
     def test_record_failsink_fallback_accepts_shared_batch_artifact_witness(self) -> None:
         _db, repo, fac, _row, first_tok = _make_repo_with_token()
         second_row = _create_test_row(repo, "run-1", "source-0", 1, {"name": "second"}, row_id="row-2")
-        second_tok = repo.create_token(second_row.row_id, token_id="tok-2")
+        second_tok = repo.create_token(
+            second_row.row_id, token_id="tok-2", coordination_token=_test_leader(repo, repo._resolve_run_id_for_row(second_row.row_id))
+        )
 
         first_state = fac.execution.begin_node_state(
-            token_id=first_tok,
-            node_id="sink-0",
-            run_id="run-1",
-            step_index=0,
-            input_data={},
+            token_id=first_tok, node_id="sink-0", step_index=0, input_data={}, member_token=_test_leader(fac.data_flow, "run-1").membership
         )
         fac.execution.complete_node_state(
             state_id=first_state.state_id,
             status=NodeStateStatus.COMPLETED,
             output_data={"written": True},
             duration_ms=1.0,
+            member_token=_state_member(fac, first_state.state_id),
         )
         second_state = fac.execution.begin_node_state(
             token_id=second_tok.token_id,
             node_id="sink-0",
-            run_id="run-1",
             step_index=0,
             input_data={},
+            member_token=_test_leader(fac.data_flow, "run-1").membership,
         )
         fac.execution.complete_node_state(
             state_id=second_state.state_id,
             status=NodeStateStatus.COMPLETED,
             output_data={"written": True},
             duration_ms=1.0,
+            member_token=_state_member(fac, second_state.state_id),
         )
-        shared_artifact = fac.execution.register_artifact(
+        shared_artifact = _register_artifact_on(
+            fac,
             run_id="run-1",
             state_id=first_state.state_id,
             sink_node_id="sink-0",
@@ -624,7 +712,7 @@ class TestRecordTokenOutcomeTwoAxis:
             size_bytes=0,
         )
 
-        outcome_id = repo.record_token_outcome(
+        outcome_id = repo.record_token_outcome_leader(
             ref=TokenRef(token_id=second_tok.token_id, run_id="run-1"),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
@@ -632,6 +720,7 @@ class TestRecordTokenOutcomeTwoAxis:
             sink_node_id="sink-0",
             artifact_id=shared_artifact.artifact_id,
             error_hash=_ERROR_HASH,
+            coordination_token=_test_leader(repo, TokenRef(token_id=second_tok.token_id, run_id="run-1").run_id),
         )
 
         assert outcome_id.startswith("out_")
@@ -641,12 +730,13 @@ class TestRecordTokenOutcomeTwoAxis:
         _record_completed_sink_state_with_artifact(fac, run_id="run-1", token_id=tok)
 
         with pytest.raises(AuditIntegrityError, match=r"I3.*discard"):
-            repo.record_token_outcome(
+            repo.record_token_outcome_leader(
                 ref=TokenRef(token_id=tok, run_id="run-1"),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.SINK_DISCARDED,
                 sink_name=DISCARD_SINK_NAME,
                 error_hash=_ERROR_HASH,
+                coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
             )
 
     @pytest.mark.parametrize("pair", tuple(_TERMINAL_PAIR_FIELD_CONSTRAINTS))
@@ -658,11 +748,12 @@ class TestRecordTokenOutcomeTwoAxis:
         fields = _invalid_constraint_fields(pair)
 
         with pytest.raises(ValueError, match="Contract violation"):
-            repo.record_token_outcome(
+            repo.record_token_outcome_leader(
                 ref=TokenRef(token_id=tok, run_id="run-1"),
                 outcome=pair[0],
                 path=pair[1],
                 **fields,
+                coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id),
             )
 
     def test_cross_run_contamination_raises(self) -> None:
@@ -671,11 +762,12 @@ class TestRecordTokenOutcomeTwoAxis:
         # Create a second run
         fac.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         with pytest.raises(AuditIntegrityError, match="Cross-run contamination"):
-            repo.record_token_outcome(
+            repo.record_token_outcome_leader(
                 ref=TokenRef(token_id=tok, run_id="run-2"),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="sink-0",
+                coordination_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-2").run_id),
             )
 
 
@@ -692,13 +784,13 @@ class TestRegisterNodeDirect:
         _db, repo, _fac = _make_repo()
         # The _make_repo already registered nodes. Register one more for test.
         node = repo.register_node(
-            run_id="run-1",
             plugin_name="passthrough",
             node_type=NodeType.TRANSFORM,
             plugin_version="2.0",
             config={"key": "val"},
             node_id="transform-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=_test_leader(repo, "run-1"),
         )
         assert node.node_id == "transform-2"
         assert node.plugin_name == "passthrough"
@@ -714,13 +806,13 @@ class TestRegisterNodeDirect:
         _db, repo, fac = _make_repo(run_id="run-1")
         fac.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         repo.register_node(
-            run_id="run-2",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
-            node_id="source-0",  # Same node_id as run-1
+            node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=_test_leader(repo, "run-2"),
         )
         node_r1 = repo.get_node("source-0", "run-1")
         node_r2 = repo.get_node("source-0", "run-2")
@@ -736,20 +828,17 @@ class TestRegisterNodeDirect:
 
         _db, repo, _fac = _make_repo()
         node = repo.register_node(
-            run_id="run-1",
             plugin_name="azure_blob",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={
                 "account_name": "audit-safe",
                 "api_key": "top-secret-key",
-                "nested": {
-                    "client_secret": "nested-secret",
-                    "connection_string": "postgresql://example.test/db?credential=redacted",
-                },
+                "nested": {"client_secret": "nested-secret", "connection_string": "postgresql://example.test/db?credential=redacted"},
             },
             node_id="source-secret",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=_test_leader(repo, "run-1"),
         )
 
         parsed = json.loads(node.config_json)
@@ -816,7 +905,6 @@ class TestRegisterNodeDirect:
             assert schema_config is not None
             plugin = plugin_by_name[node_info.plugin_name]
             repo.register_node(
-                run_id="run-graph",
                 node_id=node_info.node_id,
                 plugin_name=node_info.plugin_name,
                 node_type=node_info.node_type,
@@ -824,6 +912,7 @@ class TestRegisterNodeDirect:
                 config=node_info.config,
                 determinism=plugin.determinism,
                 schema_config=schema_config,
+                coordination_token=_test_leader(repo, "run-graph"),
             )
 
         source_node_id = next(node.node_id for node in graph.get_nodes() if node.node_type == NodeType.SOURCE)
@@ -851,11 +940,11 @@ class TestRegisterEdgeAndEdgeMapDirect:
     def test_register_edge_and_get_edge_map(self) -> None:
         _db, repo, _fac = _make_repo()
         edge = repo.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
+            coordination_token=_test_leader(repo, "run-1"),
         )
         assert edge.edge_id is not None
         edge_map = repo.get_edge_map("run-1")
@@ -866,26 +955,38 @@ class TestRegisterEdgeAndEdgeMapDirect:
         _db, repo, fac = _make_repo(run_id="run-1")
         fac.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         fac.data_flow.register_node(
-            run_id="run-2",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=_test_leader(fac.data_flow, "run-2"),
         )
         fac.data_flow.register_node(
-            run_id="run-2",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=_test_leader(fac.data_flow, "run-2"),
         )
 
-        repo.register_edge(run_id="run-1", from_node_id="transform-1", to_node_id="sink-0", label="continue", mode=RoutingMode.MOVE)
-        repo.register_edge(run_id="run-2", from_node_id="source-0", to_node_id="sink-0", label="default", mode=RoutingMode.MOVE)
+        repo.register_edge(
+            from_node_id="transform-1",
+            to_node_id="sink-0",
+            label="continue",
+            mode=RoutingMode.MOVE,
+            coordination_token=_test_leader(repo, "run-1"),
+        )
+        repo.register_edge(
+            from_node_id="source-0",
+            to_node_id="sink-0",
+            label="default",
+            mode=RoutingMode.MOVE,
+            coordination_token=_test_leader(repo, "run-2"),
+        )
 
         map_r1 = repo.get_edge_map("run-1")
         assert ("transform-1", "continue") in map_r1
@@ -909,24 +1010,24 @@ class TestRecordValidationErrorDirect:
     def test_returns_verr_prefixed_id(self) -> None:
         _db, repo, _fac = _make_repo()
         error_id = repo.record_validation_error(
-            run_id="run-1",
             node_id="source-0",
             row_data={"name": "alice"},
             error="Field missing",
             schema_mode="strict",
             destination="quarantine",
+            coordination_token=_test_leader(repo, "run-1"),
         )
         assert error_id.startswith("verr_")
 
     def test_roundtrip_via_get_validation_errors_for_run(self) -> None:
         _db, repo, _fac = _make_repo()
         repo.record_validation_error(
-            run_id="run-1",
             node_id="source-0",
             row_data={"x": 1},
             error="bad field",
             schema_mode="observed",
             destination="quarantine",
+            coordination_token=_test_leader(repo, "run-1"),
         )
         errors = repo.get_validation_errors_for_run("run-1")
         assert len(errors) == 1
@@ -953,7 +1054,8 @@ class TestLinkValidationErrorToRow:
     6. Happy-path UPDATE (line 1577-1585): error has row_id NULL,
        caller supplies a valid row_id.
 
-    Per CLAUDE.md, this method is the quarantine-lineage-exactness
+    Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    Model, this method is the quarantine-lineage-exactness
     guarantee — if linkage is wrong the audit trail confidently
     misattributes which row failed which validation. Cross-run, cross-row,
     and silent-relink corruption all fail Tier 1 trust.
@@ -963,16 +1065,15 @@ class TestLinkValidationErrorToRow:
         """row_id NULL + valid linkage → UPDATE persists row_id."""
         _db, repo, _fac, row_id, _tok = _make_repo_with_token()
         error_id = repo.record_validation_error(
-            run_id="run-1",
             node_id="source-0",
             row_data={"name": "alice"},
             error="bad field",
             schema_mode="observed",
             destination="quarantine",
-            # row_id intentionally omitted — error is recorded before quarantine row materialises
+            coordination_token=_test_leader(repo, "run-1"),
         )
 
-        repo.link_validation_error_to_row(run_id="run-1", error_id=error_id, row_id=row_id)
+        _link_error_on(repo, run_id="run-1", error_id=error_id, row_id=row_id)
 
         errors = repo.get_validation_errors_for_run("run-1")
         assert len(errors) == 1
@@ -983,16 +1084,16 @@ class TestLinkValidationErrorToRow:
         """Linking the same (error_id, row_id) twice is an early-return no-op."""
         _db, repo, _fac, row_id, _tok = _make_repo_with_token()
         error_id = repo.record_validation_error(
-            run_id="run-1",
             node_id="source-0",
             row_data={"name": "alice"},
             error="bad field",
             schema_mode="observed",
             destination="quarantine",
+            coordination_token=_test_leader(repo, "run-1"),
         )
-        repo.link_validation_error_to_row(run_id="run-1", error_id=error_id, row_id=row_id)
+        _link_error_on(repo, run_id="run-1", error_id=error_id, row_id=row_id)
         # Second call must not raise and must not relink.
-        repo.link_validation_error_to_row(run_id="run-1", error_id=error_id, row_id=row_id)
+        _link_error_on(repo, run_id="run-1", error_id=error_id, row_id=row_id)
 
         errors = repo.get_validation_errors_for_run("run-1")
         assert len(errors) == 1
@@ -1003,24 +1104,24 @@ class TestLinkValidationErrorToRow:
         _db, repo, _fac, row_id, _tok = _make_repo_with_token()
         other_row = _create_test_row(repo, "run-1", "source-0", 1, {"name": "bob"}, row_id="row-2")
         error_id = repo.record_validation_error(
-            run_id="run-1",
             node_id="source-0",
             row_data={"name": "alice"},
             error="bad field",
             schema_mode="observed",
             destination="quarantine",
+            coordination_token=_test_leader(repo, "run-1"),
         )
-        repo.link_validation_error_to_row(run_id="run-1", error_id=error_id, row_id=row_id)
+        _link_error_on(repo, run_id="run-1", error_id=error_id, row_id=row_id)
 
         with pytest.raises(AuditIntegrityError, match=r"already linked to row .* refusing to relink"):
-            repo.link_validation_error_to_row(run_id="run-1", error_id=error_id, row_id=other_row.row_id)
+            _link_error_on(repo, run_id="run-1", error_id=error_id, row_id=other_row.row_id)
 
     def test_non_existent_error_id_crashes(self) -> None:
         """A fictional error_id is Tier-1 data corruption, not a soft miss."""
         _db, repo, _fac, row_id, _tok = _make_repo_with_token()
 
         with pytest.raises(AuditIntegrityError, match=r"does not exist in validation_errors\. This is Tier 1 data corruption"):
-            repo.link_validation_error_to_row(run_id="run-1", error_id="verr_does_not_exist", row_id=row_id)
+            _link_error_on(repo, run_id="run-1", error_id="verr_does_not_exist", row_id=row_id)
 
     def test_cross_run_via_row_id_crashes(self) -> None:
         """Row from run B + caller-supplied run_id A → crash before any DB lookup of the error."""
@@ -1028,27 +1129,27 @@ class TestLinkValidationErrorToRow:
         # Set up run-B with its own row
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
         factory.data_flow.register_node(
-            run_id="run-B",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-B",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=_test_leader(factory.data_flow, "run-B"),
         )
         row_b = _create_test_row(repo, "run-B", "source-B", 0, {"name": "bob"}, row_id="row-B-1")
         error_id = repo.record_validation_error(
-            run_id="run-A",
             node_id="source-0",
             row_data={"name": "alice"},
             error="bad field",
             schema_mode="observed",
             destination="quarantine",
+            coordination_token=_test_leader(repo, "run-A"),
         )
 
         # Caller claims run-A but supplies a row from run-B → guard fires before error lookup.
         with pytest.raises(AuditIntegrityError, match=r"prevented cross-run contamination: row .* belongs to run 'run-B'"):
-            repo.link_validation_error_to_row(run_id="run-A", error_id=error_id, row_id=row_b.row_id)
+            _link_error_on(repo, run_id="run-A", error_id=error_id, row_id=row_b.row_id)
         # Sanity: the unrelated error in run-A is still present and unbound.
         assert row_id  # row-A is bound to run-A; not part of the assertion but documents fixture intent
 
@@ -1058,17 +1159,17 @@ class TestLinkValidationErrorToRow:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
         # Record the validation error against run-B with no row binding.
         error_id_b = repo.record_validation_error(
-            run_id="run-B",
-            node_id=None,  # avoid composite-FK constraint on (node_id, run_id) for run-B nodes we haven't registered
+            node_id=None,
             row_data={"name": "stranger"},
             error="bad field",
             schema_mode="observed",
             destination="quarantine",
+            coordination_token=_test_leader(repo, "run-B"),
         )
 
         # row_id is in run-A so the row-side guard passes; the error-side guard must catch it.
         with pytest.raises(AuditIntegrityError, match=r"prevented cross-run contamination: error .* belongs to run 'run-B'"):
-            repo.link_validation_error_to_row(run_id="run-A", error_id=error_id_b, row_id=row_id)
+            _link_error_on(repo, run_id="run-A", error_id=error_id_b, row_id=row_id)
 
 
 class TestRecordTransformErrorDirect:
@@ -1082,6 +1183,8 @@ class TestRecordTransformErrorDirect:
             row_data={"name": "test"},
             error_details={"reason": "test_error", "field": "amount", "error": "ZeroDivisionError"},
             destination="quarantine",
+            member_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id).membership,
+            work_item=_test_claim(repo, TokenRef(token_id=tok, run_id="run-1")),
         )
         assert error_id.startswith("terr_")
 
@@ -1098,8 +1201,10 @@ class TestRecordTransformErrorDirect:
                 ref=TokenRef(token_id=tok, run_id="run-1"),
                 transform_id="transform-1",
                 row_data={"name": "test"},
-                error_details={"reason": "banana_error", "error": "this is not a real category"},  # type: ignore[typeddict-item]  # intentionally invalid reason
+                error_details={"reason": "banana_error", "error": "this is not a real category"},
                 destination="quarantine",
+                member_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id).membership,
+                work_item=_test_claim(repo, TokenRef(token_id=tok, run_id="run-1")),
             )
 
     def test_valid_error_reason_passes_tier1_validation(self) -> None:
@@ -1111,6 +1216,8 @@ class TestRecordTransformErrorDirect:
             row_data={"name": "test"},
             error_details={"reason": "api_error", "error": "timeout"},
             destination="quarantine",
+            member_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id).membership,
+            work_item=_test_claim(repo, TokenRef(token_id=tok, run_id="run-1")),
         )
         assert error_id.startswith("terr_")
 
@@ -1119,13 +1226,13 @@ class TestRecordTransformErrorDirect:
         _db, repo, fac, _row, tok = _make_repo_with_token(run_id="run-1")
         fac.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         fac.data_flow.register_node(
-            run_id="run-2",
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id="transform-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=_test_leader(fac.data_flow, "run-2"),
         )
 
         with pytest.raises(AuditIntegrityError, match="Cross-run contamination"):
@@ -1135,7 +1242,93 @@ class TestRecordTransformErrorDirect:
                 row_data={"name": "test"},
                 error_details={"reason": "test_error", "field": "f", "error": "E"},
                 destination="quarantine",
+                member_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-2").run_id).membership,
+                work_item=_test_claim(repo, TokenRef(token_id=tok, run_id="run-2")),
             )
+
+
+class TestInsertBatchTransformErrorsOn:
+    """The batch twin of record_transform_error: one row per member of a FAILED batch.
+
+    A connection-level helper: ``ExecutionRepository.complete_aggregation_failure``
+    calls it inside the verdict's one transaction. Its three Tier-1 write guards
+    each need a test of their own: a regression that dropped one would
+    otherwise let an unknown category, a foreign run's reference or an empty
+    batch reach ``transform_errors`` (which has no CHECK constraint for the
+    category) with nothing going red.
+    """
+
+    @staticmethod
+    def _transform_error_rows(db: LandscapeDB) -> list[Any]:
+        with db.read_only_connection() as conn:
+            return list(conn.execute(select(transform_errors_table)).all())
+
+    def test_writes_one_row_per_member_in_order(self) -> None:
+        db, repo, _fac, _row, tok = _make_repo_with_token()
+        second = repo.create_token("row-1", token_id="tok-2", coordination_token=_test_leader(repo, "run-1"))
+        reason: TransformErrorReason = {"reason": "batch_failed", "error": "flush failed"}
+
+        with db.write_connection() as conn:
+            error_ids = insert_batch_transform_errors_on(
+                conn,
+                run_id="run-1",
+                members=[
+                    (TokenRef(token_id=tok, run_id="run-1"), make_pipeline_row({"name": "a"})),
+                    (TokenRef(token_id=second.token_id, run_id="run-1"), make_pipeline_row({"name": "b"})),
+                ],
+                transform_id="transform-1",
+                error_details=reason,
+                destination="quarantine",
+            )
+
+        rows = {row.error_id: row for row in self._transform_error_rows(db)}
+        assert [rows[error_id].token_id for error_id in error_ids] == [tok, second.token_id]
+        assert {json.loads(rows[error_id].error_details_json)["reason"] for error_id in error_ids} == {"batch_failed"}
+        assert {rows[error_id].destination for error_id in error_ids} == {"quarantine"}
+
+    def test_invalid_error_reason_crashes_at_tier1_boundary(self) -> None:
+        db, _repo, _fac, _row, tok = _make_repo_with_token()
+        with pytest.raises(AuditIntegrityError, match="Invalid TransformErrorCategory 'banana_error'"), db.write_connection() as conn:
+            insert_batch_transform_errors_on(
+                conn,
+                run_id="run-1",
+                members=[(TokenRef(token_id=tok, run_id="run-1"), make_pipeline_row({"name": "test"}))],
+                transform_id="transform-1",
+                error_details=cast(TransformErrorReason, {"reason": "banana_error", "error": "not a real category"}),
+                destination="quarantine",
+            )
+        assert self._transform_error_rows(db) == []
+
+    def test_a_reference_outside_the_authority_run_is_refused(self) -> None:
+        """Checked against the verdict's run before anything is written.
+
+        The reference names run-2 while the writing authority is run-1's.
+        """
+        db, _repo, fac, _row, tok = _make_repo_with_token(run_id="run-1")
+        fac.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
+        with pytest.raises(AuditIntegrityError, match="does not belong to the authority's run"), db.write_connection() as conn:
+            insert_batch_transform_errors_on(
+                conn,
+                run_id="run-1",
+                members=[(TokenRef(token_id=tok, run_id="run-2"), make_pipeline_row({"name": "test"}))],
+                transform_id="transform-1",
+                error_details={"reason": "batch_failed", "error": "flush failed"},
+                destination="quarantine",
+            )
+        assert self._transform_error_rows(db) == []
+
+    def test_an_empty_member_set_is_refused(self) -> None:
+        db, _repo, _fac, _row, _tok = _make_repo_with_token()
+        with pytest.raises(AuditIntegrityError, match="a failed batch has at least one member"), db.write_connection() as conn:
+            insert_batch_transform_errors_on(
+                conn,
+                run_id="run-1",
+                members=[],
+                transform_id="transform-1",
+                error_details={"reason": "batch_failed", "error": "flush failed"},
+                destination="quarantine",
+            )
+        assert self._transform_error_rows(db) == []
 
 
 # ===========================================================================
@@ -1185,277 +1378,103 @@ def _count_token_parents(db: LandscapeDB) -> int:
 class TestForkTokenAtomicity:
     """fork_token must be all-or-nothing: children + parent outcome together."""
 
-    def test_fork_rollback_on_failure_leaves_zero_partial_state(self) -> None:
-        """If transaction fails mid-way, no children and no parent outcome persist."""
+    def test_fork_rollback_on_failure_leaves_zero_partial_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
         db, repo, _fac, row_id, tok_id = _make_repo_with_token()
-        tokens_before = _count_tokens(db)
-        outcomes_before = _count_token_outcomes(db)
-        parents_before = _count_token_parents(db)
-
-        # Inject failure: patch _db.connection to raise after child inserts
-        original_connection = repo._db.write_connection
-        call_count = 0
-
-        @contextmanager
-        def failing_connection():
-            with original_connection() as conn:
-                original_execute = conn.execute
-                nonlocal call_count
-                call_count = 0
-
-                def patched_execute(stmt, *args: Any, **kwargs: Any):
-                    nonlocal call_count
-                    call_count += 1
-                    # Let child token + parent relationship inserts through (2 per child)
-                    # Fail when recording the parent FORKED outcome (5th call for 2 branches)
-                    if call_count >= 5:
-                        raise RuntimeError("Injected failure mid-transaction")
-                    return original_execute(stmt, *args, **kwargs)
-
-                conn.execute = patched_execute
-                yield conn
-
-        repo._db.write_connection = failing_connection  # type: ignore[method-assign]
-
+        ref = TokenRef(token_id=tok_id, run_id="run-1")
+        leader = _test_leader(repo, "run-1")
+        item = _test_claim(repo, ref)
+        before = (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db))
+        intercepted = _intercept_insert(monkeypatch, "token_outcomes", zero_rowcount=False)
         with pytest.raises(RuntimeError, match="Injected failure"):
-            repo.fork_token(
-                parent_ref=TokenRef(token_id=tok_id, run_id="run-1"),
-                row_id=row_id,
-                branches=["a", "b"],
-            )
-
-        # Verify: zero partial state — all counts unchanged
-        assert _count_tokens(db) == tokens_before
-        assert _count_token_outcomes(db) == outcomes_before
-        assert _count_token_parents(db) == parents_before
+            repo.fork_token(ref, row_id, ["a", "b"], member_token=leader.membership, work_item=item)
+        assert intercepted == ["token_outcomes"]
+        assert (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db)) == before
 
 
 class TestCoalesceTokensAtomicity:
     """coalesce_tokens must be all-or-nothing: merged token + parent links together."""
 
-    def test_coalesce_rollback_on_failure_leaves_zero_partial_state(self) -> None:
-        """If transaction fails mid-way, no merged token and no parent links persist."""
+    def test_coalesce_rollback_on_failure_leaves_zero_partial_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
         db, repo, _fac, row_id, tok_id = _make_repo_with_token()
-
-        # Fork first to get two child tokens to coalesce
-        children, _fg = repo.fork_token(
-            parent_ref=TokenRef(token_id=tok_id, run_id="run-1"),
-            row_id=row_id,
-            branches=["a", "b"],
-        )
-        child_ids = [c.token_id for c in children]
-
-        tokens_before = _count_tokens(db)
-        parents_before = _count_token_parents(db)
-
-        # Inject failure: raise after merged token insert but before parent links
-        original_connection = repo._db.write_connection
-        call_count = 0
-
-        @contextmanager
-        def failing_connection():
-            with original_connection() as conn:
-                original_execute = conn.execute
-                nonlocal call_count
-                call_count = 0
-
-                def patched_execute(stmt, *args: Any, **kwargs: Any):
-                    nonlocal call_count
-                    call_count += 1
-                    # Let merged token insert through (1st call), fail on parent link (2nd)
-                    if call_count >= 2:
-                        raise RuntimeError("Injected failure mid-transaction")
-                    return original_execute(stmt, *args, **kwargs)
-
-                conn.execute = patched_execute
-                yield conn
-
-        repo._db.write_connection = failing_connection  # type: ignore[method-assign]
-
+        ref = TokenRef(token_id=tok_id, run_id="run-1")
+        leader = _test_leader(repo, "run-1")
+        item = _test_claim(repo, ref)
+        children, _group = repo.fork_token(ref, row_id, ["a", "b"], member_token=leader.membership, work_item=item)
+        refs = [TokenRef(child.token_id, "run-1") for child in children]
+        before = (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db))
+        intercepted = _intercept_insert(monkeypatch, "token_parents", zero_rowcount=False)
         with pytest.raises(RuntimeError, match="Injected failure"):
-            repo.coalesce_tokens(
-                parent_refs=[TokenRef(token_id=cid, run_id="run-1") for cid in child_ids],
-                row_id=row_id,
-                merged_payload={"merged": True},
-                merged_contract=_MINIMAL_CONTRACT,
-            )
-
-        # Verify: zero partial state
-        assert _count_tokens(db) == tokens_before
-        assert _count_token_parents(db) == parents_before
+            repo.coalesce_tokens(refs, row_id, {"merged": True}, merged_contract=_MINIMAL_CONTRACT, coordination_token=leader)
+        assert intercepted == ["token_parents"]
+        assert (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db)) == before
 
 
 class TestExpandTokenAtomicity:
     """expand_token must be all-or-nothing: children + parent outcome together."""
 
-    def test_expand_rollback_on_failure_leaves_zero_partial_state(self) -> None:
-        """If transaction fails mid-way, no child tokens and no parent outcome persist."""
+    def test_expand_rollback_on_failure_leaves_zero_partial_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
         db, repo, _fac, row_id, tok_id = _make_repo_with_token()
-        tokens_before = _count_tokens(db)
-        outcomes_before = _count_token_outcomes(db)
-        parents_before = _count_token_parents(db)
-
-        # Inject failure: raise after child inserts but before parent outcome
-        original_connection = repo._db.write_connection
-        call_count = 0
-
-        @contextmanager
-        def failing_connection():
-            with original_connection() as conn:
-                original_execute = conn.execute
-                nonlocal call_count
-                call_count = 0
-
-                def patched_execute(stmt, *args: Any, **kwargs: Any):
-                    nonlocal call_count
-                    call_count += 1
-                    # For 3 children: 6 calls (token insert + parent link each)
-                    # 7th call is the parent EXPANDED outcome — fail here
-                    if call_count >= 7:
-                        raise RuntimeError("Injected failure mid-transaction")
-                    return original_execute(stmt, *args, **kwargs)
-
-                conn.execute = patched_execute
-                yield conn
-
-        repo._db.write_connection = failing_connection  # type: ignore[method-assign]
-
+        ref = TokenRef(token_id=tok_id, run_id="run-1")
+        leader = _test_leader(repo, "run-1")
+        before = (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db))
+        intercepted = _intercept_insert(monkeypatch, "token_outcomes", zero_rowcount=False)
         with pytest.raises(RuntimeError, match="Injected failure"):
             repo.expand_token(
-                parent_ref=TokenRef(token_id=tok_id, run_id="run-1"),
-                row_id=row_id,
-                child_payloads=[{"item": i} for i in range(3)],
-                step_in_pipeline=2,
-                output_contract=_MINIMAL_CONTRACT,
+                ref, row_id, [{"item": i} for i in range(3)], output_contract=_MINIMAL_CONTRACT, member_token=leader.membership
             )
-
-        # Verify: zero partial state
-        assert _count_tokens(db) == tokens_before
-        assert _count_token_outcomes(db) == outcomes_before
-        assert _count_token_parents(db) == parents_before
+        assert intercepted == ["token_outcomes"]
+        assert (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db)) == before
 
 
 class TestForkTokenRowcountValidation:
     """fork_token must validate rowcount on every insert — phantom tokens are audit corruption."""
 
     def test_fork_raises_on_zero_rowcount_token_insert(self) -> None:
-        """If a token insert silently affects zero rows, AuditIntegrityError is raised."""
-        _db, repo, _fac, row_id, tok_id = _make_repo_with_token()
-
-        original_connection = repo._db.write_connection
-
-        @contextmanager
-        def zero_rowcount_connection():
-            with original_connection() as conn:
-                original_execute = conn.execute
-                insert_count = 0
-
-                def patched_execute(stmt, *args: Any, **kwargs: Any):
-                    nonlocal insert_count
-                    result = original_execute(stmt, *args, **kwargs)
-                    # Only intercept INSERT statements (not SELECT for validation)
-                    if stmt.is_insert:
-                        insert_count += 1
-                        # First insert is child token — return zero rowcount
-                        if insert_count == 1:
-                            return _RowcountResult(rowcount=0)
-                    return result
-
-                conn.execute = patched_execute
-                yield conn
-
-        repo._db.write_connection = zero_rowcount_connection  # type: ignore[method-assign]
-
+        db, repo, _fac, row_id, tok_id = _make_repo_with_token()
+        ref = TokenRef(token_id=tok_id, run_id="run-1")
+        leader = _test_leader(repo, "run-1")
+        item = _test_claim(repo, ref)
+        before = (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db))
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql("CREATE TRIGGER omit_child_tokens BEFORE INSERT ON tokens BEGIN SELECT RAISE(IGNORE); END")
         with pytest.raises(AuditIntegrityError, match="zero rows"):
-            repo.fork_token(
-                parent_ref=TokenRef(token_id=tok_id, run_id="run-1"),
-                row_id=row_id,
-                branches=["a"],
-            )
+            repo.fork_token(ref, row_id, ["a", "b"], member_token=leader.membership, work_item=item)
+        assert (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db)) == before
 
 
 class TestCoalesceTokensRowcountValidation:
     """coalesce_tokens must validate rowcount on every insert."""
 
-    def test_coalesce_raises_on_zero_rowcount_token_insert(self) -> None:
-        """If merged token insert affects zero rows, AuditIntegrityError is raised."""
-        _db, repo, _fac, row_id, tok_id = _make_repo_with_token()
-
-        # Fork first to get children to coalesce
-        children, _fg = repo.fork_token(
-            parent_ref=TokenRef(token_id=tok_id, run_id="run-1"),
-            row_id=row_id,
-            branches=["a", "b"],
-        )
-        child_ids = [c.token_id for c in children]
-
-        original_connection = repo._db.write_connection
-
-        @contextmanager
-        def zero_rowcount_connection():
-            with original_connection() as conn:
-                original_execute = conn.execute
-                insert_count = 0
-
-                def patched_execute(stmt, *args: Any, **kwargs: Any):
-                    nonlocal insert_count
-                    result = original_execute(stmt, *args, **kwargs)
-                    if stmt.is_insert:
-                        insert_count += 1
-                        if insert_count == 1:
-                            return _RowcountResult(rowcount=0)
-                    return result
-
-                conn.execute = patched_execute
-                yield conn
-
-        repo._db.write_connection = zero_rowcount_connection  # type: ignore[method-assign]
-
+    def test_coalesce_raises_on_zero_rowcount_token_insert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        db, repo, _fac, row_id, tok_id = _make_repo_with_token()
+        ref = TokenRef(token_id=tok_id, run_id="run-1")
+        leader = _test_leader(repo, "run-1")
+        item = _test_claim(repo, ref)
+        children, _group = repo.fork_token(ref, row_id, ["a", "b"], member_token=leader.membership, work_item=item)
+        refs = [TokenRef(child.token_id, "run-1") for child in children]
+        before = (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db))
+        intercepted = _intercept_insert(monkeypatch, "tokens", zero_rowcount=True)
         with pytest.raises(AuditIntegrityError, match="zero rows"):
-            repo.coalesce_tokens(
-                parent_refs=[TokenRef(token_id=cid, run_id="run-1") for cid in child_ids],
-                row_id=row_id,
-                merged_payload={"merged": True},
-                merged_contract=_MINIMAL_CONTRACT,
-            )
+            repo.coalesce_tokens(refs, row_id, {"merged": True}, merged_contract=_MINIMAL_CONTRACT, coordination_token=leader)
+        assert intercepted == ["tokens"]
+        assert (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db)) == before
 
 
 class TestExpandTokenRowcountValidation:
     """expand_token must validate rowcount on every insert."""
 
     def test_expand_raises_on_zero_rowcount_token_insert(self) -> None:
-        """If child token insert affects zero rows, AuditIntegrityError is raised."""
-        _db, repo, _fac, row_id, tok_id = _make_repo_with_token()
-
-        original_connection = repo._db.write_connection
-
-        @contextmanager
-        def zero_rowcount_connection():
-            with original_connection() as conn:
-                original_execute = conn.execute
-                insert_count = 0
-
-                def patched_execute(stmt, *args: Any, **kwargs: Any):
-                    nonlocal insert_count
-                    result = original_execute(stmt, *args, **kwargs)
-                    if stmt.is_insert:
-                        insert_count += 1
-                        if insert_count == 1:
-                            return _RowcountResult(rowcount=0)
-                    return result
-
-                conn.execute = patched_execute
-                yield conn
-
-        repo._db.write_connection = zero_rowcount_connection  # type: ignore[method-assign]
-
+        db, repo, _fac, row_id, tok_id = _make_repo_with_token()
+        ref = TokenRef(token_id=tok_id, run_id="run-1")
+        leader = _test_leader(repo, "run-1")
+        before = (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db))
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql("CREATE TRIGGER omit_child_tokens BEFORE INSERT ON tokens BEGIN SELECT RAISE(IGNORE); END")
         with pytest.raises(AuditIntegrityError, match="zero rows"):
             repo.expand_token(
-                parent_ref=TokenRef(token_id=tok_id, run_id="run-1"),
-                row_id=row_id,
-                child_payloads=[{"item": 1}, {"item": 2}],
-                output_contract=_MINIMAL_CONTRACT,
+                ref, row_id, [{"item": i} for i in range(3)], output_contract=_MINIMAL_CONTRACT, member_token=leader.membership
             )
+        assert (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db)) == before
 
 
 # ===========================================================================
@@ -1578,7 +1597,8 @@ class TestValidateTokenRowOwnership:
     the comparison would go undetected because the integration tests
     cannot construct the bad input.
 
-    Per CLAUDE.md, this method is a Tier-1 audit-integrity guard:
+    Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    Model, this method is a Tier-1 audit-integrity guard:
     cross-row lineage corruption produces a valid-looking audit trail
     attributing the wrong source data to a terminal decision —
     `explain()` would return a confidently-wrong answer about which
@@ -1646,13 +1666,13 @@ class TestValidateTokenRowOwnership:
         _db, repo, factory, row_a, tok_a = _make_repo_with_token(run_id="run-A")
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
         factory.data_flow.register_node(
-            run_id="run-B",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-B",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=_test_leader(factory.data_flow, "run-B"),
         )
         row_b = _create_test_row(repo, "run-B", "source-B", 0, {"name": "stranger"}, row_id="row-B-1")
         assert row_b.row_id != row_a  # premise: rows from different runs never collide
@@ -1705,10 +1725,11 @@ class TestAdr019DeferredInvariantSweep:
         frames, which is exactly what makes this outcome "orphan": no child
         token carries an innermost FORK frame minted by this parent.
         """
-        repo.record_token_outcome(
+        repo.record_token_outcome_leader(
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.FORK_PARENT,
+            coordination_token=_test_leader(repo, TokenRef(token_id=token_id, run_id=run_id).run_id),
         )
 
     @staticmethod
@@ -1727,20 +1748,18 @@ class TestAdr019DeferredInvariantSweep:
         sweep treats it as fulfilled (non-orphan).
         """
         factory.execution.create_batch(
-            run_id=run_id,
-            aggregation_node_id="transform-1",
-            batch_id=batch_id,
+            aggregation_node_id="transform-1", batch_id=batch_id, coordination_token=_test_leader(factory.data_flow, run_id)
         )
-        repo.record_token_outcome(
+        repo.record_token_outcome_leader(
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.BATCH_CONSUMED,
             batch_id=batch_id,
+            coordination_token=_test_leader(repo, TokenRef(token_id=token_id, run_id=run_id).run_id),
         )
         if complete_batch:
             factory.execution.complete_batch(
-                batch_id=batch_id,
-                status=BatchStatus.COMPLETED,
+                batch_id=batch_id, status=BatchStatus.COMPLETED, coordination_token=_test_leader(factory.data_flow, run_id)
             )
 
     # -- find_orphaned_transient_parents ------------------------------
@@ -1765,13 +1784,16 @@ class TestAdr019DeferredInvariantSweep:
             parent_ref=TokenRef(token_id=tok, run_id="run-1"),
             row_id=row_id,
             branches=["a"],
+            member_token=_test_leader(repo, TokenRef(token_id=tok, run_id="run-1").run_id).membership,
+            work_item=_test_claim(repo, TokenRef(token_id=tok, run_id="run-1")),
         )
         # Record a terminal outcome on the child so the EXISTS subquery finds it.
-        repo.record_token_outcome(
+        repo.record_token_outcome_leader(
             ref=TokenRef(token_id=children[0].token_id, run_id="run-1"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink-0",
+            coordination_token=_test_leader(repo, TokenRef(token_id=children[0].token_id, run_id="run-1").run_id),
         )
 
         orphans = repo.find_orphaned_transient_parents("run-1")
@@ -1858,7 +1880,7 @@ class TestAdr019DeferredInvariantSweep:
         # Plant both an orphan FORK_PARENT (I1a) and an orphan BATCH_CONSUMED (I1b)
         # on the SAME token by creating a sibling for the batch case.
         self._plant_orphan_fork_parent(repo, run_id="run-1", row_id="row-1", token_id=tok)
-        sibling = repo.create_token("row-1", token_id="tok-2")
+        sibling = repo.create_token("row-1", token_id="tok-2", coordination_token=_test_leader(repo, repo._resolve_run_id_for_row("row-1")))
         self._plant_orphan_batch_consumed(repo, factory, run_id="run-1", token_id=sibling.token_id, batch_id="batch-orphan")
 
         # I1a is checked first, so we must see its message — not I1b's.

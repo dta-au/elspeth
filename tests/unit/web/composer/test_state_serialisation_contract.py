@@ -156,22 +156,22 @@ def _collector_node(**overrides: Any) -> dict[str, Any]:
     [
         pytest.param(
             [],
-            "ee343b52681824a7072806b58282abb520291b99185c62c6e65973d93d651123",
+            "828a88393b1030e7f3da9b6dddb47741d5b1281219730b1baf436c67dbc46a0a",
             id="no_structural_nodes",
         ),
         pytest.param(
             [_structural_node()],
-            "13b7552baa393c7b14d01e2590df1c209383875fa7bda07e54872e3caf972849",
+            "df869bb9e5cf1d45e55d64da5172b1289edfc8f6b94e2422321f600cb5085b9c",
             id="coalesce_without_merge_or_policy",
         ),
         pytest.param(
             [_structural_node(id="union_rows", node_type="row_union")],
-            "ab0074986f55de9f78f79946b460e32859b4fe76362e4cbd310b5838e70e7fa2",
+            "2d105f15533919a2b66fa1f0d3ac76d9445aa3b80890ffec0dee203c5b15e5f8",
             id="row_union_with_list_branches",
         ),
         pytest.param(
             [_collector_node()],
-            "6cf8e9ffd32c44bb7ca2702865a1c89d5ae680469a06f47ed3f21d01821e2949",
+            "f46a31aa72cf7d1e1787938f4f38e5b45fa2e4dd1a6705be43eb5dc902b535cb",
             id="collector_with_scope_binding",
         ),
     ],

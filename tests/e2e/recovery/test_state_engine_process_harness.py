@@ -22,7 +22,7 @@ from tests.e2e.recovery.harness import (
     _run_to_interrupted_checkpoint,
     spawn_database_process_at_seam,
 )
-from tests.fixtures.landscape import expire_lease
+from tests.fixtures.landscape import expire_lease, member_token_for
 
 _PROCESS_TIMEOUT_SECONDS = 20.0
 
@@ -36,11 +36,10 @@ def _heartbeat_crashed_lease(
 ) -> None:
     """Child action: cross the production heartbeat boundary, then pause."""
     RecorderFactory(db).scheduler.heartbeat_lease(
-        run_id=run_id,
         work_item_id=work_item_id,
         lease_owner=worker_id,
         lease_seconds=2 * _DEFAULT_LEASE_SECONDS,
-        membership_fenced=True,
+        member_token=member_token_for(db.engine, run_id=run_id, worker_id=worker_id),
     )
 
 

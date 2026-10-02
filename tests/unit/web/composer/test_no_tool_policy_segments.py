@@ -102,12 +102,12 @@ def test_exact_canonical_empty_model_notice_retains_trusted_chrome() -> None:
 
 
 def test_completion_advisory_notice_is_evidence_scoped_trusted_copy() -> None:
-    content = compose_advisor_signoff_pending_message("")
+    content = compose_advisor_signoff_pending_message("", prose_withheld=True)
 
     assert visible_message_segments(content=content, raw_content="") == (
         TrustedSystemNoticeSegment(
             "Completion advisory review did not clear after the available attempts. "
-            "Composer completion is withheld. Review the pipeline; validation and the advisory review run again on your next message. "
+            "Composer completion is withheld. Review the pipeline; validation and the advisory review run again after your next pipeline change. "
             "ELSPETH withheld the composer's own summary of this exchange; "
             "verify the pipeline before assuming every requested change was applied."
         ),
@@ -322,26 +322,35 @@ _WRAPPED_TEMPLATE_ROUND_TRIP_CASES = [
         {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
         id="_INTERPRETATION_REVIEW_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL",
     ),
+    # The ``_PUBLISHED_`` notices: an END-gate block publishes the model's prose
+    # beside the notice, so these carry no withheld-prose disclosure.
     pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL,
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINDINGS_SUFFIX_WITH_DETAIL,
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE,
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
+        {"detail": "a validator objection"},
+        id="_ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINDINGS_SUFFIX_WITH_DETAIL",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_WITH_DETAIL,
         no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_FOOTER,
         {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
-        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL",
+        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_WITH_DETAIL",
     ),
     pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL,
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_WITH_DETAIL,
         no_tool_policy._PREFLIGHT_NOTICE_HEADER,
-        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER,
         {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
-        id="_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL",
+        id="_ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_WITH_DETAIL",
     ),
     pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL,
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_SUFFIX_WITH_DETAIL,
         no_tool_policy._PREFLIGHT_NOTICE_HEADER,
-        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER,
         {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
-        id="_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL",
+        id="_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_SUFFIX_WITH_DETAIL",
     ),
 ]
 
@@ -371,6 +380,26 @@ class TestWrappedDiagnosticWireShapeLinkage:
         assert isinstance(segments[1], AssistantTextSegment)
         assert segments[1].content.startswith("Cause: ")
         assert segments[2] == TrustedSystemNoticeSegment(footer)
+
+    @pytest.mark.parametrize(
+        ("template", "header", "footer", "format_kwargs"),
+        _WRAPPED_TEMPLATE_ROUND_TRIP_CASES,
+    )
+    def test_the_recognizer_attributes_every_wrapped_suffix_to_its_own_shape(
+        self, template: str, header: str, footer: str, format_kwargs: dict[str, str]
+    ) -> None:
+        """Through the WHOLE recognizer, not the splitter alone.
+
+        Several shapes share a header, and the pending-handoff findings shape
+        exists twice, differing only by the withheld-prose disclosure in its
+        header. The splitter test above cannot see one arm claiming another's
+        suffix; this one can — a stolen suffix would come back under the wrong
+        header or footer.
+        """
+        segments = no_tool_policy._canonical_trusted_suffix_segments(template.format(**format_kwargs))
+        assert segments is not None
+        assert segments[0] == TrustedSystemNoticeSegment(header)
+        assert segments[-1] == TrustedSystemNoticeSegment(footer)
 
     def test_the_round_trip_parametrization_covers_every_wrapped_template(self) -> None:
         """The case list above is hand-maintained — this is what makes it complete.
@@ -413,6 +442,11 @@ class TestWrappedDiagnosticWireShapeLinkage:
 # family stayed on hand-maintained equality checks until elspeth-25f7b757e7).
 _BARE_SUFFIX_ROUND_TRIP_CASES = [
     pytest.param(
+        no_tool_policy._REVIEW_REPLY_UNAVAILABLE_SUFFIX,
+        no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE,
+        id="_REVIEW_REPLY_UNAVAILABLE_SUFFIX",
+    ),
+    pytest.param(
         no_tool_policy._EMPTY_STATE_FINALIZE_SUFFIX,
         no_tool_policy._EMPTY_STATE_NOTICE_BODY,
         id="_EMPTY_STATE_FINALIZE_SUFFIX",
@@ -421,41 +455,6 @@ _BARE_SUFFIX_ROUND_TRIP_CASES = [
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX,
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE,
         id="_ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
-        id="_ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE,
-        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE,
-        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE,
-        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE,
-        f"{no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER}",
-        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE,
-        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER}",
-        id="_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE",
-    ),
-    pytest.param(
-        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE,
-        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER}",
-        id="_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE",
     ),
     pytest.param(
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX,
@@ -471,6 +470,72 @@ _BARE_SUFFIX_ROUND_TRIP_CASES = [
         no_tool_policy._PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE,
         f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._PREFLIGHT_NOTICE_FOOTER}",
         id="_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE",
+    ),
+    # The END-gate blocked notices, published beside the model's reply.
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
+        id="_ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
+        id="_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE,
+        id="_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE,
+        id="_ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE,
+        id="_ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE,
+        id="_ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_NOTICE,
+        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_NOTICE,
+        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_PUBLISHED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_PUBLISHED_NOTICE,
+        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_PUBLISHED_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_BARE,
+        f"{no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_FOOTER}",
+        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_BARE",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_BARE,
+        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER}",
+        id="_ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_BARE",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_SUFFIX_BARE,
+        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER}",
+        id="_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_SUFFIX_BARE",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE,
+        id="_ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINALIZE_SUFFIX",
     ),
 ]
 
@@ -534,17 +599,17 @@ class TestBareTrustedSuffixCompleteness:
 _RED_COMPOSER_BARE_FALLBACK_CASES = [
     pytest.param(
         no_tool_policy.compose_advisor_signoff_unrepairable_red_message,
-        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_BARE,
         id="unrepairable",
     ),
     pytest.param(
         no_tool_policy.compose_advisor_signoff_flagged_red_message,
-        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE,
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_BARE,
         id="flagged",
     ),
     pytest.param(
         no_tool_policy.compose_advisor_signoff_unrendered_red_message,
-        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE,
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_SUFFIX_BARE,
         id="unrendered",
     ),
 ]
@@ -568,6 +633,9 @@ class TestRedComposerBareFallbackPairing:
         message = composer("model prose", runtime_result=detail_less_red)
 
         assert message == "model prose" + expected_bare_suffix
+        # The reply is published beside this notice, so it must not claim the
+        # reply was withheld.
+        assert no_tool_policy.ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in message
 
 
 class TestInterpretationReviewHandoffSegments:
@@ -641,7 +709,7 @@ class TestInterpretationReviewHandoffSegments:
         """The suffix is the operator's only sight of a preflight suggestion.
 
         ``_composer_persisted_validation`` projects runtime-preflight errors to
-        ``[error.message]``, dropping ``ValidationError.suggestion`` before it
+        owned message/code/component records, dropping ``ValidationError.suggestion`` before it
         reaches any structured surface. When this shape REPLACES the
         preflight-failure suffix (the staged-review cross-turn arm) it must
         therefore carry the suggestion, and carry it as untrusted text.
@@ -677,3 +745,82 @@ class TestInterpretationReviewHandoffSegments:
         content = compose_interpretation_review_handoff_message(prose) + " altered"
 
         assert visible_message_segments(content=content, raw_content=prose) == (AssistantTextSegment(content),)
+
+
+def test_review_reply_unavailable_is_trusted_alongside_handoff() -> None:
+    handoff = no_tool_policy.compose_interpretation_review_handoff_message("")
+    content = no_tool_policy.compose_review_reply_unavailable_message(handoff)
+    segments = no_tool_policy.visible_message_segments(content=content, raw_content="")
+    assert len(segments) == 2
+    assert all(isinstance(segment, no_tool_policy.TrustedSystemNoticeSegment) for segment in segments)
+    assert segments[-1].content == no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE
+
+
+# Ruling 2026-09-22 (elspeth-032ec69c41): the END gate stands aside for an
+# unchanged graph whose prior state row carries a GRAPH REJECTION, so that
+# block is re-reviewed only after the next pipeline change. Since 41aeaeac0 a
+# decision persists even on an unchanged turn, so the retry rule follows the
+# block's CAUSE, not whether this turn moved the graph: every rendered-flag
+# notice (the ABSENT "not re-verified" one included) says "after your next
+# pipeline change"; unrendered verdicts and message rejections are
+# re-reviewed on the next message. Each cause's copy must say its own truth.
+_NOTICES_FOR_A_GRAPH_REJECTION = (
+    no_tool_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER,
+    no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
+)
+_NOTICES_RE_REVIEWED_ON_THE_NEXT_MESSAGE = (
+    no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER,
+    no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE,
+    no_tool_policy._ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE,
+)
+
+
+@pytest.mark.parametrize("notice", _NOTICES_FOR_A_GRAPH_REJECTION)
+def test_graph_rejection_notice_promises_a_review_after_a_pipeline_change(notice: str) -> None:
+    assert "after your next pipeline change" in notice
+    assert "on your next message" not in notice
+    # A retry on an unchanged graph now hits the skip, so no persisted-block
+    # notice may offer "Retry the request" as a way to a fresh verdict.
+    assert "Retry the request" not in notice
+
+
+@pytest.mark.parametrize("notice", _NOTICES_RE_REVIEWED_ON_THE_NEXT_MESSAGE)
+def test_re_reviewed_notice_promises_a_review_on_the_next_message(notice: str) -> None:
+    assert "on your next message" in notice
+    assert "pipeline change" not in notice
+
+
+@pytest.mark.parametrize(
+    ("reason", "findings", "authored"),
+    [
+        ("flagged_final_pass", "", False),
+        ("flagged_final_pass", "field 'prompt_template' on step 'rate'", True),
+        ("flagged_no_repair", "", False),
+    ],
+)
+def test_durable_blocker_wording_promises_a_review_after_a_pipeline_change(reason: str, findings: str, authored: bool) -> None:
+    """The (detail, suggestion) pair persisted in the gate fact is read back by /validate only while the block is durable.
+
+    A durable block is cleared only by a pipeline change (a retry on the
+    unchanged graph meets the END gate's skip), so no persisted suggestion may
+    offer a retry, and the chat notice and the DecisionPanel must agree.
+    """
+    from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
+
+    _detail, suggestion = advisor_signoff_blocked_wording(reason=reason, findings=findings, findings_backend_authored=authored)
+    assert "after your next pipeline change" in suggestion
+    assert "on your next message" not in suggestion
+    assert "retry the request" not in suggestion.lower()
+
+
+@pytest.mark.parametrize("reason", ["unavailable", "malformed"])
+def test_transient_advisor_blocker_offers_retry_without_graph_edit(reason: str) -> None:
+    from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
+
+    _, suggestion = advisor_signoff_blocked_wording(reason=reason, findings="No verdict.")
+    assert "on your next message" in suggestion
+    assert "pipeline change" not in suggestion

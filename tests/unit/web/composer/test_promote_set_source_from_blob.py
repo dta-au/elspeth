@@ -13,6 +13,8 @@ discipline regardless of which binding tool it invoked.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,14 +41,29 @@ from elspeth.web.composer.redaction import (
 )
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from elspeth.web.composer.tools import _execute_create_blob, _execute_patch_source_options, _execute_set_source_from_blob
+from elspeth.web.composer.tools import (
+    _execute_create_blob,
+    _execute_patch_source_options,
+    _execute_set_source_from_blob,
+    _execute_update_blob,
+    execute_tool,
+)
 from elspeth.web.composer.tools._common import ToolContext as _ToolContext
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import fenced_operation_context
+
+
+@pytest.fixture
+def operation_scopes() -> Iterator[ExitStack]:
+    """Hold explicitly requested operations through creation and later reads."""
+    with ExitStack() as scopes:
+        yield scopes
 
 
 def _option_shape_summary(*, scalar: int) -> dict[str, object]:
@@ -100,6 +117,8 @@ def _session_engine_with_session() -> tuple[Any, str]:
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
     session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
@@ -241,10 +260,10 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
         )
 
         assert result.success is False
-        assert "not a valid UUID" in result.data["error"]
-        assert "upload" in result.data["error"]
-        assert "list_blobs" in result.data["error"]
-        assert "not found" not in result.data["error"].lower()
+        assert "not a valid UUID" in result.validation.errors[0].message
+        assert "upload" in result.validation.errors[0].message
+        assert "list_blobs" in result.validation.errors[0].message
+        assert "not found" not in result.validation.errors[0].message.lower()
 
     def test_valid_arguments_dispatch_normally(self, tmp_path: Path) -> None:
         """Functional smoke: a valid call wires the blob as the source.
@@ -265,23 +284,27 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
             user_message_id=user_message_id,
             user_message_content=user_message_content,
         )
-        create_result = _execute_create_blob(
-            {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
-            _empty_state(),
-            ctx,
-        )
-        assert create_result.success is True
-        blob_id = create_result.data["blob_id"]
+        with fenced_operation_context(engine, session_id) as operation:
+            ctx = replace(
+                ctx, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)
+            )
+            create_result = _execute_create_blob(
+                {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
+                _empty_state(),
+                ctx,
+            )
+            assert create_result.success is True
+            blob_id = create_result.data["blob_id"]
 
-        bind_result = _execute_set_source_from_blob(
-            {
-                "blob_id": blob_id,
-                "on_success": "out",
-                "options": {"column": "text", "schema": {"mode": "observed"}},
-            },
-            _empty_state(),
-            ctx,
-        )
+            bind_result = _execute_set_source_from_blob(
+                {
+                    "blob_id": blob_id,
+                    "on_success": "out",
+                    "options": {"column": "text", "schema": {"mode": "observed"}},
+                },
+                _empty_state(),
+                ctx,
+            )
         assert bind_result.success is True
         assert bind_result.updated_state.sources["source"].on_success == "out"
 
@@ -302,23 +325,27 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
             user_message_id=user_message_id,
             user_message_content=user_message_content,
         )
-        create_result = _execute_create_blob(
-            {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
-            _empty_state(),
-            ctx,
-        )
-        assert create_result.success is True
+        with fenced_operation_context(engine, session_id) as operation:
+            ctx = replace(
+                ctx, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)
+            )
+            create_result = _execute_create_blob(
+                {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
+                _empty_state(),
+                ctx,
+            )
+            assert create_result.success is True
 
-        bind_result = _execute_set_source_from_blob(
-            {
-                "blob_id": create_result.data["blob_id"],
-                "on_success": "out",
-                "options": {"column": "text", "schema": {"mode": "observed"}},
-                "on_validation_failure": "",
-            },
-            _empty_state(),
-            ctx,
-        )
+            bind_result = _execute_set_source_from_blob(
+                {
+                    "blob_id": create_result.data["blob_id"],
+                    "on_success": "out",
+                    "options": {"column": "text", "schema": {"mode": "observed"}},
+                    "on_validation_failure": "",
+                },
+                _empty_state(),
+                ctx,
+            )
         assert bind_result.success is True
         assert bind_result.updated_state.sources["source"].on_validation_failure == "discard"
 
@@ -368,22 +395,26 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
             composer_skill_hash="a" * 64,
             tool_arguments_hash="b" * 64,
         )
-        create_result = _execute_create_blob(
-            {"filename": "generated.txt", "mime_type": "text/plain", "content": "generated row text"},
-            _empty_state(),
-            ctx,
-        )
-        assert create_result.success is True
+        with fenced_operation_context(engine, session_id) as operation:
+            ctx = replace(
+                ctx, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)
+            )
+            create_result = _execute_create_blob(
+                {"filename": "generated.txt", "mime_type": "text/plain", "content": "generated row text"},
+                _empty_state(),
+                ctx,
+            )
+            assert create_result.success is True
 
-        bind_result = _execute_set_source_from_blob(
-            {
-                "blob_id": create_result.data["blob_id"],
-                "on_success": "out",
-                "options": {"column": "text", "schema": {"mode": "observed"}},
-            },
-            _empty_state(),
-            ctx,
-        )
+            bind_result = _execute_set_source_from_blob(
+                {
+                    "blob_id": create_result.data["blob_id"],
+                    "on_success": "out",
+                    "options": {"column": "text", "schema": {"mode": "observed"}},
+                },
+                _empty_state(),
+                ctx,
+            )
 
         assert bind_result.success is True, bind_result.data
         assert "source" in bind_result.updated_state.sources
@@ -422,7 +453,7 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
             ctx,
         )
         assert forged_authoring_patch.success is False
-        assert SOURCE_AUTHORING_KEY in forged_authoring_patch.data["error"]
+        assert SOURCE_AUTHORING_KEY in forged_authoring_patch.validation.errors[0].message
 
         patch_result = _execute_patch_source_options(
             {"patch": {"path": str(tmp_path / "other.txt")}},
@@ -430,7 +461,7 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
             ctx,
         )
         assert patch_result.success is False
-        assert "Cannot patch" in patch_result.data["error"]
+        assert "Cannot patch" in patch_result.validation.errors[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -519,21 +550,25 @@ class TestSetSourceFromBlobTsvDelimiter:
             user_message_id=user_message_id,
             user_message_content=user_message_content,
         )
-        create_result = _execute_create_blob(
-            {"filename": filename, "mime_type": "text/csv", "content": content},
-            _empty_state(),
-            ctx,
-        )
-        assert create_result.success is True, create_result.data
-        bind_result = _execute_set_source_from_blob(
-            {
-                "blob_id": create_result.data["blob_id"],
-                "on_success": "out",
-                "options": options if options is not None else {"schema": {"mode": "observed"}},
-            },
-            _empty_state(),
-            ctx,
-        )
+        with fenced_operation_context(engine, session_id) as operation:
+            ctx = replace(
+                ctx, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)
+            )
+            create_result = _execute_create_blob(
+                {"filename": filename, "mime_type": "text/csv", "content": content},
+                _empty_state(),
+                ctx,
+            )
+            assert create_result.success is True, create_result.data
+            bind_result = _execute_set_source_from_blob(
+                {
+                    "blob_id": create_result.data["blob_id"],
+                    "on_success": "out",
+                    "options": options if options is not None else {"schema": {"mode": "observed"}},
+                },
+                _empty_state(),
+                ctx,
+            )
         return bind_result
 
     def test_tsv_blob_binds_csv_source_with_tab_delimiter(self, tmp_path: Path) -> None:
@@ -616,21 +651,25 @@ class TestSetSourceFromBlobDerivedGuarantees:
             composer_skill_hash="a" * 64,
             tool_arguments_hash="b" * 64,
         )
-        create_result = _execute_create_blob(
-            {"filename": filename, "mime_type": mime_type, "content": content},
-            _empty_state(),
-            ctx,
-        )
-        assert create_result.success is True, create_result.data
-        bind_result = _execute_set_source_from_blob(
-            {
-                "blob_id": create_result.data["blob_id"],
-                "on_success": "out",
-                "options": options if options is not None else {"schema": {"mode": "observed"}},
-            },
-            _empty_state(),
-            ctx,
-        )
+        with fenced_operation_context(engine, session_id) as operation:
+            ctx = replace(
+                ctx, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)
+            )
+            create_result = _execute_create_blob(
+                {"filename": filename, "mime_type": mime_type, "content": content},
+                _empty_state(),
+                ctx,
+            )
+            assert create_result.success is True, create_result.data
+            bind_result = _execute_set_source_from_blob(
+                {
+                    "blob_id": create_result.data["blob_id"],
+                    "on_success": "out",
+                    "options": options if options is not None else {"schema": {"mode": "observed"}},
+                },
+                _empty_state(),
+                ctx,
+            )
         return bind_result
 
     def _schema(self, bind_result: Any) -> dict[str, Any]:
@@ -897,7 +936,7 @@ class TestSetSourceFromBlobDerivedGuarantees:
         schema = self._schema(bind_result)
         assert list(schema["guaranteed_fields"]) == ["a"]
 
-    def test_non_utf8_csv_blob_still_binds_and_abstains(self, tmp_path: Path) -> None:
+    def test_non_utf8_csv_blob_still_binds_and_abstains(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """An uploaded latin-1 CSV stays bindable and unstamped: it is
         user-verbatim (no source_authoring), so auto-declare never engages."""
         import asyncio
@@ -924,6 +963,8 @@ class TestSetSourceFromBlobDerivedGuarantees:
             data_dir=str(tmp_path),
             session_engine=engine,
             session_id=session_id,
+            session_operation_context=operation_scopes.enter_context(fenced_operation_context(engine, session_id)),
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
         )
         bind_result = _execute_set_source_from_blob(
             {
@@ -957,7 +998,7 @@ class TestEchoedServerOwnedMetadata:
     metadata is reduced/dropped with an advisory note; any non-matching value
     keeps the elspeth-4496f61e30 rejection."""
 
-    def _bound_source(self, tmp_path: Path) -> tuple[_ToolContext, CompositionState, dict[str, Any]]:
+    def _bound_source(self, tmp_path: Path, operation_scopes: ExitStack) -> tuple[_ToolContext, CompositionState, dict[str, Any]]:
         user_message_content = "Create generated CSV content for the source."
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
         ctx = ToolContext(
@@ -973,6 +1014,8 @@ class TestEchoedServerOwnedMetadata:
             composer_skill_hash="a" * 64,
             tool_arguments_hash="b" * 64,
         )
+        operation = operation_scopes.enter_context(fenced_operation_context(engine, session_id))
+        ctx = replace(ctx, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine))
         create = _execute_create_blob(
             {"filename": "generated.csv", "mime_type": "text/csv", "content": "name,score\nada,42\n"},
             _empty_state(),
@@ -1017,8 +1060,8 @@ class TestEchoedServerOwnedMetadata:
         source = state.sources["source"]
         return state.with_named_source("source", replace(source, options=resolved_options)), resolved_options
 
-    def test_patch_echoing_stored_pending_rows_is_accepted_and_preserved(self, tmp_path: Path) -> None:
-        ctx, state, options = self._bound_source(tmp_path)
+    def test_patch_echoing_stored_pending_rows_is_accepted_and_preserved(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
 
         result = _execute_patch_source_options(
             {"patch": {INTERPRETATION_REQUIREMENTS_KEY: options[INTERPRETATION_REQUIREMENTS_KEY]}},
@@ -1031,11 +1074,136 @@ class TestEchoedServerOwnedMetadata:
         requirements = deep_thaw(result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY])
         assert requirements == options[INTERPRETATION_REQUIREMENTS_KEY]
 
-    def test_patch_echoing_reduced_resolved_row_keeps_the_review_resolved(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("public_dispatch", [False, True])
+    @pytest.mark.parametrize("echo_review", [False, True])
+    def test_route_only_rebind_preserves_approved_source_and_replay(
+        self, tmp_path: Path, operation_scopes: ExitStack, public_dispatch: bool, echo_review: bool
+    ) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
+        state, resolved_options = self._resolved_state(state, options)
+        caller_options = {"schema": {"mode": "observed"}}
+        if echo_review:
+            caller_options[INTERPRETATION_REQUIREMENTS_KEY] = resolved_options[INTERPRETATION_REQUIREMENTS_KEY]
+            caller_options[SOURCE_AUTHORING_KEY] = resolved_options[SOURCE_AUTHORING_KEY]
+        arguments = {
+            "blob_id": options["blob_ref"],
+            "on_success": "rows",
+            "on_validation_failure": "retained_failures",
+            "options": caller_options,
+        }
+        for _attempt in range(2):
+            previous_version = state.version
+            if public_dispatch:
+                assert ctx.plugin_snapshot is not None
+                result = execute_tool(
+                    "set_source_from_blob",
+                    arguments,
+                    state,
+                    ctx.catalog,
+                    plugin_snapshot=ctx.plugin_snapshot,
+                    data_dir=ctx.data_dir,
+                    session_engine=ctx.session_engine,
+                    session_id=ctx.session_id,
+                    session_operation_context=ctx.session_operation_context,
+                    session_operation_authority=ctx.session_operation_authority,
+                    validate_arguments=True,
+                    require_data_dir_for_paths=True,
+                )
+            else:
+                result = _execute_set_source_from_blob(arguments, state, ctx)
+            assert result.success, result.data
+            source = result.updated_state.sources["source"]
+            assert source.on_validation_failure == "retained_failures"
+            assert source.options["blob_ref"] == options["blob_ref"]
+            assert deep_thaw(source.options[INTERPRETATION_REQUIREMENTS_KEY]) == resolved_options[INTERPRETATION_REQUIREMENTS_KEY]
+            assert deep_thaw(source.options[SOURCE_AUTHORING_KEY]) == resolved_options[SOURCE_AUTHORING_KEY]
+            assert result.updated_state.version == previous_version + 1
+            state = CompositionState.from_dict(json.loads(json.dumps(result.updated_state.to_dict())))
+
+    @pytest.mark.parametrize("same_content", [False, True])
+    def test_rebind_approval_is_content_bound_not_blob_id_bound(
+        self, tmp_path: Path, operation_scopes: ExitStack, same_content: bool
+    ) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
+        state, resolved_options = self._resolved_state(state, options)
+        created = _execute_create_blob(
+            {
+                "filename": "replacement.csv",
+                "mime_type": "text/csv",
+                "content": "name,score\nada,42\n" if same_content else "name,score\nada,43\n",
+            },
+            state,
+            ctx,
+        )
+        assert created.success, created.data
+        assert created.data["blob_id"] != options["blob_ref"]
+        result = _execute_set_source_from_blob(
+            {"blob_id": created.data["blob_id"], "on_success": "rows", "options": {"schema": {"mode": "observed"}}}, state, ctx
+        )
+        assert result.success, result.data
+        source_options = result.updated_state.sources["source"].options
+        (requirement,) = deep_thaw(source_options[INTERPRETATION_REQUIREMENTS_KEY])
+        if same_content:
+            assert requirement == resolved_options[INTERPRETATION_REQUIREMENTS_KEY][0]
+            assert deep_thaw(source_options[SOURCE_AUTHORING_KEY]) == resolved_options[SOURCE_AUTHORING_KEY]
+        else:
+            assert requirement["status"] == "pending"
+            assert source_options[SOURCE_AUTHORING_KEY]["content_hash"] != resolved_options[SOURCE_AUTHORING_KEY]["content_hash"]
+            assert source_options[SOURCE_AUTHORING_KEY]["review_event_id"] is None
+
+    def test_rebind_changed_bytes_at_same_blob_id_requires_new_approval(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
+        ctx, approved_state, options = self._bound_source(tmp_path, operation_scopes)
+        approved_state, resolved_options = self._resolved_state(approved_state, options)
+        # A referenced blob cannot be replaced. Replace it while unbound, then
+        # present the old approval snapshot to the binding boundary.
+        updated = _execute_update_blob({"blob_id": options["blob_ref"], "content": "name,score\nada,43\n"}, _empty_state(), ctx)
+        assert updated.success, updated.data
+        assert updated.data["blob_id"] == options["blob_ref"]
+        result = _execute_set_source_from_blob(
+            {"blob_id": options["blob_ref"], "on_success": "rows", "options": {"schema": {"mode": "observed"}}}, approved_state, ctx
+        )
+        assert result.success, result.data
+        source_options = result.updated_state.sources["source"].options
+        (requirement,) = deep_thaw(source_options[INTERPRETATION_REQUIREMENTS_KEY])
+        assert requirement["status"] == "pending"
+        assert source_options[SOURCE_AUTHORING_KEY]["content_hash"] == updated.data["content_hash"]
+        assert source_options[SOURCE_AUTHORING_KEY]["content_hash"] != resolved_options[SOURCE_AUTHORING_KEY]["content_hash"]
+        assert source_options[SOURCE_AUTHORING_KEY]["review_event_id"] is None
+
+    @pytest.mark.parametrize("change", [{"source_name": "other"}, {"plugin": "text"}])
+    def test_rebind_does_not_transfer_approval_between_components(
+        self, tmp_path: Path, operation_scopes: ExitStack, change: dict[str, str]
+    ) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
+        state, _resolved_options = self._resolved_state(state, options)
+        caller_options = {"schema": {"mode": "observed"}, **({"column": "line"} if "plugin" in change else {})}
+        result = _execute_set_source_from_blob(
+            {"blob_id": options["blob_ref"], "on_success": "rows", "options": caller_options, **change}, state, ctx
+        )
+        assert result.success, result.data
+        target = "other" if "source_name" in change else "source"
+        (requirement,) = deep_thaw(result.updated_state.sources[target].options[INTERPRETATION_REQUIREMENTS_KEY])
+        assert requirement["status"] == "pending"
+        if target == "other":
+            assert result.updated_state.sources["source"] == state.sources["source"]
+
+    def test_rebind_rejects_stale_stored_approval_without_mutation(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
+        state, resolved_options = self._resolved_state(state, options)
+        resolved_options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_artifact_hash"] = "f" * 64
+        state = state.with_named_source("source", replace(state.sources["source"], options=resolved_options))
+        result = _execute_set_source_from_blob(
+            {"blob_id": options["blob_ref"], "on_success": "rows", "options": {"schema": {"mode": "observed"}}}, state, ctx
+        )
+        assert not result.success
+        assert result.updated_state == state
+        assert result.validation.errors[0].error_code == "review_reconciliation_failed"
+
+    def test_patch_echoing_reduced_resolved_row_keeps_the_review_resolved(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """The planner-context projection of a resolved row round-trips: the
         echo reduces to a shell and reconciliation restores the resolved
         server row — no downgrade to pending."""
-        ctx, state, options = self._bound_source(tmp_path)
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
         state, resolved_options = self._resolved_state(state, options)
         stored_row = resolved_options[INTERPRETATION_REQUIREMENTS_KEY][0]
         context_projection = {field: stored_row[field] for field in ("id", "kind", "user_term", "draft", "status")}
@@ -1052,8 +1220,8 @@ class TestEchoedServerOwnedMetadata:
         authoring = deep_thaw(result.updated_state.sources["source"].options[SOURCE_AUTHORING_KEY])
         assert authoring == resolved_options[SOURCE_AUTHORING_KEY]
 
-    def test_patch_with_tampered_resolved_row_still_rejects(self, tmp_path: Path) -> None:
-        ctx, state, options = self._bound_source(tmp_path)
+    def test_patch_with_tampered_resolved_row_still_rejects(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
         state, resolved_options = self._resolved_state(state, options)
         stored_row = resolved_options[INTERPRETATION_REQUIREMENTS_KEY][0]
         tampered = {field: stored_row[field] for field in ("id", "kind", "user_term", "draft", "status")}
@@ -1066,10 +1234,10 @@ class TestEchoedServerOwnedMetadata:
         )
 
         assert result.success is False
-        assert "resolved" in result.data["error"]
+        assert "resolved" in result.validation.errors[0].message
 
-    def test_rebind_echoing_stored_source_authoring_is_accepted_with_note(self, tmp_path: Path) -> None:
-        ctx, state, options = self._bound_source(tmp_path)
+    def test_rebind_echoing_stored_source_authoring_is_accepted_with_note(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
 
         result = _execute_set_source_from_blob(
             {
@@ -1088,8 +1256,8 @@ class TestEchoedServerOwnedMetadata:
         assert "source_authoring" in result.data["server_owned_metadata_note"]
         assert deep_thaw(result.updated_state.sources["source"].options[SOURCE_AUTHORING_KEY]) == options[SOURCE_AUTHORING_KEY]
 
-    def test_rebind_with_tampered_source_authoring_still_rejects(self, tmp_path: Path) -> None:
-        ctx, state, options = self._bound_source(tmp_path)
+    def test_rebind_with_tampered_source_authoring_still_rejects(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
         tampered = {**options[SOURCE_AUTHORING_KEY], "review_event_id": "forged-event"}
 
         result = _execute_set_source_from_blob(
@@ -1103,4 +1271,4 @@ class TestEchoedServerOwnedMetadata:
         )
 
         assert result.success is False
-        assert SOURCE_AUTHORING_KEY in result.data["error"]
+        assert SOURCE_AUTHORING_KEY in result.validation.errors[0].message

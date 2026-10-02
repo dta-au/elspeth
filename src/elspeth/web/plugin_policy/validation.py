@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Literal
+from typing import Literal, Protocol
 
 from jsonschema import Draft202012Validator
 
@@ -12,8 +12,9 @@ from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities, S3ProfiledAuditI
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities, TextractProfiledAuditIdentity
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, WebConfigAuthority
-from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.plugins.infrastructure.power_automate import PowerAutomateProtocolError, normalize_allowed_origin
+from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.interpretation_state import AUTHORING_METADATA_OPTION_KEYS
 from elspeth.web.plugin_policy.coverage import (
@@ -23,8 +24,25 @@ from elspeth.web.plugin_policy.coverage import (
     control_coverage_findings,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
-from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
+from elspeth.web.plugin_policy.profiles import LoweredPluginConfig
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
+
+
+class ProfileValidationCatalog(Protocol):
+    """Schema reads needed by pure policy validation; never a dispatch guard."""
+
+    def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo: ...
+
+
+class ProfileValidationRegistry(Protocol):
+    """Pure profile operations shared by live discovery and detached facts."""
+
+    def public_schema(
+        self, plugin_id: PluginId, full_schema: PluginSchemaInfo, *, available_aliases: tuple[str, ...]
+    ) -> PluginSchemaInfo: ...
+
+    def lower_options(self, plugin_id: PluginId, *, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig: ...
+
 
 PolicyValidationStage = Literal[
     "plugin_enablement",
@@ -33,7 +51,7 @@ PolicyValidationStage = Literal[
     "required_control_coverage",
 ]
 
-_PROFILE_LOWERING_METADATA_OPTION_KEYS = AUTHORING_METADATA_OPTION_KEYS | {"resolved_prompt_template_hash"}
+_PROFILE_LOWERING_METADATA_OPTION_KEYS = AUTHORING_METADATA_OPTION_KEYS | {"approved_prompt_artifact_hash"}
 
 # Profiled plugins whose operator binding is a STORAGE location rather than an
 # LLM-family provider/model/credential set — their rejection prose must speak
@@ -132,8 +150,8 @@ def validate_plugin_policy(
     state: CompositionState,
     *,
     snapshot: PluginAvailabilitySnapshot,
-    profile_registry: OperatorProfileRegistry | None,
-    catalog: CatalogService,
+    profile_registry: ProfileValidationRegistry | None,
+    catalog: ProfileValidationCatalog,
 ) -> PluginPolicyValidationResult:
     """Validate identities/controls and lower public profile options in memory.
 
@@ -172,6 +190,11 @@ def validate_plugin_policy(
         )
 
     if not snapshot.is_trained_operator:
+        findings.extend(
+            finding
+            for component in components
+            if (finding := _power_automate_origin_finding(component, snapshot.power_automate_allowed_origins)) is not None
+        )
         findings.extend(finding for component in components if (finding := _s3_source_endpoint_override_finding(component)) is not None)
         alias_inventory = frozenset(alias for _plugin_id, aliases in snapshot.usable_profile_aliases for alias in aliases)
         findings.extend(
@@ -218,6 +241,35 @@ def validate_plugin_policy(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="web-authored Power Automate allowed_origin option in a component's untrusted options",
+    source_param="component",
+    suppresses=("R5",),
+    invariant="returns a value-free origin denial for missing, malformed or unapproved authored origins; never resolves credentials",
+)
+def _power_automate_origin_finding(component: _Component, approved_origins: tuple[str, ...]) -> PluginPolicyFinding | None:
+    if component.plugin_id not in (PluginId("source", "power_automate"), PluginId("sink", "power_automate")):
+        return None
+    authored_origin = component.options["allowed_origin"] if "allowed_origin" in component.options else None
+    normalized_origin: str | None = None
+    if type(authored_origin) is str:
+        try:
+            normalized_origin = normalize_allowed_origin(authored_origin)
+        except PowerAutomateProtocolError:
+            normalized_origin = None
+    if normalized_origin in approved_origins:
+        return None
+    return PluginPolicyFinding(
+        stage="operator_profile_options",
+        component_id=component.component_id,
+        component_type=component.component_type,
+        error_code="power_automate_origin_not_allowed",
+        message="Power Automate requires an operator-approved HTTPS443 destination origin.",
+        suggestion="Set allowed_origin to an operator-approved origin and authorize credential wiring separately.",
+    )
+
+
 # Per-diagnosis remediation for coverage findings, keyed on the finding's
 # ``reason`` — never on the stage. The diagnoses have distinct repairs, and a
 # stage-level string cannot be right for all of them: telling
@@ -235,10 +287,11 @@ _CONTROL_COVERAGE_SUGGESTIONS: dict[str, str] = {
         "the control mode to 'recommend' — it is not an authoring change."
     ),
     "input_fields_unprovable": (
-        "Do not auto-wire a field-scoped control from the known field subset. Place a "
-        "blocking control after any downstream rewrites and set fields: 'all', or rewrite "
-        "the node's prompt template so every row access is static ('{{ row.field }}', "
-        "never '{{ row[key] }}') and then protect those exact fields. Validate again."
+        "Do not auto-wire a field-scoped control from a guessed field list. Place a "
+        "blocking control after any downstream rewrites and set fields: 'all', or give the "
+        "node an explicit options.required_input_fields list naming every field its prompt "
+        "reads (the template sees exactly those fields) and then protect those exact fields. "
+        "Validate again."
     ),
     "output_not_post_dominated": (
         "Wire the required control transform so it sits on every path that carries the "
@@ -326,20 +379,21 @@ def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyF
         if coverage.scanned_fields:
             message = (
                 f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
-                f"{coverage.role.value} control upstream, but its own protected field set could not "
-                "be proven from its prompt template, so a control scoped to specific fields cannot be "
-                f"credited: protected fields {_field_set(coverage.protected_fields)}, control scans "
-                f"{_field_set(coverage.scanned_fields)}. A dynamic access such as row[key] can read "
-                "outside the statically known set, so only fields: 'all' covers it."
+                f"{coverage.role.value} control upstream, but its own protected field set is not an explicit "
+                "declaration, so a control scoped to specific fields cannot be credited: protected fields "
+                f"{_field_set(coverage.protected_fields)}, control scans {_field_set(coverage.scanned_fields)}. "
+                "The prompt template sees exactly options.required_input_fields; with that list empty ([], the "
+                "whole row) or not declared, only fields: 'all' covers it."
             )
         else:
             message = (
                 f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
-                f"{coverage.role.value} control, but its complete protected field set could not be "
-                f"proven from its prompt template (known fields: {_field_set(coverage.protected_fields)}). "
-                "A dynamic access such as row[key] can read outside that set, so Composer cannot safely "
-                "auto-wire a field-scoped control. Place a blocking control after any downstream rewrites "
-                "with fields: 'all', or rewrite the prompt to use only static row fields."
+                f"{coverage.role.value} control, but its protected field set is not an explicit declaration "
+                f"(known fields: {_field_set(coverage.protected_fields)}). The prompt template sees exactly "
+                "options.required_input_fields; with that list empty ([], the whole row) or not declared, "
+                "Composer cannot safely auto-wire a field-scoped control. Place a blocking control after any "
+                "downstream rewrites with fields: 'all', or declare required_input_fields as the fields the "
+                "prompt reads."
             )
     else:
         component_label = "Source" if coverage.component_type == "source" else "Node"
@@ -424,8 +478,8 @@ def _lower_profiled_components(
     state: CompositionState,
     *,
     snapshot: PluginAvailabilitySnapshot,
-    profile_registry: OperatorProfileRegistry | None,
-    catalog: CatalogService,
+    profile_registry: ProfileValidationRegistry | None,
+    catalog: ProfileValidationCatalog,
 ) -> tuple[CompositionState, tuple[PluginPolicyFinding, ...], S3ProfiledAuditIdentities, TextractProfiledAuditIdentities]:
     aliases_by_plugin = dict(snapshot.usable_profile_aliases)
     components = _components(state)
@@ -541,6 +595,12 @@ def _lower_profiled_components(
                 message = (
                     f"Plugin '{plugin_id}' requires a canonical relative object key within the selected operator profile. "
                     "Remove absolute, traversal, empty-segment, trailing-separator, or overlong key forms."
+                )
+            elif str(exc) == "profile_index_not_admitted":
+                # Value-free: neither the authored index nor the profile's pin is echoed.
+                message = (
+                    f"Plugin '{plugin_id}': Index is not admitted by the selected Azure AI Search profile; "
+                    "choose an index the profile lists."
                 )
             else:
                 message = f"Plugin '{plugin_id}' operator profile is no longer available."
@@ -662,8 +722,8 @@ def validate_authored_composition_state(
     state: CompositionState,
     *,
     snapshot: PluginAvailabilitySnapshot,
-    profile_registry: OperatorProfileRegistry | None,
-    catalog: CatalogService,
+    profile_registry: ProfileValidationRegistry | None,
+    catalog: ProfileValidationCatalog,
 ) -> ProfileAwareValidationResult:
     """Validate authored state once through the principal's policy boundary."""
     if snapshot.is_trained_operator:
@@ -727,8 +787,8 @@ def _profile_lowering_context(
     component: _Component,
     *,
     aliases_by_plugin: Mapping[PluginId, tuple[str, ...]],
-    profile_registry: OperatorProfileRegistry | None,
-    catalog: CatalogService,
+    profile_registry: ProfileValidationRegistry | None,
+    catalog: ProfileValidationCatalog,
     findings: list[PluginPolicyFinding],
 ) -> tuple[PluginId, tuple[str, ...], PluginSchemaInfo] | None:
     """Resolve the public profile schema or record one closed failure."""
@@ -762,7 +822,7 @@ def _normalized_profile_findings(findings: list[PluginPolicyFinding]) -> tuple[P
 
 
 def _lower_profile_options(
-    profile_registry: OperatorProfileRegistry,
+    profile_registry: ProfileValidationRegistry,
     plugin_id: PluginId,
     *,
     alias: str,

@@ -7,7 +7,7 @@ belong to the authenticated user's session.
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Annotated, cast
 from urllib.parse import quote
 from uuid import UUID
 
@@ -21,7 +21,7 @@ from elspeth.contracts.binary_documents import (
     binary_document_signature_matches,
     detect_binary_document_signature,
 )
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import (
     ALLOWED_MIME_TYPES,
@@ -35,6 +35,8 @@ from elspeth.web.blobs.protocol import (
     BlobQuotaExceededError,
     BlobRecord,
     BlobStateError,
+    IdentityStorageQuotaExceededError,
+    StorageAccountingUnavailableError,
     StorageMimeType,
 )
 from elspeth.web.blobs.schemas import BlobMetadataResponse, CreateInlineBlobRequest
@@ -42,6 +44,7 @@ from elspeth.web.blobs.service import BlobServiceImpl, sanitize_filename
 from elspeth.web.blobs.sniff import detect_mime_type
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.credential_guard import require_no_credential_material
 
 
 def _blob_response(record: BlobRecord) -> BlobMetadataResponse:
@@ -137,8 +140,8 @@ def create_blobs_router() -> APIRouter:
     async def create_blob_upload(
         session_id: UUID,
         request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         file: UploadFile = File(...),  # noqa: B008
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
     ) -> BlobMetadataResponse:
         """Create a blob from a multipart file upload."""
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
@@ -157,6 +160,7 @@ def create_blobs_router() -> APIRouter:
         # from sanitize_filename() deeper in the service layer.
         try:
             original_filename = sanitize_filename(file.filename or "upload")
+            require_no_credential_material(original_filename, surface="blob_filename")
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
         chunks: list[bytes] = []
@@ -251,6 +255,20 @@ def create_blobs_router() -> APIRouter:
                     source_description="uploaded",
                     session_operation_context=lease.context,
                 )
+            except IdentityStorageQuotaExceededError as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "error_type": "storage_quota_exceeded",
+                        "detail": str(exc),
+                        "dimension": "storage",
+                        "cap": exc.cap,
+                        "ceiling": exc.ceiling,
+                        "usage": exc.usage,
+                    },
+                ) from None
+            except StorageAccountingUnavailableError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from None
             except BlobQuotaExceededError as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from None
             return _blob_response(record)
@@ -262,7 +280,7 @@ def create_blobs_router() -> APIRouter:
         session_id: UUID,
         body: CreateInlineBlobRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> BlobMetadataResponse:
         """Create a blob from inline text/JSON content.
 
@@ -272,6 +290,7 @@ def create_blobs_router() -> APIRouter:
         This route only enforces size and persistence-layer concerns.
         """
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
+        require_no_credential_material(body.filename, surface="blob_filename")
         session_service = request.app.state.session_service
 
         settings = request.app.state.settings
@@ -314,6 +333,20 @@ def create_blobs_router() -> APIRouter:
                     source_description="created inline",
                     session_operation_context=lease.context,
                 )
+            except IdentityStorageQuotaExceededError as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "error_type": "storage_quota_exceeded",
+                        "detail": str(exc),
+                        "dimension": "storage",
+                        "cap": exc.cap,
+                        "ceiling": exc.ceiling,
+                        "usage": exc.usage,
+                    },
+                ) from None
+            except StorageAccountingUnavailableError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from None
             except BlobQuotaExceededError as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from None
             return _blob_response(record)
@@ -324,7 +357,7 @@ def create_blobs_router() -> APIRouter:
     async def list_blobs(
         session_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> list[BlobMetadataResponse]:
@@ -338,7 +371,7 @@ def create_blobs_router() -> APIRouter:
         session_id: UUID,
         blob_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> BlobMetadataResponse:
         """Get blob metadata."""
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
@@ -366,7 +399,7 @@ def create_blobs_router() -> APIRouter:
         session_id: UUID,
         blob_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> Response:
         """Download blob content.
 
@@ -423,7 +456,7 @@ def create_blobs_router() -> APIRouter:
         session_id: UUID,
         blob_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(5000, ge=1, le=50_000),
     ) -> Response:
         """Return a bounded prefix for inline blob preview."""
@@ -473,7 +506,7 @@ def create_blobs_router() -> APIRouter:
         session_id: UUID,
         blob_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> None:
         """Delete a blob and its backing file.
 

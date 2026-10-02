@@ -7,36 +7,33 @@ import json
 import os
 import sqlite3
 import time
-from collections.abc import Coroutine
 from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock, create_autospec
+from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import Connection, select
 from sqlalchemy.exc import OperationalError
 from typer.testing import CliRunner
 
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
-from elspeth.contracts.coordination import DEFAULT_RUN_HEARTBEAT_SECONDS, DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+from elspeth.contracts.coordination import (
+    DEFAULT_RUN_HEARTBEAT_SECONDS,
+    DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    CoordinationToken,
+    WorkerMembershipToken,
+)
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.checkpoint import CheckpointManager
-from elspeth.core.checkpoint import manager as checkpoint_manager_module
-from elspeth.core.landscape import LandscapeDB, run_lifecycle_repository
-from elspeth.core.landscape.data_flow import tokens as token_repository_module
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
-from elspeth.core.landscape.execution import sink_effect_finalization as sink_effect_finalization_module
-from elspeth.core.landscape.execution import sink_effect_lifecycle as sink_effect_lifecycle_module
-from elspeth.core.landscape.execution import sink_effect_reservation as sink_effect_reservation_module
-from elspeth.core.landscape.scheduler import dispositions as scheduler_dispositions_module
-from elspeth.core.landscape.scheduler import fencing as scheduler_fencing_module
-from elspeth.core.landscape.scheduler import queue as scheduler_queue_module
+from elspeth.core.config import RateLimitSettings
+from elspeth.core.landscape import LandscapeDB, run_coordination_repository, run_lifecycle_repository
+from elspeth.core.landscape.database_clock import read_landscape_decision_time
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     run_coordination_table,
@@ -57,7 +54,7 @@ from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, WebPluginPolicy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-from elspeth.web.sessions.protocol import CompositionStateRecord, SessionServiceProtocol
+from elspeth.web.sessions.protocol import CompositionStateRecord
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.e2e.recovery.harness import spawn_database_process_at_seam, spawn_database_process_with_pause
 from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
@@ -74,8 +71,8 @@ from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
     _install_short_sink_lease,
     _wait_until_run_is_resumable,
 )
-from tests.helpers.session_fences import RecordingSessionOperationAuthority
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
+from tests.helpers.web_cli_profile import create_profile_session
 
 _PROFILE_RUN_LIVENESS_SECONDS = 5.0
 # The leader's run heartbeat must beat INSIDE the shrunken window, at the
@@ -146,10 +143,11 @@ def _install_profile_leader_hooks(db: LandscapeDB, pause: Any, seam_value: str) 
     def wait_for_follower_handoff(
         self: TokenSchedulerRepository,
         *,
-        run_id: str,
+        member_token: WorkerMembershipToken,
         lease_owner: str,
         lease_seconds: int,
     ) -> Any:
+        run_id = member_token.run_id
         with db.engine.connect() as conn:
             role = conn.execute(
                 select(run_workers_table.c.role).where(
@@ -187,7 +185,7 @@ def _install_profile_leader_hooks(db: LandscapeDB, pause: Any, seam_value: str) 
                 time.sleep(0.01)
         return real_claim_ready(
             self,
-            run_id=run_id,
+            member_token=member_token,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
         )
@@ -224,18 +222,25 @@ def _install_profile_run_liveness() -> None:
     Shrinking the window without the cadence leaves the seat dead between the
     leader's last fenced write and the thread's first beat.
     """
-    run_lifecycle_repository.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    checkpoint_manager_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    token_repository_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    scheduler_dispositions_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    scheduler_fencing_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    scheduler_queue_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    # ADR-048 D8.5: the sink-effect verbs fence too, and every fence EXTENDS
-    # the seat it verifies — a profile that shrinks the window everywhere else
-    # would still see the killed leader's seat held open by these three.
-    sink_effect_lifecycle_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    sink_effect_finalization_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    sink_effect_reservation_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
+    patch = pytest.MonkeyPatch()
+    patch.setattr(run_lifecycle_repository, "DEFAULT_RUN_LIVENESS_WINDOW_SECONDS", _PROFILE_RUN_LIVENESS_SECONDS)
+    real_renew = run_coordination_repository._renew_leader_deadline_on
+
+    def profile_renew(conn: Connection, *, token: CoordinationToken, window_seconds: float, verb: str) -> None:
+        # Entry verification and successful context finalization share this
+        # renewal primitive. Both must use the profile window while retaining
+        # the real full-token CAS, fresh clock, and issued-deadline registration.
+        real_renew(conn, token=token, window_seconds=_PROFILE_RUN_LIVENESS_SECONDS, verb=verb)
+
+    patch.setattr(run_coordination_repository, "_renew_leader_deadline_on", profile_renew)
+    real_finalize = run_coordination_repository.RunCoordinationRepository._finalize_leader_registration_on
+
+    def profile_finalize(conn: Connection, *, token: CoordinationToken, window_seconds: float) -> None:
+        # Begin-run and takeover explicitly finalize both newly issued rows;
+        # resume must not restore the product window at this separate seam.
+        real_finalize(conn, token=token, window_seconds=_PROFILE_RUN_LIVENESS_SECONDS)
+
+    patch.setattr(run_coordination_repository.RunCoordinationRepository, "_finalize_leader_registration_on", staticmethod(profile_finalize))
 
     real_heartbeat_init = RunHeartbeatThread.__init__
 
@@ -371,28 +376,16 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
     session_id = uuid4()
     state_record = _web_composition_state(session_id=session_id, state_id=uuid4())
     run_uuid = UUID(run_id)
-    session_service = create_autospec(SessionServiceProtocol, instance=True)
-    session_service.get_active_run.return_value = None
-    session_service.get_current_state.return_value = state_record
-    session_service.create_run.return_value = SimpleNamespace(id=run_uuid)
-    session_service.get_run.return_value = SimpleNamespace(status="running", session_id=session_id)
-    session_service.update_run_status.return_value = None
-    event_sequence = 0
-
-    async def append_run_event(**_kwargs: Any) -> SimpleNamespace:
-        nonlocal event_sequence
-        event_sequence += 1
-        return SimpleNamespace(sequence=event_sequence)
-
-    session_service.append_run_event.side_effect = append_run_event
     tmp_path = Path(settings_path).parent
     web_settings = SimpleNamespace(
         deployment_target="default",
         deployment_state_mode="sqlite-single",
+        workflow_governance="off",
         landscape_url=settings.landscape.url,
         landscape_passphrase=None,
         payload_store_path=settings.payload_store.base_path,
         data_dir=tmp_path,
+        execution_rate_limit=RateLimitSettings(),
         get_landscape_url=lambda: settings.landscape.url,
         get_payload_store_path=lambda: settings.payload_store.base_path,
         get_session_db_url=lambda: f"sqlite:///{tmp_path / 'sessions.db'}",
@@ -400,6 +393,13 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
     )
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    session_engine, session_service, session_id = await create_profile_session(
+        tmp_path,
+        state=state_record,
+        run_id=run_uuid,
+        snapshot=snapshot,
+        user_id="task9-web-user",
+    )
     web_policy = WebPluginPolicy(
         schema_version=1,
         required=snapshot.available,
@@ -408,6 +408,7 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
         preferences=(),
         control_modes=snapshot.control_modes,
         plugin_code_identities=(),
+        power_automate_allowed_origins=snapshot.power_automate_allowed_origins,
         policy_hash=snapshot.policy_hash,
     )
     loop = asyncio.get_running_loop()
@@ -426,19 +427,6 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
         catalog=catalog,
     )
     service.set_openrouter_catalog_snapshot(sha256="0" * 64, source="bundled")
-    # The session service is already an in-memory autospec: this profile proves
-    # the real web execution, Landscape leader, and sink-recovery seams, not the
-    # production event-loop bridge to the real session database. Run those fake
-    # async methods on a strict worker-owned loop, matching the canonical
-    # execution-service test harness. Otherwise the executor can spend its full
-    # 30-second _call_async timeout waiting on the parent loop before Landscape
-    # has even persisted the run or leader worker.
-    session_bridge_loop = asyncio.new_event_loop()
-
-    def call_fake_session_async(coro: Coroutine[Any, Any, Any]) -> Any:
-        return session_bridge_loop.run_until_complete(coro)
-
-    service._call_async = call_fake_session_async  # type: ignore[method-assign]
     valid_preflight = ValidationResult(
         is_valid=True,
         checks=[],
@@ -464,15 +452,13 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
         return future
 
     service._executor.submit = capture_submit  # type: ignore[method-assign]
-    # The /execute route owns an EXECUTE session-operation lease and transfers
-    # it into the run; this web-hosted leader mints the same lease shape from
-    # the recording authority (the sessions service here is a Mock).
+    # Use the same real session authority for admission, permits and status.
     lease = await SessionOperationLease.acquire(
-        RecordingSessionOperationAuthority(),
+        session_service.session_operation_authority,
         session_id=session_id,
         operation_kind=SessionOperationKind.EXECUTE,
-        owner_instance_id="task9-web-leader",
-        lease_seconds=60,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        lease_seconds=300,
     )
     try:
         launched = await service.execute(
@@ -489,7 +475,7 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
             await lease.close()
             await service.shutdown()
         finally:
-            session_bridge_loop.close()
+            session_engine.dispose()
 
 
 def _run_web_leader_to_sink_seam(
@@ -513,24 +499,37 @@ def _resume_profile_via_cli(
     database_path: str,
 ) -> None:
     from elspeth.cli import app
+    from elspeth.plugins.sources.json_source import JSONSource
 
     _install_short_sink_lease()
     _install_profile_run_liveness()
     _install_short_scheduler_lease()
-    result = CliRunner().invoke(
-        app,
-        [
-            "resume",
-            run_id,
-            "--settings",
-            settings_path,
-            "--database",
-            database_path,
-            "--execute",
-            "--format",
-            "json",
-        ],
-    )
+    arguments = [
+        "resume",
+        run_id,
+        "--settings",
+        settings_path,
+        "--database",
+        database_path,
+        "--execute",
+        "--format",
+        "json",
+    ]
+
+    def reject_source_effect(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("CLI resume invoked an original source lifecycle/read method")
+
+    with pytest.MonkeyPatch.context() as patch:
+        for method in ("on_start", "load", "on_complete", "close"):
+            patch.setattr(JSONSource, method, reject_source_effect)
+        before_refusal = capture_state_engine_image(_db, run_id=run_id)
+        with pytest.MonkeyPatch.context() as drift:
+            drift.setattr(JSONSource, "plugin_version", JSONSource.plugin_version + "-changed")
+            refused = CliRunner().invoke(app, arguments)
+        assert refused.exit_code == 1
+        assert "Plugin implementation changed for node 'source_" in refused.output
+        assert capture_state_engine_image(_db, run_id=run_id) == before_refusal
+        result = CliRunner().invoke(app, arguments)
     if result.exit_code != 0:
         raise AssertionError(f"CLI resume failed with exit {result.exit_code}: {result.output}") from result.exception
 
@@ -662,14 +661,21 @@ def _exercise_worker_profile(
             action_args=(run_id, str(settings_path), seam_value),
         ) as child:
             _wait_for_fork_ready(database_url, run_id, lambda: child.is_alive)
+            effective_settings_path = tmp_path / "admitted-settings.yaml" if web_attributed else settings_path
+            assert effective_settings_path.is_file()
             follower_child = spawn_database_process_at_seam(
                 database_url=database_url,
                 seam="follower-seat-dead",
                 action=_run_cli_follower_until_seat_dead,
-                action_args=(run_id, str(settings_path), str(database_path)),
+                action_args=(run_id, str(effective_settings_path), str(database_path)),
             )
             ready = child.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
             assert ready.pid != os.getpid()
+            live, seat_deadline, database_now = _seat_liveness(database_url, run_id)
+            assert live and seat_deadline is not None
+            assert (seat_deadline.replace(tzinfo=UTC) - database_now).total_seconds() <= _PROFILE_RUN_LIVENESS_SECONDS, (
+                f"a writer escaped the profile liveness window: deadline={seat_deadline}, database_now={database_now}"
+            )
             child.kill()
             assert child.wait_for_exit(timeout=_PROCESS_TIMEOUT_SECONDS).was_killed
 
@@ -734,7 +740,7 @@ def _exercise_worker_profile(
             database_url=database_url,
             seam="profile-resume-completed",
             action=_resume_profile_via_cli,
-            action_args=(run_id, str(settings_path), str(database_path)),
+            action_args=(run_id, str(effective_settings_path), str(database_path)),
         ) as child:
             child.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
             child.release()
@@ -784,7 +790,7 @@ def _exercise_worker_profile(
 def _seat_liveness(database_url: str, run_id: str) -> tuple[bool, datetime | None, datetime]:
     """The follower admission predicate itself: seat deadline against Landscape database time."""
     with LandscapeDB.from_url(database_url, create_tables=False) as db, db.engine.connect() as conn:
-        database_now = read_landscape_transaction_time(conn)
+        database_now = read_landscape_decision_time(conn)
         seat = conn.execute(
             select(
                 run_coordination_table.c.leader_heartbeat_expires_at,

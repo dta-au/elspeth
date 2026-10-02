@@ -10,15 +10,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from elspeth.contracts import RowResult, TokenInfo
     from elspeth.contracts.barrier_scalars import BarrierScalars
     from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.events import TelemetryEvent
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.contracts.scheduler import GroupLossSpec
-    from elspeth.contracts.schema_contract import PipelineRow
     from elspeth.contracts.types import CoalesceName, NodeID
-    from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
     from elspeth.engine.executors.collector import CollectorExecutor
     from elspeth.engine.row_union_executor import RowUnionExecutor
     from elspeth.engine.work_items import WorkItem
@@ -46,10 +46,21 @@ class RunIdentityPort(Protocol):
 
 
 class TokenCreationPort(RunIdentityPort, Protocol):
-    """Processor surface needed when source quarantine creates a token."""
+    """Processor surface needed when source quarantine records a rejected row."""
 
-    @property
-    def token_manager(self) -> Any:
+    def ingest_quarantined_row(
+        self,
+        *,
+        source_node_id: NodeID,
+        row_index: int,
+        source_row_index: int,
+        ingest_sequence: int,
+        row: object,
+        validation_error_id: str | None,
+        quarantine_sink: str,
+        quarantine_error: str,
+        quarantine_edge_id: str,
+    ) -> RowResult:
         raise NotImplementedError
 
     @property
@@ -59,23 +70,18 @@ class TokenCreationPort(RunIdentityPort, Protocol):
 
 
 class RowProcessingPort(Protocol):
-    """Processor surface for source/resume row and token execution."""
+    """Processor surface for source row execution."""
 
     def process_row(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
-
-    def process_existing_row(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
-
-    def process_token(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
 
 class AggregationProcessorPort(Protocol):
     """Processor surface needed by aggregation timeout and EOF flushing."""
 
-    def process_token(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
+    def drain_released_continuations(self, continuations: Sequence[WorkItem], ctx: PluginContext) -> list[RowResult]:
+        """Advance every continuation of one out-of-claim flush in one drain."""
+        ...
 
     def check_aggregation_timeout(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
@@ -96,10 +102,6 @@ class SchedulerDrainPort(Protocol):
 
     def has_scheduled_work(self) -> bool:
         """Return whether the durable scheduler has active non-terminal work."""
-        ...
-
-    def active_scheduled_row_ids(self) -> frozenset[str]:
-        """Return row IDs represented by active durable scheduler work."""
         ...
 
     def summarize_scheduled_work(self) -> tuple[str, ...]:
@@ -169,7 +171,12 @@ class CoalesceCompletionPort(Protocol):
         *,
         group_losses: tuple[GroupLossSpec, ...] = (),
     ) -> int:
-        """Mark durable scheduler work consumed by a barrier as terminal."""
+        """Mark durable scheduler work consumed by a barrier as terminal.
+
+        Returns exactly the number of distinct ``token_ids``: the scheduler
+        repository raises ``AuditIntegrityError`` inside its transaction on
+        an empty, duplicated, not-BLOCKED or short-terminalized set, so
+        callers do not re-check the count."""
         ...
 
     def complete_coalesce_merge(
@@ -184,32 +191,25 @@ class CoalesceCompletionPort(Protocol):
         """Atomically consume coalesce inputs, emit the merge, and continue."""
         raise NotImplementedError
 
-    def record_group_member_terminals(
+    def settle_failed_coalesce_group(
         self,
         consumed_tokens: tuple[TokenInfo, ...],
         *,
+        coalesce_name: CoalesceName,
         group_id: str,
         failure_reason: str,
         child_items: list[WorkItem],
-        group_failed: bool,
+        losses_ride_claim: bool,
     ) -> list[RowResult]:
-        """Terminalize a closer's consumed members (spec §6.1, Task 6) — the
-        caller names the closer's own group (``group_id``, META-38: never
-        re-derived from a consumed token's innermost frame, which may be a
-        collector release-group frame) and the
-        executor no longer writes their outcomes itself. When
-        ``group_failed`` (this call IS the group's failure, never a late
-        arrival against an already-closed group) it also walks the members'
-        REMAINING lineage for an enclosing bound frame; any cascaded
-        RowResults/child_items surface via the out params."""
-        raise NotImplementedError
-
-    def take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
-        """Drain any group losses staged (but not yet durably committed) by
-        the caller's own prior work (Ruling 39): the out-of-claim sweep
-        counterpart to `take_claim_group_losses`. The caller must commit the
-        drained spec(s) durably in the same transaction as its own
-        disposition (e.g. `mark_blocked_barrier_terminal(group_losses=...)`)."""
+        """Terminalize and surface a FAILED coalesce group — the one seam every
+        coalesce group-failure arm uses: record each consumed token's
+        terminal through the settlement channel (escalating to an enclosing
+        bound frame; cascaded RowResults/child_items surface), release their
+        BLOCKED scheduler rows, emit TokenCompleted per token, and return one
+        (FAILURE, UNROUTED) RowResult per consumed token (exactly one
+        carrying ``counts_failed_barrier``) followed by any cascaded results.
+        Sweep callers pass ``losses_ride_claim=False``: they run outside any
+        claim, so a staged escalation loss commits with this release."""
         raise NotImplementedError
 
 
@@ -235,20 +235,6 @@ class BarrierScalarsSource(Protocol):
     def get_barrier_scalars(self) -> BarrierScalars:
         """Compose the underivable barrier scalars from the live executors."""
         ...
-
-
-class ResumeContinuationPort(Protocol):
-    """Processor surface for incomplete-token resume continuation."""
-
-    def resume_incomplete_token(
-        self,
-        spec: IncompleteTokenSpec,
-        row_data: PipelineRow,
-        ctx: PluginContext,
-        *,
-        resume_checkpoint_id: str,
-    ) -> list[RowResult]:
-        raise NotImplementedError
 
 
 class SinkStepResolver(Protocol):
@@ -302,7 +288,6 @@ class RowProcessorHandle(
     CollectorExecutorSource,
     SinkTerminalizationPort,
     BarrierScalarsSource,
-    ResumeContinuationPort,
     SinkStepResolver,
     Protocol,
 ):

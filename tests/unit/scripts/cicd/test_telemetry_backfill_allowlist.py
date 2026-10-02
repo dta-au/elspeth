@@ -9,7 +9,6 @@ from textwrap import dedent
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = REPO_ROOT / ".githooks" / "check-commit-range-telemetry-backfill.sh"
 COMMIT_MSG_HOOK = REPO_ROOT / ".githooks" / "commit-msg-telemetry-backfill"
-ALLOWLIST_README = REPO_ROOT / "config" / "cicd" / "enforce_telemetry_backfill_trailer" / "README.md"
 
 
 def _run(cmd: list[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -223,18 +222,6 @@ def test_range_checker_rejects_empty_block_scalar_reason(tmp_path: Path) -> None
 
     assert proc.returncode == 1
     assert "reason is required" in proc.stderr
-
-
-def test_sha_allowlist_contract_is_documented_as_ci_only() -> None:
-    readme = ALLOWLIST_README.read_text(encoding="utf-8")
-    hook = COMMIT_MSG_HOOK.read_text(encoding="utf-8")
-
-    assert "CI-only SHA allowlist" in readme
-    assert "The local commit-msg hook cannot consume this SHA allowlist" in readme
-    assert "The hook and the CI backstop both read" not in readme
-
-    assert "The SHA allowlist is CI-only" in hook
-    assert "a per-cohort YAML file may name commits" not in hook
 
 
 def test_local_commit_msg_hook_reports_sha_allowlist_as_ci_only(tmp_path: Path) -> None:

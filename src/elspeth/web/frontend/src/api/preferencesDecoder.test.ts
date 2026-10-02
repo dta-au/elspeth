@@ -2,8 +2,6 @@ import { describe, expect, it } from "vitest";
 import { decodeUserComposerPreferences } from "./preferencesDecoder";
 
 const full = {
-  default_mode: "guided",
-  banner_dismissed_at: null,
   freeform_intro_dismissed_at: "2026-05-19T12:00:00Z",
   tutorial_completed_at: null,
   tutorial_stage: "run",
@@ -22,9 +20,9 @@ describe("decodeUserComposerPreferences", () => {
     const { show_advanced: _omitted, ...without } = full;
     expect(() => decodeUserComposerPreferences(without)).toThrow(/missing show_advanced/);
   });
-  it("rejects a non-boolean show_advanced, an unknown mode, an unknown stage, and an extra key", () => {
+  it("rejects a non-boolean show_advanced, a retired mode field, an unknown stage, and an extra key", () => {
     expect(() => decodeUserComposerPreferences({ ...full, show_advanced: "yes" })).toThrow(/show_advanced/);
-    expect(() => decodeUserComposerPreferences({ ...full, default_mode: "wizard" })).toThrow(/default_mode/);
+    expect(() => decodeUserComposerPreferences({ ...full, default_mode: "freeform" })).toThrow(/unexpected default_mode/);
     expect(() => decodeUserComposerPreferences({ ...full, tutorial_stage: "welcome" })).toThrow(/tutorial_stage/);
     expect(() => decodeUserComposerPreferences({ ...full, extra: 1 })).toThrow(/unexpected extra/);
   });

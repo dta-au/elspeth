@@ -22,18 +22,21 @@ prompt-patch can land on real node JSON.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import insert, select, update
+from sqlalchemy import Connection, insert, select, update
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.composer_interpretation import (
     INTERPRETATION_HASH_DOMAIN_V2,
     InterpretationChoice,
@@ -42,9 +45,10 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
-from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -66,7 +70,9 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.inline_blob_preflight import SessionInlineBlobSnapshot
 from elspeth.web.sessions.models import (
+    blobs_table,
     composition_states_table,
     interpretation_events_table,
     proposal_events_table,
@@ -77,6 +83,7 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateProvenance,
     CompositionStateRecord,
+    CompositionValidationError,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import (
@@ -86,7 +93,8 @@ from elspeth.web.sessions.service import (
     _patch_llm_transform_prompt,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.fixtures.identities import ensure_test_identity
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
 # Fixtures and helpers
@@ -106,7 +114,7 @@ def engine():
 
 @pytest.fixture
 def service(engine) -> SessionServiceImpl:
-    instance = DualFencedSessionServiceHarness(
+    instance = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -125,6 +133,7 @@ def service(engine) -> SessionServiceImpl:
 
 
 def _insert_session(conn, session_id: str) -> None:
+    ensure_test_identity(conn, identity_id="alice")
     created_at = datetime.now(UTC)
     conn.execute(
         insert(sessions_table).values(
@@ -694,7 +703,8 @@ async def test_01_create_pending_interpretation_event_inserts_row(service, opera
 async def test_02_create_pending_rejects_unknown_node_id(service) -> None:
     """Spec test 2: writer-boundary validation on affected_node_id.
 
-    Per CLAUDE.md offensive-programming rules, the writer must detect that
+    Per the ``engine-patterns-reference`` skill §Offensive Programming
+    Examples, the writer must detect that
     affected_node_id is not present in composition_states.nodes BEFORE any
     DB write, raising ValueError. The interpretation_events table must be
     empty after the raise (transaction rolled back).
@@ -940,8 +950,8 @@ async def test_03_resolve_accepted_as_drafted_uses_llm_draft(service) -> None:
     assert resolved.hash_domain_version == "v2"
     assert resolved.arguments_hash is not None
     assert len(resolved.arguments_hash) == 64
-    assert resolved.resolved_prompt_template_hash is not None
-    assert len(resolved.resolved_prompt_template_hash) == 64
+    assert resolved.approved_prompt_artifact_hash is not None
+    assert len(resolved.approved_prompt_artifact_hash) == 64
 
     # A new composition state row exists at version+1 with interpretation_resolve provenance.
     assert new_state.version == state.version + 1
@@ -952,12 +962,47 @@ async def test_03_resolve_accepted_as_drafted_uses_llm_draft(service) -> None:
     patched_template = patched["options"]["prompt_template"]
     assert "{{interpretation:cool}}" not in patched_template
     assert "Innovative and creative" in patched_template
-    assert patched["options"]["resolved_prompt_template_hash"] == resolved.resolved_prompt_template_hash
+    assert patched["options"]["approved_prompt_artifact_hash"] == resolved.approved_prompt_artifact_hash
 
     # Verify provenance in DB.
     with service._engine.begin() as conn:
         state_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(new_state.id))).one()
     assert state_row.provenance == "interpretation_resolve"
+
+
+@pytest.mark.asyncio
+async def test_resolve_preserves_authored_display_title_and_event_link(service) -> None:
+    session_id = uuid4()
+    node = _structured_llm_node(draft="Innovative and creative")
+    node["options"][INTERPRETATION_REQUIREMENTS_KEY][0]["display_title"] = "Definition of cool"
+    state = await _seed_state_with_llm_node(service, session_id=session_id, node=node)
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_title",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Innovative and creative",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    resolved, new_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+    assert new_state.nodes is not None
+    requirement = new_state.nodes[0]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert requirement["display_title"] == "Definition of cool"
+    assert requirement["event_id"] == str(resolved.id)
+    assert requirement["user_term"] == resolved.user_term == "cool"
+    assert requirement["accepted_value"] == resolved.accepted_value == "Innovative and creative"
+    assert requirement["resolved_prompt_template_hash"] == stable_hash("Innovative and creative")
 
 
 @pytest.mark.asyncio
@@ -1053,7 +1098,7 @@ async def test_03b_resolve_recomputes_validation_for_patched_live_state(service)
             nodes=[_llm_node()],
             metadata_={"name": "Phase 5b Test", "description": ""},
             is_valid=False,
-            validation_errors=[stale_error],
+            validation_errors=[CompositionValidationError(message=stale_error, error_code=None, component=None)],
         ),
         provenance="session_seed",
     )
@@ -1066,7 +1111,7 @@ async def test_03b_resolve_recomputes_validation_for_patched_live_state(service)
         actor="user:alice",
     )
 
-    assert stale_error not in list(new_state.validation_errors or ())
+    assert stale_error not in [error.message for error in new_state.validation_errors or ()]
 
 
 _GRAPH_STRUCTURE_ERROR = (
@@ -1108,7 +1153,7 @@ def _runtime_preflight_result(*, is_valid: bool, messages: tuple[str, ...] = ())
 
 
 def _preflight_service(engine, runtime_preflight) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -1137,7 +1182,10 @@ def _authoring_valid_pipeline_dict() -> dict:
                 input="input",
                 on_success="out",
                 on_error="discard",
-                options={"prompt_template": "Rate how {{interpretation:cool}} this is."},
+                options={
+                    "system_prompt": "You rate items against the user's criterion. Reply with a score from 1 to 5.",
+                    "prompt_template": "Rate how {{interpretation:cool}} this is.",
+                },
                 condition=None,
                 routes=None,
                 fork_to=None,
@@ -1166,7 +1214,7 @@ async def _seed_authoring_valid_state(
     *,
     session_id: UUID,
     is_valid: bool = True,
-    validation_errors: list[str] | None = None,
+    validation_errors: list[CompositionValidationError] | None = None,
     insert_session: bool = True,
 ) -> CompositionStateRecord:
     if insert_session:
@@ -1186,6 +1234,284 @@ async def _seed_authoring_valid_state(
         ),
         provenance="tool_call",
     )
+
+
+async def _seed_inline_reference_review_state(
+    service: SessionServiceImpl, *, session_id: UUID, blob_id: UUID, content: bytes
+) -> tuple[CompositionStateRecord, BlobRecord]:
+    await _seed_authoring_valid_state(service, session_id=session_id)
+    digest = hashlib.sha256(content).hexdigest()
+    pipeline = _authoring_valid_pipeline_dict()
+    pipeline["nodes"].insert(
+        0,
+        {
+            "id": "lookup",
+            "node_type": "transform",
+            "plugin": "reference_join",
+            "input": "input",
+            "on_success": "lookup_out",
+            "on_error": "discard",
+            "options": {
+                "reference_content": {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": digest},
+                "reference_format": "csv",
+                "reference_key_name": "sku",
+                "key_field": "sku",
+                "output": {"description": "ref['description']"},
+            },
+        },
+    )
+    pipeline["nodes"][1]["input"] = "lookup_out"
+    state = await _save_composition_state(
+        service,
+        session_id,
+        CompositionStateData(
+            sources=pipeline["sources"],
+            nodes=pipeline["nodes"],
+            edges=pipeline["edges"],
+            outputs=pipeline["outputs"],
+            metadata_=pipeline["metadata"],
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    record = BlobRecord(
+        id=blob_id,
+        session_id=session_id,
+        filename="reference.csv",
+        mime_type="text/csv",
+        size_bytes=len(content),
+        content_hash=digest,
+        storage_path="/tmp/session-preflight-reference.csv",
+        created_at=datetime.now(UTC),
+        created_by="user",
+        source_description=None,
+        status="ready",
+        creation_modality=CreationModality.VERBATIM,
+        created_from_message_id=None,
+        creating_model_identifier=None,
+        creating_model_version=None,
+        creating_provider=None,
+        creating_composer_skill_hash=None,
+        creating_arguments_hash=None,
+    )
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(blobs_table).values(
+                id=str(blob_id),
+                session_id=str(session_id),
+                filename=record.filename,
+                mime_type=record.mime_type,
+                size_bytes=record.size_bytes,
+                content_hash=record.content_hash,
+                storage_path=record.storage_path,
+                created_at=record.created_at,
+                created_by=record.created_by,
+                source_description=None,
+                status=record.status,
+                creation_modality=record.creation_modality.value,
+            )
+        )
+    return state, record
+
+
+@pytest.mark.asyncio
+async def test_pending_inline_reference_uses_prepared_bytes_in_runtime_preflight(engine) -> None:
+    content = b"sku,description\nhats,A fine hat\n"
+    session_id = uuid4()
+    blob_id = uuid4()
+    record_holder: list[BlobRecord] = []
+    preflight_bytes: list[bytes] = []
+
+    def read_blob(context: SessionOperationContext, requested_id: UUID) -> tuple[BlobRecord, bytes]:
+        assert context.fence.session_id == str(session_id)
+        assert requested_id == blob_id
+        return record_holder[0], content
+
+    def runtime_preflight(_state, _user_id, _session_id, _plugin_snapshot, blob_get_content):
+        preflight_bytes.append(blob_get_content(blob_id)[1])
+        return _runtime_preflight_result(is_valid=True)
+
+    service = FencedSessionServiceHarness(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test"),
+        runtime_preflight=runtime_preflight,
+        inline_blob_read=read_blob,
+    )
+    state, record = await _seed_inline_reference_review_state(service, session_id=session_id, blob_id=blob_id, content=content)
+    record_holder.append(record)
+    with engine.begin() as conn:
+        conn.execute(update(sessions_table).where(sessions_table.c.id == str(session_id)).values(interpretation_review_disabled=True))
+
+    async with _compose_operation(service, session_id) as context:
+        event = await service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=state.id,
+            affected_node_id="llm_transform_1",
+            tool_call_id="call_inline_pending",
+            user_term="cool",
+            kind=InterpretationKind.VAGUE_TERM,
+            llm_draft="creative",
+            model_identifier="test-model",
+            model_version="test-version",
+            provider="test",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
+    assert event.choice is InterpretationChoice.OPTED_OUT
+    assert preflight_bytes == [content]
+
+
+@pytest.mark.asyncio
+async def test_resolve_inline_reference_uses_prepared_bytes(engine) -> None:
+    content = b"sku,description\nhats,A fine hat\n"
+    session_id = uuid4()
+    blob_id = uuid4()
+    record_holder: list[BlobRecord] = []
+    preflight_bytes: list[bytes] = []
+
+    def read_blob(_context: SessionOperationContext, requested_id: UUID) -> tuple[BlobRecord, bytes]:
+        assert requested_id == blob_id
+        return record_holder[0], content
+
+    def runtime_preflight(_state, _user_id, _session_id, _plugin_snapshot, blob_get_content):
+        preflight_bytes.append(blob_get_content(blob_id)[1])
+        return _runtime_preflight_result(is_valid=True)
+
+    service = FencedSessionServiceHarness(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test"),
+        runtime_preflight=runtime_preflight,
+        inline_blob_read=read_blob,
+    )
+    state, record = await _seed_inline_reference_review_state(service, session_id=session_id, blob_id=blob_id, content=content)
+    record_holder.append(record)
+    async with _compose_operation(service, session_id) as context:
+        event = await service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=state.id,
+            affected_node_id="llm_transform_1",
+            tool_call_id="call_inline_resolve",
+            user_term="cool",
+            kind=InterpretationKind.VAGUE_TERM,
+            llm_draft="creative",
+            model_identifier="test-model",
+            model_version="test-version",
+            provider="test",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
+        _resolved, new_state = await service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=event.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+    assert new_state.is_valid is True
+    assert preflight_bytes == [content]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blob_update", [{"status": "error"}, {"mime_type": "application/json"}])
+async def test_pending_inline_reference_refuses_blob_row_changed_after_read(engine, blob_update: dict[str, str]) -> None:
+    content = b"sku,description\nhats,A fine hat\n"
+    session_id = uuid4()
+    blob_id = uuid4()
+    record_holder: list[BlobRecord] = []
+
+    def read_blob(_context: SessionOperationContext, _requested_id: UUID) -> tuple[BlobRecord, bytes]:
+        with engine.begin() as conn:
+            conn.execute(update(blobs_table).where(blobs_table.c.id == str(blob_id)).values(**blob_update))
+        return record_holder[0], content
+
+    service = FencedSessionServiceHarness(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test"),
+        runtime_preflight=lambda *_args: _runtime_preflight_result(is_valid=True),
+        inline_blob_read=read_blob,
+    )
+    state, record = await _seed_inline_reference_review_state(service, session_id=session_id, blob_id=blob_id, content=content)
+    record_holder.append(record)
+    with engine.begin() as conn:
+        conn.execute(update(sessions_table).where(sessions_table.c.id == str(session_id)).values(interpretation_review_disabled=True))
+
+    async with _compose_operation(service, session_id) as context:
+        with pytest.raises(AuditIntegrityError, match="inline blob changed"):
+            await service.create_pending_interpretation_event(
+                session_id=session_id,
+                composition_state_id=state.id,
+                affected_node_id="llm_transform_1",
+                tool_call_id="call_inline_stale",
+                user_term="cool",
+                kind=InterpretationKind.VAGUE_TERM,
+                llm_draft="creative",
+                model_identifier="test-model",
+                model_version="test-version",
+                provider="test",
+                composer_skill_hash="a" * 64,
+                session_operation_context=context,
+            )
+    with engine.connect() as conn:
+        assert conn.execute(select(interpretation_events_table.c.id).where(interpretation_events_table.c.id.is_not(None))).all() == []
+
+
+def test_inline_snapshot_refuses_modality_swap_with_identical_bytes() -> None:
+    """Replacement may change trust provenance while retaining the same hash and size."""
+    session_id = uuid4()
+    blob_id = uuid4()
+    content = b"prompt text"
+    digest = hashlib.sha256(content).hexdigest()
+    record = BlobRecord(
+        id=blob_id,
+        session_id=session_id,
+        filename="prompt.txt",
+        mime_type="text/plain",
+        size_bytes=len(content),
+        content_hash=digest,
+        storage_path="/tmp/inline-prompt.txt",
+        created_at=datetime.now(UTC),
+        created_by="user",
+        source_description=None,
+        status="ready",
+        creation_modality=CreationModality.VERBATIM,
+        created_from_message_id=None,
+        creating_model_identifier=None,
+        creating_model_version=None,
+        creating_provider=None,
+        creating_composer_skill_hash=None,
+        creating_arguments_hash=None,
+    )
+    source_records = {blob_id: (record, content)}
+    snapshot = SessionInlineBlobSnapshot(refs=frozenset(), records=source_records)
+    source_records.clear()
+    assert snapshot.content(blob_id) == (record, content)
+    row = SimpleNamespace(
+        session_id=str(session_id),
+        status="ready",
+        content_hash=digest,
+        size_bytes=len(content),
+        filename=record.filename,
+        mime_type=record.mime_type,
+        storage_path=record.storage_path,
+        created_by=record.created_by,
+        source_description=record.source_description,
+        creation_modality=CreationModality.LLM_GENERATED.value,
+        created_from_message_id="composer-message",
+        creating_model_identifier="model",
+        creating_model_version="v1",
+        creating_provider="provider",
+        creating_composer_skill_hash="a" * 64,
+        creating_arguments_hash="b" * 64,
+    )
+    conn = MagicMock(spec=Connection)
+    conn.execute.return_value.one_or_none.return_value = row
+
+    with pytest.raises(AuditIntegrityError, match="inline blob changed"):
+        snapshot.assert_current_rows(conn, session_id=session_id)
 
 
 @pytest.mark.asyncio
@@ -1227,7 +1553,7 @@ async def test_resolve_persists_runtime_preflight_verdict_over_authoring_validit
         service,
         session_id=session_id,
         is_valid=False,
-        validation_errors=[_GRAPH_STRUCTURE_ERROR],
+        validation_errors=[CompositionValidationError(message=_GRAPH_STRUCTURE_ERROR, error_code=None, component=None)],
         insert_session=False,
     )
 
@@ -1240,7 +1566,7 @@ async def test_resolve_persists_runtime_preflight_verdict_over_authoring_validit
     )
 
     assert new_state.is_valid is False
-    assert _GRAPH_STRUCTURE_ERROR in list(new_state.validation_errors or ())
+    assert _GRAPH_STRUCTURE_ERROR in [error.message for error in new_state.validation_errors or ()]
     (call,) = preflight_calls
     called_state, called_user_id, called_session_id, called_snapshot = call
     assert called_user_id == "alice"
@@ -1322,24 +1648,11 @@ async def test_opt_out_auto_resolve_persists_runtime_preflight_verdict(engine) -
     current_state = await service.get_current_state(session_id)
     assert current_state is not None
     assert current_state.is_valid is False
-    assert _GRAPH_STRUCTURE_ERROR in list(current_state.validation_errors or ())
+    assert _GRAPH_STRUCTURE_ERROR in [error.message for error in current_state.validation_errors or ()]
 
 
-@pytest.mark.parametrize(
-    ("composer_meta", "expected_errors"),
-    [
-        ({"guided_session": GuidedSession.initial().to_dict()}, ("guided_composition_invalid",)),
-        (None, ("/home/operator/private.csv token=VALIDATION-CREDENTIAL-CANARY",)),
-    ],
-    ids=("guided-closes-validator-text", "freeform-preserves-validator-text"),
-)
 @pytest.mark.asyncio
-async def test_resolve_interpretation_normalizes_validation_for_its_composer_surface(
-    service,
-    monkeypatch,
-    composer_meta,
-    expected_errors,
-) -> None:
+async def test_resolve_interpretation_preserves_validator_text(service, monkeypatch) -> None:
     session_id = uuid4()
     surfacing_state = await _seed_state_with_llm_node(service, session_id=session_id)
     event = await service.create_pending_interpretation_event(
@@ -1362,16 +1675,16 @@ async def test_resolve_interpretation_normalizes_validation_for_its_composer_sur
             nodes=[_llm_node()],
             metadata_={"name": "Phase 5b Test", "description": ""},
             is_valid=False,
-            validation_errors=["stale unresolved placeholder"],
-            composer_meta=composer_meta,
+            validation_errors=[CompositionValidationError(message="stale unresolved placeholder", error_code=None, component=None)],
+            composer_meta=None,
         ),
         provenance="session_seed",
     )
-    canary = "/home/operator/private.csv token=VALIDATION-CREDENTIAL-CANARY"
+    canary = "/srv/private.csv token=VALIDATION-CREDENTIAL-CANARY"
     monkeypatch.setattr(
         service,
         "_validate_patched_composition_state",
-        lambda _state, *, plugin_snapshot, session_id, user_id: ValidationSummary(
+        lambda _state, *, validation_inputs, session_id, user_id: ValidationSummary(
             is_valid=False,
             errors=(ValidationEntry(component="node", message=canary, severity="high"),),
         ),
@@ -1385,7 +1698,7 @@ async def test_resolve_interpretation_normalizes_validation_for_its_composer_sur
         actor="user:alice",
     )
 
-    assert new_state.validation_errors == expected_errors
+    assert new_state.validation_errors == (CompositionValidationError(message=canary, error_code=None, component="node"),)
 
 
 @pytest.mark.asyncio
@@ -1442,10 +1755,12 @@ async def test_resolve_prompt_template_review_records_hash_without_rewriting_tem
     assert resolved.kind is InterpretationKind.LLM_PROMPT_TEMPLATE
     assert resolved.hash_domain_version == "v2"
     assert resolved.accepted_value == event.llm_draft
-    assert resolved.resolved_prompt_template_hash == stable_hash(event.llm_draft)
+    assert resolved.approved_prompt_artifact_hash == approved_prompt_artifact_hash(prompt_template=event.llm_draft, system_prompt=None)
     node = next(node for node in new_state.nodes if node["id"] == "identify_colour")
     assert node["options"]["prompt_template"] == event.llm_draft
-    assert node["options"]["resolved_prompt_template_hash"] == stable_hash(event.llm_draft)
+    assert node["options"]["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash(
+        prompt_template=event.llm_draft, system_prompt=None
+    )
     requirement = node["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
     assert requirement["kind"] == InterpretationKind.LLM_PROMPT_TEMPLATE.value
     assert requirement["status"] == "resolved"
@@ -1462,7 +1777,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
     alias.  Validating that authored shape directly cannot construct the LLM
     pass-through transform and therefore collapses its output guarantees to
     empty.  The interpretation writer must use the same transient profile
-    lowering as guided composition before persisting its new validity state.
+    lowering as ordinary composition before persisting its new validity state.
     """
     from pathlib import Path
 
@@ -1507,7 +1822,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
         selected_profile_aliases=((llm_id, "tutorial"),),
         binding_generation_fingerprint="profiled-interpretation-test-generation",
     )
-    policy_service = DualFencedSessionServiceHarness(
+    policy_service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -1516,7 +1831,10 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
         catalog=create_catalog_service(),
     )
 
+    system_prompt = "You summarise web pages. Reply with a short summary only."
     prompt_template = "Summarize {{ row.page_text }}."
+    # A node carrying both roles is reviewed as one two-section prompt surface.
+    review_draft = f"System prompt:\n{system_prompt}\n\nPrompt template:\n{prompt_template}"
     user_term = "llm_prompt_template:llm1"
     state = CompositionState(
         source=SourceSpec(
@@ -1538,6 +1856,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
                 on_error="discard",
                 options={
                     "profile": "tutorial",
+                    "system_prompt": system_prompt,
                     "prompt_template": prompt_template,
                     "required_input_fields": ["page_text"],
                     "response_field": "summary",
@@ -1548,7 +1867,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
                             "kind": InterpretationKind.LLM_PROMPT_TEMPLATE.value,
                             "user_term": user_term,
                             "status": "pending",
-                            "draft": prompt_template,
+                            "draft": review_draft,
                             "event_id": None,
                             "accepted_value": None,
                             "accepted_artifact_hash": None,
@@ -1630,7 +1949,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
             tool_call_id="call_profiled_prompt_template",
             user_term=user_term,
             kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-            llm_draft=prompt_template,
+            llm_draft=review_draft,
             model_identifier="composer-model",
             model_version="composer-model",
             provider="openrouter",
@@ -1658,7 +1977,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
             tool_call_id="call_profiled_prompt_template_opt_out",
             user_term=user_term,
             kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-            llm_draft=prompt_template,
+            llm_draft=review_draft,
             model_identifier="composer-model",
             model_version="composer-model",
             provider="openrouter",
@@ -2397,9 +2716,13 @@ async def test_create_pending_after_session_opt_out_writes_surface_specific_audi
         assert event.arguments_hash is not None
         assert event.hash_domain_version == "v2"
         if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-            assert event.resolved_prompt_template_hash == stable_hash(llm_draft)
+            assert event.approved_prompt_artifact_hash == approved_prompt_artifact_hash(prompt_template=llm_draft, system_prompt=None)
+        elif kind is InterpretationKind.VAGUE_TERM:
+            assert event.approved_prompt_artifact_hash == approved_prompt_artifact_hash(
+                prompt_template=f"Rate how {llm_draft} this is.", system_prompt=None
+            )
         else:
-            assert event.resolved_prompt_template_hash is None
+            assert event.approved_prompt_artifact_hash is None
 
     pending_rows = await service.list_interpretation_events(session_id, status="pending")
     all_rows = await service.list_interpretation_events(session_id, status="all")
@@ -2438,7 +2761,9 @@ async def test_create_pending_after_session_opt_out_writes_surface_specific_audi
     prompt_requirement = prompt_node.options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert prompt_requirement["status"] == "resolved"
     assert prompt_requirement["accepted_value"] == "Read {{ row.html }} and return JSON."
-    assert prompt_node.options["resolved_prompt_template_hash"] == stable_hash("Read {{ row.html }} and return JSON.")
+    assert prompt_node.options["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash(
+        prompt_template="Read {{ row.html }} and return JSON.", system_prompt=None
+    )
 
     cleanup_node = next(node for node in latest_state.nodes if node.id == "drop_raw_html")
     cleanup_requirement = cleanup_node.options[INTERPRETATION_REQUIREMENTS_KEY][0]
@@ -2584,9 +2909,10 @@ async def test_resolve_pipeline_decision_rejects_custom_raw_field_preservation(s
                 arguments_hash=None,
                 hash_domain_version=None,
                 interpretation_source=InterpretationSource.USER_APPROVED.value,
+                surface_origin="composer_llm",
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
-                resolved_prompt_template_hash=None,
+                approved_prompt_artifact_hash=None,
             )
         )
 
@@ -2913,9 +3239,10 @@ def _interpretation_row(**overrides: object) -> SimpleNamespace:
         "arguments_hash": "b" * 64,
         "hash_domain_version": "v2",
         "interpretation_source": "user_approved",
+        "surface_origin": "composer_llm",
         "runtime_model_identifier_at_resolve": "anthropic/claude-opus-4-7",
         "runtime_model_version_at_resolve": "2026-05-01",
-        "resolved_prompt_template_hash": "c" * 64,
+        "approved_prompt_artifact_hash": "c" * 64,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -3099,7 +3426,7 @@ def test_patch_helper_sequential_vague_resolutions_keep_per_requirement_value_ha
 
     Each resolved requirement's ``resolved_prompt_template_hash`` attests its
     own accepted value (sibling-resolution invariant), while the node-level
-    ``options.resolved_prompt_template_hash`` tracks the full rendered prompt.
+    ``options.approved_prompt_artifact_hash`` tracks the full rendered prompt.
     Storing the full-render hash on the requirement froze the first-resolved
     requirement at a partial render, so reconciliation flagged permanent
     hash-drift once any second term resolved.
@@ -3141,7 +3468,9 @@ def test_patch_helper_sequential_vague_resolutions_keep_per_requirement_value_ha
     options = next(iter(second_pass))["options"]
     requirements = {requirement["id"]: requirement for requirement in options[INTERPRETATION_REQUIREMENTS_KEY]}
     assert options["prompt_template"] == "Rate modern and quick this is."
-    assert options["resolved_prompt_template_hash"] == stable_hash("Rate modern and quick this is.")
+    assert options["approved_prompt_artifact_hash"] == approved_prompt_artifact_hash(
+        prompt_template="Rate modern and quick this is.", system_prompt=None
+    )
     assert requirements["cool"]["resolved_prompt_template_hash"] == stable_hash("modern")
     assert requirements["fast"]["resolved_prompt_template_hash"] == stable_hash("quick")
 
@@ -3452,12 +3781,12 @@ async def test_resolve_round_trips_through_state_from_record_and_yaml(service) -
     assert node.id == "llm_transform_1"
     assert "{{interpretation:cool}}" not in node.options["prompt_template"]
     assert "modern design + clear purpose" in node.options["prompt_template"]
-    assert node.options["resolved_prompt_template_hash"] == resolved.resolved_prompt_template_hash
+    assert node.options["approved_prompt_artifact_hash"] == resolved.approved_prompt_artifact_hash
 
     # Generated YAML must carry both fields under transforms[0].options.
     yaml_str = generate_yaml(cs)
     assert "prompt_template: Rate how modern design + clear purpose this is." in yaml_str
-    assert f"resolved_prompt_template_hash: {resolved.resolved_prompt_template_hash}" in yaml_str
+    assert f"approved_prompt_artifact_hash: {resolved.approved_prompt_artifact_hash}" in yaml_str
     # Negative assertion: the placeholder must not survive into the YAML.
     assert "{{interpretation:cool}}" not in yaml_str
 
@@ -3501,7 +3830,7 @@ async def test_resolve_structured_requirement_round_trips_without_authoring_meta
     node = cs.nodes[0]
     requirement = node.options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert node.options["prompt_template"] == "Rate modern and clear this is."
-    assert node.options["resolved_prompt_template_hash"] == resolved.resolved_prompt_template_hash
+    assert node.options["approved_prompt_artifact_hash"] == resolved.approved_prompt_artifact_hash
     assert requirement["status"] == "resolved"
     assert requirement["accepted_value"] == "modern and clear"
     # Requirement-level hash attests the accepted value; the node-level hash

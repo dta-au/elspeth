@@ -34,7 +34,13 @@ class _NullTelemetry(RedactionTelemetry):
     def summarizer_error(self, *, tool_name: str) -> None:
         return None
 
-    def unknown_response_key(self, *, tool_name: str) -> None:
+    def unknown_tool_redacted(self) -> None:
+        return None
+
+    def unknown_response_key_redacted(self, *, tool_name: str) -> None:
+        return None
+
+    def response_projection_limit(self, *, tool_name: str, scope: str) -> None:
         return None
 
 

@@ -38,6 +38,12 @@ class MockPayloadStore:
             raise IntegrityError(f"Payload integrity check failed: expected {content_hash}, got {actual_hash}")
         return content
 
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be nonnegative")
+        content = self.retrieve(content_hash)
+        return content if len(content) <= max_bytes else None
+
     def exists(self, content_hash: str) -> bool:
         return content_hash in self._storage
 

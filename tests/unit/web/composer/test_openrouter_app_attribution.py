@@ -27,7 +27,7 @@ from elspeth.plugins.transforms.llm.providers.openrouter import (
     OPENROUTER_APP_REFERER,
     OPENROUTER_APP_TITLE,
 )
-from elspeth.web.composer.service import (
+from elspeth.web.composer.provider_gateway import (
     _apply_openrouter_app_identity,
     _litellm_acompletion,
 )

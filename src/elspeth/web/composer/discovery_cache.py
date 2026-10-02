@@ -8,8 +8,12 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from elspeth.contracts.errors import FrameworkBugError
+from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult
+from elspeth.web.composer.response_contracts import AdmittedResponse
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools._registry import response_contract_for
 from elspeth.web.execution.runtime_preflight import RuntimePreflightEntry, RuntimePreflightKey
 
 
@@ -20,6 +24,7 @@ class CachedDiscoveryPayload:
     success: bool
     affected_nodes: tuple[str, ...]
     data: Any
+    admitted_response: AdmittedResponse | None = None
 
 
 RuntimePreflightCache = dict[RuntimePreflightKey, RuntimePreflightEntry]
@@ -46,8 +51,12 @@ def serialize_tool_result(result: ToolResult) -> str:
     return json.dumps(result.to_dict(), default=pydantic_default)
 
 
-def cached_discovery_payload(result: ToolResult) -> CachedDiscoveryPayload:
+def cached_discovery_payload(result: ToolResult | AdmittedDiscoveryResult) -> CachedDiscoveryPayload:
     """Extract the state-independent fields from a cacheable discovery result."""
+    if isinstance(result, AdmittedDiscoveryResult):
+        if not result.result.success or result.response is None:
+            raise FrameworkBugError("Only successful discovery data can be cached")
+        return CachedDiscoveryPayload(True, result.result.affected_nodes, None, result.response)
     return CachedDiscoveryPayload(
         success=result.success,
         affected_nodes=result.affected_nodes,
@@ -67,6 +76,20 @@ def result_from_cached_discovery_payload(
         affected_nodes=cached.affected_nodes,
         data=cached.data,
     )
+
+
+def admitted_result_from_cached_discovery_payload(
+    tool_name: str,
+    state: CompositionState,
+    cached: CachedDiscoveryPayload,
+) -> AdmittedDiscoveryResult:
+    """Re-admit canonical cached data before any success audit or disclosure."""
+    contract = response_contract_for(tool_name)
+    if contract is None or cached.admitted_response is None or cached.success is not True or cached.data is not None:
+        raise FrameworkBugError("Malformed admitted discovery cache entry")
+    response = cached.admitted_response.readmit(contract)
+    result = result_from_cached_discovery_payload(state, cached)
+    return AdmittedDiscoveryResult(result, response, contract)
 
 
 def make_cache_key(tool_name: str, arguments: dict[str, Any]) -> str:

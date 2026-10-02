@@ -143,7 +143,7 @@ def test_splice_transform_public_dispatch_rejects_llm_runtime_hash_atomically() 
             "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
             "prompt_template": "Summarise {{ row.text }}.",
             "required_input_fields": ["text"],
-            "resolved_prompt_template_hash": None,
+            "approved_prompt_artifact_hash": None,
             "schema": {"mode": "observed"},
         }
     )
@@ -160,9 +160,9 @@ def test_splice_transform_public_dispatch_rejects_llm_runtime_hash_atomically() 
 
     assert result.success is False
     assert result.updated_state is state
-    assert result.data is not None
-    assert "resolved_prompt_template_hash" in result.data["error"]
-    assert "retry splice_transform" in result.data["error"]
+    assert result.data is None
+    assert "approved_prompt_artifact_hash" in result.validation.errors[0].message
+    assert "retry splice_transform" in result.validation.errors[0].message
 
 
 def test_splice_transform_public_dispatch_rejects_resolver_owned_review_atomically() -> None:
@@ -198,11 +198,11 @@ def test_splice_transform_public_dispatch_rejects_resolver_owned_review_atomical
 
     assert result.success is False
     assert result.updated_state is state
-    assert result.data is not None
-    assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
-    assert "retry splice_transform" in result.data["error"]
-    assert "request_interpretation_review" in result.data["error"]
-    assert "resolve_interpretation_event" not in result.data["error"]
+    assert result.data is None
+    assert INTERPRETATION_REQUIREMENTS_KEY in result.validation.errors[0].message
+    assert "retry splice_transform" in result.validation.errors[0].message
+    assert "request_interpretation_review" in result.validation.errors[0].message
+    assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
 
 def test_splice_transform_manifest_is_type_driven() -> None:
@@ -268,6 +268,7 @@ def test_splice_transform_identical_review_staged_replay_is_same_object() -> Non
                 "provider": "openrouter",
                 "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                "system_prompt": "You summarise text. Reply with the summary only.",
                 "prompt_template": "Summarise {{ row.text }}.",
                 "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
@@ -300,6 +301,7 @@ def test_splice_transform_replay_preserves_all_trusted_requirement_ids() -> None
                 "provider": "openrouter",
                 "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                "system_prompt": "You summarise text. Reply with the summary only.",
                 # The server derives prompt_template from the parts (a pending
                 # ref renders as "pending interpretation"); the submitted
                 # literal must match the derivation or the replay projection
@@ -400,6 +402,7 @@ def test_splice_transform_identical_replay_rejects_noncanonical_retained_require
                 "provider": "openrouter",
                 "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                "system_prompt": "You summarise text. Reply with the summary only.",
                 "prompt_template": "Summarise {{ row.text }}.",
                 "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
@@ -441,7 +444,7 @@ def test_splice_transform_identical_replay_rejects_noncanonical_retained_require
     replay = _execute_splice_transform(arguments, retained, _context())
 
     assert not replay.success
-    assert replay.data["error_code"] == "interpretation_requirements_invalid"
+    assert replay.validation.errors[0].error_code == "interpretation_requirements_invalid"
     assert replay.updated_state is retained
     assert replay.updated_state.version == retained.version
 
@@ -729,7 +732,7 @@ def test_splice_transform_rejects_connection_name_exhaustion_atomically() -> Non
 
     assert not result.success
     assert result.updated_state is state
-    assert "collision-free" in result.data["error"]
+    assert "collision-free" in result.validation.errors[0].message
 
 
 def test_splice_transform_node_options_redaction_omits_values() -> None:

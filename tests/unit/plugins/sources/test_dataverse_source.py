@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import urllib.parse
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -13,6 +13,9 @@ import httpx
 import pytest
 
 from elspeth.contracts import CallStatus
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.dataverse import (
     DataverseClient,
@@ -22,8 +25,94 @@ from elspeth.plugins.infrastructure.clients.dataverse import (
 from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_url
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 
+
+@pytest.mark.parametrize("consumption", ["not_started", "partial", "closed", "empty", "discarded"])
+def test_load_statistics_distinguish_lifecycle_states(consumption: str) -> None:
+    from elspeth.contracts.events import DataverseLoadStatistics
+
+    rows = [] if consumption == "empty" else [{"contactid": "first", "fullname": "First"}, {"contactid": "second"}]
+    if consumption == "discarded":
+        rows = [{"contactid": "missing_name"}, {"fullname": "missing_id"}]
+    source = _make_source_for_load(
+        [_make_page(rows)],
+        _base_config(schema={"mode": "fixed", "fields": ["contactid: str", "fullname: str"]}, on_validation_failure="discard"),
+    )
+    ctx = _mock_lifecycle_context()
+    iterator = source.load(_mock_source_context())
+    if consumption in ("partial", "closed"):
+        next(iterator)
+        if consumption == "closed":
+            iterator.close()
+    elif consumption in ("empty", "discarded"):
+        assert list(iterator) == []
+    source.on_complete(ctx)
+    ctx.telemetry_emit.assert_called_once()
+    event = ctx.telemetry_emit.call_args.args[0]
+    assert isinstance(event, DataverseLoadStatistics)
+    assert event.run_id == ctx.run_id
+    assert event.node_id == ctx.node_id
+    assert event.pages_fetched == (0 if consumption == "not_started" else 1)
+    assert event.rows_yielded == (1 if consumption in ("partial", "closed") else 0)
+    assert event.rows_rejected == (2 if consumption == "discarded" else 0)
+    assert (
+        event.load_state
+        == {
+            "not_started": "not_started",
+            "partial": "partial",
+            "closed": "partial",
+            "empty": "exhausted",
+            "discarded": "exhausted",
+        }[consumption]
+    )
+    iterator.close()
+
+
+def test_statistics_reset_on_new_lifecycle() -> None:
+    source = _make_source_for_load([_make_page([{"count": 1}, {"count": "bad"}])], _base_config(on_validation_failure="discard"))
+    list(source.load(_mock_source_context()))
+    ctx = _mock_lifecycle_context()
+    source.on_complete(ctx)
+    assert ctx.telemetry_emit.call_args.args[0].rows_yielded == 1
+    assert ctx.telemetry_emit.call_args.args[0].rows_rejected == 1
+    source.close()
+    with (
+        patch("azure.identity.ClientSecretCredential", new=_client_secret_credential_factory),
+        patch("elspeth.plugins.sources.dataverse.DataverseClient", new=_dataverse_client_factory(_DataverseClientFake())),
+    ):
+        source.on_start(ctx)
+    source.on_complete(ctx)
+    assert ctx.telemetry_emit.call_count == 2
+    event = ctx.telemetry_emit.call_args.args[0]
+    assert (event.pages_fetched, event.rows_yielded, event.rows_rejected, event.load_state) == (0, 0, 0, "not_started")
+    source.close()
+
+
+@pytest.mark.parametrize("audit_failure", ["page", "validation"])
+def test_statistics_do_not_count_failed_audit_writes(audit_failure: str) -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    source = _make_source_for_load([_make_page([{"count": 1}, {"count": "bad"}])], _base_config(on_validation_failure="discard"))
+    ctx = _mock_source_context()
+    if audit_failure == "page":
+        # Metadata audit succeeds; fail the data-page audit before counting it.
+        ctx.record_call.side_effect = iter([None, AuditIntegrityError("audit unavailable")])
+    else:
+        ctx.record_validation_error.side_effect = AuditIntegrityError("audit unavailable")
+    with pytest.raises(AuditIntegrityError, match="audit unavailable"):
+        list(source.load(ctx))
+    lifecycle = _mock_lifecycle_context()
+    source.on_complete(lifecycle)
+    event = lifecycle.telemetry_emit.call_args.args[0]
+    assert event.load_state == "failed"
+    assert event.pages_fetched == (0 if audit_failure == "page" else 1)
+    assert event.rows_yielded == (0 if audit_failure == "page" else 1)
+    assert event.rows_rejected == 0
+
+
 # Dynamic schema config for tests
 DYNAMIC_SCHEMA = {"mode": "observed"}
+# A declared field the fixture rows omit, so validation fails through the real schema.
+_REQUIRED_FIELD_SCHEMA = {"mode": "fixed", "fields": ["contactid: str", "required_field: str"]}
 FIXED_SCHEMA = {
     "mode": "fixed",
     "fields": [
@@ -77,6 +166,27 @@ def _fetchxml_config(**overrides: Any) -> dict[str, Any]:
     }
     config.update(overrides)
     return config
+
+
+def test_discovery_query_guidance_matches_accepted_configuration() -> None:
+    from elspeth.plugins.sources.dataverse import DataverseSource, DataverseSourceConfig
+
+    assert DataverseSourceConfig.from_dict(_base_config()).entity == "contact"
+    assert DataverseSourceConfig.from_dict(_fetchxml_config()).fetch_xml is not None
+    with pytest.raises(PluginConfigError, match="query_mode"):
+        DataverseSourceConfig.from_dict(_base_config(query_mode="odata"))
+    with pytest.raises(PluginConfigError, match="exactly one"):
+        DataverseSourceConfig.from_dict(_fetchxml_config(entity="contact"))
+    for option, value in (("select", ["fullname"]), ("filter", "statecode eq 0"), ("orderby", "fullname"), ("top", 1)):
+        with pytest.raises(PluginConfigError, match="require entity"):
+            DataverseSourceConfig.from_dict(_fetchxml_config(**{option: value}))
+
+    assistance = DataverseSource.get_agent_assistance()
+    assert assistance is not None
+    hints = " ".join(assistance.composer_hints)
+    assert "query_mode" not in hints
+    assert "exactly one of entity (structured OData) or fetch_xml (FetchXML)" in hints
+    assert "select/filter/orderby/top require entity" in hints
 
 
 def _make_page(
@@ -151,6 +261,7 @@ class _LifecycleContextFake:
     run_id: str = "test-run-123"
     node_id: str | None = "source-node"
     operation_id: str | None = "op-001"
+    call_mode_session: Any = None
     landscape: Any = None
     payload_store: Any = None
     rate_limit_registry: Any = None
@@ -164,18 +275,11 @@ class _SourceContextFake:
     run_id: str = "test-run-123"
     node_id: str | None = "source-node"
     operation_id: str | None = "op-001"
+    call_mode_session: Any = None
     landscape: Any = None
     telemetry_emit: _CallRecorder = field(default_factory=_CallRecorder)
     record_call: _CallRecorder = field(default_factory=_CallRecorder)
     record_validation_error: _CallRecorder = field(default_factory=_CallRecorder)
-
-
-@dataclass(frozen=True, slots=True)
-class _ValidatedRow:
-    row: dict[str, Any]
-
-    def to_row(self) -> dict[str, Any]:
-        return dict(self.row)
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,15 +339,6 @@ def _make_metadata_page(
     )
 
 
-def _schema_class(validate: Callable[[dict[str, Any]], Any]) -> type[Any]:
-    class _Schema:
-        @staticmethod
-        def model_validate(row: dict[str, Any]) -> Any:
-            return validate(row)
-
-    return _Schema
-
-
 def _mock_lifecycle_context(run_id: str = "test-run-123") -> _LifecycleContextFake:
     """Build a LifecycleContext fake for on_start()."""
     return _LifecycleContextFake(run_id=run_id)
@@ -264,6 +359,7 @@ def _plugin_context_for_operation_calls(*, telemetry_emit: Any) -> Any:
         landscape=_OperationLandscapeFake(),
         node_id="source-node",
         operation_id="op-001",
+        coordination_token=CoordinationToken(run_id="test-run-123", worker_id="mock-worker", leader_epoch=1),
         telemetry_emit=telemetry_emit,
     )
 
@@ -308,24 +404,11 @@ def _make_source_unlocked(config: dict[str, Any]) -> Any:
     return _make_source(config)
 
 
-def _make_source_for_load(
-    pages: list[DataversePageResponse],
-    config: dict[str, Any],
-    *,
-    schema_validate_side_effect: Any = None,
-) -> Any:
+def _make_source_for_load(pages: list[DataversePageResponse], config: dict[str, Any]) -> Any:
     """Create DataverseSource for load() tests with a fake client."""
     from elspeth.plugins.sources.dataverse import DataverseSource
 
-    if schema_validate_side_effect is not None:
-        schema_cls = _schema_class(schema_validate_side_effect)
-        with patch(
-            "elspeth.plugins.sources.dataverse.create_schema_from_config",
-            return_value=schema_cls,
-        ):
-            source = DataverseSource(config)
-    else:
-        source = DataverseSource(config)
+    source = DataverseSource(config)
 
     if source._entity is not None:
         metadata_url = (
@@ -347,20 +430,11 @@ def _make_source_for_start_and_load(
     config: dict[str, Any],
     *,
     mock_client: _DataverseClientFake,
-    schema_validate_side_effect: Any = None,
 ) -> Any:
     """Create DataverseSource for lifecycle + load() tests with a patched client."""
     from elspeth.plugins.sources.dataverse import DataverseSource
 
-    if schema_validate_side_effect is not None:
-        schema_cls = _schema_class(schema_validate_side_effect)
-        with patch(
-            "elspeth.plugins.sources.dataverse.create_schema_from_config",
-            return_value=schema_cls,
-        ):
-            source = DataverseSource(config)
-    else:
-        source = DataverseSource(config)
+    source = DataverseSource(config)
 
     lifecycle_ctx = _mock_lifecycle_context()
     with (
@@ -1096,6 +1170,228 @@ class TestBuildQueryUrl:
 class TestDataverseSourceLoadStructured:
     """Tests for load() with structured OData queries."""
 
+    @pytest.mark.parametrize("reason", ["missing", "ambiguous"])
+    def test_verify_refuses_metadata_before_credential_or_client(self, reason: str) -> None:
+        source = _make_source(_base_config())
+        source._client = _DataverseClientFake()
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_operation_http_managed_identity(self, **_kwargs: Any) -> None:
+                raise AuditIntegrityError(f"source metadata call {reason}")
+
+        lifecycle_ctx = _mock_lifecycle_context()
+        source_ctx = _mock_source_context()
+        lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = _VerifySession()
+        with (
+            patch.object(type(source._auth_config), "create_credential", side_effect=AssertionError("credential constructed")),
+            patch("elspeth.plugins.sources.dataverse.DataverseClient", side_effect=AssertionError("client constructed")),
+            pytest.raises(AuditIntegrityError, match=f"source metadata call {reason}"),
+        ):
+            source.on_start(lifecycle_ctx)
+            list(source.load(source_ctx))
+        source_ctx.record_call.assert_not_called()
+
+    def test_verify_records_metadata_and_page_verdicts_in_order(self) -> None:
+        source = _make_source(_base_config())
+        headers = {
+            "Authorization": f"<fingerprint:{'a' * 64}>",
+            "Accept": "application/json",
+            "OData-MaxVersion": "4.0",
+            "OData-Version": "4.0",
+        }
+        metadata_page = replace(_make_metadata_page("contact"), request_headers=headers)
+        data_page = replace(_make_page([{"contactid": "1"}]), request_headers=headers)
+        events: list[str] = []
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_operation_http_managed_identity(self, **kwargs: Any) -> Any:
+                url = kwargs["request_data"]["url"]
+                kind = "metadata" if "EntityDefinitions" in url else "page"
+                assert kwargs["request_data"]["headers"] == {key: value for key, value in headers.items() if key != "Authorization"}
+                events.append(f"preflight:{kind}")
+                return SimpleNamespace(source_call_id=f"source-{kind}")
+
+            def admit_verify_operation_http_managed_identity(self, **kwargs: Any) -> str:
+                kind = "metadata" if "EntityDefinitions" in kwargs["request_data"]["url"] else "page"
+                assert kwargs["source_call_id"] == f"source-{kind}"
+                events.append(f"admit:{kind}:{kwargs['current_call_index']}")
+                return kwargs["source_call_id"]
+
+            def verify_call(self, **kwargs: Any) -> None:
+                assert kwargs["live_status"] is CallStatus.SUCCESS
+                events.append(f"verify:{kwargs['current_call_index']}")
+
+        session = _VerifySession()
+        lifecycle_ctx = _mock_lifecycle_context()
+        source_ctx = _mock_source_context()
+        lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = session
+        source_ctx.record_call = _CallRecorder(
+            side_effect=lambda **_kwargs: SimpleNamespace(
+                call_index=source_ctx.record_call.call_count - 1, call_id=f"current-{source_ctx.record_call.call_count}"
+            )
+        )
+
+        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+            assert events == ["preflight:metadata"]
+            events.append("client")
+            client = _DataverseClientFake(metadata_page=metadata_page)
+
+            def get_metadata(url: str) -> DataversePageResponse:
+                before_request(url)
+                events.append("dispatch:metadata")
+                return metadata_page
+
+            def get_pages(url: str) -> Any:
+                before_request(url)
+                events.append("dispatch:page")
+                yield data_page
+
+            client.get_page.side_effect = get_metadata
+            client.paginate_odata.side_effect = get_pages
+            return client
+
+        with (
+            patch.object(type(source._auth_config), "create_credential", return_value=_CredentialFake()),
+            patch("elspeth.plugins.sources.dataverse.DataverseClient", side_effect=client_factory),
+        ):
+            source.on_start(lifecycle_ctx)
+            assert events == []
+            rows = list(source.load(source_ctx))
+        assert len(rows) == 1
+        assert source_ctx.record_call.call_count == 2
+        assert events == [
+            "preflight:metadata",
+            "client",
+            "preflight:metadata",
+            "dispatch:metadata",
+            "admit:metadata:0",
+            "verify:0",
+            "preflight:page",
+            "dispatch:page",
+            "admit:page:1",
+            "verify:1",
+        ]
+
+    @pytest.mark.parametrize("reason", ["missing", "ambiguous"])
+    def test_verify_refuses_page_before_dispatch(self, reason: str) -> None:
+        source = _make_source(_base_config())
+        metadata_page = replace(
+            _make_metadata_page("contact"),
+            request_headers={
+                "Authorization": f"<fingerprint:{'a' * 64}>",
+                "Accept": "application/json",
+                "OData-MaxVersion": "4.0",
+                "OData-Version": "4.0",
+            },
+        )
+        events: list[str] = []
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_operation_http_managed_identity(self, **kwargs: Any) -> Any:
+                if "EntityDefinitions" not in kwargs["request_data"]["url"]:
+                    raise AuditIntegrityError(f"source page call {reason}")
+                events.append("metadata preflight")
+                return SimpleNamespace(source_call_id="source-metadata")
+
+            def admit_verify_operation_http_managed_identity(self, **_kwargs: Any) -> str:
+                return "source-metadata"
+
+            def verify_call(self, **_kwargs: Any) -> None:
+                events.append("metadata verdict")
+
+        lifecycle_ctx = _mock_lifecycle_context()
+        source_ctx = _mock_source_context()
+        lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = _VerifySession()
+        source_ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=0, call_id="current-metadata"))
+
+        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+            client = _DataverseClientFake(metadata_page=metadata_page)
+
+            def get_metadata(url: str) -> DataversePageResponse:
+                before_request(url)
+                return metadata_page
+
+            def get_pages(url: str) -> Any:
+                before_request(url)
+                events.append("page dispatched")
+                yield _make_page([{"contactid": "1"}])
+
+            client.get_page.side_effect = get_metadata
+            client.paginate_odata.side_effect = get_pages
+            return client
+
+        with (
+            patch.object(type(source._auth_config), "create_credential", return_value=_CredentialFake()),
+            patch("elspeth.plugins.sources.dataverse.DataverseClient", side_effect=client_factory),
+            pytest.raises(AuditIntegrityError, match=f"source page call {reason}"),
+        ):
+            source.on_start(lifecycle_ctx)
+            list(source.load(source_ctx))
+        assert source_ctx.record_call.call_count == 1
+        assert events == ["metadata preflight", "metadata preflight", "metadata verdict"]
+
+    def test_verify_persists_metadata_error_verdict(self) -> None:
+        source = _make_source(_base_config())
+        verdicts: list[Any] = []
+        headers = {
+            "Authorization": f"<fingerprint:{'a' * 64}>",
+            "Accept": "application/json",
+            "OData-MaxVersion": "4.0",
+            "OData-Version": "4.0",
+        }
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_operation_http_managed_identity(self, **_kwargs: Any) -> Any:
+                return SimpleNamespace(source_call_id="source-metadata-error")
+
+            def admit_verify_operation_http_managed_identity(self, **kwargs: Any) -> str:
+                assert kwargs["source_call_id"] == "source-metadata-error"
+                return "source-metadata-error"
+
+            def verify_call(self, **kwargs: Any) -> None:
+                verdicts.append(kwargs)
+
+        lifecycle_ctx = _mock_lifecycle_context()
+        source_ctx = _mock_source_context()
+        lifecycle_ctx.call_mode_session = source_ctx.call_mode_session = _VerifySession()
+        source_ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=0, call_id="current-error"))
+
+        def client_factory(*_args: Any, before_request: Callable[[str], None], **_kwargs: Any) -> _DataverseClientFake:
+            client = _DataverseClientFake()
+
+            def metadata_error(url: str) -> None:
+                before_request(url)
+                raise DataverseClientError(
+                    "metadata server error",
+                    retryable=True,
+                    status_code=500,
+                    request_url=url,
+                    request_headers=headers,
+                )
+
+            client.get_page.side_effect = metadata_error
+            return client
+
+        with (
+            patch.object(type(source._auth_config), "create_credential", return_value=_CredentialFake()),
+            patch("elspeth.plugins.sources.dataverse.DataverseClient", side_effect=client_factory),
+            pytest.raises(DataverseClientError, match="metadata server error"),
+        ):
+            source.on_start(lifecycle_ctx)
+            list(source.load(source_ctx))
+        assert source_ctx.record_call.call_count == 1
+        assert verdicts[0]["live_status"] is CallStatus.ERROR
+        assert verdicts[0]["current_call_index"] == 0
+        assert verdicts[0]["live_error_data"]["status_code"] == 500
+
     def test_structured_load_resolves_logical_name_to_entity_set_before_pagination(self) -> None:
         metadata_page = _make_metadata_page("contact", entity_set_name="contacts")
         mock_client = _DataverseClientFake(
@@ -1359,6 +1655,19 @@ class TestDataverseSourceLoadStructured:
         assert call_kwargs["schema_mode"] == "odata_strip"
         assert "collision" in call_kwargs["error"].lower()
 
+    def test_load_quarantines_an_unsafe_integer_value_free(self) -> None:
+        """H1 (lane 5887): an OData integer outside ±(2**53-1) is quarantined, not passed as valid."""
+        pages = [_make_page([{"contactid": "c1", "n": 9_007_199_254_740_993}, {"contactid": "c2", "n": 5}])]
+        source = _make_source_for_load(pages, _base_config())
+        ctx = _mock_source_context()
+
+        rows = list(source.load(ctx))
+
+        assert [row.is_quarantined for row in rows] == [True, False]
+        assert rows[0].quarantine_error == "1 validation error: <root>: [non_canonical_number]"
+        assert "9007199254740993" not in ctx.record_validation_error.call_args.kwargs["error"]
+        assert rows[1].row["n"] == 5
+
     def test_load_discard_does_not_yield_quarantined(self) -> None:
         """When on_validation_failure='discard', quarantined rows are not yielded."""
         pages = [
@@ -1387,57 +1696,22 @@ class TestDataverseSourceLoadStructured:
         ctx.record_validation_error.assert_called_once()
 
     def test_load_schema_validation_failure_quarantines(self) -> None:
-        """Rows failing schema validation are quarantined."""
-        from pydantic import ValidationError
-
-        def failing_validate(row: dict[str, Any]) -> None:
-            raise ValidationError.from_exception_data(
-                title="DataverseRowSchema",
-                line_errors=[
-                    {
-                        "type": "missing",
-                        "loc": ("required_field",),
-                        "input": row,
-                    }
-                ],
-            )
-
+        """Rows failing schema validation are quarantined, the failure named by its declared field."""
         pages = [_make_page([{"contactid": "1"}])]
-        source = _make_source_for_load(
-            pages,
-            _base_config(),
-            schema_validate_side_effect=failing_validate,
-        )
+        source = _make_source_for_load(pages, _base_config(schema=_REQUIRED_FIELD_SCHEMA))
         ctx = _mock_source_context()
 
         rows = list(source.load(ctx))
         assert len(rows) == 1
         assert rows[0].is_quarantined
         assert rows[0].quarantine_destination == QUARANTINE_SINK
+        assert rows[0].quarantine_error == "1 validation error: required_field: [missing]"
         ctx.record_validation_error.assert_called_once()
 
     def test_load_schema_validation_failure_discard(self) -> None:
         """Schema validation failure with discard yields no rows."""
-        from pydantic import ValidationError
-
-        def failing_validate(row: dict[str, Any]) -> None:
-            raise ValidationError.from_exception_data(
-                title="DataverseRowSchema",
-                line_errors=[
-                    {
-                        "type": "missing",
-                        "loc": ("required_field",),
-                        "input": row,
-                    }
-                ],
-            )
-
         pages = [_make_page([{"contactid": "1"}])]
-        source = _make_source_for_load(
-            pages,
-            _base_config(on_validation_failure="discard"),
-            schema_validate_side_effect=failing_validate,
-        )
+        source = _make_source_for_load(pages, _base_config(schema=_REQUIRED_FIELD_SCHEMA, on_validation_failure="discard"))
         ctx = _mock_source_context()
 
         rows = list(source.load(ctx))
@@ -1479,26 +1753,6 @@ class TestDataverseSourceLoadStructured:
 
     def test_load_valid_and_quarantined_mixed(self) -> None:
         """Valid and quarantined rows can be interleaved."""
-        from pydantic import ValidationError
-
-        call_count = 0
-
-        def sometimes_failing_validate(row: dict[str, Any]) -> _ValidatedRow:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 2:
-                raise ValidationError.from_exception_data(
-                    title="DataverseRowSchema",
-                    line_errors=[
-                        {
-                            "type": "missing",
-                            "loc": ("field",),
-                            "input": row,
-                        }
-                    ],
-                )
-            return _ValidatedRow(dict(row))
-
         pages = [
             _make_page(
                 [
@@ -1508,18 +1762,15 @@ class TestDataverseSourceLoadStructured:
                 ]
             ),
         ]
-        source = _make_source_for_load(
-            pages,
-            _base_config(),
-            schema_validate_side_effect=sometimes_failing_validate,
-        )
+        source = _make_source_for_load(pages, _base_config(schema={"mode": "fixed", "fields": ["contactid: str", "fullname: str"]}))
         ctx = _mock_source_context()
 
         rows = list(source.load(ctx))
         valid_rows = [r for r in rows if not r.is_quarantined]
         quarantined_rows = [r for r in rows if r.is_quarantined]
-        assert len(valid_rows) == 2
-        assert len(quarantined_rows) == 1
+        assert [r.row["contactid"] for r in valid_rows] == ["1", "3"]
+        assert [r.row["contactid"] for r in quarantined_rows] == ["2"]
+        assert quarantined_rows[0].quarantine_error == "1 validation error: fullname: [missing]"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1618,7 +1869,7 @@ class TestDataverseSourceLoadFetchXML:
 
         def validate_candidate(url: str, **_kwargs: Any) -> SSRFSafeRequest:
             if "fetchXml=" in url:
-                raise SSRFBlockedError("candidate rejected")
+                raise SSRFBlockedError("candidate rejected", kind="blocked_range")
             return _make_ssrf_safe(url)
 
         try:

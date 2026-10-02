@@ -464,13 +464,13 @@ class TestContractBuilderEdgeCases:
 
     def test_normalizer_typeerror_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Programmer TypeError from the normalizer is not mapped to object."""
-        from elspeth.contracts import contract_builder as contract_builder_module
+        from elspeth.contracts import type_normalization as type_normalization_module
         from elspeth.contracts.contract_builder import ContractBuilder
 
         def broken_normalizer(value: object) -> type:
             raise TypeError("programmer bug in type normalization")
 
-        monkeypatch.setattr(contract_builder_module, "normalize_type_for_contract", broken_normalizer)
+        monkeypatch.setattr(type_normalization_module, "normalize_type_for_contract", broken_normalizer)
 
         contract = SchemaContract(mode="OBSERVED", fields=(), locked=False)
         builder = ContractBuilder(contract)
@@ -542,7 +542,8 @@ class TestContractBuilderEdgeCases:
     def test_field_in_row_not_in_resolution_crashes(self) -> None:
         """Field in row but not in resolution raises KeyError (Tier 1 integrity).
 
-        Per CLAUDE.md: Sources are system code. If a field is in the row but
+        Per docs/guides/data-trust-and-error-handling.md §Plugin Ownership:
+        sources are system code. If a field is in the row but
         not in field_resolution, that's a bug in the source plugin.
         Silent fallback corrupts the audit trail with wrong original_name.
         """

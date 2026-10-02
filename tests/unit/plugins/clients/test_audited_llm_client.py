@@ -6,22 +6,430 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
+import litellm
 import pytest
+from litellm.types.utils import ModelResponse
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.events import ExternalCallCompleted
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
     ContentPolicyError,
+    ContextLengthError,
     LLMClientError,
     LLMResponse,
+    NetworkError,
     RateLimitError,
+    ServerError,
+    public_llm_error_category,
 )
+from tests.fixtures.mock_audit import mock_audit_authority
 
 _DEFAULT_USAGE = object()
+
+
+@pytest.mark.parametrize(
+    ("error", "category", "retryable"),
+    [
+        (RateLimitError("limit"), "rate_limit", True),
+        (NetworkError("network"), "network", True),
+        (ServerError("server"), "server", True),
+        (ContentPolicyError("policy"), "content_policy", False),
+        (ContextLengthError("context"), "context_length", False),
+        (LLMClientError("client"), "client", False),
+    ],
+)
+def test_public_llm_error_category_tracks_owned_retry_semantics(error: LLMClientError, category: str, retryable: bool) -> None:
+    assert public_llm_error_category(error) == category
+    assert error.retryable is retryable
+
+
+def test_replay_llm_call_returns_recorded_typed_response_without_sdk_dispatch() -> None:
+    """Replay must intercept the SDK, preserve response fields, and audit lineage."""
+
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **kwargs: Any) -> SimpleNamespace:
+            assert kwargs["call_type"] is CallType.LLM
+            assert kwargs["request_data"]["model"] == "gpt-4"
+            return SimpleNamespace(
+                source_call_id="source-call-1",
+                status=CallStatus.SUCCESS,
+                response_data={
+                    "content": "recorded answer",
+                    "model": "recorded-model",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                    "raw_response": {"choices": [{"finish_reason": "stop"}]},
+                    "pricing_model": "gpt-4",
+                    "provider_cost": None,
+                    "provider_cost_source": "not_available",
+                },
+                error_data=None,
+                latency_ms=12.5,
+            )
+
+    sdk = FakeOpenAIClient(exception=AssertionError("SDK must not be called in replay"))
+    execution = FakeExecutionRepository()
+    emitted: list[ExternalCallCompleted] = []
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_replay",
+        telemetry_emit=emitted.append,
+        underlying_client=sdk,
+        call_mode_session=ReplaySession(),
+    )
+
+    response = client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert sdk.create_calls == []
+    assert response.content == "recorded answer"
+    assert response.model == "recorded-model"
+    assert response.usage == TokenUsage.known(10, 5)
+    assert response.latency_ms == 12.5
+    assert response.raw_response is not None
+    assert response.raw_response["choices"][0]["finish_reason"] == "stop"
+    assert execution.last_record_call_kwargs["source_call_id"] == "source-call-1"
+    assert execution.last_record_call_kwargs["status"] is CallStatus.SUCCESS
+    assert len(emitted) == 1
+    assert emitted[0].status is CallStatus.SUCCESS
+
+
+def test_verify_llm_call_submits_audited_response_for_persisted_comparison() -> None:
+    """Verify consumes the exact audited semantic response after live dispatch."""
+
+    class VerifySession:
+        mode = RunMode.VERIFY
+
+        def __init__(self) -> None:
+            self.admissions: list[dict[str, Any]] = []
+            self.comparisons: list[dict[str, Any]] = []
+
+        def admit_verify_call(self, **kwargs: Any) -> str:
+            self.admissions.append(kwargs)
+            assert sdk.create_calls == []
+            return "source-call-1"
+
+        def verify_call(self, **kwargs: Any) -> SimpleNamespace:
+            self.comparisons.append(kwargs)
+            return SimpleNamespace(is_match=False)
+
+    session = VerifySession()
+    execution = FakeExecutionRepository()
+    sdk = FakeOpenAIClient(response=provider_response())
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_verify",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        call_mode_session=session,
+    )
+
+    client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert len(sdk.create_calls) == 1
+    assert len(session.admissions) == 1
+    assert session.admissions[0]["request_data"] == execution.last_record_call_kwargs["request_data"].to_dict()
+    assert len(session.comparisons) == 1
+    comparison = session.comparisons[0]
+    assert comparison["call_type"] is CallType.LLM
+    assert comparison["current_call_id"] == "call-1"
+    assert comparison["live_status"] is CallStatus.SUCCESS
+    assert comparison["live_response_data"] == execution.last_record_call_kwargs["response_data"].to_dict()
+
+
+@pytest.mark.parametrize("source_problem", ["missing", "ambiguous"])
+def test_verify_llm_refuses_unmatched_source_request_before_sdk(source_problem: str) -> None:
+    class VerifySession:
+        mode = RunMode.VERIFY
+
+        def admit_verify_call(self, **kwargs: Any) -> str:
+            assert kwargs["call_type"] is CallType.LLM
+            assert kwargs["request_data"]["model"] == "gpt-4"
+            raise AuditIntegrityError(f"Source request is {source_problem}")
+
+    sdk = FakeOpenAIClient(response=provider_response())
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_verify",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        call_mode_session=VerifySession(),
+    )
+
+    with pytest.raises(AuditIntegrityError, match=source_problem):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert sdk.create_calls == []
+    assert execution.recorded_calls == []
+
+
+@pytest.mark.parametrize(
+    ("category", "retryable", "error_class"),
+    [
+        ("rate_limit", True, RateLimitError),
+        ("network", True, NetworkError),
+    ],
+)
+def test_replay_llm_error_preserves_classification(category: str, retryable: bool, error_class: type[LLMClientError]) -> None:
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                source_call_id="source-error-call",
+                status=CallStatus.ERROR,
+                response_data=None,
+                error_data={
+                    "type": "ProviderError",
+                    "message": "LLM provider request failed",
+                    "retryable": retryable,
+                    "pricing_model": "gpt-4",
+                    "provider_cost": None,
+                    "provider_cost_source": "not_available",
+                    "category": category,
+                },
+                latency_ms=7.0,
+            )
+
+    sdk = FakeOpenAIClient(exception=AssertionError("SDK must not be called in replay"))
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_replay_error",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        call_mode_session=ReplaySession(),
+    )
+
+    with pytest.raises(error_class, match="LLM provider request failed"):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert sdk.create_calls == []
+    assert execution.last_record_call_kwargs["source_call_id"] == "source-error-call"
+    assert execution.last_record_call_kwargs["error"].to_dict()["category"] == category
+
+
+def test_replay_llm_legacy_error_without_category_fails_before_sdk() -> None:
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                source_call_id="legacy-error-call",
+                status=CallStatus.ERROR,
+                response_data=None,
+                error_data={
+                    "type": "ProviderError",
+                    "message": "LLM provider request failed",
+                    "retryable": True,
+                    "pricing_model": "gpt-4",
+                    "provider_cost": None,
+                    "provider_cost_source": "not_available",
+                },
+                latency_ms=7.0,
+            )
+
+    sdk = FakeOpenAIClient(exception=AssertionError("SDK must not be called in replay"))
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_replay_legacy_error",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        call_mode_session=ReplaySession(),
+    )
+
+    with pytest.raises(ValueError, match="classification"):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert sdk.create_calls == []
+    assert execution.recorded_calls == []
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "category", "error_class"),
+    [
+        (RuntimeError("HTTP 429"), "rate_limit", RateLimitError),
+        (OSError("connection refused"), "network", NetworkError),
+    ],
+)
+def test_live_llm_error_persists_public_classification(provider_error: Exception, category: str, error_class: type[LLMClientError]) -> None:
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_live_error",
+        telemetry_emit=lambda event: None,
+        underlying_client=FakeOpenAIClient(exception=provider_error),
+    )
+
+    with pytest.raises(error_class):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert execution.last_record_call_kwargs["error"].to_dict()["category"] == category
+
+
+@pytest.mark.parametrize("content", ["answer", None])
+def test_execution_pricing_identity_does_not_change_routing_or_returned_model(content: str | None) -> None:
+    response = ModelResponse(
+        model="provider-concrete-model",
+        choices=[{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
+    response._hidden_params = {}
+    sdk = FakeOpenAIClient(response=response)
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        pricing_model="azure/gpt-4o",
+    )
+    with patch.object(litellm, "cost_per_token", return_value=(0.01, 0.02)) as calculator:
+        if content is None:
+            with pytest.raises(ContentPolicyError):
+                client.chat_completion(model="operator-datazone-alias", messages=[ChatMessage(role="user", content="Hello")])
+        else:
+            result = client.chat_completion(model="operator-datazone-alias", messages=[ChatMessage(role="user", content="Hello")])
+            assert result.model == "provider-concrete-model"
+    assert calculator.call_args.kwargs["model"] == "azure/gpt-4o"
+    assert sdk.single_create_kwargs()["model"] == "operator-datazone-alias"
+    assert "pricing_model" not in sdk.single_create_kwargs()
+    recorded = execution.last_record_call_kwargs
+    assert recorded["request_data"].to_dict()["model"] == "operator-datazone-alias"
+    payload = recorded["response_data"].to_dict()
+    assert payload["model"] == "provider-concrete-model"
+    assert payload["pricing_model"] == "azure/gpt-4o"
+    assert payload["provider_cost"] == 0.03
+    assert payload["provider_cost_source"] == "litellm.cost_per_token"
+
+
+@pytest.mark.parametrize("cost", [0.0, 0.125, "bad"])
+def test_execution_preserves_provider_cost_metadata(cost: object) -> None:
+    response = ModelResponse(
+        model="provider-model",
+        choices=[{"message": {"role": "assistant", "content": "answer"}, "finish_reason": "stop"}],
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "cost": cost},
+    )
+    response.usage = {"prompt_tokens": 10, "completion_tokens": 5, "cost": cost}
+    sdk = FakeOpenAIClient(response=response)
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        pricing_model="azure/gpt-4o",
+    )
+    with patch.object(litellm, "cost_per_token") as calculator:
+        client.chat_completion(model="operator-alias", messages=[ChatMessage(role="user", content="Hello")])
+    calculator.assert_not_called()
+    payload = execution.last_record_call_kwargs["response_data"].to_dict()
+    assert payload["provider_cost"] == (cost if isinstance(cost, float) else None)
+    assert payload["provider_cost_source"] == ("response_usage.cost" if isinstance(cost, float) else "not_available")
+
+
+def test_execution_unknown_pricing_is_explicitly_unavailable_and_does_not_block() -> None:
+    sdk = FakeOpenAIClient(response=provider_response())
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=lambda event: None,
+        underlying_client=sdk,
+        pricing_model="elspeth-unknown-catalogue-model",
+    )
+    result = client.chat_completion(model="operator-alias", messages=[ChatMessage(role="user", content="Hello")])
+    assert result.content == "Hello!"
+    payload = execution.last_record_call_kwargs["response_data"].to_dict()
+    assert payload["provider_cost"] is None
+    assert payload["provider_cost_source"] == "not_available"
+
+
+def test_execution_cost_uses_the_same_usage_snapshot_as_token_audit() -> None:
+    class ChangingUsageResponse:
+        model = "provider-model"
+
+        def __init__(self) -> None:
+            self.usage_reads = 0
+            self.choices = [ProviderChoice(message=ProviderMessage("answer"))]
+
+        @property
+        def usage(self) -> dict[str, int]:
+            self.usage_reads += 1
+            return {"prompt_tokens": self.usage_reads * 10, "completion_tokens": 5}
+
+        def model_dump(self) -> dict[str, str]:
+            return {"model": self.model}
+
+    response = ChangingUsageResponse()
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=lambda event: None,
+        underlying_client=FakeOpenAIClient(response=response),
+        pricing_model="azure/gpt-4o",
+    )
+    with patch.object(litellm, "cost_per_token", return_value=(0.01, 0.02)) as calculator:
+        client.chat_completion(model="operator-alias", messages=[ChatMessage(role="user", content="Hello")])
+    assert response.usage_reads == 1
+    assert calculator.call_args.kwargs["prompt_tokens"] == 10
+    assert execution.last_record_call_kwargs["token_usage"] == TokenUsage.known(10, 5)
+
+
+def test_serialization_failure_preserves_already_observed_provider_cost() -> None:
+    response = provider_response(
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.125},
+        model_dump_error=ValueError("cannot serialize"),
+    )
+    execution = FakeExecutionRepository()
+    client = AuditedLLMClient(
+        **mock_audit_authority(),
+        execution=execution,
+        state_id="state_123",
+        run_id="run_abc",
+        telemetry_emit=lambda event: None,
+        underlying_client=FakeOpenAIClient(response=response),
+        pricing_model="azure/gpt-4o",
+    )
+    with pytest.raises(LLMClientError, match="serialize"):
+        client.chat_completion(model="operator-alias", messages=[ChatMessage(role="user", content="Hello")])
+    error = execution.last_record_call_kwargs["error"].to_dict()
+    assert error["provider_cost"] == 0.125
+    assert error["provider_cost_source"] == "response_usage.cost"
+    assert error["pricing_model"] == "azure/gpt-4o"
+
 
 # Smallest valid 1x1 PNG (signature-correct real image) — same fixture as
 # tests/unit/contracts/test_chat_parts.py.
@@ -106,14 +514,14 @@ class FakeExecutionRepository:
         self._next_index = 0
         self.recorded_calls: list[dict[str, Any]] = []
 
-    def allocate_call_index(self, _state_id: str) -> int:
+    def allocate_call_index(self, _state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         call_index = self._next_index
         self._next_index += 1
         return call_index
 
     def record_call(self, **kwargs: Any) -> SimpleNamespace:
         self.recorded_calls.append(kwargs)
-        return SimpleNamespace(**kwargs)
+        return SimpleNamespace(call_id=f"call-{len(self.recorded_calls)}", **kwargs)
 
     def assert_recorded_once(self) -> None:
         assert len(self.recorded_calls) == 1
@@ -161,6 +569,42 @@ def empty_choices_response(
     )
 
 
+@pytest.mark.parametrize("processing_error", [None, ValueError("unserializable response")])
+@pytest.mark.parametrize("sdk_usage", [False, True])
+def test_provider_usage_reaches_audit_even_when_response_processing_fails(processing_error: Exception | None, sdk_usage: bool) -> None:
+    from openai.types import CompletionUsage
+
+    execution = FakeExecutionRepository()
+    raw_usage = {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 4},
+        "completion_tokens_details": {"reasoning_tokens": 2},
+        "cache_creation_input_tokens": 3,
+        "cache_read_input_tokens": 1,
+    }
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda event: None,
+        underlying_client=FakeOpenAIClient(
+            response=provider_response(
+                usage=CompletionUsage.model_validate({**raw_usage, "total_tokens": 15}) if sdk_usage else raw_usage,
+                model_dump_error=processing_error,
+            )
+        ),
+        **mock_audit_authority(),
+    )
+    if processing_error is None:
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+    else:
+        with pytest.raises(LLMClientError, match="serialize"):
+            client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+    expected = {**raw_usage, "total_tokens": 15} if sdk_usage else raw_usage
+    assert execution.last_record_call_kwargs["token_usage"] == TokenUsage.from_dict(expected)
+
+
 def test_telemetry_failure_is_acknowledged_without_formatting_external_error() -> None:
     from structlog.testing import capture_logs
 
@@ -181,6 +625,7 @@ def test_telemetry_failure_is_acknowledged_without_formatting_external_error() -
         run_id="run-1",
         telemetry_emit=fail_delivery,
         underlying_client=FakeOpenAIClient(response=provider_response()),
+        **mock_audit_authority(),
     )
     with capture_logs() as records:
         response = client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
@@ -214,6 +659,7 @@ def test_telemetry_programming_errors_propagate_after_audit(failure: Exception) 
         run_id="run-1",
         telemetry_emit=fail_delivery,
         underlying_client=FakeOpenAIClient(response=provider_response()),
+        **mock_audit_authority(),
     )
     with pytest.raises(type(failure)) as raised:
         client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
@@ -321,6 +767,7 @@ class TestAuditedLLMClient:
         openai_client = self._create_mock_openai_client()
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -363,6 +810,7 @@ class TestAuditedLLMClient:
         msgs = [ChatMessage(role="user", content=(TextPart(text="t"), part))]
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -389,6 +837,7 @@ class TestAuditedLLMClient:
         emitted_events: list[ExternalCallCompleted] = []
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -412,6 +861,7 @@ class TestAuditedLLMClient:
         emitted_events: list[ExternalCallCompleted] = []
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -433,6 +883,7 @@ class TestAuditedLLMClient:
         openai_client = self._create_mock_openai_client()
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -472,6 +923,7 @@ class TestAuditedLLMClient:
         openai_client = FakeOpenAIClient(exception=Exception(provider_detail))
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -517,6 +969,7 @@ class TestAuditedLLMClient:
         openai_client = FakeOpenAIClient(response=response)
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -536,6 +989,7 @@ class TestAuditedLLMClient:
         openai_client = FakeOpenAIClient(exception=Exception("Rate limit exceeded (429)"))
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -559,6 +1013,7 @@ class TestAuditedLLMClient:
         openai_client = FakeOpenAIClient(exception=Exception("You have exceeded your rate limit"))
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -578,6 +1033,7 @@ class TestAuditedLLMClient:
         openai_client = FakeOpenAIClient(exception=Exception("400 Bad Request: enumerate at least one item"))
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -602,6 +1058,7 @@ class TestAuditedLLMClient:
         openai_client = self._create_mock_openai_client()
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -620,12 +1077,65 @@ class TestAuditedLLMClient:
         assert call_kwargs["request_data"].to_dict()["temperature"] == 0.7
         assert call_kwargs["request_data"].to_dict()["max_tokens"] == 100
 
+    def test_max_tokens_param_renames_the_wire_and_audit_key(self) -> None:
+        """A provider that requires max_completion_tokens sends and records that name."""
+        execution = self._create_mock_execution()
+        openai_client = self._create_mock_openai_client()
+
+        client = AuditedLLMClient(
+            **mock_audit_authority(),
+            execution=execution,
+            state_id="state_123",
+            run_id="run_abc",
+            telemetry_emit=lambda event: None,
+            underlying_client=openai_client,
+            provider="azure",
+            max_tokens_param="max_completion_tokens",
+        )
+
+        client.chat_completion(
+            model="gpt-4",
+            messages=[ChatMessage(role="user", content="Hello")],
+            max_tokens=100,
+        )
+
+        sdk_kwargs = openai_client.single_create_kwargs()
+        assert sdk_kwargs["max_completion_tokens"] == 100
+        assert "max_tokens" not in sdk_kwargs
+        recorded = execution.last_record_call_kwargs["request_data"].to_dict()
+        assert recorded["max_completion_tokens"] == 100
+        assert "max_tokens" not in recorded
+
+    def test_temperature_none_is_omitted_from_wire_and_audit(self) -> None:
+        """temperature=None means provider default: not sent, and not recorded as 0.0."""
+        execution = self._create_mock_execution()
+        openai_client = self._create_mock_openai_client()
+
+        client = AuditedLLMClient(
+            **mock_audit_authority(),
+            execution=execution,
+            state_id="state_123",
+            run_id="run_abc",
+            telemetry_emit=lambda event: None,
+            underlying_client=openai_client,
+        )
+
+        client.chat_completion(
+            model="gpt-4",
+            messages=[ChatMessage(role="user", content="Hello")],
+            temperature=None,
+        )
+
+        assert "temperature" not in openai_client.single_create_kwargs()
+        assert "temperature" not in execution.last_record_call_kwargs["request_data"].to_dict()
+
     def test_provider_recorded_in_request(self) -> None:
         """Provider name is recorded in request data."""
         execution = self._create_mock_execution()
         openai_client = self._create_mock_openai_client()
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -648,6 +1158,7 @@ class TestAuditedLLMClient:
         openai_client = self._create_mock_openai_client()
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -674,7 +1185,7 @@ class TestAuditedLLMClient:
 
     # NOTE: test_response_without_model_dump was removed because we require
     # openai>=2.15 which guarantees model_dump() exists on all responses.
-    # Per CLAUDE.md "No Legacy Code Policy" - no backwards compatibility code.
+    # Per CONTRIBUTING.md §Code Standards - no backwards compatibility code.
 
     def test_null_content_raises_content_policy_error(self) -> None:
         """None content from LLM raises ContentPolicyError — not fabricated to "".
@@ -695,6 +1206,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -711,8 +1223,8 @@ class TestAuditedLLMClient:
     def test_full_raw_response_recorded_in_audit_trail(self) -> None:
         """Full raw_response from model_dump() is recorded in audit trail.
 
-        This ensures audit completeness per CLAUDE.md:
-        "External calls - Full request AND response recorded"
+        This ensures audit completeness per docs/release/guarantees.md
+        §4.1 Call Recording: request and response are both recorded in full.
         """
         execution = self._create_mock_execution()
 
@@ -753,6 +1265,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -818,6 +1331,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -887,6 +1401,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -914,7 +1429,7 @@ class TestAuditedLLMClient:
 
     # NOTE: test_raw_response_none_when_model_dump_unavailable was removed because
     # we require openai>=2.15 which guarantees model_dump() exists on all responses.
-    # Per CLAUDE.md "No Legacy Code Policy" - no backwards compatibility code.
+    # Per CONTRIBUTING.md §Code Standards - no backwards compatibility code.
 
     def test_successful_call_with_missing_usage(self) -> None:
         """LLM call succeeds when provider returns no usage data.
@@ -934,6 +1449,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -971,6 +1487,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_aggregate",
             run_id="run_aggregate",
@@ -1004,6 +1521,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_empty_choices",
             run_id="run_empty_choices",
@@ -1035,6 +1553,7 @@ class TestAuditedLLMClient:
 
         emitted_events: list[ExternalCallCompleted] = []
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_bad_model",
             run_id="run_bad_model",
@@ -1075,6 +1594,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_non_string_content",
             run_id="run_non_string_content",
@@ -1113,6 +1633,41 @@ class TestBug4_1_ContentExtractionRecordsBeforeReraising:
     def _create_mock_execution() -> FakeExecutionRepository:
         return FakeExecutionRepository()
 
+    @pytest.mark.parametrize("field_name,value", [("model", None), ("choices", 1), ("choices", {"unexpected": 1}), ("choices", "bad")])
+    def test_malformed_sdk_envelope_is_audited(self, field_name: str, value: object) -> None:
+        from openai.types.chat import ChatCompletion
+
+        payload: dict[str, Any] = {
+            "id": "azure-response",
+            "model": "gpt-4o",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop", "index": 0}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+        }
+        if value is None:
+            del payload[field_name]
+        else:
+            payload[field_name] = value
+        response = ChatCompletion.model_construct(**payload)
+        execution = self._create_mock_execution()
+        events: list[ExternalCallCompleted] = []
+        client = AuditedLLMClient(
+            **mock_audit_authority(),
+            execution=execution,
+            state_id="state_azure_malformed",
+            run_id="run_azure_malformed",
+            telemetry_emit=events.append,
+            underlying_client=FakeOpenAIClient(response=response),
+            provider="azure",
+        )
+        with pytest.raises(LLMClientError) as exc_info:
+            client.chat_completion(model="deployment", messages=[ChatMessage(role="user", content="hello")])
+        assert exc_info.value.retryable is False
+        execution.assert_recorded_once()
+        assert execution.last_record_call_kwargs["status"] == CallStatus.ERROR
+        assert execution.last_record_call_kwargs["token_usage"].total_tokens == 4
+        assert len(events) == 1
+        assert events[0].status == CallStatus.ERROR
+
     def test_content_extraction_failure_records_call_before_raising(self) -> None:
         """Missing .content on success path: call recorded as ERROR, LLMClientError raised.
 
@@ -1137,6 +1692,7 @@ class TestBug4_1_ContentExtractionRecordsBeforeReraising:
 
         emitted_events: list[ExternalCallCompleted] = []
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_b41",
             run_id="run_b41",
@@ -1182,6 +1738,7 @@ class TestBug4_1_ContentExtractionRecordsBeforeReraising:
 
         emitted_events: list[ExternalCallCompleted] = []
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_b41_tel",
             run_id="run_b41_tel",
@@ -1219,6 +1776,7 @@ class TestContentFabrication:
     @staticmethod
     def _create_client(execution: FakeExecutionRepository, openai_client: FakeOpenAIClient) -> AuditedLLMClient:
         return AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_fab",
             run_id="run_fab",
@@ -1305,6 +1863,7 @@ class TestContentFabrication:
 
         emitted_events: list[ExternalCallCompleted] = []
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_fab",
             run_id="run_fab",
@@ -1403,6 +1962,7 @@ class TestModelDumpFailureRecordsCall:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_dump_fail",
             run_id="run_dump_fail",
@@ -1448,6 +2008,7 @@ class TestTier3UsageBoundary:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_float",
             run_id="run_float",
@@ -1478,6 +2039,7 @@ class TestTier3UsageBoundary:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_bool",
             run_id="run_bool",
@@ -1493,3 +2055,95 @@ class TestTier3UsageBoundary:
         # Bool values should be rejected by from_dict
         assert result.usage.prompt_tokens is None
         assert result.usage.completion_tokens is None
+
+
+def test_quota_refusal_precedes_provider_dispatch() -> None:
+    from elspeth.contracts.call_governance import LLMCallGovernance
+
+    execution = FakeExecutionRepository()
+    provider = FakeOpenAIClient(response=provider_response())
+    completions: list[None] = []
+
+    def refuse() -> str:
+        raise RuntimeError("quota exhausted")
+
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda event: None,
+        underlying_client=provider,
+        llm_call_governance=LLMCallGovernance(refuse, lambda attempt, call_id: completions.append(None)),
+        **mock_audit_authority(),
+    )
+    with pytest.raises(RuntimeError, match="quota exhausted"):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="hello")])
+    assert provider.create_calls == []
+    assert execution.recorded_calls == []
+    assert completions == []
+
+
+@pytest.mark.parametrize("provider_fails", [False, True])
+def test_each_attempt_accounts_once_after_its_audit_outcome(provider_fails: bool) -> None:
+    from elspeth.contracts.call_governance import LLMCallGovernance
+
+    execution = FakeExecutionRepository()
+    provider = (
+        FakeOpenAIClient(exception=RuntimeError("network failure")) if provider_fails else FakeOpenAIClient(response=provider_response())
+    )
+    observed: list[tuple[str, int]] = []
+
+    def admit() -> str:
+        observed.append(("before", len(execution.recorded_calls)))
+        return f"attempt-{len(execution.recorded_calls) + 1}"
+
+    def settle(attempt: str, call_id: str) -> None:
+        assert attempt == f"attempt-{len(execution.recorded_calls)}"
+        assert call_id == f"call-{len(execution.recorded_calls)}"
+        observed.append(("after", len(execution.recorded_calls)))
+
+    governance = LLMCallGovernance(before_call=admit, after_call=settle)
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda event: None,
+        underlying_client=provider,
+        llm_call_governance=governance,
+        **mock_audit_authority(),
+    )
+    for _attempt in range(2):
+        if provider_fails:
+            with pytest.raises(LLMClientError):
+                client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="hello")])
+        else:
+            client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="hello")])
+    assert observed == [("before", 0), ("after", 1), ("before", 1), ("after", 2)]
+    assert len(provider.create_calls) == 2
+    assert [record["call_index"] for record in execution.recorded_calls] == [0, 1]
+    assert execution.recorded_calls[-1]["token_usage"] == (TokenUsage.unknown() if provider_fails else TokenUsage.known(10, 5))
+
+
+def test_accounting_hook_failure_propagates_after_successful_audit() -> None:
+    from elspeth.contracts.call_governance import LLMCallGovernance
+
+    execution = FakeExecutionRepository()
+    provider = FakeOpenAIClient(response=provider_response())
+
+    def fail_accounting(attempt: str, call_id: str) -> None:
+        assert len(execution.recorded_calls) == 1
+        raise RuntimeError("ledger unavailable")
+
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda event: None,
+        underlying_client=provider,
+        llm_call_governance=LLMCallGovernance(lambda: "attempt", fail_accounting),
+        **mock_audit_authority(),
+    )
+    with pytest.raises(RuntimeError, match="ledger unavailable"):
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="hello")])
+    assert len(provider.create_calls) == 1
+    assert execution.recorded_calls[0]["status"] is CallStatus.SUCCESS

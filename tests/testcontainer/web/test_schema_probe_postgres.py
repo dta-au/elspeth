@@ -10,15 +10,21 @@ import time
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import structlog
-from sqlalchemy import Connection, Engine, create_engine, event, inspect, select, text, update
+from sqlalchemy import Connection, Engine, create_engine, event, func, insert, inspect, select, text, update
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.postgres_target import postgres_test_target
+from tests.unit.architecture import test_digest_column_shape_checks as digest_gate
 from tests.unit.core.test_schema_shape import _static_check_issues
 
 from elspeth.contracts import Artifact
@@ -28,15 +34,14 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape.database import _REQUIRED_TRIGGERS, LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, fenced_member_transaction
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, audit_export_snapshot_chunks_table
 from elspeth.core.landscape.schema import schema_identity_table as landscape_schema_identity_table
 from elspeth.core.schema_identity import SCHEMA_IDENTITY_APPLICATION_ID
 from elspeth.core.schema_shape import _text_builtin_identity_rows_on_connection
 from elspeth.web import schema_probe as schema_probe_module
-from elspeth.web.coordination.contracts import SessionOperationKind
-from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.preferences.models import UpdateComposerPreferencesRequest
-from elspeth.web.preferences.service import PreferencesService
+from elspeth.web.preferences.service import PreferencesService, TutorialProgressConflict
 from elspeth.web.schema_probe import (
     SchemaInitBusyError,
     SchemaState,
@@ -48,21 +53,14 @@ from elspeth.web.schema_probe import (
 )
 from elspeth.web.sessions.models import (
     SESSION_SCHEMA_EPOCH,
-    guided_operation_events_table,
-    guided_operations_table,
+    blob_inline_resolutions_table,
+    blob_replacement_cleanups_table,
+    session_operation_receipts_table,
     skill_markdown_history_table,
+    user_preferences_table,
 )
 from elspeth.web.sessions.models import metadata as session_metadata
 from elspeth.web.sessions.models import schema_identity_table as session_schema_identity_table
-from elspeth.web.sessions.protocol import (
-    CompositionStateData,
-    GuidedCompositionStateResult,
-    GuidedOperationActive,
-    GuidedOperationClaimed,
-    GuidedOperationCompleted,
-    GuidedOperationFenceLostError,
-    GuidedOperationTakenOver,
-)
 from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.skill_markdown_history import RepositorySkillMarkdownHistoryAuthority
@@ -104,6 +102,211 @@ def test_fresh_create_reaches_current(postgres_engine: Engine, kind: str) -> Non
         assert probe_landscape_schema(postgres_engine) is SchemaState.MISSING
         init_landscape_schema(postgres_engine)
         assert probe_landscape_schema(postgres_engine) is SchemaState.CURRENT
+
+
+def _inline_resolution_values(content_hash: str) -> dict[str, object]:
+    return {
+        "run_id": "absent-run",
+        "attempt": 1,
+        "field_path": "source.options.system_prompt",
+        "blob_id": "blob",
+        "content_hash": content_hash,
+        "byte_length": 1,
+        "mime_type": "text/plain",
+        "encoding": "utf-8",
+        "resolved_at": datetime.now(UTC),
+    }
+
+
+def _replacement_cleanup_values(column: str, value: str) -> dict[str, object]:
+    now = datetime.now(UTC)
+    values: dict[str, object] = {
+        "blob_id": "blob",
+        "replacement_id": "replacement",
+        "session_id": "absent-session",
+        "storage_path": "/data/blobs/a",
+        "staging_path": "/data/blobs/a.staging",
+        "backup_path": "/data/blobs/a.backup",
+        "operation_id": "operation-1",
+        "operation_epoch": 1,
+        "operation_kind": "compose",
+        "lease_token": "lease-1",
+        "owner_instance_id": "instance-1",
+        "phase": "intent",
+        "old_blob_snapshot": {},
+        "replacement_blob_snapshot": {},
+        "old_blob_snapshot_hash": "a" * 64,
+        "replacement_blob_snapshot_hash": "b" * 64,
+        "old_size_bytes": 1,
+        "old_content_hash": "c" * 64,
+        "replacement_size_bytes": 1,
+        "replacement_content_hash": "d" * 64,
+        "created_at": now,
+        "updated_at": now,
+    }
+    values[column] = value
+    return values
+
+
+@pytest.mark.parametrize("bad_hash", ["A" * 64, "g" * 64, "a" * 63], ids=["uppercase-hex", "non-hex-letter", "too-short"])
+def test_postgres_blob_evidence_hash_checks_require_lowercase_sha256(postgres_engine: Engine, bad_hash: str) -> None:
+    # The PostgreSQL arm of ``_lower_sha256_constraints`` is a POSIX regex the
+    # SQLite suite never executes. The parent rows are deliberately absent:
+    # PostgreSQL evaluates a row's CHECKs before its foreign keys, so a bad hash
+    # must fail on the named CHECK while a well-formed hash gets past every
+    # CHECK and fails on the foreign key instead -- the positive control.
+    init_session_schema(postgres_engine)
+    cases = [
+        (blob_inline_resolutions_table, _inline_resolution_values, "ck_blob_inline_resolutions_hash_format"),
+        *(
+            (
+                blob_replacement_cleanups_table,
+                lambda value, column=column: _replacement_cleanup_values(column, value),
+                f"ck_blob_replacement_cleanups_{stem}_hash_format",
+            )
+            for column, stem in (
+                ("old_blob_snapshot_hash", "old_snapshot"),
+                ("replacement_blob_snapshot_hash", "replacement_snapshot"),
+                ("old_content_hash", "old_content"),
+                ("replacement_content_hash", "replacement_content"),
+            )
+        ),
+    ]
+    for table, build, constraint in cases:
+        with pytest.raises(IntegrityError, match=constraint), postgres_engine.begin() as conn:
+            conn.execute(insert(table).values(**build(bad_hash)))
+        with pytest.raises(IntegrityError, match="violates foreign key constraint"), postgres_engine.begin() as conn:
+            conn.execute(insert(table).values(**build("e" * 64)))
+
+
+def test_postgres_digest_checks_enforce_every_inventoried_shape(postgres_engine: Engine) -> None:
+    # The SQLite gate evaluates every digest column's CHECK behaviourally, but
+    # each rule has a second, PostgreSQL-only arm (POSIX regex, ``::text``
+    # casts, a quantifier instead of ``length()``) that SQLite never executes.
+    # Evaluate the compiled PostgreSQL expression for every inventoried column
+    # on a real server, against the same probe values. No tables are needed:
+    # the expression runs over a one-row projection typed like the table.
+    dialect = postgresql.dialect()
+    failures: list[str] = []
+    with postgres_engine.connect() as conn:
+        for store, table_name, column, shape in digest_gate._entries():
+            table = digest_gate._STORES[store].tables[table_name]
+            context = digest_gate._CONTEXT.get((store, table_name, column), {})
+            checks = digest_gate.shape_checks(table, column, dialect)
+            if not checks:
+                failures.append(f"{table_name}.{column}: no PostgreSQL CHECK constrains its value")
+                continue
+            names = [c.name for c in table.columns]
+            # The probed column is projected as unbounded TEXT: an explicit
+            # CAST to VARCHAR(64) silently TRUNCATES in PostgreSQL (only an
+            # assignment raises "value too long"), which would hand the CHECK a
+            # well-formed 64 characters in place of the over-long probe.
+            projection = ", ".join(
+                f'CAST(%s AS {"TEXT" if c.name == column else c.type.compile(dialect=dialect)}) AS "{c.name}"' for c in table.columns
+            )
+
+            def verdict(text: str, value: object, projection: str = projection, names: list[str] = names, context=context, column=column):
+                row = {**context, column: value}
+                sql = f"SELECT ({text.replace('%', '%%')}) FROM (SELECT {projection}) AS probe"
+                return conn.exec_driver_sql(sql, tuple(row.get(name) for name in names)).scalar_one()
+
+            good, bad = digest_gate._PROFILES[shape]
+            known = {column, *context}
+            decidable = [(n, t) for n, t in checks if digest_gate._referenced_columns(table, t) <= known]
+            for value in good:
+                failures.extend(
+                    f"{table_name}.{column}: {n} rejects well-formed {value!r}" for n, t in decidable if verdict(t, value) is False
+                )
+            for value in bad:
+                if not any(verdict(t, value) is False for _n, t in checks):
+                    failures.append(f"{table_name}.{column}: admits malformed {value!r}")
+    assert failures == []
+
+
+def test_preferences_omitted_detail_level_uses_database_default(postgres_engine: Engine) -> None:
+    init_session_schema(postgres_engine)
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="default-detail")
+        conn.execute(insert(user_preferences_table).values(user_id="default-detail", updated_at=func.now()))
+        assert conn.execute(select(user_preferences_table.c.show_advanced)).scalar_one() is False
+
+
+@pytest.mark.parametrize(
+    "diagnostics,accepted",
+    [
+        (None, True),
+        (["settlement_failed"], True),
+        (["cleanup_failed"] * 32, True),
+        ([], False),
+        ({}, False),
+        ("diagnostic", False),
+        (1, False),
+        (True, False),
+        (["diagnostic"] * 33, False),
+    ],
+)
+def test_postgres_failure_diagnostics_shape_and_immutability(postgres_engine: Engine, diagnostics, accepted: bool) -> None:
+    init_session_schema(postgres_engine)
+    _seed_postgres_trigger_rows(postgres_engine, session_id="diagnostics", include_completion=False)
+    statement = insert(session_operation_receipts_table).values(
+        session_id="diagnostics",
+        operation_id="diagnostic-failure",
+        kind="session_fork",
+        status="failed",
+        request_hash="a" * 64,
+        attempt=1,
+        failure_code="integrity_error",
+        failure_diagnostics=diagnostics,
+        created_at=func.now(),
+        updated_at=func.now(),
+        settled_at=func.now(),
+    )
+    if not accepted:
+        with pytest.raises(DBAPIError), postgres_engine.begin() as conn:
+            conn.execute(statement)
+        return
+    with postgres_engine.begin() as conn:
+        conn.execute(statement)
+        assert (
+            conn.execute(
+                select(session_operation_receipts_table.c.failure_diagnostics).where(
+                    session_operation_receipts_table.c.operation_id == "diagnostic-failure"
+                )
+            ).scalar_one()
+            == diagnostics
+        )
+    with pytest.raises(DBAPIError, match="immutable"), postgres_engine.begin() as conn:
+        conn.execute(
+            update(session_operation_receipts_table)
+            .where(session_operation_receipts_table.c.operation_id == "diagnostic-failure")
+            .values(failure_diagnostics=["replacement"])
+        )
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_postgres_failure_diagnostics_rejects_nonfailed_residue(postgres_engine: Engine, completed: bool) -> None:
+    init_session_schema(postgres_engine)
+    _seed_postgres_trigger_rows(postgres_engine, session_id="diagnostics", include_completion=False)
+    statement = insert(session_operation_receipts_table).values(
+        session_id="diagnostics",
+        operation_id="diagnostic-residue",
+        kind="state_revert",
+        status="completed" if completed else "in_progress",
+        request_hash="a" * 64,
+        attempt=1,
+        failure_diagnostics=["settlement_failed"],
+        created_at=func.now(),
+        updated_at=func.now(),
+        lease_token=None if completed else "lease",
+        lease_expires_at=None if completed else func.now(),
+        settled_at=func.now() if completed else None,
+        result_state_id="diagnostics-state" if completed else None,
+        response_hash="b" * 64 if completed else None,
+    )
+    with postgres_engine.begin() as conn:
+        conn.execute(statement.values(operation_id="diagnostic-control", failure_diagnostics=None))
+    with pytest.raises(DBAPIError, match="ck_session_operation_receipts_status_bundle"), postgres_engine.begin() as conn:
+        conn.execute(statement)
 
 
 def test_a_drifted_check_constraint_names_itself_on_postgresql(postgres_engine: Engine) -> None:
@@ -294,341 +497,9 @@ def test_postgres_session_init_does_not_poison_later_sqlite_schema(postgres_engi
     assert inspect(sqlite_engine).get_foreign_keys("chat_messages")
 
 
-@pytest.mark.asyncio
-async def test_postgres_guided_operation_takeover_fences_late_worker(postgres_engine: Engine) -> None:
-    """A stale worker cannot write after an audited PostgreSQL takeover."""
-    init_session_schema(postgres_engine)
-    service_a = SessionServiceImpl(
-        postgres_engine,
-        telemetry=build_sessions_telemetry(),
-        log=structlog.get_logger("test.guided-operation-postgres-a"),
-    )
-    service_b = SessionServiceImpl(
-        postgres_engine,
-        telemetry=build_sessions_telemetry(),
-        log=structlog.get_logger("test.guided-operation-postgres-b"),
-    )
-    session_id = (await service_a.create_session("alice", "PostgreSQL guided operation", "local")).id
-    compose_context = await service_a._run_sync(
-        lambda: service_a.session_operation_authority.acquire(
-            session_id=session_id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=service_a.session_operation_owner_instance_id,
-            lease_seconds=service_a.session_operation_lease_seconds,
-        )
-    )
-    try:
-        state = await service_a.save_composition_state(
-            session_id,
-            CompositionStateData(is_valid=False),
-            provenance="session_seed",
-            session_operation_context=compose_context,
-        )
-    finally:
-        await service_a._run_sync(service_a.session_operation_authority.release, compose_context)
-    state_id = state.id
-
-    operation_id = "postgres-takeover"
-    request_hash = "a" * 64
-    # Dual fencing: every guided write proves a live session COMPOSE lease
-    # on the write connection as well as the guided fence. Worker-a claims
-    # the operation under its own session lease, then its session lease is
-    # gone (released: the worker went away) and its guided lease is forced
-    # to expire; worker-b acquires the session lease and takes the operation
-    # over. Worker-a's late writes carry its dead context and stale guided
-    # fence and must be refused at the fence, not written.
-    context_a = await service_a._run_sync(
-        lambda: service_a.session_operation_authority.acquire(
-            session_id=session_id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=service_a.session_operation_owner_instance_id,
-            lease_seconds=service_a.session_operation_lease_seconds,
-        )
-    )
-    first = await service_a.reserve_guided_operation(
-        session_id=session_id,
-        operation_id=operation_id,
-        kind="guided_start",
-        request_hash=request_hash,
-        actor="worker-a",
-        lease_seconds=30,
-        session_operation_context=context_a,
-    )
-    assert isinstance(first, GuidedOperationClaimed)
-    await service_a._run_sync(service_a.session_operation_authority.release, context_a)
-    with postgres_engine.begin() as conn:
-        conn.execute(
-            update(guided_operations_table)
-            .where(
-                guided_operations_table.c.session_id == str(session_id),
-                guided_operations_table.c.operation_id == operation_id,
-            )
-            .values(lease_expires_at=text("clock_timestamp() - interval '1 second'"))
-        )
-
-    context_b = await service_b._run_sync(
-        lambda: service_b.session_operation_authority.acquire(
-            session_id=session_id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=service_b.session_operation_owner_instance_id,
-            lease_seconds=service_b.session_operation_lease_seconds,
-        )
-    )
-    try:
-        takeover = await service_b.reserve_guided_operation(
-            session_id=session_id,
-            operation_id=operation_id,
-            kind="guided_start",
-            request_hash=request_hash,
-            actor="worker-b",
-            lease_seconds=30,
-            session_operation_context=context_b,
-        )
-        assert isinstance(takeover, GuidedOperationTakenOver)
-        with pytest.raises(GuidedOperationFenceLostError):
-            await service_a.bind_guided_operation(first.fence, result_state_id=state_id, session_operation_context=context_a)
-        with pytest.raises(GuidedOperationFenceLostError):
-            await service_a.complete_guided_operation(
-                first.fence,
-                result=GuidedCompositionStateResult(state_id=state_id),
-                response_hash="b" * 64,
-                actor="worker-a",
-                session_operation_context=context_a,
-            )
-        await service_b.bind_guided_operation(takeover.fence, result_state_id=state_id, session_operation_context=context_b)
-        completed = await service_b.complete_guided_operation(
-            takeover.fence,
-            result=GuidedCompositionStateResult(state_id=state_id),
-            response_hash="b" * 64,
-            actor="worker-b",
-            session_operation_context=context_b,
-        )
-    finally:
-        await service_b._run_sync(service_b.session_operation_authority.release, context_b)
-    assert completed == GuidedOperationCompleted(
-        result=GuidedCompositionStateResult(state_id=state_id),
-        response_hash="b" * 64,
-    )
-    with postgres_engine.connect() as conn:
-        row = conn.execute(
-            select(guided_operations_table).where(
-                guided_operations_table.c.session_id == str(session_id),
-                guided_operations_table.c.operation_id == operation_id,
-            )
-        ).one()
-        events = conn.execute(
-            select(guided_operation_events_table)
-            .where(
-                guided_operation_events_table.c.session_id == str(session_id),
-                guided_operation_events_table.c.operation_id == operation_id,
-            )
-            .order_by(guided_operation_events_table.c.sequence)
-        ).all()
-    assert row.attempt == 2
-    assert row.result_state_id == str(state_id)
-    assert [event.event_kind for event in events] == ["claimed", "taken_over", "completed"]
-
-
-@pytest.mark.asyncio
-async def test_postgres_concurrent_expired_reserve_has_one_takeover_winner(postgres_engine: Engine) -> None:
-    """The guided table arbitrates two concurrent reserves admitted by ONE session lease.
-
-    Dual fencing makes the session COMPOSE lease exclusive per session, so two
-    DISTINCT lease holders never reach ``reserve_guided_operation`` at the same
-    time (that race is decided at the session fence; see the next test). The
-    guided-table arbitration is still reachable: the session fence is a plain
-    lease-row read with no per-use consumption, so one live context presented
-    by two concurrent dispatches passes both fence checks and the two reserves
-    contend under the per-session PostgreSQL advisory lock. Exactly one takes
-    the expired operation over (attempt 2); the other observes the fresh lease
-    as active. The audited event chain records one takeover.
-    """
-    init_session_schema(postgres_engine)
-    services = [
-        SessionServiceImpl(
-            postgres_engine,
-            telemetry=build_sessions_telemetry(),
-            log=structlog.get_logger(f"test.guided-operation-contender-{index}"),
-        )
-        for index in range(3)
-    ]
-    session_id = (await services[0].create_session("alice", "Contended PostgreSQL operation", "local")).id
-    operation_id = "postgres-contended-takeover"
-    request_hash = "c" * 64
-    context = await services[0]._run_sync(
-        lambda: services[0].session_operation_authority.acquire(
-            session_id=session_id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=services[0].session_operation_owner_instance_id,
-            lease_seconds=services[0].session_operation_lease_seconds,
-        )
-    )
-    try:
-        first = await services[0].reserve_guided_operation(
-            session_id=session_id,
-            operation_id=operation_id,
-            kind="guided_start",
-            request_hash=request_hash,
-            actor="worker-a",
-            lease_seconds=30,
-            session_operation_context=context,
-        )
-        assert isinstance(first, GuidedOperationClaimed)
-        with postgres_engine.begin() as conn:
-            conn.execute(
-                update(guided_operations_table)
-                .where(
-                    guided_operations_table.c.session_id == str(session_id),
-                    guided_operations_table.c.operation_id == operation_id,
-                )
-                .values(lease_expires_at=text("clock_timestamp() - interval '1 second'"))
-            )
-
-        barrier = threading.Barrier(2)
-
-        def contend(service: SessionServiceImpl, actor: str):
-            barrier.wait()
-            return asyncio.run(
-                service.reserve_guided_operation(
-                    session_id=session_id,
-                    operation_id=operation_id,
-                    kind="guided_start",
-                    request_hash=request_hash,
-                    actor=actor,
-                    lease_seconds=30,
-                    session_operation_context=context,
-                )
-            )
-
-        outcomes = await asyncio.gather(
-            asyncio.to_thread(contend, services[1], "worker-b"),
-            asyncio.to_thread(contend, services[2], "worker-c"),
-        )
-    finally:
-        await services[0]._run_sync(services[0].session_operation_authority.release, context)
-    assert sum(isinstance(outcome, GuidedOperationTakenOver) for outcome in outcomes) == 1
-    assert sum(isinstance(outcome, GuidedOperationActive) for outcome in outcomes) == 1
-    (active,) = [outcome for outcome in outcomes if isinstance(outcome, GuidedOperationActive)]
-    assert active.attempt == 2
-    assert active.expired is False
-    with postgres_engine.connect() as conn:
-        events = conn.execute(
-            select(guided_operation_events_table)
-            .where(
-                guided_operation_events_table.c.session_id == str(session_id),
-                guided_operation_events_table.c.operation_id == operation_id,
-            )
-            .order_by(guided_operation_events_table.c.sequence)
-        ).all()
-    assert [event.event_kind for event in events] == ["claimed", "taken_over"]
-
-
-@pytest.mark.asyncio
-async def test_postgres_concurrent_takeover_contenders_are_decided_at_the_session_fence(postgres_engine: Engine) -> None:
-    """Two DISTINCT contenders for an expired guided operation are decided at the session fence.
-
-    Under dual fencing a contender must hold the session COMPOSE lease before
-    it can reach the guided table, and that lease is exclusive per session, so
-    the guided table's own arbitration (previous test) is never the deciding
-    layer between two holders. Worker-a claims under its own lease and lets it
-    go; its guided lease is forced to expire; two contenders then race for the
-    session lease at a barrier. Exactly one acquires it and takes the operation
-    over; the other is refused at the session fence and never issues a reserve.
-    The winner holds its lease until the loser has been refused (second
-    barrier), so the outcome pair is the same on every run.
-    """
-    init_session_schema(postgres_engine)
-    services = [
-        SessionServiceImpl(
-            postgres_engine,
-            telemetry=build_sessions_telemetry(),
-            log=structlog.get_logger(f"test.guided-operation-contender-{index}"),
-        )
-        for index in range(3)
-    ]
-    session_id = (await services[0].create_session("alice", "Contended PostgreSQL operation", "local")).id
-    operation_id = "postgres-contended-takeover"
-    request_hash = "c" * 64
-    context_a = await services[0]._run_sync(
-        lambda: services[0].session_operation_authority.acquire(
-            session_id=session_id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=services[0].session_operation_owner_instance_id,
-            lease_seconds=services[0].session_operation_lease_seconds,
-        )
-    )
-    first = await services[0].reserve_guided_operation(
-        session_id=session_id,
-        operation_id=operation_id,
-        kind="guided_start",
-        request_hash=request_hash,
-        actor="worker-a",
-        lease_seconds=30,
-        session_operation_context=context_a,
-    )
-    assert isinstance(first, GuidedOperationClaimed)
-    await services[0]._run_sync(services[0].session_operation_authority.release, context_a)
-    with postgres_engine.begin() as conn:
-        conn.execute(
-            update(guided_operations_table)
-            .where(
-                guided_operations_table.c.session_id == str(session_id),
-                guided_operations_table.c.operation_id == operation_id,
-            )
-            .values(lease_expires_at=text("clock_timestamp() - interval '1 second'"))
-        )
-
-    start_barrier = threading.Barrier(2)
-    settled_barrier = threading.Barrier(2)
-
-    def contend(service: SessionServiceImpl, actor: str):
-        start_barrier.wait()
-        try:
-            context = service.session_operation_authority.acquire(
-                session_id=session_id,
-                operation_kind=SessionOperationKind.COMPOSE,
-                owner_instance_id=service.session_operation_owner_instance_id,
-                lease_seconds=service.session_operation_lease_seconds,
-            )
-        except SessionOperationConflictError as refused:
-            settled_barrier.wait()
-            return refused
-        try:
-            return asyncio.run(
-                service.reserve_guided_operation(
-                    session_id=session_id,
-                    operation_id=operation_id,
-                    kind="guided_start",
-                    request_hash=request_hash,
-                    actor=actor,
-                    lease_seconds=30,
-                    session_operation_context=context,
-                )
-            )
-        finally:
-            settled_barrier.wait()
-            service.session_operation_authority.release(context)
-
-    outcomes = await asyncio.gather(
-        asyncio.to_thread(contend, services[1], "worker-b"),
-        asyncio.to_thread(contend, services[2], "worker-c"),
-    )
-    assert sum(isinstance(outcome, GuidedOperationTakenOver) for outcome in outcomes) == 1
-    assert sum(isinstance(outcome, SessionOperationConflictError) for outcome in outcomes) == 1
-    with postgres_engine.connect() as conn:
-        events = conn.execute(
-            select(guided_operation_events_table)
-            .where(
-                guided_operation_events_table.c.session_id == str(session_id),
-                guided_operation_events_table.c.operation_id == operation_id,
-            )
-            .order_by(guided_operation_events_table.c.sequence)
-        ).all()
-    assert [event.event_kind for event in events] == ["claimed", "taken_over"]
-
-
 def _seed_postgres_trigger_rows(postgres_engine: Engine, *, session_id: str, include_completion: bool) -> None:
     with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="trigger-user")
         conn.execute(
             text(
                 """
@@ -690,11 +561,11 @@ def _seed_postgres_trigger_rows(postgres_engine: Engine, *, session_id: str, inc
         conn.execute(
             text(
                 """
-                INSERT INTO guided_operations (
+                INSERT INTO session_operation_receipts (
                     session_id, operation_id, kind, status, request_hash,
                     lease_token, lease_expires_at, attempt, created_at, updated_at
                 ) VALUES (
-                    :session_id, :operation_id, 'guided_start', 'in_progress',
+                    :session_id, :operation_id, 'state_revert', 'in_progress',
                     :request_hash, 'lease-token', CURRENT_TIMESTAMP + INTERVAL '1 minute',
                     1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                 )
@@ -705,7 +576,7 @@ def _seed_postgres_trigger_rows(postgres_engine: Engine, *, session_id: str, inc
         conn.execute(
             text(
                 """
-                INSERT INTO guided_operation_events (
+                INSERT INTO session_operation_receipt_events (
                     session_id, operation_id, sequence, event_kind, actor,
                     attempt, request_hash, lease_expires_at, occurred_at
                 ) VALUES (
@@ -766,14 +637,11 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
         "trg_composer_completion_events_no_delete",
         "trg_chat_messages_immutable_content",
         "trg_chat_messages_no_delete",
-        "trg_guided_operations_terminal_immutable",
-        "trg_guided_operation_events_no_update",
-        "trg_guided_operation_events_no_delete",
-        "trg_guided_operation_admission_blocks_no_update",
-        "trg_guided_operation_admission_blocks_no_delete",
-        "trg_guided_operation_admission_blocks_reject_existing_operation",
-        "trg_guided_operations_reject_admission_block_insert",
-        "trg_guided_operations_reject_admission_block_update",
+        "trg_message_ingress_receipts_no_update",
+        "trg_message_ingress_receipts_no_delete",
+        "trg_session_operation_receipts_terminal_immutable",
+        "trg_session_operation_receipt_events_no_update",
+        "trg_session_operation_receipt_events_no_delete",
     }
 
     protected_session = "trigger-protected"
@@ -785,9 +653,9 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
         conn.execute(
             text(
                 """
-                UPDATE guided_operations
+                UPDATE session_operation_receipts
                 SET status = 'completed', lease_token = NULL,
-                    lease_expires_at = NULL, result_kind = 'composition_state',
+                    lease_expires_at = NULL,
                     result_state_id = :state_id, response_hash = :response_hash,
                     settled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
                 WHERE session_id = :session_id AND operation_id = :operation_id
@@ -803,11 +671,11 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
         conn.execute(
             text(
                 """
-                INSERT INTO guided_operations (
+                INSERT INTO session_operation_receipts (
                     session_id, operation_id, kind, status, request_hash,
                     attempt, failure_code, created_at, updated_at, settled_at
                 ) VALUES (
-                    :session_id, :operation_id, 'guided_start', 'failed',
+                    :session_id, :operation_id, 'state_revert', 'failed',
                     :request_hash, 1, 'operation_failed', CURRENT_TIMESTAMP,
                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                 )
@@ -827,13 +695,16 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
         ("DELETE FROM composer_completion_events WHERE id = :row_id", f"{protected_session}-completion"),
         ("UPDATE chat_messages SET content = 'tampered' WHERE id = :row_id", f"{protected_session}-message"),
         ("DELETE FROM chat_messages WHERE id = :row_id", f"{protected_session}-message"),
-        ("UPDATE guided_operations SET response_hash = :replacement WHERE operation_id = :row_id", f"{protected_session}-operation"),
         (
-            "UPDATE guided_operations SET failure_code = 'provider_timeout' WHERE operation_id = :row_id",
+            "UPDATE session_operation_receipts SET response_hash = :replacement WHERE operation_id = :row_id",
+            f"{protected_session}-operation",
+        ),
+        (
+            "UPDATE session_operation_receipts SET failure_code = 'custody_error' WHERE operation_id = :row_id",
             f"{protected_session}-failed-operation",
         ),
-        ("UPDATE guided_operation_events SET actor = 'attacker' WHERE operation_id = :row_id", f"{protected_session}-operation"),
-        ("DELETE FROM guided_operation_events WHERE operation_id = :row_id", f"{protected_session}-operation"),
+        ("UPDATE session_operation_receipt_events SET actor = 'attacker' WHERE operation_id = :row_id", f"{protected_session}-operation"),
+        ("DELETE FROM session_operation_receipt_events WHERE operation_id = :row_id", f"{protected_session}-operation"),
     )
     for statement, row_id in blocked_mutations:
         with pytest.raises(DBAPIError, match=r"append-only|immutable"), postgres_engine.begin() as conn:
@@ -850,12 +721,14 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
                     id, session_id, composition_state_id, affected_node_id,
                     tool_call_id, user_term, kind, llm_draft, choice,
                     created_at, actor, model_identifier, model_version,
-                    provider, composer_skill_hash, interpretation_source
+                    provider, composer_skill_hash, interpretation_source,
+                    surface_origin
                 ) VALUES (
                     :event_id, :session_id, :state_id, 'llm-node',
                     'pending-tool-call', 'term', 'vague_term', 'draft',
                     'pending', CURRENT_TIMESTAMP, 'trigger-user', 'model-id',
-                    'model-version', 'provider', :skill_hash, 'user_approved'
+                    'model-version', 'provider', :skill_hash, 'user_approved',
+                    'composer_llm'
                 )
                 """
             ),
@@ -891,7 +764,7 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
         )
         assert (
             conn.execute(
-                text("SELECT count(*) FROM guided_operation_events WHERE session_id = :session_id"),
+                text("SELECT count(*) FROM session_operation_receipt_events WHERE session_id = :session_id"),
                 {"session_id": cascade_session},
             ).scalar_one()
             == 0
@@ -903,12 +776,16 @@ def test_postgres_session_audit_triggers_are_installed_and_enforced(postgres_eng
     [
         "DROP TRIGGER trg_chat_messages_no_delete ON chat_messages",
         "ALTER TABLE chat_messages DISABLE TRIGGER trg_chat_messages_no_delete",
-        "DROP TRIGGER trg_guided_operations_terminal_immutable ON guided_operations",
-        "ALTER TABLE guided_operations DISABLE TRIGGER trg_guided_operations_terminal_immutable",
-        "DROP TRIGGER trg_guided_operation_events_no_update ON guided_operation_events",
-        "ALTER TABLE guided_operation_events DISABLE TRIGGER trg_guided_operation_events_no_update",
-        "DROP TRIGGER trg_guided_operation_events_no_delete ON guided_operation_events",
-        "ALTER TABLE guided_operation_events DISABLE TRIGGER trg_guided_operation_events_no_delete",
+        "DROP TRIGGER trg_message_ingress_receipts_no_update ON message_ingress_receipts",
+        "ALTER TABLE message_ingress_receipts DISABLE TRIGGER trg_message_ingress_receipts_no_update",
+        "DROP TRIGGER trg_message_ingress_receipts_no_delete ON message_ingress_receipts",
+        "ALTER TABLE message_ingress_receipts DISABLE TRIGGER trg_message_ingress_receipts_no_delete",
+        "DROP TRIGGER trg_session_operation_receipts_terminal_immutable ON session_operation_receipts",
+        "ALTER TABLE session_operation_receipts DISABLE TRIGGER trg_session_operation_receipts_terminal_immutable",
+        "DROP TRIGGER trg_session_operation_receipt_events_no_update ON session_operation_receipt_events",
+        "ALTER TABLE session_operation_receipt_events DISABLE TRIGGER trg_session_operation_receipt_events_no_update",
+        "DROP TRIGGER trg_session_operation_receipt_events_no_delete ON session_operation_receipt_events",
+        "ALTER TABLE session_operation_receipt_events DISABLE TRIGGER trg_session_operation_receipt_events_no_delete",
     ],
 )
 def test_missing_or_disabled_postgres_audit_trigger_marks_session_schema_stale(
@@ -924,141 +801,79 @@ def test_missing_or_disabled_postgres_audit_trigger_marks_session_schema_stale(
         initialize_session_schema(postgres_engine)
 
 
-def test_postgres_guided_operation_locator_constraints_reject_invalid_bundles_and_cross_session_refs(
-    postgres_engine: Engine,
-) -> None:
+def test_postgres_operation_receipt_locators_reject_wrong_kind_and_cross_session_state(postgres_engine: Engine) -> None:
     init_session_schema(postgres_engine)
     session_a = "locator-session-a"
     session_b = "locator-session-b"
     _seed_postgres_trigger_rows(postgres_engine, session_id=session_a, include_completion=False)
     _seed_postgres_trigger_rows(postgres_engine, session_id=session_b, include_completion=False)
-    with postgres_engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                INSERT INTO composition_proposals (
-                    id, session_id, tool_call_id, tool_name, status,
-                    summary, rationale, affects, arguments_json,
-                    arguments_redacted_json, created_at, updated_at
-                ) VALUES (
-                    :proposal_id, :session_id, 'cross-session-call',
-                    'set_pipeline', 'pending', 'Cross-session proposal',
-                    'Foreign-key proof', CAST('[]' AS json), CAST('{}' AS json),
-                    CAST('{}' AS json), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-                )
-                """
-            ),
-            {"proposal_id": f"{session_b}-proposal", "session_id": session_b},
-        )
 
-    completed_insert = """
-        INSERT INTO guided_operations (
-            session_id, operation_id, kind, status, request_hash, attempt,
-            proposal_id, result_kind, result_state_id, result_session_id,
-            response_hash, created_at, updated_at, settled_at
-        ) VALUES (
-            :session_id, :operation_id, :kind, 'completed', :request_hash, 1,
-            :proposal_id, :result_kind, :result_state_id, :result_session_id,
-            :response_hash, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-        )
-    """
+    completed_insert = insert(session_operation_receipts_table).values(
+        session_id=session_a,
+        status="completed",
+        attempt=1,
+        created_at=func.now(),
+        updated_at=func.now(),
+        settled_at=func.now(),
+        response_hash="b" * 64,
+    )
     invalid_rows = (
         (
-            {
-                "session_id": session_a,
-                "operation_id": "invalid-discriminator",
-                "kind": "guided_start",
-                "request_hash": "c" * 64,
-                "proposal_id": None,
-                "result_kind": "arbitrary_json",
-                "result_state_id": f"{session_a}-state",
-                "result_session_id": None,
-                "response_hash": "d" * 64,
-            },
-            "ck_guided_operations_result_kind",
+            {"operation_id": "invalid-kind", "kind": "arbitrary", "request_hash": "a" * 64, "result_state_id": f"{session_a}-state"},
+            "ck_session_operation_receipts_kind",
         ),
         (
             {
-                "session_id": session_a,
-                "operation_id": "wrong-kind-bundle",
+                "operation_id": "wrong-kind-locator",
                 "kind": "session_fork",
-                "request_hash": "e" * 64,
-                "proposal_id": None,
-                "result_kind": "composition_state",
+                "request_hash": "c" * 64,
                 "result_state_id": f"{session_a}-state",
-                "result_session_id": None,
-                "response_hash": "f" * 64,
             },
-            "ck_guided_operations_result_locator",
+            "ck_session_operation_receipts_result_locator",
         ),
         (
             {
-                "session_id": session_a,
                 "operation_id": "cross-session-state",
-                "kind": "guided_start",
-                "request_hash": "1" * 64,
-                "proposal_id": None,
-                "result_kind": "composition_state",
+                "kind": "state_revert",
+                "request_hash": "d" * 64,
                 "result_state_id": f"{session_b}-state",
-                "result_session_id": None,
-                "response_hash": "2" * 64,
             },
-            "fk_guided_operations_result_state_session",
-        ),
-        (
-            {
-                "session_id": session_a,
-                "operation_id": "cross-session-proposal",
-                "kind": "guided_respond",
-                "request_hash": "3" * 64,
-                "proposal_id": f"{session_b}-proposal",
-                "result_kind": "composition_state",
-                "result_state_id": f"{session_a}-state",
-                "result_session_id": None,
-                "response_hash": "4" * 64,
-            },
-            "fk_guided_operations_proposal_session",
+            "fk_session_operation_receipts_result_state_session",
         ),
     )
     for values, constraint_name in invalid_rows:
         with pytest.raises(DBAPIError, match=constraint_name), postgres_engine.begin() as conn:
-            conn.execute(text(completed_insert), values)
+            conn.execute(completed_insert.values(**values))
 
-    with pytest.raises(DBAPIError, match="fk_guided_operations_originating_message_session"), postgres_engine.begin() as conn:
+    with pytest.raises(DBAPIError, match="fk_session_operation_receipts_originating_message_session"), postgres_engine.begin() as conn:
         conn.execute(
-            text(
-                """
-                INSERT INTO guided_operations (
-                    session_id, operation_id, kind, status, request_hash,
-                    lease_token, lease_expires_at, attempt,
-                    originating_message_id, created_at, updated_at
-                ) VALUES (
-                    :session_id, 'cross-session-message', 'guided_respond',
-                    'in_progress', :request_hash, 'lease-token',
-                    CURRENT_TIMESTAMP + INTERVAL '1 minute', 1,
-                    :message_id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-                )
-                """
-            ),
-            {
-                "session_id": session_a,
-                "request_hash": "5" * 64,
-                "message_id": f"{session_b}-message",
-            },
+            insert(session_operation_receipts_table).values(
+                session_id=session_a,
+                operation_id="cross-session-message",
+                kind="session_fork",
+                status="in_progress",
+                request_hash="e" * 64,
+                lease_token="lease-token",
+                lease_expires_at=func.now(),
+                attempt=1,
+                originating_message_id=f"{session_b}-message",
+                created_at=func.now(),
+                updated_at=func.now(),
+            )
         )
-
-    assert "result_locator_json" not in {column["name"] for column in inspect(postgres_engine).get_columns("guided_operations")}
 
 
 def test_preferences_upsert_round_trips_on_postgres(postgres_engine: Engine) -> None:
     """The account preferences write path must use PostgreSQL's upsert builder."""
     init_session_schema(postgres_engine)
     service = PreferencesService(postgres_engine)
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="postgres-preferences-user")
 
     transition = asyncio.run(
         service.update_composer_preferences(
             "postgres-preferences-user",
-            UpdateComposerPreferencesRequest(default_mode="guided", tutorial_completed_at=None),
+            UpdateComposerPreferencesRequest(tutorial_completed_at=None),
         )
     )
 
@@ -1067,9 +882,78 @@ def test_preferences_upsert_round_trips_on_postgres(postgres_engine: Engine) -> 
     # (elspeth-d336060892).
     assert transition.prior.value is None
     assert transition.prior.serialised is False
-    assert transition.current.default_mode == "guided"
     assert transition.current.tutorial_completed_at is None
     assert asyncio.run(service.get_composer_preferences("postgres-preferences-user")) == transition.current
+
+
+@pytest.mark.parametrize("existing_progress", [False, True])
+def test_late_tutorial_progress_cannot_overwrite_committed_completion(postgres_engine: Engine, existing_progress: bool) -> None:
+    """The upsert must recheck completion after its READ COMMITTED prior read."""
+    init_session_schema(postgres_engine)
+    service = PreferencesService(postgres_engine)
+    user_id = "postgres-tutorial-race"
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
+    if existing_progress:
+        asyncio.run(
+            service.update_composer_preferences(
+                user_id,
+                UpdateComposerPreferencesRequest(tutorial_stage="build", tutorial_session_id="tutorial-session"),
+            )
+        )
+
+    progress_engine = create_engine(postgres_engine.url)
+    progress_service = PreferencesService(progress_engine)
+    prior_read_finished = threading.Event()
+    release_progress = threading.Event()
+
+    def _pause_progress_insert(conn, cursor, statement, parameters, context, executemany) -> None:
+        if statement.startswith("INSERT INTO user_preferences"):
+            prior_read_finished.set()
+            assert release_progress.wait(timeout=15), "Completion did not release the late progress writer"
+
+    event.listen(progress_engine, "before_cursor_execute", _pause_progress_insert)
+
+    def _write_progress() -> None:
+        asyncio.run(
+            progress_service.update_composer_preferences(
+                user_id,
+                UpdateComposerPreferencesRequest(
+                    tutorial_stage="audit",
+                    tutorial_session_id="tutorial-session",
+                    tutorial_run_id="tutorial-run",
+                    tutorial_source_data_hash="tutorial-source-hash",
+                ),
+            )
+        )
+
+    completed_at = datetime(2026, 9, 20, tzinfo=UTC)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            progress = executor.submit(_write_progress)
+            try:
+                assert prior_read_finished.wait(timeout=15), "Progress writer did not reach its upsert"
+                completed = asyncio.run(
+                    service.update_composer_preferences(
+                        user_id,
+                        UpdateComposerPreferencesRequest(tutorial_completed_at=completed_at, tutorial_completed_via="exit"),
+                    )
+                )
+                assert completed.current.tutorial_completed_at == completed_at
+            finally:
+                release_progress.set()
+            with pytest.raises(TutorialProgressConflict):
+                progress.result(timeout=15)
+    finally:
+        event.remove(progress_engine, "before_cursor_execute", _pause_progress_insert)
+        progress_engine.dispose()
+
+    current = asyncio.run(service.get_composer_preferences(user_id))
+    assert current.tutorial_completed_at == completed_at
+    assert current.tutorial_stage is None
+    assert current.tutorial_session_id is None
+    assert current.tutorial_run_id is None
+    assert current.tutorial_source_data_hash is None
 
 
 def test_skill_markdown_history_upsert_round_trips_on_postgres(postgres_engine: Engine, tmp_path: Path) -> None:
@@ -1202,9 +1086,10 @@ def test_artifact_idempotency_index_and_behavior(postgres_engine: Engine) -> Non
             openrouter_catalog_sha256="0" * 64,
             openrouter_catalog_source="bundled",
         )
+        leader = leader_coordination_token(factory, run.run_id)
         schema = SchemaConfig.from_dict({"mode": "observed"})
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -1213,7 +1098,7 @@ def test_artifact_idempotency_index_and_behavior(postgres_engine: Engine) -> Non
             schema_config=schema,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -1221,20 +1106,20 @@ def test_artifact_idempotency_index_and_behavior(postgres_engine: Engine) -> Non
             node_id="postgres-artifact-sink",
             schema_config=schema,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader,
             source_node_id="postgres-artifact-source",
             row_index=0,
             data={"value": 1},
             row_id="postgres-artifact-row",
+            token_id="postgres-artifact-token",
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="postgres-artifact-token")
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="postgres-artifact-sink",
-            run_id=run.run_id,
+            member_token=leader.membership,
             step_index=0,
             input_data={"value": 1},
             state_id="postgres-artifact-state",
@@ -1245,20 +1130,27 @@ def test_artifact_idempotency_index_and_behavior(postgres_engine: Engine) -> Non
             "sink_node_id": "postgres-artifact-sink",
             "artifact_type": "csv",
             "path": "/output/postgres.csv",
-            "content_hash": "sha256:postgres",
+            "content_hash": fake_sha256("postgres"),
             "size_bytes": 128,
             "idempotency_key": "postgres-artifact-row:csv_sink",
         }
 
-        first = factory.execution.register_artifact(**values, artifact_id="postgres-artifact-first")
-        retried = factory.execution.register_artifact(**values, artifact_id="postgres-artifact-retry")
+        with fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn:
+            first = factory.execution.artifacts.register_artifact(**values, artifact_id="postgres-artifact-first", conn=conn)
+        with fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn:
+            retried = factory.execution.artifacts.register_artifact(**values, artifact_id="postgres-artifact-retry", conn=conn)
         assert retried == first
 
-        with pytest.raises(AuditIntegrityError, match="content_hash"):
-            factory.execution.register_artifact(**(values | {"content_hash": "sha256:divergent"}))
+        with (
+            pytest.raises(AuditIntegrityError, match="content_hash"),
+            fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn,
+        ):
+            factory.execution.artifacts.register_artifact(**(values | {"content_hash": fake_sha256("divergent")}), conn=conn)
 
-        null_first = factory.execution.register_artifact(**(values | {"idempotency_key": None}))
-        null_second = factory.execution.register_artifact(**(values | {"idempotency_key": None}))
+        with fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn:
+            null_first = factory.execution.artifacts.register_artifact(**(values | {"idempotency_key": None}), conn=conn)
+        with fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn:
+            null_second = factory.execution.artifacts.register_artifact(**(values | {"idempotency_key": None}), conn=conn)
         assert null_first.artifact_id != null_second.artifact_id
         assert len(factory.execution.get_artifacts(run.run_id)) == 3
     finally:
@@ -1282,9 +1174,10 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
             openrouter_catalog_sha256="0" * 64,
             openrouter_catalog_source="bundled",
         )
+        leader = leader_coordination_token(factory, run.run_id)
         schema = SchemaConfig.from_dict({"mode": "observed"})
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -1293,7 +1186,7 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
             schema_config=schema,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -1301,20 +1194,20 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
             node_id="postgres-artifact-contention-sink",
             schema_config=schema,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader,
             source_node_id="postgres-artifact-contention-source",
             row_index=0,
             data={"value": 1},
             row_id="postgres-artifact-contention-row",
+            token_id="postgres-artifact-contention-token",
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="postgres-artifact-contention-token")
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="postgres-artifact-contention-sink",
-            run_id=run.run_id,
+            member_token=leader.membership,
             step_index=0,
             input_data={"value": 1},
             state_id="postgres-artifact-contention-state",
@@ -1328,6 +1221,17 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
             "size_bytes": 128,
             "idempotency_key": "postgres-artifact-contention-row:csv_sink",
         }
+        # Separate registered memberships retain concurrent artifact writes:
+        # one shared leader fence would serialize before the unique-index race.
+        members = [
+            factory.run_coordination.admit_follower(
+                run_id=run.run_id,
+                worker_id=f"postgres-artifact-contender-{ordinal}",
+                config_hash=run.config_hash,
+                window_seconds=300,
+            )
+            for ordinal in range(2)
+        ]
 
         transaction_barrier = threading.Barrier(2)
         physical_connections: set[int] = set()
@@ -1343,16 +1247,18 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
         event.listen(db.engine, "begin", _synchronize_contender_transactions)
 
         def _contend(ordinal: int) -> Artifact | AuditIntegrityError:
-            content_hash = "sha256:postgres-contention"
+            content_hash = fake_sha256("postgres-contention")
             if divergent and ordinal == 1:
-                content_hash = "sha256:postgres-divergent"
+                content_hash = fake_sha256("postgres-divergent")
             contender = RecorderFactory(db)
             try:
-                return contender.execution.register_artifact(
-                    **values,
-                    content_hash=content_hash,
-                    artifact_id=f"postgres-artifact-proposal-{ordinal}",
-                )
+                with fenced_member_transaction(db.engine, member_token=members[ordinal], verb="test_artifact") as conn:
+                    return contender.execution.artifacts.register_artifact(
+                        **values,
+                        content_hash=content_hash,
+                        artifact_id=f"postgres-artifact-proposal-{ordinal}",
+                        conn=conn,
+                    )
             except AuditIntegrityError as exc:
                 return exc
 

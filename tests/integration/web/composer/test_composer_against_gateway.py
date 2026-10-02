@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -88,7 +89,9 @@ import uvicorn
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from elspeth.web.composer import provider_gateway
+from tests.fixtures.identities import ensure_test_identity
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --- sys.path shim ------------------------------------------------------
 # ``gateway/`` is not on the default ELSPETH import path (see
@@ -106,7 +109,6 @@ from elspeth_llm_gateway.reference.adapter import ReferenceV1InvokeAdapter  # no
 from mock.oauth import create_mock_oauth_app  # noqa: E402
 from mock.upstream import create_mock_upstream_app  # noqa: E402
 
-import elspeth.web.composer.service as composer_service_module  # noqa: E402
 from elspeth.web.catalog.protocol import CatalogService  # noqa: E402
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary  # noqa: E402
 from elspeth.web.composer.service import ComposerServiceImpl  # noqa: E402
@@ -126,21 +128,27 @@ _INBOUND_BEARER = "composer-gw-e2e-inbound-bearer-0123456789abcdef"  # secret-sc
 _OAUTH_CLIENT_ID = "composer-gw-e2e-oauth-client"
 _OAUTH_CLIENT_SECRET = "composer-gw-e2e-oauth-client-secret-0123456789abcdef"  # secret-scan: allow-this-line
 _MODEL_ALIAS = "gpt-5.5"  # matches WebSettings.composer_model's default -- no override needed
+_SAMPLING_MODEL_ALIAS = "gpt-4.1"  # explicit model whose sampling contract admits temperature + seed
 _MODEL_TARGET = "composer-gw-e2e-target"
 _OAUTH_HOST = "oauth.composer-gw-e2e.mock"
 _UPSTREAM_HOST = "upstream.composer-gw-e2e.mock"
 
-# Bounds sized for real Composer traffic (measured empirically against the
-# trained-operator tool catalog + system skill prompt): 43 registered tools
-# totalling ~39KB of tool-def JSON (largest single tool ~7.3KB), and a
-# ~68KB system message. The Phase 2 e2e suite's bounds (10 tools / 20000
-# chars) are sized for the low-level GatewayLLMProvider's synthetic
-# messages and are far too small for a real Composer request.
-_MAX_MESSAGES = "50"
-_MAX_TOOLS = "60"
-_MAX_STRING_CHARS = "100000"
-_MAX_SCHEMA_BYTES = "65536"
-_MAX_SCHEMA_DEPTH = "15"
+
+def _scenario_c_request_bounds() -> dict[str, str]:
+    """Exercise the shipped deployment bounds with real boot and session traffic.
+
+    Independent fixture limits previously hid an example configuration that
+    rejected Composer's tool count, nested schemas, and rendered system prompt.
+    Require one literal numeric assignment per bound so a missing or changed
+    example shape cannot silently fall back to more permissive fixture values.
+    """
+    example = (_REPO_ROOT / "deploy/aws-ecs/terraform/examples/scenario-c.tfvars.example").read_text(encoding="utf-8")
+    bounds: dict[str, str] = {}
+    for name in ("messages", "tools", "string_chars", "schema_bytes", "schema_depth"):
+        values = re.findall(rf"^gateway_max_{name}\s*=\s*([0-9]+)\s*$", example, flags=re.MULTILINE)
+        assert len(values) == 1, f"expected one numeric gateway_max_{name} in Scenario C example"
+        bounds[f"ELSPETH_LLM_GATEWAY_MAX_{name.upper()}"] = values[0]
+    return bounds
 
 
 class _HostRoutedTransport(httpx.AsyncBaseTransport):
@@ -183,12 +191,10 @@ def _build_gateway_app() -> Any:
         "ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_ID": _OAUTH_CLIENT_ID,
         "ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_SECRET": _OAUTH_CLIENT_SECRET,
         "ELSPETH_LLM_GATEWAY_OAUTH_AUTH_METHOD": "client_secret_basic",
-        "ELSPETH_LLM_GATEWAY_MAX_MESSAGES": _MAX_MESSAGES,
-        "ELSPETH_LLM_GATEWAY_MAX_TOOLS": _MAX_TOOLS,
-        "ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS": _MAX_STRING_CHARS,
-        "ELSPETH_LLM_GATEWAY_MAX_SCHEMA_BYTES": _MAX_SCHEMA_BYTES,
-        "ELSPETH_LLM_GATEWAY_MAX_SCHEMA_DEPTH": _MAX_SCHEMA_DEPTH,
-        "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS": json.dumps({_MODEL_ALIAS: {"target": _MODEL_TARGET}}),
+        **_scenario_c_request_bounds(),
+        "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS": json.dumps(
+            {_MODEL_ALIAS: {"target": _MODEL_TARGET}, _SAMPLING_MODEL_ALIAS: {"target": _MODEL_TARGET}}
+        ),
     }
     config = load_config(env)
     return create_app(config, adapter=ReferenceV1InvokeAdapter(), upstream_client=upstream_client)
@@ -313,7 +319,7 @@ def _build_sessions_service(tmp_path: Path) -> SessionServiceImpl:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -326,6 +332,7 @@ def _insert_session_row(sessions_service: SessionServiceImpl, session_id: str) -
 
     now = datetime.now(UTC)
     with sessions_service._engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="gateway-e2e-user")
         conn.execute(
             sessions_table.insert().values(
                 id=session_id,
@@ -515,17 +522,25 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
 
 
 # ---------------------------------------------------------------------------
-# The boot probe against the live gateway. ``probe_composer_config``
-# unconditionally sends ``max_tokens=16``, which LiteLLM's ``openai`` path
-# translates to the wire field ``max_completion_tokens``; the gateway's
-# ``extra="forbid"`` ``ChatRequest`` rejected that as an unknown field, so
-# the probe raised ``ComposerBootConfigError`` and ``app.py`` re-raised it --
-# the web app could not boot at all against this gateway.
+# The boot probe against the live gateway. The probe sends the planner's
+# production-shaped requests: the 42-tool compose-loop list with
+# ``max_tokens=16`` (which LiteLLM's ``openai`` path translates to the wire
+# field ``max_completion_tokens``; the gateway's ``extra="forbid"``
+# ``ChatRequest`` once rejected that as an unknown field, so boot failed
+# against this gateway), and the pipeline planner's discovery tools plus its
+# terminal with the planner's own token cap. Both must be accepted.
 # ---------------------------------------------------------------------------
 
 
+def _planner_probe_requests(tmp_path: Path, gateway_base_url: str, **overrides: Any) -> Any:
+    from elspeth.web.composer.boot_probe import build_composer_probe_requests
+
+    settings = _settings(tmp_path, endpoint_base_url=f"{gateway_base_url}/v1", endpoint_api_key=_INBOUND_BEARER, **overrides)
+    return [request for request in build_composer_probe_requests(settings) if request.role == "planner"]
+
+
 @pytest.mark.asyncio
-async def test_boot_probe_succeeds_against_gateway(gateway_base_url: str) -> None:
+async def test_boot_probe_succeeds_against_gateway(tmp_path: Path, gateway_base_url: str) -> None:
     """Default settings, real probe, live gateway -- boot is not fatal.
 
     ``ComposerBootConfigError`` is asserted by absence deliberately rather
@@ -535,37 +550,53 @@ async def test_boot_probe_succeeds_against_gateway(gateway_base_url: str) -> Non
     """
     from elspeth.web.composer.boot_probe import probe_composer_config
 
-    probed = await probe_composer_config(
-        model=_MODEL_ALIAS,
-        temperature=None,
-        seed=None,
-        api_base=f"{gateway_base_url}/v1",
-        api_key=_INBOUND_BEARER,
-    )
+    requests = _planner_probe_requests(tmp_path, gateway_base_url)
+    assert [request.surface for request in requests] == ["loop_tools", "planner_tools"]
+    assert requests[0].tool_count == 42
 
-    # True (not the transient-failure False) -- the request was accepted and
-    # answered, so this proves acceptance rather than a swallowed transport
-    # error.
-    assert probed is True
+    for request in requests:
+        # True (not the transient-failure False) -- the request was accepted
+        # and answered, so this proves acceptance rather than a swallowed
+        # transport error.
+        assert await probe_composer_config(request) is True, request.surface
 
 
 @pytest.mark.asyncio
-async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(gateway_base_url: str) -> None:
+async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(tmp_path: Path, gateway_base_url: str) -> None:
     """The probe's other real payload shape: temperature + seed alongside the
     translated token cap. ``seed`` is a gated capability the reference
     adapter declares, so this also proves the alias did not disturb the
-    capability path."""
+    capability path. Use a sampling-capable model explicitly: the default
+    gpt-5.5 rejects nondefault temperature while reasoning is active."""
     from elspeth.web.composer.boot_probe import probe_composer_config
 
-    probed = await probe_composer_config(
-        model=_MODEL_ALIAS,
-        temperature=0.2,
-        seed=7,
-        api_base=f"{gateway_base_url}/v1",
-        api_key=_INBOUND_BEARER,
+    requests = _planner_probe_requests(
+        tmp_path, gateway_base_url, composer_model=_SAMPLING_MODEL_ALIAS, composer_temperature=0.2, composer_seed=7
     )
 
-    assert probed is True
+    for request in requests:
+        assert await probe_composer_config(request) is True, request.surface
+
+
+@pytest.mark.asyncio
+async def test_boot_probe_rejects_incompatible_reasoning_model_sampling(tmp_path: Path, gateway_base_url: str) -> None:
+    """An endpoint override must not silently drop rejected operator sampling."""
+    from litellm.exceptions import UnsupportedParamsError
+
+    from elspeth.web.composer.boot_probe import ComposerBootConfigError, probe_composer_config
+
+    loop_request = _planner_probe_requests(tmp_path, gateway_base_url, composer_temperature=0.2, composer_seed=7)[0]
+    with pytest.raises(ComposerBootConfigError, match="composer planner boot request rejected") as caught:
+        await probe_composer_config(loop_request)
+    assert isinstance(caught.value.__cause__, UnsupportedParamsError)
+    assert f"by {_MODEL_ALIAS}:" in str(caught.value)
+    assert "surface=loop_tools" in str(caught.value)
+    assert "tool_count=42" in str(caught.value)
+    assert "temperature_present=True" in str(caught.value)
+    assert "seed_present=True" in str(caught.value)
+    assert "reasoning_effort_present=False" in str(caught.value)
+    assert "response_format_present=False" in str(caught.value)
+    assert "provider_routing_present=False" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -650,9 +681,9 @@ async def test_advisor_role_does_not_use_primary_gateway_endpoint(
         choice = type("Choice", (), {"message": message})()
         return type("Response", (), {"choices": [choice]})()
 
-    monkeypatch.setattr(composer_service_module, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await service._call_advisor_with_audit(
+    await service._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",
@@ -664,3 +695,99 @@ async def test_advisor_role_does_not_use_primary_gateway_endpoint(
 
     assert "api_base" not in captured
     assert "api_key" not in captured
+
+
+# ---------------------------------------------------------------------------
+# S1 strict tool contracts against the gateway (T11, characterization). The
+# gateway's inbound ``ChatFunctionDef`` is ``extra="forbid"`` and has no
+# ``strict`` field, so a tool that carries ``function.strict`` -- ``true`` or
+# an explicit ``false`` -- is a 400. This is why a custom endpoint resolves to
+# the ``none`` dialect under ``composer_strict_tools="preferred"`` (resolver
+# row 8): the gateway row below is the known negative that shows the
+# ``preferred`` list is the only one this gateway accepts. Adding ``strict``
+# to the gateway's contract is a separate gateway-contract decision.
+# ---------------------------------------------------------------------------
+
+
+def _loop_tools_stamped(flag: bool) -> list[dict[str, Any]]:
+    """The compose loop's ``openai_strict`` tools whose stamp is ``flag`` (32 true, 10 false)."""
+    from elspeth.contracts.composer_llm_audit import ToolContractDialect
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+
+    tools = [tool for tool in composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT) if tool["function"]["strict"] is flag]
+    assert len(tools) == (32 if flag else 10)
+    return tools
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [True, False], ids=["strict_true", "strict_false"])
+async def test_gateway_rejects_tools_that_carry_function_strict(gateway_base_url: str, flag: bool) -> None:
+    """Characterization: a tool list stamped ``strict: true`` or ``strict: false`` is a gateway 400.
+
+    The list is the compose loop's own ``openai_strict`` list, split by
+    stamp, so both explicit values are shown to be rejected, not only
+    ``true``. The gateway's 400 does not name the field, so the same tools
+    with only the ``strict`` key removed are then sent and must be
+    accepted: that pair is what ties the 400 to ``strict`` rather than to
+    anything else in the request.
+    """
+    import copy
+
+    import litellm
+    from litellm.exceptions import BadRequestError
+
+    stamped = _loop_tools_stamped(flag)
+    unstamped = copy.deepcopy(stamped)
+    for tool in unstamped:
+        del tool["function"]["strict"]
+
+    with pytest.raises(BadRequestError):
+        await litellm.acompletion(
+            model=_MODEL_ALIAS,
+            api_base=f"{gateway_base_url}/v1",
+            api_key=_INBOUND_BEARER,
+            messages=[{"role": "user", "content": "hello gateway"}],
+            tools=stamped,
+            num_retries=0,
+        )
+
+    response = await litellm.acompletion(
+        model=_MODEL_ALIAS,
+        api_base=f"{gateway_base_url}/v1",
+        api_key=_INBOUND_BEARER,
+        messages=[{"role": "user", "content": "hello gateway"}],
+        tools=unstamped,
+        num_retries=0,
+    )
+    assert response.choices[0].message.content == "MOCK:hello gateway"
+
+
+@pytest.mark.asyncio
+async def test_gateway_accepts_the_preferred_route_tool_list(gateway_base_url: str) -> None:
+    """Characterization: under ``preferred`` the gateway route resolves to ``none`` and its list is accepted.
+
+    The route is the shipped default model with the gateway as its custom
+    endpoint (resolver row 8). Its list carries no ``strict`` key on any
+    tool, and the gateway answers it.
+    """
+    import litellm
+
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+    from elspeth.web.composer.strict_transport import StrictTransport, dialect_for, resolve_strict_transport
+
+    resolution = resolve_strict_transport(model=_MODEL_ALIAS, api_base=f"{gateway_base_url}/v1", setting="preferred", env={})
+    assert resolution.transport is StrictTransport.NONE
+    tools = composer_loop_tool_definitions(dialect_for(resolution.transport))
+    assert len(tools) == 42
+    assert [tool for tool in tools if "strict" in tool["function"]] == []
+
+    response = await litellm.acompletion(
+        model=_MODEL_ALIAS,
+        api_base=f"{gateway_base_url}/v1",
+        api_key=_INBOUND_BEARER,
+        messages=[{"role": "user", "content": "hello gateway"}],
+        tools=tools,
+        num_retries=0,
+    )
+    assert response.choices[0].message.content == "MOCK:hello gateway"
+    assert response.choices[0].finish_reason == "stop"

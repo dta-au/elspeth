@@ -1,5 +1,35 @@
 # Transforms — Pipeline Data vs Audit Provenance
 
+## Wrongly-typed row values: return, never raise
+
+A row value of the wrong type is row DATA, not a bug to crash on. Under an
+`observed` schema, or a field the schema leaves untyped (`any`), nothing
+upstream checked it.
+
+- **Never coerce it.** `"42"` stays a wrong type; do not turn it into `42`.
+- **Never raise on it.** A bare `TypeError` (or `KeyError`, `ValueError`)
+  escaping `process()` matches no conversion in the engine: the run aborts with
+  a traceback and no terminal outcomes (elspeth-5887fb7928).
+- **Return `TransformResult.error(..., retryable=False)`.** A row-level
+  transform's row then leaves through its `on_error`. At a batch node one bad
+  row fails the WHOLE batch: every buffered row routes via the aggregation's
+  `on_error`, and a collector fails its group.
+- **Never put the value in the reason.** Name the field, the expected and
+  found type, and the (batch) row index.
+- **In a batch helper that returns a value,** raise `BatchRowTypeError` from
+  `_batch_row_types.py` and catch it once in `process()`:
+  `return TransformResult.error(exc.as_reason(), retryable=False)`
+  (`batch_threshold_summary.py` is the pattern). Use `type(x) not in (...)`,
+  not `isinstance`: `bool` is an `int`.
+
+`tests/unit/plugins/test_process_path_type_error_gate.py` fails the build on an
+explicit `raise TypeError` that a class's own `process` reaches through its
+methods, same-module bases and module functions. It does not follow composed
+helper objects (`self._builder.build(...)`) or code in another module, and it
+never roots a transform that inherits `process` from another module (the RAG,
+Azure and Bedrock families here), so it cannot vouch for those. Its escape
+hatch is a reviewed entry in that file, never a suppression.
+
 ## The Decision Test
 
 > Would a pipeline operator or downstream transform ever make a decision based on this value?

@@ -18,6 +18,7 @@ import json
 import multiprocessing
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,7 +28,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import Column, delete, event, func, insert, select
+from sqlalchemy import delete, event, func, insert, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
@@ -35,6 +36,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs import service as blob_service_module
 from elspeth.web.blobs.protocol import (
     BlobActiveRunError,
@@ -44,8 +46,6 @@ from elspeth.web.blobs.protocol import (
     BlobForkFenceLostError,
     BlobForkPlanEntry,
     BlobForkWriteFence,
-    BlobGuidedOperationFenceLostError,
-    BlobGuidedOperationWriteFence,
     BlobInProgressForkError,
     BlobIntegrityError,
     BlobNotFoundError,
@@ -64,13 +64,15 @@ from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
     composition_proposals_table,
-    guided_operations_table,
+    session_operation_receipts_table,
     sessions_table,
 )
+from elspeth.web.sessions.protocol import CompositionValidationError
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -95,6 +97,7 @@ def session_id(db_engine) -> UUID:
     sid = str(uuid4())
     now = datetime.now(UTC)
     with db_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
         conn.execute(
             sessions_table.insert().values(
                 id=sid,
@@ -140,6 +143,7 @@ async def _seed_active_run(
     source: dict[str, Any],
     nodes: list[dict[str, Any]] | None = None,
     status: str = "pending",
+    validation_errors: tuple[CompositionValidationError, ...] | None = None,
 ) -> str:
     """Seed a composition state through the REAL writer, attach a run, return its id.
 
@@ -176,6 +180,7 @@ async def _seed_active_run(
             outputs=[],
             metadata_={"name": "Test", "description": ""},
             is_valid=True,
+            validation_errors=validation_errors,
         ),
         provenance="session_seed",
         session_operation_context=context,
@@ -325,6 +330,16 @@ class TestSanitizeFilename:
         result = sanitize_filename(long_name)
         assert len(result.encode("utf-8")) <= 200
 
+    def test_oversized_suffix_stays_within_byte_cap(self) -> None:
+        result = sanitize_filename("report." + "x" * 250)
+        assert result
+        assert len(result.encode("utf-8")) <= 200
+
+    def test_oversized_unicode_suffix_stays_within_byte_cap(self) -> None:
+        result = sanitize_filename("report." + "é" * 200)
+        assert result
+        assert len(result.encode("utf-8")) <= 200
+
 
 # ---------------------------------------------------------------------------
 # content_hash — audit integrity
@@ -444,6 +459,7 @@ class TestListBlobs:
                 (str(s1_id), "user-a", "Session 1"),
                 (str(s2_id), "user-b", "Session 2"),
             ]:
+                ensure_test_identity(conn, identity_id=uid)
                 conn.execute(
                     sessions_table.insert().values(
                         id=sid,
@@ -535,26 +551,39 @@ class TestDeleteBlob:
         )
         storage = Path(record.storage_path)
         original_do_commit = db_engine.dialect.do_commit
-        fail_next_commit = True
+        fail_next_commit = False
+        failure_injected = False
+
+        def arm_delete_commit(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+            nonlocal fail_next_commit
+            if statement.lstrip().upper().startswith("DELETE FROM BLOBS "):
+                fail_next_commit = True
 
         def fail_delete_commit(dbapi_connection) -> None:
-            nonlocal fail_next_commit
+            nonlocal fail_next_commit, failure_injected
             if fail_next_commit:
                 fail_next_commit = False
+                failure_injected = True
+                assert not storage.exists(), "commit fault must occur after canonical bytes have been staged"
                 raise RuntimeError("injected blob delete commit failure")
             original_do_commit(dbapi_connection)
 
         monkeypatch.setattr(db_engine.dialect, "do_commit", fail_delete_commit)
 
-        with pytest.raises(RuntimeError, match="injected blob delete commit failure"):
-            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+        event.listen(db_engine, "before_cursor_execute", arm_delete_commit)
+        try:
+            with pytest.raises(RuntimeError, match="injected blob delete commit failure"):
+                await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+        finally:
+            event.remove(db_engine, "before_cursor_execute", arm_delete_commit)
+        assert failure_injected
 
         restarted = BlobServiceImpl(db_engine, tmp_path)
         restored = await restarted.get_blob(record.id, session_operation_context=compose_context)
         assert restored.id == record.id
         assert storage.read_bytes() == content
         assert await restarted.read_blob_content(record.id, session_operation_context=compose_context) == content
-        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+        assert list(storage.parent.glob(f".{record.id}.delete-*")) == []
 
     @pytest.mark.asyncio
     async def test_delete_blob_sql_failure_restores_file_before_stage_escapes(
@@ -591,7 +620,7 @@ class TestDeleteBlob:
         restarted = BlobServiceImpl(db_engine, tmp_path)
         assert (await restarted.get_blob(record.id, session_operation_context=compose_context)).id == record.id
         assert await restarted.read_blob_content(record.id, session_operation_context=compose_context) == content
-        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+        assert list(storage.parent.glob(f".{record.id}.delete-*")) == []
 
     @pytest.mark.asyncio
     async def test_delete_blob_staging_fsync_failure_restores_file_before_stage_escapes(
@@ -631,7 +660,7 @@ class TestDeleteBlob:
         assert (await restarted.get_blob(record.id, session_operation_context=compose_context)).id == record.id
         assert storage.read_bytes() == content
         assert await restarted.read_blob_content(record.id, session_operation_context=compose_context) == content
-        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+        assert list(storage.parent.glob(f".{record.id}.delete-*")) == []
 
     @pytest.mark.asyncio
     async def test_delete_blob_tombstone_unlink_failure_is_retryable_after_restart(
@@ -671,14 +700,14 @@ class TestDeleteBlob:
 
         with pytest.raises(BlobNotFoundError):
             await blob_service.get_blob(record.id, session_operation_context=compose_context)
-        tombstones = list(storage.parent.glob(f".{storage.name}.delete-*"))
+        tombstones = list(storage.parent.glob(f".{record.id}.delete-*"))
         assert len(tombstones) == 1
         assert tombstones[0].read_bytes() == content
 
         restarted = BlobServiceImpl(db_engine, tmp_path)
         await restarted.delete_blob(record.id, session_operation_context=compose_context)
 
-        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+        assert list(storage.parent.glob(f".{record.id}.delete-*")) == []
 
     @pytest.mark.asyncio
     async def test_delete_blob_post_unlink_fsync_failure_is_retryable_after_restart(
@@ -716,7 +745,7 @@ class TestDeleteBlob:
         with pytest.raises(BlobNotFoundError):
             await blob_service.get_blob(record.id, session_operation_context=compose_context)
         assert not storage.exists()
-        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+        assert list(storage.parent.glob(f".{record.id}.delete-*")) == []
 
         restarted = BlobServiceImpl(db_engine, tmp_path)
         await restarted.delete_blob(record.id, session_operation_context=compose_context)
@@ -1146,8 +1175,11 @@ class TestDeleteBlob:
             await blob_service.get_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "validation_errors", [None, (), (CompositionValidationError(message="diagnostic", error_code="known", component="source"),)]
+    )
     async def test_delete_blob_rejects_when_active_run_exists_without_link(
-        self, blob_service, session_id, db_engine, compose_context
+        self, blob_service, session_id, db_engine, compose_context, validation_errors
     ) -> None:
         """Pre-link window: active run exists but blob_run_links row hasn't been created yet.
 
@@ -1173,6 +1205,7 @@ class TestDeleteBlob:
             db_engine,
             session_id,
             session_operation_context=compose_context,
+            validation_errors=validation_errors,
             source={
                 "plugin": "csv",
                 "on_success": "output",
@@ -1183,6 +1216,13 @@ class TestDeleteBlob:
 
         with pytest.raises(BlobActiveRunError):
             await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+
+        # Composite fork cleanup owns a separate locked deletion path. Exercise
+        # its actual SQL join as well as the ordinary repository-backed delete.
+        with db_engine.begin() as conn:
+            row = conn.execute(select(blobs_table).where(blobs_table.c.id == str(record.id))).one()
+            with pytest.raises(BlobActiveRunError):
+                blob_service._delete_fork_blob_row_locked(conn, row=row, blob_id_str=str(record.id))
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("key", ["blob_ref", "blob_id"])
@@ -1552,17 +1592,23 @@ class TestBlobQuota:
         assert "FOR UPDATE" in compiled
 
     @pytest.mark.asyncio
-    async def test_create_blob_locks_session_before_quota_sum(self, db_engine, session_id, tmp_path, monkeypatch, compose_context) -> None:
+    async def test_create_blob_locks_session_before_quota_sum(self, db_engine, session_id, tmp_path, compose_context) -> None:
         """create_blob must serialize same-session quota writers before SUM+insert."""
         service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=200)
-        locked_sessions: list[str] = []
-        original_lock = blob_service_module._lock_session_for_blob_quota
+        statements: list[tuple[object, str]] = []
+        quota_sums = 0
 
-        def recording_lock(conn, session_id_str: str) -> None:
-            locked_sessions.append(session_id_str)
-            original_lock(conn, session_id_str)
-
-        monkeypatch.setattr(blob_service_module, "_lock_session_for_blob_quota", recording_lock)
+        @event.listens_for(db_engine, "before_execute")
+        def record_quota_order(conn, clauseelement, multiparams, params, execution_options) -> None:
+            nonlocal quota_sums
+            sql = str(clauseelement.compile(dialect=postgresql.dialect()))
+            if "sum(blobs.size_bytes)" in sql:
+                quota_sums += 1
+                assert any(
+                    connection is conn and "FROM sessions" in statement and "FOR UPDATE" in statement
+                    for connection, statement in statements
+                ), "quota SUM must follow the session-row lock on the same transaction connection"
+            statements.append((conn, sql))
 
         await service.create_blob(
             session_id=session_id,
@@ -1573,7 +1619,7 @@ class TestBlobQuota:
             session_operation_context=compose_context,
         )
 
-        assert locked_sessions == [str(session_id)]
+        assert quota_sums > 0, "the ordering oracle must observe a real quota SUM"
 
     @pytest.mark.asyncio
     async def test_quota_rejects_when_exceeded(self, db_engine, session_id, tmp_path, compose_context) -> None:
@@ -1686,6 +1732,7 @@ def _custody_process(
     request_fields: dict[str, object],
     start_event: object,
     result_queue: object,
+    operation_context: SessionOperationContext,
 ) -> None:
     """Spawn-safe worker proving PostgreSQL exclusion crosses processes."""
     request_type, _ = _inline_custody_contract()
@@ -1697,7 +1744,11 @@ def _custody_process(
     try:
         if not start_event.wait(timeout=15):  # type: ignore[attr-defined]
             raise RuntimeError("PostgreSQL custody process start barrier timed out")
-        record = asyncio.run(BlobServiceImpl(engine, Path(data_dir), max_storage_per_session=100).reserve_inline_custody(request))
+        record = asyncio.run(
+            BlobServiceImpl(engine, Path(data_dir), max_storage_per_session=100).reserve_inline_custody(
+                request, session_operation_context=operation_context
+            )
+        )
         result_queue.put(("ok", str(record.id)))  # type: ignore[attr-defined]
     except BaseException as exc:
         result_queue.put(("error", type(exc).__name__, str(exc)))  # type: ignore[attr-defined]
@@ -2065,129 +2116,12 @@ class TestInlineCustodyStartupReconciliation:
 
 
 class TestInlineCustody:
-    @staticmethod
-    def _guided_operation_write_fence(
-        db_engine,
-        session_id: UUID,
-        *,
-        kind: str = "guided_plan",
-    ) -> BlobGuidedOperationWriteFence:
-        operation_id = str(uuid4())
-        lease_token = uuid4().hex
-        now = datetime.now(UTC)
-        with db_engine.begin() as conn:
-            conn.execute(
-                guided_operations_table.insert().values(
-                    session_id=str(session_id),
-                    operation_id=operation_id,
-                    kind=kind,
-                    status="in_progress",
-                    request_hash="a" * 64,
-                    lease_token=lease_token,
-                    lease_expires_at=now + timedelta(hours=1),
-                    attempt=1,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-        return BlobGuidedOperationWriteFence(
-            session_id=session_id,
-            operation_id=operation_id,
-            lease_token=lease_token,
-            attempt=1,
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("kind", ["guided_plan", "guided_respond"])
-    async def test_guided_inline_custody_accepts_closed_planning_operation_kinds(
-        self,
-        db_engine,
-        session_id: UUID,
-        tmp_path: Path,
-        kind: str,
-    ) -> None:
-        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
-        request = _custody_request(db_engine, session_id)
-        fence = self._guided_operation_write_fence(db_engine, session_id, kind=kind)
-
-        record = await service.reserve_inline_custody(request, write_fence=fence)
-
-        assert record.status == "ready"
-        assert Path(record.storage_path).read_bytes() == request.content
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("invalidity", ["wrong_kind", "wrong_token", "wrong_attempt"])
-    async def test_guided_inline_custody_requires_live_fence_at_reservation(
-        self,
-        db_engine,
-        session_id: UUID,
-        tmp_path: Path,
-        invalidity: str,
-    ) -> None:
-        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
-        request = _custody_request(db_engine, session_id)
-        fence = self._guided_operation_write_fence(
-            db_engine,
-            session_id,
-            kind="guided_chat" if invalidity == "wrong_kind" else "guided_plan",
-        )
-        if invalidity == "wrong_token":
-            fence = replace(fence, lease_token="wrong-token")
-        elif invalidity == "wrong_attempt":
-            fence = replace(fence, attempt=2)
-
-        with pytest.raises(BlobGuidedOperationFenceLostError):
-            await service.reserve_inline_custody(request, write_fence=fence)
-
-        with db_engine.connect() as conn:
-            assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
-        assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "takeover_values",
-        [
-            {"kind": "guided_chat"},
-            {"lease_token": "takeover-lease"},
-            {"attempt": 2},
-        ],
-        ids=["wrong-kind", "wrong-token", "wrong-attempt"],
-    )
-    async def test_guided_inline_custody_rechecks_fence_at_ready_write(
-        self,
-        db_engine,
-        session_id: UUID,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        takeover_values: dict[str, object],
-    ) -> None:
-        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
-        request = _custody_request(db_engine, session_id)
-        fence = self._guided_operation_write_fence(db_engine, session_id)
-        original_write = blob_service_module._write_or_validate_reserved_blob
-
-        def _write_after_takeover(**kwargs):
-            wrote = original_write(**kwargs)
-            with db_engine.begin() as conn:
-                changed = conn.execute(
-                    guided_operations_table.update()
-                    .where(guided_operations_table.c.session_id == str(session_id))
-                    .where(guided_operations_table.c.operation_id == fence.operation_id)
-                    .where(guided_operations_table.c.lease_token == fence.lease_token)
-                    .where(guided_operations_table.c.attempt == fence.attempt)
-                    .values(**takeover_values, updated_at=datetime.now(UTC))
-                ).rowcount
-            assert changed == 1
-            return wrote
-
-        monkeypatch.setattr(blob_service_module, "_write_or_validate_reserved_blob", _write_after_takeover)
-
-        with pytest.raises(BlobGuidedOperationFenceLostError):
-            await service.reserve_inline_custody(request, write_fence=fence)
-
-        with db_engine.connect() as conn:
-            row = conn.execute(select(blobs_table.c.status).where(blobs_table.c.session_id == str(session_id))).one()
-        assert row.status == "pending"
+    @pytest.fixture(autouse=True)
+    def _operation(self, compose_context: SessionOperationContext) -> None:
+        # Import the shared driver before fault injection replaces its writer
+        # dependency; a lazy import during a patch would retain the test fake.
+        importlib.import_module("elspeth.web.blobs.replacement")
+        self._operation_context = compose_context
 
     @pytest.mark.asyncio
     async def test_nonidempotent_duplicate_does_not_delete_existing_ready_file(
@@ -2357,8 +2291,8 @@ class TestInlineCustody:
         service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
         request = _custody_request(db_engine, session_id)
 
-        first = await service.reserve_inline_custody(request)
-        retried = await service.reserve_inline_custody(request)
+        first = await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
+        retried = await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
 
         assert first == retried
         assert first.id.version == 5
@@ -2377,7 +2311,9 @@ class TestInlineCustody:
         service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
         request = _custody_request(db_engine, session_id)
 
-        records = await asyncio.gather(*(service.reserve_inline_custody(request) for _ in range(8)))
+        records = await asyncio.gather(
+            *(service.reserve_inline_custody(request, session_operation_context=self._operation_context) for _ in range(8))
+        )
 
         assert {record.id for record in records} == {records[0].id}
         with db_engine.connect() as conn:
@@ -2416,7 +2352,7 @@ class TestInlineCustody:
                 )
             )
 
-        record = await service.reserve_inline_custody(request)
+        record = await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
 
         assert record.status == "ready"
         assert record.id == blob_id
@@ -2439,7 +2375,7 @@ class TestInlineCustody:
         deterministic_temp.write_bytes(b"partial")
         legacy_temp.write_bytes(b"partial")
 
-        record = await service.reserve_inline_custody(request)
+        record = await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
 
         assert record.status == "ready"
         assert storage.read_bytes() == request.content
@@ -2501,7 +2437,7 @@ class TestInlineCustody:
             )
 
         with pytest.raises(BlobIntegrityError):
-            await service.reserve_inline_custody(request)
+            await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
 
         assert storage.read_bytes() == b"tampered"
 
@@ -2520,13 +2456,13 @@ class TestInlineCustody:
         storage = tmp_path.resolve() / "blobs" / str(session_id) / f"{blob_id}_candidate.csv"
         original_write = blob_service_module._atomic_write_blob
 
-        def _write_then_interrupt(path: Path, content: bytes) -> None:
-            original_write(path, content)
+        def _write_then_interrupt(path: Path, content: bytes, *, write_guard: Callable[[], None]) -> None:
+            original_write(path, content, write_guard=write_guard)
             raise RuntimeError("simulated interruption after file write")
 
         monkeypatch.setattr(blob_service_module, "_atomic_write_blob", _write_then_interrupt)
         with pytest.raises(RuntimeError, match="simulated interruption"):
-            await service.reserve_inline_custody(request)
+            await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
 
         assert storage.read_bytes() == request.content
         with db_engine.connect() as conn:
@@ -2534,7 +2470,7 @@ class TestInlineCustody:
         assert row.status == "pending"
 
         monkeypatch.setattr(blob_service_module, "_atomic_write_blob", original_write)
-        recovered = await service.reserve_inline_custody(request)
+        recovered = await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
         assert recovered.id == blob_id
         assert recovered.status == "ready"
         with db_engine.connect() as conn:
@@ -2552,12 +2488,12 @@ class TestInlineCustody:
         request = _custody_request(db_engine, session_id)
         original_write = blob_service_module._atomic_write_blob
 
-        def _interrupt_before_write(_path: Path, _content: bytes) -> None:
+        def _interrupt_before_write(_path: Path, _content: bytes, *, write_guard: Callable[[], None]) -> None:
             raise RuntimeError("simulated interruption before file write")
 
         monkeypatch.setattr(blob_service_module, "_atomic_write_blob", _interrupt_before_write)
         with pytest.raises(RuntimeError, match="before file write"):
-            await service.reserve_inline_custody(request)
+            await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
 
         with db_engine.connect() as conn:
             row = conn.execute(select(blobs_table)).one()
@@ -2565,7 +2501,7 @@ class TestInlineCustody:
         assert not Path(row.storage_path).exists()
 
         monkeypatch.setattr(blob_service_module, "_atomic_write_blob", original_write)
-        recovered = await service.reserve_inline_custody(request)
+        recovered = await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
         assert recovered.status == "ready"
         assert Path(recovered.storage_path).read_bytes() == request.content
         with db_engine.connect() as conn:
@@ -2586,22 +2522,21 @@ class TestInlineCustody:
         request = _custody_request(db_engine, session_id)
         original_write = blob_service_module._atomic_write_blob
 
-        def _interrupt_before_write(_path: Path, _content: bytes) -> None:
+        def _interrupt_before_write(_path: Path, _content: bytes, *, write_guard: Callable[[], None]) -> None:
             raise RuntimeError("simulated interruption before file write")
 
         monkeypatch.setattr(blob_service_module, "_atomic_write_blob", _interrupt_before_write)
         with pytest.raises(RuntimeError, match="before file write"):
-            await service.reserve_inline_custody(request)
+            await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
         monkeypatch.setattr(blob_service_module, "_atomic_write_blob", original_write)
 
         publication = None
+        staged = blob_service_module.prepare_inline_custody_blob(data_dir=tmp_path, request=request, write_guard=lambda: None)
         with pytest.raises(RuntimeError, match="rollback caller-owned transaction"), db_engine.begin() as conn:
             _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
                 conn,
-                data_dir=tmp_path,
+                staged=staged,
                 max_storage_per_session=100,
-                request=request,
-                write_fence=None,
             )
             raise RuntimeError("rollback caller-owned transaction")
 
@@ -2626,22 +2561,21 @@ class TestInlineCustody:
         request = _custody_request(db_engine, session_id)
         original_write = blob_service_module._atomic_write_blob
 
-        def _interrupt_before_write(_path: Path, _content: bytes) -> None:
+        def _interrupt_before_write(_path: Path, _content: bytes, *, write_guard: Callable[[], None]) -> None:
             raise RuntimeError("simulated interruption before file write")
 
         monkeypatch.setattr(blob_service_module, "_atomic_write_blob", _interrupt_before_write)
         with pytest.raises(RuntimeError, match="before file write"):
-            await service.reserve_inline_custody(request)
+            await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
         monkeypatch.setattr(blob_service_module, "_atomic_write_blob", original_write)
 
         publication = None
+        staged = blob_service_module.prepare_inline_custody_blob(data_dir=tmp_path, request=request, write_guard=lambda: None)
         with pytest.raises(RuntimeError, match="simulate process death"), db_engine.begin() as conn:
             _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
                 conn,
-                data_dir=tmp_path,
+                staged=staged,
                 max_storage_per_session=100,
-                request=request,
-                write_fence=None,
             )
             raise RuntimeError("simulate process death")
 
@@ -2665,14 +2599,8 @@ class TestInlineCustody:
         outside_root.mkdir()
         (tmp_path / "blobs").symlink_to(outside_root, target_is_directory=True)
 
-        with pytest.raises(AuditIntegrityError, match="custody root is not a stable directory"), db_engine.begin() as conn:
-            blob_service_module.persist_inline_custody_blob_on_connection(
-                conn,
-                data_dir=tmp_path,
-                max_storage_per_session=100,
-                request=request,
-                write_fence=None,
-            )
+        with pytest.raises(AuditIntegrityError, match="custody root is not a stable directory"):
+            blob_service_module.prepare_inline_custody_blob(data_dir=tmp_path, request=request, write_guard=lambda: None)
 
         assert tuple(outside_root.rglob("*")) == ()
 
@@ -2683,13 +2611,12 @@ class TestInlineCustody:
         tmp_path: Path,
     ) -> None:
         request = _custody_request(db_engine, session_id)
+        staged = blob_service_module.prepare_inline_custody_blob(data_dir=tmp_path, request=request, write_guard=lambda: None)
         with db_engine.begin() as conn:
             _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
                 conn,
-                data_dir=tmp_path,
+                staged=staged,
                 max_storage_per_session=100,
-                request=request,
-                write_fence=None,
             )
         custody_root = tmp_path / "blobs"
         parked_root = tmp_path / "parked-blobs"
@@ -2740,13 +2667,12 @@ class TestInlineCustody:
 
         monkeypatch.setattr(blob_service_module.os, "mkdir", _tracked_mkdir)
         monkeypatch.setattr(blob_service_module.os, "fsync", _tracked_fsync)
+        staged = blob_service_module.prepare_inline_custody_blob(data_dir=tmp_path, request=request, write_guard=lambda: None)
         with db_engine.begin() as conn:
             _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
                 conn,
-                data_dir=tmp_path,
+                staged=staged,
                 max_storage_per_session=100,
-                request=request,
-                write_fence=None,
             )
 
         assert events.index("mkdir-root") < events.index("fsync-data-dir")
@@ -2783,22 +2709,15 @@ class TestInlineCustody:
             original_fsync(descriptor)
 
         monkeypatch.setattr(blob_service_module.os, "fsync", _fail_target_once)
-        with pytest.raises(OSError, match=f"simulated {failure_target} fsync failure"), db_engine.begin() as conn:
-            blob_service_module.persist_inline_custody_blob_on_connection(
-                conn,
-                data_dir=tmp_path,
-                max_storage_per_session=100,
-                request=request,
-                write_fence=None,
-            )
+        with pytest.raises(OSError, match=f"simulated {failure_target} fsync failure"):
+            blob_service_module.prepare_inline_custody_blob(data_dir=tmp_path, request=request, write_guard=lambda: None)
 
+        staged = blob_service_module.prepare_inline_custody_blob(data_dir=tmp_path, request=request, write_guard=lambda: None)
         with db_engine.begin() as conn:
             _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
                 conn,
-                data_dir=tmp_path,
+                staged=staged,
                 max_storage_per_session=100,
-                request=request,
-                write_fence=None,
             )
 
         assert target_events[:2] == ["failed", "succeeded"]
@@ -2814,22 +2733,24 @@ class TestInlineCustody:
     ) -> None:
         service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
         request = _custody_request(db_engine, session_id)
-        original_update = blobs_table.update
+        from elspeth.web.coordination.repository import _RepositoryBlobMutations
 
-        def _interrupt_before_ready_update():
+        original_update = _RepositoryBlobMutations.mark_blob_ready
+
+        def _interrupt_before_ready_update(*args, **kwargs):
             raise RuntimeError("simulated interruption before ready finalization")
 
-        monkeypatch.setattr(blobs_table, "update", _interrupt_before_ready_update)
+        monkeypatch.setattr(_RepositoryBlobMutations, "mark_blob_ready", _interrupt_before_ready_update)
         with pytest.raises(RuntimeError, match="before ready finalization"):
-            await service.reserve_inline_custody(request)
+            await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
 
         with db_engine.connect() as conn:
             row = conn.execute(select(blobs_table)).one()
         assert row.status == "pending"
         assert Path(row.storage_path).read_bytes() == request.content
 
-        monkeypatch.setattr(blobs_table, "update", original_update)
-        recovered = await service.reserve_inline_custody(request)
+        monkeypatch.setattr(_RepositoryBlobMutations, "mark_blob_ready", original_update)
+        recovered = await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
         assert recovered.status == "ready"
         with db_engine.connect() as conn:
             assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 1
@@ -2873,7 +2794,7 @@ class TestInlineCustody:
             )
 
         with pytest.raises(AuditIntegrityError, match="mismatched source_description"):
-            await service.reserve_inline_custody(request)
+            await service.reserve_inline_custody(request, session_operation_context=self._operation_context)
 
         assert storage.read_bytes() == request.content
 
@@ -2887,6 +2808,7 @@ class TestInlineCustody:
         shared_session_id = uuid4()
         now = datetime.now(UTC)
         with first_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
             conn.execute(
                 sessions_table.insert().values(
                     id=str(shared_session_id),
@@ -2900,11 +2822,12 @@ class TestInlineCustody:
         request = _custody_request(first_engine, shared_session_id)
         first_service = BlobServiceImpl(first_engine, tmp_path / "data", max_storage_per_session=100)
         second_service = BlobServiceImpl(second_engine, tmp_path / "data", max_storage_per_session=100)
+        shared_context = seed_live_compose_context(first_engine, shared_session_id)
 
         try:
             first, second = await asyncio.gather(
-                first_service.reserve_inline_custody(request),
-                second_service.reserve_inline_custody(request),
+                first_service.reserve_inline_custody(request, session_operation_context=shared_context),
+                second_service.reserve_inline_custody(request, session_operation_context=shared_context),
             )
             assert first == second
             with second_engine.connect() as conn:
@@ -2922,6 +2845,7 @@ class TestInlineCustody:
         try:
             initialize_session_schema(engine)
             with engine.begin() as conn:
+                ensure_test_identity(conn, identity_id="sqlite-custody-test")
                 conn.execute(
                     sessions_table.insert().values(
                         id=str(shared_session_id),
@@ -2950,10 +2874,11 @@ class TestInlineCustody:
             context = multiprocessing.get_context("spawn")
             start_event = context.Event()
             result_queue = context.Queue()
+            shared_context = seed_live_compose_context(engine, shared_session_id)
             processes = [
                 context.Process(
                     target=_custody_process,
-                    args=(database_url, str(tmp_path / "data"), request_fields, start_event, result_queue),
+                    args=(database_url, str(tmp_path / "data"), request_fields, start_event, result_queue, shared_context),
                 )
                 for _ in range(2)
             ]
@@ -2978,12 +2903,11 @@ class TestInlineCustody:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mismatch", [False, True], ids=["matching-winner", "mismatched-winner"])
-    async def test_insert_conflict_reloads_and_validates_winner(
+    async def test_retry_reloads_and_validates_existing_winner(
         self,
         db_engine,
         session_id: UUID,
         tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
         mismatch: bool,
     ) -> None:
         request_type, _ = _inline_custody_contract()
@@ -3003,44 +2927,16 @@ class TestInlineCustody:
             creating_arguments_hash="b" * 64,
         )
         service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
-        winner = await service.reserve_inline_custody(first_request)
+        winner = await service.reserve_inline_custody(first_request, session_operation_context=self._operation_context)
         retry = replace(first_request, creating_arguments_hash="c" * 64) if mismatch else first_request
-        original_phase_transaction = blob_service_module._blob_phase_transaction
-        phase_count = 0
-
-        class _InsertConflictConnection:
-            def __init__(self, conn) -> None:
-                self._conn = conn
-                self.dialect = conn.dialect
-                self._missed_blob_lookup = False
-
-            def execute(self, statement, *args, **kwargs):
-                if statement.is_select and not self._missed_blob_lookup:
-                    selected = tuple(statement.selected_columns)
-                    if selected and isinstance(selected[0], Column) and selected[0].table is blobs_table:
-                        self._missed_blob_lookup = True
-                        return SimpleNamespace(first=lambda: None)
-                if statement.is_insert and statement.table is blobs_table:
-                    raise IntegrityError("simulated concurrent winner", {}, RuntimeError("duplicate"))
-                return self._conn.execute(statement, *args, **kwargs)
-
-            def begin_nested(self):
-                return self._conn.begin_nested()
-
-        @contextlib.contextmanager
-        def _conflicting_first_phase(engine, held_connection):
-            nonlocal phase_count
-            phase_count += 1
-            with original_phase_transaction(engine, held_connection) as conn:
-                yield _InsertConflictConnection(conn) if phase_count == 1 else conn
-
-        monkeypatch.setattr(blob_service_module, "_blob_phase_transaction", _conflicting_first_phase)
-
         if mismatch:
             with pytest.raises(AuditIntegrityError, match="mismatched creating_arguments_hash"):
-                await service.reserve_inline_custody(retry)
+                await service.reserve_inline_custody(retry, session_operation_context=self._operation_context)
         else:
-            assert await service.reserve_inline_custody(retry) == winner
+            assert await service.reserve_inline_custody(retry, session_operation_context=self._operation_context) == winner
+        assert Path(winner.storage_path).read_bytes() == first_request.content
+        with db_engine.connect() as conn:
+            assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 1
 
     @pytest.mark.skipif(
         not os.environ.get("ELSPETH_TEST_POSTGRES_URL"),
@@ -3082,10 +2978,11 @@ class TestInlineCustody:
             context = multiprocessing.get_context("spawn")
             start_event = context.Event()
             result_queue = context.Queue()
+            shared_context = seed_live_compose_context(first_engine, shared_session_id)
             processes = [
                 context.Process(
                     target=_custody_process,
-                    args=(database_url, str(tmp_path / "data"), request_fields, start_event, result_queue),
+                    args=(database_url, str(tmp_path / "data"), request_fields, start_event, result_queue, shared_context),
                 )
                 for _ in range(2)
             ]
@@ -3142,9 +3039,9 @@ class TestInlineCustody:
         service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
 
         assert derive_blob_id(first_request) == derive_blob_id(changed_hash)
-        await service.reserve_inline_custody(first_request)
+        await service.reserve_inline_custody(first_request, session_operation_context=self._operation_context)
         with pytest.raises(AuditIntegrityError, match="mismatched creating_arguments_hash"):
-            await service.reserve_inline_custody(changed_hash)
+            await service.reserve_inline_custody(changed_hash, session_operation_context=self._operation_context)
 
         with db_engine.connect() as conn:
             assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 1
@@ -3216,13 +3113,13 @@ class TestCopyBlobsForFork:
                     attempt=1,
                 )
             operation = conn.execute(
-                select(guided_operations_table.c.operation_id).where(
-                    guided_operations_table.c.session_id == str(source_session_id),
-                    guided_operations_table.c.operation_id == operation_id,
+                select(session_operation_receipts_table.c.operation_id).where(
+                    session_operation_receipts_table.c.session_id == str(source_session_id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
                 )
             ).one_or_none()
         if operation is None:
-            session_service = DualFencedSessionServiceHarness(
+            session_service = FencedSessionServiceHarness(
                 service._engine,
                 telemetry=build_sessions_telemetry(),
                 log=structlog.get_logger("test.blob-fork-custody"),
@@ -3267,7 +3164,7 @@ class TestCopyBlobsForFork:
             conn.execute(sessions_table.update().where(sessions_table.c.id == str(target_session_id)).values(archived_at=now))
             if operation is None:
                 conn.execute(
-                    guided_operations_table.insert().values(
+                    session_operation_receipts_table.insert().values(
                         session_id=str(source_session_id),
                         operation_id=operation_id,
                         kind="session_fork",
@@ -3295,11 +3192,11 @@ class TestCopyBlobsForFork:
         now = datetime.now(UTC)
         with service._engine.begin() as conn:
             changed = conn.execute(
-                guided_operations_table.update()
+                session_operation_receipts_table.update()
                 .where(
-                    guided_operations_table.c.session_id == str(source_session_id),
-                    guided_operations_table.c.operation_id == operation_id,
-                    guided_operations_table.c.status == "in_progress",
+                    session_operation_receipts_table.c.session_id == str(source_session_id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
+                    session_operation_receipts_table.c.status == "in_progress",
                 )
                 .values(
                     status="failed",
@@ -3345,6 +3242,7 @@ class TestCopyBlobsForFork:
         session_id = uuid4()
         now = datetime.now(UTC)
         with db_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=auth_provider_type)
             conn.execute(
                 sessions_table.insert().values(
                     id=str(session_id),
@@ -3599,8 +3497,8 @@ class TestCopyBlobsForFork:
                 checkpoint=_checkpoint,
             )
         )
-        assert await asyncio.to_thread(read_entered.wait, 5)
-        checkpoint_during_read = await asyncio.to_thread(checkpoint_seen.wait, 1)
+        assert await run_sync_in_worker(read_entered.wait, 5)
+        checkpoint_during_read = await run_sync_in_worker(checkpoint_seen.wait, 1)
         release_read.set()
         copied = await copy_task
 
@@ -3651,12 +3549,12 @@ class TestCopyBlobsForFork:
             now = datetime.now(UTC)
             with db_engine.begin() as conn:
                 changed = conn.execute(
-                    guided_operations_table.update()
-                    .where(guided_operations_table.c.session_id == str(session_id))
-                    .where(guided_operations_table.c.operation_id == stale_fence.operation_id)
-                    .where(guided_operations_table.c.status == "in_progress")
-                    .where(guided_operations_table.c.lease_token == stale_fence.lease_token)
-                    .where(guided_operations_table.c.attempt == stale_fence.attempt)
+                    session_operation_receipts_table.update()
+                    .where(session_operation_receipts_table.c.session_id == str(session_id))
+                    .where(session_operation_receipts_table.c.operation_id == stale_fence.operation_id)
+                    .where(session_operation_receipts_table.c.status == "in_progress")
+                    .where(session_operation_receipts_table.c.lease_token == stale_fence.lease_token)
+                    .where(session_operation_receipts_table.c.attempt == stale_fence.attempt)
                     .values(
                         lease_token=takeover_token,
                         lease_expires_at=now + timedelta(hours=1),
@@ -3678,8 +3576,8 @@ class TestCopyBlobsForFork:
                 checkpoint=_checkpoint_then_takeover,
             )
         )
-        assert await asyncio.to_thread(fsync_entered.wait, 5)
-        takeover_during_fsync = await asyncio.to_thread(takeover_started.wait, 1)
+        assert await run_sync_in_worker(fsync_entered.wait, 5)
+        takeover_during_fsync = await run_sync_in_worker(takeover_started.wait, 1)
         release_fsync.set()
 
         with pytest.raises(BlobForkFenceLostError):
@@ -3803,14 +3701,13 @@ class TestCopyBlobsForFork:
         elif fork_status == "completed":
             values.update(
                 settled_at=now,
-                result_kind="session",
                 result_session_id=str(target_session_id),
                 response_hash="b" * 64,
             )
         else:
             values.update(settled_at=now, failure_code="operation_failed")
         with db_engine.begin() as conn:
-            conn.execute(guided_operations_table.insert().values(**values))
+            conn.execute(session_operation_receipts_table.insert().values(**values))
 
         if fork_status == "in_progress":
             with pytest.raises(BlobInProgressForkError, match=operation_id):
@@ -4045,10 +3942,10 @@ class TestCopyBlobsForFork:
         before = await blob_service.list_blobs(target_session_id, limit=None)
         with db_engine.begin() as conn:
             conn.execute(
-                guided_operations_table.update()
+                session_operation_receipts_table.update()
                 .where(
-                    guided_operations_table.c.session_id == str(session_id),
-                    guided_operations_table.c.operation_id == write_fence.operation_id,
+                    session_operation_receipts_table.c.session_id == str(session_id),
+                    session_operation_receipts_table.c.operation_id == write_fence.operation_id,
                 )
                 .values(lease_token="replacement-lease", attempt=write_fence.attempt + 1)
             )
@@ -4089,7 +3986,7 @@ class TestCopyBlobsForFork:
             stale_fence,
             checkpoint=self._checkpoint,
         )
-        original_finalize = blob_service._finalize_registered_blob_deletion
+        original_finalize = blob_service._finalize_registered_fork_blob_deletion
         finalize_calls = 0
         winner_lease_token = "takeover-lease"
 
@@ -4099,12 +3996,12 @@ class TestCopyBlobsForFork:
             if finalize_calls == 1:
                 with db_engine.begin() as conn:
                     changed = conn.execute(
-                        guided_operations_table.update()
+                        session_operation_receipts_table.update()
                         .where(
-                            guided_operations_table.c.session_id == str(session_id),
-                            guided_operations_table.c.operation_id == stale_fence.operation_id,
-                            guided_operations_table.c.lease_token == stale_fence.lease_token,
-                            guided_operations_table.c.attempt == stale_fence.attempt,
+                            session_operation_receipts_table.c.session_id == str(session_id),
+                            session_operation_receipts_table.c.operation_id == stale_fence.operation_id,
+                            session_operation_receipts_table.c.lease_token == stale_fence.lease_token,
+                            session_operation_receipts_table.c.attempt == stale_fence.attempt,
                         )
                         .values(
                             lease_token=winner_lease_token,
@@ -4115,7 +4012,7 @@ class TestCopyBlobsForFork:
                 assert changed == 1
             return original_finalize(*args, **kwargs)
 
-        monkeypatch.setattr(blob_service, "_finalize_registered_blob_deletion", _take_over_after_committed_delete)
+        monkeypatch.setattr(blob_service, "_finalize_registered_fork_blob_deletion", _take_over_after_committed_delete)
 
         with pytest.raises(BlobForkFenceLostError):
             await blob_service.cleanup_blobs_for_fork(
@@ -4175,7 +4072,7 @@ class TestCopyBlobsForFork:
         def _fail_delete(*_args, **_kwargs):
             raise integrity_failure
 
-        monkeypatch.setattr(blob_service, "_delete_blob_row_locked", _fail_delete)
+        monkeypatch.setattr(blob_service, "_delete_fork_blob_row_locked", _fail_delete)
 
         with pytest.raises(type(integrity_failure)) as exc_info:
             await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
@@ -4217,14 +4114,14 @@ class TestCopyBlobsForFork:
         assert first.errors[0].blob_id == target.id
         assert first.errors[0].exc_type == "OSError"
         assert "injected fork tombstone unlink failure" in first.errors[0].detail
-        assert len(list(storage.parent.glob(f".{storage.name}.delete-*"))) == 1
+        assert len(list(storage.parent.glob(f".{target.id}.delete-*"))) == 1
 
         restarted = BlobServiceImpl(db_engine, tmp_path)
         second = await restarted.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
 
         assert tuple(second.deleted_ids) == (target.id,)
         assert tuple(second.errors) == ()
-        assert list(storage.parent.glob(f".{storage.name}.delete-*")) == []
+        assert list(storage.parent.glob(f".{target.id}.delete-*")) == []
 
     @pytest.mark.asyncio
     async def test_cleanup_rejects_wrong_parent_and_preserves_child_blobs(
@@ -4279,7 +4176,7 @@ class TestCopyBlobsForFork:
         await self._copy(blob_service, session_id, target_session_id)
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
         before = await blob_service.list_blobs(target_session_id, limit=None)
-        session_service = DualFencedSessionServiceHarness(
+        session_service = FencedSessionServiceHarness(
             blob_service._engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test.blob-fork-custody"),
@@ -4311,7 +4208,7 @@ class TestCopyBlobsForFork:
         await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
         await self._copy(blob_service, session_id, target_session_id)
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
-        session_service = DualFencedSessionServiceHarness(
+        session_service = FencedSessionServiceHarness(
             blob_service._engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test.blob-fork-custody"),
@@ -4386,14 +4283,14 @@ class TestCopyBlobsForFork:
 
         orphan_counter = _FakeCounter()
         monkeypatch.setattr(blob_service_module, "_BLOB_COPY_FORK_ORPHAN_ROWS_COUNTER", orphan_counter)
-        original_delete = blob_service._delete_blob_row_locked
+        original_delete = blob_service._delete_fork_blob_row_locked
 
         def _fail_one(conn, *, row, blob_id_str: str):
             if blob_id_str == str(failing_id):
                 raise OSError(5, "cleanup failed")
             return original_delete(conn, row=row, blob_id_str=blob_id_str)
 
-        monkeypatch.setattr(blob_service, "_delete_blob_row_locked", _fail_one)
+        monkeypatch.setattr(blob_service, "_delete_fork_blob_row_locked", _fail_one)
         result = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
 
         assert type(result) is BlobForkCleanupResult
@@ -4408,11 +4305,9 @@ class TestCopyBlobsForFork:
         assert len(orphan_counter.calls) == 1
         amount, attrs, context = orphan_counter.calls[0]
         assert amount == 1
-        assert attrs == {
-            "orphan_blob_id": str(failing_id),
-            "target_session_id": str(target_session_id),
-            "exc_type": "OSError",
-        }
+        # Exact blob identity belongs in the cleanup evidence above, never
+        # in process-global metric dimensions served by /metrics.
+        assert attrs == {"exc_type": "OSError"}
         assert context is None
 
     @pytest.mark.asyncio
@@ -4432,7 +4327,7 @@ class TestCopyBlobsForFork:
         def fail_delete(*args, **kwargs):
             raise UnformattableCleanupError("primary cleanup failure")
 
-        monkeypatch.setattr(blob_service, "_delete_blob_row_locked", fail_delete)
+        monkeypatch.setattr(blob_service, "_delete_fork_blob_row_locked", fail_delete)
         with pytest.raises(error_class) as caught:
             await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
         assert caught.value is integrity_failure
@@ -4454,8 +4349,9 @@ class TestCopyBlobsForFork:
 
         def fail_delete_commit(connection) -> None:
             nonlocal commit_failed
-            if not commit_failed and list(storage.parent.glob(f".{storage.name}.delete-*")):
+            if not commit_failed and list(storage.parent.glob(f".{target.id}.delete-*")):
                 commit_failed = True
+                connection.rollback()
                 raise OperationalError("COMMIT", {}, RuntimeError("injected cleanup commit failure"))
             original_commit(connection)
 
@@ -4478,7 +4374,7 @@ class TestCopyBlobsForFork:
         assert "PermissionError: injected restore permission failure" in failure.detail
         assert "manual reconciliation required" in failure.detail
         assert str(storage) in failure.detail
-        tombstones = list(storage.parent.glob(f".{storage.name}.delete-*"))
+        tombstones = list(storage.parent.glob(f".{target.id}.delete-*"))
         assert len(tombstones) == 1
         assert str(tombstones[0]) in failure.detail
 
@@ -4519,7 +4415,7 @@ class TestCopyBlobsForFork:
             with original_phase(engine, held_connection) as conn:
                 yield conn
 
-        monkeypatch.setattr(blob_service, "_delete_blob_row_locked", _fail_delete)
+        monkeypatch.setattr(blob_service, "_delete_fork_blob_row_locked", _fail_delete)
         monkeypatch.setattr(blob_service_module, "_blob_phase_transaction", _fail_residual_phase)
         result = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
 
@@ -4621,7 +4517,7 @@ class TestCopyBlobsForFork:
 
         monkeypatch.setattr(blob_service_module, "_persist_blob_content", _pause_before_persist)
         copy_task = asyncio.create_task(self._copy(blob_service, session_id, target_session_id))
-        assert await asyncio.to_thread(reached_persist.wait, 5)
+        assert await run_sync_in_worker(reached_persist.wait, 5)
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
         cleanup = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
         assert cleanup.errors == ()
@@ -4942,15 +4838,23 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         run_id, session_id_str = run_env
         execute = _execute_context(db_engine, session_id)
-        rejected = await self._create_linked_blob(blob_service, session_id, run_id, execute, "large.csv", b"x" * 11)
-        accepted = await self._create_linked_blob(blob_service, session_id, run_id, execute, "small.csv", b"x")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "first.csv")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "second.csv")
+        # Put the rejected content first in the actual authority's work order:
+        # this proves the batch continues after rejection, with exact quota
+        # accounting independent of randomly generated blob identifiers.
+        rejected, accepted = blob_service._session_operation_authority.mutate(
+            execute, lambda transaction: transaction.blobs.list_pending_run_output_blobs(run_id=run_id)
+        )
+        Path(rejected.storage_path).write_bytes(b"x" * 11)
+        Path(accepted.storage_path).write_bytes(b"x")
         monkeypatch.setattr(blob_service, "_max_storage_per_session", 10)
         rejected_path = Path(rejected.storage_path)
         if cleanup_fails:
             original_unlink = Path.unlink
 
             def fail_rejected_unlink(path: Path, missing_ok: bool = False) -> None:
-                if path == rejected_path:
+                if path.parent == rejected_path.parent and path.name.startswith(f".{rejected.id}.output-delete-"):
                     raise PermissionError("quota cleanup refused")
                 original_unlink(path, missing_ok=missing_ok)
 
@@ -4963,12 +4867,20 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         assert result.errors[0].exc_type == "BlobQuotaExceededError"
         assert result.errors[0].detail == str(BlobQuotaExceededError(session_id_str, current_bytes=0, limit_bytes=10))
         assert [error.exc_type for error in result.errors] == (
-            ["BlobQuotaExceededError", "PermissionError"] if cleanup_fails else ["BlobQuotaExceededError"]
+            ["BlobQuotaExceededError", "PermissionError", "RecoveryFailed[PermissionError]"]
+            if cleanup_fails
+            else ["BlobQuotaExceededError"]
         )
         with db_engine.connect() as conn:
             status = conn.execute(select(blobs_table.c.status).where(blobs_table.c.id == str(rejected.id))).scalar_one()
         assert status == "error"
-        assert rejected_path.exists() is cleanup_fails
+        assert not rejected_path.exists()
+        tombstones = list(rejected_path.parent.glob(f".{rejected.id}.output-delete-*"))
+        if cleanup_fails:
+            (tombstone,) = tombstones
+            assert tombstone.read_bytes() == b"x" * 11
+        else:
+            assert not tombstones
 
     @pytest.mark.asyncio
     async def test_continues_after_concurrent_deletion(
@@ -5443,7 +5355,7 @@ class TestReadBlobContentPrefixVerifiedStreaming:
     the full blob in memory, mirroring read_blob_content's guards exactly.
 
     Finding B (memory half): a 100 MiB blob was fully materialized in RAM
-    per guided selection just to serve an 8 KiB bounded preview, because the
+    per selection just to serve an 8 KiB bounded preview, because the
     only way to verify the full-content hash was `storage.read_bytes()`.
     This method reads and hashes in bounded chunks instead.
     """
@@ -5782,8 +5694,6 @@ class TestBlobsReadyHashDBConstraint:
         """Direct INSERT violating the invariant is rejected at commit time."""
         from datetime import UTC, datetime
 
-        from sqlalchemy.exc import IntegrityError
-
         from elspeth.web.sessions.models import blobs_table
 
         session_id_str = str(session_id)
@@ -5830,7 +5740,6 @@ class TestBlobsReadyHashDBConstraint:
     async def test_update_ready_hash_to_null_rejected(self, blob_service, db_engine, session_id, compose_context) -> None:
         """Can't bypass the guard by mutating an existing ready row."""
         from sqlalchemy import update
-        from sqlalchemy.exc import IntegrityError
 
         from elspeth.web.sessions.models import blobs_table
 
@@ -5874,7 +5783,6 @@ class TestBlobsReadyHashDBConstraint:
         in a "ready but unverifiable" state.
         """
         from sqlalchemy import update
-        from sqlalchemy.exc import IntegrityError
 
         from elspeth.web.sessions.models import blobs_table
 
@@ -6012,6 +5920,7 @@ class TestLinkBlobToRunSessionGuard:
         session_b = UUID(str(uuid4()))
         now = datetime.now(UTC)
         with db_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user-b")
             conn.execute(
                 sessions_table.insert().values(
                     id=str(session_b),
@@ -6033,7 +5942,8 @@ class TestLinkBlobToRunSessionGuard:
             session_operation_context=compose_context,
         )
 
-        with pytest.raises(RuntimeError, match="cross-session reference"):
+        # Internal callers must never link an owned blob to another session's run.
+        with pytest.raises(RuntimeError, match="cross-session reference is a contract violation"):
             await blob_service.link_blob_to_run(
                 blob.id, foreign_run_id, "input", session_operation_context=_execute_context(db_engine, session_id)
             )
@@ -6262,6 +6172,7 @@ class TestReadBlobContentCustodyLock:
         storage_path = storage_dir / f"{blob_id}_data.csv"
         storage_path.write_bytes(content)
         with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="test-user")
             conn.execute(
                 sessions_table.insert().values(
                     id=sid,

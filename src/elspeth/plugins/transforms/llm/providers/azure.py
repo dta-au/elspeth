@@ -14,24 +14,50 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from threading import Lock
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal
 
 import structlog
 from pydantic import Field, field_validator, model_validator
 
+from elspeth.contracts import CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.value_source import ValueSource
-from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError
-from elspeth.plugins.llm.config_validation import AZURE_MODEL_VALUE_SOURCES, derive_azure_model, validate_azure_endpoint
+from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError, build_llm_call_request
+from elspeth.plugins.llm.config_validation import (
+    AZURE_MODEL_VALUE_SOURCES,
+    derive_azure_model,
+    validate_azure_api_version,
+    validate_azure_endpoint,
+)
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMQueryResult, finish_reason_from_raw_response
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig
 
 if TYPE_CHECKING:
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 logger = structlog.get_logger(__name__)
+
+# Azure OpenAI takes the output budget as ``max_completion_tokens``. Reasoning
+# deployments reject the deprecated ``max_tokens`` with HTTP 400, gpt-4o and
+# later non-reasoning deployments accept either, and a deployment name is
+# operator-chosen so the model family cannot be inferred from it — every
+# Azure call sends the current name. ``validate_azure_api_version`` holds the
+# API version at or above the first one that defines it.
+_AZURE_MAX_TOKENS_PARAM: Final = "max_completion_tokens"
+
+# ``max_completion_tokens`` counts reasoning tokens as well as the visible
+# reply, so a budget sized for "ok" alone is spent before a reasoning
+# deployment emits any content and the preflight reads as an empty completion.
+# The cap never binds on a non-reasoning deployment (the reply is a few
+# tokens); it is well above Azure's floor of 16, below which the API returns
+# HTTP 400 "integer_below_min_value" before any model work.
+_PREFLIGHT_MAX_COMPLETION_TOKENS: Final = 2048
 
 
 class AzureOpenAIConfig(LLMConfig):
@@ -58,9 +84,17 @@ class AzureOpenAIConfig(LLMConfig):
     # Override model to make it optional - will default to deployment_name
     model: str = Field(default="", description="Model identifier (defaults to deployment_name)")
 
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature. Omitted or null uses the deployment default; set explicitly for deployments supporting sampling.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+
     deployment_name: str = Field(..., description="Azure deployment name")
     endpoint: str = Field(..., description="Azure OpenAI endpoint URL")
-    api_key: str = Field(..., description="Azure OpenAI API key")
+    api_key: str = Field(..., description="Azure OpenAI API key", repr=False)
     api_version: str = Field(default="2024-10-21", description="Azure API version")
 
     # Tier 2: Plugin-internal tracing (optional)
@@ -74,6 +108,11 @@ class AzureOpenAIConfig(LLMConfig):
     @classmethod
     def _validate_endpoint_url(cls, value: str) -> str:
         return validate_azure_endpoint(value)
+
+    @field_validator("api_version")
+    @classmethod
+    def _validate_api_version(cls, value: str) -> str:
+        return validate_azure_api_version(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -115,7 +154,10 @@ class AzureLLMProvider:
         run_id: str,
         telemetry_emit: TelemetryEmitCallback,
         limiter: Any = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
+        pricing_model: str | None = None,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._api_key: str | None = api_key
@@ -128,7 +170,10 @@ class AzureLLMProvider:
         # Phase 5b Task 9 — cross-DB hash anchor. Forwarded to every
         # ``client.chat_completion`` call so the Landscape ``calls`` row
         # carries the matching SHA-256.
-        self._resolved_prompt_template_hash = resolved_prompt_template_hash
+        self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
+        self._llm_call_governance = llm_call_governance
+        self._pricing_model = pricing_model
+        self._call_mode_session = call_mode_session
 
         # Client caches — lock ordering: _llm_clients_lock → _underlying_client_lock
         # (always acquire _llm_clients_lock first to prevent deadlock)
@@ -142,7 +187,7 @@ class AzureLLMProvider:
         messages: Sequence[ChatMessage],
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
@@ -152,8 +197,9 @@ class AzureLLMProvider:
         Args:
             messages: Chat messages (system + user)
             model: Model/deployment name
-            temperature: Sampling temperature
-            max_tokens: Max response tokens (None = provider default)
+            temperature: Sampling temperature (None = omitted, provider default)
+            max_tokens: Max response tokens, sent as ``max_completion_tokens``
+                (None = provider default)
             audit_parent: Validated row or operation audit parent
             response_format: OpenAI response_format dict (e.g., {"type": "json_object"})
 
@@ -169,6 +215,23 @@ class AzureLLMProvider:
         # in the finally block, evicting the wrong cache entry during retries.
         cache_key = audit_parent.cache_key
 
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            request = build_llm_call_request(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                provider="azure",
+                max_tokens=max_tokens,
+                max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+                response_format=response_format,
+            )
+            self._call_mode_session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=request.to_dict(),
+                current_state_id=audit_parent.state_id,
+                current_operation_id=audit_parent.operation_id,
+            )
+
         try:
             client = self._get_llm_client(audit_parent)
 
@@ -178,7 +241,7 @@ class AzureLLMProvider:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 response_format=response_format,
-                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
             )
 
             # raw_response is the Azure SDK's deserialized API response: a
@@ -210,30 +273,56 @@ class AzureLLMProvider:
             with self._llm_clients_lock:
                 self._llm_clients.pop(cache_key, None)
 
-    def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited Azure OpenAI call under an operation parent."""
+        smoke_messages = [ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            request = build_llm_call_request(
+                model=model,
+                messages=smoke_messages,
+                temperature=None,
+                provider="azure",
+                max_tokens=_PREFLIGHT_MAX_COMPLETION_TOKENS,
+                max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+            )
+            self._call_mode_session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=request.to_dict(),
+                current_state_id=None,
+                current_operation_id=operation_id,
+            )
         client = AuditedLLMClient(
             execution=self._recorder,
             state_id=None,
             operation_id=operation_id,
+            coordination_token=coordination_token,
             run_id=self._run_id,
             telemetry_emit=self._telemetry_emit,
-            underlying_client=self._get_underlying_client(),
+            underlying_client=None
+            if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+            else self._get_underlying_client(),
             provider="azure",
+            pricing_model=self._pricing_model,
             limiter=self._limiter,
+            llm_call_governance=self._llm_call_governance,
+            max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+            call_mode_session=self._call_mode_session,
         )
         try:
-            client.chat_completion(
+            response = client.chat_completion(
                 model=model,
-                messages=[ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
-                temperature=0.0,
-                # Azure OpenAI requires max_output_tokens >= 16. Values below
-                # the floor return HTTP 400 with "integer_below_min_value"
-                # before any model work, killing the entire pipeline at
-                # preflight. 32 gives margin without materially affecting
-                # smoke-test cost.
-                max_tokens=32,
+                messages=smoke_messages,
+                # No temperature: reasoning deployments reject any explicit
+                # value with HTTP 400, and a smoke test has no determinism
+                # requirement.
+                temperature=None,
+                max_tokens=_PREFLIGHT_MAX_COMPLETION_TOKENS,
             )
+            if not response.content.strip():
+                raise ContentPolicyError("Azure preflight returned empty content")
+            finish_reason = finish_reason_from_raw_response(response.raw_response)
+            if finish_reason not in (None, FinishReason.STOP):
+                raise LLMClientError("Azure preflight returned an unusable finish reason", retryable=False)
         finally:
             client.close()
 
@@ -247,6 +336,7 @@ class AzureLLMProvider:
                     azure_endpoint=self._endpoint,
                     api_key=self._api_key,
                     api_version=self._api_version,
+                    max_retries=0,
                 )
                 # Clear plaintext key — SDK client holds its own copy
                 self._api_key = None
@@ -261,9 +351,15 @@ class AzureLLMProvider:
                     execution=self._recorder,
                     run_id=self._run_id,
                     telemetry_emit=self._telemetry_emit,
-                    underlying_client=self._get_underlying_client(),
+                    underlying_client=None
+                    if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+                    else self._get_underlying_client(),
                     provider="azure",
+                    pricing_model=self._pricing_model,
                     limiter=self._limiter,
+                    llm_call_governance=self._llm_call_governance,
+                    max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
+                    call_mode_session=self._call_mode_session,
                     **audit_parent.client_kwargs(),
                 )
             return self._llm_clients[cache_key]

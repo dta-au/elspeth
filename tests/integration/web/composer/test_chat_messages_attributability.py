@@ -37,9 +37,12 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.enums import CreationModality
 from elspeth.web.composer.tools import _persist_prepared_blob_create, _prepare_blob_create
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.session_fences import fenced_operation_context
 
 
 def _session_with_user_message_and_blob(tmp_path: Path) -> tuple[Any, str, str]:
@@ -60,6 +63,7 @@ def _session_with_user_message_and_blob(tmp_path: Path) -> tuple[Any, str, str]:
     user_message_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
         conn.execute(
             insert(sessions_table).values(
                 id=session_id,
@@ -88,21 +92,22 @@ def _session_with_user_message_and_blob(tmp_path: Path) -> tuple[Any, str, str]:
         )
 
     prepared = _prepare_blob_create(
-        {
-            "filename": "ada.csv",
-            "mime_type": "text/csv",
-            "content": "name,score\nada,42\n",
-        },
+        filename="ada.csv",
+        mime_type="text/csv",
+        content="name,score\nada,42\n",
         data_dir=str(tmp_path),
         session_id=session_id,
         creation_modality=CreationModality.VERBATIM,
         created_from_message_id=user_message_id,
     )
-    quota_error = _persist_prepared_blob_create(
-        prepared,
-        session_engine=engine,
-        session_id=session_id,
-    )
+    with fenced_operation_context(engine, session_id) as context:
+        quota_error = _persist_prepared_blob_create(
+            prepared,
+            session_engine=engine,
+            session_id=session_id,
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+        )
     assert quota_error is None
 
     return engine, session_id, user_message_id

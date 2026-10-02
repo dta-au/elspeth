@@ -13,23 +13,26 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.audit import begin_dispatch, finish_success, rebind_dispatch_arguments
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
-from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
+from elspeth.web.composer.authority_hashing import (
+    composer_authority_hash,
+    project_composer_authority_payload,
+    restore_composer_authority_payload,
+)
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
     PipelineProposal,
-    PlannerSurface,
     composition_content_hash,
 )
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
-from elspeth.web.sessions.protocol import CompositionStateData
-from elspeth.web.sessions.service import (
+from elspeth.web.sessions.proposal_authority import (
     _composition_state_data_content_hash,
     _pipeline_audit_payload_hash,
     _pipeline_private_arguments_hash,
 )
+from elspeth.web.sessions.protocol import CompositionStateData
 
 
 def _branches(order: Sequence[str]) -> dict[str, str]:
@@ -108,12 +111,8 @@ def _proposal(order: Sequence[str]) -> PipelineProposal:
     return PipelineProposal.create(
         pipeline=_pipeline(order),
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.GUIDED_FULL,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
 
 
@@ -322,7 +321,13 @@ def test_set_pipeline_list_branches_round_trips_through_generic_and_authority_au
     _content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
     persisted = envelope["invocation"]
     assert type(persisted) is dict
-    assert json.loads(persisted["arguments_canonical"])["nodes"][0]["branches"] == ["a_in", "b_in"]
-    assert persisted["arguments_canonical"] == persisted["authority_arguments_canonical"]
+    generic = json.loads(persisted["arguments_canonical"])
+    authority = json.loads(persisted["authority_arguments_canonical"])
+    # List-form branches are already ordered, so they are byte-identical in
+    # both canonicals; only the top-level ``sources`` map is projected.
+    assert generic["nodes"][0]["branches"] == ["a_in", "b_in"]
+    assert authority["nodes"][0]["branches"] == generic["nodes"][0]["branches"]
+    assert authority["sources"] == {"schema": "composer.ordered-sources.v1", "items": []}
+    assert canonical_json(restore_composer_authority_payload(authority)) == persisted["arguments_canonical"]
     binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
     assert binding.arguments_hash == persisted["authority_arguments_hash"]

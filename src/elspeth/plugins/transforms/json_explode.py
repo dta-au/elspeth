@@ -3,20 +3,41 @@
 Transforms one row containing an array field into multiple rows, one for each
 element in the array. This is the inverse of aggregation (1-to-N expansion).
 
-THREE-TIER TRUST MODEL COMPLIANCE:
+ROW FAILURES:
 
-Per the plugin protocol, transforms TRUST that pipeline data types are correct:
-- Source validates that required fields exist and have correct types
-- Transforms access fields directly without defensive checks
-- Type violations (missing field, wrong type) indicate UPSTREAM BUGS and should CRASH
+A wrong-typed array_field (anything but a list/tuple: str, mapping, None, a
+number) and an empty array are facts about one row's data. process() RETURNS a
+non-retryable ``TransformResult.error()`` for each (``invalid_input``, with
+``error_type: wrong_type`` for the type case), and the node's ``on_error``
+routes the row. It returns rather than raises because a TypeError or KeyError
+escaping process() matches no conversion clause in the engine and aborts the
+run (ADR-008 §"TIER_1 registration is load-bearing", Correction 2026-08-21).
+The value is never coerced: iterating a str or a mapping would fabricate rows
+the operator never supplied.
 
-JSONExplode does NOT return TransformResult.error() for type violations because:
-1. Missing field = source should have validated -> crash surfaces config bug
-2. Wrong type = source should have validated -> crash surfaces config bug
-3. There are no VALUE-level operations that can fail in this transform
+``array_field`` is a DECLARED INPUT (``declared_input_fields``): the transform
+cannot run on a row without it. The build refuses a pipeline whose upstream
+certainly omits it; behind an observed or open upstream the engine settles each
+row before ``process()`` — a row that lacks the field is a fact about that row
+and is routed via ``on_error`` with reason ``missing_field`` (ADR-013 Amendment
+2026-09-27). It used to reach ``row[array_field]`` as a raw KeyError that ended
+the run. Being a declaration, it is spelled as rows carry the field (the
+field-name spelling rule): a header spelling of a carried field is refused.
 
-Therefore, JSONExplode inherits from DataPluginConfig (NOT TransformDataConfig)
-and has no on_error configuration.
+JSONExplodeConfig extends DataPluginConfig (not TransformDataConfig), so it
+does not accept ``required_input_fields``. ``on_success`` and ``on_error`` are
+set at the pipeline settings layer (TransformSettings), as for every transform.
+
+OUTPUT DECLARATION (ADR-050):
+
+The fields this transform creates are declared before the first row, in every
+schema mode: ``output_field`` is ``any`` and nullable (an array element can be
+anything, including null) and ``item_index`` is ``int``. An operator type in
+``schema.fields`` takes precedence (``page: int`` pins the element type, and
+the engine routes an emission whose element is not an int). The declaration is
+stamped on every emitted contract, so a heterogeneous array — or two rows
+whose arrays hold different element types — records one contract, and nothing
+is inferred from the elements themselves.
 """
 
 from __future__ import annotations
@@ -32,7 +53,7 @@ from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.errors import PluginContractViolation
 from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig, PluginConfigError
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -99,17 +120,17 @@ def _build_json_explode_input_requirements(
                 # keeps that posture but discloses the gap rather than staying
                 # silent.
                 #
-                # Note the module docstring's trust model: this transform
-                # deliberately does not soften a wrong type, because the SOURCE
-                # is supposed to have validated it. For a list-shaped field the
-                # source cannot — the DSL types it ``any``, which validates
-                # nothing. So all three candidate checkpoints (source schema,
-                # this static gate, plugin-level on_error) are blind to it by
-                # construction, and the only real one is process(), which
-                # detects a non-list at the row boundary and raises with an
-                # explicit diagnostic. Holding the static gate at FAIL rejected
-                # every valid pipeline to pre-empt a case that surfaces loudly
-                # and legibly when it does occur.
+                # Note the module docstring: this transform never coerces a
+                # wrong type. For a list-shaped field the source cannot
+                # validate the type — the DSL types it ``any``, which
+                # validates nothing. So the static checkpoints (source schema,
+                # this gate) are blind to it by construction, and the only
+                # real one is process(), which detects a non-list at the row
+                # boundary and returns a non-retryable ``wrong_type`` error
+                # that the node's on_error routes. Holding the static gate at
+                # FAIL rejected every valid pipeline to pre-empt a case that
+                # surfaces per row, with an explicit diagnostic, when it does
+                # occur.
                 #
                 # WARN softens exactly that case and nothing else: it grades
                 # UNKNOWN — an ABSTAINING producer — as an advisory, and never
@@ -121,9 +142,9 @@ def _build_json_explode_input_requirements(
                 # source and transform (``llm.response_field.string``) and
                 # web_scrape (``web_scrape.content.*``, which provably encodes
                 # a str). Pointing array_field at one of those fields is a
-                # pipeline that raises TypeError on row 1 in ``process`` below,
-                # so refusing it at authoring time is correct rather than a
-                # false reject.
+                # pipeline in which ``process`` below fails every row as
+                # ``wrong_type``, so refusing it at authoring time is correct
+                # rather than a false reject.
                 #
                 # This does NOT make json_explode unwireable, and the
                 # distinction is load-bearing: ``_find_producer_facts`` matches
@@ -159,10 +180,10 @@ class JSONExplodeConfig(DataPluginConfig):
     Requires 'schema' in config to define input/output expectations.
     Use 'schema: {mode: observed}' for dynamic field handling.
 
-    Extends DataPluginConfig (not TransformDataConfig) because JSONExplode
-    has no on_error behavior -- type violations crash to surface upstream bugs.
-    Routing fields such as on_success are owned by TransformSettings at the
-    pipeline settings layer, not plugin options.
+    Extends DataPluginConfig (not TransformDataConfig), so it does not accept
+    ``required_input_fields``. Routing fields (on_success, on_error) are owned
+    by TransformSettings at the pipeline settings layer, not plugin options;
+    on_error routes the rows process() fails (see module docstring).
 
     _plugin_component_type overrides DataPluginConfig (None) because this
     config extends DataPluginConfig directly, bypassing TransformDataConfig.
@@ -257,13 +278,14 @@ class JSONExplode(BaseTransform):
             {"id": 1, "item": {"name": "b"}, "item_index": 1},
         ]
 
-    TRUST MODEL:
-        This transform trusts that the source validated:
-        - array_field exists in the row
-        - array_field value is a list/array
-
-        If these invariants are violated, the transform CRASHES (KeyError, TypeError)
-        to surface the upstream bug. This is intentional - see module docstring.
+    ROW FAILURES (see module docstring):
+        - array_field is not a list/tuple: returns a non-retryable
+          ``invalid_input``/``wrong_type`` error, routed by on_error.
+        - array_field is an empty list: returns a non-retryable
+          ``invalid_input`` error ("empty array"), routed by on_error.
+        - array_field is absent from the row: the engine refuses the row before
+          ``process()`` (declared input) and routes it by on_error as
+          ``missing_field``.
     """
 
     # array_field is the INPUT column being exploded; output_field is emitted.
@@ -271,7 +293,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:36c7c718e2cee382"
+    source_file_hash: str | None = "sha256:1919e96964500441"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "
@@ -323,6 +345,10 @@ class JSONExplode(BaseTransform):
         self._array_field = cfg.array_field
         self._output_field = cfg.output_field
         self._include_index = cfg.include_index
+        # The array field is the one column this transform cannot run without:
+        # a declared input, so the build and the engine's pre-process check
+        # settle its presence (see module docstring), never a KeyError in process().
+        self.declared_input_fields = frozenset({cfg.array_field})
 
         # Sibling fields are duplicated onto every emitted element row (the
         # plugin's own assistance text says so); only the consumed array field
@@ -403,6 +429,13 @@ class JSONExplode(BaseTransform):
             )
         ]
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """``output_field`` is ``any`` (nullable): an element can be anything; ``item_index`` is ``int``."""
+        created = [FieldDefinition(name=self._output_field, field_type="any", required=True, nullable=True)]
+        if self._include_index:
+            created.append(FieldDefinition(name="item_index", field_type="int", required=True, nullable=False))
+        return tuple(created)
+
     def _build_json_explode_output_schema_config(self, cfg: JSONExplodeConfig) -> SchemaConfig:
         """Build output schema config excluding array_field.
 
@@ -417,26 +450,13 @@ class JSONExplode(BaseTransform):
         base_guaranteed.discard(cfg.array_field)
 
         if cfg.schema_config.fields is not None:
+            # An authored declaration wins; the plugin's own declaration
+            # (created_output_fields) fills in the created fields it does
+            # not name. In observed mode the config carries no fields and
+            # the stamp reads created_output_fields directly.
             kept_fields = tuple(field for field in cfg.schema_config.fields if field.name != cfg.array_field)
-            extra_fields: list[FieldDefinition] = []
-            if all(field.name != cfg.output_field for field in kept_fields):
-                extra_fields.append(
-                    FieldDefinition(
-                        name=cfg.output_field,
-                        field_type="any",
-                        required=True,
-                        nullable=False,
-                    )
-                )
-            if cfg.include_index and all(field.name != "item_index" for field in kept_fields):
-                extra_fields.append(
-                    FieldDefinition(
-                        name="item_index",
-                        field_type="int",
-                        required=True,
-                        nullable=False,
-                    )
-                )
+            authored = {field.name for field in kept_fields}
+            extra_fields = tuple(field for field in self.created_output_fields() if field.name not in authored)
             output_field_defs = (*kept_fields, *extra_fields)
 
         # Add declared output fields (output_field + optionally item_index)
@@ -466,14 +486,18 @@ class JSONExplode(BaseTransform):
             ctx: Plugin context
 
         Returns:
-            TransformResult with multiple output rows (success_multi) or
-            single row for empty arrays (success)
+            TransformResult.success_multi with one row per array element, or a
+            non-retryable TransformResult.error for a wrong-typed or empty
+            array_field
 
         Raises:
-            KeyError: If array_field is missing (upstream bug)
+            PluginContractViolation: If output_field or item_index would
+                overwrite a field already present in the row (Tier 2: the
+                engine converts it into a routed, non-retryable error)
         """
-        # Direct access - TRUST that source validated field exists
-        # KeyError here = upstream bug (source didn't validate field exists)
+        # Direct access: array_field is a declared input, so the engine refused
+        # (routed or, for a proven field, aborted on) any row lacking it before
+        # process() ran (see module docstring).
         array_value = row[self._array_field]
 
         # Contract enforcement: array_field must be list or tuple.
@@ -483,11 +507,11 @@ class JSONExplode(BaseTransform):
             # A wrong-typed value is a ROW-level failure, not a run-level one:
             # it is a fact about this row's data, identical in kind to the
             # empty-array rejection below, so it takes the same routable exit.
-            # Raising here instead would abort the whole run — ADR-008
-            # §"TIER_1 registration is load-bearing" (Correction 2026-08-21,
-            # elspeth-181db83da7): only a RETURNED error reaches the
-            # `result.status == "error"` branch that honours `on_error`; a
-            # raised exception escapes every catch site. Not coerced: a str or
+            # Raising a TypeError here instead would abort the whole run: it
+            # matches no conversion clause in the engine and escapes every
+            # catch site (ADR-008 Correction 2026-08-21, elspeth-181db83da7;
+            # see the module docstring). A raised PluginContractViolation, by
+            # contrast, is converted and routed. Not coerced: a str or
             # dict is not a list, and iterating one would fabricate rows
             # (one per character, or per key) that the operator never supplied.
             return TransformResult.error(
@@ -548,54 +572,14 @@ class JSONExplode(BaseTransform):
                         f"row {i} has fields {sorted(row_keys)}"
                     )
 
-        # Determine the contract type for the output field.
-        # If the exploded array contains heterogeneous types (e.g., ["a", {"k": 1}]),
-        # the output field type must be `object` (the universal type) rather than
-        # the type inferred from only the first element. This prevents downstream
-        # components from relying on a contract type that doesn't hold for all rows.
-        item_types = {type(item) for item in array_value}
-        output_field_is_heterogeneous = len(item_types) > 1
-
-        # Update contract using first output row (all rows have same schema)
+        # The output contract: the input contract narrowed to the emitted
+        # keys, with every created field carrying its DECLARED contract
+        # (output_field 'any' nullable, item_index int, or the operator's
+        # type) rather than anything inferred from this row's elements.
         output_contract = narrow_contract_to_output(
             input_contract=row.contract,
             output_row=output_rows[0],
         )
-        if output_contract.find_field(self._output_field) is None:
-            output_contract = SchemaContract(
-                mode=output_contract.mode,
-                fields=(
-                    *output_contract.fields,
-                    FieldContract(
-                        normalized_name=self._output_field,
-                        original_name=self._output_field,
-                        python_type=object,
-                        required=False,
-                        source="inferred",
-                    ),
-                ),
-                locked=True,
-            )
-        elif output_field_is_heterogeneous:
-            # Override the inferred type to `object` when items have mixed types.
-            # narrow_contract_to_output inferred the type from the first element only,
-            # which would be wrong for subsequent rows with different element types.
-            patched_fields = tuple(
-                FieldContract(
-                    normalized_name=fc.normalized_name,
-                    original_name=fc.original_name,
-                    python_type=object if fc.normalized_name == self._output_field else fc.python_type,
-                    required=fc.required,
-                    source=fc.source,
-                    nullable=fc.nullable,
-                )
-                for fc in output_contract.fields
-            )
-            output_contract = SchemaContract(
-                mode=output_contract.mode,
-                fields=patched_fields,
-                locked=True,
-            )
         output_contract = self._apply_declared_output_field_contracts(output_contract)
         output_contract = self._align_output_contract(output_contract)
 

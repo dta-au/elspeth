@@ -546,8 +546,11 @@ class TestWalkerInValidatePipeline:
             result,
         )
         assert persisted_is_valid is False
-        assert persisted_errors == [expected_message]
-        assert private_value not in persisted_errors[0]
+        assert persisted_errors is not None
+        assert [error.message for error in persisted_errors] == [expected_message]
+        assert persisted_errors[0].error_code == attributed_errors[0].error_code
+        assert persisted_errors[0].component == "openrouter_node_1"
+        assert private_value not in persisted_errors[0].message
 
     def test_value_source_pass_allows_downstream_checks(self) -> None:
         """When ``instantiate_runtime_plugins`` returns a bundle without

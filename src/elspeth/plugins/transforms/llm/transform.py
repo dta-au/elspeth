@@ -21,20 +21,25 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import reduce
 from operator import or_
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Any, Protocol, cast
 
 import structlog
 from pydantic import BaseModel, TypeAdapter
 from pydantic import Field as PydanticField
 
-from elspeth.contracts import Determinism, TransformErrorReason, TransformResult, propagate_contract
+from elspeth.contracts import Determinism, RunMode, TransformErrorReason, TransformResult, propagate_contract
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, ContentPart, ImagePart, TextPart, parts_hash
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistanceExample
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ContentTrust, PluginCapability, WebConfigAuthority
+from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -47,13 +52,15 @@ from elspeth.plugins.infrastructure.clients.llm import ContextLengthError, LLMCl
 from elspeth.plugins.infrastructure.pooling import PooledExecutor, RowContext
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
-from elspeth.plugins.infrastructure.templates import TemplateError
+from elspeth.plugins.infrastructure.templates import RowProjection, TemplateError, TemplateRow, declared_row_projection
 from elspeth.plugins.transforms.llm import (
     _OUTPUT_FIELD_TYPE_TO_SCHEMA,
     _build_augmented_output_schema,
     _build_llm_output_schema_config,
     _build_multi_query_output_schema,
     _FieldType,
+    _llm_created_output_fields,
+    _llm_generated_output_fields,
     build_llm_audit_metadata,
     get_llm_guaranteed_fields,
     populate_llm_operational_fields,
@@ -86,6 +93,7 @@ from elspeth.plugins.transforms.llm.validation import (
 logger = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_semantics import OutputSemanticDeclaration
 
@@ -255,10 +263,12 @@ class SingleQueryStrategy:
     """Direct template render → LLM call → raw content output."""
 
     template: PromptTemplate
+    # What the template's ``row`` holds: the node's declaration (ADR-051).
+    row_projection: RowProjection
     system_prompt: str | None
     system_prompt_source: str | None
     model: str
-    temperature: float
+    temperature: float | None
     max_tokens: int | None
     response_field: str
     align_output_contract: Callable[[SchemaContract], SchemaContract]
@@ -291,7 +301,7 @@ class SingleQueryStrategy:
 
         # 1. Render template (THEIR DATA — wrap)
         try:
-            rendered = self.template.render_with_metadata(row, contract=row.contract)
+            rendered = self.template.render_with_metadata(TemplateRow.project(row, self.row_projection), contract=row.contract)
         except TemplateError as e:
             error_reason: TransformErrorReason = {
                 "reason": "template_rendering_failed",
@@ -346,7 +356,9 @@ class SingleQueryStrategy:
             return _shutdown_requested_result()
 
         # 3. Call provider (EXTERNAL — errors classified by provider)
-        trace_parent = LLMAuditParent.for_row(state_id=state_id, token_id=token_id)
+        trace_parent = LLMAuditParent.for_row(
+            state_id=state_id, token_id=token_id, member_token=ctx.require_member_token(), work_item=ctx.require_work_item()
+        )
         start_time = time.monotonic()
         try:
             result = provider.execute_query(
@@ -499,10 +511,12 @@ class MultiQueryStrategy:
 
     query_specs: Sequence[QuerySpec]
     template: PromptTemplate
+    # What each query's ``row.source_row`` holds: the node's declaration (ADR-051).
+    row_projection: RowProjection
     system_prompt: str | None
     system_prompt_source: str | None
     model: str
-    temperature: float
+    temperature: float | None
     max_tokens: int | None
     response_field: str
     align_output_contract: Callable[[SchemaContract], SchemaContract]
@@ -548,9 +562,15 @@ class MultiQueryStrategy:
         token_id = ctx.token.token_id
         shutdown_event = ctx.shutdown_event
 
+        audit_parent = LLMAuditParent.for_row(
+            state_id=state_id, token_id=token_id, member_token=ctx.require_member_token(), work_item=ctx.require_work_item()
+        )
+
         if self.executor is not None:
-            return self._execute_parallel(row, state_id, token_id, provider, tracer, shutdown_event, payload_store)
-        return self._execute_sequential(row, state_id, token_id, provider, tracer, shutdown_event, payload_store)
+            return self._execute_parallel(
+                row, state_id, token_id, provider, tracer, shutdown_event, payload_store, audit_parent=audit_parent
+            )
+        return self._execute_sequential(row, state_id, token_id, provider, tracer, shutdown_event, payload_store, audit_parent=audit_parent)
 
     @dataclass(frozen=True, slots=True)
     class _QuerySuccess:
@@ -583,6 +603,8 @@ class MultiQueryStrategy:
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
         payload_store: PayloadStore | None = None,
+        *,
+        audit_parent: LLMAuditParent,
     ) -> _QuerySuccess | TransformResult:
         """Execute a single query within a multi-query row.
 
@@ -599,7 +621,7 @@ class MultiQueryStrategy:
 
         # Build template context from named input_fields
         try:
-            template_ctx = spec.build_template_context(row)
+            template_ctx = spec.build_template_context(row, self.row_projection)
         except KeyError as e:
             return TransformResult.error(
                 {
@@ -618,11 +640,9 @@ class MultiQueryStrategy:
         else:
             query_template = self.template
 
-        # Render template — use contract=None because template_ctx is a
-        # synthetic dict (keys are template variable names from input_fields,
-        # not source column names). Passing the source row's contract would
-        # wrap template_ctx in a PipelineRow that rejects these synthetic keys
-        # in FIXED schema mode.
+        # Render template — contract=None because template_ctx is a synthetic
+        # dict (keys are template variable names from input_fields, not source
+        # column names); its source_row is already the projected row.
         try:
             rendered = query_template.render_with_metadata(
                 template_ctx,
@@ -690,7 +710,7 @@ class MultiQueryStrategy:
         # Execute query
         query_max_tokens = spec.max_tokens or self.max_tokens
 
-        trace_parent = LLMAuditParent.for_row(state_id=state_id, token_id=token_id)
+        trace_parent = audit_parent
         start_time = time.monotonic()
         try:
             result = provider.execute_query(
@@ -882,6 +902,8 @@ class MultiQueryStrategy:
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
         payload_store: PayloadStore | None = None,
+        *,
+        audit_parent: LLMAuditParent,
     ) -> TransformResult:
         """Execute queries sequentially (pool_size=1 fallback).
 
@@ -912,6 +934,7 @@ class MultiQueryStrategy:
                         tracer,
                         shutdown_event,
                         payload_store,
+                        audit_parent=audit_parent,
                     )
                     break  # success or non-retryable error result - exit retry loop
                 except LLMClientError as e:
@@ -1001,6 +1024,8 @@ class MultiQueryStrategy:
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
         payload_store: PayloadStore | None = None,
+        *,
+        audit_parent: LLMAuditParent,
     ) -> TransformResult:
         """Execute queries in parallel via PooledExecutor with AIMD retry.
 
@@ -1052,6 +1077,7 @@ class MultiQueryStrategy:
                 work["tracer"],
                 shutdown_event,
                 work["payload_store"],
+                audit_parent=audit_parent,
             )
             if isinstance(result, TransformResult):
                 return result  # Error passthrough
@@ -1187,7 +1213,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9d2acfb21a7717f5"
+    source_file_hash: str | None = "sha256:472746765fba66e5"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1359,7 +1385,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 messages: Sequence[ChatMessage],
                 *,
                 model: str,
-                temperature: float,
+                temperature: float | None,
                 max_tokens: int | None,
                 audit_parent: LLMAuditParent,
                 response_format: object | None = None,
@@ -1372,8 +1398,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     finish_reason=FinishReason.STOP,
                 )
 
-            def runtime_preflight(self, *, operation_id: str, model: str) -> None:
-                del operation_id, model
+            def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
+                del operation_id, model, coordination_token
 
             def close(self) -> None:
                 return None
@@ -1433,13 +1459,21 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             config_cls.from_dict(provider_config, plugin_name=self.name),
         )
         self._initialize_declared_input_fields(self._config)
+        self.header_spelled_lookups = MappingProxyType(self._config.header_spelled_row_lookups())
 
         # Store common LLM settings.
         # AzureOpenAIConfig._set_model_from_deployment ensures model is populated;
         # OpenRouterConfig requires model. So self._config.model is always non-empty.
         self._model = self._config.model
+        # What a template may see of each row: exactly the declared fields
+        # (the whole row under the ``[]`` opt-out; nothing when omitted). ADR-051.
+        self._row_projection: RowProjection = declared_row_projection(self._config.required_input_fields)
         self._template = PromptTemplate(
-            self._config.prompt_template,
+            self._config.effective_template(
+                resolve_queries(self._config.queries)[0].template
+                if self._config.prompt_template is None and self._config.queries is not None
+                else None
+            ),
             template_source=self._config.prompt_template_source,
             lookup_data=self._config.lookup,
             lookup_source=self._config.lookup_source,
@@ -1457,8 +1491,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # when the transform's prompt template carried a
         # ``{{interpretation:<term>}}`` placeholder the user resolved.
         # Forwarded to every audited LLM call so the Landscape
-        # ``calls.resolved_prompt_template_hash`` column populates.
-        self._resolved_prompt_template_hash = self._config.resolved_prompt_template_hash
+        # ``calls.approved_prompt_artifact_hash`` column populates.
+        self._approved_prompt_artifact_hash = self._config.approved_prompt_artifact_hash
 
         # Schema (input — same for both single and multi-query)
         schema_config = self._config.schema_config
@@ -1508,6 +1542,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             self._strategy: SingleQueryStrategy | MultiQueryStrategy = MultiQueryStrategy(
                 query_specs=query_specs,
                 template=self._template,
+                row_projection=self._row_projection,
                 system_prompt=self._system_prompt,
                 system_prompt_source=self._system_prompt_source,
                 model=self._model,
@@ -1539,7 +1574,13 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             # Output schema config with prefixed fields for DAG contract propagation.
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
             # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
-            self._output_schema_config = _build_llm_output_schema_config(schema_config, prefixed_guaranteed)
+            self._created_output_fields: tuple[FieldDefinition, ...] = tuple(
+                definition
+                for spec in query_specs
+                for definition in _llm_created_output_fields(
+                    f"{spec.name}_{self._response_field}", f"{spec.name}_", spec.output_fields or ()
+                )
+            )
 
             # Pydantic output schema with prefixed LLM fields
             # Build extracted_fields mapping: query_name → (field_name, schema_type) tuples
@@ -1549,6 +1590,16 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     extracted[spec.name] = tuple(
                         (f"{spec.name}_{f.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[f.type.value]) for f in spec.output_fields
                     )
+            generated_fields = tuple(
+                field
+                for spec in query_specs
+                for field in _llm_generated_output_fields(
+                    f"{spec.name}_{self._response_field}", extracted[spec.name] if spec.name in extracted else ()
+                )
+            )
+            self._output_schema_config = _build_llm_output_schema_config(
+                schema_config, prefixed_guaranteed, generated_fields=generated_fields
+            )
             self.output_schema = _build_multi_query_output_schema(
                 base_schema_config=schema_config,
                 response_field=self._response_field,
@@ -1560,6 +1611,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             single_output_fields = tuple(self._config.output_fields or ())
             self._strategy = SingleQueryStrategy(
                 template=self._template,
+                row_projection=self._row_projection,
                 system_prompt=self._system_prompt,
                 system_prompt_source=self._system_prompt_source,
                 model=self._model,
@@ -1588,7 +1640,10 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             # Output schema config with LLM output fields for DAG contract propagation.
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
             # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
-            self._output_schema_config = _build_llm_output_schema_config(schema_config, guaranteed)
+            extracted_single = tuple((field.suffix, _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in single_output_fields)
+            generated_fields = _llm_generated_output_fields(self._response_field, extracted_single)
+            self._output_schema_config = _build_llm_output_schema_config(schema_config, guaranteed, generated_fields=generated_fields)
+            self._created_output_fields = _llm_created_output_fields(self._response_field, "", single_output_fields)
 
             # Pydantic output schema with unprefixed LLM fields (structured
             # fields carry their declared runtime types)
@@ -1596,8 +1651,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 base_schema_config=schema_config,
                 response_field=self._response_field,
                 schema_name=f"{self.name}OutputSchema",
-                extracted_fields=tuple((field.suffix, _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in single_output_fields)
-                or None,
+                extracted_fields=extracted_single or None,
             )
 
         # Provider instance — deferred to on_start() when recorder/telemetry available
@@ -1606,10 +1660,11 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # Recorder, telemetry, rate limit, payload store (set in on_start)
         self._recorder: PluginAuditWriter | None = None
         self._run_id: str = ""
-        self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
+        self._telemetry_emit: Callable[[TelemetryEvent], None] = _warn_telemetry_before_start
         self._limiter: Any = None
         self._shutdown_event: threading.Event | None = None
         self._payload_store: PayloadStore | None = None
+        self._call_mode_session: CallModeSession | None = None
 
         # Batch processing state
         self._batch_initialized = False
@@ -1628,6 +1683,20 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         passed to ``__init__``) — distinct meanings, distinct names.
         """
         return self._config
+
+    @property
+    def consumed_input_fields(self) -> frozenset[str]:
+        """The base set plus every ``image_inputs`` column, the optional ones included.
+
+        An image marked ``required: false`` is not a declared input
+        (``LLMConfig.declared_input_fields``) because its absence is a valid
+        row, but the transform reads it whenever it is present. The base
+        class's column-option limb cannot see it (``image_inputs`` is not a
+        ``*_field`` option), so the plugin surfaces it here, as the base
+        contract asks of a plugin that reads a column it does not declare:
+        demotion must never treat a read column as created-only.
+        """
+        return super().consumed_input_fields | self._config.image_input_fields
 
     def output_semantics(self) -> OutputSemanticDeclaration:
         """Declare that raw LLM response fields are unconstrained strings.
@@ -1700,14 +1769,44 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         )
         self._batch_initialized = True
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """Every field this transform creates, typed by the code that writes it (ADR-050).
+
+        The operational fields follow ``_SUFFIX_SCHEMA_TYPES`` (the response
+        content and the served model are ``str``; the usage is a mapping the
+        schema DSL has no scalar type for). Each structured ``output_fields``
+        entry is BOUND to the row type of its ``OutputFieldConfig.type`` through
+        ``_OUTPUT_FIELD_TYPE_TO_SCHEMA``, and the Tier-3 parse
+        (``validation.parse_field_value``, reached through
+        ``extract_structured_fields``) returns every value it admits in exactly
+        that type (``integer`` admits an integral float as an int, ``number``
+        an int as a float), so a value the parse admits always satisfies the
+        declaration the engine enforces. The binding and the parse landed
+        together and a test pins that they agree for every ``OutputFieldType``
+        (operator ruling 2026-09-25: never one without the other).
+        """
+        return self._created_output_fields
+
     def on_start(self, ctx: LifecycleContext) -> None:
         """Capture recorder/telemetry and create provider instance."""
+        if ctx.call_mode_session is None:
+            if ctx.run_mode is not RunMode.LIVE:
+                raise RuntimeError("LLM replay/verify requires a matching call-mode session")
+        elif ctx.call_mode_session.mode is not ctx.run_mode:
+            raise RuntimeError("LLM run mode and call-mode session disagree")
+        if (
+            ctx.run_mode in (RunMode.REPLAY, RunMode.VERIFY)
+            and self._tracing_config is not None
+            and self._tracing_config.provider != "none"
+        ):
+            raise RuntimeError("LLM tracing is not supported in replay or verify mode")
         super().on_start(ctx)
         self._recorder = ctx.landscape
         self._run_id = ctx.run_id
         self._telemetry_emit = ctx.telemetry_emit
         self._shutdown_event = ctx.shutdown_event
         self._payload_store = ctx.payload_store
+        self._call_mode_session = ctx.call_mode_session
         limiter_name = (
             "azure_openai"
             if isinstance(self._config, AzureOpenAIConfig)
@@ -1720,7 +1819,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         self._limiter = ctx.rate_limit_registry.get_limiter(limiter_name) if ctx.rate_limit_registry is not None else None
 
         # Create provider now that recorder/telemetry are available
-        self._provider = self._create_provider()
+        self._provider = self._create_provider(llm_call_governance=ctx.llm_call_governance)
 
         # Initialize Azure AI tracing (process-level OpenTelemetry auto-instrumentation).
         # Must happen after provider creation — the OpenAI SDK must be available.
@@ -1735,7 +1834,9 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             raise FrameworkBugError("LLMTransform runtime_preflight requires an operation audit parent")
 
         try:
-            self._provider.runtime_preflight(operation_id=ctx.operation_id, model=self._model)
+            self._provider.runtime_preflight(
+                operation_id=ctx.operation_id, model=self._model, coordination_token=ctx.require_coordination_token()
+            )
         except LLMClientError as exc:
             raise RuntimePreflightFailedError(
                 plugin_name=self.name,
@@ -1743,7 +1844,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 cause=exc,
             ) from exc
 
-    def _create_provider(self) -> LLMProvider:
+    def _create_provider(self, *, llm_call_governance: LLMCallGovernance | None = None) -> LLMProvider:
         """Instantiate the provider with all required dependencies.
 
         Uses isinstance narrowing on self._config to safely access
@@ -1754,6 +1855,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
         if isinstance(self._config, AzureOpenAIConfig):
             return AzureLLMProvider(
+                pricing_model=self._config.pricing_model,
                 endpoint=self._config.endpoint,
                 api_key=self._config.api_key,
                 api_version=self._config.api_version,
@@ -1762,10 +1864,13 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 run_id=self._run_id,
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
-                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+                llm_call_governance=llm_call_governance,
+                call_mode_session=self._call_mode_session,
             )
         elif isinstance(self._config, OpenRouterConfig):
             return OpenRouterLLMProvider(
+                pricing_model=self._config.pricing_model,
                 api_key=self._config.api_key,
                 base_url=self._config.base_url,
                 timeout_seconds=self._config.timeout_seconds,
@@ -1773,16 +1878,22 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 run_id=self._run_id,
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
-                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+                llm_call_governance=llm_call_governance,
+                call_mode_session=self._call_mode_session,
             )
         elif isinstance(self._config, BedrockConfig):
             return BedrockLLMProvider(
+                pricing_model=self._config.pricing_model,
                 region_name=self._config.region_name,
+                credentials=self._config.credentials(),
                 recorder=self._recorder,
                 run_id=self._run_id,
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
-                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+                llm_call_governance=llm_call_governance,
+                call_mode_session=self._call_mode_session,
             )
         elif isinstance(self._config, GatewayConfig):
             # GatewayConfig.api_key already carries the resolved bearer value
@@ -1794,6 +1905,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             # report for why an earlier direct ``EnvSecretLoader`` lookup at
             # this call site was replaced with this shared path.
             return GatewayLLMProvider(
+                pricing_model=self._config.pricing_model,
                 endpoint=self._config.endpoint,
                 api_key=self._config.api_key,
                 contract_major=self._config.contract_major,
@@ -1803,7 +1915,9 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 run_id=self._run_id,
                 telemetry_emit=self._telemetry_emit,
                 limiter=self._limiter,
-                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+                llm_call_governance=llm_call_governance,
+                call_mode_session=self._call_mode_session,
             )
         else:
             raise RuntimeError(f"Unknown config type: {type(self._config).__name__}")
@@ -1873,6 +1987,28 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 summary="Call an LLM provider (Azure OpenAI, OpenRouter, or AWS Bedrock) on each row and write the response into a field. Tracks model identity, token usage, and finish reason in the audit trail.",
                 examples=(
                     PluginAssistanceExample(
+                        title="Separate colour inputs from generated answers",
+                        before={"required_input_fields": ["colour", "good_colour_pair_answer", "approximate_hex_answer"]},
+                        after={
+                            "schema": {"mode": "flexible", "fields": ["colour: str"]},
+                            "required_input_fields": ["colour"],
+                            "queries": {
+                                "good_colour_pair": {
+                                    "input_fields": {"shade": "colour"},
+                                    "template": "Name a colour paired with {{ row.shade }} as answer.",
+                                    "response_format": "structured",
+                                    "output_fields": [{"suffix": "answer", "type": "string"}],
+                                },
+                                "approximate_hex": {
+                                    "input_fields": {"shade": "colour"},
+                                    "template": "Give an approximate hex code for {{ row.shade }} as answer.",
+                                    "response_format": "structured",
+                                    "output_fields": [{"suffix": "answer", "type": "string"}],
+                                },
+                            },
+                        },
+                    ),
+                    PluginAssistanceExample(
                         # A minimal before/after option diff (the established example
                         # shape) showing the one load-bearing lesson: interpolate the
                         # per-row content, not just an identifier. A summarization task
@@ -1939,10 +2075,10 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Interpolate every row field your prompt needs with `{{ row.<field> }}`. A template naming no varying field sends identical input to every row and identical output; to score, classify, or summarize content, inject the content field (e.g. `{{ row.content }}`), not an identifier.",
                     "Never ask the model to judge a page or record from its URL or identifier alone — with no content interpolated it fabricates a plausible answer instead of reading anything. When the judgement needs fetched text, interpolate the fetch/scrape field into the prompt_template.",
                     "Identical answers across rows are only wrong when the inputs genuinely differ. A discriminating prompt injects the per-row data; do not pad prompts for artificial variety. The defect to avoid is one that CANNOT discriminate because it never interpolated the per-row field.",
-                    "If you create a prompt template from the user's goal, data, or prose instead of copying it verbatim, stage an llm_prompt_template review for the authored prompt text.",
+                    "The backend automatically stages and surfaces llm_prompt_template reviews; do not author or request that review. Keep the authored prompt exact for user review.",
                     "When you author LLM judgment semantics — a scoring scale, rubric, category meaning, threshold, signal weighting, cutoff, comparison set, or subjective criterion definition — stage a vague_term review on the LLM node before set_pipeline.",
                     "Measurable adjectives are not exempt: if the user gives the metric/cutoff, use it; if you choose a cutoff such as 'over 6 ft' or a ranking rule such as 'top quartile', review that authored threshold semantics.",
-                    "Prompt-template review is not enough for authored judgment semantics: put both interpretation_requirements in the LLM node options before set_pipeline — one vague_term for the rubric/definition/threshold/category semantics and one llm_prompt_template for the raw prompt.",
+                    "Prompt-template review is not enough for authored judgment semantics: put the vague_term requirement in interpretation_requirements before set_pipeline for the rubric, definition, threshold, or category semantics; the backend owns the raw-prompt review.",
                     "Use a stable user_term preserving the user's criterion phrase, not the whole task phrase; for an adjective embedded in prose, use the adjective or noun phrase that names the criterion.",
                     "llm_draft must equal the semantics you wrote; only an llm_prompt_template review is incomplete.",
                     "When repairing or upserting an LLM node, repeat the review preflight; carry forward existing pending LLM interpretation requirements and add missing vague_term or prompt shield requirements before stopping.",
@@ -1951,8 +2087,16 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Objective extraction such as identifying primary colours used does not by itself need a vague_term review unless you add subjective scoring, ranking, thresholds, or category semantics.",
                     "For how <adjective> phrasing, use the adjective itself as user_term unless the user supplied a more specific criterion phrase; do not use the whole how-phrase.",
                     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model — don't hand-add them.",
-                    "If downstream cleanup, sink, mapper, or transform needs the LLM response, guarantee the response_field by name in the LLM node schema. If downstream also needs source or scrape fields that pass through the LLM, also guarantee pass-through fields such as URL or identifier fields.",
-                    "Single-query LLM output is written to response_field. Prompt-requested JSON keys are not separate pipeline fields unless another transform parses them; preserve response_field through cleanup instead of invented prompt-internal keys.",
+                    "required_input_fields names upstream columns and bounds template visibility (ADR-051). Never require this node's generated fields as upstream inputs. options.schema.fields may declare output types (ADR-050); it does not extract fields from the reply.",
+                    "The plugin derives generated outputs from response_field and output_fields; pass-through guarantees come from upstream.",
+                    "In multi-query mode, input_fields maps template variables to upstream columns. Per-query output_fields generates <queryname>_<suffix>; downstream consumers use those exact names.",
+                    "For the colour example, require colour on the LLM and good_colour_pair_answer / approximate_hex_answer downstream.",
+                    "Single-query LLM output is written to response_field as raw text. Prompt wording alone does not create separate JSON fields; preserve response_field through cleanup when no output_fields are configured.",
+                    "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. The raw response_field and automatic usage/model fields remain available.",
+                    "Each output_fields type is the row type downstream nodes receive: integer -> int (5.0 arrives as 5; 5.5 fails the row), number -> float (7 arrives as 7.0), boolean -> bool, string and enum -> str.",
+                    "An authored node schema output type must admit the bound model type; number cannot narrow to int. If you declare <response_field>_usage, type it any.",
+                    "Keep downstream requirements for every field the consumer uses. Do not erase them or widen to any/flexible to silence a contradictory plugin output contract; report that contradiction.",
+                    "Read declared template fields by carried name; use get, row | list for names, row | items for pairs, and dict(row) or row | tojson for the whole row. Read a method-named column with row['keys']. Source header aliases resolve only when that header reaches the node.",
                     "The LLM transform preserves upstream row fields while adding response_field; it does not remove raw scrape fields. If a web_scrape-to-LLM workflow must save results without raw HTML or fingerprints, put a field_mapper cleanup node between the LLM and the sink.",
                     "The prompt-injection shield advisory covers LLM nodes consuming externally-fetched remote content (a web_scrape-family producer upstream) without an authorized shield between them; it is always advisory (never blocking).",
                     "Recommend an available authorized prompt-injection shield before the LLM; use azure_prompt_shield only when discovery lists it.",
@@ -1960,7 +2104,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Stage a pipeline_decision review on the LLM node with user_term prompt_injection_shield_recommendation whenever no authorized shield is upstream (State B/C). Skip it only when an authorized shield is already wired upstream (State A).",
                     "Pick the state-appropriate draft: State B (an authorized shield is available in this deployment) recommends wiring it in; State C (no shield available) is the high-risk reconsider advisory. Default to the State-C draft when availability is unknown.",
                     "LLM-node reviews stack: an authored web-content scoring prompt can need llm_prompt_template, vague_term, and prompt_injection_shield_recommendation requirements on the same LLM node.",
-                    "Interpretation reviews are not transform stages. Do not create passthrough, review, recommendation, or placeholder nodes for LLM reviews; put the review objects in this LLM node's interpretation_requirements list.",
+                    "Interpretation reviews are not transform stages. Do not create passthrough, review, recommendation, or placeholder nodes for LLM reviews; put caller-owned review objects in this LLM node's interpretation_requirements list.",
                     "For prompt-injection shielding recommendations, do not add passthrough, placeholder, no-op, or renamed utility nodes to imply protection; recommendation prose is not a graph step.",
                     "This is prompt-injection defense; do not substitute azure_content_safety. Use azure_content_safety only for harmful-content moderation or safety classification.",
                     "Concurrency is pool_size (1 = sequential, no pooling). Tune dispatch pacing with min_dispatch_delay_ms / max_dispatch_delay_ms and bound capacity retries with max_capacity_retry_seconds; there is no max_concurrency or per_minute_rate_limit field.",

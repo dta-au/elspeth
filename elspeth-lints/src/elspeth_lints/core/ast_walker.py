@@ -13,8 +13,9 @@ from pathlib import Path
 # directory name at any depth; ``EXCLUDED_WALK_PREFIXES`` is matched against
 # the exact ROOT-RELATIVE path so a bare ``worktrees`` component elsewhere in
 # tracked source is not silently dropped. Both repository-local worktree
-# conventions are excluded: ``.worktrees/`` (panel subtrees) and
-# ``.claude/worktrees/`` (agent worktrees). A new walker must call
+# conventions are excluded: ``.worktrees/`` (panel subtrees),
+# ``.claude/worktrees/`` (agent worktrees), and ``.claude/lanes/``
+# (ignored agent coordination snapshots). A new walker must call
 # :func:`iter_python_files` (or import these constants when it genuinely needs
 # its own traversal) and register itself in
 # ``tests/unit/elspeth_lints/test_python_file_walker_authority.py`` — no
@@ -40,7 +41,7 @@ EXCLUDED_WALK_DIRS = frozenset(
         "venv",
     }
 )
-EXCLUDED_WALK_PREFIXES: tuple[tuple[str, ...], ...] = ((".claude", "worktrees"),)
+EXCLUDED_WALK_PREFIXES: tuple[tuple[str, ...], ...] = ((".claude", "worktrees"), (".claude", "lanes"))
 
 # Nested-scope AST node types that a "lexical scope of this function" walker
 # must short-circuit at: descending into their children would conflate names

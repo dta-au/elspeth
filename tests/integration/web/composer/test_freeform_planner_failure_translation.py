@@ -1,14 +1,9 @@
 """Freeform planner failures are translated into safe HTTP outcomes.
 
-Regression for the still-live half of elspeth-54c11243a3: a
-``PipelinePlannerError`` raised on the freeform empty-pipeline path escaped
-every route catch as an unhandled 500 with no ``failed`` progress event and no
-durable closed failure-disposition record. The guided-full path already
-translates the same exception (``routes/composer/guided_plan.py`` +
-``fail_guided_operation_with_audit``); these tests exercise the freeform
-``send_message`` and ``recompose`` routes through the real FastAPI stack and
-assert parity: a deliberate safe status, a ``failed`` progress snapshot, a
-durable redacted disposition audit row, and no raw provider content leak.
+These tests exercise ``PipelinePlannerError`` on the empty-pipeline path
+through the real FastAPI stack and assert a deliberate safe status, a
+``failed`` progress snapshot, a durable redacted disposition audit row, and no
+raw provider content leak.
 
 The planner's own LLM-call audit evidence (``attach_llm_calls`` +
 ``_plan_and_stage_empty_pipeline``) is already durable and is deliberately NOT
@@ -19,13 +14,14 @@ disposition record, but the disposition record is a separate row.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import structlog
@@ -52,12 +48,15 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # Distinctive token planted in every scripted provider payload / error so the
-# leak assertions can prove it never reaches the HTTP body or any persisted row.
+# leak assertions distinguish deliberately withheld prose from public output
+# and value-free audit metadata.
 _PROVIDER_LEAK_SENTINEL = "PROVIDER-LEAK-SENTINEL-9f13c7"
+_WITHHELD_PROSE = f"I cannot help. {_PROVIDER_LEAK_SENTINEL}"
 
 _EMPTY_INTENT = "Build a CSV to JSONL pipeline."
 _PARITY_FIXTURE_DIR = Path(__file__).resolve().parents[4] / "evals" / "composer-parity" / "fixtures"
@@ -123,7 +122,7 @@ def _malformed_completion() -> Any:
 
     def _prose() -> _Response:
         return _Response(
-            choices=[_Choice(message=_Message(content=f"I cannot help. {_PROVIDER_LEAK_SENTINEL}", tool_calls=[]))],
+            choices=[_Choice(message=_Message(content=_WITHHELD_PROSE, tool_calls=[]))],
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
         )
 
@@ -152,6 +151,16 @@ def _malformed_completion() -> Any:
 
     async def completion(**_kwargs: Any) -> _Response:
         return responses.pop(0)
+
+    return completion
+
+
+def _cost_unavailable_completion() -> Any:
+    async def completion(**_kwargs: Any) -> _Response:
+        return _Response(
+            choices=[_Choice(message=_Message(content=_PROVIDER_LEAK_SENTINEL))],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
 
     return completion
 
@@ -186,9 +195,8 @@ def _build_app(
 ) -> tuple[SyncASGITestClient, Any, SessionServiceImpl]:
     """Wire a minimal real FastAPI app whose composer is a real ComposerServiceImpl.
 
-    Deliberately does NOT reuse the guided conftest's ``_DeterministicGuidedPlanner``
-    double (it has no ``compose`` and constructs a proposal directly); the freeform
-    routes must traverse the real ``ComposerServiceImpl.compose`` →
+    The provider double drives the real freeform routes through
+    ``ComposerServiceImpl.compose`` →
     ``_plan_and_stage_empty_pipeline`` → ``plan_pipeline`` path so the scripted
     completion drives a genuine ``PipelinePlannerError``.
     """
@@ -196,7 +204,9 @@ def _build_app(
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.sqlite3'}")
     initialize_session_schema(engine)
-    sessions = DualFencedSessionServiceHarness(
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
+    sessions = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.freeform.planner.failure"),
@@ -214,11 +224,10 @@ def _build_app(
     )
 
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -228,6 +237,7 @@ def _build_app(
     )
 
     app = FastAPI()
+    wire_test_pipeline_user_authority(app, identity_id="alice", engine=engine)
 
     async def mock_user() -> UserIdentity:
         return UserIdentity(user_id="alice", username="alice")
@@ -238,6 +248,7 @@ def _build_app(
     app.state.scoped_secret_resolver = None
     app.state.settings = settings
     app.state.composer_service = composer
+    app.state.interpretation_surfacing = composer._interpretation_surfacing
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.catalog_service = create_catalog_service()
     runtime_policy = RuntimeWebPluginConfig.from_settings(settings)
@@ -300,11 +311,41 @@ def _llm_audit_rows(engine: Any) -> list[Any]:
     return [row for row in rows if row.role == "audit" and row.tool_calls and row.tool_calls[0].get("_kind") == "llm_call_audit"]
 
 
-def _assert_no_sentinel_leak(engine: Any, response_text: str) -> None:
+def _assert_no_sentinel_leak(engine: Any, response_text: str, *, expected_withheld_replies: int) -> None:
     assert _PROVIDER_LEAK_SENTINEL not in response_text
     with engine.connect() as conn:
-        rows = conn.execute(select(chat_messages_table)).all()
-    assert not any(_PROVIDER_LEAK_SENTINEL in str(row) for row in rows)
+        rows = conn.execute(select(chat_messages_table)).mappings().all()
+    withheld_count = 0
+    for row in rows:
+        fields = dict(row)
+        calls = fields["tool_calls"]
+        if calls and calls[0].get("_kind") == "composer_withheld_reply":
+            assert fields["role"] == "audit"
+            assert fields["content"] == _WITHHELD_PROSE
+            assert calls == [
+                {
+                    "_kind": "composer_withheld_reply",
+                    "schema": "composer.withheld-reply.v1",
+                    "origin": "planner_prose_unadmitted",
+                    "content_hash": hashlib.sha256(_WITHHELD_PROSE.encode()).hexdigest(),
+                }
+            ]
+            withheld_count += 1
+            # Only this precisely verified content is intentionally retained.
+            # Check every other field without SQLAlchemy Row repr truncation.
+            del fields["content"]
+        assert _PROVIDER_LEAK_SENTINEL not in json.dumps(fields, default=str)
+    assert withheld_count == expected_withheld_replies
+
+
+def _assert_withheld_prose_is_not_visible_or_replayed(client: SyncASGITestClient, sessions: SessionServiceImpl, session_id: str) -> None:
+    from elspeth.web.sessions.routes._helpers import _composer_chat_history
+
+    visible = client.get(f"/api/sessions/{session_id}/messages")
+    assert visible.status_code == 200, visible.text
+    assert _PROVIDER_LEAK_SENTINEL not in visible.text
+    stored = asyncio.run(sessions.get_messages(UUID(session_id)))
+    assert _PROVIDER_LEAK_SENTINEL not in json.dumps(_composer_chat_history(stored))
 
 
 def _empty_state() -> CompositionState:
@@ -463,7 +504,7 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
 
     response = client.post(
         f"/api/sessions/{session_id}/messages",
-        json={"content": message},
+        json={"content": message, "client_request_id": str(uuid4())},
     )
 
     assert response.status_code == 200, response.text
@@ -489,7 +530,7 @@ def test_complete_multi_clause_request_enters_empty_pipeline_planner(
     )
     monkeypatch.setattr(composer, "_compose_loop", ordinary_loop)
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": message})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": message, "client_request_id": str(uuid4())})
 
     assert response.status_code == 504, response.text
     ordinary_loop.assert_not_awaited()
@@ -500,20 +541,28 @@ def test_complete_multi_clause_request_enters_empty_pipeline_planner(
 
 
 @pytest.mark.parametrize(
-    ("completion_factory", "expected_status", "expected_failure_code", "expected_planner_code", "expected_llm_audit_rows"),
+    (
+        "completion_factory",
+        "expected_status",
+        "expected_failure_code",
+        "expected_planner_code",
+        "expected_llm_audit_rows",
+        "expected_withheld_replies",
+    ),
     [
         # The prose (no-tool-call) reply is nudge-retried on its own bounded
         # budget, the overrun engages the escape hatch, and the advisor's
         # malformed reply spends it — so every nudged attempt AND the hatch
         # call land as durable audit evidence alongside the terminal
         # MALFORMED_RESPONSE.
-        (_malformed_completion, 502, "invalid_provider_response", "MALFORMED_RESPONSE", _PROSE_NUDGE_BUDGET + 2),
-        (_timeout_completion, 504, "provider_timeout", "TIMEOUT", 1),
+        (_malformed_completion, 502, "invalid_provider_response", "MALFORMED_RESPONSE", _PROSE_NUDGE_BUDGET + 2, 3),
+        (_timeout_completion, 504, "provider_timeout", "TIMEOUT", 1, 0),
         # LiteLLM API errors are the declared retryable provider failure, so
         # every configured physical attempt must be present in the audit.
-        (_provider_error_completion, 503, "provider_unavailable", "PROVIDER_ERROR", 3),
+        (_provider_error_completion, 503, "provider_unavailable", "PROVIDER_ERROR", 3, 0),
+        (_cost_unavailable_completion, 503, "cost_unavailable", "COST_UNAVAILABLE", 1, 0),
     ],
-    ids=["malformed", "timeout", "provider_error"],
+    ids=["malformed", "timeout", "provider_error", "cost_unavailable"],
 )
 def test_send_message_freeform_planner_failure_is_translated(
     tmp_path: Path,
@@ -523,11 +572,14 @@ def test_send_message_freeform_planner_failure_is_translated(
     expected_failure_code: str,
     expected_planner_code: str,
     expected_llm_audit_rows: int,
+    expected_withheld_replies: int,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client, engine, _sessions = _build_app(tmp_path, monkeypatch, completion_factory())
+    client, engine, sessions = _build_app(tmp_path, monkeypatch, completion_factory())
     session_id = client.post("/api/sessions", json={"title": "freeform planner failure"}).json()["id"]
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
 
     # (a) deliberate safe response, not an unhandled 500.
     assert response.status_code == expected_status, response.text
@@ -544,8 +596,12 @@ def test_send_message_freeform_planner_failure_is_translated(
     progress = client.get(f"/api/sessions/{session_id}/composer-progress").json()
     assert progress["phase"] == "failed"
     assert progress["reason"] is not None
+    if expected_failure_code == "cost_unavailable":
+        assert progress["reason"] == "service_setup_failed"
+        assert "pricing" in progress["likely_next"]
+        assert "administrator" in body["detail"]["detail"]
 
-    # (c) exactly one durable closed failure-disposition record, mirroring guided.
+    # (c) exactly one durable closed failure-disposition record.
     disposition_rows = _disposition_rows(engine)
     assert len(disposition_rows) == 1
     assert disposition_rows[0].tool_calls[0]["failure_code"] == expected_failure_code
@@ -558,13 +614,31 @@ def test_send_message_freeform_planner_failure_is_translated(
     # NOT re-persisted as a duplicate) alongside the disposition record.
     assert len(_llm_audit_rows(engine)) == expected_llm_audit_rows
 
-    # (d) no raw provider content / usage / model metadata leaks anywhere.
-    _assert_no_sentinel_leak(engine, response.text)
+    # (d) refused prose is recoverable only in its dedicated audit envelope.
+    _assert_no_sentinel_leak(engine, response.text, expected_withheld_replies=expected_withheld_replies)
+    _assert_withheld_prose_is_not_visible_or_replayed(client, sessions, session_id)
+    captured = capsys.readouterr()
+    assert _PROVIDER_LEAK_SENTINEL not in captured.out + captured.err + caplog.text
+
+    # Negative control: a marker leaked to an ordinary row must still fail,
+    # even when the same database contains valid withheld-reply records.
+    asyncio.run(
+        sessions.add_message(
+            UUID(session_id),
+            "user",
+            _PROVIDER_LEAK_SENTINEL,
+            writer_principal="route_user_message",
+        )
+    )
+    with pytest.raises(AssertionError):
+        _assert_no_sentinel_leak(engine, response.text, expected_withheld_replies=expected_withheld_replies)
 
 
 def test_recompose_freeform_planner_failure_is_translated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     client, engine, sessions = _build_app(tmp_path, monkeypatch, _malformed_completion())
     session_id = client.post("/api/sessions", json={"title": "recompose planner failure"}).json()["id"]
@@ -572,7 +646,7 @@ def test_recompose_freeform_planner_failure_is_translated(
     # Recompose requires the transcript to end at a user turn; seed one directly.
     from uuid import UUID
 
-    asyncio.run(
+    user_message = asyncio.run(
         sessions.add_message(
             UUID(session_id),
             "user",
@@ -581,7 +655,7 @@ def test_recompose_freeform_planner_failure_is_translated(
         )
     )
 
-    response = client.post(f"/api/sessions/{session_id}/recompose")
+    response = client.post(f"/api/sessions/{session_id}/recompose", json={"expected_user_message_id": str(user_message.id)})
 
     assert response.status_code == 502, response.text
     body = response.json()
@@ -595,7 +669,10 @@ def test_recompose_freeform_planner_failure_is_translated(
     assert len(disposition_rows) == 1
     assert disposition_rows[0].tool_calls[0]["failure_code"] == "invalid_provider_response"
 
-    _assert_no_sentinel_leak(engine, response.text)
+    _assert_no_sentinel_leak(engine, response.text, expected_withheld_replies=3)
+    _assert_withheld_prose_is_not_visible_or_replayed(client, sessions, session_id)
+    captured = capsys.readouterr()
+    assert _PROVIDER_LEAK_SENTINEL not in captured.out + captured.err + caplog.text
 
 
 # Every ``code=`` value raised by PipelinePlannerError in pipeline_planner.py.
@@ -626,8 +703,7 @@ def test_freeform_progress_reason_stops_blaming_the_provider_for_planner_faults(
     """The freeform failed-progress event hardcoded ``provider_unavailable`` for EVERY planner code.
 
     ``ComposerProgressReason`` already carries the codes this needs — ``planner_repair_exhausted``
-    exists verbatim "so the failed progress event stops blaming the provider" — and the GUIDED path
-    maps onto them (``guided_plan.py``). Freeform did not, so a discovery-budget exhaustion, a tool-call
+    exists verbatim to distinguish planner faults from provider faults. A discovery-budget exhaustion, a tool-call
     cap, and a genuine provider outage were one indistinguishable reason on this surface. That is what
     ``/composer-progress`` reports, which is the terminal a client reads when its request is cut
     (elspeth-ad5628ecda).
@@ -659,8 +735,7 @@ def test_freeform_progress_reason_stops_blaming_the_provider_for_planner_faults(
 
 
 # The detail-code shapes a rejection can carry. ``policy_blocked`` is keyed on
-# THIS axis, not on the planner code, so parity must be checked over the full
-# cross product rather than over codes alone.
+# THIS axis, not on the planner code, so test the full cross product.
 _DETAIL_CODE_CASES: tuple[tuple[str, ...], ...] = (
     # Non-rejection failure (timeout, provider error): no codes at all.
     (),
@@ -679,26 +754,7 @@ _DETAIL_CODE_CASES: tuple[tuple[str, ...], ...] = (
 
 @pytest.mark.parametrize("code", _ALL_PLANNER_CODES)
 @pytest.mark.parametrize("detail_codes", _DETAIL_CODE_CASES)
-def test_freeform_planner_failure_code_matches_guided(code: str, detail_codes: tuple[str, ...]) -> None:
-    """The freeform surface must classify every planner code exactly as guided.
-
-    Task 0 gates Task 3's cross-surface disposition parity; a divergence here
-    (e.g. one surface returning invalid_provider_response/502 where the other
-    returns operation_failed/500 for the same code) is precisely the bug Task 0
-    exists to prevent. Parametrized over detail codes as well since
-    ``policy_blocked`` is decided on that axis.
-    """
-    from elspeth.web.composer.pipeline_planner import PipelinePlannerError
-    from elspeth.web.sessions.routes._helpers import _freeform_planner_failure_code
-    from elspeth.web.sessions.routes.composer.guided_plan import _guided_full_failure_code
-
-    exc = PipelinePlannerError("planner failure", code=code, detail_codes=detail_codes)
-    assert _freeform_planner_failure_code(exc) == _guided_full_failure_code(exc)
-
-
-@pytest.mark.parametrize("code", _ALL_PLANNER_CODES)
-@pytest.mark.parametrize("detail_codes", _DETAIL_CODE_CASES)
-def test_policy_detail_codes_decide_policy_blocked_on_both_surfaces(code: str, detail_codes: tuple[str, ...]) -> None:
+def test_policy_detail_codes_decide_policy_blocked(code: str, detail_codes: tuple[str, ...]) -> None:
     """A categorical policy refusal is permanent under EVERY planner code.
 
     The observed failure surfaced as ``VALIDATION_FAILED`` (the server-derived
@@ -709,43 +765,26 @@ def test_policy_detail_codes_decide_policy_blocked_on_both_surfaces(code: str, d
     """
     from elspeth.web.composer.pipeline_planner import PipelinePlannerError
     from elspeth.web.sessions.routes._helpers import PLANNER_POLICY_DETAIL_CODES, _freeform_planner_failure_code
-    from elspeth.web.sessions.routes.composer.guided_plan import _guided_full_failure_code
 
     exc = PipelinePlannerError("planner failure", code=code, detail_codes=detail_codes)
     expected_policy = any(detail in PLANNER_POLICY_DETAIL_CODES for detail in detail_codes)
 
-    assert (_guided_full_failure_code(exc) == "policy_blocked") is expected_policy
     assert (_freeform_planner_failure_code(exc) == "policy_blocked") is expected_policy
 
 
-def test_every_reachable_failure_code_has_an_http_envelope_on_both_surfaces() -> None:
-    """Both mappers feed a bare dict index — an unmapped code is a raw 500.
-
-    ``_handle_planner_failure`` does ``_FREEFORM_PLANNER_FAILURE_HTTP[failure_code]``
-    and ``raise_guided_operation_failure`` refuses an unknown code with an
-    ``AuditIntegrityError``. Widening either mapper without widening its table
-    reintroduces exactly the uncoded crash this taxonomy removes, so the tables
-    are checked against everything the mappers can actually return.
-    """
+def test_every_reachable_failure_code_has_an_http_envelope() -> None:
+    """Every planner classification must have a safe HTTP envelope."""
     from elspeth.web.composer.pipeline_planner import PipelinePlannerError
     from elspeth.web.sessions.routes._helpers import _FREEFORM_PLANNER_FAILURE_HTTP, _freeform_planner_failure_code
-    from elspeth.web.sessions.routes.composer.guided_plan import _guided_full_failure_code
-    from elspeth.web.sessions.routes.guided_operations import _SAFE_FAILURES
 
     reachable: set[str] = set()
     for code in _ALL_PLANNER_CODES:
         for detail_codes in _DETAIL_CODE_CASES:
             exc = PipelinePlannerError("planner failure", code=code, detail_codes=detail_codes)
             reachable.add(_freeform_planner_failure_code(exc))
-            reachable.add(_guided_full_failure_code(exc))
 
     assert "policy_blocked" in reachable
     assert reachable <= set(_FREEFORM_PLANNER_FAILURE_HTTP)
-    assert reachable <= set(_SAFE_FAILURES)
-    # Shared codes must also agree on the HTTP status, or the same failure reads
-    # as a different class depending on which surface authored the pipeline.
-    for failure_code in reachable:
-        assert _FREEFORM_PLANNER_FAILURE_HTTP[failure_code][0] == _SAFE_FAILURES[failure_code][0], failure_code
 
 
 def test_freeform_policy_blocked_copy_blames_neither_provider_nor_operation_id() -> None:
@@ -760,7 +799,7 @@ def test_freeform_policy_blocked_copy_blames_neither_provider_nor_operation_id()
     assert "operation id" not in lowered
     assert "composer model" not in lowered
     assert "deployment policy" in lowered
-    # Freeform chat has no component highlight — only the guided review UI
+    # Freeform chat has no component highlight.
     # pins the blocked component — so this copy must not say "highlighted".
     assert "highlighted" not in lowered
 
@@ -807,7 +846,7 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
     client, engine, _sessions = _build_app(tmp_path, monkeypatch, _decline_after_exhaustion_completion())
     session_id = client.post("/api/sessions", json={"title": "freeform planner decline"}).json()["id"]
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
 
     assert response.status_code == 200, response.text
     assert _DECLINE_TEXT in response.text
@@ -852,7 +891,7 @@ def test_send_message_ordinary_turn_marker_decline_is_a_normal_assistant_message
     client, engine, _sessions = _build_app(tmp_path, monkeypatch, _marker_decline_completion())
     session_id = client.post("/api/sessions", json={"title": "ordinary turn decline"}).json()["id"]
 
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
 
     assert response.status_code == 200, response.text
     assert _DECLINE_TEXT in response.text
@@ -944,7 +983,7 @@ def test_later_explicit_imperative_reaches_planner_and_auto_commits(
 
     response = client.post(
         f"/api/sessions/{session_id}/messages",
-        json={"content": "How does this work? Now build it."},
+        json={"content": "How does this work? Now build it.", "client_request_id": str(uuid4())},
     )
 
     assert response.status_code == 200, response.text
@@ -978,12 +1017,12 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
         _valid_pipeline_completion(tmp_path, session_id_holder),
     )
     composer = client.app.state.composer_service
-    spy = AsyncMock(wraps=composer.surface_pending_interpretation_reviews)
-    monkeypatch.setattr(composer, "surface_pending_interpretation_reviews", spy)
+    spy = AsyncMock(wraps=composer._interpretation_surfacing.surface_pending_interpretation_reviews)
+    monkeypatch.setattr(composer._interpretation_surfacing, "surface_pending_interpretation_reviews", spy)
 
     session_id = client.post("/api/sessions", json={"title": "auto-commit surfacer"}).json()["id"]
     session_id_holder["id"] = session_id
-    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT})
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": _EMPTY_INTENT, "client_request_id": str(uuid4())})
 
     assert response.status_code == 200, response.text
     assert "prepared and validated" in response.text

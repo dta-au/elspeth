@@ -1,7 +1,7 @@
 """Core Orchestrator facade for pipeline execution.
 
 The Orchestrator is the main entry point for running ELSPETH pipelines. Since
-filigree elspeth-9e71ae82a4 it is a composition facade: ``__init__`` wires the
+archived issue elspeth-9e71ae82a4 it is a composition facade: ``__init__`` wires the
 collaborating services and every public entry point delegates to exactly one
 of them.
 
@@ -32,6 +32,7 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 import elspeth.engine.executors.declaration_contract_bootstrap  # noqa: F401
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.sink_effects import SinkEffectInputKind
 from elspeth.engine.orchestrator.bootstrap import prepare_for_run as prepare_for_run
 from elspeth.engine.orchestrator.ceremony import RunCeremony
@@ -44,6 +45,7 @@ from elspeth.engine.orchestrator.processor_factory import ProcessorFactory
 from elspeth.engine.orchestrator.resume import ResumeCoordinator
 from elspeth.engine.orchestrator.run_context_factory import RunContextFactory
 from elspeth.engine.orchestrator.run_lifecycle import RunLifecycleCoordinator
+from elspeth.engine.orchestrator.run_modes import RuntimeRunMode, resolve_runtime_run_mode
 from elspeth.engine.orchestrator.run_state import (
     _RunFailedWithPartialResultError as _RunFailedWithPartialResultError,
 )
@@ -59,11 +61,13 @@ if TYPE_CHECKING:
         SecretResolutionInput,
     )
     from elspeth.contracts.audit_export import AuditExportContentStore, AuditExportContentStoreResolver
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.config.runtime import RuntimeCheckpointConfig, RuntimeConcurrencyConfig
     from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
     from elspeth.contracts.preflight import PreflightResult
+    from elspeth.contracts.run_start import RunStartPermitBinding
     from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
     from elspeth.core.checkpoint import CheckpointManager
     from elspeth.core.config import ElspethSettings
@@ -110,6 +114,8 @@ class Orchestrator:
         concurrency_config: RuntimeConcurrencyConfig | None = None,
         telemetry_manager: TelemetryManagerProtocol | None = None,
         coalesce_completed_keys_limit: int = 10000,
+        llm_call_governance: LLMCallGovernance | None = None,
+        call_mode_session_factory: Callable[[RecorderFactory, RuntimeRunMode, str], CallModeSession] | None = None,
     ) -> None:
         from elspeth.core.events import NullEventBus
         from elspeth.engine.clock import DEFAULT_CLOCK
@@ -125,6 +131,7 @@ class Orchestrator:
         self._rate_limit_registry = rate_limit_registry
         self._concurrency_config = concurrency_config
         self._coalesce_completed_keys_limit = coalesce_completed_keys_limit
+        self._call_mode_session_factory = call_mode_session_factory
         self._telemetry = telemetry_manager  # Optional, disabled by default
         self._ceremony = RunCeremony(events=self._events, telemetry=self._telemetry)
         self._checkpoints = CheckpointCoordinator(checkpoint_manager=checkpoint_manager, checkpoint_config=checkpoint_config)
@@ -137,10 +144,12 @@ class Orchestrator:
             coalesce_completed_keys_limit=self._coalesce_completed_keys_limit,
         )
         self._context_factory = RunContextFactory(
+            llm_call_governance=llm_call_governance,
             ceremony=self._ceremony,
             rate_limit_registry=self._rate_limit_registry,
             concurrency_config=self._concurrency_config,
             processor_factory=self._processor_factory,
+            call_mode_session_factory=call_mode_session_factory,
         )
         self._sink_flush = SinkFlushCoordinator(
             span_factory=self._span_factory,
@@ -190,6 +199,8 @@ class Orchestrator:
         openrouter_catalog_sha256: str,
         openrouter_catalog_source: str,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
     ) -> tuple[RecorderFactory, Any, CoordinationToken]:
         """DATABASE-phase delegator (test seam — see RunLifecycleCoordinator)."""
         return self._run_lifecycle.initialize_database_phase(
@@ -202,6 +213,8 @@ class Orchestrator:
             openrouter_catalog_sha256=openrouter_catalog_sha256,
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
+            run_start_permit=run_start_permit,
+            pre_effect_guard=pre_effect_guard,
         )
 
     def run(
@@ -224,6 +237,8 @@ class Orchestrator:
         openrouter_catalog_source: str | None = None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
         check_coordination_latch: Callable[[], None] | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
     ) -> RunResult:
         """Execute a pipeline run.
 
@@ -251,15 +266,25 @@ class Orchestrator:
                 Landscape generates a run ID.
             initiated_by_user_id: Optional authenticated web user that initiated the run.
             auth_provider_type: Optional auth provider namespace for the initiating user.
+            run_start_permit: Immutable admission binding. An exact prepared
+                retry regenerates initialization under fresh Landscape authority.
+            pre_effect_guard: Revalidates caller ownership after acquiring
+                Landscape authority and before plugin effects.
+            check_coordination_latch: Revalidates caller ownership at execution
+                admission points throughout the run.
 
         Raises:
             OrchestrationInvariantError: If graph or payload_store is not provided
         """
+        runtime_mode = resolve_runtime_run_mode(config, settings)
+
         require_sink_effect_admission(
             config.sinks,
             configured_modes=config.sink_effect_modes,
             required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
             admission=config.sink_effect_admission,
+            runtime_bindings=config.sink_effect_bindings,
+            run_mode=runtime_mode.mode,
         )
         return self._run_lifecycle.run(
             config,
@@ -279,6 +304,8 @@ class Orchestrator:
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
             check_coordination_latch=check_coordination_latch,
+            pre_effect_guard=pre_effect_guard,
+            run_start_permit=run_start_permit,
             # Bound AT CALL TIME (not construction) so monkeypatch.setattr on
             # the class and patch.object on this instance keep intercepting.
             initialize_database_phase=self._initialize_database_phase,
@@ -308,6 +335,7 @@ class Orchestrator:
         shutdown_event: threading.Event | None = None,
         coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
+        before_plugin_effects: Callable[[], None] | None = None,
     ) -> RunResult:
         """Run-body delegator (test seam — see LeaderDrainCoordinator).
 
@@ -324,6 +352,7 @@ class Orchestrator:
             shutdown_event=shutdown_event,
             coordination_token=coordination_token,
             check_coordination_latch=check_coordination_latch,
+            before_plugin_effects=before_plugin_effects,
             register_graph_nodes_and_edges=self._register_graph_nodes_and_edges,
         )
 
@@ -336,18 +365,27 @@ class Orchestrator:
         payload_store: PayloadStore,
         settings: ElspethSettings | None = None,
         shutdown_event: threading.Event | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        check_coordination_latch: Callable[[], None] | None = None,
     ) -> RunResult:
         """Resume a failed run from a checkpoint.
 
         Delegates to :class:`ResumeCoordinator`, which owns the resume-path
         orchestration extracted from this class. The public signature is the
         stable contract; the implementation lives in resume.py.
+
+        ``pre_effect_guard`` runs after winning Landscape leadership, before
+        repair writes. ``check_coordination_latch`` checks caller authority
+        throughout processing. Refusal releases the seat without declaring
+        the pipeline failed.
         """
         require_sink_effect_admission(
             config.sinks,
             configured_modes=config.sink_effect_modes,
             required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
             admission=config.sink_effect_admission,
+            runtime_bindings=config.sink_effect_bindings,
+            run_mode=resolve_runtime_run_mode(config, settings).mode,
         )
         return self._resume_coordinator.resume(
             resume_point,
@@ -356,6 +394,8 @@ class Orchestrator:
             payload_store=payload_store,
             settings=settings,
             shutdown_event=shutdown_event,
+            pre_effect_guard=pre_effect_guard,
+            check_coordination_latch=check_coordination_latch,
         )
 
     def join_run(

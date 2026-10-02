@@ -20,8 +20,9 @@ collect-then-raise audit-complete dispatch (ADR-010 §Semantics).
 - Bundle types — ``PreEmissionInputs``, ``PostEmissionInputs`` /
   ``PostEmissionOutputs``, ``BatchFlushInputs`` / ``BatchFlushOutputs``,
   ``BoundaryInputs`` / ``BoundaryOutputs``. Per dispatch site. Every
-  bundle is a frozen slots dataclass; container fields are deep-frozen
-  in ``__post_init__`` per CLAUDE.md §Frozen Dataclass Immutability.
+  bundle is a frozen slots dataclass; ``frozen=True`` leaves container
+  contents mutable through the attribute reference, so container fields
+  are deep-frozen in ``__post_init__``.
 - ``DeclarationContractViolation`` — per-contract audit-evidence-bearing
   exception. Subclasses declare ``payload_schema`` (H5 Layer 1).
 - ``AggregateDeclarationContractViolation`` — SIBLING class (not subclass)
@@ -153,8 +154,10 @@ def implements_dispatch_site(site_name: DispatchSiteName) -> Callable[[F], F]:
     A typo raises ``ValueError`` at module import rather than silently
     mis-registering.
 
-    CLAUDE.md posture: direct membership check on the frozen set of valid
-    values. No ``getattr`` default, no silent pass-through.
+    Per the defensive-programming prohibition
+    (docs/guides/data-trust-and-error-handling.md §The Defensive Programming
+    Prohibition): direct membership check on the frozen set of valid values.
+    No ``getattr`` default, no silent pass-through.
     """
     if site_name not in _DISPATCH_SITE_VALUES:
         raise ValueError(
@@ -210,14 +213,17 @@ class PreEmissionInputs:
     rather than to a downstream crash inside ``process()``.
 
     Panel F1 resolution (no ``override_input_fields`` sentinel): the caller
-    (``TransformExecutor``) derives ``effective_input_fields`` from
-    ``input_row.contract.fields`` once and passes it in. Contracts MUST use
+    (``TransformExecutor``) derives ``effective_input_fields`` once with
+    :func:`derive_effective_input_fields` (the fields the row's contract
+    declares AND its payload carries) and passes it in. Contracts MUST use
     ``effective_input_fields`` and MUST NOT derive it themselves — the
     caller-side derivation prevents the B-antipattern where each contract
     re-implements the derivation and they drift.
 
-    CLAUDE.md §Frozen Dataclass Immutability: ``frozenset`` is intrinsically
-    immutable; no ``__post_init__`` guard required. Scalars need no guard.
+    Deep-freezing exists only because ``frozen=True`` leaves container
+    contents mutable through the attribute reference; ``frozenset`` is
+    intrinsically immutable, so no ``__post_init__`` guard is required here.
+    Scalars need no guard either.
     """
 
     plugin: Any
@@ -255,9 +261,10 @@ class PostEmissionOutputs:
     """Emitted-rows bundle for post-emission dispatch.
 
     ``emitted_rows`` is normalised to a deep-frozen tuple in ``__post_init__``.
-    Non-list/non-tuple inputs crash offensively per CLAUDE.md §Offensive
-    Programming — arbitrary Sequence subtypes (lazy wrappers, generators)
-    cannot silently bypass the freeze guard.
+    Non-list/non-tuple inputs crash offensively (see the
+    ``engine-patterns-reference`` skill §Offensive Programming Examples) —
+    arbitrary Sequence subtypes (lazy wrappers, generators) cannot silently
+    bypass the freeze guard.
     """
 
     emitted_rows: tuple[Any, ...]
@@ -286,9 +293,20 @@ class BatchFlushInputs:
     the violation to the triggering token (or the first buffered token on
     timeout flushes — the caller computes this choice and passes it in).
 
-    ``effective_input_fields`` is the INTERSECTION across every buffered
-    token's contract — the weakest shared guarantee. Caller computes this
-    once; contracts use it directly.
+    ``effective_input_fields`` is the weakest shared guarantee over the
+    tokens' ``derive_effective_input_fields`` (the fields a contract declares
+    AND its payload carries). The caller computes it once and contracts use it
+    directly:
+
+    - TRANSFORM mode, non-empty emission: the INTERSECTION over the buffered
+      tokens NOT in the engine-validated in-batch quarantine set
+      (``validated_quarantined_indices``). A quarantined input emits nothing,
+      so its fields do not shrink the guarantee.
+    - TRANSFORM mode, zero emission: the INTERSECTION over every buffered
+      token.
+    - PASSTHROUGH mode: one dispatch per (input, output) pair, carrying that
+      one token's own fields (``buffered_tokens`` is that single token). A
+      zero emission falls back to the intersection over every buffered token.
     """
 
     plugin: Any
@@ -1096,6 +1114,19 @@ EXPECTED_CONTRACT_SITES: Mapping[str, frozenset[DispatchSiteName]] = MappingProx
         #   Sites:      post_emission_check (single-token TransformExecutor path)
         #               batch_flush_check   (RowProcessor._cross_check_flush_output)
         "schema_config_mode": frozenset({"post_emission_check", "batch_flush_check"}),
+        # OutputDeclarationCompletenessContract
+        #   Defined:    src/elspeth/engine/executors/output_declaration.py
+        #   Registered: src/elspeth/engine/executors/output_declaration.py (module-import side-effect)
+        #   ADR:        ADR-050
+        #   Sites:      post_emission_check (single-token TransformExecutor path)
+        # NOTE: batch_flush_check deliberately absent. Batch outputs DO carry
+        # the declaration stamp, but the batch-flush dispatch carries the
+        # INTERSECTION of the buffered rows' input fields (ADR-009), which
+        # cannot tell a created key from an input field only some buffered
+        # rows carried; and the collector flush dispatches no declaration
+        # contracts. Batch-aware completeness is the registry gate
+        # (tests/invariants/test_output_declaration_completeness.py).
+        "output_declaration_completeness": frozenset({"post_emission_check"}),
         # SourceGuaranteedFieldsContract
         #   Defined:    src/elspeth/engine/executors/source_guaranteed_fields.py
         #   Registered: src/elspeth/engine/executors/source_guaranteed_fields.py (module-import side-effect)

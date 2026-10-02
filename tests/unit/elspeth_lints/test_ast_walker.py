@@ -95,7 +95,7 @@ def test_iter_python_files_yields_files_not_directories_named_python(tmp_path: P
     assert list(iter_python_files(tmp_path)) == [nested_source]
 
 
-def test_iter_python_files_prunes_only_nested_agent_worktrees(
+def test_iter_python_files_prunes_nested_agent_worktrees_and_lanes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -106,9 +106,11 @@ def test_iter_python_files_prunes_only_nested_agent_worktrees(
         tmp_path / "worktrees" / "tracked.py",
     }
     ignored_root = tmp_path / ".claude" / "worktrees"
+    ignored_lanes = tmp_path / ".claude" / "lanes"
     candidates = [
         *expected,
         ignored_root / "sibling" / "src" / "foreign.py",
+        ignored_lanes / "campaign" / "tests" / "foreign.py",
     ]
     for candidate in candidates:
         candidate.parent.mkdir(parents=True, exist_ok=True)

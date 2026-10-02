@@ -532,7 +532,23 @@ describe("blobStore", () => {
       expect(state.error).toBeNull();
     });
 
-    it("sets active-run message for 409 error", async () => {
+    it.each([
+      "Session operation is already active",
+      "Blob is referenced by a pending proposal",
+      "Blob is linked to an active run",
+    ])("preserves the actual deletion blocker: %s", async (detail) => {
+      const blob = makeBlob();
+      useBlobStore.setState({ blobs: [blob] });
+      const { deleteBlob } = await import("@/api/client");
+      vi.mocked(deleteBlob).mockRejectedValue({ status: 409, detail });
+
+      await useBlobStore.getState().deleteBlob("session-1", "blob-1");
+
+      expect(useBlobStore.getState().error).toBe(detail);
+      expect(useBlobStore.getState().blobs).toEqual([blob]);
+    });
+
+    it("does not invent a deletion blocker when the error has no detail", async () => {
       useBlobStore.setState({ blobs: [makeBlob()] });
 
       const { deleteBlob } = await import("@/api/client");
@@ -541,7 +557,7 @@ describe("blobStore", () => {
       await useBlobStore.getState().deleteBlob("session-1", "blob-1");
 
       expect(useBlobStore.getState().error).toBe(
-        "Cannot delete \u2014 file is linked to an active run.",
+        "Failed to delete file.",
       );
     });
   });

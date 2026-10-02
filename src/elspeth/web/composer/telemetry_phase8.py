@@ -35,20 +35,15 @@ Vocabulary discipline (B1-r2). The ``_SessionTrustMode`` Literal is
 intentionally scoped to per-session ``trust_mode`` values
 (``explicit_approve`` / ``auto_commit``) drawn from the CHECK
 constraint at ``sessions/models.py`` table-definition time. The
-account-level helpers (``record_mode_opted_out`` /
-``record_mode_opted_in``) take no mode kwarg and use no Literal —
-they're post-state-only per §"Account-level scope narrowing
-(B2.b — load-bearing)". The completion helper
-(``record_session_completed``) uses a separate ``_CompletionVerb``
+completion helper (``record_session_completed``) uses a separate ``_CompletionVerb``
 Literal whose value set MIRRORS the CHECK constraint on
 ``composer_completion_events_table.event_type`` at
 ``src/elspeth/web/sessions/models.py:735`` —
 ``mark_ready_for_review`` / ``export_yaml``. This is the DB-authoritative
 audit vocabulary (Tier 1 trust-store; the audit row is the legal record
-the counter aggregates over per CLAUDE.md superset rule). A pre-wire
-draft of this helper carried a UI-facing vocabulary
-(``save_for_review`` / ``run_pipeline`` / ``export_yaml``) plus an
-``_AccountMode`` (``guided`` / ``freeform``) attribute; the overall-plan
+the counter aggregates over, per the logging-telemetry-policy skill §The
+Superset Rule). A pre-wire draft of this helper carried a UI-facing vocabulary
+(``save_for_review`` / ``run_pipeline`` / ``export_yaml``) plus a mode attribute; the overall-plan
 reviewer for Sub-task 7c surfaced that ``save_for_review`` was UI vocab
 that drifts from the DB audit row, and ``run_pipeline`` is a UX-level
 verb that does NOT write a ``composer_completion_events_table`` row
@@ -62,9 +57,10 @@ event — do NOT re-broaden ``_CompletionVerb`` to include
 
 OTel exporter failure handling (W5). Every ``record_*`` helper wraps
 the underlying ``.add(...)`` call in ``try / except Exception`` that
-swallows and returns ``None``. Telemetry is best-effort per CLAUDE.md
-"Telemetry and Logging" — a broken exporter must not 500 a PATCH whose
-audit row already wrote. The ``_assert_session_trust_mode`` /
+swallows and returns ``None``. Telemetry is best-effort per the
+logging-telemetry-policy skill §Telemetry (Operational Visibility) — a
+broken exporter must not 500 a PATCH whose audit row already wrote. The
+``_assert_session_trust_mode`` /
 ``_assert_completion_verb`` ValueErrors are programmer-error guards
 and intentionally escape (they fire BEFORE the try/except so input
 validation still crashes loudly).
@@ -82,8 +78,6 @@ __all__ = [
     "SessionsTelemetry",
     "record_audit_fetch_failure",
     "record_interpretation_opt_out",
-    "record_mode_opted_in",
-    "record_mode_opted_out",
     "record_session_completed",
     "record_session_switched",
     "record_share_link_expiry_hit",
@@ -113,9 +107,8 @@ _PHASE_8_PROBE_FAILED_COUNTER = _meter.create_counter(
 
 # ── Per-session trust_mode vocabulary (B1-r2) ───────────────────────────
 # Sourced from the CHECK constraint on ``user_sessions_table.trust_mode``
-# (see ``src/elspeth/web/sessions/models.py``). Do NOT add ``guided`` /
-# ``freeform`` / ``unknown`` — those are wrong vocabulary (account-level
-# column) or fabricated values the column does not admit.
+# (see ``src/elspeth/web/sessions/models.py``). Do not add account-level mode
+# or fabricated values the column does not admit.
 _SessionTrustMode = Literal["explicit_approve", "auto_commit"]
 _KNOWN_SESSION_TRUST_MODES: frozenset[str] = frozenset({"explicit_approve", "auto_commit"})
 
@@ -132,9 +125,10 @@ _KNOWN_SESSION_TRUST_MODES: frozenset[str] = frozenset({"explicit_approve", "aut
 #
 # The two values that appear in audit rows are the only two valid
 # attribute values for ``composer.session.completed_total`` — the counter
-# aggregates over those rows per the CLAUDE.md superset rule. UI-facing
-# vocabulary (``save_for_review``) MUST NOT appear here; it would drift
-# from the audit row and silently break aggregation. The Phase 6 UX
+# aggregates over those rows per the logging-telemetry-policy skill §The
+# Superset Rule. UI-facing vocabulary (``save_for_review``) MUST NOT appear
+# here; it would drift from the audit row and silently break aggregation.
+# The Phase 6 UX
 # verb ``run_pipeline`` is also intentionally absent: a pipeline run is
 # recorded under the ``runs`` table, not the
 # ``composer_completion_events_table``, so it has no audit row this
@@ -168,40 +162,6 @@ def _assert_completion_verb(name: str, value: str) -> None:
         raise ValueError(f"{name} must be one of {sorted(_KNOWN_COMPLETION_VERBS)!r}; got {value!r}")
 
 
-# ── Account-level mode opt-out / opt-in (B2.b post-state-only) ──────────
-
-
-def record_mode_opted_out(tel: SessionsTelemetry) -> None:
-    """Account-level opt-out of guided mode.
-
-    Fires when ``default_mode=freeform`` is set on
-    ``PATCH /api/composer-preferences``, regardless of the prior
-    state. Post-state-only per §"Account-level scope narrowing
-    (B2.b — load-bearing)" — no ``from_mode`` attribute, no
-    transition-shaped audit event accompanies this emit, and the
-    helper takes no kwargs. The design-doc-10 "opt-out rate" is a
-    ratio over ``composer.preferences.patch_total``, not a
-    transition-conditional count.
-    """
-    try:
-        tel.mode_opted_out_total.add(1, attributes={})
-    except Exception:
-        return None
-    return None
-
-
-def record_mode_opted_in(tel: SessionsTelemetry) -> None:
-    """Account-level opt-in to guided mode. Symmetric to
-    ``record_mode_opted_out``; post-state-only, kwarg-free,
-    attribute-free.
-    """
-    try:
-        tel.mode_opted_in_total.add(1, attributes={})
-    except Exception:
-        return None
-    return None
-
-
 # ── Per-session trust_mode switch (transition-shaped, B1-extended) ──────
 
 
@@ -216,9 +176,7 @@ def record_session_switched(
     Fires on ``PATCH /api/sessions/{session_id}/composer/preferences``
     when the session's ``trust_mode`` column changes. Carries
     ``from_mode`` and ``to_mode`` attributes drawn from the per-session
-    ``trust_mode`` CHECK constraint vocabulary — NOT the account-level
-    ``default_composer_mode`` vocabulary (``guided`` / ``freeform``
-    will be rejected by the assert below). The companion
+    ``trust_mode`` CHECK constraint vocabulary. The companion
     ``trust_mode.changed`` audit event carries both prior and new
     state under the B1 extension; this counter mirrors the audit shape
     (superset rule satisfied).
@@ -266,17 +224,13 @@ def record_session_completed(
     ``src/elspeth/web/sessions/models.py:735``). The valid values are
     ``mark_ready_for_review`` and ``export_yaml`` — those are the two
     completion gestures that write an audit row in the
-    ``composer_completion_events_table``. Per the CLAUDE.md superset
-    rule, the counter aggregates over committed audit rows, so its
-    attribute set MUST be a strict subset of the audit-row vocabulary.
+    ``composer_completion_events_table``. Per the logging-telemetry-policy
+    skill §The Superset Rule, the counter aggregates over committed audit
+    rows, so its attribute set MUST be a strict subset of the audit-row
+    vocabulary.
 
-    No ``mode`` attribute is carried. An earlier draft tagged each emit
-    with the user's account-level ``default_composer_mode``
-    (``guided`` / ``freeform``); the overall-plan reviewer for Sub-task
-    7c flagged that as additional state read at emit-time with no
-    corresponding column on ``composer_completion_events_table`` — i.e.
-    a telemetry attribute not present in the audit row, which is the
-    exact superset-rule violation the rule exists to prevent.
+    No ``mode`` attribute is carried because it has no corresponding column
+    on ``composer_completion_events_table``.
 
     Audit primacy. Call sites MUST place this helper AFTER the
     ``engine.begin()`` block that writes the corresponding
@@ -334,8 +288,8 @@ def record_interpretation_opt_out(tel: SessionsTelemetry) -> None:
 def record_audit_fetch_failure(tel: SessionsTelemetry) -> None:
     """B3 cohort (b2) — Phase 2C audit-readiness fetch failure.
 
-    Telemetry-only signal; superset exception for non-decision read
-    (CLAUDE.md primacy rule). No audit row companion.
+    Telemetry-only signal; superset exception for non-decision read (the
+    logging-telemetry-policy skill §The Primacy Test). No audit row companion.
     """
     try:
         tel.audit_fetch_failure_total.add(1, attributes={})

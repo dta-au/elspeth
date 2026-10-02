@@ -443,9 +443,12 @@ bumps for D2 anyway; adding one nullable column is negligible cost.
 - **[barrier-machinery.md](../barrier-machinery.md)** — the twin-implementation
   checklist and structural documentation for aggregation + coalesce. D1–D6
   changes apply to both sides per that checklist.
-- **ADR-024** (delivery governance for single-maintainer mode) — preserved.
-  The checkpoint row and journal remain embedded SQLite state; no external
-  service or separate store is added.
+- **ADR-024** (delivery governance for single-maintainer mode) — **Retired
+  2026-09-13**; the assurance posture moved to `GOVERNANCE.md` § Maintainer
+  Continuity. The constraint that mattered here is the embedded-database
+  discipline held by [ADR-026](026-durable-token-scheduler.md) §*What this is
+  NOT*, and it is unaffected: the checkpoint row and journal remain embedded
+  SQLite state; no external service or separate store is added.
 - **ADR-019** (two-axis terminal model) — preserved. The `TERMINAL` / `FAILED`
   axis distinction on scheduler rows is maintained through the atomic flush
   transition in D6.

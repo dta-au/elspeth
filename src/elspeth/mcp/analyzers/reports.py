@@ -9,6 +9,7 @@ All functions accept (db, factory) as their first two parameters.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from typing import Any
 
 from elspeth.contracts.enums import CallStatus, NodeType, RoutingMode
@@ -16,6 +17,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
 from elspeth.mcp.types import (
+    CollectorGroupFailureGroup,
     DAGStructureReport,
     ErrorAnalysisReport,
     ErrorResult,
@@ -49,8 +51,12 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
         rows_table,
         token_outcomes_table,
         tokens_table,
-        transform_errors_table,
         validation_errors_table,
+    )
+    from elspeth.core.landscape.terminal_transform_failures import (
+        deciding_collector_group_failures,
+        deciding_transform_errors,
+        failed_collector_groups,
     )
 
     run = factory.run_lifecycle.get_run(run_id)
@@ -107,6 +113,10 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
             or 0
         )
 
+        # G: failed collector groups, a structural count in groups (a group no
+        # member reached counts here and nowhere else).
+        collector_groups_failed = conn.execute(select(func.count()).select_from(failed_collector_groups((run_id,)).subquery())).scalar_one()
+
         # Count validation errors
         validation_error_count = (
             conn.execute(
@@ -115,11 +125,16 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
             or 0
         )
 
-        # Count transform errors
-        transform_error_count = (
-            conn.execute(select(func.count()).select_from(transform_errors_table).where(transform_errors_table.c.run_id == run_id)).scalar()
-            or 0
-        )
+        # Count tokens whose terminal outcome is a failure a transform error
+        # decided, not transform_errors rows: a row records an ATTEMPT, and a
+        # resumed attempt can fail again (another row) or succeed and deliver
+        # the row (a row for a token that never failed).
+        deciding = deciding_transform_errors((run_id,)).subquery()
+        transform_error_count = conn.execute(select(func.count(func.distinct(deciding.c.token_id)))).scalar_one()
+
+        # M: tokens whose collector group failed, each once. Disjoint from the
+        # transform count by terminal path, so the two add.
+        collector_group_member_count = len(deciding_collector_group_failures(conn, (run_id,)))
 
         # Get outcome distribution. ADR-019 makes outcome path-aware:
         # outcome is TerminalOutcome.value or NULL, path is always populated.
@@ -171,11 +186,13 @@ def get_run_summary(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str)
             "source_loads": source_load_count,
             "sink_writes": sink_write_count,
             "runtime_preflights": runtime_preflight_count,
+            "collector_groups_failed": collector_groups_failed,
         },
         "errors": {
             "validation": validation_error_count,
             "transform": transform_error_count,
-            "total": validation_error_count + transform_error_count,
+            "collector_group": collector_group_member_count,
+            "total": validation_error_count + transform_error_count + collector_group_member_count,
         },
         "outcome_distribution": outcome_distribution,  # type: ignore[typeddict-item]  # SA Row attr types
         "avg_state_duration_ms": round(avg_duration, 2) if avg_duration is not None else None,
@@ -374,6 +391,11 @@ def get_error_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id: s
         transform_errors_table,
         validation_errors_table,
     )
+    from elspeth.core.landscape.terminal_transform_failures import (
+        deciding_collector_group_failures,
+        deciding_transform_errors,
+        failed_collector_groups,
+    )
 
     run = factory.run_lifecycle.get_run(run_id)
     if run is None:
@@ -396,18 +418,39 @@ def get_error_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id: s
         )
         val_rows = conn.execute(val_by_node).fetchall()
 
-        # Transform errors by transform node using composite key
+        # Corruption guard over EVERY transform_errors row, not only the
+        # deciding ones counted below: a row naming no node is Tier-1
+        # corruption whether or not its token terminally failed, and gating
+        # the guard on the count would let such a row vanish silently.
+        orphaned_token_count = conn.execute(
+            select(func.count(func.distinct(transform_errors_table.c.token_id)))
+            .select_from(
+                transform_errors_table.outerjoin(
+                    nodes_table,
+                    (transform_errors_table.c.transform_id == nodes_table.c.node_id)
+                    & (transform_errors_table.c.run_id == nodes_table.c.run_id),
+                )
+            )
+            .where(transform_errors_table.c.run_id == run_id)
+            .where(nodes_table.c.node_id.is_(None))
+        ).scalar_one()
+
+        # Terminally failed tokens by the transform node whose error decided
+        # them. A transform_errors row records an ATTEMPT: a resumed attempt
+        # can fail again (another row) or succeed and deliver the row, and
+        # neither is a second failure or a failure at all.
+        deciding = deciding_transform_errors((run_id,)).subquery()
         trans_by_node = (
             select(
                 nodes_table.c.plugin_name,
-                func.count(transform_errors_table.c.error_id).label("count"),
+                func.count(func.distinct(deciding.c.token_id)).label("count"),
             )
-            .outerjoin(
-                nodes_table,
-                (transform_errors_table.c.transform_id == nodes_table.c.node_id)
-                & (transform_errors_table.c.run_id == nodes_table.c.run_id),
+            .select_from(
+                deciding.join(
+                    nodes_table,
+                    (deciding.c.transform_id == nodes_table.c.node_id) & (deciding.c.run_id == nodes_table.c.run_id),
+                )
             )
-            .where(transform_errors_table.c.run_id == run_id)
             .group_by(nodes_table.c.plugin_name)
         )
         trans_rows = conn.execute(trans_by_node).fetchall()
@@ -421,6 +464,17 @@ def get_error_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id: s
             select(transform_errors_table.c.error_details_json).where(transform_errors_table.c.run_id == run_id).limit(5)
         ).fetchall()
 
+        # Collector groups that FAILED as a whole: G from the verdict rows (a
+        # group no member reached still counts), M from the members'
+        # verdict holds. Only the recorded reason code is reported, never a
+        # flush state's text: flush states are attempt evidence.
+        failed_groups = conn.execute(failed_collector_groups((run_id,))).all()
+        member_failures = deciding_collector_group_failures(conn, (run_id,))
+        plugin_by_node = {
+            str(row.node_id): str(row.plugin_name)
+            for row in conn.execute(select(nodes_table.c.node_id, nodes_table.c.plugin_name).where(nodes_table.c.run_id == run_id))
+        }
+
     validation_summary = [
         {
             "source_plugin": row.plugin_name,
@@ -431,17 +485,31 @@ def get_error_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id: s
     ]
 
     # Corruption guard: transform_errors always reference a transform node.
-    # A None plugin_name bucket means the outerjoin found no matching node row.
-    for row in trans_rows:
-        if row.plugin_name is None:
-            msg = (
-                f"Tier-1 corruption: {row.count} transform_errors row(s) reference "
-                f"transform_id(s) with no matching node in nodes table "
-                f"for run_id={run_id!r}"
-            )
-            raise AuditIntegrityError(msg)
+    if orphaned_token_count:
+        msg = (
+            f"Tier-1 corruption: transform_errors for {orphaned_token_count} token(s) reference "
+            f"transform_id(s) with no matching node in nodes table "
+            f"for run_id={run_id!r}"
+        )
+        raise AuditIntegrityError(msg)
 
     transform_summary = [{"transform_plugin": row.plugin_name, "count": row.count} for row in trans_rows]
+
+    groups_by_collector = Counter((str(group.collector_node_id), str(group.failure_reason)) for group in failed_groups)
+    members_by_collector = Counter((member.collector_node_id, member.failure_reason.value) for member in member_failures)
+    # Every member's (node, reason) is its group's (the authority cross-checks
+    # each hold against its group row), so iterating the group keys loses no
+    # member; a group no member reached reports member_tokens = 0.
+    collector_summary: list[CollectorGroupFailureGroup] = [
+        {
+            "collector_plugin": plugin_by_node[node_id],
+            "node_id": node_id,
+            "failure_reason": failure_reason,
+            "groups": groups,
+            "member_tokens": members_by_collector[(node_id, failure_reason)],
+        }
+        for (node_id, failure_reason), groups in sorted(groups_by_collector.items())
+    ]
 
     return {
         "run_id": run_id,
@@ -454,6 +522,11 @@ def get_error_analysis(db: LandscapeDB, factory: AnalyzerRepositories, run_id: s
             "total": sum(r["count"] for r in transform_summary),
             "by_transform": transform_summary,  # type: ignore[typeddict-item]
             "sample_details": [json.loads(r[0]) if r[0] else None for r in sample_trans],
+        },
+        "collector_group_failures": {
+            "groups_total": len(failed_groups),
+            "member_tokens_total": len(member_failures),
+            "by_collector": collector_summary,
         },
     }
 

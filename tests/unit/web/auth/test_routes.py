@@ -24,7 +24,7 @@ from elspeth.web.auth.routes import LoginRequest, RegisterRequest, create_auth_r
 from elspeth.web.config import WebSettings
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 
-from .conftest import build_local_auth_provider
+from .conftest import build_local_auth_provider, saturated_worker_pool
 
 # What every IdP profile requires of a deployment, whichever one is selected.
 # ``WebSettings`` refuses a non-local provider that is missing any of them, so
@@ -168,6 +168,12 @@ def test_bounded_principal_truncates_oversized_passes_normal_and_preserves_none(
     bounded = _bounded_principal(oversized)
     assert bounded == oversized[:AUTH_AUDIT_PRINCIPAL_MAX_LENGTH]
     assert len(bounded) == AUTH_AUDIT_PRINCIPAL_MAX_LENGTH
+
+
+@pytest.mark.parametrize("email", ["a@b@c", "alice@@example.com", "alice@example.com@extra"])
+def test_register_request_rejects_multiple_at_signs(email: str) -> None:
+    with pytest.raises(ValueError, match="valid email address"):
+        RegisterRequest(username="alice", password="pw123", display_name="Alice", email=email)
 
 
 def _only_auth_event(rows, event_type: str, *, issuance_path: str | None = None):
@@ -601,6 +607,48 @@ class TestRegisterEndpoint:
 
         assert retry_response.status_code == 200
 
+    async def test_a_saturated_worker_pool_at_register_is_a_503_not_an_outbox_failure(self, tmp_path) -> None:
+        """The refusal must name the pool, not the disk.
+
+        ``AsyncWorkerAdmissionTimeoutError`` subclasses ``TimeoutError`` and
+        therefore ``OSError``, so before its own arm existed it was caught by
+        the ``except OSError`` that reports a failed outbox write -- sending
+        the operator to diagnose a disk that is fine, during exactly the
+        incident (pool saturation) that the SSO offloads make reachable.
+
+        This asserts BOTH halves: the status is 503, and the detail is not the
+        outbox message. Asserting only the status would still pass if the arm
+        were deleted and the outbox handler's message were changed to 503.
+        """
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        app = _create_test_app(provider, registration_mode="email_verified", data_dir=tmp_path)
+
+        async with _client_for(app) as client, saturated_worker_pool():
+            response = await client.post(
+                "/api/auth/register",
+                json={"username": "bob", "password": "pw123", "display_name": "Bob", "email": "bob@example.com"},
+            )
+
+        assert response.status_code == 503
+        assert "outbox" not in response.json()["detail"]
+        # Nothing was written: the work never reached the provider.
+        assert not (tmp_path / "email-verifications.jsonl").exists()
+
+    async def test_a_saturated_worker_pool_at_open_register_is_a_503(self, tmp_path) -> None:
+        """The open branch has no ``except OSError`` to mislabel it, but a bare
+        500 is still the wrong answer for work that never started and is safe
+        to retry once the pool drains."""
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        app = _create_test_app(provider, registration_mode="open")
+
+        async with _client_for(app) as client, saturated_worker_pool():
+            response = await client.post(
+                "/api/auth/register",
+                json={"username": "bob", "password": "pw123", "display_name": "Bob"},
+            )
+
+        assert response.status_code == 503
+
     async def test_register_email_verified_mode_requires_email(self, tmp_path) -> None:
         provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="email_verified", data_dir=tmp_path)
@@ -630,7 +678,7 @@ class TestRegisterEndpoint:
 
         assert response.status_code == 422
         assert not (tmp_path / "email-verifications.jsonl").exists()
-        assert provider.delete_user("bob") is False
+        assert provider.delete_user("bob", reason="left the team").removed_anything is False
 
     async def test_register_email_verified_mode_uses_configured_public_base_url(self, tmp_path) -> None:
         provider = build_local_auth_provider(tmp_path / "auth.db")
@@ -1535,7 +1583,7 @@ class TestLogout:
         assert event.identity_id == pyjwt.decode(token, options={"verify_signature": False})["sub"]
         assert event.request_id == "logout-1"
         assert event.user_agent == "pytest-client"
-        assert json.loads(event.metadata_json) == {"method": "POST", "path": "/api/auth/logout"}
+        assert json.loads(event.metadata_json) == {"method": "POST", "path": "/api/auth/logout", "compartment_id": None}
 
     @pytest.mark.asyncio
     async def test_logout_without_a_bearer_is_refused_and_writes_nothing(self, tmp_path) -> None:

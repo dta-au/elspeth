@@ -12,9 +12,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
-from elspeth.contracts import Determinism, SourceRow
+from elspeth.contracts import CallType, Determinism, RunMode, SourceRow
+from elspeth.contracts.call_mode import CallModeSession
 from elspeth.contracts.chat_parts import ChatMessage
-from elspeth.contracts.errors import FrameworkBugError, TelemetryExporterError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, TelemetryExporterError
 from elspeth.contracts.events import ResourceCleanupFailed
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
 from elspeth.contracts.plugin_context import PluginContext
@@ -41,6 +42,192 @@ def _install_provider(source: LLMSource, provider: FakeProvider) -> None:
     if original is not None:
         original.close()
     source._provider = provider
+
+
+def _mode_context(source_context: PluginContext, *, mode: RunMode, session: Any) -> PluginContext:
+    return PluginContext(
+        run_id=source_context.run_id,
+        node_id=source_context.node_id,
+        config={},
+        landscape=source_context.landscape,
+        operation_id=source_context.operation_id,
+        coordination_token=source_context.coordination_token,
+        run_mode=mode,
+        replay_from="source-run",
+        call_mode_session=session,
+    )
+
+
+@pytest.mark.parametrize("provider_name", ["azure", "bedrock", "openrouter", "gateway"])
+@pytest.mark.parametrize("source_problem", ["missing", "ambiguous"])
+def test_verify_source_matches_request_before_provider_construction(
+    provider_name: str,
+    source_problem: str,
+    provider_configs: dict[str, dict[str, Any]],
+    source_context: PluginContext,
+) -> None:
+    class VerifySession:
+        mode = RunMode.VERIFY
+
+        def preflight_verify_request(self, **kwargs: Any) -> str:
+            assert kwargs["call_type"] is CallType.LLM
+            assert kwargs["current_operation_id"] == source_context.operation_id
+            assert kwargs["current_state_id"] is None
+            assert kwargs["request_data"]["model"]
+            if provider_name == "azure":
+                assert "max_tokens" not in kwargs["request_data"]
+            raise AuditIntegrityError(f"Source request is {source_problem}")
+
+    source = LLMSource(provider_configs[provider_name])
+    ctx = _mode_context(source_context, mode=RunMode.VERIFY, session=VerifySession())
+    with patch.object(source, "_create_provider", side_effect=AssertionError("provider construction is forbidden")) as construct:
+        source.on_start(ctx)
+        construct.assert_not_called()
+        with pytest.raises(AuditIntegrityError, match=source_problem):
+            list(source.load(ctx))
+    construct.assert_not_called()
+
+
+@pytest.mark.parametrize("provider_name", ["azure", "bedrock", "openrouter", "gateway"])
+def test_replay_source_startup_does_not_construct_provider(
+    provider_name: str,
+    provider_configs: dict[str, dict[str, Any]],
+    source_context: PluginContext,
+) -> None:
+    class ReplaySession:
+        mode = RunMode.REPLAY
+
+    source = LLMSource(provider_configs[provider_name])
+    ctx = _mode_context(source_context, mode=RunMode.REPLAY, session=ReplaySession())
+    with patch.object(source, "_create_provider", side_effect=AssertionError("provider construction is forbidden")) as construct:
+        source.on_start(ctx)
+        with pytest.raises(FrameworkBugError, match="archived source rows"):
+            source.load(ctx)
+    construct.assert_not_called()
+
+
+def test_verify_source_constructs_provider_only_after_request_preflight(
+    openrouter_config: Any,
+    source_context: PluginContext,
+) -> None:
+    events: list[str] = []
+
+    class VerifySession:
+        mode = RunMode.VERIFY
+
+        def preflight_verify_request(self, **kwargs: Any) -> str:
+            assert kwargs["current_operation_id"] == source_context.operation_id
+            events.append("preflight")
+            return "source-call"
+
+    source = LLMSource(openrouter_config())
+    ctx = _mode_context(source_context, mode=RunMode.VERIFY, session=VerifySession())
+    provider = FakeProvider()
+
+    def construct(*args: Any, **kwargs: Any) -> FakeProvider:
+        assert events == ["preflight"]
+        events.append("construct")
+        return provider
+
+    with patch.object(source, "_create_provider", side_effect=construct):
+        source.on_start(ctx)
+        assert source._provider is None
+        rows = list(source.load(ctx))
+
+    assert len(rows) == 1
+    assert events == ["preflight", "construct"]
+    assert provider.calls == 1
+
+
+@pytest.mark.parametrize("mode", [RunMode.REPLAY, RunMode.VERIFY])
+def test_replay_verify_source_rejects_tracing_before_provider_or_exporter_start(
+    mode: RunMode,
+    provider_configs: dict[str, dict[str, Any]],
+    source_context: PluginContext,
+) -> None:
+    config = dict(provider_configs["azure"])
+    config["tracing"] = {
+        "provider": "azure_ai",
+        "connection_string": "InstrumentationKey=00000000-0000-0000-0000-000000000000",
+    }
+    source = LLMSource(config)
+    ctx = _mode_context(source_context, mode=mode, session=MagicMock(spec_set=CallModeSession, mode=mode))
+    with (
+        patch.object(source, "_create_provider", side_effect=AssertionError("provider construction is forbidden")) as construct,
+        patch(
+            "elspeth.plugins.sources.llm.source.create_langfuse_tracer", side_effect=AssertionError("tracing exporter started")
+        ) as tracer,
+        patch(
+            "elspeth.plugins.sources.llm.source._configure_azure_monitor", side_effect=AssertionError("Azure monitor started")
+        ) as monitor,
+        pytest.raises(FrameworkBugError, match="tracing"),
+    ):
+        source.on_start(ctx)
+
+    construct.assert_not_called()
+    tracer.assert_not_called()
+    monitor.assert_not_called()
+
+
+def test_azure_source_config_hides_key_repr(provider_configs: dict[str, dict[str, Any]]) -> None:
+    from elspeth.plugins.sources.llm.config import AzureOpenAILLMSourceConfig
+
+    config = AzureOpenAILLMSourceConfig.from_dict(provider_configs["azure"])
+    assert config.api_key not in repr(config)
+    assert config.api_key not in str(config)
+    assert config.api_key == provider_configs["azure"]["api_key"]
+
+
+@pytest.mark.parametrize("temperature", ["omitted", None, 0.0, 0.7])
+def test_azure_source_preserves_temperature_wire_contract(
+    temperature: str | float | None,
+    provider_configs: dict[str, dict[str, Any]],
+    source_context: PluginContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    import openai
+
+    requests: list[dict[str, Any]] = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "source-response",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-2099-01-01",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+            },
+        )
+
+    sdk = openai.AzureOpenAI(
+        api_key="source-probe",
+        azure_endpoint="https://example.openai.azure.com",
+        api_version="2024-10-21",
+        http_client=httpx.Client(transport=httpx.MockTransport(reply)),
+    )
+    monkeypatch.setattr(AzureLLMProvider, "_get_underlying_client", lambda self: sdk)
+    config = provider_configs["azure"]
+    if temperature != "omitted":
+        config["temperature"] = temperature
+    source = LLMSource(config)
+    try:
+        source.on_start(source_context)
+        rows = list(source.load(source_context))
+        assert len(rows) == 1
+        assert len(requests) == 1
+        assert requests[0]["model"] == config["deployment_name"]
+        if temperature is None or temperature == "omitted":
+            assert "temperature" not in requests[0]
+        else:
+            assert requests[0]["temperature"] == temperature
+    finally:
+        source.close()
+        sdk.close()
 
 
 def _install_runtime_rejecting_schema(source: LLMSource) -> None:
@@ -71,7 +258,9 @@ def test_load_calls_provider_once_and_emits_one_transform_compatible_row(
     assert provider.calls == 1
     operation_id = source_context.operation_id
     assert operation_id is not None
-    assert provider.audit_parents == [LLMAuditParent.for_operation(operation_id=operation_id)]
+    assert provider.audit_parents == [
+        LLMAuditParent.for_operation(operation_id=operation_id, coordination_token=source_context.require_coordination_token())
+    ]
     assert provider.messages == [[ChatMessage(role="user", content="Summarise the audit topic.")]]
     assert provider.runtime_preflight_calls == 0
     assert len(rows) == 1
@@ -221,7 +410,9 @@ def test_provider_error_records_operation_parented_trace(
     assert operation_id is not None
     assert tracer.successes == []
     assert len(tracer.errors) == 1
-    assert tracer.errors[0]["parent"] == LLMAuditParent.for_operation(operation_id=operation_id)
+    assert tracer.errors[0]["parent"] == LLMAuditParent.for_operation(
+        operation_id=operation_id, coordination_token=source_context.require_coordination_token()
+    )
     assert tracer.errors[0]["prompt"] == "Summarise the audit topic."
     assert tracer.errors[0]["model"] == "openai/gpt-4o-mini"
     assert isinstance(tracer.errors[0]["latency_ms"], float)
@@ -284,7 +475,9 @@ def test_bad_provider_result_records_operation_parented_error_trace(
     assert operation_id is not None
     assert tracer.successes == []
     assert len(tracer.errors) == 1
-    assert tracer.errors[0]["parent"] == LLMAuditParent.for_operation(operation_id=operation_id)
+    assert tracer.errors[0]["parent"] == LLMAuditParent.for_operation(
+        operation_id=operation_id, coordination_token=source_context.require_coordination_token()
+    )
     assert tracer.errors[0]["prompt"] == "Summarise the audit topic."
     assert tracer.errors[0]["model"] == "served-model"
     assert isinstance(tracer.errors[0]["latency_ms"], float)
@@ -1025,7 +1218,9 @@ def test_success_records_operation_parented_trace_with_served_result_details(
     assert tracer.errors == []
     assert len(tracer.successes) == 1
     trace = tracer.successes[0]
-    assert trace["parent"] == LLMAuditParent.for_operation(operation_id=operation_id)
+    assert trace["parent"] == LLMAuditParent.for_operation(
+        operation_id=operation_id, coordination_token=source_context.require_coordination_token()
+    )
     assert trace["prompt"] == "Summarise the audit topic."
     assert trace["response_content"] == "A careful answer"
     assert trace["model"] == "served-model"
@@ -1063,6 +1258,7 @@ def test_source_does_not_re_guard_the_tracer_boundary(
 @pytest.mark.parametrize("failure", [FrameworkBugError("trace invariant failed"), KeyboardInterrupt(), SystemExit(17)])
 def test_success_trace_does_not_suppress_unsuppressible_failures(
     source: LLMSource,
+    source_context: PluginContext,
     failure: BaseException,
 ) -> None:
     tracer = RecordingTracer()
@@ -1073,7 +1269,7 @@ def test_success_trace_does_not_suppress_unsuppressible_failures(
         pytest.raises(type(failure)),
     ):
         source._trace_success(
-            parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            parent=LLMAuditParent.for_operation(operation_id="operation-1", coordination_token=source_context.require_coordination_token()),
             prompt="prompt",
             response_content="response",
             model="served-model",
@@ -1085,6 +1281,7 @@ def test_success_trace_does_not_suppress_unsuppressible_failures(
 @pytest.mark.parametrize("failure", [FrameworkBugError("trace invariant failed"), KeyboardInterrupt(), SystemExit(17)])
 def test_error_trace_does_not_suppress_unsuppressible_failures(
     source: LLMSource,
+    source_context: PluginContext,
     failure: BaseException,
 ) -> None:
     tracer = RecordingTracer()
@@ -1095,7 +1292,7 @@ def test_error_trace_does_not_suppress_unsuppressible_failures(
         pytest.raises(type(failure)),
     ):
         source._trace_error(
-            parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            parent=LLMAuditParent.for_operation(operation_id="operation-1", coordination_token=source_context.require_coordination_token()),
             prompt="prompt",
             error_message="provider failed",
             model="configured-model",
@@ -1132,6 +1329,11 @@ def test_schema_validation_failure_applies_configured_policy(
         assert rows[0].source_row_index == 0
         assert rows[0].quarantine_destination == destination
         assert source_context.pop_pending_quarantine_validation_error_id(rows[0].row) is not None
+        # The declared field keeps its name; the undeclared response keys and every value never appear.
+        assert rows[0].quarantine_error == (
+            "4 validation errors: request_id: [missing]; [undeclared]: [extra_forbidden]; "
+            "[undeclared]: [extra_forbidden]; [undeclared]: [extra_forbidden]"
+        )
 
 
 @pytest.mark.parametrize("destination", ["quarantine", "discard"])
@@ -1179,6 +1381,7 @@ def test_on_start_constructs_real_provider_variant_without_preflight(
     provider_type: type[AzureLLMProvider | OpenRouterLLMProvider | BedrockLLMProvider | GatewayLLMProvider],
 ) -> None:
     config = dict(provider_configs[provider_name])
+    config["pricing_model"] = "azure/gpt-4o"
     if provider_name == "azure":
         config.update(api_version="2025-01-01-preview")
     elif provider_name == "openrouter":
@@ -1202,7 +1405,8 @@ def test_on_start_constructs_real_provider_variant_without_preflight(
         assert provider._run_id == source_context.run_id
         assert provider._telemetry_emit is source_context.telemetry_emit
         assert provider._limiter is source._limiter
-        assert provider._resolved_prompt_template_hash == source._template.template_hash
+        assert provider._approved_prompt_artifact_hash is None
+        assert provider._pricing_model == "azure/gpt-4o"
         if isinstance(provider, AzureLLMProvider):
             assert provider._endpoint == "https://example.openai.azure.com"
             assert provider._api_key == "test-api-key"
@@ -1389,3 +1593,81 @@ def test_structured_extraction_failure_discard_emits_nothing(
     rows = list(source.load(source_context))
 
     assert rows == []
+
+
+# The LLM source shares the transform's Tier-3 structured-output parse
+# (``extract_structured_fields``), so the binding of each ``OutputFieldConfig.type``
+# to one row type and the numeric parse INTO that type hold here too: JSON has
+# one number type, so ``5.0`` under ``integer`` is the int 5 and ``7`` under
+# ``number`` the float 7.0 (operator ruling 2026-09-25: bound and parsed
+# together). The source's schema already declares ``int`` / ``float`` for them
+# (``build_llm_source_output_schema_config``); the row now carries exactly that.
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_score", "expected_confidence"),
+    [
+        ('{"score": 5.0, "confidence": 7, "label": "pass"}', 5, 7.0),
+        ('{"score": 5, "confidence": 0.25, "label": "pass"}', 5, 0.25),
+        ('{"score": -3.0, "confidence": 1.0, "label": "fail"}', -3, 1.0),
+    ],
+    ids=["integral-float-under-integer-and-int-under-number", "int-and-float", "negative-integral-float-and-integral-float"],
+)
+def test_structured_source_parses_json_numbers_into_the_bound_row_types(
+    openrouter_config: Any,
+    source_context: PluginContext,
+    content: str,
+    expected_score: int,
+    expected_confidence: float,
+) -> None:
+    source = _structured_source(
+        openrouter_config,
+        source_context,
+        output_fields=[
+            {"suffix": "score", "type": "integer"},
+            {"suffix": "confidence", "type": "number"},
+            {"suffix": "label", "type": "enum", "values": ["pass", "fail"]},
+        ],
+    )
+    provider = FakeProvider(
+        LLMQueryResult(
+            content=content,
+            usage=TokenUsage.known(prompt_tokens=7, completion_tokens=3),
+            model="served-model",
+            finish_reason=FinishReason.STOP,
+        )
+    )
+    _install_provider(source, provider)
+
+    rows = list(source.load(source_context))
+
+    assert len(rows) == 1
+    assert rows[0].is_quarantined is False
+    score = rows[0].row["score"]
+    confidence = rows[0].row["confidence"]
+    assert (score, type(score)) == (expected_score, int)
+    assert (confidence, type(confidence)) == (expected_confidence, float)
+
+
+def test_structured_source_rejects_a_non_integral_float_under_integer(
+    openrouter_config: Any,
+    source_context: PluginContext,
+) -> None:
+    """The parse converts only a spelling of the same number; ``3.5`` is not an integer and follows on_validation_failure."""
+    source = _structured_source(openrouter_config, source_context, on_validation_failure="quarantine")
+    provider = FakeProvider(
+        LLMQueryResult(
+            content='{"score": 3.5, "label": "pass"}',
+            usage=TokenUsage.known(prompt_tokens=7, completion_tokens=3),
+            model="served-model",
+            finish_reason=FinishReason.STOP,
+        )
+    )
+    _install_provider(source, provider)
+
+    rows = list(source.load(source_context))
+
+    assert len(rows) == 1
+    assert rows[0].is_quarantined is True
+    assert rows[0].quarantine_error is not None
+    assert "score" in rows[0].quarantine_error

@@ -9,8 +9,13 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import Determinism
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.transforms.aws.textract_inline_analysis import AWSTextractInlineAnalysis
 from elspeth.testing import make_pipeline_row
+from tests.fixtures.factories import make_context, make_token_info
+from tests.fixtures.mock_audit import mock_audit_authority
 
 
 def _probe_transform() -> AWSTextractInlineAnalysis:
@@ -21,7 +26,7 @@ def _probe_transform() -> AWSTextractInlineAnalysis:
 class _ProbeAuditWriter:
     calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         del state_id
         return len(self.calls)
 
@@ -30,13 +35,13 @@ class _ProbeAuditWriter:
         return SimpleNamespace(call_id=f"probe-call-{len(self.calls)}")
 
 
-def _probe_context() -> SimpleNamespace:
-    return SimpleNamespace(
+def _probe_context() -> PluginContext:
+    return make_context(
+        **mock_audit_authority("probe-run"),
         state_id="probe-state",
-        token=None,
+        token=make_token_info(token_id="token-1"),
         landscape=_ProbeAuditWriter(),
         run_id="probe-run",
-        telemetry_emit=lambda _event: None,
     )
 
 

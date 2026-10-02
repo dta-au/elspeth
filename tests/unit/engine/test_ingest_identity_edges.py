@@ -11,7 +11,7 @@ semantics of the source iteration loop (source_iteration.py):
    Quarantined rows are not identity-less: each gets a durable rows-table row
    (source_node_id, source_row_index, ingest_sequence, payload) plus a token
    with a completed terminal outcome, so resume's unprocessed-rows filter
-   excludes them and ordering cannot misattribute (filigree elspeth-1869c9ba64).
+   excludes them and ordering cannot misattribute (archived issue elspeth-1869c9ba64).
 2. The same invariants hold across sources: interleaved quarantines preserve
    ``ingest_sequence`` as a strict gapless global ordering in declaration
    order, and per-source ``source_row_index`` stays contiguous INCLUDING

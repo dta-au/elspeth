@@ -56,7 +56,7 @@ from uuid import uuid4
 
 import pytest
 
-from elspeth.contracts import Determinism, PipelineRow, RunStatus, SourceRow, TokenInfo
+from elspeth.contracts import Determinism, PipelineRow, RowResult, RunStatus, SourceRow, TokenInfo
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, OutputMode
 from elspeth.contracts.identity import LineageFrame
@@ -92,10 +92,10 @@ from elspeth.engine.processor import RowProcessor
 from elspeth.engine.spans import SpanFactory
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.testing import make_pipeline_row, make_source_row, make_source_row_quarantined
+from elspeth.testing import make_pipeline_row, make_source_quarantine_result, make_source_row, make_source_row_quarantined
 from tests.fixtures.base_classes import _TestSchema, _TestSourceBase, as_sink, as_source, as_transform
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import make_landscape_db, make_recorder_with_run
 from tests.fixtures.plugins import CollectSink
 
 
@@ -117,7 +117,6 @@ class _TokenManagerDouble:
         parents: list[TokenInfo],
         merged_data: PipelineRow,
         node_id: NodeID,
-        run_id: str,
         **_kwargs: Any,
     ) -> tuple[TokenInfo, str]:
         merged = TokenInfo(
@@ -140,8 +139,8 @@ class _SpyCoalesceExecutor(CoalesceExecutor):
         super().__init__(*args, **kwargs)
         self._resolutions = resolutions
 
-    def check_timeouts(self, coalesce_name: str) -> list[Any]:
-        results = super().check_timeouts(coalesce_name)
+    def check_timeouts(self, coalesce_name: str, *, coordination_token: CoordinationToken) -> list[Any]:
+        results = super().check_timeouts(coalesce_name, coordination_token=coordination_token)
         self._resolutions.append(bool(results))
         return results
 
@@ -463,6 +462,7 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
         clock = MockClock(start=1_750_000_000.0)
 
         execution = MagicMock(spec=ExecutionRepository)
+        authority_setup = make_recorder_with_run(run_id="run-quarantine-coalesce")
         execution.begin_node_state.side_effect = lambda **kw: SimpleNamespace(state_id=f"cs-{uuid4().hex[:8]}")
         # has_completed_group_for_node lives on BarrierRestoreReadModel, not
         # ExecutionRepository (spec-checked here). A fully autospec'd
@@ -512,7 +512,9 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
                 row_data=make_pipeline_row({"value": 1}),
                 lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="direct_branch"),),
             )
-            coalesce_executor.accept(token, "merge_paths", arrival_time=clock.monotonic())
+            coalesce_executor.accept(
+                token, "merge_paths", arrival_time=clock.monotonic(), coordination_token=authority_setup.coordination_token
+            )
             return []
 
         processor = MagicMock(spec=RowProcessor)
@@ -527,17 +529,23 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
             ceremony=MagicMock(spec=RunCeremony),
         )
         driver._quarantine_router = MagicMock(spec=QuarantineRouter)
+
         # The clock only jumps once the loop moves past the valid row —
         # i.e. once a quarantined row is on deck — mirroring the original
         # source's clock-jump timing. The jump is far larger than the
         # timeout budget so the very next sweep sees the deadline expired.
-        driver._quarantine_router.route.side_effect = lambda *a, **kw: clock.advance(_CLOCK_JUMP_SECONDS)
+        def _route_quarantined(*_args: Any, **_kwargs: Any) -> RowResult:
+            clock.advance(_CLOCK_JUMP_SECONDS)
+            return make_source_quarantine_result(sink_name="default")
+
+        driver._quarantine_router.route.side_effect = _route_quarantined
         lifecycle = MagicMock(spec=SourceLifecycleRecorder)
         lifecycle.record_field_resolution.return_value = ({}, None)
         driver._lifecycle_recorder = lifecycle
 
         source = MagicMock(spec=SourceProtocol)
         source.name = "fake"
+        source.config = {}
         source.on_success = "default"
         sink = MagicMock(spec=SinkProtocol)
         sink.name = "default"
@@ -574,7 +582,7 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
                 active_source_name="fake",
                 active_source=source,
                 flush_end_of_input=False,
-                coordination_token=CoordinationToken(run_id="run-quarantine-coalesce", worker_id="worker:test", leader_epoch=1),
+                coordination_token=authority_setup.coordination_token,
             )
 
         assert resolutions == [False, True, False], (

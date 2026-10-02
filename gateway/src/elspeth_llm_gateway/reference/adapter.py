@@ -46,9 +46,10 @@ something this adapter cannot read is refused at admission instead of
 failing every completion.
 
 A conversation entry carries ``text`` when the canonical message has
-content, ``operations`` when it is an assistant message requesting tool
-calls, and ``operation_ref`` when it is a tool-result message answering a
-prior call. ``directives`` is present only when the request declares tools;
+content, except exact-empty assistant text alongside tool calls. It carries
+``operations`` when an assistant requests tool calls, and ``operation_ref``
+when a tool-result message answers a prior call. ``directives`` is present
+only when the request declares tools;
 ``directive_policy`` is present only when the request sets ``tool_choice``
 (``mode`` mirrors it verbatim; ``operation`` is added, from
 ``tool_choice_function``, only when ``mode`` is ``"named"``); ``format`` is
@@ -61,9 +62,12 @@ did not set it, and is never present at all for ``{"kind": "object"}``.
 Success response body::
 
     {
-        "result": {"text": "..."} | {"invocations": [
-            {"ref": "<call id>", "operation": "<name>", "payload": {...}}
-        ]},
+        "result": {
+            "text": "..."?,
+            "invocations": [
+                {"ref": "<call id>", "operation": "<name>", "payload": {...}}
+            ]?
+        },
         "halt": "complete" | "truncated" | "operations" | "screened",
         "accounting": {"input_units": <int>, "output_units": <int>}?
     }
@@ -118,6 +122,7 @@ _FAULT_KIND_TO_CLASSIFICATION: dict[str, ErrorClassification] = {
 }
 
 _FALLBACK_CLASSIFICATION = ErrorClassification(code="upstream_response_invalid", retryable=False)
+_REQUEST_REJECTED_CLASSIFICATION = ErrorClassification(code="upstream_request_rejected", retryable=False)
 
 
 def _build_tool_call(invocation: dict) -> CanonicalToolCall:
@@ -138,7 +143,7 @@ def _conversation_entry(message: CanonicalMessage) -> dict:
     # field names for text/tool-calls/tool-results) will differ from this
     # fictional speaker/text/operations/operation_ref shape.
     entry: dict = {"speaker": message.role}
-    if message.content is not None:
+    if message.content is not None and not (message.role == "assistant" and message.content == "" and message.tool_calls):
         entry["text"] = message.content
     if message.tool_calls:
         entry["operations"] = [
@@ -270,7 +275,7 @@ class ReferenceV1InvokeAdapter:
             invocations = result["invocations"]
             if not invocations:
                 raise ValueError(f"reference_v1_invoke: empty invocations for halt={halt!r}")
-            text = None
+            text = result["text"] if "text" in result else None
             tool_calls = tuple(_build_tool_call(invocation) for invocation in invocations)
         else:
             tool_calls = ()
@@ -304,12 +309,10 @@ class ReferenceV1InvokeAdapter:
         return CanonicalResponse(text=text, tool_calls=tool_calls, finish_reason=finish_reason, usage=usage)
 
     def classify_error(self, failure: UpstreamFailure) -> ErrorClassification:
-        if failure.body is None or "fault" not in failure.body:
-            return _FALLBACK_CLASSIFICATION
-        fault = failure.body["fault"]
-        if "kind" not in fault:
-            return _FALLBACK_CLASSIFICATION
-        kind = fault["kind"]
-        if kind not in _FAULT_KIND_TO_CLASSIFICATION:
-            return _FALLBACK_CLASSIFICATION
-        return _FAULT_KIND_TO_CLASSIFICATION[kind]
+        if failure.body is not None and "fault" in failure.body:
+            fault = failure.body["fault"]
+            if isinstance(fault, dict) and "kind" in fault and fault["kind"] in _FAULT_KIND_TO_CLASSIFICATION:
+                return _FAULT_KIND_TO_CLASSIFICATION[fault["kind"]]
+        if failure.status in (400, 422):
+            return _REQUEST_REJECTED_CLASSIFICATION
+        return _FALLBACK_CLASSIFICATION

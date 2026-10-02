@@ -261,9 +261,9 @@ class TestDiscoverAllPlugins:
         from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 
         # Expected counts verified during migration from hookimpl files
-        EXPECTED_SOURCE_COUNT = 9  # Seven original sources plus llm plus blob_rows (elspeth-0c6a343921)
-        EXPECTED_TRANSFORM_COUNT = 37  # Existing 34 plus reference_join, blob_json_expand and blob_text_expand
-        EXPECTED_SINK_COUNT = 9  # csv, json, text, document, database, aws_s3, azure_blob, dataverse, chroma_sink
+        EXPECTED_SOURCE_COUNT = 10  # Runtime discovery includes the Power Automate HTTP source.
+        EXPECTED_TRANSFORM_COUNT = 39  # Existing 34 plus reference_join, blob_json_expand, blob_text_expand, azure_ai_search and batch_rank
+        EXPECTED_SINK_COUNT = 10  # Runtime discovery includes the Power Automate member-effect sink.
 
         discovered = discover_all_plugins()
 
@@ -285,6 +285,11 @@ class TestDiscoverAllPlugins:
         from elspeth.plugins.infrastructure.clients.dataverse import DataverseAuthConfig
         from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchAuthMode
         from elspeth.plugins.infrastructure.clients.retrieval.connection import ChromaConnectionMode, ChromaSearchMode
+        from elspeth.plugins.infrastructure.power_automate import (
+            PowerAutomateManagedIdentityAuth,
+            PowerAutomateSASAuth,
+            PowerAutomateServicePrincipalAuth,
+        )
         from elspeth.plugins.sources.llm.source import LLMSource
         from elspeth.plugins.transforms.aws.textract_config_shared import AuthMode as TextractAuthMode
         from elspeth.plugins.transforms.llm.transform import LLMTransform
@@ -297,30 +302,35 @@ class TestDiscoverAllPlugins:
         pb09 = next(leg for leg in catalog["legs"] if leg["id"] == "PB-09")
         catalog_keys = {case["plugin_key"] for case in pb09["required_cases"]}
 
-        assert len(live_keys) == 55
+        assert len(live_keys) == 59
         assert live_keys == golden_keys == catalog_keys
 
         dataverse_modes = get_args(DataverseAuthConfig.model_fields["method"].annotation)
+        power_automate_modes = {
+            value
+            for model in (PowerAutomateSASAuth, PowerAutomateServicePrincipalAuth, PowerAutomateManagedIdentityAuth)
+            for value in get_args(model.model_fields["method"].annotation)
+        }
         variant_map = {
             "source:azure_blob": set(get_args(AzureAuthMethod)),
             "source:dataverse": set(dataverse_modes),
             "source:llm": set(LLMSource.discriminated_variants()[1]),
+            "source:power_automate": power_automate_modes,
             "transform:aws_textract_document_analysis": set(get_args(TextractAuthMode)),
             "transform:aws_textract_inline_analysis": set(get_args(TextractAuthMode)),
+            "transform:azure_ai_search": {mode.replace("_", "-") for mode in get_args(AzureSearchAuthMode)},
             "transform:llm": set(LLMTransform.discriminated_variants()[1]),
-            "transform:rag_retrieval": {
-                *(f"azure-search-{mode.replace('_', '-')}" for mode in get_args(AzureSearchAuthMode)),
-                *(f"chroma-{mode}" for mode in get_args(ChromaSearchMode)),
-            },
+            "transform:rag_retrieval": {f"chroma-{mode}" for mode in get_args(ChromaSearchMode)},
             "sink:azure_blob": set(get_args(AzureAuthMethod)),
             "sink:chroma_sink": set(get_args(ChromaConnectionMode)),
             "sink:dataverse": set(dataverse_modes),
+            "sink:power_automate": power_automate_modes,
         }
         expected_pairs = {(plugin_key, variant) for plugin_key in live_keys for variant in variant_map.get(plugin_key, {"default"})}
         golden_pairs = {(entry["plugin_key"], variant) for entry in matrix["plugins"] for variant in entry["variants"]}
         catalog_pairs = {(case["plugin_key"], case["variant_id"]) for case in pb09["required_cases"]}
 
-        assert len(expected_pairs) == 76
+        assert len(expected_pairs) == 83
         assert expected_pairs == golden_pairs == catalog_pairs
         assert {case["case_id"] for case in pb09["required_cases"]} == {
             plugin_key if variant == "default" else f"{plugin_key}@{variant}" for plugin_key, variant in expected_pairs

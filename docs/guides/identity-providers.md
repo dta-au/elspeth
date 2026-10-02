@@ -370,6 +370,17 @@ name parts and the ABN are not carried in the ID token. Its endpoints must all
 be served from the issuer's own origin. The ABN is recorded against the
 identity as its organisation identifier.
 
+Successful identity binding refreshes the stored name, email, and ABN,
+including the first login of an identity an administrator pre-provisioned.
+Absent optional claims preserve their stored values. The subject-to-email
+rebound check runs before those fields are updated.
+
+An identity (local or SSO) that has previously logged in and then exceeds
+`identity_dormancy_days` (90 by default) returns to pending at its next login
+and needs administrator reactivation. Reactivation starts a new window. The
+last active human administrator remains active so the deployment retains an
+administrator; that exemption is recorded in the authentication audit trail.
+
 ---
 
 ## Keeping the client secret out of the repository
@@ -480,11 +491,11 @@ deployment refuses to start rather than inventing one.
 
 Both must be greater than zero.
 
-Two further settings, `quota_container_tokens_per_day` and
-`quota_container_storage_bytes`, are accepted and validated but **not yet
-enforced**: no runtime path reads either in this release. Do not treat them as
-a container-wide spend ceiling — setting them changes nothing today. The
-per-identity defaults above are the control that exists.
+The optional `quota_container_tokens_per_day` setting is enforced as a
+container-wide ceiling for every chargeable LLM operation. The optional
+`quota_container_storage_bytes` setting is accepted and validated but is not
+yet enforced. The per-identity defaults above remain the normal identity-level
+control.
 
 ### The compartment marking
 
@@ -600,6 +611,26 @@ is granted separately, in this deployment, by an administrator here, and
 recorded in `identity_roles` with a granting identity, a timestamp, an optional
 expiry, and a note. The roles are a closed set: `admin`, `approver`, `reviewer`,
 `user`, `curator`, `auditor`, `oversight`.
+
+Pipeline authoring, execution, replay, cancellation, and progress-ticket
+operations require a live deployment-wide `user` grant on an active human
+identity from the configured browser provider. The check is repeated at each
+route and again at durable execution and WebSocket-consumption boundaries.
+`auditor` and `oversight` remain reserved role values and authorize no Web API
+route in 0.8.1.
+
+Machine-to-Web-API authentication is reserved and unavailable in 0.8.1.
+`service` remains a storage discriminator for the future organisation-console
+contract; there is no service credential issuer or service-authenticated Web
+router in this release. A human browser bearer token must never be stored,
+rotated, or presented as a service credential.
+
+Administrators remove never-activated pending rows with
+`POST /api/auth/admin/identities/purge-pending`. The server uses
+`identity_pending_retention_days`; callers cannot supply a shorter window.
+Each request deletes a deterministic batch of at most 200 rows strictly older
+than the database-time cutoff and writes the exact deleted identity IDs to the
+authentication audit trail. Repeat while `has_more` is true.
 
 The practical consequence for a first-time deployment: **a first login lands
 pending, not active.** Someone who authenticates successfully is refused access

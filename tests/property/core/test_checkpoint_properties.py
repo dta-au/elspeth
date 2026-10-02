@@ -41,6 +41,7 @@ from elspeth.core.checkpoint import CheckpointCompatibilityValidator, Checkpoint
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import nodes_table, rows_table, runs_table, tokens_table
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import insert_crashed_leader_seat, leader_token_for
 from tests.helpers.checkpoint import create_checkpoint
 from tests.strategies.json import json_primitives
@@ -120,7 +121,7 @@ def setup_checkpoint_prerequisites(
             runs_table.insert().values(
                 run_id=run_id,
                 started_at=now,
-                config_hash="test-config-hash",
+                config_hash=fake_sha256("test-config-hash"),
                 settings_json="{}",
                 canonical_version="sha256-rfc8785-v1",
                 status=RunStatus.RUNNING,
@@ -141,7 +142,7 @@ def setup_checkpoint_prerequisites(
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0",
                 determinism=Determinism.DETERMINISTIC,
-                config_hash="source-hash",
+                config_hash=fake_sha256("source-hash"),
                 config_json="{}",
                 registered_at=now,
             )
@@ -156,7 +157,7 @@ def setup_checkpoint_prerequisites(
                 node_type=NodeType.TRANSFORM,
                 plugin_version="1.0",
                 determinism=Determinism.DETERMINISTIC,
-                config_hash="transform-hash",
+                config_hash=fake_sha256("transform-hash"),
                 config_json="{}",
                 registered_at=now,
             )
@@ -171,7 +172,7 @@ def setup_checkpoint_prerequisites(
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="data-hash",
+                source_data_hash=fake_sha256("data-hash"),
                 created_at=now,
             )
         )

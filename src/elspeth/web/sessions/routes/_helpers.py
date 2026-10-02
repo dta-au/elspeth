@@ -1,7 +1,8 @@
 """Session API routes -- /api/sessions/* with IDOR protection.
 
-All endpoints require authentication via Depends(get_current_user).
-Session-scoped endpoints verify ownership before any business logic.
+Owner-workspace endpoints require a live deployment-wide ``user`` role through
+``require_pipeline_user``. Session-scoped endpoints then verify ownership
+before any business logic.
 """
 
 from __future__ import annotations
@@ -10,12 +11,14 @@ import asyncio
 import contextlib
 import json
 import sys
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import replace as _replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Final, Literal, cast
+from typing import Annotated, Any, Final, Literal, cast, overload
 from uuid import UUID, uuid4
 from weakref import WeakValueDictionary
 
@@ -24,23 +27,20 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from opentelemetry import metrics
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import insert
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyPoolTimeoutError
 
 import elspeth.contracts.errors as contract_errors
+from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionRefused
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
     InterpretationEventRecord,
     InterpretationSource,
 )
-from elspeth.contracts.composer_llm_audit import (
-    ComposerChatInitiator,
-    ComposerChatTurn,
-    ComposerChatTurnStatus,
-    ComposerLLMCall,
-)
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressReason, ComposerProgressSink
-from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, GuidedCustodyIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -51,12 +51,14 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
-from elspeth.web.blobs.protocol import BlobQuotaExceededError, BlobServiceProtocol
+from elspeth.web.blobs.protocol import BlobQuotaExceededError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService as CatalogServiceProtocol
+from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord, chat_ingress_input
 from elspeth.web.composer import yaml_generator
+from elspeth.web.composer.advisor_decision import AdvisorGateDecision
 from elspeth.web.composer.audit import (
     BufferingRecorder,
     audit_envelope,
@@ -65,45 +67,16 @@ from elspeth.web.composer.audit import (
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.control_messages import replay_composer_control_message
-from elspeth.web.composer.guided.audit import (
-    emit_dropped_to_freeform,
-    emit_step_advanced,
-    emit_turn_answered,
-    emit_turn_emitted,
-)
-from elspeth.web.composer.guided.chat_solver import maybe_resolve_step_1_source_chat
-from elspeth.web.composer.guided.emitters import (
-    _inspection_matches_source_plugin,
-    build_initial_step_1_turn,
-    build_step_1_inspect_and_confirm_turn_from_intent,
-    build_step_1_schema_form_turn,
-    build_step_1_schema_form_turn_from_resolved,
-    build_step_1_source_prefill,
-    build_step_2_multi_select_turn,
-    build_step_2_schema_form_turn,
-    build_step_2_schema_form_turn_from_resolved,
-    build_step_2_single_select_turn,
-    build_step_4_wire_turn,
-)
-from elspeth.web.composer.guided.errors import InvariantError
-from elspeth.web.composer.guided.profile import EMPTY_PROFILE, WorkflowProfile
-from elspeth.web.composer.guided.protocol import ChatRole, ChatTurn, ControlSignal, GuidedStep, TurnType
-from elspeth.web.composer.guided.state_machine import (
-    GuidedSession,
-    SinkIntent,
-    SourceResolved,
-    TerminalKind,
-    TerminalReason,
-    TerminalState,
-    TurnRecord,
-)
+from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
 from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.no_tool_policy import visible_message_segments
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.progress import (
     ComposerProgressRegistry,
     ComposerProgressSnapshot,
+    ComposerRequestLease,
     client_cancelled_progress_event,
     convergence_progress_event,
 )
@@ -116,53 +89,46 @@ from elspeth.web.composer.protocol import (
     ComposerService,
     ComposerServiceError,
 )
+from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.composer.provider_telemetry import (
     begin_composer_request_metrics,
     finish_composer_request_metrics,
     mark_composer_request_terminal,
 )
-from elspeth.web.composer.redaction import redact_guided_snapshot_storage_paths, redact_source_storage_path
-from elspeth.web.composer.service import _BadRequestLLMError
-from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content
+from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationEntry, ValidationSummary
 from elspeth.web.composer.telemetry_phase8 import (
     SessionsTelemetry,
     record_session_completed,
     record_session_switched,
 )
-from elspeth.web.composer.tools import _DATA_ERROR_KEY, ToolResult, execute_tool
+from elspeth.web.composer.tools import execute_tool
+from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.composer.yaml_generator import generate_public_yaml
+from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost, DatabaseComposerProgressRegistry
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.completion_gates import (
     COMPLETION_GATES_META_KEY,
     CompletionGatesDict,
     completion_gates_meta_from_facts,
-    completion_gates_meta_value,
     parse_completion_gates,
+    resolve_completion_gate_facts,
 )
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.execution.validation import validate_pipeline
-from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limiter
+from elspeth.web.middleware.rate_limit import WebRateLimiter, get_rate_limiter
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_authored_composition_state
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions._auto_title import maybe_auto_title_session
-from elspeth.web.sessions._guided_step_chat import (
-    _COMMIT_REJECTED_MESSAGE,
-    _SYNTHETIC_UNAVAILABLE_MESSAGE,
-    Step2SinkChatResult,
-    StepChatResult,
-    resolve_step_1_source_chat_with_auto_drop,
-    resolve_step_2_sink_chat_with_auto_drop,
-    solve_step_chat_with_auto_drop,
-)
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.audit_story_models import RunAuditStoryResponse
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryService
 from elspeth.web.sessions.converters import state_from_record as _state_from_record
-from elspeth.web.sessions.guided_replay import project_composition_proposal, validation_errors_for_composer_surface
 from elspeth.web.sessions.models import composer_completion_events_table
+from elspeth.web.sessions.proposal_projection import project_composition_proposal
 from elspeth.web.sessions.protocol import (
     AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST,
     SESSION_TERMINAL_RUN_STATUS_VALUES,
@@ -170,8 +136,10 @@ from elspeth.web.sessions.protocol import (
     ChatMessageRole,
     ComposerSessionPreferencesRecord,
     CompositionProposalRecord,
+    CompositionRejectionEventRecord,
     CompositionStateData,
     CompositionStateRecord,
+    CompositionValidationError,
     InterpretationEventAlreadyResolvedError,
     InterpretationEventNotFoundError,
     InterpretationNodeMissingError,
@@ -189,25 +157,20 @@ from elspeth.web.sessions.protocol import (
     SessionRecord,
     SessionServiceProtocol,
     TransitionAssistantDraft,
+    serialize_composition_validation_errors,
 )
 from elspeth.web.sessions.schemas import (
     AcceptProposalRequest,
     ChatMessageResponse,
     ChatMessageSegmentResponse,
-    ChatTurnResponse,
     ComposerPreferencesResponse,
     CompositionObject,
     CompositionProposalResponse,
     CompositionStateResponse,
+    CompositionValidationErrorResponse,
     CreateSessionRequest,
     ForkSessionRequest,
     ForkSessionResponse,
-    GetGuidedResponse,
-    GuidedChatRequest,
-    GuidedChatResponse,
-    GuidedRespondRequest,
-    GuidedRespondResponse,
-    GuidedSessionResponse,
     InterpretationEventResponse,
     InterpretationOptOutResponse,
     InterpretationResolveRequest,
@@ -222,13 +185,10 @@ from elspeth.web.sessions.schemas import (
     RunResponse,
     SendMessageRequest,
     SessionResponse,
-    TerminalStateResponse,
-    TurnPayloadResponse,
-    TurnRecordResponse,
+    ToolRejectionResponse,
     UpdateComposerPreferencesRequest,
     UpdateSessionRequest,
     ValidationEntryResponse,
-    WorkflowProfileResponse,
 )
 
 slog = structlog.get_logger()
@@ -254,42 +214,6 @@ def _log_last_resort_diagnostic(log_call: Callable[..., object], event: str, /, 
 
 _REDACTED_SECRET_DETAIL = "<redacted-secret>"
 _PROVIDER_DETAIL_REDACTED = "Provider detail redacted because it may contain secrets."
-_GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL = (
-    "Source path is outside the allowed upload area. "
-    "Upload the file through the composer or use a path under the configured blobs directory."
-)
-
-
-@trust_boundary(
-    tier=3,
-    source=(
-        "ToolResult.data payload from the guided source-commit tool path — plugin/tool-produced "
-        "content whose nested shape no first-party contract promotes before this egress sanitizer"
-    ),
-    source_param="tool_result",
-    suppresses=("R1", "R5"),
-    invariant=(
-        "raises TypeError when the carrier is not an exact ToolResult; any unrecognized "
-        "ToolResult.data shape yields the closed generic detail string, never a raw repr "
-        "(the raw tool_result repr can dump CompositionState with Tier-3 row data and must "
-        "not reach the HTTP body)"
-    ),
-    test_ref=(
-        "tests/unit/web/sessions/routes/test_trust_boundary_helpers.py::test_guided_source_commit_failure_detail_rejects_non_tool_result"
-    ),
-    test_fingerprint="30d4ed69702aa3b786449e221203286bc29047cdc9a9318d42800affdd64abe2",
-)
-def _guided_source_commit_failure_detail(tool_result: object) -> str:
-    if type(tool_result) is not ToolResult:
-        raise TypeError(f"guided source commit failure detail requires ToolResult, got {type(tool_result).__name__}")
-    raw_data = tool_result.data
-    if isinstance(raw_data, Mapping):
-        error = raw_data.get(_DATA_ERROR_KEY)
-        if isinstance(error, str) and error.startswith("Path violation (S2):") and "Source file paths" in error:
-            return _GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL
-    return "Step 1 source commit failed"
-
-
 _MAX_PROVIDER_DETAIL_CHARS = 1_000
 
 
@@ -349,9 +273,9 @@ def _get_session_compose_lock_registry(request: Request) -> _SessionComposeLockR
     return cast(_SessionComposeLockRegistry, request.app.state.session_compose_lock_registry)
 
 
-def _get_composer_progress_registry(request: Request) -> ComposerProgressRegistry:
+def _get_composer_progress_registry(request: Request) -> ComposerProgressRegistry | DatabaseComposerProgressRegistry:
     """Return the app-scoped composer progress registry."""
-    return cast(ComposerProgressRegistry, request.app.state.composer_progress_registry)
+    return cast(ComposerProgressRegistry | DatabaseComposerProgressRegistry, request.app.state.composer_progress_registry)
 
 
 def _request_plugin_policy_context(
@@ -364,8 +288,9 @@ def _request_plugin_policy_context(
     return PolicyCatalogView(catalog, snapshot, request.app.state.operator_profile_registry), snapshot
 
 
-def _composer_progress_sink(
-    registry: ComposerProgressRegistry,
+async def _composer_progress_sink(
+    registry: ComposerProgressRegistry | DatabaseComposerProgressRegistry,
+    request: Request,
     *,
     session_id: str,
     request_id: str | None,
@@ -379,7 +304,8 @@ def _composer_progress_sink(
     composer request.
     """
 
-    return registry.bind_request(
+    return await registry.claim_request(
+        lease=cast(ComposerRequestLease, request.state.composer_request_lease),
         session_id=session_id,
         request_id=request_id,
         user_id=user_id,
@@ -469,6 +395,14 @@ class _ToolCallOutcomeKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class _ToolCallRejection:
+    """Public closed-code guidance, with no session-derived diagnostic text."""
+
+    error_code: str
+    guidance: tuple[str, str]
+
+
+@dataclass(frozen=True, slots=True)
 class _ToolCallOutcome:
     """Server-derived outcome of one tool call, projected for the SPA.
 
@@ -479,6 +413,7 @@ class _ToolCallOutcome:
 
     outcome: _ToolCallOutcomeKind
     applied_state_version: int | None
+    rejection: _ToolCallRejection | None = None
 
 
 def _tool_call_outcomes_by_call_id(
@@ -575,10 +510,43 @@ def _tool_call_outcomes_by_call_id(
                 )
                 continue
             if "success" in content and content["success"] is False:
-                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.REJECTED, applied_state_version=None)
+                # The failure producer puts the rejected mutation first; later
+                # errors can describe the unchanged baseline, so never search
+                # them for a replacement diagnosis. Only registered codes with
+                # public catalogue guidance cross into the conversation. Raw
+                # messages remain confined to the audit opt-in below.
+                validation = content["validation"] if "validation" in content else None
+                errors = validation["errors"] if type(validation) is dict and "errors" in validation else None
+                leading_error = errors[0] if type(errors) is list and errors else None
+                code = leading_error["error_code"] if type(leading_error) is dict and "error_code" in leading_error else None
+                rejection: _ToolCallRejection | None = None
+                if type(code) is str and code in REGISTERED_ERROR_CODES:
+                    guidance = explain_validation_code(code)
+                    if guidance is not None:
+                        rejection = _ToolCallRejection(code, guidance)
+                outcomes[row.tool_call_id] = _ToolCallOutcome(
+                    outcome=_ToolCallOutcomeKind.REJECTED, applied_state_version=None, rejection=rejection
+                )
                 continue
         outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.COMPLETED, applied_state_version=None)
     return outcomes
+
+
+def _rejections_by_tool_call_id(
+    records: Sequence[CompositionRejectionEventRecord],
+) -> dict[str, CompositionRejectionEventRecord]:
+    """Index one session's rejection rows by provider tool_call_id.
+
+    ``uq_chat_messages_tool_call_id`` makes a tool_call_id unique per session
+    and the compose loop writes at most one rejection per tool row, so a
+    duplicate is Tier-1 corruption: crash rather than silently pick one.
+    """
+    indexed: dict[str, CompositionRejectionEventRecord] = {}
+    for record in records:
+        if record.tool_call_id in indexed:
+            raise AuditIntegrityError("composition_rejection_events holds two rows for one tool_call_id in a session")
+        indexed[record.tool_call_id] = record
+    return indexed
 
 
 def _message_response(
@@ -586,6 +554,7 @@ def _message_response(
     *,
     include_raw_content: bool = False,
     tool_outcomes: Mapping[str, _ToolCallOutcome] | None = None,
+    rejections: Mapping[str, CompositionRejectionEventRecord] | None = None,
 ) -> ChatMessageResponse:
     """Convert a ChatMessageRecord to a ChatMessageResponse.
 
@@ -601,6 +570,16 @@ def _message_response(
     stamp is derived from Tier-1 tool rows server-side — never from tool
     names. Envelopes without a projection are passed through untouched and
     render under the client's conservative default.
+
+    Rejected envelopes can additionally carry ``rejection`` with only the
+    leading closed error code and static public catalogue guidance. This
+    supports recovery in the conversation without publishing raw diagnostic
+    messages, source facts, or the separate audit-only rejection record.
+
+    ``rejections`` (elspeth-3e28029d2f read side) is supplied only by the
+    audit-grade view under ``include_rejection_reasons``; a ``role="tool"``
+    row whose call id has a rejection row carries it as ``rejection``. Every
+    other caller omits it and the field stays ``None``.
     """
     tool_calls = deep_thaw(msg.tool_calls) if msg.tool_calls is not None else None
     if tool_calls is not None and tool_outcomes:
@@ -623,11 +602,33 @@ def _message_response(
                     "outcome": projected.outcome.value,
                     "applied_state_version": projected.applied_state_version,
                 }
+                if projected.rejection is not None:
+                    entry["rejection"] = {
+                        "error_code": projected.rejection.error_code,
+                        "guidance": list(projected.rejection.guidance),
+                    }
             stamped.append(entry)
         tool_calls = stamped
+    rejection_record = (
+        rejections[msg.tool_call_id]
+        if rejections is not None and msg.role == "tool" and msg.tool_call_id is not None and msg.tool_call_id in rejections
+        else None
+    )
+    rejection = (
+        ToolRejectionResponse(
+            tool_name=rejection_record.tool_name,
+            error_code=rejection_record.error_code,
+            message=rejection_record.message,
+            composition_state_id=rejection_record.composition_state_id,
+            created_at=rejection_record.created_at,
+        )
+        if rejection_record is not None
+        else None
+    )
     return ChatMessageResponse(
         id=str(msg.id),
         session_id=str(msg.session_id),
+        client_request_id=str(msg.client_request_id) if msg.client_request_id is not None else None,
         role=msg.role,
         content=msg.content,
         raw_content=msg.raw_content if include_raw_content else None,
@@ -644,6 +645,7 @@ def _message_response(
         tool_call_id=msg.tool_call_id,
         parent_assistant_id=str(msg.parent_assistant_id) if msg.parent_assistant_id else None,
         sequence_no=msg.sequence_no,
+        rejection=rejection,
     )
 
 
@@ -750,6 +752,167 @@ def _litellm_error_detail(
     return detail
 
 
+async def _handle_composer_provider_failure(
+    exc: Exception,
+    *,
+    route: Literal["messages", "recompose"],
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    composition_state_id: UUID | None,
+    progress_sink: ComposerProgressSink | None,
+    session_operation_context: SessionOperationContext,
+    expose_provider_error: bool,
+) -> HTTPException:
+    """Publish one safe provider disposition for either Composer HTTP route."""
+    from litellm.exceptions import BadGatewayError, ServiceUnavailableError
+
+    failure = classify_provider_failure(exc)
+    if failure is None:
+        raise TypeError("Composer provider failure requires a classified SDK exception")
+    slog.error(
+        "compose_llm_provider_error",
+        route=route,
+        session_id=str(session_id),
+        exc_class=type(exc).__name__,
+    )
+    if failure.kind == "auth":
+        headline = "The composer model is not available."
+        evidence = "The model provider rejected the composer request."
+        likely_next = "Check the composer provider configuration before retrying."
+        reason: ComposerProgressReason = "provider_auth_failed"
+        error_type = "llm_auth_error"
+    elif failure.kind == "bad_request":
+        headline = "The composer model rejected this request."
+        evidence = "The model provider rejected the composer request as invalid."
+        likely_next = "Check the composer provider configuration and request options before retrying."
+        reason = "provider_unavailable"
+        error_type = "llm_unavailable"
+    elif failure.kind == "timeout":
+        headline = "The composer model did not respond in time."
+        evidence = "The model call timed out."
+        likely_next = "Retry later; if this continues, ask an administrator to investigate the model gateway."
+        reason = "provider_unavailable"
+        error_type = "llm_unavailable"
+    else:
+        headline = "The composer model is temporarily unavailable."
+        evidence = "The model provider did not complete the request."
+        likely_next = (
+            "Retry later; if this continues, ask an administrator to investigate the model gateway."
+            if isinstance(exc, (BadGatewayError, ServiceUnavailableError))
+            else "Retry when the provider is available."
+        )
+        reason = "provider_unavailable"
+        error_type = "llm_unavailable"
+    if progress_sink is not None:
+        await _publish_progress(
+            progress_sink,
+            event=ComposerProgressEvent(
+                phase="failed",
+                headline=headline,
+                evidence=(evidence,),
+                likely_next=likely_next,
+                reason=reason,
+            ),
+        )
+    llm_calls = _llm_calls_from_exception(exc)
+    if llm_calls:
+        await _persist_llm_calls(
+            service,
+            session_id,
+            llm_calls,
+            composition_state_id,
+            plugin_crash_pending=True,
+            session_operation_context=session_operation_context,
+        )
+    # Gateway 502/503 text may contain an upstream response body. The staging
+    # debug option cannot make that material safe for a user-facing surface.
+    gateway_failure = isinstance(exc, (BadGatewayError, ServiceUnavailableError)) or failure.kind == "timeout"
+    detail = _litellm_error_detail(
+        error_type,
+        exc,
+        expose_provider_error=expose_provider_error and not gateway_failure,
+    )
+    if gateway_failure:
+        detail["guidance"] = likely_next
+    return HTTPException(status_code=504 if failure.kind == "timeout" else 502, detail=detail)
+
+
+async def _handle_composer_chargeable_refusal(
+    exc: ChargeableAdmissionRefused,
+    *,
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    composition_state_id: UUID | None,
+    progress_sink: ComposerProgressSink | None,
+    session_operation_context: SessionOperationContext,
+) -> HTTPException:
+    """Keep unknown token usage distinct from a failed provider dispatch."""
+    llm_calls = _llm_calls_from_exception(exc)
+    if llm_calls:
+        await _persist_llm_calls(
+            service,
+            session_id,
+            llm_calls,
+            composition_state_id,
+            plugin_crash_pending=True,
+            session_operation_context=session_operation_context,
+        )
+    if exc.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE:
+        guidance = "Ask an administrator to reconcile token accounting before retrying."
+        if progress_sink is not None:
+            await _publish_progress(
+                progress_sink,
+                event=ComposerProgressEvent(
+                    phase="failed",
+                    headline="Token accounting is unavailable for this request.",
+                    evidence=("A new provider attempt could not be admitted.",),
+                    likely_next=guidance,
+                    reason="accounting_unavailable",
+                ),
+            )
+        return HTTPException(
+            status_code=503,
+            detail={
+                "error_type": "composer_admission_refused",
+                "failure_code": "token_accounting_unavailable",
+                "detail": "Token accounting is unavailable, so a new model call cannot start. Ask an administrator to reconcile usage before retrying.",
+                "guidance": guidance,
+            },
+        )
+    if progress_sink is not None:
+        await _publish_progress(
+            progress_sink,
+            event=ComposerProgressEvent(
+                phase="failed",
+                headline="This request was refused by the admission policy.",
+                evidence=(str(exc),),
+                likely_next="Ask an administrator to review your access and quota configuration.",
+                reason="admission_refused",
+            ),
+        )
+    return HTTPException(
+        status_code=403,
+        detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},
+    )
+
+
+def composition_validation_error_responses(
+    values: Sequence[CompositionValidationError] | None,
+) -> list[CompositionValidationErrorResponse] | None:
+    """Serialize checked owned errors into the strict nested HTTP shape."""
+    records = serialize_composition_validation_errors(values)
+    if records is None:
+        return None
+    return [CompositionValidationErrorResponse(**record) for record in records]
+
+
+def _validation_entry_responses(entries: Sequence[ValidationEntry]) -> list[ValidationEntryResponse]:
+    """Project owned Stage-1 warnings and suggestions into their HTTP shape."""
+    return [
+        ValidationEntryResponse(component=e.component, message=e.message, severity=e.severity, error_code=e.error_code) for e in entries
+    ]
+
+
 def _state_response(
     state: CompositionStateRecord,
     live_validation: ValidationSummary | None = None,
@@ -778,22 +941,7 @@ def _state_response(
         redacted = redact_source_storage_path({"sources": sources_data})
         sources_data = redacted["sources"]
 
-    # B4 (guided): a guided blob-backed source is committed via the manual
-    # set_source path, which strips ``blob_ref`` (it cannot prove
-    # ``path == storage_path``). So the committed source AND the persisted
-    # GuidedSession snapshot in ``composer_meta`` both carry the absolute
-    # storage_path with no ``blob_ref`` for the source-keyed redaction above to
-    # key off, and the snapshot is serialised here unredacted. Cross-reference
-    # the snapshot's RETAINED ``blob_ref`` (a no-DB-lookup signal that the source
-    # is blob-backed) to mask the storage_path in both the snapshot and the
-    # committed source before either reaches the wire.
     composer_meta_data = deep_thaw(state.composer_meta) if state.composer_meta is not None else None
-    sources_data, composer_meta_data = redact_guided_snapshot_storage_paths(
-        sources_data,
-        composer_meta_data,
-        raw_sources=raw_sources,
-        degrade_unbindable=degrade_unbindable_custody,
-    )
 
     return CompositionStateResponse(
         id=str(state.id),
@@ -805,19 +953,9 @@ def _state_response(
         outputs=deep_thaw(state.outputs),
         metadata=deep_thaw(state.metadata_),
         is_valid=state.is_valid,
-        validation_errors=deep_thaw(state.validation_errors),
-        validation_warnings=[
-            ValidationEntryResponse(component=e.component, message=e.message, severity=e.severity, error_code=e.error_code)
-            for e in live_validation.warnings
-        ]
-        if live_validation is not None
-        else None,
-        validation_suggestions=[
-            ValidationEntryResponse(component=e.component, message=e.message, severity=e.severity, error_code=e.error_code)
-            for e in live_validation.suggestions
-        ]
-        if live_validation is not None
-        else None,
+        validation_errors=composition_validation_error_responses(state.validation_errors),
+        validation_warnings=_validation_entry_responses(live_validation.warnings) if live_validation is not None else None,
+        validation_suggestions=_validation_entry_responses(live_validation.suggestions) if live_validation is not None else None,
         derived_from_state_id=str(state.derived_from_state_id) if state.derived_from_state_id is not None else None,
         created_at=state.created_at,
         composer_meta=composer_meta_data,
@@ -930,7 +1068,7 @@ async def _durable_completion_gates(
     """
     record = await service.get_current_state(session_id)
     if record is None:
-        return {}
+        return completion_gates_meta_from_facts(None)
     return completion_gates_meta_from_facts(parse_completion_gates(record.composer_meta))
 
 
@@ -940,42 +1078,12 @@ def merge_composer_meta_updates(
 ) -> CompositionObject:
     """Merge route-owned updates without dropping opaque lifecycle metadata.
 
-    ``composer_meta`` is a shared persistence envelope.  Version-changing
-    freeform writes must carry forward keys owned by guided mode and other
-    subsystems rather than rebuilding the envelope from only the keys they
-    understand.
+    ``composer_meta`` is a shared persistence envelope. Version-changing
+    writes retain keys owned by other subsystems.
     """
     merged = cast(CompositionObject, dict(deep_thaw(existing_meta))) if existing_meta is not None else {}
     merged.update(updates)
     return merged
-
-
-GUIDED_CUSTODY_PROJECTION_FAILED = "guided_custody_projection_failed"
-GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL = (
-    "This session's retained guided source review no longer matches the files this pipeline uses; "
-    "restore an earlier version from Composition history to continue."
-)
-GUIDED_CUSTODY_REVERT_REFUSED_DETAIL = (
-    "This version can't be restored: its guided source review no longer matches "
-    "the files this pipeline uses. Choose a different version from Composition history."
-)
-
-
-@contextlib.contextmanager
-def _named_guided_custody_projection(detail: str = GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL) -> Iterator[None]:
-    """Name a custody-unbindable tip's read refusal instead of a bare 500.
-
-    Only a tip persisted BEFORE the write gate (elspeth-4c442aaaa8) can still
-    raise here: the gate refuses new active pairs and the projection degrades
-    terminal ones. The 409 carries a constant detail — never the path.
-    """
-    try:
-        yield
-    except GuidedCustodyIntegrityError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"error_type": GUIDED_CUSTODY_PROJECTION_FAILED, "detail": detail},
-        ) from exc
 
 
 def _recovery_partial_state_response(state: CompositionStateRecord) -> dict[str, Any]:
@@ -1011,11 +1119,12 @@ def _interpretation_event_response(event: InterpretationEventRecord) -> Interpre
         model_version=event.model_version,
         provider=event.provider,
         composer_skill_hash=event.composer_skill_hash,
+        surface_origin=event.surface_origin,
         arguments_hash=event.arguments_hash,
         hash_domain_version=event.hash_domain_version,
         runtime_model_identifier_at_resolve=event.runtime_model_identifier_at_resolve,
         runtime_model_version_at_resolve=event.runtime_model_version_at_resolve,
-        resolved_prompt_template_hash=event.resolved_prompt_template_hash,
+        approved_prompt_artifact_hash=event.approved_prompt_artifact_hash,
     )
 
 
@@ -1219,31 +1328,18 @@ def _runtime_preflight_failure_errors(
     exception_class: str,
     exception_message_first_line: str,
     frames: Sequence[str],
-) -> list[str]:
-    """Build the structured ``validation_errors`` list for a runtime-preflight crash.
+) -> list[CompositionValidationError]:
+    """Preserve bounded diagnostics with a directly owned failure code.
 
-    Replaces the legacy opaque ``["runtime_preflight_failed"]`` sentinel
-    with a self-describing list. The first entry remains
-    ``"runtime_preflight_failed"`` so existing parsers/UIs that key on
-    the sentinel continue to work; subsequent entries are advisory and
-    may be empty when frame capture is impossible (e.g. when only
-    ``exception_class`` is available without a live traceback).
-
-    Schema is preserved: each entry is a string, so
-    :class:`CompositionStateData.validation_errors` (typed
-    ``Sequence[str]``) does not need a migration. Operators / the LLM
-    parsing the audit row receive ``"key=value"`` shaped strings.
-
-    Bounded length: ``exception_message_first_line`` is clipped to
-    :data:`_RUNTIME_PREFLIGHT_MESSAGE_LIMIT` characters. ``frames`` is
-    limited at the caller (see :func:`_safe_frame_strings`).
+    The sentinel has a known code. Other permitted diagnostic strings remain
+    message-only records; no identity is inferred from their prose.
     """
     truncated_msg = exception_message_first_line[:_RUNTIME_PREFLIGHT_MESSAGE_LIMIT]
     return [
-        "runtime_preflight_failed",
-        f"exception_class={exception_class}",
-        f"exception_message={truncated_msg}",
-        *frames,
+        CompositionValidationError(message="runtime_preflight_failed", error_code="runtime_preflight_failed", component=None),
+        CompositionValidationError(message=f"exception_class={exception_class}", error_code=None, component=None),
+        CompositionValidationError(message=f"exception_message={truncated_msg}", error_code=None, component=None),
+        *(CompositionValidationError(message=frame, error_code=None, component=None) for frame in frames),
     ]
 
 
@@ -1284,6 +1380,114 @@ _COMPOSER_AUTHORING_VALIDATION_COUNTER = metrics.get_meter(__name__).create_coun
 # explosion) — per-session attribution lives on the progress snapshot.
 _ComposerRequestEndpoint = Literal["send_message", "recompose"]
 _ComposerRequestTerminalStatus = Literal["completed", "failed", "timed_out", "cancelled"]
+
+
+@dataclass(frozen=True)
+class _FreeformContinuationReceipt:
+    """A fully projected freeform turn whose terminal progress was published."""
+
+    response: MessageWithStateResponse
+    terminal_status: Literal["completed"] = "completed"
+
+
+@dataclass(frozen=True)
+class _FreeformChildFailure:
+    """An observed child error retained for one route-level propagation."""
+
+    error: Exception | asyncio.CancelledError
+
+
+async def _capture_freeform_child[T](awaitable: Awaitable[T]) -> T | _FreeformChildFailure:
+    """Keep lease-owned children successful while the route inspects faults.
+
+    Lease close otherwise rethrows a child error already translated by the
+    route and groups it with that HTTP response. The route joins immediately,
+    inspects this envelope, and propagates the original error exactly once.
+    """
+    try:
+        return await awaitable
+    except (Exception, asyncio.CancelledError) as exc:
+        return _FreeformChildFailure(exc)
+
+
+def _freeform_child_result[T](outcome: T | _FreeformChildFailure) -> T:
+    """Propagate one inspected child fault without replaying it at lease close."""
+    if isinstance(outcome, _FreeformChildFailure):
+        if isinstance(outcome.error, asyncio.CancelledError):
+            raise AuditIntegrityError("Freeform continuation cancelled before settlement") from outcome.error
+        raise outcome.error
+    return outcome
+
+
+@overload
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T]) -> T: ...
+
+
+@overload
+async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T], *, primary_cancellation: asyncio.CancelledError) -> T | None: ...
+
+
+async def _join_shielded_task_after_cancellation[T](
+    task: asyncio.Task[T], *, primary_cancellation: asyncio.CancelledError | None = None
+) -> T | None:
+    """Join an owned cleanup task despite repeated caller cancellation."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            if not task.done():
+                raise
+    try:
+        return task.result()
+    except BaseException as child_error:
+        if primary_cancellation is None:
+            raise
+        fatal = (
+            child_error.subgroup(contract_errors.TIER_1_ERRORS) is not None
+            if isinstance(child_error, BaseExceptionGroup)
+            else isinstance(child_error, contract_errors.TIER_1_ERRORS)
+        )
+        if fatal:
+            raise child_error from primary_cancellation
+        if isinstance(child_error, asyncio.CancelledError):
+            raise AuditIntegrityError("Shielded cleanup task was cancelled before completion") from primary_cancellation
+        if not isinstance(child_error, Exception):
+            raise
+        primary_cancellation.add_note(f"Shielded cleanup also failed with {type(child_error).__name__}.")
+        previous_cause = primary_cancellation.__cause__
+        primary_cancellation.__cause__ = (
+            child_error if previous_cause is None else BaseExceptionGroup("Shielded cleanup failures", [previous_cause, child_error])
+        )
+        return None
+
+
+async def _join_freeform_owned_task[T](task: asyncio.Task[T]) -> tuple[T, asyncio.CancelledError | None]:
+    """Join one required continuation through repeated caller cancellation.
+
+    The caller retains its operation lease and compose lock while joining.
+    A child that cancels itself has not proved settlement, even if the HTTP
+    caller happened to cancel in the same event-loop turn.
+    """
+    first_cancellation: asyncio.CancelledError | None = None
+    owner = asyncio.current_task()
+    if owner is None:
+        raise RuntimeError("Freeform settlement requires an owning request task")
+    while True:
+        try:
+            return await asyncio.shield(task), first_cancellation
+        except asyncio.CancelledError as exc:
+            if owner.cancelling():
+                owner.uncancel()
+                if first_cancellation is None:
+                    first_cancellation = exc
+            if task.done():
+                if task.cancelled():
+                    raise AuditIntegrityError("Freeform continuation cancelled before settlement") from exc
+                return task.result(), first_cancellation
+
+
 _COMPOSER_REQUESTS_INFLIGHT = metrics.get_meter(__name__).create_up_down_counter(
     "composer.requests.inflight",
     unit="1",
@@ -1621,29 +1825,30 @@ def _composer_chat_history(messages: Sequence[ChatMessageRecord]) -> list[Compos
             history_message = ComposerHistoryMessage(role=message.role, content=_composer_history_content(message))
             if message.role == "user" and message.writer_principal in {"route_user_message", "session_fork"}:
                 history_message["_elspeth_user_authored"] = True
+                history_message["_elspeth_user_message_id"] = str(message.id)
             history.append(history_message)
     return history
+
+
+def _chat_ingress_inputs(messages: Sequence[ChatMessageRecord], *, own_compartment_id: str | None) -> list[ChatIngressInput]:
+    """Collect exact persisted human inputs in transcript order, without their text."""
+    return [
+        chat_ingress_input(str(message.id), message.content, own_compartment_id=own_compartment_id)
+        for message in messages
+        if message.role == "user" and message.writer_principal in {"route_user_message", "session_fork"}
+    ]
 
 
 def _composer_persisted_validation(
     authoring: ValidationSummary,
     runtime_preflight: _RuntimePreflightOutcome,
-) -> tuple[bool, list[str] | None]:
+) -> tuple[bool, list[CompositionValidationError] | None]:
     """Return persisted validity/errors for a composer-produced state.
 
-    When the runtime preflight crashed unexpectedly, emit a structured
-    diagnostic list (sentinel + ``exception_class=...`` +
-    ``exception_message=...`` + ``frame=...`` entries) so the persisted
-    audit row carries the attribution the previous opaque
-    ``["runtime_preflight_failed"]`` sentinel withheld. The first entry
-    remains the legacy sentinel so external parsers keying on it (the
-    SPA / LLM recovery loop) continue to detect the failure class.
-
-    The bare-sentinel path is preserved for the
-    :data:`_RUNTIME_PREFLIGHT_FAILED` zero-arg constant — older tests
-    construct it directly and assert the legacy single-string output
-    to lock in the contract that authoring-valid + opaque-runtime-fail
-    persists as ``is_valid=False``.
+    Runtime crashes retain a directly coded failure record followed by the
+    existing bounded diagnostic messages. Validator outcomes carry their
+    owned code and component directly. No diagnostic prose is parsed to
+    manufacture identity, and opaque runtime failure remains invalid.
     """
     # Exact-type dispatch on our own ``_RuntimePreflightOutcome`` union
     # (``ValidationResult | _RuntimePreflightFailed | None``). ``type() is``
@@ -1653,18 +1858,26 @@ def _composer_persisted_validation(
     # rather than relying on negative narrowing of a single branch.
     if type(runtime_preflight) is _RuntimePreflightFailed:
         if runtime_preflight.exception_class is None:
-            return False, ["runtime_preflight_failed"]
+            return False, [
+                CompositionValidationError(message="runtime_preflight_failed", error_code="runtime_preflight_failed", component=None)
+            ]
         return False, _runtime_preflight_failure_errors(
             runtime_preflight.exception_class,
             runtime_preflight.exception_message_first_line,
             runtime_preflight.frames,
         )
     if type(runtime_preflight) is ValidationResult:
-        messages = [error.message for error in runtime_preflight.errors]
+        messages = [
+            CompositionValidationError(message=error.message, error_code=error.error_code, component=error.component_id)
+            for error in runtime_preflight.errors
+        ]
         return runtime_preflight.is_valid, messages or None
     if authoring.is_valid:
         raise ValueError("Composer persistence for authoring-valid state requires runtime preflight outcome")
-    messages = [error.message for error in authoring.errors]
+    messages = [
+        CompositionValidationError(message=error.message, error_code=error.error_code, component=error.component)
+        for error in authoring.errors
+    ]
     return authoring.is_valid, messages or None
 
 
@@ -1745,8 +1958,9 @@ async def _persist_tool_invocations(
       was already written and we are about to return success. A
       SQLAlchemyError here means the assistant message exists in the
       audit trail but the tool rows that prove what the LLM saw are
-      missing. That is a Tier-1 audit corruption (CLAUDE.md: "I don't
-      know what happened" is never an acceptable answer). Increment the
+      missing. That is a Tier-1 audit corruption ("I don't know what
+      happened" is never an acceptable answer — ARCHITECTURE.md §Design
+      Principles). Increment the
       Tier-1 counter and raise :class:`AuditIntegrityError` chained
       through the SQLAlchemyError. The request will 500 with the chained
       cause visible to the operator.
@@ -1759,7 +1973,8 @@ async def _persist_tool_invocations(
       AuditIntegrityError here would mask the original failure, which is
       what the operator needs to see. Increment the
       "persist failed during unwind" counter, slog the audit-system
-      failure (the slog is permitted under CLAUDE.md primacy because the
+      failure (the slog is permitted under the logging-telemetry-policy skill
+      §Logging Policy because the
       audit system itself failed — telemetry has nowhere to write the
       structured event), and continue. The unwind disposition is
       observable via the counter increment + slog event; the partial
@@ -2173,8 +2388,9 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
       but a CancelledError escaping the app is logged as "Exception in
       ASGI application").
     * If the disconnect races the guarded block's completion, the
-      pending cancellation is flushed and absorbed here so it cannot
-      detonate mid-way through the route's post-compose persist tail.
+      pending watcher cancellation is flushed here. Freeform routes keep
+      their owned post-provider continuation inside this guard and join it
+      before watcher teardown.
     * Both test transports (Starlette TestClient, httpx ASGITransport)
       block their ``receive()`` until the response completes, so the
       watcher stays dormant under tests unless a disconnect is
@@ -2235,10 +2451,9 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
                 exc.args = ()
         raise
     else:
-        # Normal exit: resolve completion races BEFORE the route resumes
-        # its persist tail, so a disconnect-cancel that landed in the
-        # same tick the guarded block completed cannot detonate mid-way
-        # through the post-compose persists.
+        # Normal exit: resolve completion races before the route resumes
+        # after its guarded operation. Freeform routes have already joined
+        # their post-provider continuation at this point.
         if not watcher.done():
             watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -2272,9 +2487,114 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
             watcher.cancel()
 
 
+_COMPOSER_HEARTBEAT_SECONDS = 15.0
+
+_COMPOSER_REQUEST_LEASE_SECONDS = 60
+"""Lifetime a composer request lease gains on each renewal.
+
+Copy of ``SessionComposerProgressAuthority``'s ``lease_seconds`` default,
+which ``web/app.py`` does not override. The progress-registry protocol does
+not expose the lease length, so the heartbeat derives its retry headroom
+from this copy.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class _ComposerHeartbeatTimer:
+    """Clock and wait the compose heartbeat measures its lease headroom with.
+
+    ``now`` is a monotonic reading in seconds and ``wait`` suspends for the
+    given seconds. Kept together so a test that fakes the clock also fakes the
+    interval wait it measures.
+    """
+
+    now: Callable[[], float]
+    wait: Callable[[float], Awaitable[None]]
+
+
+_COMPOSER_HEARTBEAT_TIMER = _ComposerHeartbeatTimer(now=time.monotonic, wait=asyncio.sleep)
+
+
+@dataclass(frozen=True, slots=True)
+class _ComposerHeartbeatCancel:
+    """Why the compose heartbeat cancelled its owning request.
+
+    Only the three module singletons below exist. One is passed through
+    ``Task.cancel(message)``, so it arrives as the sole ``CancelledError.args``
+    entry and is recognised by identity, exactly like
+    ``_CLIENT_DISCONNECT_CANCEL_MARKER``. Unlike that marker it names why, so a
+    route can record a server fault instead of a client Stop.
+    """
+
+    kind: Literal["transient_exhausted", "lease_lost", "renewal_defect"]
+
+
+_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED = _ComposerHeartbeatCancel(kind="transient_exhausted")
+_COMPOSER_HEARTBEAT_LEASE_LOST = _ComposerHeartbeatCancel(kind="lease_lost")
+_COMPOSER_HEARTBEAT_RENEWAL_DEFECT = _ComposerHeartbeatCancel(kind="renewal_defect")
+# Keyed by identity: the singletons live for the whole process, so no other
+# live object (such as a CancelledError's argument) can share one of these ids.
+_COMPOSER_HEARTBEAT_CANCELS_BY_ID: Final[dict[int, _ComposerHeartbeatCancel]] = {
+    id(marker): marker
+    for marker in (
+        _COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED,
+        _COMPOSER_HEARTBEAT_LEASE_LOST,
+        _COMPOSER_HEARTBEAT_RENEWAL_DEFECT,
+    )
+}
+
+
+def _composer_heartbeat_cancel_of(exc: asyncio.CancelledError) -> _ComposerHeartbeatCancel | None:
+    """Return the heartbeat's cancel marker when ``exc`` was delivered by it."""
+    if len(exc.args) != 1:
+        return None
+    delivered_id = id(exc.args[0])
+    if delivered_id not in _COMPOSER_HEARTBEAT_CANCELS_BY_ID:
+        return None
+    return _COMPOSER_HEARTBEAT_CANCELS_BY_ID[delivered_id]
+
+
+def _composer_heartbeat_failed_progress_event() -> ComposerProgressEvent:
+    """Terminal progress for a request the server cancelled after losing its lease.
+
+    A server fault, never ``client_cancelled``: the user did not press Stop.
+    ``service_setup_failed`` is the progress contract's catch-all server-side
+    code; the contract has no dedicated lease-loss code.
+    """
+    return ComposerProgressEvent(
+        phase="failed",
+        headline="The server could not keep this composer request running.",
+        evidence=("The server lost this request's lease before the composer finished.",),
+        likely_next="Resubmit the message.",
+        reason="service_setup_failed",
+    )
+
+
+def _composer_heartbeat_http_error(cancel: _ComposerHeartbeatCancel) -> HTTPException:
+    """Structured, retryable 503 for a request the heartbeat cancelled."""
+    if cancel.kind == "transient_exhausted":
+        # Same envelope text as the app's OperationalError handler, which is
+        # what this request answered before the heartbeat learned to retry.
+        return HTTPException(
+            status_code=503,
+            detail={
+                "error_type": "database_unavailable",
+                "detail": "Database is currently unavailable. Please retry in a moment.",
+            },
+        )
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error_type": "composer_request_lease_lost",
+            "detail": "The server lost this composer request's lease before it finished. Please resubmit.",
+        },
+    )
+
+
 async def _track_compose_inflight(
     session_id: UUID,
     request: Request,
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> AsyncIterator[None]:
     """Count this request in the session's in-flight compose tally.
 
@@ -2291,30 +2611,165 @@ async def _track_compose_inflight(
     not yet published progress (queued on the lock, immediate Stop), where
     the registry still holds the previous turn's terminal snapshot.
 
-    Keyed by the raw path ``session_id`` (pre-ownership-check): a request
-    rejected by the ownership guard still transits the counter briefly,
-    which is harmless — the counter only ever delays a resync while
-    non-zero, and rejected requests decrement within the same request
-    lifecycle.
+    Admission follows authenticated session ownership verification. Each request
+    owns an exact server token, renewed until teardown, including long provider
+    calls and lock waits.
+
+    Renewal failures (finding #28): a transient database failure
+    (``OperationalError``, pool ``TimeoutError``) is retried only while the
+    next attempt would still start inside the lease. Headroom is measured in
+    time since the last good renewal, not in failures, because a pool checkout
+    that times out takes 30 s to fail; a renewal still unresolved when the
+    lease runs out is abandoned. A lost lease (``ComposerRequestLeaseLost``,
+    ``PermissionError``) or any other renewal failure cancels the owning
+    request at once. The cancel carries a
+    :class:`_ComposerHeartbeatCancel` marker, so it is recorded as ``failed``
+    rather than a client ``cancelled``, and it leaves this dependency as a
+    structured 503 (or, for a renewal defect, as the defect itself) instead of
+    a bare cancellation. Teardown never re-raises the heartbeat's stored
+    renewal failure over the request's own outcome.
     """
+    await _verify_session_ownership(session_id, user, request)
     registry = _get_composer_progress_registry(request)
     sid = str(session_id)
     # This dependency is mounted only on Composer endpoints. Collapse the
-    # route family to a closed surface label; never export the raw path.
-    surface: Literal["freeform", "guided"] = "guided" if "/guided/" in request.url.path else "freeform"
+    # Route family uses a closed surface label; never export the raw path.
+    surface: Literal["freeform"] = "freeform"
+    timer = _COMPOSER_HEARTBEAT_TIMER
+    # Read before the call that creates the lease: the database stamps its
+    # expiry during that call, so the lease lasts at least
+    # _COMPOSER_REQUEST_LEASE_SECONDS from this reading.
+    lease_started_at = timer.now()
+    lease = await registry.start_request(sid, user.user_id)
+    request.state.composer_request_lease = lease
+    request.state.composer_durable_completed = False
     metrics_token = begin_composer_request_metrics(surface=surface)
     terminal_status: _ComposerRequestTerminalStatus = "completed"
-    registry.begin_request(sid)
+
+    owner_task = asyncio.current_task()
+    if owner_task is None:
+        raise RuntimeError("Composer lifecycle requires an owning task")
+
+    async def renew() -> None:
+        # Every exit except a transient retry cancels the owner and re-raises,
+        # so the heartbeat task ends holding the renewal failure. exc_info is
+        # deliberately omitted from the diagnostics: SQLAlchemy cause chains
+        # carry the database URL.
+        #
+        # Lease headroom is time, not a failure count: a pool checkout that
+        # times out takes 30 s to fail, so three counted failures ran 75 s past
+        # a 60 s lease. ``renewed_at`` is read before the call that last
+        # extended the lease, for the same reason as ``lease_started_at``.
+        renewed_at = lease_started_at
+        consecutive_failures = 0
+
+        def lease_headroom_exhausted(exc: Exception) -> bool:
+            # Records a transient failure; True when the next attempt would
+            # start outside the lease, so the owner must be cancelled now.
+            nonlocal consecutive_failures
+            consecutive_failures += 1
+            seconds_since_renewal = timer.now() - renewed_at
+            exhausted = seconds_since_renewal + _COMPOSER_HEARTBEAT_SECONDS >= _COMPOSER_REQUEST_LEASE_SECONDS
+            if exhausted:
+                _log_last_resort_diagnostic(
+                    slog.error,
+                    "compose.heartbeat_cancelled_request",
+                    kind=_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED.kind,
+                    exc_class=type(exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                    seconds_since_renewal=round(seconds_since_renewal, 1),
+                )
+            else:
+                _log_last_resort_diagnostic(
+                    slog.warning,
+                    "compose.heartbeat_renewal_retrying",
+                    exc_class=type(exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                    seconds_since_renewal=round(seconds_since_renewal, 1),
+                )
+            return exhausted
+
+        while True:
+            await timer.wait(_COMPOSER_HEARTBEAT_SECONDS)
+            attempt_started_at = timer.now()
+            # A renewal still unresolved when the lease runs out is abandoned
+            # rather than left to hold the request past its lease.
+            lease_deadline = asyncio.timeout(renewed_at + _COMPOSER_REQUEST_LEASE_SECONDS - attempt_started_at)
+            try:
+                async with lease_deadline:
+                    await registry.renew_request(lease)
+            except (OperationalError, SQLAlchemyPoolTimeoutError) as exc:
+                # The one failure family that models a transient blip (a
+                # connection dropped mid-transaction, pool exhaustion, a
+                # failover): retried only while the next attempt would still
+                # start inside the lease.
+                if lease_headroom_exhausted(exc):
+                    owner_task.cancel(_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED)
+                    raise
+            except TimeoutError as exc:
+                if not lease_deadline.expired():
+                    # A TimeoutError the renewal raised itself, not the lease
+                    # deadline above: treated like any other renewal defect.
+                    owner_task.cancel(_COMPOSER_HEARTBEAT_RENEWAL_DEFECT)
+                    raise
+                # The lease deadline expired with the renewal unresolved.
+                if lease_headroom_exhausted(exc):
+                    owner_task.cancel(_COMPOSER_HEARTBEAT_TRANSIENT_EXHAUSTED)
+                    raise
+            except (ComposerRequestLeaseLost, PermissionError) as exc:
+                # The lease row is gone, expired or no longer ours: renewing
+                # again cannot restore it.
+                _log_last_resort_diagnostic(
+                    slog.error,
+                    "compose.heartbeat_cancelled_request",
+                    kind=_COMPOSER_HEARTBEAT_LEASE_LOST.kind,
+                    exc_class=type(exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                )
+                owner_task.cancel(_COMPOSER_HEARTBEAT_LEASE_LOST)
+                raise
+            except Exception:
+                # Anything else is a first-party defect: the owning request
+                # raises it (see the CancelledError arm below).
+                owner_task.cancel(_COMPOSER_HEARTBEAT_RENEWAL_DEFECT)
+                raise
+            else:
+                renewed_at = attempt_started_at
+                consecutive_failures = 0
+
+    heartbeat = asyncio.create_task(renew())
     try:
         yield
-    except asyncio.CancelledError:
-        terminal_status = "cancelled"
-        raise
+    except asyncio.CancelledError as exc:
+        heartbeat_cancel = _composer_heartbeat_cancel_of(exc)
+        if heartbeat_cancel is None:
+            terminal_status = "completed" if request.state.composer_durable_completed else "cancelled"
+            raise
+        # The heartbeat re-raised in the same step that cancelled this task,
+        # so it is done and holds the renewal failure; retrieving it here is
+        # what keeps teardown from ever re-raising it.
+        renewal_failure = heartbeat.exception()
+        # Convert only when the heartbeat's cancel is the task's sole pending
+        # request (the disconnect watcher's rule): an external cancel (server
+        # shutdown) racing it keeps unwinding as genuinely cancelled.
+        if owner_task.uncancel() > 0:
+            terminal_status = "completed" if request.state.composer_durable_completed else "cancelled"
+            raise
+        terminal_status = "completed" if request.state.composer_durable_completed else "failed"
+        if renewal_failure is None:
+            raise RuntimeError("Composer heartbeat cancelled its request without a renewal failure") from exc
+        if heartbeat_cancel is _COMPOSER_HEARTBEAT_RENEWAL_DEFECT:
+            # Keep the defect's own cause chain; the cancellation is only the
+            # delivery mechanism, not its cause.
+            raise renewal_failure from renewal_failure.__cause__
+        raise _composer_heartbeat_http_error(heartbeat_cancel) from exc
     except TimeoutError:
-        terminal_status = "timed_out"
+        terminal_status = "completed" if request.state.composer_durable_completed else "timed_out"
         raise
     except HTTPException as exc:
-        if exc.status_code in {408, 504}:
+        if request.state.composer_durable_completed:
+            terminal_status = "completed"
+        elif exc.status_code in {408, 504}:
             terminal_status = "timed_out"
         elif exc.status_code == 499:
             terminal_status = "cancelled"
@@ -2322,12 +2777,21 @@ async def _track_compose_inflight(
             terminal_status = "failed"
         raise
     except Exception:
-        terminal_status = "failed"
+        terminal_status = "completed" if request.state.composer_durable_completed else "failed"
         raise
     finally:
         primary_error = sys.exception()
         try:
-            registry.end_request(sid)
+            try:
+                # A heartbeat that already ended holds the renewal failure it
+                # cancelled this request over; awaiting it would re-raise that
+                # failure over the request's own outcome (finding #28).
+                if not heartbeat.done():
+                    heartbeat.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await heartbeat
+            finally:
+                await registry.finish_request(lease)
         finally:
             finish_composer_request_metrics(
                 metrics_token,
@@ -2352,6 +2816,7 @@ async def _state_data_from_composer_state(
     telemetry_source: _ComposerPreflightTelemetrySource,
     composer_meta: Mapping[str, Any] | None = None,
     prior_completion_gates: CompletionGatesDict | None = None,
+    advisor_gate_decision: AdvisorGateDecision | None = None,
 ) -> tuple[CompositionStateData, ValidationSummary]:
     try:
         authoring = validate_authored_composition_state(
@@ -2442,40 +2907,17 @@ async def _state_data_from_composer_state(
     # carried forward from a mid-turn compose row (elspeth-67c6fa691d;
     # column doc at web/sessions/models.py ``composer_meta``).
     surface_meta["validation_lane"] = "strict"
-    if state.guided_session is not None and "guided_session" not in surface_meta:
-        surface_meta["guided_session"] = state.guided_session.to_dict()
     persisted_composer_meta = merge_implicit_decisions_meta(surface_meta, state)
-    # Completion-gate facts (advisor sign-off first) are durable only here:
-    # the key is OVERWRITTEN on every ADJUDICATING compose-preflight save —
-    # populated when the preflight withheld completion, empty when it did
-    # not — so a stale blocked fact cannot survive a clean compose turn.
-    # Exact-type dispatch mirrors the ``_RuntimePreflightOutcome``
-    # convention above: a captured ``_RuntimePreflightFailed`` persists
-    # ``is_valid=False`` and carries no gate verdict.
-    #
-    # Saves whose caller passed no adjudicated result (``runtime_preflight``
-    # argument was not a ``ValidationResult`` — the recovery persists and
-    # seeds) re-derive a plain preflight that can NEVER emit the advisor
-    # blocker, so overwriting would silently erase a durable advisor fact.
-    # Those callers hand in ``prior_completion_gates`` and the fact is
-    # carried forward verbatim; ``merge_completion_gates``' ``for_graph``
-    # fingerprint check downgrades it to pending wording on read if the
-    # graph moved, so the verdict is never re-attributed.
-    completion_gates_value = completion_gates_meta_value(
-        runtime if type(runtime) is ValidationResult else None,
-        state,
+    # Runtime validation is not an advisor verdict. Only an explicit END
+    # decision can replace a prior fact, including on graph-unchanged saves.
+    prior_facts = parse_completion_gates(
+        {COMPLETION_GATES_META_KEY: prior_completion_gates} if prior_completion_gates is not None else composer_meta
     )
-    if not completion_gates_value and prior_completion_gates and type(runtime_preflight) is not ValidationResult:
-        completion_gates_value = prior_completion_gates
+    completion_gates_value = completion_gates_meta_from_facts(resolve_completion_gate_facts(prior_facts, advisor_gate_decision, state))
     persisted_composer_meta = {
         **persisted_composer_meta,
         COMPLETION_GATES_META_KEY: completion_gates_value,
     }
-    normalized_persisted_errors = validation_errors_for_composer_surface(
-        composer_meta=persisted_composer_meta,
-        is_valid=persisted_is_valid,
-        validation_errors=persisted_errors,
-    )
     return (
         CompositionStateData(
             sources=state_d["sources"],
@@ -2484,7 +2926,7 @@ async def _state_data_from_composer_state(
             outputs=state_d["outputs"],
             metadata_=state_d["metadata"],
             is_valid=persisted_is_valid,
-            validation_errors=normalized_persisted_errors,
+            validation_errors=persisted_errors,
             composer_meta=persisted_composer_meta,
         ),
         authoring,
@@ -2534,22 +2976,8 @@ async def _failed_turn_response_body(
     }
 
 
-# Freeform planner-failure taxonomy. Kept in lockstep with the guided path's
-# ``PipelinePlannerError`` sub-mapping in
-# ``routes/composer/guided_plan.py::_guided_full_failure_code`` and the
-# ``_SAFE_FAILURES`` status table in ``routes/guided_operations.py`` so a given
-# ``PipelinePlannerError.code`` yields the same closed failure code and HTTP
-# status on both surfaces. The freeform surface has no ``guided_operations``
-# lease to terminalize, so ``_handle_planner_failure`` writes an equivalent
-# durable disposition audit row instead of calling
-# ``fail_guided_operation_with_audit``.
-# Byte-identical to the guided set — do NOT add codes here without adding them
-# to guided's ``_guided_full_failure_code`` in the same change, or the two
-# surfaces return different closed codes (and HTTP statuses) for the same
-# ``PipelinePlannerError.code``, which is exactly the divergence Task 0 exists to
-# prevent. ``COST_CAP_EXCEEDED`` and ``REQUEST_BYTES_EXHAUSTED`` are deliberately
-# absent (they fall through to ``operation_failed`` on both surfaces), matching
-# guided.
+# Closed planner-failure taxonomy. ``COST_CAP_EXCEEDED`` and
+# ``REQUEST_BYTES_EXHAUSTED`` fall through to ``operation_failed``.
 #
 # ``policy_blocked`` is NOT keyed on ``PipelinePlannerError.code`` at all — it is
 # keyed on the rejection's ``detail_codes`` (see
@@ -2557,14 +2985,13 @@ async def _failed_turn_response_body(
 # surfaces under whichever planner code the refusal happened to exhaust
 # (``REPAIR_EXHAUSTED`` when the model burnt its budget re-authoring the same
 # prohibited component; ``VALIDATION_FAILED`` from commit-time re-validation, and
-# historically from the server-derived gate elspeth-b4a286d517 removed). The code
+# historically from the server-derived gate). The code
 # alone cannot distinguish "the model produced garbage" from "the deployment
-# forbids this", so the detail-code test runs FIRST on both surfaces.
+# forbids this", so the detail-code test runs first.
 _FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(
     {
         "COMPLETION_TOKENS_EXCEEDED",
         "COMPOSITION_EXHAUSTED",
-        "COST_UNAVAILABLE",
         "DISCOVERY_CYCLE",
         "DISCOVERY_EXHAUSTED",
         "DISCOVERY_ONLY",
@@ -2578,46 +3005,42 @@ _FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(
 # The closed validation codes that mean "a deployment policy categorically
 # refuses this component", as opposed to "this candidate is wired wrong". A
 # rejection carrying any of them is PERMANENT: no repair to the pipeline and no
-# retry of the request can clear it, so both surfaces must answer
+# retry of the request can clear it, so the route must answer
 # ``policy_blocked`` rather than a retryable provider fault.
 #
 # ``plugin_not_allowed_on_web`` is derived from
-# ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED`` rather than restated so the
-# two cannot drift; ``aws_s3_source_not_allowed`` is the authoritative source
+# ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED`` rather than restated;
+# ``aws_s3_source_not_allowed`` is the authoritative source
 # gate's own code (``composer/tools/sessions.py``, ``execution/validation.py``),
 # which predates the snapshot-level reason and is emitted by a different seam.
 # A new categorical policy refusal MUST be added here or it silently reads as a
-# provider fault on both surfaces.
+# provider fault.
 PLANNER_POLICY_DETAIL_CODES: Final[frozenset[str]] = frozenset(
     {
         "aws_s3_source_not_allowed",
         PluginUnavailableReason.WEB_SURFACE_PROHIBITED.value,
     }
 )
-# ``failure_code -> (http_status, safe static detail)``. Mirrors the subset of
-# ``_SAFE_FAILURES`` the freeform planner can reach; the detail text is
+# ``failure_code -> (http_status, safe static detail)``. The detail text is
 # provider-safe (no exception message, no provider content).
 _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
+    "cost_unavailable": (
+        503,
+        "The composer could not determine the model cost. Ask an administrator to configure or correct model pricing before trying again.",
+    ),
     "provider_timeout": (504, "The composer model timed out before producing a pipeline. Retry the request."),
     "provider_unavailable": (503, "The composer model is unavailable. Retry the request."),
     "invalid_provider_response": (502, "The composer model returned an unusable pipeline plan. Retry the request."),
     # Planner-owned non-convergence (elspeth-5904b1683a): the model answered
     # every repair turn; the planner loop could not produce a candidate that
     # passed validation. 500 (our loop, not a gateway fault) with an honest
-    # retry offer — the first candidate is model-stochastic. Kept in lockstep
-    # with the guided ``_SAFE_FAILURES["planner_repair_exhausted"]`` copy.
+    # retry offer — the first candidate is model-stochastic.
     "planner_repair_exhausted": (
         500,
         "The composer could not produce a valid pipeline within its repair budget. Retry the request, or revise it if this recurs.",
     ),
-    # Same status and same message shape as the guided
-    # ``_SAFE_FAILURES["policy_blocked"]`` copy — a policy refusal is a
-    # property of the deployment and the pipeline, not of the authoring
-    # surface or the model — EXCEPT that freeform chat has no component
-    # highlight, so this copy must not say "highlighted" (the guided surface
-    # pins its blocked component in the review UI; here the detail text is
-    # the whole signal). Names neither the provider nor an operation id, and
-    # offers no retry.
+    # A deployment-policy refusal is not a provider failure. The detail names
+    # neither provider nor operation id and offers no retry.
     "policy_blocked": (
         422,
         "This pipeline is blocked by a deployment policy and cannot be built as configured. "
@@ -2630,10 +3053,8 @@ _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
 def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
     """Return whether a planner failure was a categorical deployment-policy refusal.
 
-    The single shared predicate behind both surfaces' failure-code mappers, so
-    the guided/freeform lockstep is mechanical rather than a comment: see
-    ``routes/composer/guided_plan.py::_guided_full_failure_code`` and
-    :func:`_freeform_planner_failure_code`.
+    This predicate is evaluated before mapping a planner error code because a
+    policy refusal may surface under several planner codes.
     """
     return any(code in PLANNER_POLICY_DETAIL_CODES for code in exc.detail_codes)
 
@@ -2646,14 +3067,14 @@ def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
 # planner code, so a discovery-budget exhaustion, a tool-call cap and a real provider outage
 # were one indistinguishable reason (elspeth-ad5628ecda). The vocabulary already anticipated
 # the split — ``planner_repair_exhausted`` is documented in ``contracts/composer_progress.py``
-# as existing "so the failed progress event stops blaming the provider" — and the GUIDED path
-# already maps onto it (``routes/composer/guided_plan.py``). This is the freeform mirror.
+# as existing "so the failed progress event stops blaming the provider".
 #
 # ``PROVIDER_CALLS_EXHAUSTED`` is deliberately ABSENT: it is planner-owned (our budget on
 # physical provider attempts) but the closed vocabulary has no member for it, and widening
 # that vocabulary is a frontend/contract change rather than an attribution fix. It therefore
 # still reads ``provider_unavailable`` — a known residual, not an oversight.
 _FREEFORM_PLANNER_PROGRESS_REASONS: Final[dict[str, ComposerProgressReason]] = {
+    "COST_UNAVAILABLE": "service_setup_failed",
     "REPAIR_EXHAUSTED": "planner_repair_exhausted",
     "COMPOSITION_EXHAUSTED": "convergence_composition_budget",
     "DISCOVERY_EXHAUSTED": "convergence_discovery_budget",
@@ -2672,9 +3093,7 @@ def freeform_planner_progress_reason(planner_code: str) -> ComposerProgressReaso
 def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
     """Map a ``PipelinePlannerError.code`` to a closed freeform failure code.
 
-    Byte-parity with the ``isinstance(exc, PipelinePlannerError)`` branch of the
-    guided ``_guided_full_failure_code``; kept as a separate function so the
-    guided path stays untouched.
+    Use closed, provider-safe codes for the HTTP response.
     """
     if planner_failure_is_policy_blocked(exc):
         return "policy_blocked"
@@ -2682,10 +3101,11 @@ def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
         return "provider_timeout"
     if exc.code == "PROVIDER_ERROR":
         return "provider_unavailable"
+    if exc.code == "COST_UNAVAILABLE":
+        return "cost_unavailable"
     if exc.code == "REPAIR_EXHAUSTED":
-        # Honest exhaustion envelope (elspeth-5904b1683a) — byte-parity with
-        # the guided branch: the provider answered every repair turn; the
-        # planner loop is the actor that could not converge.
+        # The provider answered every repair turn; the planner loop could not
+        # converge.
         return "planner_repair_exhausted"
     if exc.code in _FREEFORM_PLANNER_INVALID_PROVIDER_CODES:
         return "invalid_provider_response"
@@ -2702,9 +3122,7 @@ async def _handle_planner_failure(
 ) -> tuple[int, dict[str, object]]:
     """Translate a freeform ``PipelinePlannerError`` into a safe HTTP outcome.
 
-    Mirrors the guided path's ``fail_guided_operation_with_audit``
-    terminalization on the freeform surface, which has no guided-operation lease
-    to close: persists one durable, redacted terminal failure-disposition audit
+    Persists one durable, redacted terminal failure-disposition audit
     row carrying the mapped closed failure code, then returns the
     ``(status, body)`` the route raises. Shared by ``send_message`` and
     ``recompose`` so the two freeform routes cannot drift on planner-failure UX.
@@ -2774,6 +3192,8 @@ async def _handle_convergence_error(
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
     session_operation_context: SessionOperationContext,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
 ) -> dict[str, object]:
     """Build 422 response body and persist partial state for convergence errors.
 
@@ -2846,7 +3266,8 @@ async def _handle_convergence_error(
         # Persistence guard: DB write failure should not upgrade the
         # response from 422 (convergence error) to 500 (internal).
         #
-        # SQLAlchemyError ONLY — narrowed per CLAUDE.md Tier 1 semantics.
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model.
         # _state_data_from_composer_state's internal validate() guard catches
         # (ValueError, TypeError, KeyError) from structurally damaged partial
         # state — those are acceptable there. A TypeError/KeyError from
@@ -2854,16 +3275,8 @@ async def _handle_convergence_error(
         # bug and must propagate. This catch is the SQLAlchemy persistence
         # layer only.
         #
-        # ``GuidedCustodyIntegrityError`` is deliberately NOT caught here (nor
-        # in the two sibling recovery handlers). It is registered Tier-1 and
-        # subclasses ``AuditIntegrityError``: the guided reviewed-source
-        # custody could not be proven against the live sources, so the audit
-        # trail's source provenance is unprovable. ADR-008 requires that class
-        # to bubble and abort — it reaches the app-level ``AuditIntegrityError``
-        # handler and its fail-closed 500 — rather than be reduced to a
-        # ``partial_state_save_error`` string on an ordinary recovery body.
-        # Pinned by
-        # tests/unit/web/sessions/test_routes.py::test_recovery_partial_state_custody_integrity_failure_is_not_contained.
+        # Audit-integrity failures remain Tier 1: they must bubble through
+        # the app-level fail-closed handler, not become a recovery detail.
         try:
             state_data, _validation = await _state_data_from_composer_state(
                 exc.partial_state,
@@ -2879,6 +3292,12 @@ async def _handle_convergence_error(
                 initial_version=None,
                 telemetry_source="convergence",
                 prior_completion_gates=await _durable_completion_gates(service, session_id),
+                composer_meta={
+                    **({"ingress": ingress} if ingress is not None else {}),
+                    **({"chat_ingress_inputs": chat_ingress_inputs} if chat_ingress_inputs is not None else {}),
+                }
+                if ingress is not None or chat_ingress_inputs is not None
+                else None,
             )
             partial_record = await service.save_composition_state(
                 session_id,
@@ -2947,6 +3366,8 @@ async def _handle_plugin_crash(
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
     session_operation_context: SessionOperationContext,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
 ) -> dict[str, object]:
     """Build 500 response body and persist partial state for plugin crashes.
 
@@ -3006,7 +3427,8 @@ async def _handle_plugin_crash(
         # plugin crash (response stays as the 500 below, the save failure
         # is recorded as a separate audit-system-failure slog event).
         #
-        # SQLAlchemyError ONLY — narrowed per CLAUDE.md Tier 1 semantics.
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model.
         # _state_data_from_composer_state's validate() guard catches
         # (ValueError, TypeError, KeyError) from structurally damaged partial
         # state — those are acceptable there. TypeError/KeyError from
@@ -3028,6 +3450,12 @@ async def _handle_plugin_crash(
                 initial_version=None,
                 telemetry_source="plugin_crash",
                 prior_completion_gates=await _durable_completion_gates(service, session_id),
+                composer_meta={
+                    **({"ingress": ingress} if ingress is not None else {}),
+                    **({"chat_ingress_inputs": chat_ingress_inputs} if chat_ingress_inputs is not None else {}),
+                }
+                if ingress is not None or chat_ingress_inputs is not None
+                else None,
             )
             partial_record = await service.save_composition_state(
                 session_id,
@@ -3108,6 +3536,8 @@ async def _handle_runtime_preflight_failure(
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
     session_operation_context: SessionOperationContext,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
 ) -> dict[str, object]:
     """Build 500 response body and persist partial state for runtime-preflight failures.
 
@@ -3248,7 +3678,8 @@ async def _handle_runtime_preflight_failure(
         # slog event — that slog event is the persistence-fallback
         # exemption, NOT a normal-flow log).
         #
-        # SQLAlchemyError ONLY — narrowed per CLAUDE.md Tier 1 semantics,
+        # SQLAlchemyError ONLY — narrowed per the Tier 1 semantics in
+        # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model,
         # symmetric with the sibling _handle_plugin_crash /
         # _handle_convergence_error helpers. See the comment in
         # _handle_convergence_error for the full rationale on the
@@ -3268,6 +3699,12 @@ async def _handle_runtime_preflight_failure(
                 initial_version=None,
                 telemetry_source="runtime_preflight",
                 prior_completion_gates=await _durable_completion_gates(service, session_id),
+                composer_meta={
+                    **({"ingress": ingress} if ingress is not None else {}),
+                    **({"chat_ingress_inputs": chat_ingress_inputs} if chat_ingress_inputs is not None else {}),
+                }
+                if ingress is not None or chat_ingress_inputs is not None
+                else None,
             )
             partial_record = await service.save_composition_state(
                 session_id,
@@ -3293,9 +3730,10 @@ async def _handle_runtime_preflight_failure(
         # state is captured (the path-1 cached re-raise with no LLM
         # mutation case), the persist_invalid re-call above is skipped,
         # so its source=runtime_preflight emission inside
-        # _state_data_from_composer_state never fires. CLAUDE.md
-        # telemetry primacy ("every telemetry emission point must send
-        # or explicitly acknowledge 'nothing to send.'") requires the
+        # _state_data_from_composer_state never fires. The no-silent-failures
+        # rule (the logging-telemetry-policy skill §Telemetry (Operational
+        # Visibility)) — every telemetry emission point must send what it has
+        # or explicitly acknowledge "I have nothing" — requires the
         # recovery handler to count its own invocation regardless of
         # whether persistence work occurred — otherwise dashboards
         # filtering composer.runtime_preflight.total{source=
@@ -3328,23 +3766,8 @@ async def _handle_runtime_preflight_failure(
     return response_body
 
 
-def _initial_composition_state_with_guided_session(*, profile: WorkflowProfile = EMPTY_PROFILE) -> CompositionState:
-    """Construct a fresh CompositionState with a latent guided-mode session attached.
-
-    Originally added under spec §5.2 / errata C7 ("new sessions default to
-    guided"), and still pre-attaches :func:`GuidedSession.initial` so every
-    server-side lazy-create branch (send_message, recompose, /guided
-    endpoints) reaches a uniformly-shaped state.
-
-    The user-visible default is now **freeform**: the frontend stopped
-    auto-fetching ``GET /guided`` on session selection / creation, so the
-    latent guided session is invisible until the operator clicks "Switch
-    to guided" in the freeform chat header. That click hits ``GET /guided``,
-    which surfaces (and persists, on first visit) the same wizard state
-    this helper installs in-memory. The contract is unchanged — only the
-    activation gesture moved client-side. The spec doc has not been
-    re-issued; treat the title here as descriptive, not authoritative.
-    """
+def _initial_composition_state() -> CompositionState:
+    """Initialize freeform authoring."""
     return CompositionState(
         source=None,
         nodes=(),
@@ -3352,59 +3775,7 @@ def _initial_composition_state_with_guided_session(*, profile: WorkflowProfile =
         outputs=(),
         metadata=PipelineMetadata(),
         version=1,
-        guided_session=GuidedSession.initial(profile=profile),
     )
-
-
-def _workflow_profile_response(guided: GuidedSession) -> WorkflowProfileResponse | None:
-    """Project a GuidedSession's server-owned profile onto the wire subset.
-
-    Returns ``None`` for the empty/live-guided profile (== ``EMPTY_PROFILE``).
-    """
-    if guided.profile == EMPTY_PROFILE:
-        return None
-    return WorkflowProfileResponse(
-        coaching=guided.profile.coaching,
-        bookends=guided.profile.bookends,
-    )
-
-
-async def _inspect_latest_ready_session_blob(
-    blob_service: BlobServiceProtocol,
-    session_id: UUID,
-    *,
-    session_operation_context: SessionOperationContext,
-    filename: str | None = None,
-    source_plugin: str | None = None,
-) -> SourceInspectionFacts | None:
-    """Inspect the newest matching ready blob for Step-1 schema prefill.
-
-    Blob bytes are Tier 3 and ``inspect_blob_content`` is the source-boundary
-    validation/coercion point. If the session has no ready blob, the caller
-    falls back to the existing observed-schema prefill. When ``filename`` is
-    provided, only ready blobs whose stored filename exactly matches it are
-    eligible. When ``source_plugin`` is provided, inspection continues past
-    newer ready blobs of other source kinds and returns the newest ready blob
-    whose inspected content safely prefills that plugin.
-    """
-    records = await blob_service.list_blobs(session_id, limit=None)
-    for record in records:
-        if record.status != "ready":
-            continue
-        if filename is not None and record.filename != filename:
-            continue
-        content = await blob_service.read_blob_content(record.id, session_operation_context=session_operation_context)
-        facts = inspect_blob_content(
-            content=content,
-            filename=record.filename,
-            mime_type=record.mime_type,
-            blob_id=record.id,
-            content_hash=record.content_hash,
-        )
-        if source_plugin is not None and not _inspection_matches_source_plugin(source_plugin, facts):
-            continue
-        return facts
-    return None
 
 
 __all__ = [
@@ -3413,7 +3784,6 @@ __all__ = [
     "SESSION_TERMINAL_RUN_STATUS_VALUES",
     "UTC",
     "UUID",
-    "_COMMIT_REJECTED_MESSAGE",
     "_COMPOSER_AUTHORING_VALIDATION_COUNTER",
     "_COMPOSER_EXCEPTION_CLASS_BUCKETS",
     "_COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER",
@@ -3421,7 +3791,6 @@ __all__ = [
     "_COMPOSER_REQUEST_TERMINAL_COUNTER",
     "_COMPOSER_RUNTIME_PREFLIGHT_COUNTER",
     "_COMPOSER_TIER1_VIOLATION_COUNTER",
-    "_DATA_ERROR_KEY",
     "_MAX_PROVIDER_DETAIL_CHARS",
     "_OTHER_COMPOSER_EXCEPTION_CLASS",
     "_PROVIDER_DETAIL_REDACTED",
@@ -3429,7 +3798,6 @@ __all__ = [
     "_RUNTIME_PREFLIGHT_FAILED",
     "_RUNTIME_PREFLIGHT_FRAME_LIMIT",
     "_RUNTIME_PREFLIGHT_MESSAGE_LIMIT",
-    "_SYNTHETIC_UNAVAILABLE_MESSAGE",
     "APIRouter",
     "AcceptProposalRequest",
     "Any",
@@ -3437,18 +3805,11 @@ __all__ = [
     "AuditStoryIntegrityError",
     "AuditStoryService",
     "BlobQuotaExceededError",
-    "BlobServiceProtocol",
     "BufferingRecorder",
     "CatalogServiceProtocol",
     "ChatMessageRecord",
     "ChatMessageResponse",
     "ChatMessageRole",
-    "ChatRole",
-    "ChatTurn",
-    "ChatTurnResponse",
-    "ComposerChatInitiator",
-    "ComposerChatTurn",
-    "ComposerChatTurnStatus",
     "ComposerConvergenceError",
     "ComposerLLMCall",
     "ComposerPluginCrashError",
@@ -3457,7 +3818,6 @@ __all__ = [
     "ComposerProgressRegistry",
     "ComposerProgressSink",
     "ComposerProgressSnapshot",
-    "ComposerRateLimiter",
     "ComposerRuntimePreflightError",
     "ComposerService",
     "ComposerServiceError",
@@ -3470,21 +3830,12 @@ __all__ = [
     "CompositionStateData",
     "CompositionStateRecord",
     "CompositionStateResponse",
-    "ControlSignal",
     "CreateSessionRequest",
     "Depends",
     "FailedTurnMetadata",
     "ForkSessionRequest",
     "ForkSessionResponse",
-    "GetGuidedResponse",
     "GraphValidationError",
-    "GuidedChatRequest",
-    "GuidedChatResponse",
-    "GuidedRespondRequest",
-    "GuidedRespondResponse",
-    "GuidedSession",
-    "GuidedSessionResponse",
-    "GuidedStep",
     "HTTPException",
     "InterpretationChoice",
     "InterpretationEventAlreadyResolvedError",
@@ -3532,20 +3883,7 @@ __all__ = [
     "SessionResponse",
     "SessionServiceProtocol",
     "SessionsTelemetry",
-    "SinkIntent",
-    "SourceInspectionFacts",
-    "SourceResolved",
-    "Step2SinkChatResult",
-    "StepChatResult",
-    "TerminalKind",
-    "TerminalReason",
-    "TerminalState",
-    "TerminalStateResponse",
     "TransitionAssistantDraft",
-    "TurnPayloadResponse",
-    "TurnRecord",
-    "TurnRecordResponse",
-    "TurnType",
     "UpdateComposerPreferencesRequest",
     "UpdateSessionRequest",
     "UserIdentity",
@@ -3553,7 +3891,7 @@ __all__ = [
     "ValidationEntryResponse",
     "ValidationResult",
     "ValidationSummary",
-    "_BadRequestLLMError",
+    "WebRateLimiter",
     "_ComposerPreflightTelemetryResult",
     "_ComposerPreflightTelemetrySource",
     "_ComposerRequestEndpoint",
@@ -3570,6 +3908,8 @@ __all__ = [
     "_composer_conversation_or_llm_audit_messages",
     "_composer_conversation_or_tool_messages",
     "_composer_conversation_tool_or_llm_audit_messages",
+    "_composer_heartbeat_cancel_of",
+    "_composer_heartbeat_failed_progress_event",
     "_composer_history_content",
     "_composer_persisted_validation",
     "_composer_preferences_response",
@@ -3581,12 +3921,13 @@ __all__ = [
     "_first_message_line",
     "_get_composer_progress_registry",
     "_get_session_compose_lock_registry",
+    "_handle_composer_chargeable_refusal",
+    "_handle_composer_provider_failure",
     "_handle_convergence_error",
     "_handle_planner_failure",
     "_handle_plugin_crash",
     "_handle_runtime_preflight_failure",
-    "_initial_composition_state_with_guided_session",
-    "_inspect_latest_ready_session_blob",
+    "_initial_composition_state",
     "_interpretation_event_response",
     "_is_client_disconnect_cancel",
     "_is_composer_audit_tool_message",
@@ -3604,6 +3945,7 @@ __all__ = [
     "_record_composer_authoring_validation_telemetry",
     "_record_composer_request_terminal",
     "_record_composer_runtime_preflight_telemetry",
+    "_rejections_by_tool_call_id",
     "_replace",
     "_run_accounting_integrity_http",
     "_runtime_preflight_failure_errors",
@@ -3616,20 +3958,9 @@ __all__ = [
     "_track_compose_inflight",
     "_validate_run_status_accounting_for_list",
     "_verify_session_ownership",
-    "_workflow_profile_response",
     "annotations",
     "asyncio",
     "audit_envelope",
-    "build_initial_step_1_turn",
-    "build_step_1_inspect_and_confirm_turn_from_intent",
-    "build_step_1_schema_form_turn",
-    "build_step_1_schema_form_turn_from_resolved",
-    "build_step_1_source_prefill",
-    "build_step_2_multi_select_turn",
-    "build_step_2_schema_form_turn",
-    "build_step_2_schema_form_turn_from_resolved",
-    "build_step_2_single_select_turn",
-    "build_step_4_wire_turn",
     "cast",
     "client_cancelled_progress_event",
     "composer_completion_events_table",
@@ -3638,22 +3969,15 @@ __all__ = [
     "dataclass",
     "datetime",
     "deep_thaw",
-    "emit_dropped_to_freeform",
-    "emit_step_advanced",
-    "emit_turn_answered",
-    "emit_turn_emitted",
     "execute_tool",
     "generate_public_yaml",
-    "get_current_user",
     "get_rate_limiter",
     "insert",
-    "inspect_blob_content",
     "json",
     "llm_call_audit_envelope",
     "llm_call_audit_summary",
     "load_run_accounting_for_settings",
     "maybe_auto_title_session",
-    "maybe_resolve_step_1_source_chat",
     "merge_composer_meta_updates",
     "merge_implicit_decisions_meta",
     "metrics",
@@ -3661,17 +3985,14 @@ __all__ = [
     "record_session_completed",
     "record_session_switched",
     "redact_source_storage_path",
-    "resolve_step_1_source_chat_with_auto_drop",
-    "resolve_step_2_sink_chat_with_auto_drop",
+    "require_pipeline_user",
     "run_sync_in_worker",
     "scrub_text_for_audit",
     "slog",
-    "solve_step_chat_with_auto_drop",
     "stable_hash",
     "structlog",
     "sys",
     "uuid4",
     "validate_pipeline",
-    "validation_errors_for_composer_surface",
     "yaml_generator",
 ]

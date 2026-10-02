@@ -12,16 +12,17 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import select
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import tokens_table, transform_errors_table
+from elspeth.core.landscape.schema import transform_errors_table
 from elspeth.web.execution.failure_samples import (
     KNOWN_ERROR_CATEGORIES,
     NON_CANONICAL_CATEGORY,
@@ -31,6 +32,7 @@ from elspeth.web.execution.failure_samples import (
     format_failure_categories,
     load_top_failure_categories,
 )
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -45,7 +47,7 @@ def _make_run_with_transform(transform_id: str = "fetch") -> tuple[LandscapeDB, 
     factory = RecorderFactory(db)
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
     factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
         plugin_name="test_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -55,7 +57,7 @@ def _make_run_with_transform(transform_id: str = "fetch") -> tuple[LandscapeDB, 
         sequence=0,
     )
     factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
         plugin_name="web_scrape",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
@@ -76,27 +78,58 @@ def _record_error(
     token_id: str,
     row_index: int,
 ) -> None:
+    """Record one token's transform error AND its terminal discard, as the per-row discard arm does.
+
+    The summary counts tokens whose terminal outcome is a failure a transform
+    error decided, so a fixture token without its terminal would model a run
+    that never finished that token.
+    """
     factory = RecorderFactory(db)
-    row = factory.data_flow.create_row(
-        run_id=run_id,
+    _row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run_id),
+        token_id=token_id,
         source_node_id="source_test",
         row_index=row_index,
         data={"url": f"row-{row_index}"},
         source_row_index=row_index,
         ingest_sequence=row_index,
     )
-    with db.write_connection() as conn:
-        conn.execute(
-            tokens_table.insert().values(
-                token_id=token_id,
-                row_id=row.row_id,
-                run_id=run_id,
-                step_in_pipeline=0,
-                created_at=datetime.now(UTC),
-            )
-        )
-        conn.commit()
+    member = leader_coordination_token(factory, run_id).membership
+    work_item = claim_test_work_item(factory, member_token=member, token_id=token.token_id, node_id=transform_id)
     factory.data_flow.record_transform_error(
+        member_token=member,
+        work_item=work_item,
+        ref=TokenRef(token_id=token_id, run_id=run_id),
+        transform_id=transform_id,
+        row_data={"url": f"row-{row_index}"},
+        error_details=error_details,  # type: ignore[arg-type]
+        destination="discard",
+    )
+    factory.data_flow.record_token_outcome_leader(
+        coordination_token=leader_coordination_token(factory, run_id),
+        ref=TokenRef(token_id=token_id, run_id=run_id),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.QUARANTINED_AT_SOURCE,
+        error_hash="a" * 16,
+    )
+
+
+def _record_resumed_attempt(
+    db: LandscapeDB,
+    run_id: str,
+    transform_id: str,
+    *,
+    error_details: dict[str, object],
+    token_id: str,
+    row_index: int,
+) -> None:
+    """Write the SAME token's error again, as a resumed attempt does after a crash."""
+    factory = RecorderFactory(db)
+    member = leader_coordination_token(factory, run_id).membership
+    work_item = claim_test_work_item(factory, member_token=member, token_id=token_id, node_id=transform_id)
+    factory.data_flow.record_transform_error(
+        member_token=member,
+        work_item=work_item,
         ref=TokenRef(token_id=token_id, run_id=run_id),
         transform_id=transform_id,
         row_data={"url": f"row-{row_index}"},
@@ -126,7 +159,8 @@ class TestClientSafeFailureSummaryType:
         type, not just a call site.
         """
         field_names = {field.name for field in dataclasses.fields(ClientSafeFailureSummary)}
-        assert field_names == {"transform_id", "category", "count"}
+        # ``kind`` is a two-value Literal naming the counting arm, not text.
+        assert field_names == {"kind", "transform_id", "category", "count"}
 
     def test_sentinels_are_not_members_of_the_closed_vocabulary(self) -> None:
         """Both sentinels must stay distinguishable from a real category.
@@ -201,7 +235,7 @@ class TestLoadTopFailureCategories:
         summaries = load_top_failure_categories(db, run_id)
         rendered = format_failure_categories(summaries)
 
-        assert summaries == [ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=3)]
+        assert summaries == [ClientSafeFailureSummary(kind="transform_error", transform_id=transform_id, category="decode_failed", count=3)]
         for canary in (CANARY_ROW, CANARY_PROVIDER, "incorrect header check", "BadGzipFile"):
             assert canary not in rendered, rendered
             assert all(canary not in str(summary) for summary in summaries), summaries
@@ -226,7 +260,7 @@ class TestLoadTopFailureCategories:
 
         summaries = load_top_failure_categories(db, run_id)
 
-        assert summaries == [ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=3)]
+        assert summaries == [ClientSafeFailureSummary(kind="transform_error", transform_id=transform_id, category="decode_failed", count=3)]
 
     def test_top_n_is_taken_after_category_aggregation(self) -> None:
         """Regression: the top-N slice must not be taken over messages.
@@ -259,15 +293,35 @@ class TestLoadTopFailureCategories:
         summaries = load_top_failure_categories(db, run_id, limit=2)
 
         assert summaries == [
-            ClientSafeFailureSummary(transform_id=transform_id, category="decode_failed", count=4),
-            ClientSafeFailureSummary(transform_id=transform_id, category="rate_limited", count=2),
+            ClientSafeFailureSummary(kind="transform_error", transform_id=transform_id, category="decode_failed", count=4),
+            ClientSafeFailureSummary(kind="transform_error", transform_id=transform_id, category="rate_limited", count=2),
         ]
+
+    def test_a_token_whose_error_a_resumed_attempt_rewrote_counts_once(self) -> None:
+        """Two attempts' rows for N tokens report ``Nx``, not ``2Nx`` (elspeth-5887fb7928 E8).
+
+        ``transform_errors`` has no ``(token_id, transform_id)`` uniqueness,
+        so a crash after the error write and a resumed attempt leave two rows
+        per token. The summary counts failed tokens.
+        """
+        db, run_id, transform_id = _make_run_with_transform()
+        details: dict[str, object] = {"reason": "decode_failed"}
+        for index in range(3):
+            _record_error(db, run_id, transform_id, error_details=details, token_id=f"tok_{index}", row_index=index)
+            _record_resumed_attempt(db, run_id, transform_id, error_details=details, token_id=f"tok_{index}", row_index=index)
+        with db.connection() as conn:
+            rows = conn.execute(select(transform_errors_table.c.error_id).where(transform_errors_table.c.run_id == run_id)).all()
+        assert len(rows) == 6, "control: both attempts' rows are in the audit trail"
+
+        summaries = load_top_failure_categories(db, run_id)
+
+        assert summaries == [ClientSafeFailureSummary(kind="transform_error", transform_id=transform_id, category="decode_failed", count=3)]
 
     def test_distinct_nodes_stay_distinct(self) -> None:
         db, run_id, first = _make_run_with_transform("fetch")
         factory = RecorderFactory(db)
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="llm",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -368,19 +422,23 @@ class TestFormatFailureCategories:
         assert format_failure_categories([]) == ""
 
     def test_renders_count_node_and_category(self) -> None:
-        rendered = format_failure_categories([ClientSafeFailureSummary(transform_id="fetch", category="decode_failed", count=3)])
+        rendered = format_failure_categories(
+            [ClientSafeFailureSummary(kind="transform_error", transform_id="fetch", category="decode_failed", count=3)]
+        )
         assert rendered == "  • 3x [fetch] decode_failed"
 
     def test_node_is_shown_even_for_a_single_node_run(self) -> None:
         """The failing node is half of what makes the category actionable."""
-        rendered = format_failure_categories([ClientSafeFailureSummary(transform_id="fetch", category="rate_limited", count=1)])
+        rendered = format_failure_categories(
+            [ClientSafeFailureSummary(kind="transform_error", transform_id="fetch", category="rate_limited", count=1)]
+        )
         assert "[fetch]" in rendered
 
     def test_renders_one_bullet_per_summary(self) -> None:
         rendered = format_failure_categories(
             [
-                ClientSafeFailureSummary(transform_id="fetch", category="decode_failed", count=2),
-                ClientSafeFailureSummary(transform_id="summarise", category="rate_limited", count=1),
+                ClientSafeFailureSummary(kind="transform_error", transform_id="fetch", category="decode_failed", count=2),
+                ClientSafeFailureSummary(kind="transform_error", transform_id="summarise", category="rate_limited", count=1),
             ]
         )
         assert rendered.splitlines() == [
@@ -388,6 +446,19 @@ class TestFormatFailureCategories:
             "  • 1x [summarise] rate_limited",
         ]
 
+    def test_a_collector_group_failure_renders_as_its_collector_node_and_reason_code(self) -> None:
+        """The collector arm goes through the same presenter: count, node, closed code, nothing else."""
+        rendered = format_failure_categories(
+            [
+                ClientSafeFailureSummary(
+                    kind="collector_group", transform_id="collector_stitch", category="collector_missing_members", count=2
+                ),
+            ]
+        )
+        assert rendered == "  • 2x [collector_stitch] collector_missing_members"
+
     def test_long_node_id_is_bounded(self) -> None:
-        rendered = format_failure_categories([ClientSafeFailureSummary(transform_id="n" * 200, category="decode_failed", count=1)])
+        rendered = format_failure_categories(
+            [ClientSafeFailureSummary(kind="transform_error", transform_id="n" * 200, category="decode_failed", count=1)]
+        )
         assert len(rendered) < 120

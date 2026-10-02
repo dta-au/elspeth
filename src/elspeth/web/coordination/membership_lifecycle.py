@@ -29,15 +29,16 @@ from elspeth.web.coordination.membership_authority import (
     WebInstanceIdentity,
     WebInstanceMembershipLost,
 )
+from elspeth.web.process_recovery import ProcessRecovery
 
 _HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 5
 """Consecutive transient-failure bound for lease renewal.
 
 One or two ``OperationalError`` heartbeats are contention and retry
 cleanly; this many in a row means the process can no longer prove it is
-alive. The heartbeat task then re-raises, its done callback cancels the
-owning lifespan task, and the process exits so the supervisor restarts
-it — the same escalation the periodic orphan sweeper uses.
+alive. The heartbeat task then re-raises and its done callback signals the
+host to shut down the process so the supervisor restarts it — the same
+escalation the periodic orphan sweeper uses.
 """
 
 
@@ -100,7 +101,7 @@ class SingleProcessWebInstanceMembership(WebInstanceMembership):
 class RegisteredWebInstanceMembership(WebInstanceMembership):
     """Registers one process, renews its lease, and records drain and stop."""
 
-    __slots__ = ("_authority", "_heartbeat_task", "_identity", "_interval_seconds", "_lease_seconds", "_log")
+    __slots__ = ("_authority", "_heartbeat_task", "_identity", "_interval_seconds", "_lease_seconds", "_log", "_process_recovery")
 
     def __init__(
         self,
@@ -109,6 +110,7 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
         *,
         lease_seconds: int,
         interval_seconds: int | None = None,
+        process_recovery: ProcessRecovery | None = None,
     ) -> None:
         if type(authority) is not RepositoryWebInstanceMembershipAuthority:
             raise TypeError("authority must be a RepositoryWebInstanceMembershipAuthority")
@@ -124,6 +126,7 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
         self._interval_seconds = resolved_interval
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._log = structlog.get_logger("web.membership")
+        self._process_recovery = ProcessRecovery() if process_recovery is None else process_recovery
 
     @property
     def identity(self) -> WebInstanceIdentity:
@@ -133,17 +136,15 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
         """Register, then renew the lease until ``stop``; failure to register fails boot."""
         if self._heartbeat_task is not None:
             raise RuntimeError("web instance membership already started")
-        owner = asyncio.current_task()
-        if owner is None:
-            raise RuntimeError("web instance membership must start inside an asyncio task")
         await run_sync_in_worker(self._authority.register, self._identity, lease_seconds=self._lease_seconds)
         task = asyncio.create_task(self._heartbeat_loop())
 
-        def _stop_owner_on_failure(completed: asyncio.Task[None]) -> None:
+        def _recover_process_on_failure(completed: asyncio.Task[None]) -> None:
             if not completed.cancelled() and completed.exception() is not None:
-                owner.cancel()
+                self._draining.set()
+                self._process_recovery.request_shutdown()
 
-        task.add_done_callback(_stop_owner_on_failure)
+        task.add_done_callback(_recover_process_on_failure)
         self._heartbeat_task = task
 
     async def _heartbeat_loop(self) -> None:
@@ -194,7 +195,7 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
 
         A heartbeat task that had already died re-raises its stored failure
         here, after the stop write has been attempted, so the fault that
-        cancelled the lifespan surfaces at shutdown instead of being lost.
+        triggered process recovery surfaces at shutdown instead of being lost.
         """
         task = self._heartbeat_task
         self._heartbeat_task = None

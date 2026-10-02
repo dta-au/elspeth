@@ -12,12 +12,15 @@ Tests cover:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
 
-from elspeth.contracts import CallStatus, CallType, Determinism, NodeStateStatus, NodeType
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts import CallStatus, CallType, Determinism, NodeStateStatus, NodeType, RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
+from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -35,7 +38,8 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -54,13 +58,13 @@ class TestComputeGrade:
     def test_all_deterministic_returns_full(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.FULL_REPRODUCIBLE
@@ -68,7 +72,6 @@ class TestComputeGrade:
     def test_seeded_returns_full(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sampler",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -76,6 +79,7 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.SEEDED,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.FULL_REPRODUCIBLE
@@ -83,7 +87,6 @@ class TestComputeGrade:
     def test_nondeterministic_returns_replay(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="llm",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -91,6 +94,7 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.NON_DETERMINISTIC,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -98,7 +102,6 @@ class TestComputeGrade:
     def test_external_call_returns_replay(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="api",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -106,6 +109,7 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.EXTERNAL_CALL,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -113,7 +117,6 @@ class TestComputeGrade:
     def test_io_read_returns_replay(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="reader",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -121,6 +124,7 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.IO_READ,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -128,7 +132,6 @@ class TestComputeGrade:
     def test_io_write_returns_replay(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="writer",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -136,6 +139,7 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.IO_WRITE,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -143,7 +147,6 @@ class TestComputeGrade:
     def test_mixed_deterministic_and_nondeterministic(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -151,9 +154,9 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.DETERMINISTIC,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="llm",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -161,6 +164,7 @@ class TestComputeGrade:
             node_id="n2",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.NON_DETERMINISTIC,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -195,7 +199,6 @@ def _create_nondeterministic_call(
 ) -> None:
     """Create a node + node_state + call chain for purge testing."""
     factory.data_flow.register_node(
-        run_id="run-1",
         plugin_name="llm",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
@@ -203,6 +206,7 @@ def _create_nondeterministic_call(
         node_id=node_id,
         schema_config=_DYNAMIC_SCHEMA,
         determinism=determinism,
+        coordination_token=leader_coordination_token(factory, "run-1"),
     )
     with db.write_connection() as conn:
         # Row and token are needed for node_state FK
@@ -214,7 +218,7 @@ def _create_nondeterministic_call(
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="src_hash",
+                source_data_hash=fake_sha256("src_hash"),
                 created_at=datetime.now(UTC),
             )
         )
@@ -235,8 +239,8 @@ def _create_nondeterministic_call(
                 step_index=0,
                 attempt=0,
                 status=NodeStateStatus.COMPLETED,
-                input_hash="in_hash",
-                output_hash="out_hash",
+                input_hash=fake_sha256("in_hash"),
+                output_hash=fake_sha256("out_hash"),
                 started_at=datetime.now(UTC),
             )
         )
@@ -248,7 +252,7 @@ def _create_nondeterministic_call(
                 call_index=0,
                 call_type=CallType.HTTP,
                 status=CallStatus.SUCCESS,
-                request_hash="req_hash",
+                request_hash=fake_sha256("req_hash"),
                 response_hash=response_hash,
                 response_ref=response_ref,
                 created_at=datetime.now(UTC),
@@ -273,7 +277,6 @@ def _create_nondeterministic_operation_call(
 ) -> None:
     """Create a source/sink operation call chain for purge downgrade testing."""
     factory.data_flow.register_node(
-        run_id="run-1",
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -281,6 +284,7 @@ def _create_nondeterministic_operation_call(
         node_id=node_id,
         schema_config=_DYNAMIC_SCHEMA,
         determinism=determinism,
+        coordination_token=leader_coordination_token(factory, "run-1"),
     )
     with db.write_connection() as conn:
         conn.execute(
@@ -305,7 +309,7 @@ def _create_nondeterministic_operation_call(
                 call_index=0,
                 call_type=CallType.HTTP,
                 status=CallStatus.SUCCESS,
-                request_hash="req_hash",
+                request_hash=fake_sha256("req_hash"),
                 response_hash=response_hash,
                 response_ref=response_ref,
                 created_at=datetime.now(UTC),
@@ -322,7 +326,6 @@ def _create_source_row(
     node_id: str = "source-node",
 ) -> None:
     factory.data_flow.register_node(
-        run_id="run-1",
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -330,6 +333,7 @@ def _create_source_row(
         node_id=node_id,
         schema_config=_DYNAMIC_SCHEMA,
         determinism=determinism,
+        coordination_token=leader_coordination_token(factory, "run-1"),
     )
     with db.write_connection() as conn:
         conn.execute(
@@ -340,7 +344,7 @@ def _create_source_row(
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="src_hash",
+                source_data_hash=fake_sha256("src_hash"),
                 source_data_ref=source_data_ref,
                 created_at=datetime.now(UTC),
             )
@@ -350,14 +354,52 @@ def _create_source_row(
 class TestUpdateGradeAfterPurge:
     """Tests for update_grade_after_purge — degrades REPLAY → ATTRIBUTABLE."""
 
+    @pytest.mark.parametrize("deposed", [False, True])
+    def test_purge_grade_requires_current_export_authority(self, deposed: bool) -> None:
+        db, factory = _setup()
+        _create_nondeterministic_call(db, factory, response_ref=None, response_hash=fake_sha256("resp_hash"))
+        leader = leader_coordination_token(factory, "run-1")
+        # The call's row reaches its outcome before the success stamp (QR-4).
+        factory.data_flow.record_token_outcome_leader(
+            TokenRef(token_id="tok-nd-node", run_id="run-1"),
+            TerminalOutcome.SUCCESS,
+            TerminalPath.DEFAULT_FLOW,
+            coordination_token=leader,
+            sink_name="default",
+        )
+        factory.run_lifecycle.finalize_run(
+            status=RunStatus.COMPLETED,
+            coordination_token=leader,
+        )
+        factory.run_coordination.release_seat(token=leader)
+        authority = factory.run_coordination.acquire_export_leadership(
+            run_id="run-1", worker_id=mint_worker_id("run-1"), window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+        )
+        if deposed:
+            factory.run_coordination.release_seat(token=authority)
+            successor = factory.run_coordination.acquire_export_leadership(
+                run_id="run-1", worker_id=mint_worker_id("run-1"), window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+            )
+            with pytest.raises(RunLeadershipLostError):
+                update_grade_after_purge(db, coordination_token=authority)
+            current_leader = factory.run_coordination.live_leader(run_id="run-1")
+            assert current_leader is not None
+            assert current_leader.leader_worker_id == successor.worker_id
+        else:
+            update_grade_after_purge(db, coordination_token=authority)
+        run = factory.run_lifecycle.get_run("run-1")
+        assert run is not None
+        expected = ReproducibilityGrade.REPLAY_REPRODUCIBLE if deposed else ReproducibilityGrade.ATTRIBUTABLE_ONLY
+        assert run.reproducibility_grade == expected
+
     def test_replay_degrades_when_nondeterministic_response_purged(self) -> None:
         """Downgrade when a nondeterministic node's response payload has been purged."""
         db, factory = _setup()
         # Create a nondeterministic node with a purged response
         # (response_hash set but response_ref is None = purged)
-        _create_nondeterministic_call(db, factory, response_ref=None, response_hash="resp_hash")
+        _create_nondeterministic_call(db, factory, response_ref=None, response_hash=fake_sha256("resp_hash"))
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
-        update_grade_after_purge(db, "run-1")
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.reproducibility_grade == ReproducibilityGrade.ATTRIBUTABLE_ONLY
@@ -365,9 +407,13 @@ class TestUpdateGradeAfterPurge:
     def test_replay_degrades_when_nondeterministic_operation_response_ref_deleted(self) -> None:
         """Downgrade when a source/sink operation call response payload was purged."""
         db, factory = _setup()
-        _create_nondeterministic_operation_call(db, factory, response_ref="ref://operation-response", response_hash="resp_hash")
+        _create_nondeterministic_operation_call(
+            db, factory, response_ref="ref://operation-response", response_hash=fake_sha256("resp_hash")
+        )
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
-        update_grade_after_purge(db, "run-1", deleted_refs=["ref://operation-response"])
+        update_grade_after_purge(
+            db, coordination_token=leader_coordination_token(factory, "run-1"), deleted_refs=["ref://operation-response"]
+        )
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.reproducibility_grade == ReproducibilityGrade.ATTRIBUTABLE_ONLY
@@ -377,7 +423,7 @@ class TestUpdateGradeAfterPurge:
         db, factory = _setup()
         _create_source_row(db, factory, determinism=Determinism.IO_READ, source_data_ref="ref://source-row")
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
-        update_grade_after_purge(db, "run-1", deleted_refs=["ref://source-row"])
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"), deleted_refs=["ref://source-row"])
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.reproducibility_grade == ReproducibilityGrade.ATTRIBUTABLE_ONLY
@@ -390,11 +436,13 @@ class TestUpdateGradeAfterPurge:
             factory,
             determinism=Determinism.IO_WRITE,
             output_data_ref="ref://operation-output",
-            output_data_hash="output_hash",
+            output_data_hash=fake_sha256("output_hash"),
             response_hash=None,
         )
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
-        update_grade_after_purge(db, "run-1", deleted_refs=["ref://operation-output"])
+        update_grade_after_purge(
+            db, coordination_token=leader_coordination_token(factory, "run-1"), deleted_refs=["ref://operation-output"]
+        )
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.reproducibility_grade == ReproducibilityGrade.ATTRIBUTABLE_ONLY
@@ -408,10 +456,10 @@ class TestUpdateGradeAfterPurge:
             factory,
             determinism=Determinism.DETERMINISTIC,
             response_ref=None,
-            response_hash="resp_hash",
+            response_hash=fake_sha256("resp_hash"),
         )
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
-        update_grade_after_purge(db, "run-1")
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.reproducibility_grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -420,9 +468,9 @@ class TestUpdateGradeAfterPurge:
         """Do NOT downgrade when nondeterministic responses are still present."""
         db, factory = _setup()
         # Create a nondeterministic node with response still present
-        _create_nondeterministic_call(db, factory, response_ref="ref://still-there", response_hash="resp_hash")
+        _create_nondeterministic_call(db, factory, response_ref="ref://still-there", response_hash=fake_sha256("resp_hash"))
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
-        update_grade_after_purge(db, "run-1")
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.reproducibility_grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -431,7 +479,7 @@ class TestUpdateGradeAfterPurge:
         """Do NOT downgrade when run has no calls at all (nothing to purge)."""
         db, factory = _setup()
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
-        update_grade_after_purge(db, "run-1")
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.reproducibility_grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -439,7 +487,7 @@ class TestUpdateGradeAfterPurge:
     def test_full_unchanged_after_purge(self) -> None:
         db, factory = _setup()
         _set_grade(db, "run-1", ReproducibilityGrade.FULL_REPRODUCIBLE)
-        update_grade_after_purge(db, "run-1")
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.reproducibility_grade == ReproducibilityGrade.FULL_REPRODUCIBLE
@@ -447,23 +495,24 @@ class TestUpdateGradeAfterPurge:
     def test_attributable_unchanged_after_purge(self) -> None:
         db, factory = _setup()
         _set_grade(db, "run-1", ReproducibilityGrade.ATTRIBUTABLE_ONLY)
-        update_grade_after_purge(db, "run-1")
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.reproducibility_grade == ReproducibilityGrade.ATTRIBUTABLE_ONLY
 
     def test_nonexistent_run_raises(self) -> None:
         """Purging a nonexistent run is a caller bug — must crash."""
-        db, _factory = _setup()
-        with pytest.raises(AuditIntegrityError, match="does not exist"):
-            update_grade_after_purge(db, "nonexistent")
+        db, factory = _setup()
+        token = replace(leader_coordination_token(factory, "run-1"), run_id="nonexistent")
+        with pytest.raises(RunLeadershipLostError):
+            update_grade_after_purge(db, coordination_token=token)
 
     def test_null_grade_raises(self) -> None:
         """NULL reproducibility_grade is Tier 1 corruption — must crash."""
-        db, _factory = _setup()
+        db, factory = _setup()
         # begin_run doesn't set a grade by default, so it's NULL
         with pytest.raises(AuditIntegrityError, match="NULL reproducibility_grade"):
-            update_grade_after_purge(db, "run-1")
+            update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))
 
     def test_invalid_node_determinism_raises_before_purge_downgrade(self) -> None:
         """Invalid node determinism is Tier 1 corruption, not a non-critical payload."""
@@ -472,7 +521,7 @@ class TestUpdateGradeAfterPurge:
             db,
             factory,
             response_ref=None,
-            response_hash="resp_hash",
+            response_hash=fake_sha256("resp_hash"),
             node_id="corrupt-node",
         )
         _set_grade(db, "run-1", ReproducibilityGrade.REPLAY_REPRODUCIBLE)
@@ -486,7 +535,7 @@ class TestUpdateGradeAfterPurge:
             )
 
         with pytest.raises(AuditIntegrityError, match="Invalid determinism value 'tampered'"):
-            update_grade_after_purge(db, "run-1")
+            update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))
 
     def test_invalid_node_determinism_raises_before_non_replay_grade_return(self) -> None:
         """Non-replay grades still validate node determinism before returning."""
@@ -495,7 +544,7 @@ class TestUpdateGradeAfterPurge:
             db,
             factory,
             response_ref=None,
-            response_hash="resp_hash",
+            response_hash=fake_sha256("resp_hash"),
             node_id="corrupt-node",
         )
         _set_grade(db, "run-1", ReproducibilityGrade.FULL_REPRODUCIBLE)
@@ -509,4 +558,4 @@ class TestUpdateGradeAfterPurge:
             )
 
         with pytest.raises(AuditIntegrityError, match="Invalid determinism value 'tampered'"):
-            update_grade_after_purge(db, "run-1")
+            update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, "run-1"))

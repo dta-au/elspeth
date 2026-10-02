@@ -88,14 +88,14 @@ class TestCheckpointSerialization:
         assert result["metadata"]["updated_at"] == dt
 
     def test_rejects_nan(self) -> None:
-        """NaN values are rejected per CLAUDE.md audit integrity."""
+        """NaN values are rejected (engine-patterns-reference skill §Canonical JSON)."""
         data = {"value": float("nan")}
 
         with pytest.raises(ValueError, match="non-finite float"):
             checkpoint_dumps(data)
 
     def test_rejects_infinity(self) -> None:
-        """Infinity values are rejected per CLAUDE.md audit integrity."""
+        """Infinity values are rejected (engine-patterns-reference skill §Canonical JSON)."""
         data = {"value": float("inf")}
 
         with pytest.raises(ValueError, match="non-finite float"):

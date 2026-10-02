@@ -10,6 +10,8 @@ import { Button } from "@/components/ui";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ToolCallCard } from "./ToolCallCard";
 import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
+import { PENDING_REVIEW_NOTICE } from "./pendingReviewNotice";
+
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -23,9 +25,6 @@ interface MessageBubbleProps {
    */
   compositionState?: CompositionState | null;
   staleProposalIds?: string[];
-  proposalActionPendingIds?: string[];
-  onAcceptProposal?: (proposalId: string) => void;
-  onRejectProposal?: (proposalId: string) => void;
   /**
    * Inline source summaries attached to this turn — rendered as a second
    * collapsible group below the tool-calls group, separated by a horizontal
@@ -37,6 +36,8 @@ interface MessageBubbleProps {
    */
   sourcesCreated?: ReadonlyArray<InlineSourceSummary>;
   onEditInlineSource?: (summary: InlineSourceSummary) => void;
+  /** Creation times of current pending cards; absent until review state loads. */
+  pendingReviewCreatedAt?: ReadonlyArray<string>;
 }
 
 export function MessageBubble({
@@ -47,24 +48,28 @@ export function MessageBubble({
   proposalsByToolCallId,
   compositionState = null,
   staleProposalIds = [],
-  proposalActionPendingIds = [],
-  onAcceptProposal = () => undefined,
-  onRejectProposal = () => undefined,
   sourcesCreated,
   onEditInlineSource,
+  pendingReviewCreatedAt,
 }: MessageBubbleProps) {
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
   const [toolsExpanded, setToolsExpanded] = useState(false);
   const hasToolCalls = !!(message.tool_calls && message.tool_calls.length > 0);
   const hasSourcesCreated = !!(sourcesCreated && sourcesCreated.length > 0);
-  const visibleSegments = useMemo(
-    () =>
-      message.segments ?? [
+  const visibleSegments = useMemo(() => {
+    const segments = message.segments ?? [
         { kind: "text" as const, content: message.content },
-      ],
-    [message.content, message.segments],
-  );
+      ];
+    if (pendingReviewCreatedAt === undefined) return segments;
+    const handoffAt = Date.parse(message.created_at);
+    if (Number.isNaN(handoffAt) || pendingReviewCreatedAt.some((createdAt) => Date.parse(createdAt) <= handoffAt)) {
+      return segments;
+    }
+    return segments.filter((segment) =>
+      !(segment.kind === "trusted_system_notice" && segment.content === PENDING_REVIEW_NOTICE),
+    );
+  }, [message.content, message.created_at, message.segments, pendingReviewCreatedAt]);
   const [copied, setCopied] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(message.content);
@@ -126,15 +131,16 @@ export function MessageBubble({
   // legibility). An sr-only label, read first, supplies it. (elspeth-f700d8d8a5)
   const authorLabel = isUser ? "You said:" : isSystem ? "System note:" : "ELSPETH said:";
 
-  // System messages: centre-aligned full-width banner, muted colour,
-  // italic text. Used for audit markers like "Pipeline reverted to version N."
+  // Short audit markers remain centred and italic. The current validation
+  // message can contain long error explanations, so it reads as a left-aligned
+  // notice instead.
   if (isSystem) {
     return (
       <div
         className="message-bubble message-bubble--system message-row message-row--system"
       >
         <div
-          className="bubble bubble-system"
+          className={`bubble bubble-system${message.id === "system-validation-current" ? " bubble-system--validation" : ""}`}
           role="status"
         >
           <span className="sr-only">{authorLabel}</span>
@@ -272,10 +278,9 @@ export function MessageBubble({
               {message.local_error ?? "Failed to send message. Please try again."}
             </span>
             {/* S1: ``policy_blocked`` is permanent by construction — a
-                deployment policy refused the pipeline (see the F13-D guided
-                precedent in sessionStore.ts) — so keep the failed text but
+                deployment policy refused the pipeline, so keep the failed text but
                 never render a retry invitation for it. */}
-            {message.local_failure_code !== "policy_blocked" && (
+            {message.local_failure_code !== "policy_blocked" && message.local_failure_code !== "admission_refused" && message.local_failure_code !== "token_accounting_unavailable" && message.local_failure_code !== "message_idempotency_conflict" && message.local_failure_code !== "recompose_user_message_mismatch" && (
               <Button
                 variant="bare"
                 onClick={() => onRetry(message.id)}
@@ -329,15 +334,6 @@ export function MessageBubble({
                           )
                         : false
                     }
-                    isBusy={
-                      tc.id
-                        ? proposalActionPendingIds.includes(
-                            proposalsByToolCallId?.get(tc.id)?.id ?? "",
-                          )
-                        : false
-                    }
-                    onAccept={onAcceptProposal}
-                    onReject={onRejectProposal}
                   />
                 ))}
               </div>

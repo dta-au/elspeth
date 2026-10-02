@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import leader_coordination_token
 
 from elspeth.contracts import CallStatus, CallType, Determinism, NodeStateStatus, NodeType, RunStatus
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import RunLeadershipLostError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import calls_table, node_states_table, rows_table, tokens_table
@@ -77,8 +79,8 @@ def _insert_purged_call(
                 step_index=0,
                 attempt=0,
                 status=NodeStateStatus.COMPLETED.value,
-                input_hash="in_hash",
-                output_hash="out_hash",
+                input_hash=fake_sha256("in_hash"),
+                output_hash=fake_sha256("out_hash"),
                 started_at=now,
             )
         )
@@ -90,8 +92,8 @@ def _insert_purged_call(
                 call_index=0,
                 call_type=CallType.HTTP.value,
                 status=CallStatus.SUCCESS.value,
-                request_hash="req_hash",
-                response_hash="resp_hash",  # Proof the payload once existed
+                request_hash=fake_sha256("req_hash"),
+                response_hash=fake_sha256("resp_hash"),  # Proof the payload once existed
                 response_ref=None,  # NULL = payload has been purged
                 created_at=now,
             )
@@ -114,7 +116,7 @@ class TestReproducibilityGradeComputation:
 
         # All deterministic nodes
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -123,7 +125,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="field_mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -132,7 +134,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="seeded_sampler",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -141,7 +143,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -167,7 +169,7 @@ class TestReproducibilityGradeComputation:
 
         # Mix of deterministic and nondeterministic nodes
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -176,7 +178,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="llm_classifier",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -185,7 +187,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -211,7 +213,7 @@ class TestReproducibilityGradeComputation:
 
         # Register deterministic nodes
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -220,7 +222,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -257,7 +259,7 @@ class TestReproducibilityGradeComputation:
 
         # Nondeterministic pipeline
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="llm_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -277,7 +279,7 @@ class TestReproducibilityGradeComputation:
         _insert_purged_call(db, run.run_id, node_id=node.node_id)
 
         # Simulate purge - grade should degrade because replay-critical payload is gone
-        update_grade_after_purge(db, run.run_id)
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Check grade was degraded
         updated_run = factory.run_lifecycle.get_run(run.run_id)
@@ -300,7 +302,7 @@ class TestReproducibilityGradeComputation:
 
         # Deterministic pipeline
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -316,7 +318,7 @@ class TestReproducibilityGradeComputation:
         assert completed_run.reproducibility_grade == ReproducibilityGrade.FULL_REPRODUCIBLE
 
         # Simulate purge - grade should NOT degrade
-        update_grade_after_purge(db, run.run_id)
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Check grade unchanged
         updated_run = factory.run_lifecycle.get_run(run.run_id)
@@ -341,13 +343,17 @@ class TestReproducibilityGradeComputation:
 
     def test_update_grade_after_purge_nonexistent_run_raises(self) -> None:
         """update_grade_after_purge() crashes on nonexistent run — caller bug or corruption."""
+        from tests.fixtures.landscape import make_factory
+
         from elspeth.core.landscape.database import LandscapeDB
         from elspeth.core.landscape.reproducibility import update_grade_after_purge
 
         db = LandscapeDB.in_memory()
-
-        with pytest.raises(AuditIntegrityError, match="does not exist"):
-            update_grade_after_purge(db, "nonexistent_run_id")
+        factory = make_factory(db)
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        token = replace(leader_coordination_token(factory, run.run_id), run_id="nonexistent_run_id")
+        with pytest.raises(RunLeadershipLostError):
+            update_grade_after_purge(db, coordination_token=token)
 
     def test_attributable_only_unchanged_after_purge(self) -> None:
         """ATTRIBUTABLE_ONLY remains unchanged after purge (already at lowest grade).
@@ -368,7 +374,7 @@ class TestReproducibilityGradeComputation:
 
         # Nondeterministic pipeline
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="llm_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -384,7 +390,7 @@ class TestReproducibilityGradeComputation:
         _insert_purged_call(db, run.run_id, node_id=node.node_id)
 
         # First purge: degrades REPLAY_REPRODUCIBLE → ATTRIBUTABLE_ONLY
-        update_grade_after_purge(db, run.run_id)
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Verify it's ATTRIBUTABLE_ONLY
         run_after_first_purge = factory.run_lifecycle.get_run(run.run_id)
@@ -392,7 +398,7 @@ class TestReproducibilityGradeComputation:
         assert run_after_first_purge.reproducibility_grade == ReproducibilityGrade.ATTRIBUTABLE_ONLY
 
         # Second purge: no-op, already at lowest grade
-        update_grade_after_purge(db, run.run_id)
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, run.run_id))
 
         run_after_second_purge = factory.run_lifecycle.get_run(run.run_id)
         assert run_after_second_purge is not None
@@ -410,7 +416,7 @@ class TestReproducibilityGradeComputation:
 
         # Register nodes WITHOUT specifying determinism - should default to DETERMINISTIC
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -419,7 +425,7 @@ class TestReproducibilityGradeComputation:
             # determinism not specified - should default to DETERMINISTIC
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="field_mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",

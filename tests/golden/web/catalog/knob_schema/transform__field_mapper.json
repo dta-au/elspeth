@@ -13,7 +13,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -23,7 +23,7 @@
         "tier": "common"
       },
       {
-        "description": "Mapping from existing input field names to output field names.",
+        "description": "Mapping keys locate existing input fields (header aliases may resolve when the source carries them); values create output names. An explicit target-only schema declaration can type a created target, but never converts its value.",
         "kind": "json-object",
         "label": "Mapping",
         "name": "mapping",
@@ -37,16 +37,6 @@
         "kind": "checkbox",
         "label": "Select Only",
         "name": "select_only",
-        "nullable": false,
-        "required": false,
-        "tier": "common"
-      },
-      {
-        "default": false,
-        "description": "Controls direct process() calls for a missing normalized source. Normal engine execution requires every configured source before process(); dotted and unresolved original-header misses always route.",
-        "kind": "checkbox",
-        "label": "Strict",
-        "name": "strict",
         "nullable": false,
         "required": false,
         "tier": "common"

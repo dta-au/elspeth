@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
@@ -22,6 +23,13 @@ import pytest
 
 from elspeth.core.config import SecretsConfig
 from elspeth.core.security.config_secrets import SecretLoadError, load_secrets_from_config
+
+
+@pytest.fixture(autouse=True)
+def _restore_secret_environment() -> Iterator[None]:
+    """Restore all mapped secrets after each real secret-injection test."""
+    with patch.dict("os.environ"):
+        yield
 
 
 class _RecordedCall:

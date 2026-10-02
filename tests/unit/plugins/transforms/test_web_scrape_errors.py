@@ -56,3 +56,13 @@ def test_ssrf_blocked_error_is_not_retryable():
     """SSRFBlockedError should not be retryable."""
     error = SSRFBlockedError("Blocked IP: 127.0.0.1")
     assert error.retryable is False
+
+
+def test_every_url_policy_refusal_kind_has_value_free_text() -> None:
+    """Every SSRF/DNS refusal kind maps to one fixed sentence; none is missing or extra (C3)."""
+    from typing import get_args
+
+    from elspeth.core.security.web import DNSFailureKind, SSRFRefusalKind
+    from elspeth.plugins.transforms.web_scrape_errors import URL_POLICY_REFUSAL_TEXT
+
+    assert set(URL_POLICY_REFUSAL_TEXT) == set(get_args(SSRFRefusalKind)) | set(get_args(DNSFailureKind))

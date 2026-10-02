@@ -38,7 +38,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.reproducibility import ReproducibilityGrade
 from elspeth.core.landscape.schema import nodes_table, rows_table, runs_table
 from elspeth.core.retention import PurgeManager, PurgeResult
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db
 
 # =============================================================================
 # Strategies for retention testing
@@ -79,18 +79,16 @@ def _create_completed_run(
     run_id = f"run-{next(_RUN_COUNTER):06d}"
     now = _REFERENCE_TIME
     config = {"node_id": SOURCE_NODE_ID}
+    factory = make_factory(db)
+    factory.run_lifecycle.begin_run(run_id=run_id, config={"run_id": run_id}, canonical_version="sha256-rfc8785-v1")
+    factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_token_for(db, run_id))
     with db.write_connection() as conn:
         conn.execute(
-            runs_table.insert().values(
-                run_id=run_id,
+            runs_table.update()
+            .where(runs_table.c.run_id == run_id)
+            .values(
                 started_at=now,
                 completed_at=completed_at,
-                config_hash=stable_hash({"run_id": run_id}),
-                settings_json="{}",
-                canonical_version="sha256-rfc8785-v1",
-                status=RunStatus.COMPLETED,
-                openrouter_catalog_sha256="0" * 64,
-                openrouter_catalog_source="bundled",
             )
         )
         # Create a source node (required FK for rows.source_node_id)
@@ -116,6 +114,7 @@ def _create_completed_run(
                 reproducibility_grade=ReproducibilityGrade.FULL_REPRODUCIBLE.value,
             )
         )
+    factory.run_coordination.release_seat(token=leader_token_for(db, run_id))
     return run_id
 
 

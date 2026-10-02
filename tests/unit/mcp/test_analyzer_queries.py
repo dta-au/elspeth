@@ -24,6 +24,7 @@ import json
 from typing import Any, cast
 
 import pytest
+from sqlalchemy import select
 
 from elspeth.contracts import (
     CallStatus,
@@ -37,11 +38,14 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
-from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.enums import CollectorGroupFailureReason, FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.sink_effects import SinkEffectAttemptAction, SinkEffectAttemptRequest
+from elspeth.core.landscape.collector_group_failure_holds import collector_group_failure_hold_error
 from elspeth.core.landscape.lineage import explain
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from elspeth.core.landscape.schema import transform_errors_table
 from elspeth.mcp.analyzer import LandscapeAnalyzer
 from elspeth.mcp.analyzers.diagnostics import get_failure_context
 from elspeth.mcp.analyzers.queries import (
@@ -58,7 +62,9 @@ from elspeth.mcp.analyzers.queries import (
 from elspeth.mcp.analyzers.reports import get_error_analysis, get_run_summary
 from elspeth.mcp.types import ErrorResult
 from tests.fixtures.landscape import (
+    claim_test_work_item,
     leader_coordination_token,
+    leader_member_token,
     make_factory,
     make_landscape_db,
     make_recorder_with_run,
@@ -117,16 +123,28 @@ def _build_linear_pipeline(
     )
 
     # Register edges
-    edge_1 = factory.data_flow.register_edge(run_id, source_node_id, transform_node_id, "continue", RoutingMode.MOVE)
-    edge_2 = factory.data_flow.register_edge(run_id, transform_node_id, sink_node_id, "on_success", RoutingMode.MOVE)
+    edge_1 = factory.data_flow.register_edge(
+        source_node_id, transform_node_id, "continue", RoutingMode.MOVE, coordination_token=leader_coordination_token(factory, run_id)
+    )
+    edge_2 = factory.data_flow.register_edge(
+        transform_node_id, sink_node_id, "on_success", RoutingMode.MOVE, coordination_token=leader_coordination_token(factory, run_id)
+    )
 
     # Create row and token
     data = row_data or {"name": "Alice", "amount": 100}
-    row = factory.data_flow.create_row(run_id, source_node_id, row_index=0, data=data, source_row_index=0, ingest_sequence=0)
-    token = factory.data_flow.create_token(row.row_id)
+    row, token = factory.data_flow.create_row_with_token(
+        source_node_id,
+        row_index=0,
+        data=data,
+        source_row_index=0,
+        ingest_sequence=0,
+        coordination_token=leader_coordination_token(factory, run_id),
+    )
 
     # Process through transform
-    ns = factory.execution.begin_node_state(token.token_id, transform_node_id, run_id, step_index=1, input_data=data)
+    ns = factory.execution.begin_node_state(
+        token.token_id, transform_node_id, step_index=1, input_data=data, member_token=leader_coordination_token(factory, run_id).membership
+    )
 
     if fail_transform:
         factory.execution.complete_node_state(
@@ -134,6 +152,7 @@ def _build_linear_pipeline(
             NodeStateStatus.FAILED,
             duration_ms=50.0,
             error=ExecutionError(exception="deliberately failed", exception_type="TestFailure"),
+            member_token=leader_coordination_token(factory, run_id).membership,
         )
     else:
         factory.execution.complete_node_state(
@@ -141,23 +160,23 @@ def _build_linear_pipeline(
             NodeStateStatus.COMPLETED,
             output_data=data,
             duration_ms=50.0,
+            member_token=leader_coordination_token(factory, run_id).membership,
         )
         # Record routing event for the transform->sink edge
         factory.execution.record_routing_event(
-            ns.state_id,
-            edge_2.edge_id,
-            RoutingMode.MOVE,
+            ns.state_id, edge_2.edge_id, RoutingMode.MOVE, member_token=leader_coordination_token(factory, run_id).membership
         )
 
     if complete_token:
         outcome = TerminalOutcome.FAILURE if fail_transform else TerminalOutcome.SUCCESS
         path = TerminalPath.UNROUTED if fail_transform else TerminalPath.DEFAULT_FLOW
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id=run_id),
             outcome=outcome,
             path=path,
             sink_name=None if fail_transform else "csv_sink",
-            error_hash="e" * 64 if fail_transform else None,
+            error_hash="e" * 16 if fail_transform else None,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
     if complete_run:
@@ -191,9 +210,7 @@ class TestListOperations:
         """Runtime-written operation types must remain queryable through MCP."""
         p = _build_linear_pipeline(transform_node_id="llm-transform")
         operation = p["factory"].execution.begin_operation(
-            p["run_id"],
-            "llm-transform",
-            "runtime_preflight",
+            "llm-transform", "runtime_preflight", coordination_token=leader_coordination_token(p["factory"], p["run_id"])
         )
 
         rows = list_operations(
@@ -210,15 +227,22 @@ class TestListOperations:
 
 def test_list_artifacts_maps_explicit_producer_and_publication_evidence() -> None:
     p = _build_linear_pipeline()
-    artifact = p["factory"].execution.register_artifact(
-        run_id=p["run_id"],
-        state_id=p["node_state"].state_id,
-        sink_node_id=p["sink_node_id"],
-        artifact_type="file",
-        path="/output/result.csv",
-        content_hash="a" * 64,
-        size_bytes=1,
-    )
+    with fenced_leader_transaction(
+        p["db"].engine,
+        token=leader_coordination_token(p["factory"], p["run_id"]),
+        window_seconds=300,
+        verb="seed_artifact_query",
+    ) as conn:
+        artifact = p["factory"].execution.artifacts.register_artifact(
+            run_id=p["run_id"],
+            state_id=p["node_state"].state_id,
+            sink_node_id=p["sink_node_id"],
+            artifact_type="file",
+            path="/output/result.csv",
+            content_hash="a" * 64,
+            size_bytes=1,
+            conn=conn,
+        )
 
     rows = list_artifacts(p["db"], p["factory"], p["run_id"])
 
@@ -292,10 +316,18 @@ class TestListTokensLineagePath:
         setup = make_recorder_with_run(run_id="run-fork-lineage", source_node_id="src")
         db, factory, run_id = setup.db, setup.factory, setup.run_id
 
-        row = factory.data_flow.create_row(run_id, "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
+        row, _initial_token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
         factory.data_flow.create_token(
             row.row_id,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
         records = list_tokens(db, factory, run_id=run_id, row_id=None, limit=50)
@@ -371,10 +403,18 @@ class TestExplainTokenLineage:
 
     def test_explain_includes_calls(self) -> None:
         """explain() includes external calls made during processing."""
-        p = _build_linear_pipeline()
+        p = _build_linear_pipeline(complete_run=False)
         state_id = p["node_state"].state_id
 
-        call_index = p["factory"].execution.allocate_call_index(state_id)
+        audit_member = leader_member_token(p["factory"], p["run_id"])
+        audit_item = claim_test_work_item(
+            p["factory"],
+            member_token=audit_member,
+            token_id=p["token"].token_id,
+            node_id=p["node_state"].node_id,
+            step_index=p["node_state"].step_index,
+        )
+        call_index = p["factory"].execution.allocate_call_index(state_id, member_token=audit_member, work_item=audit_item)
         p["factory"].execution.record_call(
             state_id,
             call_index,
@@ -383,6 +423,14 @@ class TestExplainTokenLineage:
             RawCallPayload({"prompt": "test"}),
             RawCallPayload({"response": "ok"}),
             latency_ms=100.0,
+            member_token=audit_member,
+            work_item=audit_item,
+        )
+        p["factory"].scheduler.mark_terminal(
+            member_token=audit_member, work_item_id=audit_item.work_item_id, expected_lease_owner=audit_member.worker_id
+        )
+        p["factory"].run_lifecycle.complete_run(
+            RunStatus.COMPLETED, coordination_token=leader_coordination_token(p["factory"], p["run_id"])
         )
 
         result = explain(p["factory"].query, p["factory"].data_flow, p["run_id"], token_id=p["token"].token_id)
@@ -399,25 +447,47 @@ class TestExplainTokenLineage:
 
         register_test_node(factory.data_flow, run_id, "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
 
-        row = factory.data_flow.create_row(run_id, "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
 
-        ns = factory.execution.begin_node_state(token.token_id, "xform", run_id, step_index=1, input_data={"x": 1})
+        ns = factory.execution.begin_node_state(
+            token.token_id, "xform", step_index=1, input_data={"x": 1}, member_token=leader_coordination_token(factory, run_id).membership
+        )
         error_reason: TransformErrorReason = {"reason": "validation_failed", "message": "division by zero"}
-        factory.execution.complete_node_state(ns.state_id, NodeStateStatus.FAILED, error=error_reason, duration_ms=5.0)
+        factory.execution.complete_node_state(
+            ns.state_id,
+            NodeStateStatus.FAILED,
+            error=error_reason,
+            duration_ms=5.0,
+            member_token=leader_coordination_token(factory, run_id).membership,
+        )
 
+        error_member = leader_member_token(factory, run_id)
+        error_item = claim_test_work_item(factory, member_token=error_member, token_id=token.token_id, node_id="xform")
         factory.data_flow.record_transform_error(
             ref=TokenRef(token_id=token.token_id, run_id=run_id),
             transform_id="xform",
             row_data={"x": 1},
             error_details=error_reason,
             destination="quarantine",
+            member_token=error_member,
+            work_item=error_item,
         )
-        factory.data_flow.record_token_outcome(
+        factory.scheduler.mark_terminal(
+            member_token=error_member, work_item_id=error_item.work_item_id, expected_lease_owner=error_member.worker_id
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id=run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="b" * 64,
+            error_hash="b" * 16,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run_id))
 
@@ -532,25 +602,51 @@ class TestGetFailureContext:
 
         register_test_node(factory.data_flow, "terr-run", "xform", node_type=NodeType.TRANSFORM, plugin_name="llm_classifier")
 
-        row = factory.data_flow.create_row("terr-run", "src", row_index=0, data={"text": "hello"}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"text": "hello"},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "terr-run"),
+        )
 
-        ns = factory.execution.begin_node_state(token.token_id, "xform", "terr-run", step_index=1, input_data={"text": "hello"})
+        ns = factory.execution.begin_node_state(
+            token.token_id,
+            "xform",
+            step_index=1,
+            input_data={"text": "hello"},
+            member_token=leader_coordination_token(factory, "terr-run").membership,
+        )
         error_reason: TransformErrorReason = {"reason": "llm_call_failed", "error": "timeout"}
-        factory.execution.complete_node_state(ns.state_id, NodeStateStatus.FAILED, error=error_reason, duration_ms=5000.0)
+        factory.execution.complete_node_state(
+            ns.state_id,
+            NodeStateStatus.FAILED,
+            error=error_reason,
+            duration_ms=5000.0,
+            member_token=leader_coordination_token(factory, "terr-run").membership,
+        )
 
+        error_member = leader_member_token(factory, "terr-run")
+        error_item = claim_test_work_item(factory, member_token=error_member, token_id=token.token_id, node_id="xform")
         factory.data_flow.record_transform_error(
             ref=TokenRef(token_id=token.token_id, run_id="terr-run"),
             transform_id="xform",
             row_data={"text": "hello"},
             error_details=error_reason,
             destination="quarantine",
+            member_token=error_member,
+            work_item=error_item,
         )
-        factory.data_flow.record_token_outcome(
+        factory.scheduler.mark_terminal(
+            member_token=error_member, work_item_id=error_item.work_item_id, expected_lease_owner=error_member.worker_id
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id="terr-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="c" * 64,
+            error_hash="c" * 16,
+            coordination_token=leader_coordination_token(factory, "terr-run"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "terr-run"))
 
@@ -570,12 +666,12 @@ class TestGetFailureContext:
         db, factory = setup.db, setup.factory
 
         factory.data_flow.record_validation_error(
-            "verr-run",
             "src",
             {"bad_field": None},
             "required field missing",
             "observed",
             "quarantine",
+            coordination_token=leader_coordination_token(factory, "verr-run"),
         )
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "verr-run"))
 
@@ -595,41 +691,72 @@ class TestGetFailureContext:
 
         register_test_node(factory.data_flow, "retry-run", "xform", node_type=NodeType.TRANSFORM, plugin_name="flaky")
 
-        row = factory.data_flow.create_row("retry-run", "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "retry-run"),
+        )
 
         # Attempt 0: failed (initial)
-        ns0 = factory.execution.begin_node_state(token.token_id, "xform", "retry-run", step_index=1, input_data={"x": 1}, attempt=0)
+        ns0 = factory.execution.begin_node_state(
+            token.token_id,
+            "xform",
+            step_index=1,
+            input_data={"x": 1},
+            attempt=0,
+            member_token=leader_coordination_token(factory, "retry-run").membership,
+        )
         factory.execution.complete_node_state(
             ns0.state_id,
             NodeStateStatus.FAILED,
             duration_ms=10.0,
             error=ExecutionError(exception="test_failure", exception_type="TestFailure"),
+            member_token=leader_coordination_token(factory, "retry-run").membership,
         )
 
         # Attempt 1: failed (first retry)
-        ns1 = factory.execution.begin_node_state(token.token_id, "xform", "retry-run", step_index=1, input_data={"x": 1}, attempt=1)
+        ns1 = factory.execution.begin_node_state(
+            token.token_id,
+            "xform",
+            step_index=1,
+            input_data={"x": 1},
+            attempt=1,
+            member_token=leader_coordination_token(factory, "retry-run").membership,
+        )
         factory.execution.complete_node_state(
             ns1.state_id,
             NodeStateStatus.FAILED,
             duration_ms=10.0,
             error=ExecutionError(exception="test_failure", exception_type="TestFailure"),
+            member_token=leader_coordination_token(factory, "retry-run").membership,
         )
 
         # Attempt 2: failed (second retry — triggers has_retries detection)
-        ns2 = factory.execution.begin_node_state(token.token_id, "xform", "retry-run", step_index=1, input_data={"x": 1}, attempt=2)
+        ns2 = factory.execution.begin_node_state(
+            token.token_id,
+            "xform",
+            step_index=1,
+            input_data={"x": 1},
+            attempt=2,
+            member_token=leader_coordination_token(factory, "retry-run").membership,
+        )
         factory.execution.complete_node_state(
             ns2.state_id,
             NodeStateStatus.FAILED,
             duration_ms=10.0,
             error=ExecutionError(exception="test_failure", exception_type="TestFailure"),
+            member_token=leader_coordination_token(factory, "retry-run").membership,
         )
 
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id="retry-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="d" * 64,
+            error_hash="d" * 16,
+            coordination_token=leader_coordination_token(factory, "retry-run"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "retry-run"))
 
@@ -647,32 +774,55 @@ class TestGetFailureContext:
 
         register_test_node(factory.data_flow, "first-retry-run", "xform", node_type=NodeType.TRANSFORM, plugin_name="flaky")
 
-        row = factory.data_flow.create_row("first-retry-run", "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "first-retry-run"),
+        )
 
         # Attempt 0: initial try
-        ns0 = factory.execution.begin_node_state(token.token_id, "xform", "first-retry-run", step_index=1, input_data={"x": 1}, attempt=0)
+        ns0 = factory.execution.begin_node_state(
+            token.token_id,
+            "xform",
+            step_index=1,
+            input_data={"x": 1},
+            attempt=0,
+            member_token=leader_coordination_token(factory, "first-retry-run").membership,
+        )
         factory.execution.complete_node_state(
             ns0.state_id,
             NodeStateStatus.FAILED,
             duration_ms=10.0,
             error=ExecutionError(exception="test_failure", exception_type="TestFailure"),
+            member_token=leader_coordination_token(factory, "first-retry-run").membership,
         )
 
         # Attempt 1: first retry — this alone should trigger has_retries
-        ns1 = factory.execution.begin_node_state(token.token_id, "xform", "first-retry-run", step_index=1, input_data={"x": 1}, attempt=1)
+        ns1 = factory.execution.begin_node_state(
+            token.token_id,
+            "xform",
+            step_index=1,
+            input_data={"x": 1},
+            attempt=1,
+            member_token=leader_coordination_token(factory, "first-retry-run").membership,
+        )
         factory.execution.complete_node_state(
             ns1.state_id,
             NodeStateStatus.FAILED,
             duration_ms=10.0,
             error=ExecutionError(exception="test_failure", exception_type="TestFailure"),
+            member_token=leader_coordination_token(factory, "first-retry-run").membership,
         )
 
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id="first-retry-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="e" * 64,
+            error_hash="e" * 16,
+            coordination_token=leader_coordination_token(factory, "first-retry-run"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "first-retry-run"))
 
@@ -702,21 +852,35 @@ class TestGetFailureContext:
         # Run X: xform is "llm_classifier"
         register_test_node(factory.data_flow, "run-X", "xform", node_type=NodeType.TRANSFORM, plugin_name="llm_classifier")
 
-        row_x = factory.data_flow.create_row("run-X", "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
-        token_x = factory.data_flow.create_token(row_x.row_id)
+        _row_x, token_x = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-X"),
+        )
 
-        ns_x = factory.execution.begin_node_state(token_x.token_id, "xform", "run-X", step_index=1, input_data={"x": 1})
+        ns_x = factory.execution.begin_node_state(
+            token_x.token_id,
+            "xform",
+            step_index=1,
+            input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "run-X").membership,
+        )
         factory.execution.complete_node_state(
             ns_x.state_id,
             NodeStateStatus.FAILED,
             duration_ms=10.0,
             error=ExecutionError(exception="test_failure", exception_type="TestFailure"),
+            member_token=leader_coordination_token(factory, "run-X").membership,
         )
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token_x.token_id, run_id="run-X"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="e" * 64,
+            error_hash="e" * 16,
+            coordination_token=leader_coordination_token(factory, "run-X"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-X"))
 
@@ -725,21 +889,35 @@ class TestGetFailureContext:
         register_test_node(factory.data_flow, "run-Y", "src", node_type=NodeType.SOURCE, plugin_name="source")
         register_test_node(factory.data_flow, "run-Y", "xform", node_type=NodeType.TRANSFORM, plugin_name="field_mapper")
 
-        row_y = factory.data_flow.create_row("run-Y", "src", row_index=0, data={"y": 2}, source_row_index=0, ingest_sequence=0)
-        token_y = factory.data_flow.create_token(row_y.row_id)
+        _row_y, token_y = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"y": 2},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-Y"),
+        )
 
-        ns_y = factory.execution.begin_node_state(token_y.token_id, "xform", "run-Y", step_index=1, input_data={"y": 2})
+        ns_y = factory.execution.begin_node_state(
+            token_y.token_id,
+            "xform",
+            step_index=1,
+            input_data={"y": 2},
+            member_token=leader_coordination_token(factory, "run-Y").membership,
+        )
         factory.execution.complete_node_state(
             ns_y.state_id,
             NodeStateStatus.FAILED,
             duration_ms=20.0,
             error=ExecutionError(exception="test_failure", exception_type="TestFailure"),
+            member_token=leader_coordination_token(factory, "run-Y").membership,
         )
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token_y.token_id, run_id="run-Y"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="f" * 64,
+            error_hash="f" * 16,
+            coordination_token=leader_coordination_token(factory, "run-Y"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-Y"))
 
@@ -767,21 +945,35 @@ class TestGetFailureContext:
 
         # Run P: xform is "slow_transform"
         register_test_node(factory.data_flow, "run-P", "xform", node_type=NodeType.TRANSFORM, plugin_name="slow_transform")
-        row_p = factory.data_flow.create_row("run-P", "src", row_index=0, data={"p": 1}, source_row_index=0, ingest_sequence=0)
-        token_p = factory.data_flow.create_token(row_p.row_id)
+        _row_p, token_p = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"p": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-P"),
+        )
         error_reason: TransformErrorReason = {"reason": "retry_timeout"}
+        error_member = leader_member_token(factory, "run-P")
+        error_item = claim_test_work_item(factory, member_token=error_member, token_id=token_p.token_id, node_id="xform")
         factory.data_flow.record_transform_error(
             ref=TokenRef(token_id=token_p.token_id, run_id="run-P"),
             transform_id="xform",
             row_data={"p": 1},
             error_details=error_reason,
             destination="quarantine",
+            member_token=error_member,
+            work_item=error_item,
         )
-        factory.data_flow.record_token_outcome(
+        factory.scheduler.mark_terminal(
+            member_token=error_member, work_item_id=error_item.work_item_id, expected_lease_owner=error_member.worker_id
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token_p.token_id, run_id="run-P"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
+            coordination_token=leader_coordination_token(factory, "run-P"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-P"))
 
@@ -789,21 +981,35 @@ class TestGetFailureContext:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-Q")
         register_test_node(factory.data_flow, "run-Q", "src", node_type=NodeType.SOURCE, plugin_name="source")
         register_test_node(factory.data_flow, "run-Q", "xform", node_type=NodeType.TRANSFORM, plugin_name="fast_transform")
-        row_q = factory.data_flow.create_row("run-Q", "src", row_index=0, data={"q": 2}, source_row_index=0, ingest_sequence=0)
-        token_q = factory.data_flow.create_token(row_q.row_id)
+        _row_q, token_q = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"q": 2},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-Q"),
+        )
         error_reason_q: TransformErrorReason = {"reason": "invalid_input"}
+        error_member = leader_member_token(factory, "run-Q")
+        error_item = claim_test_work_item(factory, member_token=error_member, token_id=token_q.token_id, node_id="xform")
         factory.data_flow.record_transform_error(
             ref=TokenRef(token_id=token_q.token_id, run_id="run-Q"),
             transform_id="xform",
             row_data={"q": 2},
             error_details=error_reason_q,
             destination="quarantine",
+            member_token=error_member,
+            work_item=error_item,
         )
-        factory.data_flow.record_token_outcome(
+        factory.scheduler.mark_terminal(
+            member_token=error_member, work_item_id=error_item.work_item_id, expected_lease_owner=error_member.worker_id
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token_q.token_id, run_id="run-Q"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="b" * 64,
+            error_hash="b" * 16,
+            coordination_token=leader_coordination_token(factory, "run-Q"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-Q"))
 
@@ -824,20 +1030,34 @@ class TestGetFailureContext:
 
         # Create 5 rows, all failing
         for i in range(5):
-            row = factory.data_flow.create_row("limit-run", "src", row_index=i, data={"i": i}, source_row_index=i, ingest_sequence=i)
-            token = factory.data_flow.create_token(row.row_id)
-            ns = factory.execution.begin_node_state(token.token_id, "xform", "limit-run", step_index=1, input_data={"i": i})
+            _row, token = factory.data_flow.create_row_with_token(
+                "src",
+                row_index=i,
+                data={"i": i},
+                source_row_index=i,
+                ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, "limit-run"),
+            )
+            ns = factory.execution.begin_node_state(
+                token.token_id,
+                "xform",
+                step_index=1,
+                input_data={"i": i},
+                member_token=leader_coordination_token(factory, "limit-run").membership,
+            )
             factory.execution.complete_node_state(
                 ns.state_id,
                 NodeStateStatus.FAILED,
                 duration_ms=10.0,
                 error=ExecutionError(exception="test_failure", exception_type="TestFailure"),
+                member_token=leader_coordination_token(factory, "limit-run").membership,
             )
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
                 ref=TokenRef(token_id=token.token_id, run_id="limit-run"),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
-                error_hash="a" * 64,
+                error_hash="a" * 16,
+                coordination_token=leader_coordination_token(factory, "limit-run"),
             )
 
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "limit-run"))
@@ -857,37 +1077,65 @@ class TestGetFailureContext:
         register_test_node(factory.data_flow, "pattern-run", "xform-b", node_type=NodeType.TRANSFORM, plugin_name="classifier")
 
         # Fail in xform-a
-        row0 = factory.data_flow.create_row("pattern-run", "src", row_index=0, data={"i": 0}, source_row_index=0, ingest_sequence=0)
-        token0 = factory.data_flow.create_token(row0.row_id)
-        ns0 = factory.execution.begin_node_state(token0.token_id, "xform-a", "pattern-run", step_index=1, input_data={"i": 0})
+        _row0, token0 = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"i": 0},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "pattern-run"),
+        )
+        ns0 = factory.execution.begin_node_state(
+            token0.token_id,
+            "xform-a",
+            step_index=1,
+            input_data={"i": 0},
+            member_token=leader_coordination_token(factory, "pattern-run").membership,
+        )
         factory.execution.complete_node_state(
             ns0.state_id,
             NodeStateStatus.FAILED,
             duration_ms=10.0,
             error=ExecutionError(exception="test_failure", exception_type="TestFailure"),
+            member_token=leader_coordination_token(factory, "pattern-run").membership,
         )
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token0.token_id, run_id="pattern-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
+            coordination_token=leader_coordination_token(factory, "pattern-run"),
         )
 
         # Fail in xform-b
-        row1 = factory.data_flow.create_row("pattern-run", "src", row_index=1, data={"i": 1}, source_row_index=1, ingest_sequence=1)
-        token1 = factory.data_flow.create_token(row1.row_id)
-        ns1 = factory.execution.begin_node_state(token1.token_id, "xform-b", "pattern-run", step_index=2, input_data={"i": 1})
+        _row1, token1 = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=1,
+            data={"i": 1},
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "pattern-run"),
+        )
+        ns1 = factory.execution.begin_node_state(
+            token1.token_id,
+            "xform-b",
+            step_index=2,
+            input_data={"i": 1},
+            member_token=leader_coordination_token(factory, "pattern-run").membership,
+        )
         factory.execution.complete_node_state(
             ns1.state_id,
             NodeStateStatus.FAILED,
             duration_ms=10.0,
             error=ExecutionError(exception="test_failure", exception_type="TestFailure"),
+            member_token=leader_coordination_token(factory, "pattern-run").membership,
         )
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token1.token_id, run_id="pattern-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
-            error_hash="b" * 64,
+            error_hash="b" * 16,
+            coordination_token=leader_coordination_token(factory, "pattern-run"),
         )
 
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "pattern-run"))
@@ -923,8 +1171,53 @@ class TestGetRunSummary:
         assert result["errors"]["validation"] == 0
         assert result["errors"]["transform"] == 0
         assert result["errors"]["total"] == 0
+        assert result["counts"]["collector_groups_failed"] == 0
         distribution = {(entry["outcome"], entry["path"], entry["completed"]): entry["count"] for entry in result["outcome_distribution"]}
         assert distribution[(TerminalOutcome.SUCCESS.value, TerminalPath.DEFAULT_FLOW.value, True)] == 1
+
+    def test_summary_counts_structural_collector_failure_separately_from_row_errors(self) -> None:
+        """A failed group with no arrived members is visible without inflating row errors."""
+        setup = make_recorder_with_run(run_id="collector-summary-run", source_node_id="collector-summary-source")
+        register_test_node(
+            setup.factory.data_flow,
+            setup.run_id,
+            "collector-summary-node",
+            node_type=NodeType.COLLECTOR,
+            plugin_name="collector",
+        )
+        _row, token = setup.factory.data_flow.create_row_with_token(
+            setup.source_node_id,
+            row_index=0,
+            data={"value": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=setup.coordination_token,
+        )
+        group_id = setup.factory.data_flow.record_empty_expansion(
+            TokenRef(token_id=token.token_id, run_id=setup.run_id),
+            member_token=setup.coordination_token.membership,
+        )
+        setup.factory.execution.complete_collector_failure(
+            coordination_token=setup.coordination_token,
+            group_id=group_id,
+            collector_node_id="collector-summary-node",
+            failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION,
+            flush_state_id=None,
+            flush_error=None,
+            flush_duration_ms=None,
+            member_holds=(),
+            hold_error=collector_group_failure_hold_error(
+                group_id=group_id, failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION, lost_members=()
+            ),
+        )
+
+        result = get_run_summary(setup.db, setup.factory, setup.run_id)
+
+        assert "error" not in result
+        assert result["counts"]["collector_groups_failed"] == 1
+        # G counts groups; no member token failed, so no error total moves.
+        assert result["errors"]["collector_group"] == 0
+        assert result["errors"]["total"] == 0
 
     def test_summary_token_count_is_run_scoped(self) -> None:
         """Tokens owned by another run must not be counted in the target run."""
@@ -939,15 +1232,14 @@ class TestGetRunSummary:
             node_type=NodeType.SOURCE,
             plugin_name="other-source",
         )
-        other_row = factory.data_flow.create_row(
-            "summary-other-run",
+        _other_row, _initial_token = factory.data_flow.create_row_with_token(
             "other-source",
             row_index=0,
             data={"name": "Bob"},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "summary-other-run"),
         )
-        factory.data_flow.create_token(other_row.row_id)
 
         result = get_run_summary(db, factory, "summary-target-run")
 
@@ -962,9 +1254,15 @@ class TestGetRunSummary:
             transform_node_id="llm-transform",
             sink_node_id="sink-0",
         )
-        setup["factory"].execution.begin_operation("summary-preflight-run", "source-0", "source_load")
-        setup["factory"].execution.begin_operation("summary-preflight-run", "sink-0", "sink_write")
-        setup["factory"].execution.begin_operation("summary-preflight-run", "llm-transform", "runtime_preflight")
+        setup["factory"].execution.begin_operation(
+            "source-0", "source_load", coordination_token=leader_coordination_token(setup["factory"], "summary-preflight-run")
+        )
+        setup["factory"].execution.begin_operation(
+            "sink-0", "sink_write", coordination_token=leader_coordination_token(setup["factory"], "summary-preflight-run")
+        )
+        setup["factory"].execution.begin_operation(
+            "llm-transform", "runtime_preflight", coordination_token=leader_coordination_token(setup["factory"], "summary-preflight-run")
+        )
 
         result = get_run_summary(setup["db"], setup["factory"], "summary-preflight-run")
 
@@ -989,24 +1287,45 @@ class TestGetRunSummary:
         register_test_node(factory.data_flow, "err-run", "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
 
         # Record a validation error
-        factory.data_flow.record_validation_error("err-run", "src", {"bad": "data"}, "missing field", "observed", "quarantine")
+        factory.data_flow.record_validation_error(
+            "src",
+            {"bad": "data"},
+            "missing field",
+            "observed",
+            "quarantine",
+            coordination_token=leader_coordination_token(factory, "err-run"),
+        )
 
         # Record a transform error
-        row = factory.data_flow.create_row("err-run", "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "err-run"),
+        )
         error_reason: TransformErrorReason = {"reason": "api_error"}
+        error_member = leader_member_token(factory, "err-run")
+        error_item = claim_test_work_item(factory, member_token=error_member, token_id=token.token_id, node_id="xform")
         factory.data_flow.record_transform_error(
             ref=TokenRef(token_id=token.token_id, run_id="err-run"),
             transform_id="xform",
             row_data={"x": 1},
             error_details=error_reason,
             destination="quarantine",
+            member_token=error_member,
+            work_item=error_item,
         )
-        factory.data_flow.record_token_outcome(
+        factory.scheduler.mark_terminal(
+            member_token=error_member, work_item_id=error_item.work_item_id, expected_lease_owner=error_member.worker_id
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id="err-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
+            coordination_token=leader_coordination_token(factory, "err-run"),
         )
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "err-run"))
 
@@ -1017,29 +1336,39 @@ class TestGetRunSummary:
         assert result["errors"]["transform"] == 1
         assert result["errors"]["total"] == 2
 
+    def test_summary_counts_a_token_once_when_a_resumed_attempt_rewrote_its_error(self) -> None:
+        """Two attempts' rows for N tokens count N transform errors, not 2N."""
+        db, factory = _record_two_attempts_per_token("two-attempt-summary-run", tokens=3)
+
+        result = get_run_summary(db, factory, "two-attempt-summary-run")
+
+        assert "error" not in result
+        assert result["errors"]["transform"] == 3
+        assert result["errors"]["total"] == 3
+
     def test_list_rows_exposes_source_local_and_ingest_identity(self) -> None:
         setup = make_recorder_with_run(run_id="multi-source-rows", source_node_id="orders")
         db = setup.db
         factory = setup.factory
         register_test_node(factory.data_flow, "multi-source-rows", "refunds", node_type=NodeType.SOURCE, plugin_name="csv")
 
-        factory.data_flow.create_row(
-            "multi-source-rows",
+        factory.data_flow.create_row_with_token(
             "refunds",
             row_index=0,
             data={"kind": "refund"},
             row_id="row-refunds",
             source_row_index=0,
             ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "multi-source-rows"),
         )
-        factory.data_flow.create_row(
-            "multi-source-rows",
+        factory.data_flow.create_row_with_token(
             "orders",
             row_index=0,
             data={"kind": "order"},
             row_id="row-orders",
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "multi-source-rows"),
         )
 
         rows = list_rows(db, factory, "multi-source-rows")
@@ -1056,7 +1385,9 @@ class TestGetRunSummary:
 
     def test_list_operations_accepts_runtime_preflight_filter(self) -> None:
         setup = make_recorder_with_run(run_id="preflight-ops", source_node_id="source-0")
-        operation = setup.factory.execution.begin_operation("preflight-ops", "source-0", "runtime_preflight")
+        operation = setup.factory.execution.begin_operation(
+            "source-0", "runtime_preflight", coordination_token=leader_coordination_token(setup.factory, "preflight-ops")
+        )
 
         rows = list_operations(setup.db, setup.factory, "preflight-ops", operation_type="runtime_preflight")
 
@@ -1072,46 +1403,74 @@ class TestGetRunSummary:
         register_test_node(factory.data_flow, "dist-run", "sink", node_type=NodeType.SINK, plugin_name="csv_sink")
 
         # Row 0: completed
-        row0 = factory.data_flow.create_row("dist-run", "src", row_index=0, data={"i": 0}, source_row_index=0, ingest_sequence=0)
-        token0 = factory.data_flow.create_token(row0.row_id)
-        factory.data_flow.record_token_outcome(
+        _row0, token0 = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"i": 0},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "dist-run"),
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token0.token_id, run_id="dist-run"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="csv_sink",
+            coordination_token=leader_coordination_token(factory, "dist-run"),
         )
 
         # Row 1: quarantined
-        row1 = factory.data_flow.create_row("dist-run", "src", row_index=1, data={"i": 1}, source_row_index=1, ingest_sequence=1)
-        token1 = factory.data_flow.create_token(row1.row_id)
-        factory.data_flow.record_token_outcome(
+        _row1, token1 = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=1,
+            data={"i": 1},
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "dist-run"),
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token1.token_id, run_id="dist-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="b" * 64,
+            error_hash="b" * 16,
+            coordination_token=leader_coordination_token(factory, "dist-run"),
         )
 
         # Row 2: completed
-        row2 = factory.data_flow.create_row("dist-run", "src", row_index=2, data={"i": 2}, source_row_index=2, ingest_sequence=2)
-        token2 = factory.data_flow.create_token(row2.row_id)
-        factory.data_flow.record_token_outcome(
+        _row2, token2 = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=2,
+            data={"i": 2},
+            source_row_index=2,
+            ingest_sequence=2,
+            coordination_token=leader_coordination_token(factory, "dist-run"),
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token2.token_id, run_id="dist-run"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="csv_sink",
+            coordination_token=leader_coordination_token(factory, "dist-run"),
         )
 
         # Row 3: routed_on_error (DIVERT path) — elspeth-5069612f3c new outcome.
         # MCP must surface ROUTED_ON_ERROR as its own outcome_distribution
         # bucket; it does not collapse into the legacy "routed" bucket.
-        row3 = factory.data_flow.create_row("dist-run", "src", row_index=3, data={"i": 3}, source_row_index=3, ingest_sequence=3)
-        token3 = factory.data_flow.create_token(row3.row_id)
-        factory.data_flow.record_token_outcome(
+        _row3, token3 = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=3,
+            data={"i": 3},
+            source_row_index=3,
+            ingest_sequence=3,
+            coordination_token=leader_coordination_token(factory, "dist-run"),
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token3.token_id, run_id="dist-run"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.ON_ERROR_ROUTED,
             sink_name="csv_sink",
-            error_hash="c" * 64,
+            error_hash="c" * 16,
+            coordination_token=leader_coordination_token(factory, "dist-run"),
         )
 
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "dist-run"))
@@ -1231,21 +1590,35 @@ class TestFailureContextCorruptionGuards:
 
         register_test_node(factory.data_flow, "corrupt-te", "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
 
-        row = factory.data_flow.create_row("corrupt-te", "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "corrupt-te"),
+        )
         error_reason: TransformErrorReason = {"reason": "test_error"}
+        error_member = leader_member_token(factory, "corrupt-te")
+        error_item = claim_test_work_item(factory, member_token=error_member, token_id=token.token_id, node_id="xform")
         factory.data_flow.record_transform_error(
             ref=TokenRef(token_id=token.token_id, run_id="corrupt-te"),
             transform_id="xform",
             row_data={"x": 1},
             error_details=error_reason,
             destination="quarantine",
+            member_token=error_member,
+            work_item=error_item,
         )
-        factory.data_flow.record_token_outcome(
+        factory.scheduler.mark_terminal(
+            member_token=error_member, work_item_id=error_item.work_item_id, expected_lease_owner=error_member.worker_id
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id="corrupt-te"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
+            coordination_token=leader_coordination_token(factory, "corrupt-te"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "corrupt-te"))
 
@@ -1259,7 +1632,14 @@ class TestFailureContextCorruptionGuards:
         setup = make_recorder_with_run(run_id="corrupt-ve", source_node_id="src")
         db, factory = setup.db, setup.factory
 
-        factory.data_flow.record_validation_error("corrupt-ve", "src", {"bad": "data"}, "missing field", "observed", "quarantine")
+        factory.data_flow.record_validation_error(
+            "src",
+            {"bad": "data"},
+            "missing field",
+            "observed",
+            "quarantine",
+            coordination_token=leader_coordination_token(factory, "corrupt-ve"),
+        )
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "corrupt-ve"))
 
         _delete_node(db, "corrupt-ve", "src")
@@ -1290,28 +1670,140 @@ class TestErrorAnalysisCorruptionGuard:
 
         register_test_node(factory.data_flow, "corrupt-ea", "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
 
-        row = factory.data_flow.create_row("corrupt-ea", "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "corrupt-ea"),
+        )
         error_reason: TransformErrorReason = {"reason": "test_error"}
+        error_member = leader_member_token(factory, "corrupt-ea")
+        error_item = claim_test_work_item(factory, member_token=error_member, token_id=token.token_id, node_id="xform")
         factory.data_flow.record_transform_error(
             ref=TokenRef(token_id=token.token_id, run_id="corrupt-ea"),
             transform_id="xform",
             row_data={"x": 1},
             error_details=error_reason,
             destination="quarantine",
+            member_token=error_member,
+            work_item=error_item,
         )
-        factory.data_flow.record_token_outcome(
+        factory.scheduler.mark_terminal(
+            member_token=error_member, work_item_id=error_item.work_item_id, expected_lease_owner=error_member.worker_id
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id="corrupt-ea"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
+            coordination_token=leader_coordination_token(factory, "corrupt-ea"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "corrupt-ea"))
 
         _delete_node(db, "corrupt-ea", "xform")
 
-        with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption.*transform_errors"):
+        # The guard's count is COUNT(DISTINCT token_id), so it names tokens, not rows.
+        with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption: transform_errors for 1 token\(s\) reference"):
             get_error_analysis(db, factory, "corrupt-ea")
+
+    def test_missing_node_raises_even_when_its_token_did_not_fail(self) -> None:
+        """The guard reads EVERY transform_errors row, not only the ones the count keeps.
+
+        The counts keep only the error that decided a terminally failed token.
+        An orphaned row whose token was delivered after a resumed retry is
+        still Tier-1 corruption, and gating the guard on the count would let it
+        vanish silently.
+        """
+        setup = make_recorder_with_run(run_id="corrupt-delivered", source_node_id="src")
+        db, factory = setup.db, setup.factory
+        register_test_node(factory.data_flow, "corrupt-delivered", "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "corrupt-delivered"),
+        )
+        error_reason: TransformErrorReason = {"reason": "test_error"}
+        error_member = leader_member_token(factory, "corrupt-delivered")
+        error_item = claim_test_work_item(factory, member_token=error_member, token_id=token.token_id, node_id="xform")
+        factory.data_flow.record_transform_error(
+            ref=TokenRef(token_id=token.token_id, run_id="corrupt-delivered"),
+            transform_id="xform",
+            row_data={"x": 1},
+            error_details=error_reason,
+            destination="discard",
+            member_token=error_member,
+            work_item=error_item,
+        )
+        factory.data_flow.record_token_outcome_leader(
+            ref=TokenRef(token_id=token.token_id, run_id="corrupt-delivered"),
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+            sink_name="output",
+            coordination_token=leader_coordination_token(factory, "corrupt-delivered"),
+        )
+        control = get_error_analysis(db, factory, "corrupt-delivered")
+        assert "error" not in control
+        assert control["transform_errors"]["total"] == 0, "control: the delivered token is not a failure"
+
+        _delete_node(db, "corrupt-delivered", "xform")
+
+        with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption: transform_errors for 1 token\(s\) reference"):
+            get_error_analysis(db, factory, "corrupt-delivered")
+
+    def test_an_orphan_in_another_run_does_not_fail_this_runs_analysis(self) -> None:
+        """The guard scans the analysed run's transform_errors only.
+
+        One audit database holds many runs. An orphaned row in one run is that
+        run's corruption. It must not make every other run's error analysis
+        raise.
+        """
+        corrupt = make_recorder_with_run(run_id="orphan-run", source_node_id="src")
+        clean = make_recorder_with_run(run_id="clean-neighbour-run", source_node_id="src", db=corrupt.db)
+        for setup in (corrupt, clean):
+            run_id, factory = setup.run_id, setup.factory
+            register_test_node(factory.data_flow, run_id, "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
+            _row, token = factory.data_flow.create_row_with_token(
+                "src",
+                row_index=0,
+                data={"x": 1},
+                source_row_index=0,
+                ingest_sequence=0,
+                coordination_token=leader_coordination_token(factory, run_id),
+            )
+            error_reason: TransformErrorReason = {"reason": "test_error"}
+            error_member = leader_member_token(factory, run_id)
+            error_item = claim_test_work_item(factory, member_token=error_member, token_id=token.token_id, node_id="xform")
+            factory.data_flow.record_transform_error(
+                ref=TokenRef(token_id=token.token_id, run_id=run_id),
+                transform_id="xform",
+                row_data={"x": 1},
+                error_details=error_reason,
+                destination="discard",
+                member_token=error_member,
+                work_item=error_item,
+            )
+            factory.data_flow.record_token_outcome_leader(
+                ref=TokenRef(token_id=token.token_id, run_id=run_id),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                error_hash="a" * 16,
+                coordination_token=leader_coordination_token(factory, run_id),
+            )
+
+        _delete_node(corrupt.db, "orphan-run", "xform")
+        with pytest.raises(AuditIntegrityError, match=r"Tier-1 corruption: transform_errors for 1 token\(s\) reference"):
+            get_error_analysis(corrupt.db, corrupt.factory, "orphan-run")
+
+        result = get_error_analysis(clean.db, clean.factory, "clean-neighbour-run")
+
+        assert "error" not in result
+        assert result["transform_errors"]["total"] == 1
+        assert result["transform_errors"]["by_transform"] == [{"transform_plugin": "mapper", "count": 1}]
 
     def test_clean_error_analysis_still_works(self) -> None:
         """Corruption guard doesn't break normal error analysis."""
@@ -1320,21 +1812,35 @@ class TestErrorAnalysisCorruptionGuard:
 
         register_test_node(factory.data_flow, "clean-ea", "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
 
-        row = factory.data_flow.create_row("clean-ea", "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "clean-ea"),
+        )
         error_reason: TransformErrorReason = {"reason": "test_error"}
+        error_member = leader_member_token(factory, "clean-ea")
+        error_item = claim_test_work_item(factory, member_token=error_member, token_id=token.token_id, node_id="xform")
         factory.data_flow.record_transform_error(
             ref=TokenRef(token_id=token.token_id, run_id="clean-ea"),
             transform_id="xform",
             row_data={"x": 1},
             error_details=error_reason,
             destination="quarantine",
+            member_token=error_member,
+            work_item=error_item,
         )
-        factory.data_flow.record_token_outcome(
+        factory.scheduler.mark_terminal(
+            member_token=error_member, work_item_id=error_item.work_item_id, expected_lease_owner=error_member.worker_id
+        )
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id="clean-ea"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="a" * 64,
+            error_hash="a" * 16,
+            coordination_token=leader_coordination_token(factory, "clean-ea"),
         )
         factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "clean-ea"))
 
@@ -1343,6 +1849,64 @@ class TestErrorAnalysisCorruptionGuard:
         assert "error" not in result
         assert result["transform_errors"]["total"] == 1
         assert result["transform_errors"]["by_transform"][0]["transform_plugin"] == "mapper"
+
+    def test_error_analysis_counts_a_token_once_when_a_resumed_attempt_rewrote_its_error(self) -> None:
+        """Two attempts' rows for N tokens count N per transform and in the total, not 2N."""
+        db, factory = _record_two_attempts_per_token("two-attempt-ea-run", tokens=3)
+
+        result = get_error_analysis(db, factory, "two-attempt-ea-run")
+
+        assert "error" not in result
+        assert result["transform_errors"]["total"] == 3
+        assert result["transform_errors"]["by_transform"] == [{"transform_plugin": "mapper", "count": 3}]
+
+
+def _record_two_attempts_per_token(run_id: str, *, tokens: int) -> tuple[Any, Any]:
+    """A run whose ``tokens`` tokens each own TWO transform_errors rows at one node.
+
+    That is what a crash after the error write followed by a resumed attempt
+    leaves (elspeth-5887fb7928 E8): ``transform_errors`` has no
+    ``(token_id, transform_id)`` uniqueness.
+    """
+    setup = make_recorder_with_run(run_id=run_id, source_node_id="src")
+    db, factory = setup.db, setup.factory
+    register_test_node(factory.data_flow, run_id, "xform", node_type=NodeType.TRANSFORM, plugin_name="mapper")
+    member = leader_member_token(factory, run_id)
+    error_reason: TransformErrorReason = {"reason": "api_error"}
+    for index in range(tokens):
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=index,
+            data={"x": index},
+            source_row_index=index,
+            ingest_sequence=index,
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
+        work_item = claim_test_work_item(factory, member_token=member, token_id=token.token_id, node_id="xform")
+        for _attempt in range(2):
+            factory.data_flow.record_transform_error(
+                ref=TokenRef(token_id=token.token_id, run_id=run_id),
+                transform_id="xform",
+                row_data={"x": index},
+                error_details=error_reason,
+                destination="quarantine",
+                member_token=member,
+                work_item=work_item,
+            )
+        # The second attempt failed too and routed the token to its on_error sink.
+        factory.data_flow.record_token_outcome_leader(
+            ref=TokenRef(token_id=token.token_id, run_id=run_id),
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.ON_ERROR_ROUTED,
+            sink_name="quarantine",
+            error_hash="a" * 16,
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
+    factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run_id))
+    with db.connection() as conn:
+        rows = conn.execute(select(transform_errors_table.c.error_id).where(transform_errors_table.c.run_id == run_id)).all()
+    assert len(rows) == 2 * tokens, "control: both attempts' rows are in the audit trail"
+    return db, factory
 
 
 class TestExplainTokenErrorHandling:
@@ -1376,20 +1940,28 @@ class TestExplainTokenErrorHandling:
         register_test_node(factory.data_flow, "et-ambig", "sink-a", node_type=NodeType.SINK, plugin_name="sink_a")
         register_test_node(factory.data_flow, "et-ambig", "sink-b", node_type=NodeType.SINK, plugin_name="sink_b")
 
-        row = factory.data_flow.create_row("et-ambig", "src", row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0)
-        token_a = factory.data_flow.create_token(row.row_id)
-        token_b = factory.data_flow.create_token(row.row_id)
-        factory.data_flow.record_token_outcome(
+        row, token_a = factory.data_flow.create_row_with_token(
+            "src",
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "et-ambig"),
+        )
+        token_b = factory.data_flow.create_token(row.row_id, coordination_token=leader_coordination_token(factory, "et-ambig"))
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token_a.token_id, run_id="et-ambig"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink_a",
+            coordination_token=leader_coordination_token(factory, "et-ambig"),
         )
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token_b.token_id, run_id="et-ambig"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink_b",
+            coordination_token=leader_coordination_token(factory, "et-ambig"),
         )
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "et-ambig"))
 
@@ -1560,21 +2132,20 @@ class TestListCollisions:
             node_type=NodeType.COALESCE,
             plugin_name="coalesce:merge",
         )
-        row = setup.factory.data_flow.create_row(
-            "branch-only",
+        _row, token = setup.factory.data_flow.create_row_with_token(
             setup.source_node_id,
             row_index=0,
             data={"x": 1},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(setup.factory, "branch-only"),
         )
-        token = setup.factory.data_flow.create_token(row.row_id)
         state = setup.factory.execution.begin_node_state(
             token.token_id,
             "coalesce-node",
-            "branch-only",
             step_index=1,
             input_data={"x": 1},
+            member_token=leader_coordination_token(setup.factory, "branch-only").membership,
         )
         context_json = json.dumps(
             {
@@ -1642,13 +2213,23 @@ class TestListCollisions:
         )
 
         # Create a row and token to satisfy FK constraints
-        row = factory.data_flow.create_row(
-            "plain-coalesce", setup.source_node_id, row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0
+        _row, token = factory.data_flow.create_row_with_token(
+            setup.source_node_id,
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "plain-coalesce"),
         )
-        token = factory.data_flow.create_token(row.row_id)
 
         # Record a node state with collision data in context_after
-        ns = factory.execution.begin_node_state(token.token_id, "coalesce-node", "plain-coalesce", step_index=1, input_data={"x": 1})
+        ns = factory.execution.begin_node_state(
+            token.token_id,
+            "coalesce-node",
+            step_index=1,
+            input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "plain-coalesce").membership,
+        )
 
         # Use raw SQL to update context_after_json with collision data
         # (the complete_node_state API doesn't directly support arbitrary JSON)
@@ -1701,12 +2282,22 @@ class TestListCollisions:
             plugin_name="coalesce:merge",
         )
 
-        row = factory.data_flow.create_row(
-            "overlap-only", setup.source_node_id, row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0
+        _row, token = factory.data_flow.create_row_with_token(
+            setup.source_node_id,
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "overlap-only"),
         )
-        token = factory.data_flow.create_token(row.row_id)
 
-        ns = factory.execution.begin_node_state(token.token_id, "coalesce-node", "overlap-only", step_index=1, input_data={"x": 1})
+        ns = factory.execution.begin_node_state(
+            token.token_id,
+            "coalesce-node",
+            step_index=1,
+            input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "overlap-only").membership,
+        )
 
         # Set up overlap-only collision values — all branches have same value
         context_json = json.dumps(
@@ -1759,12 +2350,22 @@ class TestListCollisions:
             plugin_name="coalesce:merge",
         )
 
-        row = factory.data_flow.create_row(
-            "first-wins", setup.source_node_id, row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0
+        _row, token = factory.data_flow.create_row_with_token(
+            setup.source_node_id,
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "first-wins"),
         )
-        token = factory.data_flow.create_token(row.row_id)
 
-        ns = factory.execution.begin_node_state(token.token_id, "coalesce-node", "first-wins", step_index=1, input_data={"x": 1})
+        ns = factory.execution.begin_node_state(
+            token.token_id,
+            "coalesce-node",
+            step_index=1,
+            input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "first-wins").membership,
+        )
 
         # Simulate first_wins: branch1 wins even though branch2 comes last in merge order
         context_json = json.dumps(
@@ -1835,12 +2436,22 @@ class TestListCollisions:
             plugin_name="coalesce:strict_merge",
         )
 
-        row = factory.data_flow.create_row(
-            "failed-merge", setup.source_node_id, row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0
+        _row, token = factory.data_flow.create_row_with_token(
+            setup.source_node_id,
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "failed-merge"),
         )
-        token = factory.data_flow.create_token(row.row_id)
 
-        ns = factory.execution.begin_node_state(token.token_id, "coalesce-node", "failed-merge", step_index=1, input_data={"x": 1})
+        ns = factory.execution.begin_node_state(
+            token.token_id,
+            "coalesce-node",
+            step_index=1,
+            input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "failed-merge").membership,
+        )
 
         # Simulate a failed merge: status='failed' but union_field_origins still
         # contains data from before the failure. With union_collision_policy='fail',
@@ -1916,14 +2527,22 @@ class TestListCollisions:
         )
 
         # Create two rows and tokens — simulating two consumed branches
-        row1 = factory.data_flow.create_row(
-            "no-dedup-test", setup.source_node_id, row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0
+        _row1, token1 = factory.data_flow.create_row_with_token(
+            setup.source_node_id,
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "no-dedup-test"),
         )
-        token1 = factory.data_flow.create_token(row1.row_id)
-        row2 = factory.data_flow.create_row(
-            "no-dedup-test", setup.source_node_id, row_index=1, data={"x": 2}, source_row_index=1, ingest_sequence=1
+        _row2, token2 = factory.data_flow.create_row_with_token(
+            setup.source_node_id,
+            row_index=1,
+            data={"x": 2},
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "no-dedup-test"),
         )
-        token2 = factory.data_flow.create_token(row2.row_id)
 
         # Both tokens get node_states with identical context_after_json (same collision pattern)
         context_json = json.dumps(
@@ -1935,8 +2554,20 @@ class TestListCollisions:
             }
         )
 
-        ns1 = factory.execution.begin_node_state(token1.token_id, "coalesce-node", "no-dedup-test", step_index=1, input_data={"x": 1})
-        ns2 = factory.execution.begin_node_state(token2.token_id, "coalesce-node", "no-dedup-test", step_index=1, input_data={"x": 2})
+        ns1 = factory.execution.begin_node_state(
+            token1.token_id,
+            "coalesce-node",
+            step_index=1,
+            input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "no-dedup-test").membership,
+        )
+        ns2 = factory.execution.begin_node_state(
+            token2.token_id,
+            "coalesce-node",
+            step_index=1,
+            input_data={"x": 2},
+            member_token=leader_coordination_token(factory, "no-dedup-test").membership,
+        )
 
         with db.write_connection() as conn:
             for ns in [ns1, ns2]:
@@ -1988,10 +2619,14 @@ class TestListCollisions:
         # Create 3 rows: first 2 are overlap-only (same values), third is a real collision
         rows_and_tokens = []
         for i in range(3):
-            row = factory.data_flow.create_row(
-                "limit-after-filter", setup.source_node_id, row_index=i, data={"x": i}, source_row_index=i, ingest_sequence=i
+            row, token = factory.data_flow.create_row_with_token(
+                setup.source_node_id,
+                row_index=i,
+                data={"x": i},
+                source_row_index=i,
+                ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, "limit-after-filter"),
             )
-            token = factory.data_flow.create_token(row.row_id)
             rows_and_tokens.append((row, token))
 
         # Create node_states: first 2 with overlap-only data (more recent), third with real collision (older).
@@ -2000,7 +2635,13 @@ class TestListCollisions:
         # write connection on the in-memory StaticPool nests transactions under the
         # write-intent begin discipline).
         node_states = [
-            factory.execution.begin_node_state(token.token_id, "coalesce-node", "limit-after-filter", step_index=1, input_data={"x": i})
+            factory.execution.begin_node_state(
+                token.token_id,
+                "coalesce-node",
+                step_index=1,
+                input_data={"x": i},
+                member_token=leader_coordination_token(factory, "limit-after-filter").membership,
+            )
             for i, (_row, token) in enumerate(rows_and_tokens)
         ]
         with db.write_connection() as conn:
@@ -2076,12 +2717,22 @@ class TestListCollisions:
             plugin_name="coalesce:merge",
         )
 
-        row = factory.data_flow.create_row(
-            "canonical-test", setup.source_node_id, row_index=0, data={"x": 1}, source_row_index=0, ingest_sequence=0
+        _row, token = factory.data_flow.create_row_with_token(
+            setup.source_node_id,
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "canonical-test"),
         )
-        token = factory.data_flow.create_token(row.row_id)
 
-        ns = factory.execution.begin_node_state(token.token_id, "coalesce-node", "canonical-test", step_index=1, input_data={"x": 1})
+        ns = factory.execution.begin_node_state(
+            token.token_id,
+            "coalesce-node",
+            step_index=1,
+            input_data={"x": 1},
+            member_token=leader_coordination_token(factory, "canonical-test").membership,
+        )
 
         # Two dicts that are structurally equal but may have different repr()
         # due to key ordering. They should NOT be reported as a collision.
@@ -2151,13 +2802,21 @@ class TestListCollisions:
         fixed_timestamp = "2024-01-15 12:00:00"
 
         for i in range(5):
-            row = factory.data_flow.create_row(
-                "pagination-stability", setup.source_node_id, row_index=i, data={"x": i}, source_row_index=i, ingest_sequence=i
+            _row, token = factory.data_flow.create_row_with_token(
+                setup.source_node_id,
+                row_index=i,
+                data={"x": i},
+                source_row_index=i,
+                ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, "pagination-stability"),
             )
-            token = factory.data_flow.create_token(row.row_id)
             token_ids.append(token.token_id)
             ns = factory.execution.begin_node_state(
-                token.token_id, "coalesce-node", "pagination-stability", step_index=1, input_data={"x": i}
+                token.token_id,
+                "coalesce-node",
+                step_index=1,
+                input_data={"x": i},
+                member_token=leader_coordination_token(factory, "pagination-stability").membership,
             )
 
             # All records get the SAME timestamp — this is the trigger for instability
@@ -2196,7 +2855,7 @@ class TestListCollisions:
 
 
 class TestResolvedPromptTemplateHashAcrossReadSurfaces:
-    """elspeth-543ee35ed3: a recorded LLM-call resolved_prompt_template_hash must
+    """elspeth-543ee35ed3: a recorded LLM-call approved_prompt_artifact_hash must
     survive every audit read/export surface — the CallLoader, MCP get_calls,
     MCP get_operation_calls, and the JSONL export — for both state-parented and
     operation-parented calls. Otherwise audit tooling cannot join runtime LLM
@@ -2208,14 +2867,22 @@ class TestResolvedPromptTemplateHashAcrossReadSurfaces:
     def test_hash_preserved_across_loader_mcp_and_export(self) -> None:
         from elspeth.core.landscape.exporter import LandscapeExporter
 
-        p = _build_linear_pipeline()
+        p = _build_linear_pipeline(complete_run=False)
         db = p["db"]
         factory = p["factory"]
         run_id = p["run_id"]
         state_id = p["node_state"].state_id
 
         # State-parented LLM call carrying the cross-DB hash anchor.
-        idx = factory.execution.allocate_call_index(state_id)
+        audit_member = leader_member_token(factory, p["run_id"])
+        audit_item = claim_test_work_item(
+            factory,
+            member_token=audit_member,
+            token_id=p["token"].token_id,
+            node_id=p["node_state"].node_id,
+            step_index=p["node_state"].step_index,
+        )
+        idx = factory.execution.allocate_call_index(state_id, member_token=audit_member, work_item=audit_item)
         factory.execution.record_call(
             state_id,
             idx,
@@ -2223,32 +2890,41 @@ class TestResolvedPromptTemplateHashAcrossReadSurfaces:
             CallStatus.SUCCESS,
             RawCallPayload({"prompt": "p"}),
             RawCallPayload({"response": "r"}),
-            resolved_prompt_template_hash=self.HASH,
+            approved_prompt_artifact_hash=self.HASH,
+            member_token=audit_member,
+            work_item=audit_item,
         )
+        factory.scheduler.mark_terminal(
+            member_token=audit_member, work_item_id=audit_item.work_item_id, expected_lease_owner=audit_member.worker_id
+        )
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, p["run_id"]))
 
         # Operation-parented LLM call carrying the hash anchor.
-        op = factory.execution.begin_operation(run_id, "source-1", "source_load")
+        op = factory.execution.begin_operation("source-1", "source_load", coordination_token=leader_coordination_token(factory, run_id))
         factory.execution.record_operation_call(
             op.operation_id,
             CallType.LLM,
             CallStatus.SUCCESS,
             RawCallPayload({"prompt": "p2"}),
-            resolved_prompt_template_hash=self.HASH,
+            approved_prompt_artifact_hash=self.HASH,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
         # 1. Loader — repository getters reconstruct Call via CallLoader.
         state_calls = factory.query.get_calls(state_id)
-        assert state_calls[0].resolved_prompt_template_hash == self.HASH
+        assert state_calls[0].approved_prompt_artifact_hash == self.HASH
         loaded_op_calls = factory.execution.get_operation_calls(op.operation_id)
-        assert loaded_op_calls[0].resolved_prompt_template_hash == self.HASH
+        assert loaded_op_calls[0].approved_prompt_artifact_hash == self.HASH
 
         # 2. MCP get_calls (state) and get_operation_calls (operation).
         mcp_state = get_calls(db, factory, state_id)
-        assert mcp_state[0]["resolved_prompt_template_hash"] == self.HASH
+        assert mcp_state[0]["approved_prompt_artifact_hash"] == self.HASH
         mcp_op = get_operation_calls(db, factory, op.operation_id)
-        assert mcp_op[0]["resolved_prompt_template_hash"] == self.HASH
+        assert mcp_op[0]["approved_prompt_artifact_hash"] == self.HASH
 
         # 3. Export records — both the state call and the operation call.
-        call_records = [r for r in LandscapeExporter(db).export_run(run_id) if r.get("record_type") == "call"]
-        exported_hashes = [r.get("resolved_prompt_template_hash") for r in call_records]
+        call_records = [
+            r for r in LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id) if r.get("record_type") == "call"
+        ]
+        exported_hashes = [r.get("approved_prompt_artifact_hash") for r in call_records]
         assert exported_hashes.count(self.HASH) == 2

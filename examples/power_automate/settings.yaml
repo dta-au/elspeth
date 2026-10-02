@@ -1,0 +1,55 @@
+# Placeholder destination. The credential-free integration fixture intercepts it.
+# Use the exact current designer origin and secret-backed URLs when operating flows.
+sources:
+  records:
+    plugin: power_automate
+    on_success: publish
+    options:
+      on_validation_failure: quarantine
+      auth:
+        method: sas_url
+        trigger_url_secret: "${POWER_AUTOMATE_READ_TRIGGER_URL}"
+      allowed_origin: https://flows.example.test
+      query:
+        dataset: approved_records
+      snapshot_for_resume: true
+      page_size: 100
+      max_pages: 1000
+      max_rows: 100000
+      timeout_seconds: 90
+      max_request_body_bytes: 1048576
+      max_response_body_bytes: 4194304
+      schema:
+        mode: fixed
+        fields:
+          - "record_id: str"
+          - "result: str"
+sinks:
+  publish:
+    plugin: power_automate
+    on_write_failure: quarantine
+    options:
+      auth:
+        method: sas_url
+        trigger_url_secret: "${POWER_AUTOMATE_WRITE_TRIGGER_URL}"
+      allowed_origin: https://flows.example.test
+      fields: [record_id, result]
+      timeout_seconds: 90
+      max_request_body_bytes: 1048576
+      max_response_body_bytes: 1048576
+      schema:
+        mode: flexible
+        fields:
+          - "record_id: str"
+          - "result: str"
+  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/power_automate/output/quarantine.jsonl
+      format: jsonl
+      mode: append
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///examples/power_automate/runs/landscape.db

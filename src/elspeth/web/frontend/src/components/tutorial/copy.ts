@@ -3,7 +3,7 @@ import { CANONICAL_TUTORIAL_PROMPT } from "./tutorialMachine";
 export { CANONICAL_TUTORIAL_PROMPT };
 
 export const TURN_1_PRIMARY_BUTTON = "Let's go";
-// The mode-choice turn is gone (graduation now saves Guided as the default),
+// The mode-choice turn is gone (graduation saves Freeform as the default),
 // so skip exits the whole tutorial straight to graduation rather than naming a
 // removed step.
 export const TURN_1_SKIP_BUTTON = "Skip the tutorial";
@@ -29,7 +29,7 @@ export const TURN_7_PRIMARY_BUTTON = "Take me to the composer";
 export const HELLO_WORLD_SESSION_TITLE = "First-run tutorial";
 
 // Set immediately after createSession in HelloWorldTutorial.onStart (before the
-// guided shell's external POST /guided/start) so the backend orphan-cleanup
+// freeform shell's first authoring message) so the backend orphan-cleanup
 // scan (which matches this exact pending title — mirrored as
 // _TUTORIAL_PENDING_SESSION_TITLE in composer/tutorial_service.py; change BOTH
 // together) catches sessions abandoned mid-tutorial. Without this tag, a user
@@ -80,7 +80,7 @@ export const TURN_7_LEARNING_BULLETS_SKIPPED = [
   {
     title: "What the composer builds is AI-generated.",
     body:
-      "When you describe a pipeline in a sentence, an LLM interprets it and drafts the pipeline for you. The prompt it writes for itself and cleanup choices it makes are kept in the audit trail with your approval against them. You can revisit that record any time in each pipeline's Checks tab.",
+      "When you describe a pipeline in a sentence, an LLM interprets it and drafts the pipeline for you. The system and user prompts used by its LLM steps, and cleanup choices it makes, are kept in the audit trail with your approval against them. You can revisit that record any time on each pipeline's Approvals tab.",
   },
   {
     title: "Read before you run.",
@@ -93,7 +93,7 @@ export const TURN_7_LEARNING_BULLETS = [
   {
     title: "What you built is AI-generated.",
     body:
-      "The pipeline you just ran was authored by an LLM that interpreted your one-sentence description. The prompt it wrote for itself and cleanup choices such as dropping raw HTML are kept in the audit trail with your approval against them — alongside the source pages you named. You can come back to that record any time in your pipeline's Checks tab.",
+      "The pipeline you just ran was authored by an LLM that interpreted your one-sentence description. The system and user prompts used by its LLM step, and cleanup choices such as dropping raw HTML, are kept in the audit trail with your approval against them — alongside the source pages you named. You can come back to that record any time on your pipeline's Approvals tab.",
   },
   {
     title: "Read before you run.",
@@ -106,10 +106,9 @@ export const TURN_7_LEARNING_BULLETS = [
     // (elspeth-cc67815217). The trailing full stop is part of the literal, as
     // it is on every sibling bullet title.
     title: "Ask ELSPETH.",
-    // Guided/freeform parity guidance is folded into this existing chat-panel
-    // item and shared verbatim with the skip path.
+    // The final lesson points to the same conversational surface used in Build.
     body:
-      "If anything in a pipeline (a plugin name, a transform's effect, a recorded assumption) doesn't make sense, ask in the chat panel. The composer can explain the pipeline it just built, in plain English, against the actual node options. Guided and freeform can build the same pipelines: choose guided for structured prompts or freeform for a conversational, step-by-step exchange. That is an interaction preference, not a capability limit.",
+      "If anything in a pipeline (a plugin name, a transform's effect, a recorded assumption) doesn't make sense, ask in the chat panel. The composer can explain the pipeline it just built, in plain English, against the actual node options. You can keep shaping the pipeline in that same freeform conversation.",
   },
   {
     title: "LLMs are confident even when they're wrong.",

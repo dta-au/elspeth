@@ -76,7 +76,7 @@
 // (REQUEST_RUN_EVENT stays single-owner per App.tsx doctrine).
 // ============================================================================
 
-import { useRef } from "react";
+import { type JSX, useRef } from "react";
 
 import { Button } from "@/components/ui";
 import { useExecutionStore } from "@/stores/executionStore";

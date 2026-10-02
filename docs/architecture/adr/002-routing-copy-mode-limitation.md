@@ -59,7 +59,9 @@ Investigation found:
 
 ### Critical Constraint: Single Terminal State Per Token
 
-From CLAUDE.md:
+As worded in CLAUDE.md at the time of this decision (the live home is
+docs/contracts/system-operations.md §Complete Token State Diagram, which
+states the same invariant over *tokens* rather than rows):
 
 > Every row reaches exactly one terminal state - no silent drops
 
@@ -189,7 +191,9 @@ def test_route_with_copy_raises(self) -> None:
   `f4f348de1`.
 - Current enforcement: [routing contract](../../../src/elspeth/contracts/routing.py)
   and [regression test](../../../tests/unit/contracts/test_routing.py).
-- CLAUDE.md: "Every row reaches exactly one terminal state"
+- docs/contracts/system-operations.md §Complete Token State Diagram — "Every
+  token reaches exactly one terminal state — no silent drops." (This ADR
+  states the same invariant over rows; the terminal state is per token.)
 - ARCHITECTURE.md: Token lifecycle state machine
 
 ## Status History

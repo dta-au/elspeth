@@ -46,13 +46,17 @@ import httpx
 import structlog
 from pydantic import Field, field_validator, model_validator
 
-from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts import CallStatus, CallType, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
+from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import ValueSource
+from elspeth.core.llm_pricing import provider_cost_from_response
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
@@ -61,6 +65,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     NetworkError,
     RateLimitError,
     ServerError,
+    public_llm_error_category,
 )
 from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed
 from elspeth.plugins.llm.config_validation import (
@@ -78,14 +83,22 @@ from elspeth.plugins.llm.config_validation import (
     validate_gateway_single_prompt_structured_output_capability,
     validate_gateway_structured_output_capability,
 )
+from elspeth.plugins.llm.pricing import observe_http_provider_cost
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.multi_query import ResponseFormat, resolve_queries
-from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult, ParsedFinishReason, parse_finish_reason
+from elspeth.plugins.transforms.llm.provider import (
+    LLMAuditParent,
+    LLMQueryResult,
+    ParsedFinishReason,
+    observe_http_token_usage,
+    parse_finish_reason,
+)
 from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 __all__ = ["GatewayConfig", "GatewayLLMProvider"]
@@ -256,6 +269,7 @@ _GATEWAY_NON_RETRYABLE_CONFIG_CODES = frozenset(
         "model_not_allowed",
         "capability_unsupported",
         "upstream_unauthorized",
+        "upstream_request_rejected",
         "upstream_response_invalid",
         "internal_error",
         # ELSPETH's own static bearer was rejected by the gateway's inbound
@@ -496,7 +510,7 @@ class GatewayLLMProvider:
     Like OpenRouterLLMProvider, the underlying transport is HTTP, so
     ``AuditedHTTPClient`` records the raw transport row automatically; the
     semantic ``CallType.LLM`` row is recorded here so
-    ``calls.resolved_prompt_template_hash`` remains attached only to
+    ``calls.approved_prompt_artifact_hash`` remains attached only to
     ``CallType.LLM`` rows.
 
     ELSPETH owns all retry/pooling/row-level policy — this provider issues
@@ -515,7 +529,10 @@ class GatewayLLMProvider:
         run_id: str,
         telemetry_emit: TelemetryEmitCallback,
         limiter: Any = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
+        pricing_model: str | None = None,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         # Re-validate defensively (mirrors OpenRouterLLMProvider): GatewayConfig
         # already enforces this shape at config-construction time, but this
@@ -538,7 +555,10 @@ class GatewayLLMProvider:
         self._run_id = run_id
         self._telemetry_emit = telemetry_emit
         self._limiter = limiter
-        self._resolved_prompt_template_hash = resolved_prompt_template_hash
+        self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
+        self._llm_call_governance = llm_call_governance
+        self._pricing_model = pricing_model
+        self._call_mode_session = call_mode_session
 
         # Client cache with reference counting for parallel multi-query safety
         # — same pattern as OpenRouterLLMProvider.
@@ -551,7 +571,7 @@ class GatewayLLMProvider:
         messages: Sequence[ChatMessage],
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
@@ -574,22 +594,37 @@ class GatewayLLMProvider:
             max_tokens=max_tokens,
             response_format=response_format,
         )
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            self._call_mode_session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=llm_request_payload.to_dict(),
+                current_state_id=audit_parent.state_id,
+                current_operation_id=audit_parent.operation_id,
+            )
         logical_start = time.perf_counter()
 
+        replaying = self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+        attempt_id = self._llm_call_governance.before_call() if self._llm_call_governance is not None and not replaying else None
         http_client = self._get_http_client(audit_parent)
         primary_error: BaseException | None = None
+        observed_usage = TokenUsage.unknown()
+        observed_response_body = b""
         try:
             request_body: dict[str, Any] = {
                 "model": model,
                 "messages": wire_messages(messages),
-                "temperature": temperature,
             }
+            if temperature is not None:
+                request_body["temperature"] = temperature
             if max_tokens is not None:
                 request_body["max_tokens"] = max_tokens
             if response_format is not None:
                 request_body["response_format"] = response_format
 
             response = self._post_chat_completion(http_client, request_body)
+            observed_usage = observe_http_token_usage(response.content)
+            observed_response_body = response.content
+            self._validate_completion_status(response)
 
             data, content, usage, finish_reason, response_model = _validate_gateway_success_response(
                 response, usage_required=self._usage_required
@@ -609,15 +644,23 @@ class GatewayLLMProvider:
                 model=response_model,
                 usage=usage,
                 raw_response=data,
+                attempt_id=attempt_id,
             )
             return result
         except LLMClientError as exc:
             primary_error = exc
+            observed_cost, observed_cost_source = observe_http_provider_cost(
+                observed_response_body, model_requested=self._pricing_model or model
+            )
             self._record_logical_llm_error(
                 audit_parent=audit_parent,
                 started_at=logical_start,
                 request_payload=llm_request_payload,
                 exc=exc,
+                usage=observed_usage,
+                provider_cost=observed_cost,
+                provider_cost_source=observed_cost_source,
+                attempt_id=attempt_id,
             )
             raise
         except BaseException as exc:
@@ -636,13 +679,15 @@ class GatewayLLMProvider:
                     error=cleanup_error,
                     suppressed=primary_error is not None,
                     logger=logger,
-                    **audit_parent.client_kwargs(),
+                    state_id=audit_parent.state_id,
+                    token_id=audit_parent.token_id,
+                    operation_id=audit_parent.operation_id,
                 )
                 if primary_error is None:
                     raise cleanup_error
 
     def _post_chat_completion(self, http_client: AuditedHTTPClient, request_body: dict[str, Any]) -> httpx.Response:
-        """POST one request, mapping transport and gateway-envelope failures.
+        """POST one request, mapping transport failures.
 
         ``httpx.TimeoutException`` is a subclass of ``httpx.RequestError`` —
         the timeout-specific except clause is listed first (mirroring the
@@ -661,6 +706,10 @@ class GatewayLLMProvider:
         except httpx.RequestError as e:
             raise NetworkError(_STATIC_GATEWAY_ERROR) from e
 
+        return response
+
+    def _validate_completion_status(self, response: httpx.Response) -> None:
+        """Reject gateway envelopes after execution has observed reported usage."""
         # Contract-header verification applies to every response — success
         # or error — before any status-code or body classification.
         _validate_contract_header(response, self._contract_major)
@@ -673,14 +722,12 @@ class GatewayLLMProvider:
             # a misleading status alongside a correct code, or vice versa).
             raise _classify_gateway_http_error(e.response) from e
 
-        return response
-
     def _build_llm_request_payload(
         self,
         *,
         model: str,
         messages: Sequence[ChatMessage],
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         response_format: dict[str, Any] | None,
     ) -> LLMCallRequest:
@@ -706,10 +753,13 @@ class GatewayLLMProvider:
         model: str,
         usage: TokenUsage,
         raw_response: dict[str, Any],
+        attempt_id: str | None,
     ) -> None:
         """Record the semantic LLM call that the HTTP transport fulfilled."""
+        pricing_model = self._pricing_model or request_payload.model
+        provider_cost, provider_cost_source = provider_cost_from_response(raw_response, pricing_model=pricing_model)
         call_index = audit_parent.allocate_call_index(self._recorder)
-        audit_parent.record_call(
+        call = audit_parent.record_call(
             self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
@@ -718,12 +768,23 @@ class GatewayLLMProvider:
             response_data=LLMCallResponse(
                 content=content,
                 model=model,
+                pricing_model=pricing_model,
+                provider_cost=provider_cost,
+                provider_cost_source=provider_cost_source,
                 usage=usage,
                 raw_response=raw_response,
             ),
+            token_usage=usage,
             latency_ms=(time.perf_counter() - started_at) * 1000,
-            resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+            call_mode_session=self._call_mode_session,
         )
+        if self._llm_call_governance is not None and (
+            self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY
+        ):
+            if attempt_id is None:
+                raise RuntimeError("Governed LLM call has no admission attempt")
+            self._llm_call_governance.after_call(attempt_id, call.call_id)
 
     def _record_logical_llm_error(
         self,
@@ -732,49 +793,67 @@ class GatewayLLMProvider:
         started_at: float,
         request_payload: LLMCallRequest,
         exc: LLMClientError,
+        usage: TokenUsage,
+        provider_cost: float | None,
+        provider_cost_source: ComposerLLMProviderCostSource,
+        attempt_id: str | None,
     ) -> None:
         call_index = audit_parent.allocate_call_index(self._recorder)
         message = str(exc) or type(exc).__name__
-        audit_parent.record_call(
+        call = audit_parent.record_call(
             self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
             status=CallStatus.ERROR,
+            token_usage=usage,
             request_data=request_payload,
             error=LLMCallError(
                 type=type(exc).__name__,
                 message=message,
                 retryable=exc.retryable,
+                category=public_llm_error_category(exc),
+                pricing_model=self._pricing_model or request_payload.model,
+                provider_cost=provider_cost,
+                provider_cost_source=provider_cost_source,
             ),
             latency_ms=(time.perf_counter() - started_at) * 1000,
-            resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+            call_mode_session=self._call_mode_session,
         )
+        if self._llm_call_governance is not None and (
+            self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY
+        ):
+            if attempt_id is None:
+                raise RuntimeError("Governed LLM call has no admission attempt")
+            self._llm_call_governance.after_call(attempt_id, call.call_id)
 
-    def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Validate gateway readiness, THEN run one bounded real completion.
 
         A readyz document alone is never accepted as proof of health (an
         explicit design requirement) — readiness only gates whether the
         second half (an actual authenticated completion) runs at all.
         """
-        self._check_readyz(operation_id=operation_id, model=model)
-        self._smoke_test_completion(operation_id=operation_id, model=model)
+        self._check_readyz(operation_id=operation_id, model=model, coordination_token=coordination_token)
+        self._smoke_test_completion(operation_id=operation_id, model=model, coordination_token=coordination_token)
 
     def _readyz_base_url(self) -> str:
         """The gateway root (``/readyz`` lives one level above ``/v1``)."""
         return self._base_url.removesuffix(GATEWAY_VERSIONED_BASE)
 
-    def _check_readyz(self, *, operation_id: str, model: str) -> None:
+    def _check_readyz(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         http_client = AuditedHTTPClient(
             execution=self._recorder,
             state_id=None,
             operation_id=operation_id,
+            coordination_token=coordination_token,
             run_id=self._run_id,
             telemetry_emit=self._telemetry_emit,
             timeout=self._timeout,
             base_url=self._readyz_base_url(),
             headers=self._request_headers,
             limiter=self._limiter,
+            call_mode_session=self._call_mode_session,
         )
         try:
             try:
@@ -798,30 +877,15 @@ class GatewayLLMProvider:
         finally:
             http_client.close()
 
-    def _smoke_test_completion(self, *, operation_id: str, model: str) -> None:
+    def _smoke_test_completion(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited gateway completion under an operation parent."""
-        http_client = AuditedHTTPClient(
-            execution=self._recorder,
-            state_id=None,
-            operation_id=operation_id,
-            run_id=self._run_id,
-            telemetry_emit=self._telemetry_emit,
-            timeout=self._timeout,
-            base_url=self._base_url,
-            headers=self._request_headers,
-            limiter=self._limiter,
+        self.execute_query(
+            [ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
+            model=model,
+            temperature=0.0,
+            max_tokens=32,
+            audit_parent=LLMAuditParent.for_operation(operation_id=operation_id, coordination_token=coordination_token),
         )
-        try:
-            request_body: dict[str, Any] = {
-                "model": model,
-                "messages": wire_messages([ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]),
-                "temperature": 0.0,
-                "max_tokens": 32,
-            }
-            response = self._post_chat_completion(http_client, request_body)
-            _validate_gateway_success_response(response, usage_required=self._usage_required)
-        finally:
-            http_client.close()
 
     def _get_http_client(self, audit_parent: LLMAuditParent) -> AuditedHTTPClient:
         """Get or create AuditedHTTPClient for an audit parent (thread-safe).
@@ -840,6 +904,7 @@ class GatewayLLMProvider:
                     base_url=self._base_url,
                     headers=self._request_headers,
                     limiter=self._limiter,
+                    call_mode_session=self._call_mode_session,
                     **audit_parent.client_kwargs(),
                 )
                 self._http_client_refs[cache_key] = 0

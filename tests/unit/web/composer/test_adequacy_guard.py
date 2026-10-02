@@ -35,6 +35,7 @@ from typing import Annotated, Any, Literal, get_origin
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
+from pydantic.json_schema import SkipJsonSchema
 
 from elspeth.web.composer.redaction import (
     MANIFEST,
@@ -254,6 +255,20 @@ def test_declarative_sensitive_response_keys_subset_of_known_response_keys() -> 
 # ---------------------------------------------------------------------------
 # Walker-completeness floor-check (rev-3 M1).
 # ---------------------------------------------------------------------------
+
+
+def test_walker_normalizes_annotated_none_without_losing_sensitive_metadata() -> None:
+    class AnnotatedOptionalModel(BaseModel):
+        public: str | SkipJsonSchema[None] = None
+        secret: Annotated[str, Sensitive()] | SkipJsonSchema[None] = None
+
+    nodes = list(walk_model_schema(AnnotatedOptionalModel, with_values=True))
+    assert [(node.path, node.field_type) for node in nodes] == [("public", str), ("secret", str)]
+    assert not any(isinstance(marker, _SensitiveMarker) for marker in nodes[0].metadata)
+    assert any(isinstance(marker, _SensitiveMarker) for marker in nodes[1].metadata)
+    for node in nodes:
+        assert node.value_provider is not None
+        assert node.value_provider({"public": "visible", "secret": "canary"}) == ("visible" if node.path == "public" else "canary")
 
 
 def test_walker_emits_node_for_every_top_level_field() -> None:

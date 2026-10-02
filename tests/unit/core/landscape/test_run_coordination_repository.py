@@ -40,7 +40,9 @@ from sqlalchemy import create_engine, delete, event, insert, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipLost, WorkerMembershipToken, mint_worker_id
+from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     JoinRefusedError,
@@ -48,8 +50,9 @@ from elspeth.contracts.errors import (
     WriteLockHeldError,
 )
 from elspeth.core.checkpoint.recovery import NonResumableRunError
+from elspeth.core.landscape import run_coordination_repository as coordination_module
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine, begin_write
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import (
     CoordinationEventRow,
     RunCoordinationRepository,
@@ -65,11 +68,11 @@ from elspeth.core.landscape.schema import (
     run_workers_table,
     runs_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import (
     assert_deadline_within,
     assert_stamped_between,
     landscape_database_now,
-    within_one_database_second,
 )
 from tests.helpers.run_coordination import register_run_leader
 
@@ -126,7 +129,7 @@ def _seed_run(engine: Tier1Engine, *, run_id: str = RUN_ID, status: str = "runni
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=NOW,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=status,
@@ -170,12 +173,12 @@ def test_worker_heartbeat_missing_seat_refuses_without_liveness_write(
     worker_id = leader_id
     if role == "follower":
         worker_id = mint_worker_id(RUN_ID)
-        repo.admit_follower(run_id=RUN_ID, worker_id=worker_id, config_hash="config", window_seconds=WINDOW)
+        repo.admit_follower(run_id=RUN_ID, worker_id=worker_id, config_hash=fake_sha256("config"), window_seconds=WINDOW)
     with engine.begin() as conn:
         conn.execute(delete(run_coordination_table).where(run_coordination_table.c.run_id == RUN_ID))
         conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == worker_id).values(heartbeat_expires_at=NOW))
     before = _coordination_image(engine)
-    with pytest.raises(AuditIntegrityError, match="no run_coordination seat"):
+    with pytest.raises(AuditIntegrityError, match="registered membership but no coordination seat"):
         repo.worker_heartbeat(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=worker_id), window_seconds=WINDOW)
     assert _coordination_image(engine) == before
 
@@ -327,6 +330,23 @@ class TestSeatMint:
 class TestAcquireRunLeadershipCAS:
     """§B.4: exactly one of two racers wins; the loser is side-effect-free."""
 
+    @pytest.mark.parametrize("status", ["failed", "interrupted", "running"])
+    def test_takeover_clears_prior_attempt_reproducibility_grade(
+        self, engine: Tier1Engine, repo: RunCoordinationRepository, status: str
+    ) -> None:
+        _seed_run(engine, status=status)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+        with begin_write(engine) as conn:
+            conn.execute(update(runs_table).where(runs_table.c.run_id == RUN_ID).values(reproducibility_grade="full_reproducible"))
+        _expire_seat(engine)
+
+        repo.acquire_run_leadership(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+
+        with engine.connect() as conn:
+            run = conn.execute(select(runs_table.c.status, runs_table.c.reproducibility_grade).where(runs_table.c.run_id == RUN_ID)).one()
+        assert run.status == "running"
+        assert run.reproducibility_grade is None
+
     def test_takeover_of_expired_seat_bumps_epoch_and_flips_run_status(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="failed")
         leader_a = mint_worker_id(RUN_ID)
@@ -352,8 +372,8 @@ class TestAcquireRunLeadershipCAS:
         assert run.status == "running"
         assert run.completed_at is None
 
-    def test_dead_leader_running_takeover_arm_skips_status_flip(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
-        """RUNNING + expired seat: admissible takeover; the flip predicate skips."""
+    def test_dead_leader_running_takeover_preserves_running_status(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
+        """RUNNING + expired seat: admissible takeover retains its run status."""
         _seed_run(engine, status="running")
         register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
         _expire_seat(engine)
@@ -378,6 +398,7 @@ class TestAcquireRunLeadershipCAS:
 
         assert "run leadership is held by" in str(excinfo.value)
         assert leader_b in str(excinfo.value)
+        assert excinfo.value.cause is ResumeRefusalCause.LEADER_LIVE
         # Zero mutation: seat, registry, ledger, and runs row all untouched.
         seat = _seat_row(engine)
         assert seat["leader_worker_id"] == leader_b
@@ -433,6 +454,21 @@ class TestAcquireRunLeadershipCAS:
 class TestAcquireExportLeadership:
     """ADR-048 §4: re-driving a finalized run's audit export takes the seat first — a separate arm from the resume takeover."""
 
+    def test_reconciliation_status_race_refuses_without_mutation(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
+        _seed_run(engine, status="interrupted")
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+        repo.release_seat(token=token)
+        before = _coordination_image(engine)
+        with pytest.raises(NonResumableRunError) as exc_info:
+            repo.acquire_reconciliation_leadership(
+                run_id=RUN_ID,
+                worker_id=mint_worker_id(RUN_ID),
+                window_seconds=WINDOW,
+                expected_status=RunStatus.FAILED,
+            )
+        assert exc_info.value.cause is ResumeRefusalCause.TERMINAL_STATUS_CHANGED
+        assert _coordination_image(engine) == before
+
     @pytest.mark.parametrize("terminal_status", ["completed", "completed_with_failures", "empty", "failed", "interrupted"])
     def test_vacant_seat_on_terminal_run_is_taken_without_a_status_flip(
         self, engine: Tier1Engine, repo: RunCoordinationRepository, terminal_status: str
@@ -473,9 +509,10 @@ class TestAcquireExportLeadership:
         repo.release_seat(token=token_a)
         image_before = _coordination_image(engine)
 
-        with pytest.raises(AuditIntegrityError, match="not terminal"):
+        with pytest.raises(NonResumableRunError, match="not terminal") as excinfo:
             repo.acquire_export_leadership(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
 
+        assert excinfo.value.cause is ResumeRefusalCause.RUN_NOT_FINALIZED
         assert _coordination_image(engine) == image_before
 
     def test_live_seat_is_refused_with_zero_mutation(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
@@ -489,6 +526,7 @@ class TestAcquireExportLeadership:
 
         assert "run leadership is held by" in str(excinfo.value)
         assert holder in str(excinfo.value)
+        assert excinfo.value.cause is ResumeRefusalCause.LEADER_LIVE
         assert _coordination_image(engine) == image_before
 
     def test_expired_dead_leader_is_evicted_by_the_export_seat(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
@@ -987,7 +1025,7 @@ class TestRegistryVerbs:
         register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
 
         follower = mint_worker_id(RUN_ID)
-        member = repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash="config", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash=fake_sha256("config"), window_seconds=WINDOW)
         assert member == WorkerMembershipToken(run_id=RUN_ID, worker_id=follower)
         worker = _worker_row(engine, follower)
         assert worker["role"] == "follower"
@@ -995,21 +1033,21 @@ class TestRegistryVerbs:
         assert worker["entry_point"] == "join"
 
         with pytest.raises(JoinRefusedError, match="does not match"):
-            repo.admit_follower(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), config_hash="other", window_seconds=WINDOW)
+            repo.admit_follower(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), config_hash=fake_sha256("other"), window_seconds=WINDOW)
         _expire_seat(engine)  # seat liveness is judged against the database clock
         with pytest.raises(JoinRefusedError, match="no live leader"):
-            repo.admit_follower(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), config_hash="config", window_seconds=WINDOW)
+            repo.admit_follower(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), config_hash=fake_sha256("config"), window_seconds=WINDOW)
         _seed_run(engine, run_id="run-terminal", status="completed")
         with pytest.raises(JoinRefusedError, match="terminal"):
             repo.admit_follower(
-                run_id="run-terminal", worker_id=mint_worker_id("run-terminal"), config_hash="config", window_seconds=WINDOW
+                run_id="run-terminal", worker_id=mint_worker_id("run-terminal"), config_hash=fake_sha256("config"), window_seconds=WINDOW
             )
 
     def test_depart_worker_idempotent_cas(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="running")
         register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
         follower = mint_worker_id(RUN_ID)
-        member = repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash="config", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash=fake_sha256("config"), window_seconds=WINDOW)
 
         repo.depart_worker(member_token=member)
         assert _worker_row(engine, follower)["status"] == "departed"
@@ -1082,40 +1120,29 @@ class TestRunCoordinationTruthTables:
         self,
         engine: Tier1Engine,
         repo: RunCoordinationRepository,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A seat whose deadline EQUALS database time is not yet expired: the CAS predicate is strict ``<``.
 
-        The boundary can only be pinned when the seat is stamped and the CAS
-        decides inside the same database second (SQLite stamps whole seconds),
-        so each attempt seeds a fresh run and is repeated when the clock
-        rolled over during it.
+        Pin the decision helper to an actual database sample so wall-clock
+        advancement cannot turn equality into a different boundary case.
+        PostgreSQL contention proofs separately exercise unmodified fresh reads.
         """
-        attempts: list[str] = []
-
-        def attempt(database_now: datetime) -> tuple[CoordinationToken, dict[str, tuple[dict[str, object], ...]], bool]:
-            run_id = f"{RUN_ID}-equality-{len(attempts)}"
-            attempts.append(run_id)
-            _seed_run(engine, run_id=run_id, status="failed")
-            incumbent = register_run_leader(repo, run_id=run_id, worker_id=f"leader-a-{len(attempts)}", window_seconds=WINDOW)
-            with engine.begin() as conn:
-                conn.execute(
-                    update(run_coordination_table)
-                    .where(run_coordination_table.c.run_id == run_id)
-                    .values(leader_heartbeat_expires_at=database_now)
-                )
-            before = _coordination_image(engine, run_id)
-            try:
-                repo.acquire_run_leadership(run_id=run_id, worker_id=f"leader-b-{len(attempts)}", window_seconds=WINDOW)
-            except NonResumableRunError as exc:
-                assert "run leadership is held by" in str(exc)
-                return incumbent, before, True
-            return incumbent, before, False
-
-        incumbent, before, refused = within_one_database_second(engine, attempt)
-
-        assert refused, "a deadline equal to database time is live; the takeover CAS must lose"
+        _seed_run(engine, status="failed")
+        incumbent = register_run_leader(repo, run_id=RUN_ID, worker_id="leader-a", window_seconds=WINDOW)
+        with engine.begin() as conn:
+            database_now = read_landscape_decision_time(conn)
+            conn.execute(
+                update(run_coordination_table)
+                .where(run_coordination_table.c.run_id == RUN_ID)
+                .values(leader_heartbeat_expires_at=database_now)
+            )
+        before = _coordination_image(engine)
+        monkeypatch.setattr(coordination_module, "read_landscape_decision_time", lambda _conn: database_now)
+        with pytest.raises(NonResumableRunError, match="run leadership is held by"):
+            repo.acquire_run_leadership(run_id=RUN_ID, worker_id="leader-b", window_seconds=WINDOW)
         assert incumbent.leader_epoch == 1
-        assert _coordination_image(engine, attempts[-1]) == before
+        assert _coordination_image(engine) == before
 
     def test_rc02_takeover_exactly_rotates_seat_evicts_incumbent_and_records_winner(
         self,
@@ -1174,7 +1201,7 @@ class TestRunCoordinationTruthTables:
         follower = repo.admit_follower(
             run_id=RUN_ID,
             worker_id="follower",
-            config_hash="config",
+            config_hash=fake_sha256("config"),
             window_seconds=WINDOW,
         )
         # Age the follower's deadline so the beat's database-time refresh is observable.
@@ -1213,7 +1240,7 @@ class TestRunCoordinationTruthTables:
         follower = repo.admit_follower(
             run_id=RUN_ID,
             worker_id="follower",
-            config_hash="config",
+            config_hash=fake_sha256("config"),
             window_seconds=WINDOW,
         )
         departed_from = landscape_database_now(engine)
@@ -1278,7 +1305,7 @@ class TestRunCoordinationTruthTables:
         repo.admit_follower(
             run_id=RUN_ID,
             worker_id="follower",
-            config_hash="config",
+            config_hash=fake_sha256("config"),
             window_seconds=WINDOW,
         )
         after = landscape_database_now(engine)
@@ -1304,7 +1331,7 @@ class TestRunCoordinationTruthTables:
             repo.admit_follower(
                 run_id=RUN_ID,
                 worker_id="rejected",
-                config_hash="wrong",
+                config_hash=fake_sha256("wrong"),
                 window_seconds=WINDOW,
             )
 
@@ -1314,6 +1341,7 @@ class TestRunCoordinationTruthTables:
         self,
         engine: Tier1Engine,
         repo: RunCoordinationRepository,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _seed_run(engine)
         token = register_run_leader(repo, run_id=RUN_ID, worker_id="leader", window_seconds=WINDOW)
@@ -1324,26 +1352,21 @@ class TestRunCoordinationTruthTables:
         _seed_follower(engine, "eligible", heartbeat_expires_at=seeded_at - timedelta(seconds=grace + 60))
         _seed_follower(engine, "fresh", heartbeat_expires_at=seeded_at - timedelta(seconds=grace - 60))
 
-        # The equality boundary (``heartbeat_expires_at == database_now - grace``
-        # is NOT strictly expired) needs the row stamped and the verb deciding
-        # inside one database second; a fresh row per attempt keeps a rolled-over
-        # attempt from leaving anything to restore.
-        equal_rows: list[str] = []
-
-        def equal_arm(database_now: datetime) -> bool:
-            worker_id = f"equal-{len(equal_rows)}"
-            equal_rows.append(worker_id)
-            _seed_follower(engine, worker_id, heartbeat_expires_at=database_now - timedelta(seconds=grace))
-            return repo.evict_worker(token=token, target_worker_id=worker_id, grace_seconds=grace, window_seconds=WINDOW)
-
-        assert within_one_database_second(engine, equal_arm) is False
+        # Keep exact equality independent of elapsed milliseconds. Only this
+        # boundary arm pins the repository helper to the observed DB instant.
+        with engine.connect() as conn:
+            database_now = read_landscape_decision_time(conn)
+        _seed_follower(engine, "equal", heartbeat_expires_at=database_now - timedelta(seconds=grace))
+        with monkeypatch.context() as boundary:
+            boundary.setattr(coordination_module, "read_landscape_decision_time", lambda _conn: database_now)
+            assert repo.evict_worker(token=token, target_worker_id="equal", grace_seconds=grace, window_seconds=WINDOW) is False
         assert repo.evict_worker(token=token, target_worker_id="fresh", grace_seconds=grace, window_seconds=WINDOW) is False
         assert repo.evict_worker(token=token, target_worker_id=token.worker_id, grace_seconds=grace, window_seconds=WINDOW) is False
         before = landscape_database_now(engine)
         assert repo.evict_worker(token=token, target_worker_id="eligible", grace_seconds=grace, window_seconds=WINDOW) is True
         after = landscape_database_now(engine)
 
-        assert _worker_row(engine, equal_rows[-1])["status"] == "active"
+        assert _worker_row(engine, "equal")["status"] == "active"
         assert _worker_row(engine, "fresh")["status"] == "active"
         eligible = _worker_row(engine, "eligible")
         assert eligible["status"] == "evicted"

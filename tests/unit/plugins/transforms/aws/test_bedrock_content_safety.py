@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 from tests.fixtures.factories import make_context
+from tests.fixtures.mock_audit import mock_item_audit_authority
 from tests.unit.plugins.transforms.aws.test_guardrails_client import CONTENT_FILTERS, FakeExecution
 
 from elspeth.contracts import Determinism
@@ -35,7 +36,7 @@ def _config(**overrides: object) -> dict[str, object]:
 def _started_transform(**overrides: object) -> tuple[AWSBedrockContentSafety, Any]:
     transform = AWSBedrockContentSafety(_config(**overrides))
     transform._sdk_client = object()
-    context = make_context(landscape=FakeExecution())
+    context = make_context(landscape=FakeExecution(), **mock_item_audit_authority())
     transform.on_start(context)
     return transform, context
 

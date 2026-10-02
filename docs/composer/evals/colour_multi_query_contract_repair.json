@@ -1,0 +1,28 @@
+{
+  "scenario_id": "colour_multi_query_contract_repair",
+  "persona": "p1_compliance",
+  "task_class": "regression",
+  "task_summary": "Two colour answers with stable source approval after retention repair",
+  "opening_prompt": "Invent a small CSV with five different basic colour names in a colour column. For each colour, use one multi-query LLM node with two separate prompts: one asks for a good colour pairing and the other for an approximate hex value. Save exactly colour, good_colour_pair_answer, and approximate_hex_answer to colour_answers.csv. Preserve source-validation failures and LLM failures in separate outputs.",
+  "probe": "Upstream input requirements versus generated output declarations (ADR-050), effective per-query prompts and declared template visibility (ADR-051), required non-null successful answers, exact typed projection, and content-bound source approval through an operational route change.",
+  "product_capability_used": "Invented CSV source, one two-query LLM, select-only field mapper, fixed CSV sink and separate failure outputs",
+  "required_followup_after_approval": "Keep the source data and processing unchanged. Send source-validation failures to a new retained output named source_failures_revised.",
+  "message_budget_user_turns": 5,
+  "stop_conditions": [
+    "Do not stop at pipeline ready: authoring, real source approval, route change and execution must all be observed.",
+    "Resolve review cards using the normal user review API; those are not extra chat turns.",
+    "After approval, send required_followup_after_approval verbatim as the fixed regression stimulus; use the persona only for unscripted clarification turns.",
+    "After the route change, explicitly execute the approved workflow and inspect its outputs.",
+    "At five user turns, stop and mark every missing milestone unverified and the scenario incomplete, never passed."
+  ],
+  "expected_outcome": "A five-row CSV with exactly the requested three columns and one pairing and one approximate hex answer per original colour. The route-only change preserves the invented-source approval event and content hash without another pending review.",
+  "pass_criterion": "All four milestones must pass independently: provider-authored one-node/two-query graph with upstream-only required_input_fields and an effective user template for each query; real artifact-bound source approval; changed retention routing with unchanged full source proof after reload; successful execution with five corresponding colour rows, exactly three columns and ten runtime model queries. A node prompt_template fallback is optional when every query supplies a template. Report live-provider evidence separately from deterministic tests.",
+  "evidence": [
+    "Capture authored state before and after the route change, final YAML and validation results.",
+    "Capture GET /api/sessions/{id}/interpretations and compare resolved event identity, accepted artifact hash and pending-review counts.",
+    "Paginate GET /api/sessions/{id}/messages with include_tool_rows=true, include_llm_audit=true, include_raw_content=true and include_rejection_reasons=true, limit at most 500.",
+    "Use canonical redacted tool-invocation audit envelopes, not credential-bearing raw arguments.",
+    "Inspect actual output CSV and query audit, matching whichever five colours the provider invented.",
+    "Record pass, fail or unverified for each milestone. The harness ledger alone is not a verdict."
+  ]
+}

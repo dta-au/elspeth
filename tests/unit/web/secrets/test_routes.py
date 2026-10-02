@@ -23,6 +23,7 @@ from elspeth.web.secrets.service import WebSecretService
 from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -53,6 +54,8 @@ class _MockSettings:
 def _make_app(
     user_id: str = "alice",
     server_allowlist: tuple[str, ...] = (),
+    *,
+    user_secrets_enabled: bool = True,
 ) -> FastAPI:
     """Create a test app with secret routes and an in-memory DB."""
     engine = create_session_engine(
@@ -61,12 +64,16 @@ def _make_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
 
     user_store = UserSecretStore(engine, _TEST_MASTER_KEY)
     server_store = ServerSecretStore(server_allowlist)
-    secret_service = WebSecretService(user_store, server_store)
+    secret_service = WebSecretService(user_store, server_store, user_secrets_enabled=user_secrets_enabled)
 
     app = FastAPI()
+    # Mirrors production app.state so a test can seed a pre-lockdown row.
+    app.state.user_secret_store = user_store
 
     identity = UserIdentity(user_id=user_id, username=user_id)
 
@@ -76,6 +83,7 @@ def _make_app(
     app.dependency_overrides[get_current_user] = mock_user
     app.state.secret_service = secret_service
     app.state.settings = _MockSettings()
+    wire_test_pipeline_user_authority(app, identity_id=user_id, engine=engine)
 
     app.include_router(create_secrets_router())
     return app
@@ -409,6 +417,9 @@ class TestCrossUserIsolation:
             connect_args={"check_same_thread": False},
         )
         initialize_session_schema(engine)
+        with engine.begin() as conn:
+            for identity_id in ("alice", "bob"):
+                ensure_test_identity(conn, identity_id=identity_id)
 
         user_store = UserSecretStore(engine, _TEST_MASTER_KEY)
         server_store = ServerSecretStore(())
@@ -426,6 +437,7 @@ class TestCrossUserIsolation:
         app_a.dependency_overrides[get_current_user] = mock_user_a
         app_a.state.secret_service = secret_service
         app_a.state.settings = mock_settings
+        wire_test_pipeline_user_authority(app_a, identity_id="alice", engine=engine)
         app_a.include_router(create_secrets_router())
 
         # App for User B — same service, different identity
@@ -438,6 +450,7 @@ class TestCrossUserIsolation:
         app_b.dependency_overrides[get_current_user] = mock_user_b
         app_b.state.secret_service = secret_service
         app_b.state.settings = mock_settings
+        wire_test_pipeline_user_authority(app_b, identity_id="bob", engine=engine)
         app_b.include_router(create_secrets_router())
 
         return TestClient(app_a), TestClient(app_b)
@@ -544,3 +557,50 @@ class TestSecretValidationRedaction:
             assert "loc" in error
             assert "msg" in error
             assert set(error.keys()) <= self._SAFE_KEYS
+
+
+# ---------------------------------------------------------------------------
+# Locked-down server-only mode
+# ---------------------------------------------------------------------------
+
+
+class TestServerOnlyMode:
+    """``user_secrets_enabled=False``: no user-scope writes, read-only inventory."""
+
+    def test_create_is_refused_with_a_typed_403_and_writes_nothing(self) -> None:
+        app = _make_app(user_secrets_enabled=False)
+        client = TestClient(app)
+
+        resp = client.post("/api/secrets", json={"name": "MY_KEY", "value": "super-secret-value"})
+
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["error_type"] == "user_secrets_disabled"
+        assert "super-secret-value" not in resp.text
+        assert app.state.user_secret_store.has_secret_record("MY_KEY", user_id="alice", auth_provider_type="local") is False
+
+    def test_create_succeeds_when_enabled(self) -> None:
+        """Positive control for the refusal above: same request, flag on."""
+        client = TestClient(_make_app())
+
+        assert client.post("/api/secrets", json={"name": "MY_KEY", "value": "v"}).status_code == 201
+
+    def test_delete_is_refused_and_the_row_survives(self) -> None:
+        app = _make_app(user_secrets_enabled=False)
+        app.state.user_secret_store.set_secret("OLD_KEY", value="v", user_id="alice", auth_provider_type="local")
+
+        resp = TestClient(app).delete("/api/secrets/OLD_KEY")
+
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["error_type"] == "user_secrets_disabled"
+        assert app.state.user_secret_store.has_secret_record("OLD_KEY", user_id="alice", auth_provider_type="local") is True
+
+    def test_inventory_lists_server_secrets_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "server-value")
+        app = _make_app(server_allowlist=("AWS_BEARER_TOKEN_BEDROCK",), user_secrets_enabled=False)
+        app.state.user_secret_store.set_secret("OLD_KEY", value="v", user_id="alice", auth_provider_type="local")
+        client = TestClient(app)
+
+        listed = client.get("/api/secrets").json()
+
+        assert [(item["name"], item["scope"], item["available"]) for item in listed] == [("AWS_BEARER_TOKEN_BEDROCK", "server", True)]
+        assert client.post("/api/secrets/OLD_KEY/validate").json() == {"name": "OLD_KEY", "available": False}

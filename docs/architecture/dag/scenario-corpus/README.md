@@ -30,7 +30,7 @@ These sources have distinct jobs:
   pins the exact scenario, dimension, case, and evidence registries and checks
   the links from this live documentation.
 
-Filigree does not replace the manifest. It owns delivery status, dependencies,
+GitHub Issues does not replace the manifest. It owns delivery status, dependencies,
 and work ownership. Conversely, the manifest's `owner_issue` values connect
 evidence gaps to work but do not replace live tracker state.
 
@@ -48,9 +48,9 @@ show exactly where executable scenario evidence exists or remains incomplete.
 | Status | Meaning | Required shape |
 | --- | --- | --- |
 | `pass` | Current executable evidence proves the complete cell. | At least one applicable `harness` or `pytest` evidence reference; no gap metadata. |
-| `partial` | Evidence proves part, but not all, of the cell. | Precise reason, Filigree owner issue, and observable exit gate. |
-| `fail` | Evidence demonstrates behavior that misses the requirement. | Precise reason, Filigree owner issue, and observable exit gate. |
-| `unknown` | Adequate current production-path evidence has not been executed or does not exist. | Precise reason, Filigree owner issue, and observable exit gate. |
+| `partial` | Evidence proves part, but not all, of the cell. | Precise reason, owner issue, and observable exit gate. |
+| `fail` | Evidence demonstrates behavior that misses the requirement. | Precise reason, owner issue, and observable exit gate. |
+| `unknown` | Adequate current production-path evidence has not been executed or does not exist. | Precise reason, owner issue, and observable exit gate. |
 | `not_applicable` | The dimension genuinely does not apply. | Narrow reason; no evidence, owner, or exit gate. |
 
 Documentary evidence may explain a cell, but only executable `harness` or
@@ -101,10 +101,11 @@ The unit suite must reject malformed inventory or evidence. The integration
 suite must run registered cases without skips or expected failures and assert
 observed evidence, not merely successful process exit.
 
-## Active Filigree work
+## Archived issue references
 
-This status snapshot was taken on 2026-08-29. It is navigation aid only; use
-the commands below for current status, ownership, and dependencies.
+This status snapshot was taken on 2026-08-29. The identifiers refer to archived
+tracker records, not GitHub issue numbers. Current status, ownership, and
+dependencies belong in GitHub Issues after separate triage and import.
 
 | Issue | Snapshot status | Purpose |
 | --- | --- | --- |
@@ -112,14 +113,8 @@ the commands below for current status, ownership, and dependencies.
 | `elspeth-cb1053fe46` | `open`; blocks `elspeth-ef29ef6ba4` | Define and gate the supported scale envelope. |
 | `elspeth-be41d0ea25` | `open` | Repair and CI-bind the normative execution-graph contract. |
 
-```bash
-filigree show elspeth-ef29ef6ba4 --json
-filigree show elspeth-cb1053fe46 --json
-filigree show elspeth-be41d0ea25 --json
-```
-
 Do not copy tracker-maintained case totals into this page. The manifest and
-contract test own corpus counts; Filigree owns the state of the work.
+contract test own corpus counts; GitHub Issues owns the state of current work.
 
 ## Historical assessment work
 

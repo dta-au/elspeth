@@ -14,11 +14,13 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, NoReturn, cast, final
 from urllib.parse import parse_qsl, urlsplit
 
+from elspeth.contracts.credential_material import CredentialTraversalPolicy, find_credential_material
 from elspeth.contracts.enums import CallType, TerminalOutcome, TerminalPath
 from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, require_int
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.results import ArtifactDescriptor, require_no_artifact_uri_credentials
-from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
+from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.sink_effect_http import SinkEffectHTTPPost, SinkEffectHTTPPostFactory
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS
 
@@ -27,6 +29,10 @@ if TYPE_CHECKING:
 
 SINK_EFFECT_PROTOCOL_VERSION: Final = "sink-effect-v1"
 _SINK_EFFECT_EVIDENCE_MAX_BYTES: Final = 64 * 1024
+_SINK_EFFECT_EVIDENCE_CREDENTIAL_POLICY: Final = CredentialTraversalPolicy(
+    max_nodes=_SINK_EFFECT_EVIDENCE_MAX_BYTES,
+    max_width=_SINK_EFFECT_EVIDENCE_MAX_BYTES,
+)
 _AUDIT_EXPORT_MANIFEST_MAX_BYTES: Final = 64 * 1024
 _AUDIT_EXPORT_MAX_CHUNKS: Final = 100_000
 _AUDIT_EXPORT_MAX_CHUNK_BYTES: Final = 64 * 1024 * 1024
@@ -35,7 +41,7 @@ _AUDIT_EXPORT_MAX_TOTAL_BYTES: Final = 1024 * 1024 * 1024 * 1024
 _AUDIT_EXPORT_MAX_TOTAL_RECORDS: Final = 100_000_000
 _AUDIT_EXPORT_MANIFEST_SCHEMA: Final = "elspeth.audit-export-manifest.v2"
 _AUDIT_EXPORT_DERIVATION_VERSION: Final = "audit-export-derivation-v1"
-_AUDIT_EXPORT_SERIALIZATION_VERSION: Final = "audit-export-v2"
+_AUDIT_EXPORT_SERIALIZATION_VERSION: Final = "audit-export-v3"
 _UNSIGNED_RECORD_CHAIN: Final = "sha256_concat_record_sha256_v1"
 _HMAC_RECORD_CHAIN: Final = "sha256_concat_hmac_sha256_signatures_v1"
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -129,6 +135,7 @@ class SinkEffectRuntimeBinding:
     purpose: SinkEffectExecutionPurpose
     effect_mode: ResolvedSinkEffectMode | None
     audit_export_publication_preflight: Callable[[], None] | None = None
+    http_post_factory: SinkEffectHTTPPostFactory | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.sink_name, str) or not self.sink_name.strip():
@@ -141,6 +148,8 @@ class SinkEffectRuntimeBinding:
             raise TypeError("Sink runtime binding purpose must be exact SinkEffectExecutionPurpose")
         if self.effect_mode is not None and type(self.effect_mode) is not ResolvedSinkEffectMode:
             raise TypeError("Sink runtime binding mode must be ResolvedSinkEffectMode or None")
+        if self.http_post_factory is not None and not isinstance(self.http_post_factory, SinkEffectHTTPPostFactory):
+            raise TypeError("http_post_factory must be a nominal SinkEffectHTTPPostFactory")
 
 
 class AuditExportFormat(StrEnum):
@@ -277,7 +286,7 @@ def _freeze_bounded_evidence(evidence: Mapping[str, object], field_name: str) ->
     canonical = canonical_json(detached)
     if len(canonical.encode("utf-8")) > _SINK_EFFECT_EVIDENCE_MAX_BYTES:
         raise ValueError(f"{field_name} canonical JSON exceeds the 64 KiB limit")
-    if scrub_payload_for_audit(detached) != detached:
+    if find_credential_material(detached, _SINK_EFFECT_EVIDENCE_CREDENTIAL_POLICY) is not None:
         raise ValueError(f"{field_name} must be credential-free (known secret form detected)")
     return frozen
 
@@ -995,7 +1004,7 @@ def _verify_content_bytes(content: object, expected_hash: str, expected_size: in
         "TypeError when a manifest field has the wrong exact type; never accepts a manifest it cannot verify"
     ),
     test_ref="tests/unit/contracts/test_sink_effect_contract.py::test_verify_signed_manifest_bytes_rejects_non_dict_json",
-    test_fingerprint="3bd157d4f24dc84a3eb08d513c06f71987484dd8d5ad0fa4424f6cda9a8a59a3",
+    test_fingerprint="dadcc96c98b9a10e70a0a07b7fed5ad86b568d2121bc531ab4cb34b0070229d9",
 )
 def _verify_signed_manifest_bytes(
     content: bytes,
@@ -1422,6 +1431,7 @@ class RestrictedSinkEffectContext:
     run_started_at: datetime
     operation_id: str
     sink_node_id: str
+    http_post: SinkEffectHTTPPost | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _require_nonempty_string(self.run_id, "run_id")
@@ -1429,6 +1439,8 @@ class RestrictedSinkEffectContext:
         _require_nonempty_string(self.sink_node_id, "sink_node_id")
         if not isinstance(self.run_started_at, datetime):
             raise TypeError("run_started_at must be datetime")
+        if self.http_post is not None and not isinstance(self.http_post, SinkEffectHTTPPost):
+            raise TypeError("http_post must be a nominal SinkEffectHTTPPost")
 
 
 class SinkEffectContract:

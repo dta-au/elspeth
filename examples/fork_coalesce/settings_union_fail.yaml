@@ -1,28 +1,33 @@
 # Fork/Coalesce Example — Union Merge with `fail` Collision Policy
 #
-# *** THIS PIPELINE IS DESIGNED TO FAIL. ***
+# *** EVERY ROW IN THIS PIPELINE IS DESIGNED TO FAIL AT THE COALESCE. ***
 #
-# Demonstrates `union_collision_policy: fail` — on ANY field-name
-# collision, the coalesce raises `CoalesceCollisionError`. The orchestrator
-# catches the error, marks the coalesce node FAILED, and persists the full
-# collision record (`union_field_origins`, `union_field_collisions`)
-# to `node_states.context_after_json` so auditors can see which fields
-# collided and which branches contributed, without value-derived hashes
-# or types.
+# Demonstrates `union_collision_policy: fail` — a field name carried by
+# more than one arriving branch fails that row's merge group. Each consumed
+# branch row is recorded FAILED with the closed, value-free reason
+# `union_field_collision`, and the full collision record
+# (`union_field_origins`, `union_field_collisions`) is persisted to each
+# FAILED hold's `node_states.context_after_json`, so auditors can see which
+# fields collided and which branches contributed, without value-derived
+# hashes or types. The run continues with the next row; it never aborts.
 #
 #   source ─(raw)─> [fork_gate] ─┬─ path_a ─> truncate(20) ─(trunc_a)─┐
 #                                 └─ path_b ─> truncate(50) ─(trunc_b)─┤
-#                                                                       X  <- collision, FAIL
+#                                                                       X  <- collision, row FAILED
 #
-# Both branches carry the same column set (id, product, price, category,
-# description), so every field name overlaps. The `fail` policy treats
-# ANY overlap as an error — it does not distinguish "same value" from
-# "different value." If you want the runtime to silently reconcile
+# The source is `observed`: the build cannot know which columns a row
+# carries, so the collision is a per-row fault found when the branches
+# merge. (With a `fixed` source, both branches would GUARANTEE the same
+# columns and every merge would be certain to collide — `elspeth validate`
+# refuses that pipeline before any row is read, naming the fields.) The
+# `fail` policy treats ANY overlap as an error — it does not distinguish
+# "same value" from "different value." If you want the runtime to reconcile
 # overlaps, use `last_wins` or `first_wins` instead.
 #
-# Expected result: `elspeth run` exits non-zero. The audit database at
-# runs/union_fail.db will contain a FAILED coalesce node state with the
-# full collision record preserved. Inspect via:
+# Expected result: `elspeth run` ends FAILED (exit 2): every row's group
+# fails, nothing reaches the sink. The audit database at
+# runs/union_fail.db holds a FAILED coalesce node state per consumed branch
+# row with the collision record preserved. Inspect via:
 #
 #   elspeth-mcp --database sqlite:///examples/fork_coalesce/runs/union_fail.db
 #
@@ -38,13 +43,7 @@ sources:
     options:
       path: examples/fork_coalesce/input.csv
       schema:
-        mode: fixed
-        fields:
-        - 'id: int'
-        - 'product: str'
-        - 'price: int'
-        - 'category: str'
-        - 'description: str'
+        mode: observed
       on_validation_failure: discard
 
 gates:
@@ -97,7 +96,7 @@ coalesce:
     path_b: trunc_b
   policy: require_all
   merge: union
-  union_collision_policy: fail   # DELIBERATE: any collision raises CoalesceCollisionError
+  union_collision_policy: fail   # DELIBERATE: any collision fails the row's group (union_field_collision)
 
 sinks:
   output:

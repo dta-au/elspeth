@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from elspeth.core.template_materialization import TemplateOptionMaterializer
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.transforms import reference_join
 from elspeth.plugins.transforms.reference_join import ReferenceJoin
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_source_context
@@ -55,6 +56,91 @@ def ctx() -> "PluginContext":
 
 
 class TestJoinSemantics:
+    @pytest.mark.parametrize(
+        ("reference_format", "reference_content", "expected_value", "expected_type"),
+        [
+            ("csv", "category,response_sla_hours\nbilling,24\n", "24", "str"),
+            ("json", '[{"category":"billing","response_sla_hours":24}]', 24, "int"),
+        ],
+    )
+    def test_numeric_reference_cells_require_truthful_consumer_and_repair_guidance(
+        self,
+        ctx: "PluginContext",
+        tmp_path: Path,
+        reference_format: str,
+        reference_content: str,
+        expected_value: str | int,
+        expected_type: str,
+    ) -> None:
+        from elspeth.plugins.sinks.csv_sink import CSVSink
+        from elspeth.plugins.transforms.type_coerce import TypeCoerce
+        from elspeth.web.composer.skills import load_skill
+
+        transform = build(
+            reference_format=reference_format,
+            reference_content=reference_content,
+            key_field="category",
+            reference_key_name="category",
+            output={"response_sla_hours": "ref['response_sla_hours']"},
+        )
+        result = transform.process(make_pipeline_row({"category": "billing"}), ctx)
+        assert result.row is not None
+        assert result.row["response_sla_hours"] == expected_value
+        assert _declared_output_field(transform, "response_sla_hours").field_type == expected_type
+        sink = CSVSink(
+            {
+                "path": str(tmp_path / "output.csv"),
+                "schema": {"mode": "fixed", "fields": ["category: str", "response_sla_hours: int"]},
+            }
+        )
+        if reference_format == "csv":
+            with pytest.raises(ValidationError, match="int_type"):
+                sink.input_schema.model_validate(result.row.to_dict())
+            conversion = TypeCoerce(
+                {
+                    "schema": {"mode": "flexible", "fields": ["response_sla_hours: str"]},
+                    "conversions": [{"field": "response_sla_hours", "to": "int"}],
+                }
+            )
+            converted = conversion.process(result.row, ctx)
+            assert converted.row is not None
+            assert converted.row["response_sla_hours"] == 24
+            sink.input_schema.model_validate(converted.row.to_dict())
+        else:
+            sink.input_schema.model_validate(result.row.to_dict())
+
+        assistance = ReferenceJoin.get_agent_assistance()
+        assert assistance is not None
+        hints = " ".join(assistance.composer_hints)
+        assert "CSV cells remain strings" in hints
+        assert "JSON numbers retain numeric types" in hints
+        assert "type_coerce" in hints
+        assert "field_mapper" in hints
+        assert "arriving str" in hints
+        assert "Never replace a supplied CSV" in hints
+        skill = load_skill("pipeline_composer")
+        repair = next(line for line in skill.splitlines() if line.startswith("| Joined or enriched field"))
+        assert "get_plugin_schema" in repair
+        assert "get_plugin_assistance" in repair
+        assert "Preserve supplied reference data" in repair
+        assert "explicit conversion before the consumer" in repair
+
+    def test_composer_assistance_wires_an_existing_upload(self) -> None:
+        assistance = ReferenceJoin.get_agent_assistance()
+        assert assistance is not None
+        hints = " ".join(assistance.composer_hints)
+        assert "list_blobs" in hints
+        assert "get_blob_metadata" in hints
+        assert "node:<node_id>.options.reference_content" in hints
+        assert "create_blob only for table bytes you create" in hints
+        assert "reference_format explicitly" in hints
+
+    def test_rejects_reference_index_cartesian_product_above_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(reference_join, "MAX_REFERENCE_INDEX_CELLS", 3)
+
+        with pytest.raises(PluginConfigError, match=r"2 entries and 2 output fields.*4 values; the limit is 3"):
+            build(output={"description": "ref['description']", "price": "ref['price']"})
+
     def test_csv_flat_hit_adds_named_field(self, ctx: "PluginContext") -> None:
         transform = build()
         result = transform.process(make_pipeline_row({"order_id": "a", "product": "hats"}), ctx)
@@ -120,8 +206,10 @@ class TestMissPolicy:
         assert result.status == "error"
         assert result.reason is not None
         assert result.reason["reason"] == "reference_miss"
-        assert result.reason["reference_key_value"] == "gloves"
         assert result.reason["unresolved_fields"] == ["product_description"]
+        # The join key is row data: named by field, never by value.
+        assert result.reason["field"] == "product"
+        assert "gloves" not in repr(result.reason)
 
     def test_key_miss_writes_null(self, ctx: "PluginContext") -> None:
         transform = build(on_miss="null")
@@ -153,6 +241,7 @@ class TestMissPolicy:
         assert result.reason["reason"] == "reference_miss"
         assert result.reason["unresolved_fields"] == ["tax_rate"]
         assert "did not resolve" in result.reason["error"]
+        assert "socks" not in repr(result.reason)
 
     def test_unresolved_path_nulls_only_that_field(self, ctx: "PluginContext") -> None:
         transform = build(
@@ -194,6 +283,33 @@ class TestMissPolicy:
 
 
 class TestLoadTimeRejection:
+    def test_duplicate_csv_header_is_refused_before_a_value_is_overwritten(self) -> None:
+        with pytest.raises(PluginConfigError) as exc:
+            build(reference_content="sku,description,description\nhats,First,Last\n")
+
+        assert "duplicate CSV header" in str(exc.value)
+        assert "'description'" in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "table",
+        [
+            '[{"sku":"hats","description":"First","description":"Last"}]',
+            '[{"sku":"hats","description":"Fine","tax":{"rate":1,"rate":2}}]',
+        ],
+    )
+    def test_duplicate_json_object_member_is_refused_even_when_nested(self, table: str) -> None:
+        with pytest.raises(PluginConfigError) as exc:
+            build(reference_content=table, reference_format="json")
+
+        assert "duplicate JSON object member" in str(exc.value)
+
+    def test_distinct_case_sensitive_reference_names_remain_distinct(self, ctx: "PluginContext") -> None:
+        transform = build(reference_content="sku,description,Description\nhats,Lower,Upper\n")
+
+        result = transform.process(make_pipeline_row({"product": "hats"}), ctx)
+        assert result.row is not None
+        assert result.row["product_description"] == "Lower"
+
     def test_duplicate_reference_keys_are_refused(self) -> None:
         with pytest.raises(PluginConfigError) as exc:
             build(reference_content="sku,description\nhats,One\nhats,Two\n")
@@ -257,6 +373,23 @@ class TestLoadTimeRejection:
             build(output={"desc": "__import__('os').system('x')"})
 
         assert "desc" in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "expression",
+        ["{ref['description'], ref['sku']}", "ref['description'] or {1}", "[{ref['sku']}]"],
+    )
+    def test_an_expression_that_can_store_a_set_is_refused(self, expression: str) -> None:
+        """A set has no canonical order: the joined value would differ between processes (elspeth-5887fb7928)."""
+        with pytest.raises(PluginConfigError) as exc:
+            build(output={"tags": expression})
+
+        assert "output field 'tags'" in str(exc.value)
+        assert "can produce a set, which has no canonical order" in str(exc.value)
+
+    def test_a_set_literal_consumed_by_a_membership_test_builds(self) -> None:
+        transform = build(output={"is_hat": "ref['sku'] in {'hats', 'caps'}"})
+
+        assert transform is not None
 
     def test_an_expression_addressing_row_is_refused(self) -> None:
         """Only the matched entry is in scope; 'row' is not a second grammar."""
@@ -432,6 +565,32 @@ class TestTheTableIsWholeOrItIsRefused:
         assert result.status == "success"
         assert result.row is not None
         assert result.row.to_dict()["d"] is None
+
+    def test_a_format_key_the_entry_lacks_is_a_miss_not_a_crash(self) -> None:
+        """``str % mapping`` raises KeyError when the mapping lacks the named key (C3 review r2).
+
+        The evaluator classifies it as ``missing_key`` — the same fact as a
+        subscript miss: this entry's mapping does not hold what the expression
+        asks for — so a sparse entry stays governed by on_miss. It used to crash
+        through the load as a bare KeyError.
+        """
+        table = json.dumps([{"sku": "hats", "attrs": {"description": "A fine hat"}}, {"sku": "coats", "attrs": {}}])
+        transform = build(
+            reference_content=table,
+            reference_format="json",
+            output={"d": "'%(description)s' % ref['attrs']"},
+            on_miss="null",
+        )
+        ctx_local = make_source_context()
+
+        hit = transform.process(make_pipeline_row({"product": "hats"}), ctx_local)
+        miss = transform.process(make_pipeline_row({"product": "coats"}), ctx_local)
+
+        assert hit.row is not None
+        assert hit.row.to_dict()["d"] == "A fine hat"
+        assert miss.status == "success"
+        assert miss.row is not None
+        assert miss.row.to_dict()["d"] is None
 
 
 class TestANullIsAValueAndAMissIsNot:
@@ -693,7 +852,7 @@ class TestJoinedOutputFieldTypes:
         )
         field = _declared_output_field(transform, "response_sla_hours")
         assert field.field_type == "str"
-        assert resolved_guarantee_type_mismatch(field.field_type, str, consumer_strict=True) is None
+        assert resolved_guarantee_type_mismatch(field.field_type, str) is None
 
 
 class TestAuthorDeclarationsOnJoinedFields:

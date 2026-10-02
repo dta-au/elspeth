@@ -1,0 +1,214 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "decision": "NO GO for execution as written",
+  "plan_directory": "docs/plans/2026-09-13-kubernetes-and-identity/",
+  "reviewed_on": "2026-09-15",
+  "source_head": "a522874fe4b4692721f273eb271ce724cc60c428",
+  "scope": "Targeted four-lens review of the master plan and task interfaces, executable excerpts, live source contracts and specification. The full task corpus was not exhaustively reviewed line by line. Concurrent wording edits were observed and principal finding anchors rechecked. This is a plan review, not implementation acceptance.",
+  "blocking_issues": [
+    {
+      "id": "B1",
+      "priority": "P1",
+      "source": "architecture",
+      "title": "Cutover restores expired and temporary authority as permanent grants",
+      "evidence": [
+        "I11-cutover.md:487-491",
+        "I11-cutover.md:507",
+        "I11-cutover.md:519-527",
+        "src/elspeth/web/coordination/identity_authority.py:889-892"
+      ],
+      "impact": "The export filters revoked_at but omits expires_at. Re-admission restores role names with no expiry. An expired unrevoked approver or administrator is revived; a valid temporary grant becomes permanent. Provisioning every export row also duplicates identities with multiple roles.",
+      "resolution": "Separate identity restoration from grant restoration. Preserve scope and expires_at, restore each identity once, restore only grants active at restoration time, and handle the bootstrap administrator explicitly.",
+      "validation": "Cutover cases for expired/unrevoked, future-expiring, revoked, scoped and multiple grants. Verify resulting authority and expiry through the real admin API.",
+      "basis": "Controlled live-schema/export-query reproduction; output: approver live active: False; reviewer live active: True; auditor live active: False; plan export roles: [('approver',), ('reviewer',)]."
+    },
+    {
+      "id": "B2",
+      "priority": "P1",
+      "source": "quality",
+      "title": "Mailbox exposes approvals that substitute approvers cannot inspect, while decision buttons remain enabled",
+      "evidence": [
+        "I9-frontend.md:366-375",
+        "I7-scoped-reads.md:637-643",
+        "I9-frontend.md:4108-4117",
+        "I9-frontend.md:4168-4175",
+        "docs/specs/2026-09-02-pluggable-sso-design.md:1205-1215"
+      ],
+      "impact": "An eligible approver receives another approver's request but inspection returns 404. The UI can still submit approval without loading the frozen pipeline.",
+      "resolution": "Use consistent role-based approval eligibility across inbox, inspect and decide. Disable decision actions while inspection is loading, failed or stale.",
+      "validation": "Integrated author Alice, addressed approver Bob, substitute Carol case; Carol must inspect the exact state before deciding. Test inspection loading/failure and target changes.",
+      "basis": "Exact planned SQLAlchemy expressions extracted from fenced-code ASTs: Bob inbox=True inspect=True; Carol inbox=True inspect=False; author Alice inbox=False inspect=False."
+    },
+    {
+      "id": "B3",
+      "priority": "P1",
+      "source": "architecture",
+      "title": "Repeated approvals for one state crash the R2 query",
+      "evidence": [
+        "I3-approvals.md:1338-1362",
+        "I3-approvals.md:1457-1461",
+        "I3-approvals.md:1502",
+        "src/elspeth/web/sessions/models.py:3658-3667"
+      ],
+      "impact": "Only open requests are unique. Request/approve/request/approve for one state produces multiple approved rows, but approved_binding uses one_or_none and raises MultipleResultsFound. Re-approval after binding changes is a legitimate trigger.",
+      "resolution": "Define multiplicity semantics. Find an approved row matching the entire current binding, with deterministic mismatch handling, or explicitly retire earlier approvals with lifecycle/audit rules. Do not pick an arbitrary first row.",
+      "validation": "Public-route repeat-approval tests for equal and changed bindings, including PostgreSQL and R2 execute/readiness behavior.",
+      "basis": "Live approvals_table reproduction: one approved row succeeds; two approved rows are admitted and one_or_none raises MultipleResultsFound; absent state returns None. In-memory instrument does not prove public-route behavior."
+    },
+    {
+      "id": "B4",
+      "priority": "P1",
+      "source": "reality",
+      "title": "Cold Kubernetes install starts schema initialization before storage is ready",
+      "evidence": [
+        "K4-kind-harness.md:234-239",
+        "K5-acceptance-probes.md:1479-1481",
+        "K1-kustomize-base.md:788",
+        "K1-kustomize-base.md:810-820",
+        "src/elspeth/web/doctor.py:57-80",
+        "src/elspeth/web/doctor.py:624-632"
+      ],
+      "impact": "Applying the entire overlay starts both Jobs. Waiting for provision-storage first does not sequence their starts. Schema-init can probe missing directories and fail permanently with backoffLimit=0.",
+      "resolution": "Apply prerequisites and provision-storage, wait for success, then apply schema-init and wait, then start web Deployments. Reuse the ordered cold-install path for K5's standalone fixture.",
+      "validation": "Deliberately delay storage provisioning on a fresh volume and prove schema initialization cannot start early; run both the combined lane and K5 alone.",
+      "basis": "Static Job-ordering analysis plus live doctor positive/negative control: missing directory ok=False/FileNotFoundError; after provisioning ok=True. No cluster was run."
+    },
+    {
+      "id": "B5",
+      "priority": "P1",
+      "source": "systems",
+      "title": "Public documentation claims a probe that default CI skips",
+      "evidence": [
+        "K5-acceptance-probes.md:1727-1732",
+        "K5-acceptance-probes.md:1958",
+        "K8-runbook-and-claim-flip.md:491-499"
+      ],
+      "impact": "K5 explicitly expects P4a to skip without provider configuration, but K8 says CI proves postgresql_and_nfs, the P4a mechanism.",
+      "resolution": "Either provide and require the P4a execution before publishing the claim, or state precisely that the default lane does not measure it and condition qualification on a completed separate run.",
+      "validation": "Check completed test outcomes, including skips, against every published acceptance claim. A required qualification must fail when its prerequisite is absent.",
+      "basis": "Direct contradiction between planned default test outcome and planned public status text."
+    },
+    {
+      "id": "B6",
+      "priority": "P1",
+      "source": "systems",
+      "title": "AKS runbook promises credential isolation absent from the selected overlay",
+      "evidence": [
+        "K6-aks-overlay.md:430-467",
+        "K6-aks-overlay.md:543",
+        "K6-aks-overlay.md:580-610",
+        "K8-runbook-and-claim-flip.md:706-709"
+      ],
+      "impact": "K8 says the runtime identity cannot read the schema-owner vault. K6 selects one add-on managed identity with access to both vaults and describes its node-level reachability. Separate mounted Secrets do not establish the promised identity boundary.",
+      "resolution": "Resolve the identity topology and reconcile the complete AKS procedure. If runtime/schema-owner isolation is required, implement distinct identities with enforced access boundaries; if a shared identity is accepted, document the actual boundary without the isolation claim.",
+      "validation": "Negative authorization checks proving runtime identity cannot retrieve schema-owner material for an isolation claim, plus rendered-manifest/runbook parity.",
+      "basis": "Verified contradiction within plan artifacts; no live Azure authorization trial performed."
+    },
+    {
+      "id": "B7",
+      "priority": "P1",
+      "source": "quality",
+      "title": "Authorization and review timestamps are sampled before blocking locks",
+      "evidence": [
+        "I4-reviews.md:780-782",
+        "I4-reviews.md:861-884",
+        "I4-reviews.md:50-55",
+        "I7-scoped-reads.md:1411-1446",
+        "src/elspeth/web/coordination/identity_authority.py:2666-2681",
+        "src/elspeth/web/coordination/identity_authority.py:2816-2826"
+      ],
+      "impact": "A reviewer grant can expire during a lock wait but be accepted against an earlier timestamp. An attestation can commit after a new request yet carry an earlier timestamp and fail the derived closure predicate. Delegated curator grants also read actor/role/edge without holding locks that serialize concurrent revocation.",
+      "resolution": "Acquire compatible authority locks before evaluating current time and predicates; revalidate after waits. Ensure request/attestation ordering represents the serialized operation order.",
+      "validation": "PostgreSQL interleavings that pause at target/participant locks, cross an expiry, revoke authorizing role/edge, and create a newer review request before releasing the waiter.",
+      "basis": "Static source and plan analysis only; these concurrency schedules were not executed."
+    },
+    {
+      "id": "B8",
+      "priority": "P1",
+      "source": "specification",
+      "title": "Approval supersession deliberately omits its required audit event",
+      "evidence": [
+        "I3-approvals.md:24-34",
+        "I3-approvals.md:1303",
+        "docs/specs/2026-09-02-pluggable-sso-design.md:1387-1388"
+      ],
+      "impact": "The proposed supersede writer takes no record callback and writes no Landscape event, contrary to the workflow mutation audit requirement. The plan itself requires an operator ruling before executing this exception.",
+      "resolution": "Thread the audit callback through state writers with fail-closed behavior, or obtain and record an explicit specification change before executing the exception.",
+      "validation": "Supersession produces the required audit record; audit write failure prevents the corresponding mutation. If scope changes, reconcile spec, plan, tests and delivery claims.",
+      "basis": "Explicit plan exception cross-checked against the current specification; not a newly discovered runtime defect."
+    },
+    {
+      "id": "B9",
+      "priority": "P1",
+      "source": "specification",
+      "title": "Required signed-export compartment stamping is omitted",
+      "evidence": [
+        "I6-compartment-marking.md:87-98",
+        "docs/specs/2026-09-02-pluggable-sso-design.md:1454-1461"
+      ],
+      "impact": "The plan claims completion of the identity workflow while explicitly leaving out the signed Landscape export marking required by the specification.",
+      "resolution": "Include the versioned export-contract work, or obtain an explicit scope ruling and narrow the completion claim. Resolve the related chat-ingress interpretation rather than leaving it as an implementer assumption.",
+      "validation": "Signed export includes the intended compartment identity with compatible derivation/verification tests, or approved scope documentation accurately states the omission.",
+      "basis": "Explicit delivery gap, not an inferred implementation failure."
+    }
+  ],
+  "warnings": [
+    {
+      "id": "W1",
+      "priority": "P2",
+      "title": "Failure diagnostics are collected after cluster teardown",
+      "evidence": [
+        "K4-kind-harness.md:692-694",
+        "K4-kind-harness.md:964-975"
+      ],
+      "resolution": "Collect bounded redacted diagnostics before deleting the cluster, or give the outer script sole cleanup ownership. Deliberately fail a probe and verify retained logs contain workload diagnostics."
+    },
+    {
+      "id": "W2",
+      "priority": "P2",
+      "title": "Review outcomes are absent from the requester mailbox",
+      "evidence": [
+        "I9-frontend.md:55-60",
+        "I9-frontend.md:1880-1890",
+        "docs/specs/2026-09-02-pluggable-sso-design.md:1228-1229"
+      ],
+      "resolution": "Include requester-owned review history and decision notes. Lack of a seen column does not prevent displaying outcomes."
+    }
+  ],
+  "go_conditions": [
+    "Correct the executable defects and update their specified regression tests.",
+    "Resolve the audit, export-marking and AKS identity decisions; align specification, task instructions and claims.",
+    "Re-review the affected cross-task flows against a stable plan snapshot. Full implementation/cluster acceptance remains future work."
+  ],
+  "validation": {
+    "completed": [
+      "Controlled in-memory approval uniqueness/query reproduction with positive and negative controls",
+      "Controlled quota-cutover role export comparison against live active-role predicate",
+      "Exact planned mailbox/inspect SQL expression comparison",
+      "Live doctor missing/provisioned-directory controls",
+      "Current source/specification and cross-task comparisons"
+    ],
+    "not_performed": [
+      "Implementation or broad test suites",
+      "PostgreSQL concurrency schedules",
+      "kind/Kubernetes acceptance",
+      "Live AKS deployment or identity validation",
+      "Exhaustive review of every fenced implementation block"
+    ],
+    "artifacts": [
+      ".claude/lanes/kidentity-review-20260914/architecture-repro.py",
+      ".claude/lanes/kidentity-review-20260914/architecture-repro.log",
+      ".claude/lanes/kidentity-review-20260914/reality.md",
+      ".claude/lanes/kidentity-review-20260914/architecture.md",
+      ".claude/lanes/kidentity-review-20260914/quality.md",
+      ".claude/lanes/kidentity-review-20260914/systems.md"
+    ]
+  },
+  "external_checks": [
+    {
+      "claim": "Kubernetes v1.37.0 is listed as released; its version number was not treated as a blocker.",
+      "source": "https://kubernetes.io/releases/",
+      "limitation": "kubectl checksum endpoint could not be independently opened; no checksum claim made."
+    }
+  ]
+}

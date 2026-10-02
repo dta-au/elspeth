@@ -1,0 +1,678 @@
+{
+  "states": {
+    "null": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": true,
+      "validation_errors": null,
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    },
+    "empty": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": true,
+      "validation_errors": [],
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    },
+    "coded": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": false,
+      "validation_errors": [
+        {
+          "message": "Review is pending",
+          "error_code": "interpretation_review_pending",
+          "component": "classify"
+        }
+      ],
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    },
+    "unexpected": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": false,
+      "validation_errors": [
+        {
+          "message": "Output is invalid",
+          "error_code": "invalid_output_path",
+          "component": "out"
+        }
+      ],
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    },
+    "uncoded": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": false,
+      "validation_errors": [
+        {
+          "message": "interpretation_review_pending: message only",
+          "error_code": null,
+          "component": null
+        }
+      ],
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    },
+    "guided_invalid": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": false,
+      "validation_errors": [
+        {
+          "message": "guided_composition_invalid",
+          "error_code": "guided_composition_invalid",
+          "component": null
+        }
+      ],
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    }
+  },
+  "versions": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": true,
+      "validation_errors": null,
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": true,
+      "validation_errors": [],
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": false,
+      "validation_errors": [
+        {
+          "message": "Review is pending",
+          "error_code": "interpretation_review_pending",
+          "component": "classify"
+        }
+      ],
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": false,
+      "validation_errors": [
+        {
+          "message": "Output is invalid",
+          "error_code": "invalid_output_path",
+          "component": "out"
+        }
+      ],
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": false,
+      "validation_errors": [
+        {
+          "message": "interpretation_review_pending: message only",
+          "error_code": null,
+          "component": null
+        }
+      ],
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "session_id": "00000000-0000-4000-8000-000000000002",
+      "version": 1,
+      "sources": {
+        "primary": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {
+            "path": "input.csv",
+            "schema": {
+              "mode": "observed"
+            }
+          },
+          "on_validation_failure": "discard"
+        }
+      },
+      "nodes": [
+        {
+          "id": "classify",
+          "node_type": "transform",
+          "plugin": "passthrough",
+          "input": "rows",
+          "on_success": "out",
+          "on_error": "discard",
+          "options": {}
+        }
+      ],
+      "edges": [],
+      "outputs": [
+        {
+          "name": "out",
+          "plugin": "json",
+          "options": {
+            "path": "output.json"
+          },
+          "on_write_failure": "discard"
+        }
+      ],
+      "metadata": {
+        "name": "HTTP fixture",
+        "description": ""
+      },
+      "is_valid": false,
+      "validation_errors": [
+        {
+          "message": "guided_composition_invalid",
+          "error_code": "guided_composition_invalid",
+          "component": null
+        }
+      ],
+      "validation_warnings": null,
+      "validation_suggestions": null,
+      "derived_from_state_id": null,
+      "created_at": "2026-09-12T00:00:00Z",
+      "composer_meta": null,
+      "plugin_policy_findings": []
+    }
+  ]
+}

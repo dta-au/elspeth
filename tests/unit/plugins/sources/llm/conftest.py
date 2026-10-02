@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.sources.llm import LLMSource
@@ -57,7 +58,7 @@ class FakeProvider:
             raise self.result
         return self.result
 
-    def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, coordination_token: CoordinationToken, operation_id: str, model: str) -> None:
         del operation_id, model
         self.runtime_preflight_calls += 1
 

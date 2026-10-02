@@ -15,6 +15,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     SESSION_SCHEMA_EPOCH,
     blob_deletion_cleanups_table,
+    blob_replacement_cleanups_table,
     blobs_table,
     composition_states_table,
     metadata,
@@ -36,6 +37,7 @@ from elspeth.web.sessions.schema import (
     initialize_session_schema,
     probe_current_schema,
 )
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.mark.parametrize(
@@ -79,6 +81,7 @@ def engine():
 
 
 def _seed_session_state(conn) -> tuple[str, str]:
+    ensure_test_identity(conn, identity_id="alice")
     now = datetime.now(UTC)
     session_id = str(uuid.uuid4())
     state_id = str(uuid.uuid4())
@@ -103,6 +106,11 @@ def _seed_session_state(conn) -> tuple[str, str]:
         )
     )
     return session_id, state_id
+
+
+def test_preferences_have_no_composer_mode_column(engine) -> None:
+    columns = {column["name"] for column in inspect(engine).get_columns("user_preferences")}
+    assert "default_composer_mode" not in columns
 
 
 def _seed_run(conn) -> str:
@@ -224,6 +232,71 @@ def test_blob_deletion_cleanup_rejects_invalid_exact_ledger_constraints(
             conn.execute(insert(blob_deletion_cleanups_table).values(**values))
 
 
+def _blob_replacement_cleanup_values(session_id: str) -> dict[str, object]:
+    now = datetime.now(UTC)
+    blob_id = str(uuid.uuid4())
+    storage_path = f"/data/blobs/{session_id}/{blob_id}_artifact.txt"
+    return {
+        "blob_id": blob_id,
+        "replacement_id": str(uuid.uuid4()),
+        "session_id": session_id,
+        "storage_path": storage_path,
+        "staging_path": f"{storage_path}.staging",
+        "backup_path": f"{storage_path}.backup",
+        "operation_id": "operation-1",
+        "operation_epoch": 1,
+        "operation_kind": "compose",
+        "lease_token": "lease-1",
+        "owner_instance_id": "instance-1",
+        "phase": "intent",
+        "old_blob_snapshot": {},
+        "replacement_blob_snapshot": {},
+        "old_blob_snapshot_hash": "a" * 64,
+        "replacement_blob_snapshot_hash": "b" * 64,
+        "old_size_bytes": 4,
+        "old_content_hash": "c" * 64,
+        "replacement_size_bytes": 5,
+        "replacement_content_hash": "d" * 64,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def test_blob_replacement_cleanup_accepts_lowercase_sha256_evidence(engine) -> None:
+    # Positive control for the rejection matrix below: the baseline row those
+    # cases mutate must itself be admissible, or every rejection is vacuous.
+    with engine.begin() as conn:
+        session_id, _state_id = _seed_session_state(conn)
+        conn.execute(insert(blob_replacement_cleanups_table).values(**_blob_replacement_cleanup_values(session_id)))
+
+
+@pytest.mark.parametrize(
+    ("column", "constraint"),
+    [
+        ("old_blob_snapshot_hash", "ck_blob_replacement_cleanups_old_snapshot_hash_format"),
+        ("replacement_blob_snapshot_hash", "ck_blob_replacement_cleanups_replacement_snapshot_hash_format"),
+        ("old_content_hash", "ck_blob_replacement_cleanups_old_content_hash_format"),
+        ("replacement_content_hash", "ck_blob_replacement_cleanups_replacement_content_hash_format"),
+    ],
+)
+@pytest.mark.parametrize("bad_hash", ["A" * 64, "g" * 64, "a" * 63], ids=["uppercase-hex", "non-hex-letter", "too-short"])
+def test_blob_replacement_cleanup_rejects_non_lowercase_sha256_evidence(
+    engine,
+    column: str,
+    constraint: str,
+    bad_hash: str,
+) -> None:
+    # The replacement ledger is recovery evidence: a hash that is 64 characters
+    # of anything but lowercase hex can never match real bytes, so recovery
+    # would compare against a value no file can produce.
+    with engine.begin() as conn:
+        session_id, _state_id = _seed_session_state(conn)
+        values = _blob_replacement_cleanup_values(session_id)
+        values[column] = bad_hash
+        with pytest.raises(IntegrityError, match=constraint):
+            conn.execute(insert(blob_replacement_cleanups_table).values(**values))
+
+
 @pytest.mark.parametrize(
     "custody",
     [
@@ -273,10 +346,27 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
 
     # 48 -> 51 by the multi-replica merge (elspeth-4d6c0dd0f5), then -> 52
     # when the pluggable-SSO identity substrate landed (elspeth-07cd19ba73),
-    # then -> 53 for the per-admission read records (elspeth-f98e0ae8b2).
+    # then -> 53 for per-admission reads and 54 for durable Composer progress.
+    # 55 pairs with Landscape40 for identity owners and durable admission evidence.
     # _COORDINATION_HARD_CUT_EPOCH tracks this by exact equality, so a bump
     # that missed it would stop every session DB from opening.
-    assert SESSION_SCHEMA_EPOCH == 53
+    # 56 couples sparse proposal display with structured stored validation errors.
+    # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
+    # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
+    # Epoch 61 defaults preferences to freeform and retires the mode banner.
+    # Epoch 64 admits the distinct cost-accounting failure classification.
+    # Epoch 65: completion_gates.advisor_signoff.note became a required key
+    # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
+    # Epoch 66 binds control-message provenance in the v2 checksum; v1 rows
+    # must be rejected at startup rather than during conversation replay.
+    # Epoch 67 binds coalesce branch order and sources order in the composer
+    # authority hashes; stored epoch-66 preimages cannot be re-verified.
+    # Epoch 68 adds ordinary proposal checkpoint rebase reasons.
+    # Epoch 69 adds immutable freeform message ingress receipts.
+    # Epoch 70 stores the tutorial Build stage as build.
+    # Epoch 71 removes the Composer mode preference and adds mode-neutral
+    # fork/revert receipts.
+    assert SESSION_SCHEMA_EPOCH == 71
     expected_tables = frozenset(
         {
             "web_instances",
@@ -285,6 +375,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
             "run_start_permits",
             "run_execution_inputs",
             "websocket_tickets",
+            "composer_inflight_requests",
+            "composer_progress_snapshots",
             "rate_limit_buckets",
             "rate_limit_events",
             "sessions_cleanup_claims",
@@ -301,6 +393,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
         "run_start_permits": {"ix_run_start_permits_retention_expires_at"},
         "run_execution_inputs": set(),
         "websocket_tickets": {"ix_websocket_tickets_expires_at", "ix_websocket_tickets_run_id"},
+        "composer_inflight_requests": {"ix_composer_inflight_requests_expires_at", "ix_composer_inflight_session_expiry"},
+        "composer_progress_snapshots": {"ix_composer_progress_snapshots_expires_at"},
         "rate_limit_buckets": {"ix_rate_limit_buckets_expires_at"},
         "rate_limit_events": {"ix_rate_limit_events_expires_at", "ix_rate_limit_events_subject_occurred"},
         "sessions_cleanup_claims": {"ix_sessions_cleanup_claims_lease_expires_at"},
@@ -310,6 +404,24 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
 
     run_indexes = {index["name"] for index in inspector.get_indexes("runs")}
     assert {"ix_runs_owner_lease_expires_at", "ix_runs_saga_state"} <= run_indexes
+
+
+def test_message_ingress_receipt_schema_has_exact_same_session_bindings() -> None:
+    engine = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(engine)
+    inspector = inspect(engine)
+    assert "message_ingress_receipts" in inspector.get_table_names()
+    assert inspector.get_pk_constraint("message_ingress_receipts")["constrained_columns"] == ["session_id", "client_request_id"]
+    assert {tuple(item["column_names"]) for item in inspector.get_unique_constraints("message_ingress_receipts")} == {("user_message_id",)}
+    bindings = {
+        (tuple(item["constrained_columns"]), item["referred_table"], tuple(item["referred_columns"]))
+        for item in inspector.get_foreign_keys("message_ingress_receipts")
+    }
+    assert bindings == {
+        (("session_id",), "sessions", ("id",)),
+        (("user_message_id", "session_id"), "chat_messages", ("id", "session_id")),
+        (("requested_state_id", "session_id"), "composition_states", ("id", "session_id")),
+    }
 
 
 def test_coordination_hard_cut_check_constraints_are_exact() -> None:
@@ -346,6 +458,8 @@ def test_coordination_hard_cut_check_constraints_are_exact() -> None:
             "ck_session_read_admissions_token_not_owner",
         },
         "run_start_permits": {
+            "ck_run_start_permits_admission_hash",
+            "ck_run_start_permits_recovery_refusal",
             "ck_run_start_permits_run_id_nonblank",
             "ck_run_start_permits_state",
             "ck_run_start_permits_state_fields",
@@ -366,6 +480,16 @@ def test_coordination_hard_cut_check_constraints_are_exact() -> None:
             "ck_websocket_tickets_digest_sha256",
             "ck_websocket_tickets_run_id_nonblank",
             "ck_websocket_tickets_user_id_nonblank",
+        },
+        "composer_inflight_requests": {
+            "ck_composer_inflight_token_nonblank",
+            "ck_composer_inflight_owner_nonblank",
+            "ck_composer_inflight_time_order",
+        },
+        "composer_progress_snapshots": {
+            "ck_composer_progress_generation_nonblank",
+            "ck_composer_progress_time_order",
+            "ck_composer_progress_bounded",
         },
         "rate_limit_buckets": {
             "ck_rate_limit_buckets_digest_sha256",
@@ -413,6 +537,55 @@ def test_session_operation_authority_shape_retains_exact_nonnull_fields() -> Non
     assert session_operation_fences_table.primary_key.columns.keys() == ["session_id"]
 
 
+def test_previous_epoch_rejection_does_not_rewrite_store() -> None:
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    previous = SESSION_SCHEMA_EPOCH - 1
+    with eng.begin() as conn:
+        conn.execute(
+            text("UPDATE elspeth_schema_identity SET schema_epoch = :previous WHERE store_kind = 'session'"), {"previous": previous}
+        )
+        conn.exec_driver_sql(f"PRAGMA user_version = {previous}")
+        before = conn.execute(text("SELECT * FROM elspeth_schema_identity")).all()
+        schema_before = conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all()
+    with pytest.raises(SessionSchemaError):
+        initialize_session_schema(eng)
+    with eng.connect() as conn:
+        assert conn.execute(text("SELECT * FROM elspeth_schema_identity")).all() == before
+        assert conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all() == schema_before
+        assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == previous
+
+
+def test_epoch_61_is_rejected_before_reading_old_advisor_gate_grammar() -> None:
+    from elspeth.web.execution.completion_gates import parse_completion_gates
+
+    # The preceding epoch allowed unversioned blocked facts without a suggestion.
+    # The current parser rejects their envelope before inspecting fact fields.
+    with pytest.raises(ValueError, match="schema_version must be 2"):
+        parse_completion_gates(
+            {
+                "completion_gates": {
+                    "advisor_signoff": {
+                        "status": "blocked",
+                        "detail": "Review pending.",
+                        "for_graph": "reviewed-graph",
+                        "note": None,
+                    }
+                }
+            }
+        )
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    with eng.begin() as conn:
+        conn.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 61 WHERE store_kind = 'session'"))
+        conn.exec_driver_sql("PRAGMA user_version = 61")
+    with pytest.raises(SessionSchemaError, match="schema version 61"):
+        initialize_session_schema(eng)
+    with eng.connect() as conn:
+        assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == 61
+        assert conn.execute(text("SELECT schema_epoch FROM elspeth_schema_identity")).scalar_one() == 61
+
+
 def test_epoch_36_database_is_rejected_by_epoch_44_runtime() -> None:
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
@@ -443,17 +616,15 @@ def test_postgres_schema_emits_native_audit_trigger_ddl() -> None:
         "trg_composer_completion_events_no_delete",
         "trg_chat_messages_immutable_content",
         "trg_chat_messages_no_delete",
-        "trg_guided_operations_terminal_immutable",
-        "trg_guided_operation_events_no_update",
-        "trg_guided_operation_events_no_delete",
-        "trg_guided_operation_admission_blocks_no_update",
-        "trg_guided_operation_admission_blocks_no_delete",
-        "trg_guided_operation_admission_blocks_reject_existing_operation",
-        "trg_guided_operations_reject_admission_block_insert",
-        "trg_guided_operations_reject_admission_block_update",
+        "trg_message_ingress_receipts_no_update",
+        "trg_message_ingress_receipts_no_delete",
+        "trg_session_operation_receipts_terminal_immutable",
+        "trg_session_operation_receipt_events_no_update",
+        "trg_session_operation_receipt_events_no_delete",
     ):
         assert f"CREATE TRIGGER {trigger_name}" in ddl
     assert not any("SELECT RAISE" in statement for statement in emitted)
+    assert "guided_operations" not in ddl
 
 
 def test_postgres_schema_uses_postgres_non_blank_check_syntax() -> None:
@@ -894,97 +1065,6 @@ def test_initialize_session_schema_rejects_epoch_35_database() -> None:
         initialize_session_schema(eng)
 
 
-def test_epoch_36_database_without_declined_result_contract_fails_at_sentinel(tmp_path) -> None:
-    """The pre-decline epoch-36 CHECKs are rejected as an older schema."""
-    db_path = tmp_path / "epoch-36-without-declined-result.db"
-    engine = create_session_engine(f"sqlite:///{db_path}")
-    initialize_session_schema(engine)
-    with engine.begin() as connection:
-        guided_operations_sql = connection.execute(
-            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
-        ).scalar_one()
-        declined_result_kind = "'composition_state', 'pipeline_proposal', 'session', 'declined'"
-        prior_result_kind = "'composition_state', 'pipeline_proposal', 'session'"
-        declined_result_locator = (
-            "(kind = 'guided_plan' AND result_kind = 'declined' "
-            "AND result_state_id IS NOT NULL AND result_message_id IS NOT NULL "
-            "AND result_session_id IS NULL AND proposal_id IS NULL) OR "
-        )
-        epoch_36_sql = guided_operations_sql.replace(declined_result_kind, prior_result_kind).replace(
-            declined_result_locator,
-            "",
-        )
-        assert epoch_36_sql != guided_operations_sql
-        assert "'declined'" not in epoch_36_sql
-        connection.execute(text("PRAGMA writable_schema = ON"))
-        connection.execute(
-            text("UPDATE sqlite_master SET sql = :sql WHERE type = 'table' AND name = 'guided_operations'"),
-            {"sql": epoch_36_sql},
-        )
-        connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 36 WHERE store_kind = 'session'"))
-        connection.execute(text("PRAGMA user_version = 36"))
-        schema_version = connection.execute(text("PRAGMA schema_version")).scalar_one()
-        connection.execute(text(f"PRAGMA schema_version = {schema_version + 1}"))
-        connection.execute(text("PRAGMA writable_schema = OFF"))
-    engine.dispose()
-
-    stale_engine = create_session_engine(f"sqlite:///{db_path}")
-    with stale_engine.connect() as connection:
-        assert connection.execute(text("PRAGMA user_version")).scalar_one() == 36
-        stored_sql = connection.execute(
-            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
-        ).scalar_one()
-        assert "'declined'" not in stored_sql
-
-    with pytest.raises(
-        SessionSchemaError,
-        match=rf"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*"
-        r"Delete the session DB file and restart",
-    ):
-        initialize_session_schema(stale_engine)
-
-
-def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with_recreate_guidance(tmp_path) -> None:
-    """The epoch-30 operation CHECKs cannot be opened by epoch-33 code."""
-    db_path = tmp_path / "epoch-30-without-guided-plan.db"
-    engine = create_session_engine(f"sqlite:///{db_path}")
-    initialize_session_schema(engine)
-    with engine.begin() as connection:
-        guided_operations_sql = connection.execute(
-            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
-        ).scalar_one()
-        assert "'guided_plan'" in guided_operations_sql
-        epoch_30_sql = guided_operations_sql.replace("'guided_plan'", "'guided_convert'")
-        assert epoch_30_sql != guided_operations_sql
-        assert "'guided_plan'" not in epoch_30_sql
-        connection.execute(text("PRAGMA writable_schema = ON"))
-        connection.execute(
-            text("UPDATE sqlite_master SET sql = :sql WHERE type = 'table' AND name = 'guided_operations'"),
-            {"sql": epoch_30_sql},
-        )
-        connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 30 WHERE store_kind = 'session'"))
-        connection.execute(text("PRAGMA user_version = 30"))
-        schema_version = connection.execute(text("PRAGMA schema_version")).scalar_one()
-        connection.execute(text(f"PRAGMA schema_version = {schema_version + 1}"))
-        connection.execute(text("PRAGMA writable_schema = OFF"))
-    engine.dispose()
-
-    stale_engine = create_session_engine(f"sqlite:///{db_path}")
-    with stale_engine.connect() as connection:
-        assert connection.execute(text("PRAGMA user_version")).scalar_one() == 30
-        stored_sql = connection.execute(
-            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
-        ).scalar_one()
-        assert "'guided_plan'" not in stored_sql
-
-    with pytest.raises(
-        SessionSchemaError,
-        match=rf"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*"
-        r"Delete the session DB file and restart",
-    ):
-        initialize_session_schema(stale_engine)
-
-
 @pytest.mark.parametrize("renamed_column", ["singleton_id", "application_id", "store_kind", "schema_epoch"])
 def test_initialize_session_schema_rejects_identity_table_with_renamed_column(renamed_column: str) -> None:
     """A divergent identity-table shape fail-closes with the actionable error.
@@ -1015,6 +1095,7 @@ def test_probe_current_schema_returns_false_for_identity_table_with_renamed_colu
 def test_current_schema_enforces_ready_blob_hash_check(engine) -> None:
     session_id = str(uuid.uuid4())
     with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
         conn.execute(
             insert(sessions_table).values(
                 id=session_id,

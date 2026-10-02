@@ -95,6 +95,29 @@ class CommittedAggregationOutputReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class RecordedAggregationFailure:
+    """A batch's recorded FAILED verdict whose members are still BLOCKED.
+
+    Written atomically by ``ExecutionRepository.complete_aggregation_failure``
+    and final: resume completes the disposition ``destination`` names for every
+    member (the named ``on_error`` sink, or ``"discard"``) with the recorded
+    reason, without re-invoking the batch plugin.
+
+    Attributes:
+        reason_json: The recorded reason — the canonical JSON every member's
+            ``transform_errors.error_details_json`` and the flush node_state's
+            ``error_json`` carry, byte for byte.
+    """
+
+    batch_id: str
+    aggregation_node_id: str
+    aggregation_state_id: str
+    member_token_ids: tuple[str, ...]
+    reason_json: str
+    destination: str
+
+
+@dataclass(frozen=True, slots=True)
 class CommittedCoalesceResidual:
     """Durable coalesce merge whose scheduler barrier has not completed."""
 
@@ -165,8 +188,9 @@ class PendingOutcome:
 
     Carries (outcome, path) pairs through the pending_tokens queue so token
     outcomes are recorded only after sink write + flush complete successfully.
-    ``scheduler_pending_sink`` is true only when a durable scheduler row has
-    already been transitioned to PENDING_SINK for this exact token.
+    Every sink-bound token has a durable PENDING_SINK scheduler handoff by the
+    time it is queued here (``accumulate_row_outcomes`` refuses one without),
+    so every written batch terminalizes its scheduler rows after durability.
     """
 
     _REQUIRES_ERROR_HASH_PATHS: ClassVar[frozenset[TerminalPath]] = frozenset(
@@ -183,13 +207,10 @@ class PendingOutcome:
     outcome: TerminalOutcome | None
     path: TerminalPath
     error_hash: str | None = None
-    scheduler_pending_sink: bool = False
     join_group_id: str | None = None
 
     def __post_init__(self) -> None:
         """Validate pair/error_hash consistency before sink side effects."""
-        if type(self.scheduler_pending_sink) is not bool:
-            raise ValueError("PendingOutcome.scheduler_pending_sink must be a bool")
         if self.outcome is not None and not isinstance(self.outcome, TerminalOutcome):
             raise ValueError("PendingOutcome.outcome must be TerminalOutcome or None")
         if not isinstance(self.path, TerminalPath):

@@ -46,7 +46,6 @@ def _empty_state() -> CompositionState:
 def _profiled_multi_query_options() -> dict[str, Any]:
     return {
         "profile": "task-role",
-        "temperature": 0.0,
         "required_input_fields": ["color_name"],
         "prompt_template": "Assess {{ row.color_name }}.",
         "queries": {
@@ -102,7 +101,7 @@ def test_upsert_node_admits_profiled_multi_query_llm(parity_env: Any) -> None:
     assert "max_capacity_retry_seconds" not in node.options
 
 
-def test_patch_node_options_admits_profiled_multi_query_llm(parity_env: Any) -> None:
+def test_patch_node_options_rejects_authored_profile_temperature(parity_env: Any) -> None:
     created = _run(parity_env, "upsert_node", _profiled_node(_profiled_multi_query_options()), _empty_state())
     assert created.success is True, created.data
 
@@ -112,9 +111,9 @@ def test_patch_node_options_admits_profiled_multi_query_llm(parity_env: Any) -> 
         {"node_id": "assess_blue", "patch": {"temperature": 0.2}},
         created.updated_state,
     )
-    assert patched.success is True, patched.data
-    node = next(n for n in patched.updated_state.nodes if n.id == "assess_blue")
-    assert node.options.get("temperature") == 0.2
+    assert patched.success is False
+    node = next(n for n in created.updated_state.nodes if n.id == "assess_blue")
+    assert "temperature" not in node.options
     assert node.options.get("profile") == "task-role"
 
 
@@ -194,7 +193,7 @@ def test_splice_transform_clears_retry_budget_gate_for_profiled_multi_query(pari
         },
     }
     result = _run(parity_env, "splice_transform", args, _splice_base_state())
-    error = "" if result.success else str(result.data.get("error", "")).lower()
+    error = "" if result.success else str(result.validation.errors[0].message).lower()
     assert _RETRY_BUDGET_MARKER not in error, result.data
 
 
@@ -246,7 +245,7 @@ def _egress_rejection_error(result: Any) -> str:
     ``profile_unavailable`` mechanism.
     """
     assert result.success is False, result.data
-    return str(result.data.get("error", "")).lower()
+    return str(result.validation.errors[0].message).lower()
 
 
 @pytest.mark.parametrize("field,value", _SMUGGLED_EGRESS_FIELDS)

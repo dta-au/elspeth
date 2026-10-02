@@ -38,10 +38,14 @@ _ADJUDICATION_CANDIDATES = {
         "R5:_reframe_settings_missing_parts",
         "R5:_infer_component_type_from_plugin_error",
     ],
+    # A missing or non-ready blob is converted to a field-scoped
+    # blob_inline_refs refusal; re-raising would bypass that user-facing
+    # validation result. R6 does not recognize the accumulated violations.
+    "_validation_materialization.py": ["R6:materialize_validation_yaml", "R6:materialize_validation_yaml"],
     # Same closed-union discrimination as review_interpretations, at the
     # compiled-id identity seam (elspeth-ba01834a57): the strict materializer
     # returns CompositionState | InterpretationReviewPending, both owned types.
-    "validation.py": ["R5:_identity_state_for_compiled_ids"],
+    "validation.py": ["R5:_identity_state_for_compiled_ids", "R5:_validate_pipeline_impl"],
 }
 
 _EXPECTED_SUPPRESSION_OBSERVATIONS = {
@@ -103,5 +107,11 @@ def test_completion_gate_parser_needs_no_shape_suppressions() -> None:
     # Persisted envelopes admit only the closed dict/MappingProxyType
     # representations produced by JSON decoding and owned record freezing.
     # The former arbitrary-Mapping R5 probes no longer need adjudication.
-    assert findings == []
+    # Only the new resolver's two nominal checks over owned decision classes
+    # remain active adjudication candidates, as required by ADR-032. Pin them
+    # explicitly so a new parser shape probe still fails this regression.
+    assert [f"{finding.rule_id}:{':'.join(finding.symbol_context)}" for finding in findings] == [
+        "R5:resolve_completion_gate_facts",
+        "R5:resolve_completion_gate_facts",
+    ]
     assert suppressed == []

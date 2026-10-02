@@ -29,22 +29,16 @@ local paths after ownership checks pass.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Final, Protocol, TypedDict, cast
 
 import yaml
 
-from elspeth.contracts.errors import AuditIntegrityError, PipelineLoweringError
+from elspeth.contracts.enums import OutputMode
+from elspeth.contracts.errors import PipelineLoweringError
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.web.composer.guided.state_machine import TerminalKind
-from elspeth.web.composer.guided_blob_refs import (
-    GuidedReviewedBlobBinding,
-    validate_guided_reviewed_blob_binding,
-    validate_guided_reviewed_blob_source_mapping,
-    validate_guided_reviewed_sentinel_source_mapping,
-)
 from elspeth.web.composer.state import COMPOSER_NODE_TYPES, CompositionState, queue_node_contract_error
 from elspeth.web.interpretation_state import AUTHORING_METADATA_OPTION_KEYS
 from elspeth.web.paths import (
@@ -127,7 +121,7 @@ def _strip_web_metadata(options: dict[str, Any], *, omit_source_paths: bool = Fa
 def _strip_profile_lowering_provenance(plugin: str, options: dict[str, Any]) -> dict[str, Any]:
     """Drop server-authored prompt provenance from profile-selecting llm nodes.
 
-    ``resolved_prompt_template_hash`` is in ``LLM_PROFILE_PRIVATE_FIELDS``, so
+    ``approved_prompt_artifact_hash`` is in ``LLM_PROFILE_PRIVATE_FIELDS``, so
     the batch/CLI loader's profile-lowering pass rejects any llm component
     that both selects a ``profile`` and carries the hash
     (``ValueError('private_profile_option')``) — exported YAML could never be
@@ -140,8 +134,8 @@ def _strip_profile_lowering_provenance(plugin: str, options: dict[str, Any]) -> 
     prompt provenance lives in the audit trail, not in plugin options
     (operator decision, 2026-08-09).
     """
-    if plugin == "llm" and "profile" in options and "resolved_prompt_template_hash" in options:
-        del options["resolved_prompt_template_hash"]
+    if plugin == "llm" and "profile" in options and "approved_prompt_artifact_hash" in options:
+        del options["approved_prompt_artifact_hash"]
     return options
 
 
@@ -272,6 +266,12 @@ def _lower_row_union_nodes(doc: LoweredPipelineDocument, *, state: CompositionSt
 
 def _lower_aggregation_nodes(doc: LoweredPipelineDocument, *, state: CompositionState, state_dict: PublicCompositionDict) -> None:
     # Aggregations
+    for node in state.nodes:
+        if node.node_type == "aggregation" and (node.output_mode is None or node.output_mode in OutputMode):
+            mode = OutputMode.TRANSFORM if node.output_mode is None else OutputMode(node.output_mode)
+            count_error = mode.expected_output_count_error(node.expected_output_count)
+            if count_error is not None:
+                raise PipelineLoweringError(f"Aggregation '{node.id}': {count_error}")
     aggregations = [n for n in state_dict["nodes"] if n["node_type"] == "aggregation"]
     if aggregations:
         doc["aggregations"] = []
@@ -476,170 +476,6 @@ def generate_pipeline_dict(state: CompositionState) -> LoweredPipelineDocument:
     return _generate_pipeline_dict(state, omit_source_paths=False)
 
 
-def reattach_guided_blob_refs_for_public_export(state: CompositionState) -> CompositionState:
-    """Reconstitute guided blob refs before public YAML generation.
-
-    Guided mode can commit sources with only their storage ``path`` while each
-    authoritative ``blob_ref`` survives in schema-8 ``reviewed_sources``.
-    Public YAML stripping keys off ``blob_ref``, so reattach each binding to a
-    working copy. Private reviewed paths must exactly match the live source;
-    public ``blob:<uuid>`` sentinels must match the retained ref and source name,
-    after which the HTTP export boundary verifies live blob custody and the exact
-    private storage path before returning the sidecar.
-
-    An ``exited_to_freeform`` terminal retains guided history for audit and
-    possible re-entry, but it is no longer current source authority. Completed
-    guided sessions remain authoritative until an explicit exit records that
-    lifecycle boundary.
-
-    Direction note (elspeth-3b45cdb41e): this identity return is correct for
-    EXPORT consumers only — exported YAML must not shadow a replaced freeform
-    source with stale guided history. The run-admission proof needs the
-    opposite failure direction; it must use
-    :func:`derive_guided_blob_refs_for_admission_proof`, never this function.
-    """
-    guided = state.guided_session
-    if guided is None or not guided.reviewed_sources:
-        return state
-    if guided.terminal is not None and guided.terminal.kind is TerminalKind.EXITED_TO_FREEFORM:
-        return state
-    return _reattach_guided_reviewed_blob_bindings(state)
-
-
-@dataclass(frozen=True, slots=True)
-class AdmissionProofDerivation:
-    """Admission-direction proof-state derivation outcome.
-
-    ``custody_unavailable=True`` means retained guided review custody exists
-    but could not be bound to the live sources; the admission consumer must
-    record a FAILED (blocking) proof check — never a pass without a proof run.
-    ``proof_state`` is then the untouched input state, provided only so the
-    caller has a coherent state object; it carries no derived custody.
-    """
-
-    proof_state: CompositionState
-    custody_unavailable: bool
-
-
-def derive_guided_blob_refs_for_admission_proof(state: CompositionState) -> AdmissionProofDerivation:
-    """Derive the source-proof state for run admission, failing closed.
-
-    Export and admission consume the same reviewed-source history with
-    OPPOSITE safety directions (epic elspeth-c1b8b26d32).
-    :func:`reattach_guided_blob_refs_for_public_export` keeps its
-    ``EXITED_TO_FREEFORM`` identity return — exited history is no longer
-    authoring authority and must not shadow a replaced freeform source in an
-    export. The admission proof must NOT inherit that skip: for admission the
-    retained review history is still proof custody, and skipping it recorded a
-    fabricated passing ``proof_diagnostics`` check for exactly the pipeline
-    guided confirmation had just blocked (elspeth-3b45cdb41e).
-
-    Non-exited states derive byte-identically to the export path, including
-    letting :class:`AuditIntegrityError` propagate. Exited states run the same
-    strict binding; when the diverged freeform state can no longer bind the
-    retained custody (renamed/removed sources, re-pointed carriers, or a
-    conflicting live ``blob_ref``), the derivation reports
-    ``custody_unavailable=True`` so admission blocks instead of admitting an
-    unproven source.
-
-    Never mutates ``state``; the derived custody exists only for the proof
-    computation and is not persisted.
-    """
-    guided = state.guided_session
-    if guided is None or not guided.reviewed_sources:
-        return AdmissionProofDerivation(proof_state=state, custody_unavailable=False)
-    if guided.terminal is not None and guided.terminal.kind is TerminalKind.EXITED_TO_FREEFORM:
-        try:
-            derived = _reattach_guided_reviewed_blob_bindings(state)
-        except AuditIntegrityError:
-            return AdmissionProofDerivation(proof_state=state, custody_unavailable=True)
-        return AdmissionProofDerivation(proof_state=derived, custody_unavailable=False)
-    return AdmissionProofDerivation(
-        proof_state=_reattach_guided_reviewed_blob_bindings(state),
-        custody_unavailable=False,
-    )
-
-
-def _reattach_guided_reviewed_blob_bindings(state: CompositionState) -> CompositionState:
-    """Bind retained reviewed-source custody onto a working copy of ``state``.
-
-    Shared binding body for both directions above; callers own the terminal
-    gating. Raises :class:`AuditIntegrityError` when the retained history and
-    the live sources disagree.
-    """
-    guided = state.guided_session
-    assert guided is not None  # callers gate on a populated guided session
-
-    reviewed_bindings: list[tuple[str, frozenset[str], str]] = []
-    sentinel_bindings: list[tuple[str, GuidedReviewedBlobBinding]] = []
-    reviewed_names: set[str] = set()
-    for snapshot in guided.reviewed_sources.values():
-        source_name = snapshot.name
-        if source_name in reviewed_names:
-            raise AuditIntegrityError("guided reviewed source names must be unique")
-        reviewed_names.add(source_name)
-        binding = validate_guided_reviewed_blob_binding(snapshot.options)
-        if binding is None:
-            continue
-        if binding.is_sentinel:
-            sentinel_bindings.append((source_name, binding))
-            continue
-        reviewed_bindings.append((source_name, binding.paths, binding.blob_ref))
-
-    if not reviewed_bindings and not sentinel_bindings:
-        return state
-    validate_guided_reviewed_blob_source_mapping(
-        [(name, paths) for name, paths, _blob_ref in reviewed_bindings],
-        {name: source.options for name, source in state.sources.items()},
-    )
-    all_reviewed_paths = frozenset(path for _name, paths, _blob_ref in reviewed_bindings for path in paths)
-    reattached = dict(state.sources)
-    changed = False
-    for source_name, source in state.sources.items():
-        live_reviewed_paths = {
-            value
-            for key in SOURCE_LOCAL_PATH_OPTION_KEYS
-            if key in source.options and type(value := source.options[key]) is str and value in all_reviewed_paths
-        }
-        if not live_reviewed_paths:
-            continue
-        candidates = [
-            (paths, blob_ref)
-            for reviewed_name, paths, blob_ref in reviewed_bindings
-            if reviewed_name == source_name and live_reviewed_paths <= paths
-        ]
-        if len(candidates) != 1:
-            raise AuditIntegrityError("guided blob source mapping is inconsistent")
-        _reviewed_paths, blob_ref = candidates[0]
-        options = source.options
-        if "blob_ref" in options:
-            if options["blob_ref"] != blob_ref:
-                raise AuditIntegrityError("guided blob source mapping is inconsistent")
-            continue
-        merged = dict(options)
-        merged["blob_ref"] = blob_ref
-        reattached[source_name] = replace(source, options=merged)
-        changed = True
-
-    live_source_options = {name: source.options for name, source in state.sources.items()}
-    for source_name, binding in sentinel_bindings:
-        validate_guided_reviewed_sentinel_source_mapping(
-            binding,
-            source_name=source_name,
-            live_source_options=live_source_options,
-        )
-        sentinel_source = state.sources[source_name]
-        options = sentinel_source.options
-        if "blob_ref" in options:
-            continue
-        merged = dict(options)
-        merged["blob_ref"] = binding.blob_ref
-        reattached[source_name] = replace(sentinel_source, options=merged)
-        changed = True
-
-    return replace(state, sources=reattached) if changed else state
-
-
 @observation_boundary(
     tier=3,
     source="an arbitrary-depth value nested inside a source/node/output options block — planner/LLM-authored "
@@ -695,8 +531,7 @@ def generate_public_composition_dict(state: CompositionState) -> PublicCompositi
     blob identifiers, bind-source markers, and recursively nested authoring
     metadata are excluded.
     """
-    export_state = reattach_guided_blob_refs_for_public_export(state)
-    projected = cast(PublicCompositionDict, export_state.to_dict())
+    projected = cast(PublicCompositionDict, state.to_dict())
 
     for source in projected["sources"].values():
         source["options"] = _recursive_public_option_projection(
@@ -777,24 +612,32 @@ def public_export_redaction(state: CompositionState) -> PublicExportRedaction:
 
     Derived from the same key-set authorities the projection itself uses
     (``_PUBLIC_STORAGE_OPTION_KEYS`` and the blob-linkage keys), over the same
-    blob-ref-reattached export state, so the account cannot drift from the
+    export state, so the account cannot drift from the
     scrub (elspeth-06f92da0d9). Top-level option keys only: that is where the
     schema-defined source/sink storage carriers live; recursive scrubs of
     nested custody subtrees stay undocumented here because they carry no
     re-bindable user data.
     """
-    export_state = reattach_guided_blob_refs_for_public_export(state)
     sources: dict[str, list[str]] = {}
-    for source_name, source in export_state.sources.items():
+    for source_name, source in state.sources.items():
         stripped = sorted(key for key in source.options if key in _PUBLIC_STORAGE_OPTION_KEYS or key in _PUBLIC_SOURCE_LINKAGE_KEYS)
         if stripped:
             sources[source_name] = stripped
     outputs: dict[str, list[str]] = {}
-    for output in export_state.outputs:
+    for output in state.outputs:
         stripped = sorted(key for key in output.options if key in _PUBLIC_STORAGE_OPTION_KEYS or key == "blob_id")
         if stripped:
             outputs[output.name] = stripped
     return {"sources": sources, "outputs": outputs}
+
+
+def sources_reading_uploaded_blobs(state: CompositionState) -> tuple[str, ...]:
+    """Name sources with live upload bindings in the same state used for export."""
+    return tuple(
+        source_name
+        for source_name, source in state.sources.items()
+        if any(key in source.options and source.options[key] is not None for key in _PUBLIC_SOURCE_LINKAGE_KEYS)
+    )
 
 
 # The marker prose uses category labels, not raw option-key names: the
@@ -867,3 +710,8 @@ def generate_public_yaml(state: CompositionState) -> str:
     """
     doc = generate_public_pipeline_dict(state)
     return yaml.dump(doc, default_flow_style=False, sort_keys=False)
+
+
+def public_projection_digest(state: CompositionState) -> str:
+    """Return the content address of the exact UTF-8 public YAML projection."""
+    return hashlib.sha256(generate_public_yaml(state).encode("utf-8")).hexdigest()

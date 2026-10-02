@@ -10,7 +10,7 @@ Key Properties:
 - Stability: repeated coercion produces identical results
 - Type preservation: coerced values maintain their Python type
 
-Per CLAUDE.md Three-Tier Trust Model:
+Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model:
 - Sources (Tier 3 -> Tier 2): May coerce "42" -> 42
 - Transforms/Sinks: Expect already-coerced data (no re-coercion needed)
 """

@@ -13,7 +13,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -67,6 +67,16 @@
         "kind": "number-int",
         "label": "Max Lines",
         "name": "max_lines",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 67108864,
+        "description": "Maximum estimated size of all rows emitted for one input row (serialized bytes plus copied-container memory)",
+        "kind": "number-int",
+        "label": "Max Output Bytes",
+        "name": "max_output_bytes",
         "nullable": false,
         "required": false,
         "tier": "common"

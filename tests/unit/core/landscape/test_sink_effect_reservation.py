@@ -51,21 +51,20 @@ def _pipeline_members(factory: RecorderFactory, count: int = 3) -> tuple[str, st
     candidates: list[SinkEffectMemberCandidate] = []
     for ordinal in range(count):
         payload = {"ordinal": ordinal}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id=source_id,
             row_index=ordinal,
             data=payload,
             source_row_index=ordinal,
             ingest_sequence=ordinal,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
-        token = factory.data_flow.create_token(row.row_id)
         factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink_id,
-            run_id=run.run_id,
             step_index=0,
             input_data=payload,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
         )
         candidates.append(SinkEffectMemberCandidate(token_id=token.token_id, row=payload))
     return run.run_id, sink_id, resolve_sink_effect_members(factory, candidates)
@@ -307,7 +306,7 @@ def _insert_snapshot(db: LandscapeDB, run_id: str) -> str:
                 exported_at=completed,
                 registry_key_hash="5" * 64,
                 exporter_version="v2",
-                serialization_version="audit-export-v2",
+                serialization_version="audit-export-v3",
                 export_format="json",
                 signing_mode="unsigned",
                 signer_key_id="UNSIGNED",

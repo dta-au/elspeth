@@ -11,7 +11,6 @@ import type {
   RunAccounting,
   ValidationResult,
 } from "@/types";
-import type { GetGuidedResponse } from "@/types/guided";
 import type {
   InterpretationEvent,
   ListInterpretationEventsResponse,
@@ -37,7 +36,6 @@ export const DESKTOP_VIEWPORTS = [
 export const WORKSPACE_SCENARIOS = [
   "empty-freeform",
   "populated-long-transcript",
-  "active-guided-decision",
   "validation-audit-issues",
   "pending-acknowledgement",
   "active-completed-run",
@@ -98,12 +96,24 @@ const FIXED_TIME = "2026-08-11T08:00:00.000Z";
 // count are recorded in the commit that set it). Exported so the visual
 // spec's graph node count derives from it.
 export const TALL_DIALOG_NODE_COUNT = 88;
+// Every composer llm node carries BOTH prompt roles (Stage-1
+// llm_system_prompt_missing, 2026-09-21); a seed without a system prompt is no
+// longer a validated pipeline.
+const TALL_DIALOG_SYSTEM_PROMPT =
+  "You review product categories. Reply with one concise classification and nothing else.";
 const TALL_DIALOG_PROMPT_TEMPLATE =
   "Review category {{ row.category }} and return a concise classification.";
-// elspeth.core.canonical.stable_hash(TALL_DIALOG_PROMPT_TEMPLATE), 2026-09-05,
-// release/0.8.0 @ b00674f5d. Re-derive if the prompt text above changes.
+// With a system prompt present the reviewed surface is the labelled pair, and
+// so is the anchor: interpretation_state.prompt_review_draft_from_options and
+// prompt_review_anchor_hash_from_options (domain
+// elspeth.single-prompt-review.v1), both computed in the worktree venv for the
+// exact two strings above, 2026-09-21. Control for that derivation: with no
+// system prompt it reproduced the previous pin, stable_hash(template) =
+// be07c8ba…d2b6. Re-derive BOTH if either prompt changes.
+const TALL_DIALOG_PROMPT_REVIEW_DRAFT =
+  `System prompt:\n${TALL_DIALOG_SYSTEM_PROMPT}\n\nPrompt template:\n${TALL_DIALOG_PROMPT_TEMPLATE}`;
 const TALL_DIALOG_PROMPT_TEMPLATE_HASH =
-  "be07c8ba62144f98ae93e15a63d3e745393e8a388053db74e4bd3491267ad2b6";
+  "87501a0726a4fb95c5b20f5157a4884bf76ae62539753535dda5aa2faf5082f8";
 
 function deferredSignal(): DeferredSignal {
   let release: (() => void) | undefined;
@@ -170,6 +180,7 @@ async function seedCanonicalComposition(
         // playwright.config.ts. Authoring provider/model alongside a profile
         // is correctly rejected by live preflight.
         profile: "e2e-bedrock",
+        system_prompt: TALL_DIALOG_SYSTEM_PROMPT,
         prompt_template: TALL_DIALOG_PROMPT_TEMPLATE,
         required_input_fields: ["category"],
         // One output field per stage: graph_structure rejects a transform
@@ -183,18 +194,17 @@ async function seedCanonicalComposition(
         // review debt the backend cannot surface. The fixture's intent is a
         // validated pipeline, so the review is RESOLVED against the prompt's
         // own hash rather than left pending (which would gate Run behind
-        // TALL_DIALOG_NODE_COUNT interpretation cards). The hash is stable_hash(prompt_template) —
-        // interpretation_state._validate_prompt_template_review — computed
-        // in the worktree venv for the exact prompt above; change both or
-        // neither.
+        // TALL_DIALOG_NODE_COUNT interpretation cards). The draft and the
+        // anchor hash cover the system/user PAIR — see the constants above;
+        // change all three or none.
         interpretation_requirements: [
           {
             id: `prompt-template-review-${String(index + 1).padStart(3, "0")}`,
             kind: "llm_prompt_template",
             user_term: `llm_prompt_template:${id}`,
             status: "resolved",
-            draft: TALL_DIALOG_PROMPT_TEMPLATE,
-            accepted_value: TALL_DIALOG_PROMPT_TEMPLATE,
+            draft: TALL_DIALOG_PROMPT_REVIEW_DRAFT,
+            accepted_value: TALL_DIALOG_PROMPT_REVIEW_DRAFT,
             accepted_artifact_hash: null,
             resolved_prompt_template_hash: TALL_DIALOG_PROMPT_TEMPLATE_HASH,
             event_id: null,
@@ -278,51 +288,6 @@ function longTranscript(sessionId: string): ChatMessage[] {
   });
 }
 
-function guidedFixture(
-  sessionId: string,
-  compositionState: CompositionState,
-): GetGuidedResponse {
-  return {
-    guided_session: {
-      step: "step_1_source",
-      history: [],
-      terminal: null,
-      chat_history: [
-        {
-          role: "assistant",
-          content: "Choose the authoritative input for this pipeline.",
-          seq: 0,
-          step: "step_1_source",
-          ts_iso: FIXED_TIME,
-          assistant_message_kind: "assistant",
-          synthetic_failure_reason: null,
-          turn_token: null,
-        },
-      ],
-      chat_turn_seq: 1,
-      // Server-projected reviewed ledger (elspeth-f2a8550b3d): required on
-      // the wire. Empty at step 1 before the first review turn.
-      reviewed_components: { sources: [], outputs: [] },
-      profile: { coaching: true, bookends: true },
-    },
-    next_turn: {
-      type: "single_select",
-      step_index: 0,
-      turn_token: "a".repeat(64),
-      payload: {
-        question: "Which source should the pipeline use?",
-        options: [
-          { id: "csv", label: "CSV", hint: "Use the uploaded CSV fixture." },
-          { id: "inline_blob", label: "Inline rows", hint: null },
-        ],
-        allow_custom: false,
-      },
-    },
-    terminal: null,
-    composition_state: { ...compositionState, session_id: sessionId },
-  };
-}
-
 function validationIssues(): ValidationResult {
   const errors = Array.from({ length: 24 }, (_, index) => ({
     component_id: "source",
@@ -346,6 +311,8 @@ function validationIssues(): ValidationResult {
         component_id: "source",
         component_type: "source",
         detail: `Deterministic validation issue ${index + 1}`,
+        suggestion: null,
+        note: null,
       })),
     },
   };
@@ -426,7 +393,7 @@ function pendingInterpretation(
     hash_domain_version: null,
     runtime_model_identifier_at_resolve: null,
     runtime_model_version_at_resolve: null,
-    resolved_prompt_template_hash: null,
+    approved_prompt_artifact_hash: null,
   };
 }
 
@@ -436,6 +403,7 @@ function runFixtures(sessionId: string): Run[] {
     sources: { source: { rows_processed: 2, rows_rejected: 0, rows_read: 2 } },
     tokens: { emitted: 2, terminal: 2, succeeded: 2, failed: 0, structural: 0, pending: 0, abandoned: 0 },
     routing: { routed_success: 2, routed_failure: 0, quarantined: 0, discarded: 0 },
+    collector_groups_failed: 0,
     integrity: { closure: "closed", missing_terminal_outcomes: 0, duplicate_terminal_outcomes: 0 },
   } satisfies RunAccounting;
   return [
@@ -457,14 +425,6 @@ async function fulfillWorkspaceRoute(
 
   if (pathname === `/api/sessions/${sessionId}/messages` && method === "GET") {
     await route.fulfill({ json: scenario === "populated-long-transcript" ? longTranscript(sessionId) : [] });
-    return true;
-  }
-  if (pathname === `/api/sessions/${sessionId}/guided` && method === "GET") {
-    await route.fulfill({
-      json: scenario === "active-guided-decision" && compositionState !== null
-        ? guidedFixture(sessionId, compositionState)
-        : { guided_session: null, next_turn: null, terminal: null, composition_state: null },
-    });
     return true;
   }
   if (pathname === `/api/sessions/${sessionId}/interpretations` && method === "GET") {
@@ -531,6 +491,7 @@ async function fulfillWorkspaceRoute(
         json: {
           composer_available: installed.noticeMode === "recoverable-backend",
           composer_model: "deterministic-e2e-model",
+          composer_advisor_model: "deterministic-e2e-advisor",
           composer_provider: "playwright-route",
           composer_reason:
             installed.noticeMode === "long-content"

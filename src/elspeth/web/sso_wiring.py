@@ -35,7 +35,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
 
 import httpx
 from sqlalchemy import Engine
@@ -63,8 +62,11 @@ from elspeth.web.auth.sso import (
 from elspeth.web.config import WebSettings, configured_auth_settings
 from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
+    AdminBootstrapMode,
     IdentityActivated,
     IdentityAlreadyDisabled,
+    IdentityDormancyExempted,
+    IdentityDormant,
     IdentityRebound,
     RepositoryIdentityAuthority,
     RoleForbiddenForIdentity,
@@ -114,7 +116,7 @@ def build_sso_wiring(
     *,
     session_engine: Engine,
     identity_authority: RepositoryIdentityAuthority,
-    resolved_state_mode: Literal["sqlite-single", "external-postgresql"],
+    audit_recorder: AuthAuditRecorder,
 ) -> SsoWiring | None:
     """Assemble the network-free half, or ``None`` when the deployment is not wired.
 
@@ -132,13 +134,10 @@ def build_sso_wiring(
     assert settings.sso_transaction_secret is not None
     assert settings.public_base_url is not None
     issuer_url = profile.resolve_issuer(settings)
-    audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
     provider = settings.auth_provider
 
     def _principal_is_active(identity_id: str) -> bool:
-        record = identity_authority.read_identity(identity_id=identity_id)
-        # An absent row is never an implicit grant.
-        return record is not None and record.is_active
+        return identity_authority.is_active_human_identity(identity_id=identity_id, provider=provider)
 
     def _record_admission(identity_id: str, username: str, quota_written: bool) -> None:
         # Runs INSIDE ensure_identity's transaction: a failed audit rolls
@@ -167,6 +166,26 @@ def build_sso_wiring(
             current_email=event.current_email,
         )
 
+    def _record_dormant(event: IdentityDormant | IdentityDormancyExempted) -> None:
+        # Runs INSIDE ensure_identity's transaction, like _record_rebound: a
+        # re-pend this trail cannot hold does not commit. No request -- the
+        # refused login writes its own auth_failure row with the request
+        # context and the sso_access_pending category (the row is pending
+        # now, so `admit` is what refuses it), and the two join on
+        # identity_id.
+        record = (
+            audit_recorder.record_identity_dormancy_exempted
+            if isinstance(event, IdentityDormancyExempted)
+            else audit_recorder.record_identity_dormant
+        )
+        record(
+            provider=provider,
+            identity_id=event.record.identity_id,
+            username=event.record.username,
+            last_login_at=event.last_login_at,
+            dormancy_days=event.dormancy_days,
+        )
+
     def _record_bootstrap(event: IdentityActivated) -> None:
         # Runs INSIDE bootstrap_admin's transaction, like _record_admission:
         # a seed the trail cannot hold does not commit. No request: the seed
@@ -181,6 +200,10 @@ def build_sso_wiring(
             note=event.note,
             role=None if event.role is None else event.role.role,
             role_id=None if event.role is None else event.role.role_id,
+            # Normally empty here -- the seed usually creates the row it
+            # seeds -- but it binds an existing one too, and R9 is what put a
+            # live ``admin`` grant on a ``pending`` row this can bind.
+            retained_roles=tuple((grant.role, grant.scope) for grant in event.retained_roles),
             tokens_per_day=settings.quota_default_tokens_per_day if event.quota_written else None,
             storage_bytes=settings.quota_default_storage_bytes if event.quota_written else None,
             on_behalf_of=event.on_behalf_of,
@@ -189,11 +212,11 @@ def build_sso_wiring(
 
     def _upsert_identity(claims: IdentityClaims) -> AdmittedIdentity:
         # D20 bootstrap seed: a listed subject activates itself as the first
-        # admin ONLY while the container has zero active human admins. The
-        # count here is a pre-check that keeps the common path (every later
-        # login) off the population lock; bootstrap_admin re-counts under
-        # the lock and is the authority on the race.
-        if claims.subject in settings.sso_admin_subjects and identity_authority.count_active_human_admins() == 0:
+        # admin ONLY before any human deployment admin grant has existed.
+        # Retained grant history keeps the seed consumed after lockout. This
+        # advisory precheck avoids the population lock on later logins; the
+        # authority repeats it inside the locked transaction.
+        if claims.subject in settings.sso_admin_subjects and not identity_authority.configured_admin_seed_consumed():
             try:
                 return identity_authority.bootstrap_admin(
                     claims=claims,
@@ -201,6 +224,7 @@ def build_sso_wiring(
                     quota_tokens_per_day=settings.quota_default_tokens_per_day,
                     quota_storage_bytes=settings.quota_default_storage_bytes,
                     record=_record_bootstrap,
+                    mode=AdminBootstrapMode.CONFIGURED_SEED,
                 ).record
             except (AdminAlreadyBootstrapped, IdentityAlreadyDisabled, RoleForbiddenForIdentity):
                 # Lost the race to another replica, or the listed subject's
@@ -219,8 +243,10 @@ def build_sso_wiring(
             activate=False,
             quota_tokens_per_day=settings.quota_default_tokens_per_day,
             quota_storage_bytes=settings.quota_default_storage_bytes,
+            identity_dormancy_days=settings.identity_dormancy_days,
             record_admission=_record_admission,
             record_rebound=_record_rebound,
+            record_dormant=_record_dormant,
         )
         if outcome.rebound_refused:
             # R3, and the ONLY place this refusal can be raised: the authority
@@ -300,6 +326,7 @@ async def resolve_sso_runtime(
         settings.jwks_failure_retry_seconds,
         settings.jwks_max_stale_seconds,
         algorithms=wiring.profile.id_token_algorithms,
+        token_issuer_aliases=wiring.profile.token_issuer_aliases,
         jwks_uri=endpoints.jwks_uri,
         transport=transport,
     )

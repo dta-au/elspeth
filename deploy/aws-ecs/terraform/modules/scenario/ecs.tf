@@ -116,7 +116,13 @@ locals {
       { name = "ELSPETH_LLM_GATEWAY_ADAPTER", value = var.gateway_adapter },
       { name = "ELSPETH_LLM_GATEWAY_UPSTREAM_ORIGIN", value = var.gateway_upstream_origin },
       { name = "ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_URL", value = var.gateway_oauth_token_url },
+      { name = "ELSPETH_LLM_GATEWAY_OAUTH_AUTH_METHOD", value = var.gateway_oauth_auth_method },
       { name = "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS", value = var.gateway_model_mappings_json },
+      { name = "ELSPETH_LLM_GATEWAY_MAX_MESSAGES", value = tostring(var.gateway_max_messages) },
+      { name = "ELSPETH_LLM_GATEWAY_MAX_TOOLS", value = tostring(var.gateway_max_tools) },
+      { name = "ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS", value = tostring(var.gateway_max_string_chars) },
+      { name = "ELSPETH_LLM_GATEWAY_MAX_SCHEMA_BYTES", value = tostring(var.gateway_max_schema_bytes) },
+      { name = "ELSPETH_LLM_GATEWAY_MAX_SCHEMA_DEPTH", value = tostring(var.gateway_max_schema_depth) },
     ]
     secrets = [
       { name = "ELSPETH_LLM_GATEWAY_INBOUND_BEARER", valueFrom = var.gateway_bearer_secret_arn },

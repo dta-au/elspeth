@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import Engine, delete, event, func, insert, select, update
+from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.blobs import blob_record_snapshot_hash
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
@@ -56,8 +57,10 @@ def postgres_engine(external_deployment_postgres_url: str) -> Engine:
         engine.dispose()
 
 
-def _create(repository: PostgresSessionOperationRepository, *, title: str):
+def _create(repository: PostgresSessionOperationRepository, engine: Engine, *, title: str):
     owner = f"postgres-owner-{uuid4()}"
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return repository.create_session_with_initial_fence(
         user_id="alice",
         title=title,
@@ -148,7 +151,7 @@ def _acquire(repository: PostgresSessionOperationRepository, *, session_id: UUID
 
 def test_postgres_blob_effect_receipt_commits_atomically_with_replacement_metadata(postgres_engine: Engine) -> None:
     repository = PostgresSessionOperationRepository(postgres_engine)
-    session = _create(repository, title="atomic proposal blob receipt")
+    session = _create(repository, postgres_engine, title="atomic proposal blob receipt")
     run_id, blob_id = _seed_run_and_blob(postgres_engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
     proposal_id = uuid4()
     creation_event_id = uuid4()
@@ -275,8 +278,8 @@ def test_postgres_blob_effect_receipt_commits_atomically_with_replacement_metada
 
 def test_postgres_rejects_foreign_parents_and_rolls_back_mixed_inline_batch(postgres_engine: Engine) -> None:
     repository = PostgresSessionOperationRepository(postgres_engine)
-    owned = _create(repository, title="owned")
-    foreign = _create(repository, title="foreign")
+    owned = _create(repository, postgres_engine, title="owned")
+    foreign = _create(repository, postgres_engine, title="foreign")
     owned_run, owned_blob = _seed_run_and_blob(postgres_engine, session_id=owned.id, content_hash="a" * 64, size_bytes=3)
     foreign_run, foreign_blob = _seed_run_and_blob(
         postgres_engine,
@@ -359,7 +362,7 @@ def test_postgres_rejects_foreign_parents_and_rolls_back_mixed_inline_batch(post
 
 def test_postgres_stale_event_writer_consumes_no_sequence(postgres_engine: Engine) -> None:
     repository = PostgresSessionOperationRepository(postgres_engine)
-    session = _create(repository, title="stale writer")
+    session = _create(repository, postgres_engine, title="stale writer")
     run_id, _blob_id = _seed_run_and_blob(postgres_engine, session_id=session.id, content_hash="c" * 64, size_bytes=7)
     stale = _acquire(repository, session_id=session.id)
     first = repository.mutate(
@@ -399,7 +402,7 @@ def test_postgres_stale_event_writer_consumes_no_sequence(postgres_engine: Engin
 
 def test_postgres_plugin_crash_breadcrumb_rejects_stale_predecessor(postgres_engine: Engine) -> None:
     repository = PostgresSessionOperationRepository(postgres_engine)
-    session = _create(repository, title="plugin crash breadcrumb")
+    session = _create(repository, postgres_engine, title="plugin crash breadcrumb")
     predecessor = repository.acquire(
         session_id=session.id,
         operation_kind=SessionOperationKind.COMPOSE,
@@ -449,7 +452,7 @@ def test_postgres_audit_access_and_archive_delete_serialize_in_both_orders(
     archive_engine = create_session_engine(external_deployment_postgres_url)
     audit_authority = RepositoryAuditAccessLogAuthority(audit_engine)
     archive_repository = PostgresSessionOperationRepository(archive_engine)
-    session = _create(archive_repository, title=f"audit archive race {first_actor}")
+    session = _create(archive_repository, archive_engine, title=f"audit archive race {first_actor}")
     archive_context = archive_repository.acquire(
         session_id=session.id,
         operation_kind=SessionOperationKind.ARCHIVE,
@@ -538,7 +541,7 @@ def test_postgres_audit_access_and_archive_delete_serialize_in_both_orders(
 
 def test_postgres_concurrent_event_writers_allocate_monotonic_sequences(postgres_engine: Engine) -> None:
     repository = PostgresSessionOperationRepository(postgres_engine)
-    session = _create(repository, title="concurrent writers")
+    session = _create(repository, postgres_engine, title="concurrent writers")
     run_id, _blob_id = _seed_run_and_blob(postgres_engine, session_id=session.id, content_hash="d" * 64, size_bytes=11)
     fence = _acquire(repository, session_id=session.id)
 
@@ -568,7 +571,7 @@ def test_postgres_replacement_and_deletion_race_admits_exactly_one_recoverable_l
     tmp_path: Path,
 ) -> None:
     seed_repository = PostgresSessionOperationRepository(postgres_engine)
-    session = _create(seed_repository, title="replacement deletion race")
+    session = _create(seed_repository, postgres_engine, title="replacement deletion race")
     old_content = b"old durable bytes"
     storage = tmp_path / "race.txt"
     storage.write_bytes(old_content)
@@ -675,8 +678,8 @@ def test_postgres_replacement_and_deletion_race_admits_exactly_one_recoverable_l
 
 def test_postgres_output_read_checks_blob_custody(postgres_engine: Engine) -> None:
     repository = PostgresSessionOperationRepository(postgres_engine)
-    owned = _create(repository, title="owned output")
-    foreign = _create(repository, title="foreign output")
+    owned = _create(repository, postgres_engine, title="owned output")
+    foreign = _create(repository, postgres_engine, title="foreign output")
     owned_run, owned_blob = _seed_run_and_blob(postgres_engine, session_id=owned.id, content_hash="e" * 64, size_bytes=13)
     _foreign_run, foreign_blob = _seed_run_and_blob(
         postgres_engine,

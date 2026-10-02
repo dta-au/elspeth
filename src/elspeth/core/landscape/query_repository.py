@@ -27,6 +27,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
@@ -190,7 +191,7 @@ class QueryRepository:
             raise AuditIntegrityError(f"Payload retrieval failed for row {row_id}: reason=payload_store_os_error") from e
 
         try:
-            decoded_data = json.loads(payload_bytes.decode("utf-8"))
+            decoded_data = canonical_json_loads(payload_bytes.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             raise AuditIntegrityError(f"Corrupt payload for row {row_id} (ref={source_data_ref}): {e}") from e
 
@@ -575,7 +576,8 @@ class QueryRepository:
         Returns:
             List of NodeState models, ordered by token_id then step_index then attempt
         """
-        # node_states has run_id denormalized (per CLAUDE.md composite FK pattern)
+        # node_states has run_id denormalized (see the engine-patterns-reference
+        # skill §Composite Primary Key Pattern: nodes Table)
         query = (
             select(node_states_table)
             .where(node_states_table.c.run_id == run_id)

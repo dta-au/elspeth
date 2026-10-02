@@ -25,7 +25,7 @@ from elspeth.core.landscape.schema import node_states_table
 from elspeth.engine.executors import SinkExecutor
 from elspeth.testing import make_field, make_row
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
 
 
 class _SpanContext:
@@ -93,15 +93,14 @@ class TestTokenResumeOffsetReachesSinkNodeState:
         )
 
         # Create a row and token in the DB (satisfies FK constraints)
-        row = factory.data_flow.create_row(
-            run_id,
-            setup.source_node_id,
+        row, token_db = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run_id),
+            source_node_id=setup.source_node_id,
             row_index=0,
             data={"value": "hello"},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token_db = factory.data_flow.create_token(row.row_id)
 
         # resume_checkpoint_id is a marker-only id (no FK to checkpoints), so no checkpoint
         # row needs to exist — the provenance string is written/read on node_states alone.
@@ -124,9 +123,12 @@ class TestTokenResumeOffsetReachesSinkNodeState:
             factory.data_flow,
             _SpanFactoryDouble(),
             run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
-        ctx = make_context(landscape=factory.plugin_audit_writer(), run_id=run_id)
+        ctx = make_context(
+            coordination_token=leader_coordination_token(factory, run_id), landscape=factory.plugin_audit_writer(), run_id=run_id
+        )
 
         # ── Drive the token through the effect-only sink pre-phase ──
         executor._open_primary_states(
@@ -178,15 +180,14 @@ class TestTokenResumeOffsetReachesSinkNodeState:
             plugin_name="test_sink",
         )
 
-        row = factory.data_flow.create_row(
-            run_id,
-            setup.source_node_id,
+        row, token_db = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run_id),
+            source_node_id=setup.source_node_id,
             row_index=0,
             data={"value": "world"},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token_db = factory.data_flow.create_token(row.row_id)
 
         contract = _make_permissive_contract()
         row_data = make_row({"value": "world"}, contract=contract)
@@ -202,9 +203,12 @@ class TestTokenResumeOffsetReachesSinkNodeState:
             factory.data_flow,
             _SpanFactoryDouble(),
             run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
-        ctx = make_context(landscape=factory.plugin_audit_writer(), run_id=run_id)
+        ctx = make_context(
+            coordination_token=leader_coordination_token(factory, run_id), landscape=factory.plugin_audit_writer(), run_id=run_id
+        )
 
         executor._open_primary_states(
             tokens=[token],

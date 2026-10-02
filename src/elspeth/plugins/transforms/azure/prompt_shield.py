@@ -17,6 +17,7 @@ from typing import Any, TypedDict
 from pydantic import Field
 
 from elspeth.contracts import Determinism
+from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import (
     CapabilityDeclaration,
@@ -114,7 +115,7 @@ class AzurePromptShield(BaseAzureSafetyTransform):
     )
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9516e48630df9db5"
+    source_file_hash: str | None = "sha256:c49c3e68304b81b6"
     config_model = AzurePromptShieldConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("azure", "prompt-shield", "security")
@@ -150,6 +151,7 @@ class AzurePromptShield(BaseAzureSafetyTransform):
                     "Choose analysis_type deliberately: both requests two analyses and may incur both analysis costs, but sends one audited HTTP call.",
                     "Use user_prompt for direct user text; use document for retrieved context or untrusted documents.",
                     "Set fields to the string fields to inspect, or 'all' only when every string field should be scanned.",
+                    "A field-scoped shield proves coverage only for declared model inputs; required_input_fields omitted or [] is unprovable unless a dominating all-fields shield scans every field.",
                     "Detected attacks return errors; route on_error to quarantine or security review.",
                     "Malformed Azure responses fail closed instead of passing suspicious content through.",
                 ),
@@ -226,9 +228,10 @@ class AzurePromptShield(BaseAzureSafetyTransform):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> TransformResult | None:
         """Analyze field via Prompt Shield API for attack detection."""
-        analysis = self._analyze_prompt(value, state_id, token_id=token_id)
+        analysis = self._analyze_prompt(value, state_id, token_id=token_id, ctx=ctx)
 
         if analysis["user_prompt_attack"] or analysis["document_attack"]:
             return TransformResult.error(
@@ -247,6 +250,7 @@ class AzurePromptShield(BaseAzureSafetyTransform):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> dict[str, bool]:
         """Call Azure Prompt Shield API.
 
@@ -258,7 +262,7 @@ class AzurePromptShield(BaseAzureSafetyTransform):
         Respects self._analysis_type to avoid double API cost when only one
         analysis path is needed.
         """
-        http_client = self._get_http_client(state_id, token_id=token_id)
+        http_client = self._get_http_client(state_id, token_id=token_id, ctx=ctx)
 
         url = f"{self._endpoint}/contentsafety/text:shieldPrompt?api-version={self.API_VERSION}"
 

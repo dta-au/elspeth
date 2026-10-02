@@ -16,8 +16,10 @@ from elspeth.contracts import BatchStatus, NodeType
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape import LandscapeDB
-from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from tests.fixtures.landscape import leader_coordination_token
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -44,9 +46,9 @@ def _transition_batch_worker(
     try:
         target_status = BatchStatus(target_status_value)
         if target_status is BatchStatus.EXECUTING:
-            factory.execution.update_batch_status(batch_id, target_status)
+            factory.execution.update_batch_status(batch_id, target_status, coordination_token=leader_coordination_token(factory, "run-1"))
         else:
-            factory.execution.complete_batch(batch_id, target_status)
+            factory.execution.complete_batch(batch_id, target_status, coordination_token=leader_coordination_token(factory, "run-1"))
         results.put(("transition", "committed"))
     except BaseException as exc:  # pragma: no cover - asserted in parent
         results.put(("transition", f"{type(exc).__name__}: {exc}"))
@@ -73,7 +75,10 @@ def _add_member_worker(
 
     event.listen(db.engine, "before_cursor_execute", observe_attempt)
     try:
-        factory.execution.add_batch_member(batch_id, token_id, ordinal=0)
+        with fenced_leader_transaction(
+            db.engine, token=leader_coordination_token(factory, "run-1"), window_seconds=300, verb="batch_membership_contention"
+        ) as conn:
+            add_batch_member_guarded(conn, batch_id=batch_id, token_id=token_id, ordinal=0, expected_run_id="run-1")
     except AuditIntegrityError as exc:
         results.put(("member", f"refused: {exc}"))
     except BaseException as exc:  # pragma: no cover - asserted in parent
@@ -91,7 +96,7 @@ def _seed_file_database(db_path: Path) -> tuple[str, str, str]:
     factory = RecorderFactory(db)
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
     source = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -100,7 +105,7 @@ def _seed_file_database(db_path: Path) -> tuple[str, str, str]:
         schema_config=_DYNAMIC_SCHEMA,
     )
     aggregation = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
         plugin_name="aggregation",
         node_type=NodeType.AGGREGATION,
         plugin_version="1.0",
@@ -108,17 +113,19 @@ def _seed_file_database(db_path: Path) -> tuple[str, str, str]:
         node_id="agg-1",
         schema_config=_DYNAMIC_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run.run_id,
+    _row, token = factory.data_flow.create_row_with_token(
         source.node_id,
         0,
         {"value": 1},
         row_id="row-1",
+        token_id="token-1",
+        coordination_token=leader_coordination_token(factory, run.run_id),
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row.row_id, token_id="token-1")
-    batch = factory.execution.create_batch(run.run_id, aggregation.node_id, batch_id="batch-1")
+    batch = factory.execution.create_batch(
+        aggregation.node_id, batch_id="batch-1", coordination_token=leader_coordination_token(factory, run.run_id)
+    )
     db.close()
     return db_url, batch.batch_id, token.token_id
 
@@ -204,8 +211,8 @@ def test_public_read_connection_cannot_bypass_write_transaction_policy_during_cl
     """A caller-owned public read connection cannot become a deferred writer.
 
     The peer closes the batch immediately before the guarded insert.  The
-    caller then attempts to pass ``LandscapeDB.connection()`` into the write
-    repository directly, reproducing the former escape hatch.  The read-only
+    caller then passes ``LandscapeDB.connection()`` into the guarded membership
+    primitive directly, reproducing the former escape hatch.  The read-only
     connection must reject the write at the database boundary and leave no
     membership row; callers that need to compose writes must explicitly use
     ``write_connection()`` and its eager SQLite write intent.
@@ -226,7 +233,7 @@ def test_public_read_connection_cannot_bypass_write_transaction_policy_during_cl
             transition_done.set()
             return
         try:
-            peer.execution.update_batch_status(batch_id, BatchStatus.EXECUTING)
+            peer.execution.update_batch_status(batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(peer, "run-1"))
         except BaseException as exc:  # pragma: no cover - asserted below
             peer_errors.append(exc)
         finally:
@@ -258,19 +265,18 @@ def test_public_read_connection_cannot_bypass_write_transaction_policy_during_cl
         with (
             caller_db.connection() as conn,
             pytest.raises(
-                LandscapeRecordError,
-                match=r"database rejected audit write: OperationalError",
+                OperationalError,
+                match=r"attempt to write a readonly database",
             ) as exc_info,
         ):
-            caller.execution.add_batch_member(batch_id, token_id, ordinal=0, conn=conn)
+            add_batch_member_guarded(conn, batch_id=batch_id, token_id=token_id, ordinal=0, expected_run_id="run-1")
     finally:
         start_transition.set()
         worker.join(timeout=10)
         event.remove(caller_db.engine, "before_cursor_execute", before_caller_statement)
         event.remove(caller_db.engine, "after_cursor_execute", after_caller_statement)
 
-    assert isinstance(exc_info.value.__cause__, OperationalError)
-    assert "attempt to write a readonly database" in str(exc_info.value.__cause__)
+    assert "attempt to write a readonly database" in str(exc_info.value)
     assert not worker.is_alive()
     assert peer_errors == []
     assert coordinated.is_set(), "test did not exercise the synchronized closure window"

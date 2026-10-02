@@ -10,12 +10,14 @@ from pathlib import Path
 from elspeth_lints.core.protocols import Finding, RuleContext, RuleMetadata, RuleScope
 from elspeth_lints.rules.composer.catch_order.metadata import LEGACY_RULE_ID, RULE_ID, RULE_METADATA, SUGGESTION
 
-# The composer crash subclasses all descend from ComposerServiceError, which
-# descends from Exception/BaseException — so a bare ``except Exception:`` (or
-# ``BaseException``) before the narrow handler shadows it just as the named
+# The composer exception subclasses all descend from ComposerServiceError,
+# which descends from Exception/BaseException — so a bare ``except Exception:``
+# (or ``BaseException``) before the narrow handler shadows it just as the named
 # supertype does (elspeth-eb90341cdb).
 _BROAD_SUPERTYPES: frozenset[str] = frozenset({"Exception", "BaseException"})
 _SUBCLASS_TO_SUPERCLASSES: dict[str, frozenset[str]] = {
+    "ComposerAdmissionRefused": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
+    "CredentialMaterialRefused": frozenset({"ComposerAdmissionRefused", "ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerPluginCrashError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerConvergenceError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerRuntimePreflightError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,

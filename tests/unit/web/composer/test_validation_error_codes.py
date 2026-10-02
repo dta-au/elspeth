@@ -1,8 +1,7 @@
 # tests/unit/web/composer/test_validation_error_codes.py
 """Every candidate-path rejection carries a closed error_code + structural facts.
 
-Guided A/B session 5113b7ac (attempts 6/10/12, 2026-07-22) died
-REPAIR_EXHAUSTED with ``rejection_codes=[]``: the planner's redacted repair
+Planner repair can exhaust with ``rejection_codes=[]``: the redacted repair
 feedback (``_allowlisted_candidate_feedback``) strips raw validation messages
 and keys its enrichment on the closed ``error_code`` — so a ``ValidationEntry``
 emitted without one forwards NOTHING actionable. A rejection with no code and
@@ -32,6 +31,10 @@ from typing import Any
 import pytest
 
 from elspeth.web.composer.state import (
+    _LLM_SYSTEM_PROMPT_MISSING_EXPLANATION,
+    _LLM_SYSTEM_PROMPT_MISSING_FIX,
+    _LLM_USER_PROMPT_MISSING_EXPLANATION,
+    _LLM_USER_PROMPT_MISSING_FIX,
     _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION,
     _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
     _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
@@ -586,16 +589,40 @@ class TestClosedCodeCatalogueInvariants:
         # this error by withdrawing the contract for every OTHER field too.
         assert "withdraws the contract for every field" in fix
 
-        # Rewrite-the-reference must LEAD. ``verify_declared_required_fields``
-        # is a plain set difference over row keys with no dual-name limb, so
-        # declaring a read name the producer does not guarantee is accepted at
-        # config time and then raises on every row — leading with it would hand
-        # the planner a repair that clears this error and breaks the run
-        # (elspeth-a9ba80cb0b). This is the claim the catalogue must carry, not
-        # a property of whatever string happened to be written first.
+        # Rewrite-the-reference must LEAD. Declaring a read name the producer
+        # does not guarantee is refused when the pipeline is validated
+        # (schema_contract_violation, or the field-name spelling rule for a
+        # header spelling) — leading with it would hand the planner a repair
+        # that trades this error for another (elspeth-a9ba80cb0b). This is the
+        # claim the catalogue must carry, not a property of whatever string
+        # happened to be written first.
         assert fix.index("Rewrite each reference") < fix.index("Add a name to options.required_input_fields")
         assert "ONLY if the upstream producer guarantees that exact name" in fix
-        assert "fails every row at run time" in fix
+        assert "refused when the pipeline is validated" in fix
+
+    def test_prompt_role_codes_resolve_to_planner_authoring_guidance(self) -> None:
+        """Both prompt-role codes are closed, distinct, and never offer a server default.
+
+        The repair is planner work or a question to the user (composer
+        invariant 1): the catalogue must not hand the planner a stock system
+        prompt to paste, and must not suggest satisfying the check by moving
+        the user's own prompt text across roles (session 60ab6a67).
+        """
+        for code in ("llm_system_prompt_missing", "llm_user_prompt_missing"):
+            assert code in _CLOSED_VALIDATION_ERROR_CODES
+            assert explain_validation_code(code) is not None, code
+
+        system = explain_validation_code("llm_system_prompt_missing")
+        user = explain_validation_code("llm_user_prompt_missing")
+        assert system is not None and user is not None
+        assert system != user
+
+        _explanation, fix = system
+        assert "options.system_prompt" in fix
+        assert "verbatim" in fix
+        assert "ask the user" in fix
+        assert "never move the user's prompt text into system_prompt" in fix
+        assert "Never send an empty or placeholder" in fix
 
     def test_transform_contract_advice_has_exactly_one_owner(self) -> None:
         """The catalogue must SERVE ``state``'s advice, never restate it.
@@ -625,6 +652,14 @@ class TestClosedCodeCatalogueInvariants:
             (
                 "prompt_template_undeclared_row_fields",
                 (_PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION, _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX),
+            ),
+            (
+                "llm_system_prompt_missing",
+                (_LLM_SYSTEM_PROMPT_MISSING_EXPLANATION, _LLM_SYSTEM_PROMPT_MISSING_FIX),
+            ),
+            (
+                "llm_user_prompt_missing",
+                (_LLM_USER_PROMPT_MISSING_EXPLANATION, _LLM_USER_PROMPT_MISSING_FIX),
             ),
         ):
             guidance = explain_validation_code(code)
@@ -734,12 +769,17 @@ class TestClosedCodeCatalogueInvariants:
 
         # Representative fragment of the real builder message
         # (core/dag/builder.py rule-9 resolution pass).
-        by_runtime_text = explain_validation_code(
+        from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog, execute_tool
+
+        runtime_text = (
             "Transform 'cleanup' on_error 'merge_paths' names closer 'merge_paths' but 'cleanup' "
             "is not inside that closer's bound region. A closer is a legal on_error target only "
             "from inside its own region (spec §7 rule 9)."
         )
-        assert by_runtime_text == by_code
+        assert explain_validation_code(runtime_text) is None
+        result = execute_tool("explain_validation_error", {"error_text": runtime_text}, _empty_state(), _mock_catalog())
+        assert result.data is not None
+        assert (result.data["explanation"], result.data["suggested_fix"]) == by_code
 
     def test_query_template_unbound_row_fields_resolves_to_multi_query_guidance(self) -> None:
         """The multi-query row-binding code must not fall through to the
@@ -761,65 +801,8 @@ class TestClosedCodeCatalogueInvariants:
         assert single_prompt is not None
         assert guidance != single_prompt
 
-    @pytest.mark.parametrize(
-        "code",
-        ("guided_amend_contract_violation", "guided_revision_unchanged"),
-    )
-    def test_guided_prose_amend_codes_are_closed_and_actionable(self, code: str) -> None:
-        assert code in _CLOSED_VALIDATION_ERROR_CODES
-        guidance = explain_validation_code(code)
-        assert guidance is not None
-        explanation, fix = guidance
-        assert explanation and fix
-        assert "correction_target" not in explanation
-        assert "correction_target" not in fix
-        assert "private" not in explanation.lower()
-        assert "private" not in fix.lower()
-
-    @pytest.mark.parametrize(
-        "code",
-        (
-            "guided_delta_unknown_stable_id",
-            "guided_delta_duplicate_stable_id",
-            "guided_delta_authority_violation",
-            "guided_delta_nonincident_route",
-            "guided_delta_unknown_reference",
-            "guided_delta_reviewed_failure_route_required",
-            # guided_collector_not_authorable was RETIRED with the WS6 guided
-            # collector-guard lift (ruling 7878, elspeth-88bb77953c): the
-            # guided lane now authors and projects collectors, so the binder
-            # refusal and its code no longer exist.
-            "guided_collector_opener_unresolved",
-        ),
-    )
-    def test_guided_delta_codes_are_closed_and_actionable(self, code: str) -> None:
-        assert code in _CLOSED_VALIDATION_ERROR_CODES
-        guidance = explain_validation_code(code)
-        assert guidance is not None
-        explanation, fix = guidance
-        assert explanation and fix
-        assert "tutorial" not in explanation.lower()
-        assert "tutorial" not in fix.lower()
-        assert "private" not in explanation.lower()
-        assert "private" not in fix.lower()
-
-    def test_reviewed_output_projection_conflict_is_closed_and_actionable(self) -> None:
-        code = "reviewed_output_projection_conflict"
-        assert code in _CLOSED_VALIDATION_ERROR_CODES
-
-        guidance = explain_validation_code(code)
-        assert guidance is not None
-        explanation, fix = guidance
-        assert "select-only field_mapper" in explanation
-        assert "VALUES" in explanation
-        assert "missing_fields" in explanation
-        assert "options.mapping value" in fix
-        assert "reviewed output form" in fix
-        assert "tutorial" not in (explanation + fix).lower()
-        assert "private" not in (explanation + fix).lower()
-
     def test_review_reconciliation_failed_is_closed_and_actionable(self) -> None:
-        """The reconciliation rejection must be explainable on BOTH surfaces.
+        """The reconciliation rejection must be explainable by both lookup paths.
 
         Session f33fa7c3 (2026-09-01): ``set_pipeline`` rejected with
         ``review_reconciliation_failed``, the planner called
@@ -828,7 +811,7 @@ class TestClosedCodeCatalogueInvariants:
         catalogue — so the tool fell through to its no-match branch and
         answered "does not match any known validation message or closed
         error_code". The planner had nothing new and resubmitted an identical
-        payload. Both lookup paths are pinned here: the freeform tool matches
+        payload. Both lookup paths are pinned here: the tool matches
         the MESSAGE, and the one-shot planner feedback
         (``_allowlisted_candidate_feedback``) strips the message and can only
         resolve the bare CODE.
@@ -1170,12 +1153,10 @@ def _make_coalesce(id: str, branches: Any) -> NodeSpec:
 def _orphaned_coalesce_state(branches: Any) -> CompositionState:
     """Fork/coalesce pipeline whose branch transforms bypass the coalesce.
 
-    Reconstruction of guided session 277fb6c4 (attempts 3/6/9/10, 2026-07-22):
-    the per-branch transforms publish straight to the sink — legal in
+    The per-branch transforms publish straight to the sink — legal in
     isolation, so no companion code fires — leaving the coalesce's branches
     values naming connections nothing produces. The ONLY rejection is
-    ``coalesce_branch_unreachable``, exactly matching the observed
-    single-code per-attempt trail.
+    ``coalesce_branch_unreachable``.
     """
     state = _empty_state()
     state = state.with_source(_make_source(on_success="rows"))
@@ -1191,8 +1172,7 @@ def _orphaned_coalesce_state(branches: Any) -> CompositionState:
 class TestCoalesceReachabilityFacts:
     """The coalesce reachability rejection carries instance wiring facts.
 
-    Guided session 277fb6c4 died REPAIR_EXHAUSTED on four identical
-    ``coalesce_branch_unreachable`` rejections: the static guidance directs
+    Repeated ``coalesce_branch_unreachable`` rejections are possible: the static guidance directs
     the repair at the coalesce node, but the observed miswiring lives in the
     branch transforms' ``on_success`` — a repair the planner cannot find
     from a bare code. These facts name each unreachable branches value and
@@ -1216,9 +1196,7 @@ class TestCoalesceReachabilityFacts:
                 # One record per broken branch, each carrying its own lure:
                 # the repair reads "this branch is broken AND this node broke
                 # it" as one fact, with no join back by connection name
-                # (guided attempt 14, session 04200b45 — the model wired
-                # branch transforms to the reviewed sink 3x with the bare
-                # facts live).
+                # so the planner can identify the source of the broken branch.
                 "unreachable_branches": [
                     {
                         "branch": "branch_a",

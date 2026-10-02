@@ -14,9 +14,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from elspeth.contracts.chargeable_admission import AdmissionRefusalReason
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.plugin_semantics import SemanticEdgeContract
 from elspeth.web.composer.state import ValidationEntry
+from elspeth.web.coordination.approval_authority import ApprovalBinding
 from elspeth.web.interpretation_state import InterpretationReviewSite
 
 if TYPE_CHECKING:
@@ -96,6 +98,20 @@ class ExecutionReadinessError(Exception):
         blockers = tuple(blockers)
         self.blockers = blockers
         super().__init__("Pipeline is not ready for execution.")
+
+
+class ExecutionApprovalRequired(Exception):
+    """The exact compiled state has no currently valid approval."""
+
+    def __init__(self, *, reason: AdmissionRefusalReason, binding: ApprovalBinding) -> None:
+        if reason not in {
+            AdmissionRefusalReason.APPROVAL_REQUIRED,
+            AdmissionRefusalReason.APPROVAL_BINDING_MISMATCH,
+        }:
+            raise ValueError("ExecutionApprovalRequired requires an approval refusal reason")
+        self.reason = reason
+        self.binding = binding
+        super().__init__(reason.value)
 
 
 class CompletionGateIntegrityError(Exception):

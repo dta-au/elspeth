@@ -86,6 +86,15 @@ class AdvisorCheckpointPassData(TypedDict):
     verdict: AdvisorCheckpointTelemetryVerdict
     source: AdvisorCheckpointVerdictSource
     findings_hash: str
+    provider_attempts: int
+    first_attempt_schema_valid: bool | None
+    first_attempt_accepted: bool | None
+    format_reprompt_sent: bool
+    step_ids_offered: int | None
+    step_ids_kept: int | None
+    note_present: bool | None
+    url_redactions: int | None
+    email_redactions: int | None
 
 
 class AdvisorTerminalPublicationData(TypedDict):
@@ -128,18 +137,80 @@ class AdvisorCheckpointPassRecord:
     verdict: AdvisorCheckpointTelemetryVerdict
     source: AdvisorCheckpointVerdictSource
     findings_hash: str
+    provider_attempts: int
+    first_attempt_schema_valid: bool | None
+    first_attempt_accepted: bool | None
+    format_reprompt_sent: bool
+    step_ids_offered: int | None
+    step_ids_kept: int | None
+    note_present: bool | None
+    url_redactions: int | None
+    email_redactions: int | None
 
     def __post_init__(self) -> None:
-        if self.phase not in _CHECKPOINT_PHASES:
-            raise AuditIntegrityError("AdvisorCheckpointPassRecord.phase is outside the closed vocabulary")
+        vocabulary_fields: tuple[tuple[str, object, frozenset[str]], ...] = (
+            ("phase", self.phase, _CHECKPOINT_PHASES),
+            ("verdict", self.verdict, _CHECKPOINT_VERDICTS),
+            ("source", self.source, _CHECKPOINT_SOURCES),
+        )
+        for name, value, vocabulary in vocabulary_fields:
+            if type(value) is not str or value not in vocabulary:
+                raise AuditIntegrityError(f"AdvisorCheckpointPassRecord.{name} is outside the closed vocabulary")
         if type(self.pass_index) is not int or self.pass_index < 0:
             raise AuditIntegrityError("AdvisorCheckpointPassRecord.pass_index must be a non-negative exact int")
-        if self.verdict not in _CHECKPOINT_VERDICTS:
-            raise AuditIntegrityError("AdvisorCheckpointPassRecord.verdict is outside the closed vocabulary")
-        if self.source not in _CHECKPOINT_SOURCES:
-            raise AuditIntegrityError("AdvisorCheckpointPassRecord.source is outside the closed vocabulary")
         if type(self.findings_hash) is not str or not self.findings_hash:
             raise AuditIntegrityError("AdvisorCheckpointPassRecord.findings_hash must be a non-empty exact string")
+        if type(self.provider_attempts) is not int or not 0 <= self.provider_attempts <= 2:
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord.provider_attempts must be an exact int from zero to two")
+        for name, value in (
+            ("first_attempt_schema_valid", self.first_attempt_schema_valid),
+            ("first_attempt_accepted", self.first_attempt_accepted),
+            ("note_present", self.note_present),
+        ):
+            if value is not None and type(value) is not bool:
+                raise AuditIntegrityError(f"AdvisorCheckpointPassRecord.{name} must be an exact bool or None")
+        if type(self.format_reprompt_sent) is not bool:
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord.format_reprompt_sent must be an exact bool")
+        if (self.first_attempt_schema_valid is None) != (self.first_attempt_accepted is None):
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord first-attempt applicability must agree")
+        if self.first_attempt_accepted is True and self.first_attempt_schema_valid is not True:
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord acceptance requires schema validity")
+        if self.source == "prescan":
+            if self.provider_attempts != 0 or self.verdict != "flagged" or self.first_attempt_schema_valid is not None:
+                raise AuditIntegrityError("AdvisorCheckpointPassRecord prescan must be flagged without provider attempts or conformance")
+        elif self.provider_attempts == 0 and (
+            self.verdict not in {"unavailable", "malformed"} or self.first_attempt_schema_valid is not None
+        ):
+            # Admission can fail before the SDK call starts. That completed
+            # failure has no provider response to describe, unlike an
+            # accepted model verdict, which always requires dispatch.
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord undispatched model pass must fail without response conformance")
+        if self.format_reprompt_sent != (self.provider_attempts == 2 and self.first_attempt_accepted is False):
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord format reprompt requires a started retry after rejected text")
+
+        accepted_response = self.source == "model" and self.verdict in {"clean", "flagged"}
+        if self.first_attempt_accepted is True and (self.provider_attempts != 1 or not accepted_response):
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord accepted first attempt must finish the pass")
+        if accepted_response and self.provider_attempts == 1 and self.first_attempt_accepted is not True:
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord single-attempt verdict requires first-attempt acceptance")
+        for name, value in (
+            ("step_ids_offered", self.step_ids_offered),
+            ("step_ids_kept", self.step_ids_kept),
+            ("url_redactions", self.url_redactions),
+            ("email_redactions", self.email_redactions),
+        ):
+            if value is not None and (type(value) is not int or value < 0):
+                raise AuditIntegrityError(f"AdvisorCheckpointPassRecord.{name} must be a non-negative exact int or None")
+            if (value is not None) != accepted_response:
+                raise AuditIntegrityError(f"AdvisorCheckpointPassRecord.{name} applies exactly to accepted model responses")
+        if (self.note_present is not None) != accepted_response:
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord.note_present applies exactly to accepted model responses")
+        if self.step_ids_kept is not None and self.step_ids_offered is not None and self.step_ids_kept > self.step_ids_offered:
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord cannot keep more step ids than offered")
+        if self.note_present is False and (self.url_redactions != 0 or self.email_redactions != 0):
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord cannot redact an absent note")
+        if self.verdict == "clean" and (self.step_ids_offered != 0 or self.step_ids_kept != 0 or self.note_present is not False):
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord CLEAN must have no offered steps or note")
 
     @classmethod
     def from_findings(
@@ -150,6 +221,15 @@ class AdvisorCheckpointPassRecord:
         verdict: AdvisorCheckpointTelemetryVerdict,
         source: AdvisorCheckpointVerdictSource,
         findings_text: str,
+        provider_attempts: int,
+        first_attempt_schema_valid: bool | None,
+        first_attempt_accepted: bool | None,
+        format_reprompt_sent: bool,
+        step_ids_offered: int | None,
+        step_ids_kept: int | None,
+        note_present: bool | None,
+        url_redactions: int | None,
+        email_redactions: int | None,
     ) -> AdvisorCheckpointPassRecord:
         # ``stable_hash`` is ELSPETH-owned: a canonicalization refusal is a
         # programmer error about our own payload and propagates from here,
@@ -160,6 +240,15 @@ class AdvisorCheckpointPassRecord:
             verdict=verdict,
             source=source,
             findings_hash=stable_hash({"advisor_findings": findings_text}),
+            provider_attempts=provider_attempts,
+            first_attempt_schema_valid=first_attempt_schema_valid,
+            first_attempt_accepted=first_attempt_accepted,
+            format_reprompt_sent=format_reprompt_sent,
+            step_ids_offered=step_ids_offered,
+            step_ids_kept=step_ids_kept,
+            note_present=note_present,
+            url_redactions=url_redactions,
+            email_redactions=email_redactions,
         )
 
     def to_dict(self) -> AdvisorCheckpointPassData:
@@ -169,6 +258,15 @@ class AdvisorCheckpointPassRecord:
             "verdict": self.verdict,
             "source": self.source,
             "findings_hash": self.findings_hash,
+            "provider_attempts": self.provider_attempts,
+            "first_attempt_schema_valid": self.first_attempt_schema_valid,
+            "first_attempt_accepted": self.first_attempt_accepted,
+            "format_reprompt_sent": self.format_reprompt_sent,
+            "step_ids_offered": self.step_ids_offered,
+            "step_ids_kept": self.step_ids_kept,
+            "note_present": self.note_present,
+            "url_redactions": self.url_redactions,
+            "email_redactions": self.email_redactions,
         }
 
 
@@ -281,6 +379,15 @@ async def persist_advisor_checkpoint_pass(
         verdict=record.verdict,
         source=record.source,
         findings_hash=record.findings_hash,
+        provider_attempts=record.provider_attempts,
+        first_attempt_schema_valid=record.first_attempt_schema_valid,
+        first_attempt_accepted=record.first_attempt_accepted,
+        format_reprompt_sent=record.format_reprompt_sent,
+        step_ids_offered=record.step_ids_offered,
+        step_ids_kept=record.step_ids_kept,
+        note_present=record.note_present,
+        url_redactions=record.url_redactions,
+        email_redactions=record.email_redactions,
     )
 
 

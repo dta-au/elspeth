@@ -1,4 +1,4 @@
-import { describe, expect, it, afterEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
 
 import {
@@ -15,6 +15,9 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
 
 describe("compose timeout ceiling", () => {
+  beforeEach(() => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+  });
   afterEach(() => {
     // The ceiling is module-level state; the readiness gate lives in the
     // store. Restore both so tests stay independent.

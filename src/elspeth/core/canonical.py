@@ -302,26 +302,68 @@ def _edge_to_canonical_dict(
 @trust_boundary(
     tier=3,
     source=(
+        "a value from external row data whose Python type is not yet known — a source row at the source-boundary "
+        "schema, or a quarantined row being made hashable"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns True only for a number canonical_json refuses by value and False for every other value, "
+        "including every non-number; never raises on malformed input"
+    ),
+    non_raising=True,
+)
+def is_non_canonical_number(value: object) -> bool:
+    """Return whether ``value`` is a number canonical JSON refuses by its VALUE.
+
+    The one authority for the canonical-number rule at the Tier-3 boundaries
+    (the source schema's admission check and the quarantine sanitizer): a
+    number is non-canonical exactly when this module's canonicalizer refuses
+    it with ``ValueError`` — an integer outside the JSON safe range
+    ±(2**53-1) (``rfc8785.IntegerDomainError``), a NaN or infinite float or
+    Decimal, or a NumPy floating value beyond the IEEE 754 double range. The
+    canonicalizer decides; this function only asks it.
+
+    ``bool`` is not a number here (it serializes as ``true``/``false``), and
+    non-numeric values are never "non-canonical numbers": a value canonical
+    JSON cannot represent because of its TYPE is a different defect (the
+    producer emitted a type it must not) and is not this function's concern.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float | Decimal | np.integer | np.floating):
+        return False
+    try:
+        canonical_json(value)
+    except ValueError:
+        return True
+    return False
+
+
+@trust_boundary(
+    tier=3,
+    source=(
         "external row data on the quarantine path — already-malformed values being normalized so they "
         "can pass through canonical_json/stable_hash for the quarantine record"
     ),
     source_param="obj",
     suppresses=("R5",),
     invariant=(
-        "replaces non-finite floats with None inside recognized dict/ndarray/list/tuple shapes and "
-        "returns every other value unchanged; never raises on malformed input"
+        "replaces numbers canonical JSON refuses by value (NaN, Infinity, integers outside the JSON safe "
+        "range) with None inside recognized dict/ndarray/list/tuple shapes and returns every other value "
+        "unchanged; never raises on malformed input"
     ),
     non_raising=True,
 )
 def sanitize_for_canonical(obj: Any) -> Any:
-    """Recursively replace non-finite floats (NaN, Infinity) with None.
+    """Recursively replace non-canonical numbers (``is_non_canonical_number``) with None.
 
     Used at Tier-3 trust boundaries (quarantine path) to normalize external
-    data so it can safely pass through canonical_json and stable_hash.
-    Per CLAUDE.md: sources MAY coerce to normalize external data at ingestion.
+    data so it can safely pass through canonical_json and stable_hash: NaN,
+    Infinity, and integers outside the JSON safe range ±(2**53-1).
+    Per docs/guides/data-trust-and-error-handling.md §Coercion Rules by Plugin
+    Type, sources MAY coerce to normalize external data at ingestion.
 
     The quarantine error message records what was originally wrong with the data,
-    so replacing NaN/Infinity with None preserves auditability.
+    so replacing such a number with None preserves auditability.
     """
     if isinstance(obj, dict):
         return {k: sanitize_for_canonical(v) for k, v in obj.items()}
@@ -329,11 +371,6 @@ def sanitize_for_canonical(obj: Any) -> Any:
         return sanitize_for_canonical(obj.tolist())
     if isinstance(obj, (list, tuple)):
         return [sanitize_for_canonical(v) for v in obj]
-    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
-        return None
-    # numpy floating scalars (longdouble, float16, float32, float64, etc.)
-    # Use np.isfinite() — math.isfinite(float(obj)) overflows for np.longdouble
-    # values outside IEEE 754 double range, falsely treating finite values as inf.
-    if isinstance(obj, np.floating) and not np.isfinite(obj):
+    if is_non_canonical_number(obj):
         return None
     return obj

@@ -9,9 +9,9 @@ DAG builder change.
 **Date:** 2026-08-23.
 
 **Adjudicator:** Panel synthesis (`.superpowers/sdd/2026-08-21-unified-lineage-ws2-config-validation/panel/synthesis.md`),
-maintainer-ratified. RC-3 (`docs/plans/2026-08-21-unified-lineage-protocols.md:805-814`) names the
-replacement topology; the panel resolved a transcription-drift ambiguity between two candidate readings
-in favour of RC-3's own text.
+maintainer-ratified. RC-3 (2026-08-21 unified-lineage protocols plan, lines 805-814 — retired from the
+active docs, retrievable from git history) names the replacement topology; the panel resolved a
+transcription-drift ambiguity between two candidate readings in favour of RC-3's own text.
 
 **Replacement scenario:** Same scenario id (`parallel-coalesces`), same case ids
 (`two-parallel-require-all`, `resume-after-left-finalize`) — only the fixture topology changed, in

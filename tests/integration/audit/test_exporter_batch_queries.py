@@ -15,9 +15,12 @@ a real node_state, and record counts match direct DB queries.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from elspeth.contracts import (
     BatchStatus,
@@ -26,19 +29,22 @@ from elspeth.contracts import (
     NodeStateStatus,
     NodeType,
     RunStatus,
+    TerminalOutcome,
+    TerminalPath,
     TriggerType,
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
-from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec
 from elspeth.core.config import GateSettings
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.exporter import LandscapeExporter
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token, make_factory, register_test_node
 from tests.fixtures.pipeline import build_fork_pipeline, build_linear_pipeline
 from tests.fixtures.plugins import CollectSink, PassTransform
 
@@ -93,6 +99,8 @@ def _run_fork_on_db(
     db: LandscapeDB,
     payload_root: Path,
     source_data: list[dict[str, Any]],
+    *,
+    before_complete: Callable[[str], None] | None = None,
 ) -> str:
     """Run a fork pipeline against an existing LandscapeDB and return run_id."""
     payload_store = FilesystemPayloadStore(payload_root)
@@ -122,7 +130,24 @@ def _run_fork_on_db(
         sink_effect_modes=dict.fromkeys(all_sinks, "write"),
     )
 
-    result = Orchestrator(db).run(config, graph=graph, payload_store=payload_store)
+    orchestrator = Orchestrator(db)
+    with pytest.MonkeyPatch.context() as patch:
+        if before_complete is not None:
+            initialize = orchestrator._initialize_database_phase
+
+            def initialize_with_seed(*args, **kwargs):
+                factory, run, authority = initialize(*args, **kwargs)
+                complete = factory.run_lifecycle.complete_run
+
+                def complete_with_seed(*complete_args, **complete_kwargs):
+                    before_complete(run.run_id)
+                    return complete(*complete_args, **complete_kwargs)
+
+                patch.setattr(factory.run_lifecycle, "complete_run", complete_with_seed)
+                return factory, run, authority
+
+            patch.setattr(orchestrator, "_initialize_database_phase", initialize_with_seed)
+        result = orchestrator.run(config, graph=graph, payload_store=payload_store)
     # elspeth-5069612f3c: gate route_to_sink is intentional MOVE
     # (rows_routed_success). Gate-routed-only run -> COMPLETED.
     assert result.status == RunStatus.COMPLETED
@@ -153,8 +178,10 @@ def _one_node_id(factory: RecorderFactory, run_id: str, node_type: NodeType) -> 
 
 
 def _seed_exporter_isolation_records(db: LandscapeDB, run_id: str, label: str) -> _SeededAuditIds:
-    """Add exporter record families to a completed run without mocking repositories."""
+    """Add exporter record families while the run's registered leader is active."""
     factory = make_factory(db)
+    authority = leader_coordination_token(factory, run_id)
+    member = authority.membership
 
     source_node_id = _one_node_id(factory, run_id, NodeType.SOURCE)
     sink_node_id = _one_node_id(factory, run_id, NodeType.SINK)
@@ -167,50 +194,58 @@ def _seed_exporter_isolation_records(db: LandscapeDB, run_id: str, label: str) -
         plugin_name="audit_extra_aggregation",
     )
 
-    row = factory.data_flow.create_row(
-        run_id,
+    row, parent_token = factory.data_flow.create_row_with_token(
         source_node_id,
+        coordination_token=authority,
         row_index=10_000,
         data={"seed": label},
         source_row_index=10_000,
         ingest_sequence=10_000,
         row_id=f"audit-extra-row-{label}",
+        token_id=f"audit-extra-token-{label}",
     )
-    parent_token = factory.data_flow.create_token(row.row_id, token_id=f"audit-extra-token-{label}")
+    parent_item = claim_test_work_item(factory, member_token=member, token_id=parent_token.token_id, node_id=source_node_id, step_index=90)
     child_tokens, _fork_group_id = factory.data_flow.fork_token(
         TokenRef(token_id=parent_token.token_id, run_id=run_id),
         row.row_id,
         [f"{label}-left", f"{label}-right"],
+        member_token=member,
+        work_item=parent_item,
         step_in_pipeline=90,
     )
+    factory.scheduler.mark_terminal(member_token=member, work_item_id=parent_item.work_item_id, expected_lease_owner=member.worker_id)
     token_ids = frozenset({parent_token.token_id, *(token.token_id for token in child_tokens)})
     child_token_id = child_tokens[0].token_id
 
     aggregation_state = factory.execution.begin_node_state(
         child_token_id,
         aggregation_node_id,
-        run_id,
         91,
         {"seed": label, "stage": "aggregation"},
+        member_token=member,
     )
     factory.execution.complete_node_state(
         aggregation_state.state_id,
         NodeStateStatus.COMPLETED,
+        member_token=member,
         output_data={"seed": label, "stage": "aggregation"},
         duration_ms=1.0,
     )
     sink_state = factory.execution.begin_node_state(
         child_token_id,
         sink_node_id,
-        run_id,
         92,
         {"seed": label, "stage": "sink"},
+        member_token=member,
     )
+    sink_item = claim_test_work_item(factory, member_token=member, token_id=child_token_id, node_id=sink_node_id, step_index=92)
     state_call = factory.execution.record_call(
         sink_state.state_id,
-        factory.execution.allocate_call_index(sink_state.state_id),
+        factory.execution.allocate_call_index(sink_state.state_id, member_token=member, work_item=sink_item),
         CallType.LLM,
         CallStatus.SUCCESS,
+        member_token=member,
+        work_item=sink_item,
         request_data=RawCallPayload({"seed": label, "scope": "state"}),
         response_data=RawCallPayload({"ok": True}),
         latency_ms=1.0,
@@ -218,20 +253,22 @@ def _seed_exporter_isolation_records(db: LandscapeDB, run_id: str, label: str) -
     factory.execution.complete_node_state(
         sink_state.state_id,
         NodeStateStatus.COMPLETED,
+        member_token=member,
         output_data={"seed": label, "stage": "sink"},
         duration_ms=1.0,
     )
 
     operation = factory.execution.begin_operation(
-        run_id,
         source_node_id,
         "source_load",
+        coordination_token=authority,
         input_data={"seed": label, "scope": "operation"},
     )
     operation_call = factory.execution.record_operation_call(
         operation.operation_id,
         CallType.HTTP,
         CallStatus.SUCCESS,
+        coordination_token=authority,
         request_data=RawCallPayload({"seed": label, "scope": "operation"}),
         response_data=RawCallPayload({"ok": True}),
         latency_ms=1.0,
@@ -239,31 +276,60 @@ def _seed_exporter_isolation_records(db: LandscapeDB, run_id: str, label: str) -
     factory.execution.complete_operation(
         operation.operation_id,
         "completed",
+        coordination_token=authority,
         output_data={"seed": label, "scope": "operation"},
         duration_ms=1.0,
     )
 
-    batch = factory.execution.create_batch(run_id, aggregation_node_id, batch_id=f"audit-extra-batch-{label}")
-    factory.execution.add_batch_member(batch.batch_id, child_token_id, ordinal=0)
+    batch = factory.execution.create_batch(aggregation_node_id, coordination_token=authority, batch_id=f"audit-extra-batch-{label}")
+    barrier_key = f"aggregation:{aggregation_node_id}"
+    factory.scheduler.mark_blocked(
+        member_token=member,
+        work_item_id=sink_item.work_item_id,
+        row_payload_json=sink_item.row_payload_json,
+        queue_key=None,
+        barrier_key=barrier_key,
+        expected_lease_owner=member.worker_id,
+    )
+    factory.scheduler.adopt_blocked_barrier_item(
+        work_item_id=sink_item.work_item_id,
+        token_id=child_token_id,
+        barrier_key=barrier_key,
+        membership=BatchMembershipSpec(batch_id=batch.batch_id, ordinal=0),
+        buffered_outcome=BufferedOutcomeSpec(batch_id=batch.batch_id),
+        coordination_token=authority,
+    )
     factory.execution.complete_batch(
         batch.batch_id,
         BatchStatus.COMPLETED,
+        coordination_token=authority,
         trigger_type=TriggerType.COUNT,
         trigger_reason=f"exporter isolation seed {label}",
         state_id=aggregation_state.state_id,
     )
 
-    artifact = factory.execution.register_artifact(
-        run_id,
-        sink_node_id,
-        artifact_type="test",
-        path=f"file:///tmp/elspeth-exporter-isolation-{label}.json",
-        content_hash="0" * 64,
-        size_bytes=0,
-        state_id=sink_state.state_id,
-        artifact_id=f"audit-extra-artifact-{label}",
-        idempotency_key=f"audit-extra-artifact-{label}",
-    )
+    factory.scheduler.mark_blocked_barrier_terminal(coordination_token=authority, barrier_key=barrier_key, token_ids=[child_token_id])
+    for child in child_tokens:
+        factory.data_flow.record_token_outcome_leader(
+            ref=TokenRef(token_id=child.token_id, run_id=run_id),
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+            sink_name="high_sink",
+            coordination_token=authority,
+        )
+    with fenced_leader_transaction(db.engine, token=authority, window_seconds=80.0, verb="register_artifact") as conn:
+        artifact = factory.execution.artifacts.register_artifact(
+            run_id,
+            sink_node_id,
+            artifact_type="test",
+            path=f"file:///tmp/elspeth-exporter-isolation-{label}.json",
+            content_hash="0" * 64,
+            size_bytes=0,
+            state_id=sink_state.state_id,
+            artifact_id=f"audit-extra-artifact-{label}",
+            idempotency_key=f"audit-extra-artifact-{label}",
+            conn=conn,
+        )
 
     return _SeededAuditIds(
         node_id=aggregation_node_id,
@@ -275,6 +341,20 @@ def _seed_exporter_isolation_records(db: LandscapeDB, run_id: str, label: str) -
         batch_id=batch.batch_id,
         artifact_id=artifact.artifact_id,
     )
+
+
+def _run_seeded_fork_on_db(
+    db: LandscapeDB, payload_root: Path, source_data: list[dict[str, Any]], *, label: str
+) -> tuple[str, _SeededAuditIds]:
+    seeds: list[_SeededAuditIds] = []
+
+    def seed(run_id: str) -> None:
+        assert not seeds, "expected exactly one real finalization"
+        seeds.append(_seed_exporter_isolation_records(db, run_id, label))
+
+    run_id = _run_fork_on_db(db, payload_root, source_data, before_complete=seed)
+    assert len(seeds) == 1
+    return run_id, seeds[0]
 
 
 def _exported_ids(grouped: dict[str, list[dict[str, Any]]], record_type: str, id_field: str) -> set[str]:
@@ -313,6 +393,13 @@ def _assert_export_relationships_are_closed(grouped: dict[str, list[dict[str, An
     batch_ids = _exported_ids(grouped, "batch", "batch_id")
 
     for record_type, records in grouped.items():
+        if record_type == "audit_export_config":
+            assert records[0]["public_config"]["auth_events"] == "omitted"
+            continue
+        if record_type == "auth_event_coverage":
+            assert records[0]["policy"] == "omitted"
+            assert records[0]["selected_count"] is None
+            continue
         for record in records:
             assert record["run_id"] == grouped["run"][0]["run_id"], f"{record_type} has sibling run_id: {record}"
 
@@ -376,7 +463,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_linear(tmp_path, source_data)
 
         try:
-            records = list(LandscapeExporter(db).export_run(run_id))
+            records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(records)
 
             token_ids = {t["token_id"] for t in grouped["token"]}
@@ -395,7 +482,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_linear(tmp_path, source_data)
 
         try:
-            records = list(LandscapeExporter(db).export_run(run_id))
+            records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(records)
 
             token_ids = {t["token_id"] for t in grouped["token"]}
@@ -411,7 +498,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_fork(tmp_path, source_data)
 
         try:
-            records = list(LandscapeExporter(db).export_run(run_id))
+            records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(records)
 
             state_ids = {s["state_id"] for s in grouped.get("node_state", [])}
@@ -427,7 +514,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_linear(tmp_path, source_data)
 
         try:
-            records = list(LandscapeExporter(db).export_run(run_id))
+            records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(records)
 
             token_ids = {t["token_id"] for t in grouped["token"]}
@@ -443,7 +530,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_linear(tmp_path, source_data)
 
         try:
-            exporter = LandscapeExporter(db)
+            exporter = LandscapeExporter(db, compartment_id="test-compartment")
             first = list(exporter.export_run(run_id))
             second = list(exporter.export_run(run_id))
 
@@ -462,7 +549,7 @@ class TestExporterBatchQueryIntegrity:
         run_id, db = _run_fork(tmp_path, source_data)
 
         try:
-            records = list(LandscapeExporter(db).export_run(run_id))
+            records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(records)
 
             assert len(grouped.get("routing_event", [])) > 0, "Fork pipeline should produce routing_event records"
@@ -483,7 +570,7 @@ class TestExporterBatchQueryIntegrity:
             direct_states = factory.query.get_all_node_states_for_run(run_id)
             direct_outcomes = factory.query.get_all_token_outcomes_for_run(run_id)
 
-            grouped = _group_records(list(LandscapeExporter(db).export_run(run_id)))
+            grouped = _group_records(list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id)))
 
             assert len(grouped["row"]) == len(direct_rows), f"row count: export={len(grouped['row'])} vs db={len(direct_rows)}"
             assert len(grouped["token"]) == len(direct_tokens), f"token count: export={len(grouped['token'])} vs db={len(direct_tokens)}"
@@ -500,28 +587,27 @@ class TestExporterBatchQueryIntegrity:
         """A multi-run export must contain only records owned by the requested run."""
         db = LandscapeDB(f"sqlite:///{tmp_path}/audit.db")
         try:
-            target_run_id = _run_fork_on_db(
+            target_run_id, target_seed = _run_seeded_fork_on_db(
                 db,
                 tmp_path / "payloads-target",
                 [
                     {"id": "target-high", "value": 80},
                     {"id": "target-low", "value": 20},
                 ],
+                label="target",
             )
-            sibling_run_id = _run_fork_on_db(
+            sibling_run_id, sibling_seed = _run_seeded_fork_on_db(
                 db,
                 tmp_path / "payloads-sibling",
                 [
                     {"id": "sibling-high", "value": 90},
                     {"id": "sibling-low", "value": 10},
                 ],
+                label="sibling",
             )
             assert target_run_id != sibling_run_id
 
-            target_seed = _seed_exporter_isolation_records(db, target_run_id, "target")
-            sibling_seed = _seed_exporter_isolation_records(db, sibling_run_id, "sibling")
-
-            grouped = _group_records(list(LandscapeExporter(db).export_run(target_run_id)))
+            grouped = _group_records(list(LandscapeExporter(db, compartment_id="test-compartment").export_run(target_run_id)))
 
             expected_record_types = {
                 "artifact",
@@ -572,7 +658,7 @@ class TestExporterRowBatchStreaming:
 
     def _build_seeded_fork_run(self, db: LandscapeDB, tmp_path: Path) -> str:
         """Fork run + seeded extras so every row-family record type is exercised."""
-        run_id = _run_fork_on_db(
+        run_id, _seed = _run_seeded_fork_on_db(
             db,
             tmp_path / "payloads",
             [
@@ -581,21 +667,10 @@ class TestExporterRowBatchStreaming:
                 {"id": "r2", "value": 60},
                 {"id": "r3", "value": 40},
             ],
+            label="stream",
         )
-        seed = _seed_exporter_isolation_records(db, run_id, "stream")
-        # The seeded families cover forks/batches/artifacts but not scheduler
-        # events; enqueue one so batching covers that export path too.
-        factory = make_factory(db)
-        payload = factory.scheduler.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
-        factory.scheduler.enqueue_ready(
-            run_id=run_id,
-            token_id=sorted(seed.token_ids)[0],
-            row_id=seed.row_id,
-            node_id=seed.node_id,
-            step_index=1,
-            ingest_sequence=10_000,
-            row_payload_json=payload,
-        )
+        # The seeded fork claim and barrier adoption emit real scheduler events
+        # before finalization; no work is appended to the completed run.
         return run_id
 
     def test_export_identical_across_row_batch_sizes(self, tmp_path: Path) -> None:
@@ -604,14 +679,14 @@ class TestExporterRowBatchStreaming:
         try:
             run_id = self._build_seeded_fork_run(db, tmp_path)
 
-            baseline = list(LandscapeExporter(db).export_run(run_id))
+            baseline = list(LandscapeExporter(db, compartment_id="test-compartment").export_run(run_id))
             grouped = _group_records(baseline)
             for record_type in self._ROW_FAMILY_RECORD_TYPES:
                 assert grouped.get(record_type), f"equivalence fixture must exercise record type: {record_type}"
             assert len(grouped["row"]) >= 4, "fixture must span multiple row batches at small batch sizes"
 
             for batch_size in (1, 2, 3):
-                chunked = list(LandscapeExporter(db, row_batch_size=batch_size).export_run(run_id))
+                chunked = list(LandscapeExporter(db, compartment_id="test-compartment", row_batch_size=batch_size).export_run(run_id))
                 assert chunked == baseline, f"row_batch_size={batch_size} changed the export stream"
         finally:
             db.close()
@@ -623,9 +698,15 @@ class TestExporterRowBatchStreaming:
             run_id = self._build_seeded_fork_run(db, tmp_path)
             key = b"row-batch-equivalence-key"
 
-            signed_default = list(LandscapeExporter(db, signing_key=key, signer_key_id="row-batch-key").export_run(run_id, sign=True))
+            signed_default = list(
+                LandscapeExporter(db, signing_key=key, signer_key_id="row-batch-key", compartment_id="test-compartment").export_run(
+                    run_id, sign=True
+                )
+            )
             signed_batched = list(
-                LandscapeExporter(db, signing_key=key, signer_key_id="row-batch-key", row_batch_size=1).export_run(run_id, sign=True)
+                LandscapeExporter(
+                    db, signing_key=key, signer_key_id="row-batch-key", compartment_id="test-compartment", row_batch_size=1
+                ).export_run(run_id, sign=True)
             )
 
             # Every data record — signature included — must match; only the

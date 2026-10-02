@@ -69,16 +69,11 @@ accept this trade-off.
 
 ## First-deploy operator action
 
-For 0.8.0, shareable-review state is part of the broader web session database
-contract. The release expects `SESSION_SCHEMA_EPOCH=53` and
-`SQLITE_SCHEMA_EPOCH=38`. Session epoch 29 introduced durable guided
-operations, session epoch 30 added the closed `quota_exceeded` terminal failure
-code used for stable HTTP 413 fork replay, and later session epochs completed
-proposal admission, retryable blob cleanup, ordinary guided-plan decline
-settlement, the decline replay message locator, the eager cutovers for
-persisted coalesce timeout metadata and the projected node option summary, and
-run-diagnostics writer-principal attribution and operator-profiled
-Textract document authoring. Landscape epoch 30 adds durable row_union barrier
+For 0.8.1, shareable-review state is part of the broader web session database
+contract. The candidate currently expects `SESSION_SCHEMA_EPOCH=71` and
+`SQLITE_SCHEMA_EPOCH=49`; confirm both against the deployed service's live
+schema constants before recreating a store. Landscape epoch 30 adds durable
+row_union barrier
 attribution, and epoch 31 closes scheduler work-item status over the public
 six-state vocabulary. Epoch 32 adds atomic, durable aggregation result receipts
 for transform, passthrough, and empty outputs so recovery does not replay a
@@ -92,8 +87,33 @@ discriminators are retired and `token_lineage_frames`/`lineage_path_json`
 become the sole lineage truth. Epoch 36 binds coalesce effects to their
 non-null lineage group. Epoch 37 widens the auth provider CHECK constraints on
 `auth_events` and `run_attributions`, and epoch 38 adds the
-`scheduler_events.seq` replay key that orders scheduler transitions. A
-Landscape store below epoch 38 is stale and must be recreated. When
+`scheduler_events.seq` replay key that orders scheduler transitions. Epoch 39
+adds immutable web run-start permit binding and recoverable pre-effect admission
+state. Session epoch 54 adds durable Composer progress snapshots and exact
+request lifecycle leases. Session epoch 55 adds identity ownership constraints,
+approval revocation provenance and durable admission decisions. Session epoch 56
+preserves sparse proposal arguments and structured validation errors. Landscape epoch
+40 adds call token measures and quota-policy/secret-wiring admission evidence.
+Session epoch 57 and Landscape epoch 41 replace the fallback-template digest
+with the approved prompt artifact anchor. Session epoch 58 widens the three quota
+policy limits to 64-bit integers and makes token-ledger prompt/completion measures
+nullable: unknown usage is NULL, never zero. Landscape epoch 42 requires
+admission evidence v2 with per-principal token quota usage and limits; stored
+v1 evidence is incompatible. Session epoch 59 adds timestamp-leading indexes for
+container-wide quota scans. Session epoch 61 established freeform as the
+Composer default; recreate predecessor session databases.
+Session epoch 62 requires nullable backend suggestions in durable advisor
+completion gates and rejects older stores at startup before session reload.
+Session epoch 63 makes the `blob_inline_resolutions.content_hash` CHECK and the
+four `blob_replacement_cleanups` evidence-hash CHECKs enforce the full lowercase
+SHA-256 shape rather than the length alone, and gives every remaining session
+digest column its own shape CHECK. Landscape epoch 43 does the same for every
+Landscape digest column.
+It also adds `interpretation_events.surface_origin`: review cards raised by
+the state-revert, YAML-import and E2E-seed routes now record that origin with
+empty LLM provenance, where they previously wrote the route name into the
+model, provider and `composer_skill_hash` columns.
+A Landscape store below the deployed epoch is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and
 uninstall the web service, archive/export evidence when required, recreate each
 configured database whose epoch is stale, then reinstall and initialize this
@@ -116,7 +136,7 @@ A shareable link goes through three distinct lifecycle phases.
 
 ### Mark-time
 
-The owner clicks **Save for review** in the composer UI. The backend:
+The owner clicks **Share inspect link** in the composer UI. The backend:
 
 1. Runs validation against the current composition state. Validation
    failures return HTTP 409 — the user fixes the errors and tries again.
@@ -137,7 +157,7 @@ the same instant.
 
 ### Re-mint-time (no new audit row)
 
-If the owner clicks **Save for review** again on the same composition
+If the owner clicks **Share inspect link** again on the same composition
 state — for example, because they lost the URL — the backend reads the
 current state, rebuilds the snapshot, and mints a fresh token. Because
 the content is identical, the `payload_digest` is identical too;
@@ -211,7 +231,7 @@ they can read, not *whether they can read at all*).
 3. **Restart the web service.** The service will load the new key and
    reject every outstanding token immediately.
 4. **Notify users** that previously shared links have been invalidated;
-   they must re-mint by clicking **Save for review** again.
+   they must re-mint by clicking **Share inspect link** again.
 
 There is no per-token revocation in v1 — rotation invalidates all.
 
@@ -224,7 +244,7 @@ a fresh link."
 
 1. The owner of the original session opens the composer at that
    session.
-2. The owner clicks **Save for review** again. This re-mints a fresh
+2. The owner clicks **Share inspect link** again. This re-mints a fresh
    token (the payload store stores the blob again under the same
    digest).
 3. The owner sends the new URL to the reviewer.

@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback } from "react";
+import { type JSX, type ReactNode, useCallback } from "react";
 
 import { AuditReadinessPanel } from "@/components/audit/AuditReadinessPanel";
 import { SideRailValidationBanner } from "@/components/sidebar/SideRailValidationBanner";
@@ -7,8 +7,8 @@ import { useSessionStore } from "@/stores/sessionStore";
 
 /** The Checks artifact tab: the one home for both pipeline assessments —
  *  validation findings and audit readiness — rendered inline where the old
- *  action-bar chips only linked to an Inspector drawer. Both panels are the
- *  same components that drawer mounted; this is a relocation, not a fork.
+ *  action-bar chips once linked to an inspector drawer. Both assessments
+ *  now render inline in the artifact pane.
  *
  *  `validationContent` exists for the tutorial shell, which projects its own
  *  PipelineValidationSummary — a content override on the shared surface, not

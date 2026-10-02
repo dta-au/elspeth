@@ -14,6 +14,7 @@ from elspeth.web.audit_readiness.routes import create_audit_readiness_router
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
+from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.protocol import SessionRecord
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.helpers.session_fences import RecordingSessionOperationAuthority
@@ -25,8 +26,9 @@ from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 # ``project_phase2c_implementation_complete.md``); the probe is now a
 # hard precondition rather than a skip-gate so a future route rename
 # surfaces loud at test-import time instead of silently skipping the
-# four Sub-task 7f telemetry-emit tests below.  CLAUDE.md "no silent
-# failures": a silent-skip on telemetry-emit regression is exactly the
+# four Sub-task 7f telemetry-emit tests below.  Per the ``logging-telemetry-policy``
+# skill §Telemetry (Operational Visibility), "No Silent Failures":
+# a silent-skip on telemetry-emit regression is exactly the
 # audit-trail gap the policy forbids. Decoupled from the production
 # app so test discovery doesn't pay full-app-import cost.
 _router_for_probe = create_audit_readiness_router()
@@ -86,6 +88,7 @@ def _client() -> TestClient:
     )
     app.state.session_service = _SessionService()
     app.state.readiness_service = _ExplodingReadinessService()
+    app.state.audit_readiness_rate_limiter = ComposerRateLimiter(limit=100)
     # Phase 8 Sub-task 7f. The route reads ``app.state.sessions_telemetry``
     # in the exception path to emit ``composer.audit.fetch_failure_total``.
     # Tests use the fake-counter container so ``observed_value`` can
@@ -117,7 +120,8 @@ def test_snapshot_fetch_failure_emits_audit_fetch_failure_counter() -> None:
     read path. The route emits ``composer.audit.fetch_failure_total``
     exactly once and re-raises so the failure remains visible (no
     silent swallow to a 200 response). Telemetry-only signal under
-    the CLAUDE.md non-decision read superset exception.
+    the non-decision read exception in the ``logging-telemetry-policy``
+    skill §The Superset Rule.
     """
     client = _client()
     with (
@@ -161,6 +165,7 @@ def test_snapshot_composition_state_not_found_does_not_emit_fetch_failure() -> N
     )
     app.state.session_service = _SessionService()
     app.state.readiness_service = _NotFoundReadinessService()
+    app.state.audit_readiness_rate_limiter = ComposerRateLimiter(limit=100)
     app.state.sessions_telemetry = build_sessions_telemetry()
     app.include_router(create_audit_readiness_router())
     with TestClient(app) as client:

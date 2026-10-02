@@ -21,6 +21,7 @@ import pytest
 
 from elspeth.contracts import PendingOutcome, RowResult, TokenInfo
 from elspeth.contracts.audit import Batch
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import BatchStatus, FrameKind, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
@@ -102,6 +103,8 @@ def _make_result(
         outcome=outcome,
         path=path,
         sink_name=sink_name,
+        # A real sink-bound result always carries its durable PENDING_SINK handoff.
+        scheduler_pending_sink=sink_name is not None,
         join_group_id="join-1" if path == TerminalPath.COALESCED else None,
     )
 
@@ -254,6 +257,8 @@ class TestFindAggregationTransform:
 class TestHandleIncompleteBatches:
     """Tests for crash recovery of incomplete batches."""
 
+    coordination_token = CoordinationToken(run_id="run-1", worker_id="resume-worker", leader_epoch=1)
+
     def test_executing_batch_marked_failed_then_retried(self) -> None:
         """EXECUTING batch (crash interrupted) -> failed -> retried."""
         batch = _make_batch(
@@ -270,7 +275,7 @@ class TestHandleIncompleteBatches:
         recorder.get_incomplete_batches.return_value = [batch]
         recorder.retry_batch.return_value = retry_batch
 
-        mapping = handle_incomplete_batches(recorder, "run-1")
+        mapping = handle_incomplete_batches(recorder, coordination_token=self.coordination_token)
 
         recorder.complete_batch.assert_called_once_with(
             "batch-123",
@@ -278,9 +283,10 @@ class TestHandleIncompleteBatches:
             trigger_type=TriggerType.COUNT,
             trigger_reason="count=2",
             state_id="state-123",
+            coordination_token=self.coordination_token,
         )
         recorder.update_batch_status.assert_not_called()
-        recorder.retry_batch.assert_called_once_with("batch-123")
+        recorder.retry_batch.assert_called_once_with("batch-123", coordination_token=self.coordination_token)
         assert mapping == {"batch-123": "batch-123-retry"}
 
     def test_failed_batch_retried(self) -> None:
@@ -293,11 +299,11 @@ class TestHandleIncompleteBatches:
         recorder.get_incomplete_batches.return_value = [batch]
         recorder.retry_batch.return_value = retry_batch
 
-        mapping = handle_incomplete_batches(recorder, "run-1")
+        mapping = handle_incomplete_batches(recorder, coordination_token=self.coordination_token)
 
         recorder.complete_batch.assert_not_called()
         recorder.update_batch_status.assert_not_called()
-        recorder.retry_batch.assert_called_once_with("batch-456")
+        recorder.retry_batch.assert_called_once_with("batch-456", coordination_token=self.coordination_token)
         assert mapping == {"batch-456": "batch-456-retry"}
 
     def test_draft_batch_left_alone(self) -> None:
@@ -307,7 +313,7 @@ class TestHandleIncompleteBatches:
         recorder = _make_execution()
         recorder.get_incomplete_batches.return_value = [batch]
 
-        mapping = handle_incomplete_batches(recorder, "run-1")
+        mapping = handle_incomplete_batches(recorder, coordination_token=self.coordination_token)
 
         recorder.complete_batch.assert_not_called()
         recorder.update_batch_status.assert_not_called()
@@ -319,7 +325,7 @@ class TestHandleIncompleteBatches:
         recorder = _make_execution()
         recorder.get_incomplete_batches.return_value = []
 
-        mapping = handle_incomplete_batches(recorder, "run-1")
+        mapping = handle_incomplete_batches(recorder, coordination_token=self.coordination_token)
 
         recorder.complete_batch.assert_not_called()
         recorder.update_batch_status.assert_not_called()
@@ -339,7 +345,7 @@ class TestHandleIncompleteBatches:
         recorder.get_incomplete_batches.return_value = [executing, failed, draft]
         recorder.retry_batch.side_effect = [retry_b1, retry_b2]
 
-        mapping = handle_incomplete_batches(recorder, "run-1")
+        mapping = handle_incomplete_batches(recorder, coordination_token=self.coordination_token)
 
         recorder.complete_batch.assert_called_once_with(
             "b1",
@@ -347,6 +353,7 @@ class TestHandleIncompleteBatches:
             trigger_type=None,
             trigger_reason=None,
             state_id=None,
+            coordination_token=self.coordination_token,
         )
         recorder.update_batch_status.assert_not_called()
         assert recorder.retry_batch.call_count == 2
@@ -497,8 +504,13 @@ class TestCheckAggregationTimeouts:
         assert len(pending["output"]) == 1
 
     def test_timeout_flush_failed_results(self) -> None:
-        """Failed results from flush increment failed counter."""
-        failed = _make_result(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
+        """A discarded failed batch's members count failed AND quarantined.
+
+        Operator ruling B3: a failed flush with ``on_error: discard`` returns
+        every member as (FAILURE, QUARANTINED_AT_SOURCE), the per-row discard
+        pair — no longer (FAILURE, UNROUTED).
+        """
+        failed = _make_result(TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)
 
         agg_transform = _make_batch_transform(node_id="agg-1")
         config = _make_config(
@@ -522,6 +534,7 @@ class TestCheckAggregationTimeouts:
         )
 
         assert result.rows_failed == 1
+        assert result.rows_quarantined == 1
         assert result.rows_succeeded == 0
 
     def test_work_items_continue_processing(self) -> None:
@@ -539,7 +552,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 2
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [downstream_result]
+        processor.drain_released_continuations.return_value = [downstream_result]
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -553,8 +566,9 @@ class TestCheckAggregationTimeouts:
         )
 
         assert result.rows_succeeded == 1
-        processor.process_token.assert_called_once()
-        assert processor.process_token.call_args.kwargs["current_node_id"] == NodeID("continue-node")
+        processor.drain_released_continuations.assert_called_once()
+        continuations = processor.drain_released_continuations.call_args.args[0]
+        assert [item.current_node_id for item in continuations] == [NodeID("continue-node")]
 
     def test_work_items_with_coalesce_node(self) -> None:
         """Work items can carry an explicit coalesce node continuation."""
@@ -573,7 +587,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = []
+        processor.drain_released_continuations.return_value = []
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -586,9 +600,8 @@ class TestCheckAggregationTimeouts:
             agg_transform_lookup=lookup,
         )
 
-        assert processor.process_token.call_args.kwargs["current_node_id"] == NodeID("continue-node")
-        assert processor.process_token.call_args.kwargs["coalesce_node_id"] == NodeID("coalesce::merge")
-        assert processor.process_token.call_args.kwargs["coalesce_name"] == "merge"
+        # The flush's own continuation, with its coalesce cursor, reaches the one drain unchanged.
+        assert list(processor.drain_released_continuations.call_args.args[0]) == [work_item]
 
     def test_downstream_routed_outcome(self) -> None:
         """ROUTED outcome from downstream is tracked."""
@@ -604,7 +617,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [routed]
+        processor.drain_released_continuations.return_value = [routed]
 
         pending: dict[str, list[tuple[TokenInfo, PendingOutcome | None]]] = {"output": [], "risk_sink": []}
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -637,7 +650,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [quarantined]
+        processor.drain_released_continuations.return_value = [quarantined]
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -666,7 +679,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [coalesced]
+        processor.drain_released_continuations.return_value = [coalesced]
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -696,7 +709,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [failed]
+        processor.drain_released_continuations.return_value = [failed]
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -731,7 +744,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [completed]
+        processor.drain_released_continuations.return_value = [completed]
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -765,7 +778,7 @@ class TestCheckAggregationTimeouts:
         processor.check_aggregation_timeout.return_value = (True, TriggerType.TIMEOUT)
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = outcomes
+        processor.drain_released_continuations.return_value = outcomes
 
         pending = _make_pending()
         lookup: dict[str, AggNodeEntry] = {"agg-1": AggNodeEntry(transform=agg_transform, node_id=NodeID("agg-1"))}
@@ -930,7 +943,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [downstream]
+        processor.drain_released_continuations.return_value = [downstream]
 
         pending = _make_pending()
 
@@ -942,6 +955,40 @@ class TestFlushRemainingAggregationBuffers:
         )
 
         assert result.rows_succeeded == 1
+
+    def test_every_continuation_of_one_flush_reaches_one_drain(self) -> None:
+        """A multi-row release hands ALL its continuations to one drain, never one drain per continuation.
+
+        A drain claims every READY row of the run, so a per-continuation drain
+        also advances the siblings and then replays their stale READY images.
+        """
+        first = _make_work_item(token=make_token_info(token_id="tok-1"), current_node_id=NodeID("continue-node"))
+        second = _make_work_item(token=make_token_info(token_id="tok-2"), current_node_id=NodeID("continue-node"))
+        downstream = [
+            _make_result(TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, token=item.token, sink_name="output")
+            for item in (first, second)
+        ]
+
+        agg_transform = _make_batch_transform(node_id="agg-1")
+        config = _make_config(
+            transforms=[agg_transform, _TransformPlaceholder("continue-node")],
+            aggregation_settings={"agg-1": _make_agg_settings()},
+        )
+        processor = _make_processor()
+        processor.get_aggregation_buffer_count.return_value = 2
+        processor.handle_timeout_flush.return_value = ([], [first, second])
+        processor.drain_released_continuations.return_value = downstream
+
+        result = flush_remaining_aggregation_buffers(
+            config=config,
+            processor=processor,
+            ctx=_make_context(),
+            pending_tokens=_make_pending(),
+        )
+
+        processor.drain_released_continuations.assert_called_once()
+        assert list(processor.drain_released_continuations.call_args.args[0]) == [first, second]
+        assert result.rows_succeeded == 2
 
     def test_downstream_routed_tokens_counted(self) -> None:
         """ROUTED downstream outcome is counted correctly."""
@@ -956,7 +1003,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [routed]
+        processor.drain_released_continuations.return_value = [routed]
 
         pending: dict[str, list[tuple[TokenInfo, PendingOutcome | None]]] = {"output": [], "risk": []}
 
@@ -984,7 +1031,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [coalesced]
+        processor.drain_released_continuations.return_value = [coalesced]
 
         pending = _make_pending()
 
@@ -1043,7 +1090,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [failed]
+        processor.drain_released_continuations.return_value = [failed]
 
         pending = _make_pending()
 
@@ -1075,7 +1122,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [completed]
+        processor.drain_released_continuations.return_value = [completed]
 
         pending = _make_pending()
 
@@ -1102,7 +1149,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = [quarantined]
+        processor.drain_released_continuations.return_value = [quarantined]
 
         pending = _make_pending()
 
@@ -1132,7 +1179,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = outcomes
+        processor.drain_released_continuations.return_value = outcomes
 
         pending = _make_pending()
 
@@ -1163,7 +1210,7 @@ class TestFlushRemainingAggregationBuffers:
         processor = _make_processor()
         processor.get_aggregation_buffer_count.return_value = 1
         processor.handle_timeout_flush.return_value = ([], [work_item])
-        processor.process_token.return_value = []
+        processor.drain_released_continuations.return_value = []
 
         pending = _make_pending()
 
@@ -1174,8 +1221,8 @@ class TestFlushRemainingAggregationBuffers:
             pending_tokens=pending,
         )
 
-        assert processor.process_token.call_args.kwargs["current_node_id"] == NodeID("continue-node")
-        assert processor.process_token.call_args.kwargs["coalesce_node_id"] == NodeID("coalesce::merge")
+        # The flush's own continuation, with its coalesce cursor, reaches the one drain unchanged.
+        assert list(processor.drain_released_continuations.call_args.args[0]) == [work_item]
 
     def test_completed_result_branch_fallback_to_sink_name(self) -> None:
         """Completed result with branch not in pending routes to sink_name from result."""

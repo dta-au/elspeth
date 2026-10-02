@@ -159,6 +159,7 @@ vi.mock("../api/client", () => ({
   fetchSystemStatus: vi.fn().mockResolvedValue({
     composer_available: true,
     composer_model: "gpt-4o",
+    composer_advisor_model: "anthropic/claude-sonnet-4-6",
     composer_provider: "openai",
     composer_reason: null,
     composer_missing_keys: [],
@@ -200,7 +201,6 @@ vi.mock("../api/client", () => ({
   },
   fetchUserComposerPreferences: vi.fn().mockResolvedValue({
     default_mode: "freeform",
-    banner_dismissed_at: null,
     tutorial_completed_at: "2026-05-19T00:00:00Z",
     tutorial_stage: null,
     tutorial_session_id: null,
@@ -406,6 +406,7 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -450,14 +451,15 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
     await user.type(input, userText);
     await user.click(screen.getByRole("button", { name: /send message/i }));
 
-    // (a) sendMessage was called with the user text. The third arg is
-    // the optional stateId (state.id from the seeded composition).
+    // (a) The send carries one client request UUID alongside the user text
+    // and the original state id from the seeded composition.
     await waitFor(() => {
       expect(sendMessageSpy).toHaveBeenCalled();
     });
     expect(sendMessageSpy).toHaveBeenCalledWith(
       SESSION_ID,
       userText,
+      expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
       "state-1",
       expect.any(AbortSignal),
     );
@@ -488,7 +490,7 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
     // (f) The projection store now holds a non-null summary with the
     // hyphenated provenance form (translated from the snake_case wire
     // value via the `toInlineSourceProvenance` adapter).
-    const summary = useInlineSourceStore.getState().getSummary(SESSION_ID);
+    const summary = useInlineSourceStore.getState().getSummaries(SESSION_ID)[0];
     expect(summary).not.toBeNull();
     expect(summary?.provenance).toBe("verbatim");
     expect(summary?.blobId).toBe(BLOB_ID);
@@ -539,7 +541,7 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
 
     // Store projection carries the hyphenated form translated from the
     // snake_case wire `llm_generated`.
-    const summary = useInlineSourceStore.getState().getSummary(SESSION_ID);
+    const summary = useInlineSourceStore.getState().getSummaries(SESSION_ID)[0];
     expect(summary).not.toBeNull();
     expect(summary?.provenance).toBe("llm-generated");
     expect(summary?.blobId).toBe(BLOB_ID);

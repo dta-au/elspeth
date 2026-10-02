@@ -57,10 +57,10 @@ DEAD = "dead"
 
 DEFAULT_WINDOW_SECONDS = 900
 # RED is decided by the RUNNER, never by exit codes or output text (which the lane's test controls): pytest is
-# launched with prove-it's prove_it_red_plugin, which records each failed test's exception type. Under any other
+# launched with lane-manager's lane_red_plugin, which records each failed test's exception type. Under any other
 # runner the failure kind is not measurable and the lane is not verified, for that stated reason.
 SCRIPT_PATH = Path(__file__).resolve()
-PLUGIN_PATH = SCRIPT_PATH.parent.parent / "prove-it" / "prove_it_red_plugin.py"
+PLUGIN_PATH = SCRIPT_PATH.parent / "lane_red_plugin.py"
 PYTEST_RE = re.compile(r"\bpytest\b")
 
 
@@ -612,7 +612,7 @@ def _run_command(command: str, cwd: Path, timeout: int, *, red_report: Path | No
         if not PLUGIN_PATH.is_file():
             return None, f"structural RED plugin missing: {PLUGIN_PATH}"
         env["PYTHONPATH"] += f":{PLUGIN_PATH.parent}"
-        env["PROVE_IT_RED_REPORT"] = str(red_report)
+        env["LANE_MANAGER_RED_REPORT"] = str(red_report)
         argv += ["-p", PLUGIN_PATH.stem]
     try:
         proc = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, check=False)

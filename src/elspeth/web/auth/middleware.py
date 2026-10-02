@@ -6,22 +6,25 @@ routes declare it via Depends(get_current_user).
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Annotated, cast
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from opentelemetry import metrics
 
 from elspeth.contracts.auth import AuthProviderType
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditWriter, classify_authentication_failure
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, UserIdentity
 from elspeth.web.auth.protocol import AuthProvider
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.middleware.rate_limit import check_auth_rate_limit
 
 # Operational signal for over-limit auth failures whose durable audit write was
-# skipped. Per logging-telemetry-policy this is a "drop rate" — meta-operational,
-# telemetry-only — so the suppression is never silent even though the audit row
-# is intentionally capped. NOT slog (forbidden for operational metrics).
+# skipped. This is a "drop rate" — meta-operational, telemetry-only under the
+# system-health exemption in the logging-telemetry-policy skill §The Superset
+# Rule — so the suppression is never silent even though the audit row is
+# intentionally capped. NOT slog (forbidden for operational metrics).
 _AUTH_FAILURE_AUDIT_SUPPRESSED_TOTAL = metrics.get_meter(__name__).create_counter(
     "auth_failure_audit.suppressed_total",
     description="Auth-failure audit writes skipped because the per-client rate limit was exceeded.",
@@ -160,3 +163,26 @@ async def get_current_user(request: Request) -> UserIdentity:
             exception_class=type(exc).__name__,
         )
         raise HTTPException(status_code=401, detail=exc.detail) from exc
+
+
+async def require_pipeline_user(
+    request: Request,
+    user: Annotated[UserIdentity, Depends(get_current_user)],
+) -> UserIdentity:
+    """Require the live deployment-wide ``user`` role for authoring and runs."""
+    authority = cast(RepositoryIdentityAuthority, request.app.state.identity_authority)
+    settings: WebSettings = request.app.state.settings
+    if not await run_sync_in_worker(
+        authority.holds_active_human_role,
+        identity_id=user.user_id,
+        provider=settings.auth_provider,
+        role="user",
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error_type": "user_role_required",
+                "detail": "A live deployment-wide user role is required for pipeline authoring and execution",
+            },
+        )
+    return user

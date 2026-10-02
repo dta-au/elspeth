@@ -13,18 +13,23 @@ FakePayloadStore mirrors tests/unit/plugins/llm/test_image_inputs.py.
 from __future__ import annotations
 
 import hashlib
-from types import MappingProxyType, SimpleNamespace
+from types import MappingProxyType
 from typing import Any
 
 from elspeth.contracts.chat_parts import ChatMessage, ImagePart, TextPart, parts_hash
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.plugins.infrastructure.templates import ALL_FIELDS
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
 from elspeth.plugins.transforms.llm.multi_query import OutputFieldConfig, OutputFieldType, QuerySpec, ResponseFormat
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.plugins.transforms.llm.transform import MultiQueryStrategy, SingleQueryStrategy
 from elspeth.testing import make_pipeline_row
+from tests.fixtures.factories import make_context
 from tests.unit.contracts.test_chat_parts import JPEG_BYTES, PNG_BYTES
 
 PNG_SHA256 = hashlib.sha256(PNG_BYTES).hexdigest()
@@ -91,7 +96,7 @@ class FakeProvider:
         )
         return self._result
 
-    def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, coordination_token: CoordinationToken, operation_id: str, model: str) -> None:
         raise AssertionError("not exercised in these tests")
 
     def close(self) -> None:
@@ -113,12 +118,11 @@ class FakeTracer:
         pass
 
 
-def _make_ctx() -> SimpleNamespace:
-    return SimpleNamespace(
+def _make_ctx() -> PluginContext:
+    return make_context(
         state_id="state-123",
         run_id="run-123",
-        token=SimpleNamespace(token_id="token-1"),
-        shutdown_event=None,
+        token=TokenInfo(row_id="row-1", token_id="token-1", row_data=make_pipeline_row({})),
     )
 
 
@@ -135,6 +139,7 @@ def _make_single_strategy(
 ) -> SingleQueryStrategy:
     return SingleQueryStrategy(
         template=PromptTemplate(prompt_template),
+        row_projection=ALL_FIELDS,
         system_prompt=None,
         system_prompt_source=None,
         model="gpt-4o",
@@ -160,6 +165,7 @@ def _make_multi_strategy(
     return MultiQueryStrategy(
         query_specs=query_specs,
         template=PromptTemplate(prompt_template),
+        row_projection=ALL_FIELDS,
         system_prompt=None,
         system_prompt_source=None,
         model="gpt-4o",

@@ -10,34 +10,28 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, NotRequired, Protocol, TypedDict, final
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, NotRequired, Protocol, TypedDict, TypeGuard, final
 from uuid import UUID
+
+from pydantic import ValidationError as PydanticValidationError
 
 if TYPE_CHECKING:
     from pydantic import SecretStr
 
     from elspeth.contracts.session_operation import SessionOperationContext
-    from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.audit import BufferingRecorder
-    from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
-    from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalState
-    from elspeth.web.composer.pipeline_planner import (
-        GuidedPlannerDecline,
-        PipelinePlanResult,
-        PlannerOriginatingMessage,
-    )
-    from elspeth.web.composer.pipeline_proposal import PresentBase
-    from elspeth.web.composer.service import AdvisorCheckpointVerdict
-    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-    from elspeth.web.sessions.protocol import GuidedOperationFence
+    from elspeth.web.composer.strict_transport import StrictToolsSetting
+    from elspeth.web.execution.completion_gates import CompletionGateFacts
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
 from elspeth.contracts.errors import FailedTurnMetadata, FrameworkBugError
 from elspeth.web.composer.advisor_audit import AdvisorTerminalPublication
+from elspeth.web.composer.advisor_decision import AdvisorGateDecision
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
@@ -48,6 +42,7 @@ _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # Bare Final (not Final[str]) so mypy infers the Literal type and TypedDict
 # indexing through this constant type-checks at the history boundary.
 COMPOSER_HISTORY_USER_AUTHORED_KEY: Final = "_elspeth_user_authored"
+COMPOSER_HISTORY_USER_MESSAGE_ID_KEY: Final = "_elspeth_user_message_id"
 
 # Canonical request-tool kind policy. ``InterpretationKind`` is the closed
 # persistence/event vocabulary; this tuple is the subset the planner may send
@@ -69,6 +64,14 @@ if frozenset(REQUEST_INTERPRETATION_REVIEW_KINDS) & _BACKEND_ONLY_INTERPRETATION
     raise RuntimeError("every InterpretationKind must be classified as requestable or backend-only")
 REQUEST_INTERPRETATION_REVIEW_KIND_VALUES: Final[tuple[str, ...]] = tuple(kind.value for kind in REQUEST_INTERPRETATION_REVIEW_KINDS)
 REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION: Final[str] = ", ".join(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES)
+# A stale ``llm_prompt_template`` review draft is compared against the text the
+# model receives (``prompt_review_draft_from_options``), not against
+# ``options.prompt_template`` alone. The producer and the secret-safe
+# ToolArgumentError projector share this exact operator-owned string.
+LLM_PROMPT_REVIEW_DRAFT_EXPECTATION: Final[str] = (
+    "the current prompt review draft for the node: the rendered multi-query prompt surface on a "
+    "multi-query LLM node, otherwise options.prompt_template"
+)
 
 # Source-data-contract repair vocabulary. Producers and the secret-safe
 # ToolArgumentError projector share these exact operator-owned strings so the
@@ -86,6 +89,25 @@ SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION: Final[str] = (
 SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE: Final[str] = "caller-supplied draft that does not match the server-computed data contract"
 SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE: Final[str] = "missing source component"
 
+# Interpretation-review rate-cap repair vocabulary (ADR-037). The caps are
+# coherent only because the planner has a fallback: write a direct
+# interpretation into the prompt template instead of asking again. Producers
+# and the secret-safe ToolArgumentError projector share these exact,
+# value-free strings so the fallback survives canonicalization and reaches the
+# planner instead of collapsing to a bare "limit" diagnostic.
+INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION: Final[str] = (
+    "within the per-term interpretation request limit — reviews for this term are exhausted in this composition, "
+    "so use a direct interpretation in the prompt template instead: write the interpretation into "
+    "options.prompt_template and remove the pending vague_term requirement and its prompt wiring rather than "
+    "requesting the review again"
+)
+INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION: Final[str] = (
+    "within the per session per UTC day interpretation request limit — no more reviews are available today, "
+    "so use a direct interpretation in the prompt template instead: write the interpretation into "
+    "options.prompt_template and remove the pending vague_term requirement and its prompt wiring rather than "
+    "requesting the review again"
+)
+
 
 class ComposerHistoryMessage(TypedDict):
     """One in-process history row with optional persisted human authority."""
@@ -93,6 +115,7 @@ class ComposerHistoryMessage(TypedDict):
     role: str
     content: str
     _elspeth_user_authored: NotRequired[Literal[True]]
+    _elspeth_user_message_id: NotRequired[str]
 
 
 # User-facing assistant text for planner-staged pipeline proposals. Shared
@@ -237,6 +260,8 @@ class ComposerResult:
     message: str
     state: CompositionState
     runtime_preflight: ValidationResult | None = None
+    # Only a completed END checkpoint can replace a durable advisor fact.
+    advisor_gate_decision: AdvisorGateDecision | None = None
     raw_assistant_content: str | None = None
     pipeline_commit_intent: PipelineCommitIntent | None = None
     # Per-tool-call audit trail produced during this compose() invocation.
@@ -307,6 +332,9 @@ class ComposerResult:
         return self.advisor_terminal_publication is not None and self.advisor_terminal_publication.branch == "terminal_block"
 
     def __post_init__(self) -> None:
+        if self.advisor_gate_decision is not None and self.pipeline_commit_intent is not None:
+            raise ValueError("An advisor decision cannot accompany an unsettled pipeline commit intent")
+
         # Two directions of the field-pairing invariant. Both matter:
         #
         # 1. preflight failed with no raw_assistant_content →
@@ -426,6 +454,10 @@ class ComposerServiceError(Exception):
     """Base exception for composer service errors."""
 
 
+class ComposerAdmissionRefused(ComposerServiceError):
+    """A committed admission decision refused this provider operation."""
+
+
 def _convergence_reason_for_budget(
     budget_exhausted: Literal["composition", "discovery", "timeout"],
 ) -> ComposerProgressReason:
@@ -479,11 +511,17 @@ class ComposerConvergenceError(ComposerServiceError):
         evidence: Mapping[str, Any] | None = None,
         failed_turn: FailedTurnMetadata | None = None,
     ) -> None:
-        super().__init__(
-            f"Composer did not converge within {max_turns} turns "
-            f"(budget exhausted: {budget_exhausted}). "
-            f"The LLM kept making tool calls without producing a final response."
+        # This string is the HTTP ``detail`` the user reads. A turn budget is
+        # spent by tool-call turns, so the loop wording is true for those. A
+        # timeout is not: the deadline can expire after the model's final
+        # reply, while the END gate re-validates, so the timeout wording claims
+        # only what every timeout has in common.
+        cause = (
+            "The request ran out of time before the turn could be completed."
+            if budget_exhausted == "timeout"
+            else "The LLM kept making tool calls without producing a final response."
         )
+        super().__init__(f"Composer did not converge within {max_turns} turns (budget exhausted: {budget_exhausted}). {cause}")
         self.max_turns = max_turns
         self.budget_exhausted = budget_exhausted
         self.partial_state = partial_state
@@ -741,6 +779,52 @@ _TOOL_ARGUMENT_ERROR_CODES = frozenset(
     }
 )
 
+# Closed-code value rejections carry their category 1:1. ``SCHEMA_VALIDATION``
+# is split by the failing schema keyword, so its constructor must name one of
+# the two schema categories explicitly.
+_TOOL_ARGUMENT_CATEGORY_BY_CODE: Final[Mapping[str, ToolArgumentErrorCategory]] = MappingProxyType(
+    {
+        "DISCOVERY_ONLY": ToolArgumentErrorCategory.DISCOVERY_ONLY,
+        "DUPLICATE_RESOLVED_INTERPRETATION": ToolArgumentErrorCategory.DUPLICATE_RESOLVED_INTERPRETATION,
+        "RATE_CAP_PER_SESSION_DAY": ToolArgumentErrorCategory.RATE_CAP_PER_SESSION_DAY,
+        "RATE_CAP_PER_TERM": ToolArgumentErrorCategory.RATE_CAP_PER_TERM,
+    }
+)
+_SCHEMA_VALIDATION_CATEGORIES: Final[frozenset[ToolArgumentErrorCategory]] = frozenset(
+    {ToolArgumentErrorCategory.SCHEMA_SHAPE, ToolArgumentErrorCategory.SCHEMA_BOUND}
+)
+# Categories that belong to a closed code: a rejection may only claim one of
+# these when it also carries that code.
+_CODE_OWNED_TOOL_ARGUMENT_CATEGORIES: Final[frozenset[ToolArgumentErrorCategory]] = frozenset(
+    {*_TOOL_ARGUMENT_CATEGORY_BY_CODE.values(), *_SCHEMA_VALIDATION_CATEGORIES}
+)
+
+
+def _resolve_tool_argument_category(code: str | None, category: object) -> ToolArgumentErrorCategory:
+    """Return the closed category for a ``(code, category)`` pair, or raise."""
+    requested: ToolArgumentErrorCategory | None
+    if category is None:
+        requested = None
+    elif type(category) is ToolArgumentErrorCategory:
+        requested = category
+    else:
+        raise ValueError("ToolArgumentError received an unsupported category")
+    if code == "SCHEMA_VALIDATION":
+        if requested is None or requested not in _SCHEMA_VALIDATION_CATEGORIES:
+            raise ValueError("ToolArgumentError code SCHEMA_VALIDATION requires the schema_shape or schema_bound category")
+        return requested
+    if code is not None:
+        coded = _TOOL_ARGUMENT_CATEGORY_BY_CODE[code]
+        if requested is not None and requested is not coded:
+            raise ValueError("ToolArgumentError category disagrees with its code")
+        return coded
+    if requested is None:
+        return ToolArgumentErrorCategory.SEMANTIC_RULE
+    if requested in _CODE_OWNED_TOOL_ARGUMENT_CATEGORIES:
+        raise ValueError("ToolArgumentError category requires its closed code")
+    return requested
+
+
 _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS = 4096
 
 _SAFE_TOOL_ARGUMENT_NAMES = frozenset(
@@ -809,54 +893,101 @@ _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS = MappingProxyType(
     }
 )
 
-_SAFE_TOOL_ARGUMENT_EXPECTATIONS = frozenset(
-    {
-        "'source' for invented_source or 'source:<name>' for a named source",
-        "a declared read-only discovery tool",
-        (
-            "a fresh interpretation review (this kind+user_term+affected_node_id "
-            "tuple has already been resolved in this composition branch — carry "
-            "the resolved value forward, do not re-stage)"
-        ),
-        "a non-empty string",
-        "a 12-character lowercase hex string",
-        (
-            "a persisted composition state; call set_pipeline or another "
-            "state-staging tool successfully, wait for its tool result, "
-            "then call request_interpretation_review"
-        ),
-        "a sanitizable filename (no path separators, non-empty after stripping)",
-        "a string",
-        "a valid composer source name",
-        "content that does not match a known credential shape",
-        "content without template metacharacters, control characters, or credential patterns",
-        "id of a node whose plugin is 'llm'",
-        "only the optional 'source_name' key",
-        "source artifact content without template metacharacters, credential patterns, or non-printable controls",
-        REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
-        SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
-        SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
-        SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
-        SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
-        "source with composer-authored source metadata",
-        "the exact node review requirement draft staged in options.interpretation_requirements",
-        "the exact source review requirement draft staged in source.options.interpretation_requirements",
-        "valid UTF-8 text",
-        "well-formed interpretation authoring metadata",
-        "a valid value",
-        "an object conforming to the declared argument schema",
-        "a pipeline decision without preserved raw HTML/fingerprint fields",
-        "a pending interpretation requirement",
-        "a pending interpretation requirement or placeholder",
-        "id of an existing LLM transform",
-        "one of: the allowed values",
-        "prompt_template_parts interpretation_ref or placeholder wiring",
-        "the current non-empty options.model",
-        "the current non-empty options.prompt_template",
-        "within the per session per UTC day interpretation request limit",
-        "within the per-term interpretation request limit",
-    }
-) | frozenset(_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.values())
+_TOOL_ARGUMENT_JSON_TYPE_GUIDANCE = (
+    ". Match the tool's declared JSON types. Supply object and array fields as actual JSON objects and arrays, not strings containing JSON."
+)
+
+# Pydantic error types outside the ``*_type`` / ``json_*`` families that still
+# mean the value had the wrong JSON type: text sent where a number or boolean
+# is declared. Value, length, pattern, enum, missing-field and extra-field
+# failures are not type faults, so the JSON-type guidance would name a fault
+# the call does not have.
+_EXTRA_TYPE_SHAPE_PYDANTIC_ERROR_TYPES: Final[frozenset[str]] = frozenset(
+    {"is_instance_of", "int_parsing", "float_parsing", "bool_parsing", "decimal_parsing"}
+)
+# redaction._reject_coerced_integer (the ``_JsonInteger`` fields) rejects text
+# and booleans with a plain ValueError, which Pydantic reports as
+# ``value_error`` under this fixed operator-authored message.
+_JSON_INTEGER_VALUE_ERROR_MESSAGE: Final[str] = "Value error, expected a JSON integer"
+
+
+def _is_type_shape_pydantic_error(error_type: str, message: str) -> bool:
+    if error_type.endswith("_type") or error_type.startswith("json_") or error_type in _EXTRA_TYPE_SHAPE_PYDANTIC_ERROR_TYPES:
+        return True
+    return error_type == "value_error" and message == _JSON_INTEGER_VALUE_ERROR_MESSAGE
+
+
+def _cause_rules_out_json_type_guidance(cause: BaseException | None) -> bool:
+    """True when a chained Pydantic cause carries no type-shape error at all.
+
+    Only each error's ``type`` token is inspected, plus an exact comparison of
+    its message against one fixed operator-authored string; rejected input,
+    context and URLs are never materialized and nothing is retained.
+    """
+    if not isinstance(cause, PydanticValidationError):
+        return False
+    return not any(
+        _is_type_shape_pydantic_error(error["type"], error["msg"])
+        for error in cause.errors(include_url=False, include_context=False, include_input=False)
+    )
+
+
+_SAFE_TOOL_ARGUMENT_EXPECTATIONS = (
+    frozenset(
+        {
+            "'source' for invented_source or 'source:<name>' for a named source",
+            "a declared read-only discovery tool",
+            (
+                "a fresh interpretation review (this kind+user_term+affected_node_id "
+                "tuple has already been resolved in this composition branch — carry "
+                "the resolved value forward, do not re-stage)"
+            ),
+            "a non-empty string",
+            "a 12-character lowercase hex string",
+            (
+                "a persisted composition state; call set_pipeline or another "
+                "state-staging tool successfully, wait for its tool result, "
+                "then call request_interpretation_review"
+            ),
+            "a sanitizable filename (no path separators, non-empty after stripping)",
+            "a string",
+            "a valid composer source name",
+            "content that does not match a known credential shape",
+            "content without template metacharacters, control characters, or credential patterns",
+            "id of a node whose plugin is 'llm'",
+            "only the optional 'source_name' key",
+            "source artifact content without template metacharacters, credential patterns, or non-printable controls",
+            REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+            SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
+            SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
+            SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
+            SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
+            "source with composer-authored source metadata",
+            "the exact node review requirement draft staged in options.interpretation_requirements",
+            "the exact source review requirement draft staged in source.options.interpretation_requirements",
+            "valid UTF-8 text",
+            "well-formed interpretation authoring metadata",
+            "a valid value",
+            "an object conforming to the declared argument schema",
+            "a pipeline decision without preserved raw HTML/fingerprint fields",
+            "a pending interpretation requirement",
+            "a pending interpretation requirement or placeholder",
+            "id of an existing LLM transform",
+            "one of: the allowed values",
+            "prompt_template_parts interpretation_ref or placeholder wiring",
+            "the current non-empty options.model",
+            "the current non-empty options.prompt_template",
+            LLM_PROMPT_REVIEW_DRAFT_EXPECTATION,
+            INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION,
+            INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION,
+        }
+    )
+    | frozenset(_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.values())
+    | frozenset(
+        expectation + _TOOL_ARGUMENT_JSON_TYPE_GUIDANCE
+        for expectation in (*_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.values(), "an object conforming to the declared argument schema")
+    )
+)
 
 _SAFE_TOOL_ARGUMENT_EXPECTATIONS = _SAFE_TOOL_ARGUMENT_EXPECTATIONS | frozenset(
     f"a pending {kind.value} interpretation requirement{suffix}" for kind in InterpretationKind for suffix in ("", " or placeholder")
@@ -936,20 +1067,26 @@ def _canonical_tool_argument_expectation(value: object, argument: str) -> str:
     """Map caller prose to an operator-owned, bounded expectation."""
     if type(value) is not str or not value or len(value) > _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS:
         return "a valid value"
-    if value in _SAFE_TOOL_ARGUMENT_EXPECTATIONS:
-        return value
-
     lowered = value.casefold()
     if "object conforming to" in lowered:
-        return (
+        schema_expectation = (
             _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS[argument]
             if argument in _TOOL_ARGUMENT_SCHEMA_EXPECTATIONS
             else "an object conforming to the declared argument schema"
         )
+        # The JSON-schema producer (tools/_dispatch.py) appends a
+        # parenthesised one-error summary; only a ``type`` violation there is
+        # a type fault. Pydantic producers carry no summary and are
+        # classified from the chained cause when read (``expected``).
+        if "(" in value and "must be of type" not in lowered:
+            return schema_expectation
+        return schema_expectation + _TOOL_ARGUMENT_JSON_TYPE_GUIDANCE
+    if value in _SAFE_TOOL_ARGUMENT_EXPECTATIONS:
+        return value
     if "per session per utc day" in lowered:
-        return "within the per session per UTC day interpretation request limit"
+        return INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION
     if "per term" in lowered and ("at most" in lowered or "limit" in lowered):
-        return "within the per-term interpretation request limit"
+        return INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION
     if "prompt_template_parts" in lowered or "interpretation_ref" in lowered:
         return "prompt_template_parts interpretation_ref or placeholder wiring"
     if "preserves raw html/fingerprint field" in lowered:
@@ -1008,6 +1145,53 @@ def _canonical_tool_argument_actual_type(value: object) -> str:
     return "invalid value"
 
 
+class SchemaViolationCode(StrEnum):
+    """Closed code for one S-gate violation (S1 T9).
+
+    A subset of the pydantic canonicaliser's codes (``audit.py``), so the
+    compose loop renders both carriers with one fixed-message table. The
+    canonicaliser's ``invalid_value`` has no S-gate source, and ``truncated``
+    is a rendering of a violation count, never a violation.
+    """
+
+    MISSING = "missing"
+    UNEXPECTED = "unexpected"
+    INVALID_CHOICE = "invalid_choice"
+    INVALID_TYPE = "invalid_type"
+    OUT_OF_BOUNDS = "out_of_bounds"
+    INVALID = "invalid"
+
+
+SCHEMA_VIOLATION_MAX_LOC_DEPTH: Final[int] = 4
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SchemaViolation:
+    """One closed S-gate violation: where (``loc``) and what kind (``code``).
+
+    ``loc`` holds only schema-declared property names or the generic
+    ``field``/``item``/``index`` tokens; the S gate never places a
+    model-authored key in it (plan C10). At most four segments.
+    """
+
+    loc: tuple[str, ...]
+    code: SchemaViolationCode
+
+    def __post_init__(self) -> None:
+        if type(self.loc) is not tuple or len(self.loc) > SCHEMA_VIOLATION_MAX_LOC_DEPTH:
+            raise ValueError("SchemaViolation.loc must be a tuple of at most 4 segments")
+        for segment in self.loc:
+            if type(segment) is not str or not segment or len(segment) > _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS:
+                raise ValueError("SchemaViolation.loc segments must be non-empty strings")
+        if type(self.code) is not SchemaViolationCode:
+            raise ValueError("SchemaViolation.code must be a SchemaViolationCode")
+
+
+def _valid_schema_violations(value: object) -> TypeGuard[tuple[SchemaViolation, ...]]:
+    return type(value) is tuple and all(type(item) is SchemaViolation for item in value)
+
+
 @final
 class ToolArgumentError(Exception):
     """Raised by a tool handler when LLM-supplied arguments are unusable.
@@ -1020,8 +1204,9 @@ class ToolArgumentError(Exception):
     This is the ONLY exception class the compose loop catches around
     execute_tool(). Any other TypeError/ValueError/UnicodeError/KeyError
     escaping a tool handler is a plugin bug and MUST crash — per
-    CLAUDE.md, plugin bugs that silently produce wrong results are worse
-    than a crash because they pollute the audit trail with confidently
+    docs/guides/data-trust-and-error-handling.md §Plugin Ownership: System
+    Code, Not User Code, plugin bugs that silently produce wrong results are
+    worse than a crash because they pollute the audit trail with confidently
     wrong data.
 
     Inheritance rationale: this class inherits from ``Exception`` directly,
@@ -1098,8 +1283,10 @@ class ToolArgumentError(Exception):
     __slots__ = (
         "_safe_actual_type",
         "_safe_argument",
+        "_safe_category",
         "_safe_code",
         "_safe_expected",
+        "_safe_schema_violations",
         "_tool_argument_error_sealed",
     )
 
@@ -1107,15 +1294,19 @@ class ToolArgumentError(Exception):
         {
             "_safe_actual_type",
             "_safe_argument",
+            "_safe_category",
             "_safe_code",
             "_safe_expected",
+            "_safe_schema_violations",
             "_tool_argument_error_sealed",
             "actual_type",
             "args",
             "argument",
+            "category",
             "code",
             "expected",
             "safe_message",
+            "schema_violations",
         }
     )
     _RUNTIME_MUTABLE_ATTRS: ClassVar[frozenset[str]] = frozenset(
@@ -1138,7 +1329,11 @@ class ToolArgumentError(Exception):
         expected: str,
         actual_type: str,
         code: str | None = None,
+        category: ToolArgumentErrorCategory | None = None,
+        schema_violations: tuple[SchemaViolation, ...] = (),
     ) -> None:
+        if not _valid_schema_violations(schema_violations):
+            raise ValueError("ToolArgumentError.schema_violations must be a tuple of SchemaViolation")
         if type(argument) is not str or not argument:
             raise ValueError("ToolArgumentError.argument must be a non-empty identifier")
         if type(expected) is not str or not expected:
@@ -1147,6 +1342,7 @@ class ToolArgumentError(Exception):
             raise ValueError("ToolArgumentError.actual_type must be a non-empty type name")
         if code is not None and (type(code) is not str or code not in _TOOL_ARGUMENT_ERROR_CODES):
             raise ValueError("ToolArgumentError received an unsupported code")
+        safe_category = _resolve_tool_argument_category(code, category)
 
         safe_argument = _canonical_tool_argument_name(argument)
         safe_expected = _canonical_tool_argument_expectation(expected, safe_argument)
@@ -1157,6 +1353,8 @@ class ToolArgumentError(Exception):
         BaseException.__setattr__(self, "_safe_expected", safe_expected)
         BaseException.__setattr__(self, "_safe_actual_type", safe_actual_type)
         BaseException.__setattr__(self, "_safe_code", code)
+        BaseException.__setattr__(self, "_safe_category", safe_category)
+        BaseException.__setattr__(self, "_safe_schema_violations", schema_violations)
         super().__init__(safe_message)
         BaseException.__setattr__(self, "_tool_argument_error_sealed", True)
 
@@ -1178,11 +1376,14 @@ class ToolArgumentError(Exception):
             value = BaseException.__getattribute__(self, "_safe_expected")
         except AttributeError:
             return "a valid value"
-        return (
-            value
-            if type(value) is str and len(value) <= _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS and value in _SAFE_TOOL_ARGUMENT_EXPECTATIONS
-            else "a valid value"
-        )
+        if type(value) is not str or len(value) > _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS or value not in _SAFE_TOOL_ARGUMENT_EXPECTATIONS:
+            return "a valid value"
+        # ``raise ... from exc`` binds the Pydantic cause after construction,
+        # so the type-shape decision is made on read. The cause can only
+        # choose between two operator-owned strings, both in the closed set.
+        if value.endswith(_TOOL_ARGUMENT_JSON_TYPE_GUIDANCE) and _cause_rules_out_json_type_guidance(self.__cause__):
+            return value[: -len(_TOOL_ARGUMENT_JSON_TYPE_GUIDANCE)]
+        return value
 
     @expected.setter
     def expected(self, value: object) -> None:
@@ -1220,6 +1421,41 @@ class ToolArgumentError(Exception):
 
     @code.setter
     def code(self, value: object) -> None:
+        del value
+
+    @property
+    def category(self) -> ToolArgumentErrorCategory:
+        try:
+            value = BaseException.__getattribute__(self, "_safe_category")
+        except AttributeError:
+            raise FrameworkBugError("ToolArgumentError classification category is missing") from None
+        if type(value) is ToolArgumentErrorCategory:
+            return value
+        raise FrameworkBugError("ToolArgumentError classification category is invalid")
+
+    @category.setter
+    def category(self, value: object) -> None:
+        del value
+
+    @property
+    def schema_violations(self) -> tuple[SchemaViolation, ...]:
+        """Closed S-gate violations (empty when the rejection is not the S gate's).
+
+        Rendered only by the compose loop's ``arg_error_payload``. A corrupt
+        backing value reads as empty, like the display fallbacks: the
+        violations are a repair hint, not the failure's classification. The
+        constructor always binds the slot, so its absence is a framework bug.
+        """
+        try:
+            value = BaseException.__getattribute__(self, "_safe_schema_violations")
+        except AttributeError:
+            raise FrameworkBugError("ToolArgumentError schema violations are missing") from None
+        if _valid_schema_violations(value):
+            return value
+        return ()
+
+    @schema_violations.setter
+    def schema_violations(self, value: object) -> None:
         del value
 
     @property
@@ -1271,6 +1507,12 @@ class ComposerSettings(Protocol):
     def composer_model(self) -> str: ...
 
     @property
+    def composer_pricing_model(self) -> str | None: ...
+
+    @property
+    def compartment_id(self) -> str | None: ...
+
+    @property
     def composer_endpoint_base_url(self) -> str | None: ...
 
     @property
@@ -1281,6 +1523,9 @@ class ComposerSettings(Protocol):
 
     @property
     def composer_seed(self) -> int | None: ...
+
+    @property
+    def composer_strict_tools(self) -> StrictToolsSetting: ...
 
     @property
     def composer_discovery_reasoning_effort(self) -> str: ...
@@ -1323,6 +1568,9 @@ class ComposerSettings(Protocol):
 
     @property
     def composer_advisor_model(self) -> str: ...
+
+    @property
+    def composer_advisor_pricing_model(self) -> str | None: ...
 
     @property
     def composer_advisor_endpoint_base_url(self) -> str | None: ...
@@ -1380,9 +1628,11 @@ class ComposerService(Protocol):
         current_state_id: str | None = None,
         user_id: str | None = None,
         progress: ComposerProgressSink | None = None,
-        guided_terminal: TerminalState | None = None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        # Durable advisor gate fact from the prior state row (ruling
+        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 
@@ -1401,9 +1651,6 @@ class ComposerService(Protocol):
                 persisted session row. Used as the stale-state guard for
                 compose-loop tool-call audit persistence.
             user_id: Current user ID. Passed through to secret tools.
-            guided_terminal: When set, the resolved TerminalState from the
-                completed guided session; triggers the layered mode-transition
-                prompt for this first freeform turn (spec §8.2).
             user_message_id: Database id of the just-persisted user
                 ``chat_messages`` row that triggered this compose call
                 (Phase 5a Task 2.5). Threaded through the compose loop into
@@ -1422,115 +1669,12 @@ class ComposerService(Protocol):
             ComposerConvergenceError: If the loop exceeds max_turns.
         """
 
-    async def plan_guided_pipeline(
-        self,
-        *,
-        intent: str,
-        current_state: CompositionState,
-        guided: GuidedSession,
-        originating_message: PlannerOriginatingMessage,
-        base: PresentBase,
-        user_id: str | None,
-        supersedes_draft_hash: str | None,
-        recorder: BufferingRecorder,
-        operation_fence: GuidedOperationFence,
-        session_operation_context: SessionOperationContext,
-        progress: ComposerProgressSink | None = None,
-        correction_target: GuidedCorrectionTarget | None = None,
-        revision_authority: GuidedRevisionAuthority | None = None,
-        root_goal: str | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
-        """Run the shared planner once with split private/provider-safe facts.
-
-        ``root_goal`` is the outcome the author stated when the session
-        started, carried as a NAMED reviewed fact on a correction or revision
-        only — never folded into ``intent``, which always means "the request
-        being made now". A revision that narrows or withdraws part of the goal
-        would otherwise argue against the goal inside the one field the
-        planner (and the deterministic request guards that parse it) read as
-        the current request.
-        """
-        ...
-
-    async def plan_guided_full_pipeline(
-        self,
-        *,
-        intent: str,
-        current_state: CompositionState,
-        originating_message: PlannerOriginatingMessage,
-        base: PresentBase,
-        policy_catalog: PolicyCatalogView,
-        plugin_snapshot: PluginAvailabilitySnapshot,
-        recorder: BufferingRecorder,
-        operation_fence: GuidedOperationFence,
-        session_operation_context: SessionOperationContext,
-        progress: ComposerProgressSink | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
-        """Plan one ordinary guided-full proposal through the shared planner."""
-        ...
-
-    async def surface_pending_interpretation_reviews(
-        self,
-        state: CompositionState,
-        *,
-        session_id: str | None,
-        current_state_id: str | None,
-        only_missing_evidence: bool = False,
-        session_operation_context: SessionOperationContext,
-    ) -> None:
-        """Kind-general backend surfacer for the GUIDED commit path (B1).
-
-        Surfaces a resolvable pending interpretation EVENT for every
-        interpretation site on ``state`` whose writer-boundary precondition
-        holds (every ``InterpretationKind`` member). Called by the guided
-        route persistence seam (``post_guided_respond``) after every committed
-        source or transform commit, because the guided dispatch path
-        never reaches the freeform fail-closed orphan gate, and by the
-        /validate backstop (elspeth-03f5728c33) with
-        ``only_missing_evidence=True`` to repair states stranded by a compose
-        that died after persisting its mutating turn — repair mode leaves every
-        site already carrying evidence in any resolution status alone.
-        Advisory polarity: the run-time
-        ``UnresolvedInterpretationPlaceholderError`` gate stays the hard
-        backstop. Idempotent; a no-op when there is no session/persisted
-        state. See P3.1 for the concrete implementation.
-        """
-        ...
-
-    async def run_signoff_checkpoint(
-        self,
-        *,
-        state: CompositionState,
-        session_id: str | None,
-        recorder: BufferingRecorder | None,
-        progress: ComposerProgressSink | None = None,
-        user_message: str | None = None,
-    ) -> AdvisorCheckpointVerdict:
-        """Run the deterministic END evidence-scoped completion advisory checkpoint.
-
-        Public façade over the private ``_run_advisor_checkpoint(phase='end')``
-        so the guided STEP_4_WIRE dispatcher — which holds a ``ComposerService``
-        handle but not the impl's private methods — can request an
-        evidence-scoped completion advisory verdict. Non-raising: a sustained
-        provider failure yields ``ok=False`` (unavailable); a FLAGGED review yields
-        ``blocking=True``; CLEAN yields ``ok=True, blocking=False``. The caller
-        (the wire branch) maps the verdict to terminal/redirect per D13.
-
-        ``recorder`` threads the advisor call's audit sidecar; ``progress``
-        (when set) receives a ``calling_model`` event before the call.
-        ``user_message`` (R2-F8a, elspeth-583c2a0792) is the originating user
-        chat turn, forwarded so the advisor can compare the supplied pipeline
-        evidence with explicit constraints visible in the bounded excerpt
-        (schema mode, field names/types, named plugins/values); optional and
-        rendered inside the existing untrusted fence.
-        """
-        ...
-
     async def explain_run_diagnostics(
         self,
         snapshot: Mapping[str, object],
         *,
         recorder: BufferingRecorder | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> str:
         """Explain a bounded run diagnostics snapshot without mutating state."""
         ...

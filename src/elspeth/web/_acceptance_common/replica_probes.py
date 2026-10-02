@@ -1,7 +1,7 @@
 """The replicas > 1 probes: one driver, one decision table, a closed ``mechanism`` vocabulary.
 
-The four probes (plan §7) are what an acceptance run must prove before a
-deployment target may claim "replicas > 1". They are written once here and
+The legacy probes (plan §7) define this acceptance receipt's evidence scope,
+not the complete current multi-replica runtime. They are written once here and
 driven against a :class:`ReplicaController` port (address a replica, partition
 or stop the owner, restore it) and an :class:`EvidenceObserver` port (read the
 database facts a probe scores). Each provider supplies its two ports; the
@@ -12,12 +12,13 @@ the ``mechanism`` that produced its evidence from a closed set, each probe may
 only claim the mechanisms the tree actually has for it, and P4b cannot be
 constructed with any outcome but ``cannot_pass``:
 
-- **P1** concurrent guided operations on one session from two replicas end in
-  a fence conflict, never a double dispatch — ``session_operation_fence``.
+- **P1** concurrent freeform message ingress on one session from two replicas
+  ends in a fence conflict and one durable ingress receipt, never a double
+  dispatch — ``session_operation_fence``.
 - **P2** concurrent run starts end in one run and one 409 —
   ``session_operation_fence_execute``. The result has no field for a
-  ``run_start_permits`` row because nothing in the tree writes one; the
-  durable permit saga is a recorded follow-up, not a claim.
+  ``run_start_permits`` row: the legacy receipt measures fence contention,
+  not a durable permit saga or cross-database dispatch recovery.
 - **P3** a survivor takes a dead owner's lease over only after it expires —
   ``role_revocation_lease_expiry`` (the primary primitive: the owner's
   database role is revoked with ``ALTER ROLE … NOLOGIN`` and its backends
@@ -25,14 +26,13 @@ constructed with any outcome but ``cannot_pass``:
   ``revision_deactivate_lease_expiry`` (the secondary, a grace-0 platform
   stop). If the owner's membership row reads ``stopped`` or ``draining`` the
   owner *did* reach its lifecycle release path, so the result **downgrades**
-  to ``graceful_stop``: a takeover happened, but not from a dead owner. Until
-  the membership authority ships (6b-2) no row exists and the probe is
-  reported ``unreachable``, stated as such.
+  to ``graceful_stop``: a takeover happened, but not from a dead owner. Missing
+  owner membership is reported ``unreachable`` rather than inferred.
 - **P4a** database-backed state and blob bytes written on one replica are
   visible from the other within one poll interval — ``postgresql_and_nfs``.
-- **P4b** the live progress stream and the WebSocket ticket are owner-affine
-  today; the probe records ``owner_affine`` and the production mitigation and
-  **cannot** pass.
+- **P4b** the legacy contract does not measure durable progress or peer ticket
+  consumption. It retains ``owner_affine`` and the production mitigation and
+  **cannot** pass, independently of newer runtime capabilities.
 
 **Timezones.** Every datetime a decision compares must be timezone-aware; the
 driver converts to UTC before comparing and refuses a naive value with
@@ -47,12 +47,13 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Final, Literal, TypedDict
+from uuid import UUID
 
-from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 
 from .errors import AcceptanceCheckError, AcceptanceInputError
@@ -113,6 +114,14 @@ DEFAULT_TRIALS: Final = 20
 DEFAULT_MAX_DISPATCH_SPREAD_MS: Final = 5.0
 
 
+def require_contention_trials(value: int) -> int:
+    """The acceptance plan requires at least twenty independent contention pairs."""
+
+    if type(value) is not int or value < DEFAULT_TRIALS:
+        raise AcceptanceInputError(f"contention trials must be an integer at least {DEFAULT_TRIALS}")
+    return value
+
+
 class ProbeReceiptDetails(TypedDict):
     """The closed detail set a probe result contributes to a receipt."""
 
@@ -148,6 +157,18 @@ class ProbeResult:
             raise ValueError("reasons must be non-empty bounded strings")
         if any(type(key) is not str or not key for key in self.evidence):
             raise ValueError("evidence keys must be non-empty strings")
+        if self.outcome == "pass" and self.probe in {"P1", "P2"}:
+            if "trials" not in self.evidence:
+                raise ValueError("passing contention evidence requires a trial count")
+            trials = self.evidence["trials"]
+            if type(trials) is not int or trials < DEFAULT_TRIALS:
+                raise ValueError("passing contention evidence requires at least twenty trials")
+            if self.probe == "P1":
+                if "distinct_winners" not in self.evidence:
+                    raise ValueError("passing P1 evidence requires a winner count")
+                winners = self.evidence["distinct_winners"]
+                if type(winners) is not int or not 2 <= winners <= trials:
+                    raise ValueError("passing P1 evidence requires distinct winners")
         freeze_fields(self, "evidence")
 
     def to_receipt_details(self) -> ProbeReceiptDetails:
@@ -156,7 +177,7 @@ class ProbeResult:
             "outcome": self.outcome,
             "mechanism": self.mechanism,
             "reasons": list(self.reasons),
-            "evidence": dict(self.evidence),
+            "evidence": {key: deep_thaw(value) for key, value in self.evidence.items()},
         }
 
 
@@ -184,13 +205,13 @@ class ReplicaResponse:
 
 @dataclass(frozen=True)
 class FenceConflictTrial:
-    """P1: one concurrent pair of guided operations and the fence facts around it."""
+    """P1: one concurrent freeform message pair and its durable fence facts."""
 
     responses: tuple[ReplicaResponse, ReplicaResponse]
     fence_epoch_before: int
     fence_epoch_after: int
     fence_owner_after: str | None
-    guided_operation_rows: int
+    message_ingress_receipt_rows: int
     dispatch_spread_ms: float
 
 
@@ -198,8 +219,8 @@ class FenceConflictTrial:
 class RunStartTrial:
     """P2: one concurrent pair of run starts and the run rows they produced.
 
-    There is deliberately no ``run_start_permit`` field: nothing in the tree
-    writes ``run_start_permits``, so a receipt has no way to assert one.
+    There is deliberately no ``run_start_permit`` field: the legacy receipt
+    measures run-start contention, not permit durability or dispatch recovery.
     """
 
     responses: tuple[ReplicaResponse, ReplicaResponse]
@@ -272,6 +293,7 @@ def decide_fence_conflict(
 ) -> ProbeResult:
     """P1: every trial is exactly one success and one fence refusal from two distinct replicas."""
 
+    require_contention_trials(required_trials)
     reasons: list[str] = []
     if len(trials) != required_trials:
         reasons.append(f"trial_count:{len(trials)}!={required_trials}")
@@ -291,8 +313,8 @@ def decide_fence_conflict(
             reasons.append(f"trial[{index}]:fence_epoch_not_advanced_by_one")
         if trial.fence_owner_after != winner:
             reasons.append(f"trial[{index}]:fence_owner_is_not_the_winner")
-        if trial.guided_operation_rows != 1:
-            reasons.append(f"trial[{index}]:guided_operation_rows:{trial.guided_operation_rows}!=1")
+        if trial.message_ingress_receipt_rows != 1:
+            reasons.append(f"trial[{index}]:message_ingress_receipt_rows:{trial.message_ingress_receipt_rows}!=1")
         if trial.dispatch_spread_ms > max_dispatch_spread_ms:
             reasons.append(f"trial[{index}]:dispatch_spread_ms:{trial.dispatch_spread_ms:.3f}>{max_dispatch_spread_ms}")
     if trials and len(winners) < 2:
@@ -314,6 +336,7 @@ def decide_run_start(
 ) -> ProbeResult:
     """P2: every trial is one accepted run and one fence refusal, and exactly one run row exists."""
 
+    require_contention_trials(required_trials)
     reasons: list[str] = []
     if len(trials) != required_trials:
         reasons.append(f"trial_count:{len(trials)}!={required_trials}")
@@ -374,6 +397,8 @@ def decide_lease_takeover(observation: LeaseTakeoverObservation) -> ProbeResult:
         reasons.append(f"owner_row_state_unknown:{row.state}")
     if not observation.before_expiry.refused_by_fence:
         reasons.append("survivor_not_refused_before_lease_expiry")
+    if observation.before_expiry.instance_id != observation.survivor_instance_id:
+        reasons.append("before_expiry_response_not_from_survivor")
     if takeover_observed_at <= lease_expires_at:
         reasons.append("takeover_observed_before_lease_expiry")
     if not observation.after_expiry.succeeded:
@@ -398,6 +423,22 @@ def decide_lease_takeover(observation: LeaseTakeoverObservation) -> ProbeResult:
             "owner_row_state": row.state,
             "lease_expires_at": lease_expires_at.isoformat().replace("+00:00", "Z"),
             "takeover_observed_at": takeover_observed_at.isoformat().replace("+00:00", "Z"),
+            "observation": {
+                "primitive": observation.primitive,
+                "owner_instance_id": observation.owner_instance_id,
+                "survivor_instance_id": observation.survivor_instance_id,
+                "owner_row": {
+                    "instance_id": row.instance_id,
+                    "state": row.state,
+                    "lease_expires_at": lease_expires_at.isoformat().replace("+00:00", "Z"),
+                },
+                "before_expiry": asdict(observation.before_expiry),
+                "after_expiry": asdict(observation.after_expiry),
+                "takeover_observed_at": takeover_observed_at.isoformat().replace("+00:00", "Z"),
+                "cancelled_run_reason": observation.cancelled_run_reason,
+                "fence_owner_after": observation.fence_owner_after,
+                "duplicate_sink_effects": observation.duplicate_sink_effects,
+            },
         },
     )
 
@@ -426,18 +467,18 @@ def decide_cross_replica_progress(observation: CrossReplicaProgressObservation) 
         outcome="pass" if not reasons else "fail",
         mechanism="postgresql_and_nfs",
         reasons=tuple(reasons),
-        evidence={"poll_interval_seconds": observation.poll_interval_seconds},
+        evidence={"poll_interval_seconds": observation.poll_interval_seconds, "observation": asdict(observation)},
     )
 
 
 def record_owner_affine_progress(*, mitigation: Literal["single_revision_sticky_sessions"]) -> ProbeResult:
-    """P4b: the live progress stream and WebSocket ticket are owner-affine; recorded, never passed."""
+    """P4b retains its legacy mechanism; durable progress is not measured and cannot pass here."""
 
     return ProbeResult(
         probe="P4b",
         outcome="cannot_pass",
         mechanism="owner_affine",
-        reasons=("progress_stream_and_websocket_ticket_are_process_local",),
+        reasons=("legacy_p4b_contract_does_not_measure_durable_progress",),
         evidence={"mitigation": mitigation},
     )
 
@@ -481,7 +522,7 @@ class EvidenceObserver(ABC):
     def fence_owner(self, session_id: str) -> str | None: ...
 
     @abstractmethod
-    def guided_operation_rows(self, session_id: str, *, since_epoch: int) -> int: ...
+    def message_ingress_receipt_rows(self, session_id: str, *, client_request_id: str) -> int: ...
 
     @abstractmethod
     def runs_row_ids(self, session_id: str) -> tuple[str, ...]: ...
@@ -535,23 +576,30 @@ class ReplicaProbeDriver:
         observer: EvidenceObserver,
         client_factory: Callable[[str], AcceptanceHttpClient],
         clock: Callable[[], float] = time.monotonic,
+        pinned_clients: tuple[AcceptanceHttpClient, AcceptanceHttpClient] | None = None,
     ) -> None:
         self._controller = controller
         self._observer = observer
         self._client_factory = client_factory
         self._clock = clock
+        self._pinned_clients = pinned_clients
+        if pinned_clients is not None:
+            addresses = controller.replicas()
+            if pinned_clients[0] is pinned_clients[1] or any(
+                client.origin != address.origin for client, address in zip(pinned_clients, addresses, strict=True)
+            ):
+                raise AcceptanceInputError("pinned clients must be distinct and match ordered replica origins")
 
     def fire_pair(self, request: ProbeRequest, *, expected_statuses: set[int]) -> tuple[tuple[ReplicaResponse, ReplicaResponse], float]:
         """Send ``request`` to both replicas, released together; return the responses and the dispatch spread in ms."""
 
         first, second = self._controller.replicas()
-        if first.name == second.name or first.origin == second.origin:
+        if first.name == second.name or (first.origin == second.origin and self._pinned_clients is None):
             raise AcceptanceInputError("replica probes need two distinct replicas")
-        barrier = threading.Barrier(2)
+        barrier = threading.Barrier(2, timeout=30.0)
         sent_at: dict[str, float] = {}
 
-        def fire(address: ReplicaAddress) -> ReplicaResponse:
-            client = self._client_factory(address.origin)
+        def send(address: ReplicaAddress, client: AcceptanceHttpClient) -> ReplicaResponse:
             barrier.wait()
             sent_at[address.name] = self._clock()
             status, instance_id, body = client.request_json_with_instance(
@@ -562,14 +610,32 @@ class ReplicaProbeDriver:
             )
             return replica_response_from_envelope(addressed_to=address.name, status=status, instance_id=instance_id, body=body)
 
+        def fire(address: ReplicaAddress, index: int) -> ReplicaResponse:
+            if self._pinned_clients is not None:
+                return send(address, self._pinned_clients[index])
+            with self._client_factory(address.origin) as client:
+                client.authenticate(register=False)
+                return send(address, client)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            futures = (pool.submit(fire, first), pool.submit(fire, second))
+            futures = (pool.submit(fire, first, 0), pool.submit(fire, second, 1))
             responses = (futures[0].result(), futures[1].result())
         spread_ms = abs(sent_at[first.name] - sent_at[second.name]) * 1000.0
         return responses, spread_ms
 
     def fence_conflict_trial(self, session_id: str, request: ProbeRequest) -> FenceConflictTrial:
-        """One P1 trial: read the fence, fire the pair, read the fence and the operation rows again."""
+        """One P1 trial: fire one freeform request on both replicas and read its receipt."""
+
+        body = request.json_body
+        if type(body) is not dict or type(body.get("client_request_id")) is not str:
+            raise AcceptanceInputError("P1 requires a client_request_id in the freeform message body")
+        request_id = body["client_request_id"]
+        try:
+            parsed_request_id = UUID(request_id)
+        except ValueError as exc:
+            raise AcceptanceInputError("P1 client_request_id must be a canonical UUID") from exc
+        if str(parsed_request_id) != request_id:
+            raise AcceptanceInputError("P1 client_request_id must be a canonical UUID")
 
         epoch_before = self._observer.fence_epoch(session_id)
         responses, spread_ms = self.fire_pair(request, expected_statuses={200, 202, 409})
@@ -578,17 +644,26 @@ class ReplicaProbeDriver:
             fence_epoch_before=epoch_before,
             fence_epoch_after=self._observer.fence_epoch(session_id),
             fence_owner_after=self._observer.fence_owner(session_id),
-            guided_operation_rows=self._observer.guided_operation_rows(session_id, since_epoch=epoch_before),
+            message_ingress_receipt_rows=self._observer.message_ingress_receipt_rows(session_id, client_request_id=request_id),
             dispatch_spread_ms=spread_ms,
         )
 
-    def run_start_trial(self, session_id: str, request: ProbeRequest) -> RunStartTrial:
-        """One P2 trial: fire the pair, then read the run rows the session now has."""
+    def run_start_trial(self, session_id: str, request: ProbeRequest, *, observation_timeout_seconds: float = 30.0) -> RunStartTrial:
+        """One P2 trial against a fresh prepared session; historical runs invalidate isolation."""
 
+        if self._observer.runs_row_ids(session_id) or self._observer.landscape_run_ids(session_id):
+            raise AcceptanceCheckError("probe_session_not_fresh")
         responses, spread_ms = self.fire_pair(request, expected_statuses={202, 409})
+        # HTTP 202 follows worker submission; the worker creates its Landscape
+        # row asynchronously. Observe its durable publication before scoring.
+        deadline = time.monotonic() + observation_timeout_seconds
+        landscape_ids = self._observer.landscape_run_ids(session_id)
+        while not landscape_ids and time.monotonic() < deadline:
+            time.sleep(0.05)
+            landscape_ids = self._observer.landscape_run_ids(session_id)
         return RunStartTrial(
             responses=responses,
             runs_row_ids=self._observer.runs_row_ids(session_id),
-            landscape_run_ids=self._observer.landscape_run_ids(session_id),
+            landscape_run_ids=landscape_ids,
             dispatch_spread_ms=spread_ms,
         )

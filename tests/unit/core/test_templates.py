@@ -7,6 +7,8 @@ import textwrap
 
 import pytest
 
+from elspeth.core.templates import Jinja2FieldExtraction
+
 
 class TestExtractJinja2Fields:
     """Tests for extract_jinja2_fields function."""
@@ -202,7 +204,8 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{{ (row | attr('get'))(row.selector) }}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("attr",)
+        # attr('get') names the row's one method without calling it in place.
+        assert result.dynamic_accesses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     def test_row_alias_derived_map_attribute_filter_reported_by_usage(self) -> None:
@@ -222,7 +225,8 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{% set r = row %}{{ (r | attr('get'))(r.selector) }}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("attr",)
+        # attr('get') names the row's one method without calling it in place.
+        assert result.dynamic_accesses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     def test_with_row_alias_derived_map_attribute_filter_reported_by_usage(self) -> None:
@@ -242,7 +246,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{% set g = row.get %}{{ g(row.selector) }}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -260,7 +267,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage(template)
 
         assert result.fields == frozenset()
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     def test_container_carried_row_get_alias_dynamic_key_reported_by_usage(self) -> None:
@@ -270,7 +280,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{% set ns = namespace(g=row.get) %}{{ ns.g(row.selector) }}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -287,7 +300,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage(template)
 
         assert result.fields == frozenset()
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     def test_namespace_assigned_row_alias_dynamic_get_reported_by_usage(self) -> None:
@@ -317,7 +333,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{% set xs = [row.get] %}{{ xs[0](row.selector) }}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     def test_loop_target_from_row_get_alias_collection_reported_by_usage(self) -> None:
@@ -327,7 +346,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage("{% set xs = [row.get] %}{% for g in xs %}{{ g(row.selector) }}{% endfor %}")
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -354,7 +376,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage(template)
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -375,7 +400,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage(template)
 
         assert result.fields == frozenset({"selector"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -399,7 +427,10 @@ class TestExtractJinja2Fields:
         result = extract_jinja2_field_usage(template)
 
         assert result.fields <= frozenset({"selector", "idx"})
-        assert result.dynamic_accesses == ("get",)
+        # The carrier analysis still sees the dynamic get; naming row.get without a
+        # call is itself refused under every declaration (the one row API).
+        assert result.computed_key_accesses == ("get",)
+        assert result.row_api_misuses == ("get-uncalled",)
         assert result.has_dynamic_access is True
 
     @pytest.mark.parametrize(
@@ -1045,6 +1076,218 @@ class TestExtractJinja2Fields:
                 "special_notes",
             }
         )
+
+
+class TestWholeRowIsNotAConfigurationQuestion:
+    """The extractor does not judge a whole row used as a value (ADR-051).
+
+    At render a template's row holds only the node's declared fields
+    (``TemplateRow.project``), so ``row|dictsort``, ``dict(row)`` or a row
+    carried through a list, loop or macro argument can only ever see declared
+    fields. That is the confidentiality guarantee, by construction; this
+    analysis is configuration's early error and does not claim it. The leak
+    corpus the retired whole-row gate chased lives on as runtime projection
+    tests (tests/unit/plugins/infrastructure/test_template_projection.py).
+    """
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{{ row | dictsort }}",
+            "{{ dict(row) }}",
+            "{{ '%(secret)s' % row }}",
+            "{% for a, b in [(1, [row])] %}{{ b[0] | dictsort }}{% endfor %}",
+            "{% macro m() %}{{ varargs[0] | dictsort }}{% endmacro %}{{ m(row) }}",
+        ],
+    )
+    def test_a_whole_row_used_as_a_value_reports_no_dynamic_access(self, template: str) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        assert extract_jinja2_field_usage(template).dynamic_accesses == ()
+
+
+class TestImplicitMacroArguments:
+    """Arguments Jinja hands a macro or call block beyond its declared parameters are tracked (S0 fix round 2).
+
+    Jinja binds extra positionals to the body's ``varargs`` and unmatched keywords
+    to its ``kwargs`` whenever the body names them; ``caller(...)`` binds a call
+    block's parameters by position, keyword or default the same way.
+    """
+
+    @pytest.mark.parametrize(
+        ("template", "fields", "dynamic"),
+        [
+            ("{% macro m() %}{{ varargs[0].secret }}{% endmacro %}{{ row.note }} {{ m(row) }}", {"note", "secret"}, ()),
+            ("{% macro m() %}{{ kwargs.r.secret }}{% endmacro %}{{ row.note }} {{ m(r=row) }}", {"note", "secret"}, ()),
+            ("{% macro m(a) %}{{ varargs[0]['Amount USD'] }}{% endmacro %}{{ m(1, row) }}", {"Amount USD"}, ()),
+            ("{% macro m() %}{% for v in varargs %}{{ v.secret }}{% endfor %}{% endmacro %}{{ m(row, row) }}", {"secret"}, ()),
+            ("{% macro m() %}{{ caller(x=row) }}{% endmacro %}{% call(x) m() %}{{ x.secret }}{% endcall %}", {"secret"}, ()),
+            ("{% macro m() %}{{ caller() }}{% endmacro %}{% call(x=row) m() %}{{ x.secret }}{% endcall %}", {"secret"}, ()),
+            ("{% macro m() %}{{ caller(row) }}{% endmacro %}{% call m() %}{{ varargs[0].secret }}{% endcall %}", {"secret"}, ()),
+            # A tuple holding a row is a row collection, so every item may be the row: the key is computed.
+            ("{% macro m() %}{{ varargs[0][varargs[1]] }}{% endmacro %}{{ m(row, row.note) }}", {"note"}, ("item",)),
+            ("{% macro m() %}{{ varargs[0]('secret') }}{% endmacro %}{{ m(row.get) }}", set(), ("get", "get-uncalled")),
+            (
+                "{% set c = [1, row.get] %}{% macro m(a) %}{{ varargs[0]('secret') }}{% endmacro %}{{ m(*c) }}",
+                set(),
+                ("get-uncalled", "get"),
+            ),
+            ("{% macro m() %}{{ varargs }}{% endmacro %}{{ m(1, 2) }}", set(), ()),
+            ("{% macro m() %}{{ varargs[0] | upper }}{% endmacro %}{{ m(row.note) }}", {"note"}, ()),
+        ],
+    )
+    def test_reads_through_varargs_kwargs_and_caller_are_extracted(self, template: str, fields: set[str], dynamic: tuple[str, ...]) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        result = extract_jinja2_field_usage(template)
+
+        assert result.fields == frozenset(fields)
+        assert result.dynamic_accesses == dynamic
+
+    def test_a_splat_that_starts_at_varargs_zero_is_bound_to_varargs_whole(self) -> None:
+        """``m(*c)`` into ``m()`` makes ``varargs`` the items of ``c``, so a row inside one is found by its path."""
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        result = extract_jinja2_field_usage(
+            "{% set c = [{'a': row}] %}{% macro m() %}{{ varargs[0].a.secret }}{{ varargs[0].a | dictsort }}{% endmacro %}{{ m(*c) }}"
+        )
+
+        # 'a' is the analysis's usual over-report for a lookup on a list that holds a row somewhere below.
+        assert result.fields == frozenset({"a", "secret"})
+        assert result.dynamic_accesses == ()
+
+    @pytest.mark.parametrize(
+        ("template", "expected"),
+        [
+            ("{% set c = [row.get] %}{% macro m() %}{{ varargs[1]('x') }}{% endmacro %}{{ m(1, *c) }}", ("get-uncalled", "get")),
+            ("{% set c = [1, row.get] %}{% macro m(a) %}{{ varargs[0]('x') }}{% endmacro %}{{ m(*c) }}", ("get-uncalled", "get")),
+            (
+                "{% set c = [row.contract] %}{% macro m() %}{{ caller(1, *c) }}{% endmacro %}{% call m() %}{{ varargs[1] }}{% endcall %}",
+                ("row-api",),
+            ),
+        ],
+    )
+    def test_row_api_in_a_splat_the_analysis_cannot_place_in_varargs_fails_closed(self, template: str, expected: tuple[str, ...]) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        assert extract_jinja2_field_usage(template).dynamic_accesses == expected
+
+    def test_a_row_in_a_splat_the_analysis_cannot_place_reports_nothing(self) -> None:
+        """Its field reads go unnamed; at render the row holds only the declared fields (ADR-051)."""
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        result = extract_jinja2_field_usage("{% set c = [row] %}{% macro m() %}{{ varargs[1].q }}{% endmacro %}{{ m(1, *c) }}")
+
+        assert result.dynamic_accesses == ()
+
+    def test_a_splat_of_the_row_itself_hands_on_names_only(self) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        result = extract_jinja2_field_usage("{% macro m(a) %}{{ varargs | join(',') }}{% endmacro %}{{ m(1, *row) }}")
+
+        assert result.dynamic_accesses == ()
+
+
+def _extract_within(template: str, seconds: float = 10.0) -> Jinja2FieldExtraction:
+    """Run the field-usage extractor on a thread; fail if it has not returned in time."""
+    import threading
+
+    from elspeth.core.templates import extract_jinja2_field_usage
+
+    outcome: list[Jinja2FieldExtraction] = []
+    worker = threading.Thread(target=lambda: outcome.append(extract_jinja2_field_usage(template)), daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), f"alias analysis did not terminate within {seconds}s"
+    return outcome[0]
+
+
+class TestAliasAnalysisTerminates:
+    """The alias fixpoint only ever widens, and a self-holding carrier stops at the path cap (S0 fix round 2)."""
+
+    @pytest.mark.parametrize(
+        ("template", "expected"),
+        [
+            # A name bound to two different API carriers or kinds used to be rewritten back and forth forever.
+            ("{% set a = [row.get] %}{% set a = {'k': row.get} %}{{ a }}", ("get-uncalled",)),
+            ("{% macro m(a) %}{{ a }}{% endmacro %}{{ m([row.get]) }}{{ m({'k': row.get}) }}", ("get-uncalled",)),
+            ("{% macro m(a) %}{{ a[0]('x') }}{% endmacro %}{{ m([1, row.get]) }}{{ m([row.get]) }}", ("get", "get-uncalled")),
+            ("{% macro m() %}{% endmacro %}{% set a = [m] %}{% set a = {'k': m} %}{{ a }}", ()),
+            ("{% macro m() %}{% endmacro %}{% macro n() %}{% endmacro %}{% set a = [m] %}{% set a = [n] %}{{ a }}", ()),
+            ("{% set g = row.get %}{% set g = row.contract %}{{ g }}", ("get-uncalled", "row-api")),
+            ("{% set ns = namespace() %}{% set ns.a = row.get %}{% set ns.a = row.contract %}{{ ns }}", ("get-uncalled", "row-api")),
+            ("{% for g in [row.get] %}{% endfor %}{% for g in [row.contract] %}{% endfor %}{{ g }}", ("get-uncalled", "row-api")),
+        ],
+    )
+    def test_a_name_bound_to_conflicting_values_joins_them(self, template: str, expected: tuple[str, ...]) -> None:
+        result = _extract_within(template)
+
+        assert result.dynamic_accesses == expected
+        assert result.fields == frozenset()
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{% set a = {'k': row} %}{% set a = {'k': a} %}{{ a }}",
+            "{% set a = {'k': row} %}{% set a = {'k': a, 'j': a} %}{{ a }}",
+            "{% set a = {'k': row.get} %}{% set a = {'k': a} %}{{ a }}",
+            "{% set ns = namespace(k=row) %}{% set ns.k = ns %}{{ ns }}",
+            "{% macro m() %}{% endmacro %}{% set a = [m] %}{% set a = [a] %}{{ a }}",
+        ],
+    )
+    def test_a_carrier_that_holds_itself_reports_the_carrier_limit(self, template: str) -> None:
+        result = _extract_within(template)
+
+        # The row.get case is also refused as a named, uncalled method.
+        assert result.computed_key_accesses == ("carrier-limit",)
+
+    def test_the_field_only_helpers_terminate_on_a_self_holding_carrier(self) -> None:
+        import threading
+
+        from elspeth.core.templates import extract_jinja2_fields, extract_jinja2_fields_with_details
+
+        template = "{% set a = {'k': row} %}{% set a = {'k': a} %}{{ a.k.note }}"
+        outcome: list[object] = []
+        worker = threading.Thread(
+            target=lambda: outcome.append((extract_jinja2_fields(template), extract_jinja2_fields_with_details(template))),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(10.0)
+
+        assert not worker.is_alive()
+        assert outcome == [(frozenset({"note"}), {"note": ["attr"]})]
+
+
+class TestNestedRowRoot:
+    """``row_attribute`` analyses ``<namespace>.<attribute>`` as the row (multi-query ``row.source_row``)."""
+
+    @pytest.mark.parametrize(
+        ("template", "expected"),
+        [
+            ("{{ row.source_row[row.k] }}", ("item",)),
+            ("{{ row['source_row'][row.k] }}", ("item",)),
+            ("{% set s = row.source_row %}{{ s[row.k] }}", ("item",)),
+            ("{{ row.source_row.get(row.k) }}", ("get",)),
+            ("{{ row.source_row.contract }}", ("row-api",)),
+            ("{{ row.source_row | dictsort }}", ()),
+        ],
+    )
+    def test_reads_through_the_nested_row_are_classified(self, template: str, expected: tuple[str, ...]) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        assert extract_jinja2_field_usage(template, row_attribute="source_row").dynamic_accesses == expected
+
+    def test_literal_reads_through_the_nested_row_are_its_fields(self) -> None:
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        result = extract_jinja2_field_usage(
+            "{{ row.text }} {{ row.source_row.title }} {{ row['source_row']['body'] }} {{ row.source_row.get('kind') }} {{ row.source_row }}",
+            row_attribute="source_row",
+        )
+
+        assert result.fields == frozenset({"title", "body", "kind"})
+        assert result.dynamic_accesses == ()
 
 
 class TestExtractJinja2FieldsWithDetails:

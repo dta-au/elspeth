@@ -80,7 +80,7 @@ test.describe("graph a11y component list — keyboard path", () => {
       (createdSessionId) => deleteWorkspaceScenario(page, createdSessionId),
     );
     try {
-      await composer.artifactTab("Graph").click();
+      await composer.artifactTab("Workflow").click();
       const list = page.getByRole("list", { name: /pipeline components in source-to-sink order/i });
       await expect(list).toBeAttached();
 
@@ -90,7 +90,7 @@ test.describe("graph a11y component list — keyboard path", () => {
       await expectCollapsed(list);
 
       // Tab from the Graph tab until focus lands inside the list (the reveal).
-      await composer.artifactTab("Graph").focus();
+      await composer.artifactTab("Workflow").focus();
       await tabUntilFocusWithin(page, list);
       await expectRevealed(list);
       const items = list.getByRole("button");
@@ -162,13 +162,13 @@ test.describe("graph a11y component list — keyboard path", () => {
         (createdSessionId) => deleteWorkspaceScenario(page, createdSessionId),
       );
       try {
-        await composer.artifactTab("Graph").click();
+        await composer.artifactTab("Workflow").click();
         await page.addStyleTag({
           content:
             ".graph-a11y-list:focus-within { width: 1px !important; height: 1px !important; clip: rect(0 0 0 0) !important; }",
         });
         const list = page.getByRole("list", { name: /pipeline components in source-to-sink order/i });
-        await composer.artifactTab("Graph").focus();
+        await composer.artifactTab("Workflow").focus();
         await tabUntilFocusWithin(page, list);
         // Expected outcome when this block is switched from test.skip to
         // test: FAILS here. Verified 2026-08-30: the failure lands on the
@@ -199,12 +199,12 @@ test.describe("graph a11y component list — keyboard path", () => {
         (createdSessionId) => deleteWorkspaceScenario(page, createdSessionId),
       );
       try {
-        await composer.artifactTab("Graph").click();
+        await composer.artifactTab("Workflow").click();
         await page.addStyleTag({
           content: ".graph-a11y-list:focus-within { clip: rect(0 0 0 0) !important; }",
         });
         const list = page.getByRole("list", { name: /pipeline components in source-to-sink order/i });
-        await composer.artifactTab("Graph").focus();
+        await composer.artifactTab("Workflow").focus();
         await tabUntilFocusWithin(page, list);
         // Expected outcome when this block is switched from test.skip to
         // test: width/height polls PASS (layout box is unaffected by clip)

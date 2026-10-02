@@ -61,6 +61,7 @@ from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.tree_gate import iter_gate_files, iter_gate_sources
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -369,6 +370,7 @@ def _seed_session_blob(tmp_path: Path) -> tuple[sa.engine.Engine, str, str]:
     storage_path = storage_dir / f"{blob_id}_urls.json"
     storage_path.write_bytes(body)
     with engine.begin() as connection:
+        ensure_test_identity(connection, identity_id="matrix-user")
         connection.execute(
             sessions_table.insert().values(
                 id=session_id,
@@ -411,14 +413,12 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
     context = ToolContext(catalog=view, plugin_snapshot=snapshot, session_engine=engine, session_id=session_id)
 
     catalog_api, policy_wire = asyncio.run(_catalog_http_surfaces(snapshot=snapshot, policy=policy, profiles=profiles))
-    guided_results = (
+    tool_results = (
         _handle_list_sources({}, empty_state, context),
         _handle_list_transforms({}, empty_state, context),
         _handle_list_sinks({}, empty_state, context),
     )
-    guided_discovery = frozenset(
-        str(PluginId(item.plugin_type, item.name)) for result in guided_results for item in result.data["available"]
-    )
+    tool_discovery = frozenset(str(PluginId(item.plugin_type, item.name)) for result in tool_results for item in result.data["available"])
     prompt = build_catalog_context_string(view, plugin_snapshot=snapshot)
     freeform_policy = json.loads(prompt.partition("\n")[2])["plugin_policy"]
     freeform_prompt = frozenset(freeform_policy["available_ids"])
@@ -444,20 +444,20 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
     }
 
     assert backend_projection == fixture_projection
-    assert catalog_api == frozenset(policy_wire.available_plugin_ids) == guided_discovery == freeform_prompt == expected
+    assert catalog_api == frozenset(policy_wire.available_plugin_ids) == tool_discovery == freeform_prompt == expected
     assert {row.capability.value: row.plugin_id for row in policy_wire.selections} == expected_selected
     assert freeform_policy["selected"] == expected_selected
     assert dict(evidence.selected_implementations) == expected_selected
     assert {row.capability.value: tuple(row.available_plugin_ids) for row in policy_wire.capability_groups} == expected_capabilities
     assert {name: tuple(plugin_ids) for name, plugin_ids in freeform_policy["capability_groups"].items()} == expected_capabilities
-    guided_capabilities: dict[str, set[str]] = {}
-    for result in guided_results:
+    tool_capabilities: dict[str, set[str]] = {}
+    for result in tool_results:
         assert result.success is True
         for item in result.data["available"]:
             plugin_id = str(PluginId(item.plugin_type, item.name))
             for declaration in item.policy_capabilities:
-                guided_capabilities.setdefault(declaration.capability.value, set()).add(plugin_id)
-    assert {capability: tuple(sorted(plugin_ids)) for capability, plugin_ids in guided_capabilities.items()} == expected_capabilities
+                tool_capabilities.setdefault(declaration.capability.value, set()).add(plugin_id)
+    assert {capability: tuple(sorted(plugin_ids)) for capability, plugin_ids in tool_capabilities.items()} == expected_capabilities
     assert frozenset(evidence.available_plugin_ids) == expected
     assert frozenset(evidence.authorized_plugin_ids) == frozenset(map(str, _CORE_IDS | case.extra_authorized))
     assert (
@@ -491,8 +491,8 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
                 if plugin_id in case.extra_authorized
                 else PluginUnavailableReason.NOT_AUTHORIZED.value
             )
-            assert schema_result.data["error_code"] == expected_code
-            assert assistance_result.data["error_code"] == expected_code
+            assert schema_result.validation.errors[0].error_code == expected_code
+            assert assistance_result.validation.errors[0].error_code == expected_code
 
     for plugin_id in _ALL_CONTROLS:
         probe = _control_probe_state(plugin_id)
@@ -552,7 +552,7 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
             assert [finding.error_code for finding in validation.findings_for("plugin_enablement")] == [expected_code]
             assert [finding.error_code for finding in imported_validation.findings_for("plugin_enablement")] == [expected_code]
             assert direct_tool.success is False
-            assert direct_tool.data["error_code"] == expected_code
+            assert direct_tool.validation.errors[0].error_code == expected_code
             with pytest.raises(ValueError, match="not available"):
                 require_settings_plugins_available(runtime_settings, snapshot)
 
@@ -817,6 +817,8 @@ def test_server_profile_scope_survives_lowering_and_same_name_user_shadow(
     engine: sa.engine.Engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
     user_store = UserSecretStore(engine=engine, master_key="profile-scope-test-master-key")
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     user_store.set_secret(
         "SHARED_LLM_KEY",
         value="user-value",
@@ -875,6 +877,8 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
     engine: sa.engine.Engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
     user_store = UserSecretStore(engine=engine, master_key="profile-validation-master-key")
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     user_store.set_secret(
         "SHARED_LLM_KEY",
         value="user-value",
@@ -1141,7 +1145,7 @@ def test_auto_wired_required_controls_clear_the_execution_required_control_gate(
     def _validate(candidate: dict[str, Any]) -> Any:
         context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
         built = build_set_pipeline_candidate(candidate, _empty_state(), context)
-        rejection = None if built.acceptable else (built.result.data or {}).get("error")
+        rejection = None if built.acceptable else built.result.validation.errors[0].message
         assert built.acceptable is True, f"candidate rejected: {rejection}"
         return validation_module.validate_pipeline(
             built.result.updated_state,

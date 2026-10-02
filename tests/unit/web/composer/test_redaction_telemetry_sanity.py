@@ -24,6 +24,10 @@ Counters covered:
   * ``composer.redaction.summarizer_errors_total`` — fires immediately
     before ``AuditIntegrityError`` raise on summarizer exception OR non-str
     return.
+  * ``composer.redaction.response_projection_limit`` — fires once per
+    projection-budget substitution in ``redact_tool_call_response``, with a
+    ``scope`` label (``key`` for one top-level value, ``row`` for the
+    whole-row stub).
 """
 
 from __future__ import annotations
@@ -63,7 +67,7 @@ class _CounterFake:
 
 @pytest.fixture
 def patched_counters(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, _CounterFake]]:
-    """Replace the three module-level OTel counters with recording fakes.
+    """Replace the four module-level OTel counters with recording fakes.
 
     Returns the dict so each test can assert on whichever counter is
     relevant to the pathway exercised.  Monkeypatch restores the originals
@@ -73,10 +77,12 @@ def patched_counters(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, _Cou
         "manifest_dispatch": _CounterFake(),
         "unknown_response_key": _CounterFake(),
         "summarizer_error": _CounterFake(),
+        "response_projection_limit": _CounterFake(),
     }
     monkeypatch.setattr(rt_mod, "_MANIFEST_DISPATCH_COUNTER", counters["manifest_dispatch"])
     monkeypatch.setattr(rt_mod, "_UNKNOWN_RESPONSE_KEY_COUNTER", counters["unknown_response_key"])
     monkeypatch.setattr(rt_mod, "_SUMMARIZER_ERROR_COUNTER", counters["summarizer_error"])
+    monkeypatch.setattr(rt_mod, "_RESPONSE_PROJECTION_LIMIT_COUNTER", counters["response_projection_limit"])
     yield counters
 
 
@@ -199,3 +205,20 @@ def test_summarizer_error_counter_fires_before_audit_integrity_error(
     # handles_no_sensitive_data path. The unused-import lint guard keeps
     # this fixture available for sibling tests in the file.
     _ = _safe_reason
+
+
+def test_response_projection_limit_counter_fires_per_scope(patched_counters: dict[str, _CounterFake]) -> None:
+    """Both projection-budget scopes reach the production counter through the walker.
+
+    A declarative ``upsert_node`` response with an over-wide known ``data``
+    degrades that key (``scope="key"``); a response with more top-level keys
+    than the container width collapses the row (``scope="row"``).
+    """
+    tel = OtelRedactionTelemetry()
+    redact_tool_call_response("upsert_node", {"success": False, "version": 1, "data": ["external"] * 65}, telemetry=tel)
+    redact_tool_call_response("list_models", {f"key_{index}": index for index in range(65)}, telemetry=tel)
+
+    assert patched_counters["response_projection_limit"].add.calls == [
+        ((1, {"tool_name": "upsert_node", "scope": "key"}), {}),
+        ((1, {"tool_name": "list_models", "scope": "row"}), {}),
+    ]

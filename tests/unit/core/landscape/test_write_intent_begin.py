@@ -27,7 +27,9 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,7 @@ from elspeth.core.landscape.database import (
     begin_write,
     verify_sqlite_tier1_pragmas,
 )
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     SQLITE_SCHEMA_EPOCH,
@@ -52,6 +55,8 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.helpers.run_coordination import register_run_leader
 
 BASE = datetime(2026, 6, 11, 12, 0, 0, tzinfo=UTC)
 RUN_ID = "run-write-intent"
@@ -103,7 +108,7 @@ def _run_values(run_id: str = RUN_ID) -> dict[str, Any]:
     return {
         "run_id": run_id,
         "started_at": BASE,
-        "config_hash": "config",
+        "config_hash": fake_sha256("config"),
         "settings_json": "{}",
         "canonical_version": "v1",
         "status": "running",
@@ -214,7 +219,7 @@ class TestBeginMode:
                         node_type=NodeType.TRANSFORM.value,
                         plugin_version="1.0",
                         determinism="deterministic",
-                        config_hash="config",
+                        config_hash=fake_sha256("config"),
                         config_json="{}",
                         registered_at=BASE,
                     )
@@ -227,18 +232,19 @@ class TestBeginMode:
                         row_index=0,
                         source_row_index=0,
                         ingest_sequence=0,
-                        source_data_hash="hash-row-0",
+                        source_data_hash=fake_sha256("hash-row-0"),
                         created_at=BASE,
                     )
                 )
                 conn.execute(insert(tokens_table).values(token_id="token-0", row_id="row-0", run_id=RUN_ID, created_at=BASE))
 
             repo = TokenSchedulerRepository(db.engine)
+            authority = register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id="worker-1", window_seconds=80)
             payload = TokenSchedulerRepository.serialize_row_payload(
                 PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
             )
             repo.enqueue_ready(
-                run_id=RUN_ID,
+                member_token=authority.membership,
                 token_id="token-0",
                 row_id="row-0",
                 node_id="normalize",
@@ -248,18 +254,17 @@ class TestBeginMode:
             )
 
             trace = _attach_trace(db.engine)
-            claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-1", lease_seconds=30)
+            claimed = repo.claim_ready(member_token=authority.membership, lease_owner="worker-1", lease_seconds=30)
             assert claimed is not None
             assert "BEGIN IMMEDIATE" in _begin_statements(trace)
 
             # heartbeat_lease (manual conn.begin() shape) carries intent too.
             trace2 = _attach_trace(db.engine)
             repo.heartbeat_lease(
-                run_id=RUN_ID,
+                member_token=authority.membership,
                 work_item_id=claimed.work_item_id,
                 lease_owner="worker-1",
                 lease_seconds=30,
-                membership_fenced=False,
             )
             assert "BEGIN IMMEDIATE" in _begin_statements(trace2)
         finally:
@@ -396,6 +401,138 @@ class TestLockAtBegin:
 # ---------------------------------------------------------------------------
 
 
+def _assert_waits_for_static_pool_write(
+    db: LandscapeDB,
+    monkeypatch: pytest.MonkeyPatch,
+    action: Callable[[], object],
+    *,
+    what: str,
+) -> None:
+    """Run ``action`` on a second thread while a writer holds the StaticPool lock.
+
+    ``action`` must contend on the held lock instead of driving the shared
+    connection mid-transaction, and must complete once the writer commits.
+    """
+    from elspeth.core.landscape import database as landscape_database
+
+    write_started = threading.Event()
+    release_write = threading.Event()
+    action_lock_contended = threading.Event()
+    action_finished = threading.Event()
+    action_progressed = threading.Event()
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def record_error(exc: BaseException) -> None:
+        with errors_lock:
+            errors.append(exc)
+
+    def writer() -> None:
+        try:
+            with db.write_connection():
+                write_started.set()
+                assert release_write.wait(timeout=10)
+        except BaseException as exc:
+            record_error(exc)
+
+    def run_action() -> None:
+        try:
+            action()
+        except BaseException as exc:
+            record_error(exc)
+        finally:
+            action_finished.set()
+            action_progressed.set()
+
+    writer_thread = threading.Thread(target=writer)
+    action_thread = threading.Thread(target=run_action)
+    writer_thread_started = False
+    action_thread_started = False
+    try:
+        writer_thread.start()
+        writer_thread_started = True
+        assert write_started.wait(timeout=10)
+
+        real_lock = landscape_database._shared_connection_lock(db.engine)
+        assert real_lock is not None
+
+        class RecordingLock:
+            def __enter__(self) -> None:
+                acquired = real_lock.acquire(blocking=False)
+                if acquired:
+                    real_lock.release()
+                    raise AssertionError("writer did not hold the StaticPool lock")
+                action_lock_contended.set()
+                action_progressed.set()
+                real_lock.acquire()
+
+            def __exit__(self, *_args: Any) -> None:
+                real_lock.release()
+
+        original_shared_connection_lock = landscape_database._shared_connection_lock
+
+        def recording_shared_connection_lock(engine: Engine) -> Any:
+            if engine is db.engine:
+                return RecordingLock()
+            return original_shared_connection_lock(engine)
+
+        monkeypatch.setattr(landscape_database, "_shared_connection_lock", recording_shared_connection_lock)
+
+        action_thread.start()
+        action_thread_started = True
+        assert action_progressed.wait(timeout=10)
+        assert action_lock_contended.is_set(), f"{what} bypassed the held StaticPool lock: {errors!r}"
+        assert not action_finished.is_set()
+
+        release_write.set()
+    finally:
+        release_write.set()
+        if writer_thread_started:
+            writer_thread.join(timeout=10)
+        if action_thread_started:
+            action_thread.join(timeout=10)
+
+    assert not writer_thread.is_alive()
+    assert not action_thread.is_alive()
+    assert action_finished.is_set()
+    assert errors == []
+
+
+def _scheduler(db: LandscapeDB) -> TokenSchedulerRepository:
+    return TokenSchedulerRepository(db.engine)
+
+
+# Every plain read the coordination and scheduler repositories open with
+# ``engine.connect()``: (id, bind) where bind builds the repository and returns
+# the zero-argument read. Inputs are chosen so no read returns before it
+# connects (``count_ready_in_set`` short-circuits an empty id set).
+_PLAIN_REPOSITORY_READS: tuple[tuple[str, Callable[[LandscapeDB], Callable[[], object]]], ...] = (
+    ("live_leader", lambda db: partial(RunCoordinationRepository(db.engine).live_leader, run_id=RUN_ID)),
+    (
+        "dead_non_leader_workers",
+        lambda db: partial(
+            RunCoordinationRepository(db.engine).dead_non_leader_workers, run_id=RUN_ID, leader_worker_id="leader", grace_seconds=0.0
+        ),
+    ),
+    ("barrier_database_now", lambda db: _scheduler(db).barriers.database_now),
+    ("list_blocked_barrier_items", lambda db: partial(_scheduler(db).barriers.list_blocked_barrier_items, run_id=RUN_ID)),
+    ("count_blocked_barrier_items", lambda db: partial(_scheduler(db).barriers.count_blocked_barrier_items, run_id=RUN_ID)),
+    (
+        "list_pending_blocked_barrier_items",
+        lambda db: partial(_scheduler(db).barriers.list_pending_blocked_barrier_items, run_id=RUN_ID),
+    ),
+    ("count_ready_in_set", lambda db: partial(_scheduler(db).reads.count_ready_in_set, run_id=RUN_ID, work_item_ids=("item",))),
+    ("count_failed_in_set", lambda db: partial(_scheduler(db).reads.count_failed_in_set, run_id=RUN_ID, work_item_ids=("item",))),
+    ("has_peer_owned_work", lambda db: partial(_scheduler(db).reads.has_peer_owned_work, run_id=RUN_ID, caller_owner="worker")),
+    ("count_active_work", lambda db: partial(_scheduler(db).reads.count_active_work, run_id=RUN_ID)),
+    ("count_unquiesced_work", lambda db: partial(_scheduler(db).reads.count_unquiesced_work, run_id=RUN_ID)),
+    ("summarize_unquiesced_work", lambda db: partial(_scheduler(db).reads.summarize_unquiesced_work, run_id=RUN_ID)),
+    ("count_unresolved_work", lambda db: partial(_scheduler(db).reads.count_unresolved_work, run_id=RUN_ID)),
+    ("summarize_unresolved_work", lambda db: partial(_scheduler(db).reads.summarize_unresolved_work, run_id=RUN_ID)),
+    ("summarize_active_work", lambda db: partial(_scheduler(db).reads.summarize_active_work, run_id=RUN_ID)),
+)
+
+
 class TestStaticPoolConnectionSerialization:
     """StaticPool engines share ONE DBAPI connection across all threads.
 
@@ -458,91 +595,41 @@ class TestStaticPoolConnectionSerialization:
 
     def test_tier1_pragma_probe_waits_for_static_pool_write_transaction(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Tier-1 verification must not drive a shared connection mid-write."""
-        from elspeth.core.landscape import database as landscape_database
-
         db = LandscapeDB.in_memory()
-        write_started = threading.Event()
-        release_write = threading.Event()
-        probe_lock_contended = threading.Event()
-        probe_finished = threading.Event()
-        probe_progressed = threading.Event()
-        errors: list[BaseException] = []
-        errors_lock = threading.Lock()
-
-        def record_error(exc: BaseException) -> None:
-            with errors_lock:
-                errors.append(exc)
-
-        def writer() -> None:
-            try:
-                with db.write_connection():
-                    write_started.set()
-                    assert release_write.wait(timeout=10)
-            except BaseException as exc:
-                record_error(exc)
-
-        def probe() -> None:
-            try:
-                verify_sqlite_tier1_pragmas(db.engine, owner="concurrent probe")
-            except BaseException as exc:
-                record_error(exc)
-            finally:
-                probe_finished.set()
-                probe_progressed.set()
-
-        writer_thread = threading.Thread(target=writer)
-        probe_thread = threading.Thread(target=probe)
-        writer_thread_started = False
-        probe_thread_started = False
         try:
-            writer_thread.start()
-            writer_thread_started = True
-            assert write_started.wait(timeout=10)
-
-            real_lock = landscape_database._shared_connection_lock(db.engine)
-            assert real_lock is not None
-
-            class RecordingLock:
-                def __enter__(self) -> None:
-                    acquired = real_lock.acquire(blocking=False)
-                    if acquired:
-                        real_lock.release()
-                        raise AssertionError("writer did not hold the StaticPool lock")
-                    probe_lock_contended.set()
-                    probe_progressed.set()
-                    real_lock.acquire()
-
-                def __exit__(self, *_args: Any) -> None:
-                    real_lock.release()
-
-            original_shared_connection_lock = landscape_database._shared_connection_lock
-
-            def recording_shared_connection_lock(engine: Engine) -> Any:
-                if engine is db.engine:
-                    return RecordingLock()
-                return original_shared_connection_lock(engine)
-
-            monkeypatch.setattr(landscape_database, "_shared_connection_lock", recording_shared_connection_lock)
-
-            probe_thread.start()
-            probe_thread_started = True
-            assert probe_progressed.wait(timeout=10)
-            assert probe_lock_contended.is_set(), f"Tier-1 probe bypassed the held StaticPool lock: {errors!r}"
-            assert not probe_finished.is_set()
-
-            release_write.set()
+            _assert_waits_for_static_pool_write(
+                db,
+                monkeypatch,
+                lambda: verify_sqlite_tier1_pragmas(db.engine, owner="concurrent probe"),
+                what="Tier-1 probe",
+            )
         finally:
-            release_write.set()
-            if writer_thread_started:
-                writer_thread.join(timeout=10)
-            if probe_thread_started:
-                probe_thread.join(timeout=10)
             db.close()
 
-        assert not writer_thread.is_alive()
-        assert not probe_thread.is_alive()
-        assert probe_finished.is_set()
-        assert errors == []
+    @pytest.mark.parametrize("read", _PLAIN_REPOSITORY_READS, ids=lambda read: read[0])
+    def test_plain_repository_reads_wait_for_static_pool_write_transaction(
+        self,
+        read: tuple[str, Callable[[LandscapeDB], Callable[[], object]]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A plain ``engine.connect()`` read autobegins on the shared connection.
+
+        A locked writer on another thread that then BEGINs fails with "cannot
+        start a transaction within a transaction": a sink-effect lease heartbeat
+        died this way when a test fixture's ``live_leader`` read overlapped it.
+        Every plain read in the coordination and scheduler repositories, which
+        the idle-timeout pump and lease heartbeats share with the main thread,
+        must wait for the lock instead.
+        """
+        name, bind = read
+        db = LandscapeDB.in_memory()
+        try:
+            # Bind before the writer starts: repository constructors run their
+            # own (locked) Tier-1 probe, which is not the read under test.
+            action = bind(db)
+            _assert_waits_for_static_pool_write(db, monkeypatch, action, what=name)
+        finally:
+            db.close()
 
     def test_file_backed_engine_takes_no_static_pool_lock(self, tmp_path: Path) -> None:
         """Production (file-backed QueuePool) engines must NOT be given the

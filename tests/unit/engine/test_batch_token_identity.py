@@ -167,7 +167,9 @@ class TestBatchTokenIdentity:
             # fenced adoption verbs require the run's leader token.
             coordination_token=leader_coordination_token(setup.factory, run_id),
         )
-        ctx = make_context(run_id=run_id, landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            coordination_token=leader_coordination_token(factory, run_id), run_id=run_id, landscape=factory.plugin_audit_writer()
+        )
 
         # Process 3 rows to trigger batch flush
         all_results = []
@@ -256,7 +258,9 @@ class TestBatchTokenIdentity:
             # fenced adoption verbs require the run's leader token.
             coordination_token=leader_coordination_token(setup.factory, run_id),
         )
-        ctx = make_context(run_id=run_id, landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            coordination_token=leader_coordination_token(factory, run_id), run_id=run_id, landscape=factory.plugin_audit_writer()
+        )
 
         # Process row 0 - buffered, returns BUFFERED (T26: non-terminal at buffer time)
         pipeline_row_0 = make_pipeline_row({"value": 10})
@@ -348,7 +352,9 @@ class TestBatchTokenIdentity:
             # fenced adoption verbs require the run's leader token.
             coordination_token=leader_coordination_token(setup.factory, run_id),
         )
-        ctx = make_context(run_id=run_id, landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            coordination_token=leader_coordination_token(factory, run_id), run_id=run_id, landscape=factory.plugin_audit_writer()
+        )
 
         # Process 3 rows to trigger batch flush
         all_results = []

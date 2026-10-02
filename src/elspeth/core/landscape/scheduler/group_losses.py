@@ -4,7 +4,7 @@
 The append-only ``group_losses`` table: in-transaction recording (riding the
 caller's disposition transaction), the intake/takeover reads, the fenced
 replay-cursor adoption mark, and the adoption-context frame guard. Migrated
-1:1 from ``branch_losses.py`` (filigree elspeth-ef9c36d767) onto the
+1:1 from ``branch_losses.py`` (archived issue elspeth-ef9c36d767) onto the
 group-scoped natural key (run_id, closer_name, group_id, member_key).
 """
 
@@ -14,9 +14,8 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
 
-from sqlalchemy import String, select, update
+from sqlalchemy import String, bindparam, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, RowMapping
@@ -26,6 +25,7 @@ from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import GroupLossSpec
 from elspeth.core.ids import generate_id
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
@@ -77,80 +77,112 @@ def record_group_loss(
     Returns ``True`` if this call inserted the row, ``False`` if the row
     pre-existed.
     """
-    # Fail-closed length check BEFORE the INSERT (elspeth-74b795208f): SQLite
-    # does not enforce VARCHAR lengths, so an over-wide reason passes every
-    # local test and dies only on real PostgreSQL (StringDataRightTruncation)
-    # — the audit write killing the run it exists to explain. Deliberately do
-    # NOT echo the reason content: failure-path reasons can carry secrets.
-    if len(spec.reason) > _REASON_MAX_LENGTH:
-        raise AuditIntegrityError(
-            f"Group-loss reason is {len(spec.reason)} chars but the reason column holds a "
-            f"category token of at most {_REASON_MAX_LENGTH}; producers must record a bare "
-            "token (e.g. 'quarantined') and carry detail via the token outcome's error hash."
+    return record_group_losses(conn, run_id=run_id, specs=(spec,), recorded_by=recorded_by, now=now) == 1
+
+
+def record_group_losses(
+    conn: Connection,
+    *,
+    run_id: str,
+    specs: Sequence[GroupLossSpec],
+    recorded_by: str,
+    now: datetime,
+) -> int:
+    """Append a batch, checking natural-key conflicts before and after insertion."""
+    if not specs:
+        return 0
+    by_key: dict[tuple[str, str, str], GroupLossSpec] = {}
+    for spec in specs:
+        if len(spec.reason) > _REASON_MAX_LENGTH:
+            raise AuditIntegrityError(
+                f"Group-loss reason is {len(spec.reason)} chars but the reason column holds a category token of at most {_REASON_MAX_LENGTH}"
+            )
+        key = (spec.closer_name, spec.group_id, spec.member_key)
+        if key in by_key:
+            if by_key[key].token_id != spec.token_id:
+                raise AuditIntegrityError("Two distinct tokens cannot lose the same member of one group — token lineage corruption")
+        else:
+            by_key[key] = spec
+    values = [
+        {
+            "loss_id": f"loss_{generate_id()[:12]}",
+            "run_id": run_id,
+            "closer_name": spec.closer_name,
+            "group_id": spec.group_id,
+            "member_key": spec.member_key,
+            "token_id": spec.token_id,
+            "reason": spec.reason,
+            "recorded_by": recorded_by,
+            "recorded_at": now,
+            "adopted_epoch": None,
+        }
+        for spec in by_key.values()
+    ]
+    if conn.dialect.name == "sqlite":
+        inserted = (
+            conn.execute(
+                sqlite_insert(group_losses_table)
+                .on_conflict_do_nothing(index_elements=["run_id", "closer_name", "group_id", "member_key"])
+                .returning(group_losses_table.c.loss_id),
+                values,
+            )
+            .scalars()
+            .all()
         )
-    loss_id = f"loss_{generate_id()[:12]}"
-    values = {
-        "loss_id": loss_id,
-        "run_id": run_id,
-        "closer_name": spec.closer_name,
-        "group_id": spec.group_id,
-        "member_key": spec.member_key,
-        "token_id": spec.token_id,
-        "reason": spec.reason,
-        "recorded_by": recorded_by,
-        "recorded_at": now,
-        "adopted_epoch": None,
-    }
-    dialect = conn.dialect.name
-    stmt: Any
-    if dialect == "sqlite":
-        stmt = sqlite_insert(group_losses_table).values(**values)
-    elif dialect == "postgresql":
-        stmt = postgresql_insert(group_losses_table).values(**values)
+    elif conn.dialect.name == "postgresql":
+        inserted = (
+            conn.execute(
+                postgresql_insert(group_losses_table)
+                .on_conflict_do_nothing(index_elements=["run_id", "closer_name", "group_id", "member_key"])
+                .returning(group_losses_table.c.loss_id),
+                values,
+            )
+            .scalars()
+            .all()
+        )
     else:
-        raise NotImplementedError(
-            f"group-loss recording requires an atomic insert-or-ignore for landscape database dialect {dialect!r}; "
-            "supported dialects: sqlite, postgresql"
-        )
-    inserted_loss_id = conn.execute(
-        stmt.on_conflict_do_nothing(index_elements=["run_id", "closer_name", "group_id", "member_key"]).returning(
-            group_losses_table.c.loss_id
-        )
-    ).scalar_one_or_none()
-    if inserted_loss_id is not None:
-        if inserted_loss_id != loss_id:
-            raise AuditIntegrityError(f"Group-loss insert returned unexpected loss_id={inserted_loss_id!r}; expected {loss_id!r}.")
-        return True
-    existing = (
-        conn.execute(
-            select(group_losses_table)
-            .where(group_losses_table.c.run_id == run_id)
-            .where(group_losses_table.c.closer_name == spec.closer_name)
-            .where(group_losses_table.c.group_id == spec.group_id)
-            .where(group_losses_table.c.member_key == spec.member_key)
+        raise NotImplementedError(f"group-loss recording unsupported database dialect {conn.dialect.name!r}")
+    expected_ids = {value["loss_id"] for value in values}
+    if not set(inserted).issubset(expected_ids) or len(inserted) != len(set(inserted)):
+        raise AuditIntegrityError("Group-loss insert returned unexpected loss_id")
+    # One batch may name any number of members (a whole expansion's lost
+    # children), so the read-back runs in chunks of the shared bind budget,
+    # three binds per natural key, on this one connection.
+    existing_rows = [
+        row
+        for chunk in bind_budget_chunks(tuple(by_key), binds_per_item=3)
+        for row in conn.execute(
+            select(group_losses_table).where(
+                group_losses_table.c.run_id == run_id,
+                tuple_(group_losses_table.c.closer_name, group_losses_table.c.group_id, group_losses_table.c.member_key).in_(chunk),
+            )
         )
         .mappings()
-        .one()
-    )
-    if existing["token_id"] != spec.token_id:
-        raise AuditIntegrityError(
-            f"Group-loss record for run_id={run_id!r} closer_name={spec.closer_name!r} "
-            f"group_id={spec.group_id!r} member_key={spec.member_key!r} already exists with "
-            f"token_id={existing['token_id']!r}, but this call claims token_id={spec.token_id!r}; "
-            "two distinct tokens cannot lose the same member of one group — token lineage corruption."
-        )
-    if existing["reason"] != spec.reason:
-        logger.warning(
-            "group-loss re-record for run %r closer %r group %r member %r tolerated a reason change "
-            "(durable %r, offered %r); the first durable record wins",
-            run_id,
-            spec.closer_name,
-            spec.group_id,
-            spec.member_key,
-            existing["reason"],
-            spec.reason,
-        )
-    return False
+        .all()
+    ]
+    existing_by_key = {(row["closer_name"], row["group_id"], row["member_key"]): row for row in existing_rows}
+    if len(existing_by_key) != len(by_key):
+        raise AuditIntegrityError("Group-loss batch insertion left a missing natural key")
+    for spec in specs:
+        existing = existing_by_key[(spec.closer_name, spec.group_id, spec.member_key)]
+        if existing["token_id"] != spec.token_id:
+            raise AuditIntegrityError(
+                f"Group-loss record for run_id={run_id!r} closer_name={spec.closer_name!r} "
+                f"group_id={spec.group_id!r} member_key={spec.member_key!r} already exists with "
+                f"token_id={existing['token_id']!r}, but this call claims token_id={spec.token_id!r}; "
+                "two distinct tokens cannot lose the same member of one group — token lineage corruption."
+            )
+        if existing["reason"] != spec.reason:
+            logger.warning(
+                "group-loss re-record for run %r closer %r group %r member %r tolerated a reason change (durable %r, offered %r); the first durable record wins",
+                run_id,
+                spec.closer_name,
+                spec.group_id,
+                spec.member_key,
+                existing["reason"],
+                spec.reason,
+            )
+    return len(inserted)
 
 
 def authenticate_adoption_loss(
@@ -266,7 +298,6 @@ class GroupLossRepository:
     def adopt_group_losses(
         self,
         *,
-        run_id: str,
         loss_ids: Sequence[str],
         coordination_token: CoordinationToken,
     ) -> int:
@@ -287,12 +318,16 @@ class GroupLossRepository:
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="adopt_group_losses",
         ) as conn:
+            # A resume adopts every recorded loss of the run, so the mark is one
+            # executemany of a fixed-size statement (core/landscape/bind_budget.py);
+            # both dialects report the summed rowcount.
             result = conn.execute(
                 update(group_losses_table)
-                .where(group_losses_table.c.run_id == run_id)
-                .where(group_losses_table.c.loss_id.in_(tuple(loss_ids)))
+                .where(group_losses_table.c.run_id == coordination_token.run_id)
+                .where(group_losses_table.c.loss_id == bindparam("b_loss_id"))
                 .where(group_losses_table.c.adopted_epoch.is_(None))
-                .values(adopted_epoch=coordination_token.leader_epoch)
+                .values(adopted_epoch=coordination_token.leader_epoch),
+                [{"b_loss_id": loss_id} for loss_id in loss_ids],
             )
             marked = result.rowcount
         return 0 if marked is None else int(marked)
@@ -300,7 +335,6 @@ class GroupLossRepository:
     def stage_escalation_loss(
         self,
         *,
-        run_id: str,
         spec: GroupLossSpec,
         frame_kind: FrameKind,
         declared_roster: tuple[str, ...] | None,
@@ -324,7 +358,11 @@ class GroupLossRepository:
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="stage_escalation_loss",
         ) as conn:
-            authenticate_adoption_loss(conn, run_id=run_id, spec=spec, frame_kind=frame_kind, declared_roster=declared_roster)
+            authenticate_adoption_loss(
+                conn, run_id=coordination_token.run_id, spec=spec, frame_kind=frame_kind, declared_roster=declared_roster
+            )
             # The loss is recorded at Landscape database time (ADR-047), the
             # same clock the fence that admitted this transaction used.
-            return record_group_loss(conn, run_id=run_id, spec=spec, recorded_by=recorded_by, now=read_landscape_transaction_time(conn))
+            return record_group_loss(
+                conn, run_id=coordination_token.run_id, spec=spec, recorded_by=recorded_by, now=read_landscape_transaction_time(conn)
+            )

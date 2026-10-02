@@ -12,7 +12,7 @@
 // Empty state when no nodes.
 // ============================================================================
 
-import { useMemo, useCallback, useEffect, useRef, type ReactNode } from "react";
+import { useMemo, useCallback, useEffect, useRef, type JSX, type ReactNode } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -31,6 +31,7 @@ import {
   type ReactFlowInstance,
   type FitViewOptions,
   Background,
+  ControlButton,
   Controls,
   MiniMap,
 } from "@xyflow/react";
@@ -38,8 +39,6 @@ import dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
-import { projectGuidedGraph } from "@/components/chat/guided/guidedGraphProjection";
-import { GuidedGraphPane } from "./GuidedGraphPane";
 import { useTheme } from "@/hooks/useTheme";
 import {
   hasCompositionContent,
@@ -54,12 +53,15 @@ import {
 } from "@/lib/graphTopology";
 import { plural } from "@/utils/plural";
 import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, VALIDATION_COLORS } from "@/styles/tokens";
-import { Button, TypeBadge } from "@/components/ui";
+import { Button, Icon, TypeBadge } from "@/components/ui";
 import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
+import { llmBindingLabel } from "@/lib/llmBindingLabel";
 import type { CompositionState } from "@/types/index";
 
 import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
+import { GraphOutputs } from "./GraphOutputs";
+import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 
 const NODE_WIDTH = 260;
 const NODE_HEIGHT = 80;
@@ -828,7 +830,13 @@ function layoutGraph(
 
 // ── GraphView component ──────────────────────────────────────────────────────
 
-export function GraphView() {
+export interface GraphViewProps {
+  /** Opens the full-screen graph. Passed by the Workflow tab only; GraphModal
+   *  renders this same component and must not offer to open itself. */
+  onFullscreen?: () => void;
+}
+
+export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   const compositionState = useSessionStore((s) => s.compositionState);
   const pendingProposalCount = useSessionStore(
     (s) =>
@@ -839,27 +847,6 @@ export function GraphView() {
   );
   const selectedNodeId = useSessionStore((s) => s.selectedNodeId);
   const selectNode = useSessionStore((s) => s.selectNode);
-  // Guided pre-commit projection (elspeth-9f0873426a, IA-1 / V-1): what the
-  // learner has reviewed or is being asked to approve. The pending decision
-  // comes from the guided turn payload; the reviewed ledger is the SERVER's
-  // projection (elspeth-f2a8550b3d), published on `guided_session` and read
-  // through `selectGuidedReviewedComponents` — not folded from turns, so a
-  // reload mid-build still draws the confirmed components. Both selectors
-  // return stable references (the ledger is the wire object itself).
-  const guidedNextTurn = useSessionStore((s) => s.guidedNextTurn);
-  const guidedReviewedComponents = useSessionStore(
-    (s) => s.guidedReviewedComponents,
-  );
-  const guidedTerminal = useSessionStore((s) => s.guidedTerminal);
-  const guidedProjection = useMemo(
-    () =>
-      projectGuidedGraph({
-        nextTurn: guidedNextTurn,
-        reviewed: guidedReviewedComponents,
-        terminal: guidedTerminal,
-      }),
-    [guidedNextTurn, guidedReviewedComponents, guidedTerminal],
-  );
   const { resolvedTheme } = useTheme();
 
   const validationResult = useExecutionStore((s) => s.validationResult);
@@ -1060,6 +1047,7 @@ export function GraphView() {
       validationStatus?: ValidationStatus,
       validationTooltip?: string,
       isSelected?: boolean,
+      modelLabel?: string,
     ): PipelineGraphNodeModel {
       const validationMarker = validationStatus
         ? VALIDATION_STATUS_MARKERS[validationStatus]
@@ -1136,8 +1124,12 @@ export function GraphView() {
                 )}
               </div>
               {subtitle && (
-                <div className="graph-node-subtitle">
-                  {subtitle}
+                <div
+                  className="graph-node-subtitle"
+                  title={modelLabel ? `${subtitle} · ${modelLabel}` : undefined}
+                  style={modelLabel ? { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } : undefined}
+                >
+                  {subtitle}{modelLabel && <> · {modelLabel}</>}
                 </div>
               )}
             </div>
@@ -1195,6 +1187,9 @@ export function GraphView() {
           nodeValidationMap[node.id],
           nodeMessageMap[node.id],
           selectedNodeId === node.id,
+          node.node_type === "transform" && node.plugin === "llm"
+            ? llmBindingLabel(node.options)
+            : undefined,
         ),
       );
     }
@@ -1254,10 +1249,24 @@ export function GraphView() {
     const existingConnections = new Set(
       rfEdges.map(edgeModelSemanticIdentity),
     );
+    const explicitSuccessEdgeIds = new Set(
+      rfEdges.filter((_, index) => explicitEdges[index]?.edge_type === "on_success")
+        .map((edge) => edge.id),
+    );
     function rebuildExistingConnections(): void {
       existingConnections.clear();
       for (const edge of rfEdges) {
         existingConnections.add(edgeModelSemanticIdentity(edge));
+        // An explicit on_success edge may use a descriptive display label.
+        // It still represents the success route inferred from connection names.
+        if (explicitSuccessEdgeIds.has(edge.id)) {
+          existingConnections.add(edgeSemanticIdentity(
+            edge.source,
+            edge.target,
+            "success",
+            "success",
+          ));
+        }
       }
     }
     const explicitEdgeIndexesByConnection = new Map<string, number[]>();
@@ -1315,6 +1324,15 @@ export function GraphView() {
     }
     const nodeIds = new Set(rfNodes.map(n => n.id));
     const outputIds = new Set(compositionState.outputs.map((output) => output.name));
+    function hasErrorRoute(sourceId: string, targetId: string): boolean {
+      // An explicit on_error hint may carry a useful route name. Its label
+      // differs from the inferred "error" label, but both draw the same route.
+      return rfEdges.some((edge) =>
+        edge.source === sourceId
+        && edge.target === targetId
+        && edge.data.flowType === "error",
+      );
+    }
     function addDirectOutputErrorEdge(
       kind: string,
       sourceId: string,
@@ -1333,7 +1351,7 @@ export function GraphView() {
         "error",
         "error",
       );
-      if (existingConnections.has(semanticKey)) return;
+      if (hasErrorRoute(sourceId, targetId)) return;
 
       rfEdges.push({
         id: inferredSemanticEdgeId(
@@ -1563,7 +1581,10 @@ export function GraphView() {
           producer.label,
           producer.edgeType,
         );
-        if (existingConnections.has(semanticKey)) continue;
+        if (
+          existingConnections.has(semanticKey)
+          || (producer.origin === "error" && hasErrorRoute(producer.nodeId, queueId))
+        ) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
           id: inferredSemanticEdgeId(
@@ -1645,7 +1666,10 @@ export function GraphView() {
           producer.label,
           producer.edgeType,
         );
-        if (existingConnections.has(semanticKey)) continue;
+        if (
+          existingConnections.has(semanticKey)
+          || (producer.origin === "error" && hasErrorRoute(producer.nodeId, node.id))
+        ) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
           id: rowUnionIds.has(producer.nodeId)
@@ -1788,12 +1812,7 @@ export function GraphView() {
         node.node_type !== "collector" &&
         node.on_error &&
         nodeIds.has(node.on_error) &&
-        !existingConnections.has(edgeSemanticIdentity(
-          node.id,
-          node.on_error,
-          "error",
-          "error",
-        ))
+        !hasErrorRoute(node.id, node.on_error)
       ) {
         rfEdges.push({
           id: inferredSemanticEdgeId(
@@ -2019,7 +2038,11 @@ export function GraphView() {
       out.push(describe(sourceComponentId(sourceName), "source", source.plugin));
     }
     for (const node of compositionState.nodes) {
-      out.push(describe(node.id, node.node_type, node.plugin));
+      const description = describe(node.id, node.node_type, node.plugin);
+      if (node.node_type === "transform" && node.plugin === "llm") {
+        description.label += `. ${llmBindingLabel(node.options)}`;
+      }
+      out.push(description);
     }
     for (const output of compositionState.outputs) {
       out.push(describe(output.name, "sink", output.plugin));
@@ -2053,17 +2076,6 @@ export function GraphView() {
   // explicit {" "} keeps the two sentences one whitespace-normalised string
   // for text-content assertions.
   //
-  // Guided builds first (elspeth-9f0873426a): a pending proposal or wire
-  // stage is what the learner is deciding on, so it is drawn even over a
-  // committed composition (a re-entered session keeps its old graph until
-  // the new one is confirmed — and the proposal card no longer draws its
-  // own copy). The weaker reviewed-components ledger only fills the void.
-  if (
-    guidedProjection !== null &&
-    (guidedProjection.stage !== "reviewed" || nodes.length === 0)
-  ) {
-    return <GuidedGraphPane projection={guidedProjection} />;
-  }
   if (nodes.length === 0) {
     return (
       <div className="empty-state graph-view-empty">
@@ -2193,7 +2205,16 @@ export function GraphView() {
           <Controls
             showInteractive={false}
             fitViewOptions={GRAPH_FIT_VIEW_OPTIONS}
-          />
+          >
+            {/* Fourth control, under fit view: the keyboard-operable trigger
+                for GraphModal (palette "Show graph" and Ctrl+Shift+G only
+                switch to this tab; the canvas's click gestures are bound). */}
+            {onFullscreen && (
+              <ControlButton onClick={onFullscreen} title="Fullscreen" aria-label="Fullscreen">
+                <Icon name="maximise" />
+              </ControlButton>
+            )}
+          </Controls>
           {nodes.length > MINIMAP_NODE_COUNT_THRESHOLD && (
             <MiniMap
               bgColor="var(--color-surface)"
@@ -2213,6 +2234,11 @@ export function GraphView() {
             />
           )}
         </div>
+        {compositionState && (
+          <ErrorBoundary label="Wiring table">
+            <GraphOutputs state={compositionState} />
+          </ErrorBoundary>
+        )}
         {selectedConfig && (
           <NodeConfigPanel
             config={selectedConfig}

@@ -1,14 +1,43 @@
 # tests/unit/engine/test_token_manager_pipeline_row.py
 """Tests for TokenManager with PipelineRow support."""
 
+from datetime import UTC, datetime
+
 import pytest
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.identity import LineageFrame, TokenInfo
+from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.testing import make_field, make_row, make_source_row
 from tests.unit.engine.conftest import make_test_step_resolver as _make_step_resolver
+
+# This module mocks the repository completely: no durable run or worker exists
+# to read back. These explicit mock-only authorities follow ADR-048 R7.9.
+_MOCK_COORDINATION = CoordinationToken(run_id="run_001", worker_id="mock-worker", leader_epoch=1)
+
+
+def _mock_claim(parent: TokenInfo) -> TokenWorkItem:
+    stamp = datetime(2026, 1, 1, tzinfo=UTC)
+    return TokenWorkItem(
+        work_item_id="mock-claim",
+        run_id=_MOCK_COORDINATION.run_id,
+        token_id=parent.token_id,
+        row_id=parent.row_id,
+        node_id="gate_node",
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json="{}",
+        status=TokenWorkStatus.LEASED,
+        attempt=1,
+        available_at=stamp,
+        created_at=stamp,
+        updated_at=stamp,
+        lease_owner=_MOCK_COORDINATION.worker_id,
+        lease_expires_at=stamp,
+    )
 
 
 def _make_contract() -> SchemaContract:
@@ -111,12 +140,12 @@ class TestTokenManagerCreateInitialToken:
         source_row = make_source_row({"amount": 100}, contract=contract)
 
         token = manager.create_initial_token(
-            run_id="run_001",
             source_node_id="source_001",
             row_index=0,
             source_row=source_row,
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=_MOCK_COORDINATION,
         )
 
         # Token has PipelineRow
@@ -129,24 +158,12 @@ class TestTokenManagerCreateInitialToken:
         call_kwargs = recorder.create_row_with_token.call_args.kwargs
         assert call_kwargs["data"] == {"amount": 100}
 
-    def test_create_initial_token_requires_contract(self) -> None:
-        """SourceRow.valid() should fail fast when contract is omitted.
-
-        This is a critical guard - if a source plugin returns SourceRow without
-        contract, we crash immediately with a clear message rather than propagating
-        None through the pipeline.
-        """
+    def test_source_row_rejects_missing_contract_before_token_creation(self) -> None:
+        """Construction rejects a missing contract before TokenManager can consume it."""
         from elspeth.contracts import SourceRow
-        from elspeth.engine.tokens import TokenManager
 
-        recorder = _make_recorder()
-        TokenManager(recorder, step_resolver=_make_step_resolver())
-
-        # Since elspeth-a27e71979f, SourceRow.__post_init__ rejects contract=None
-        # at construction time, so the engine's guard is now unreachable via
-        # normal construction. Verify the earlier guard fires instead.
-        with pytest.raises(TypeError, match="contract"):
-            SourceRow.valid({"amount": 100})
+        with pytest.raises(ValueError, match=r"^Valid SourceRow must have a contract\."):
+            SourceRow(row={"amount": 100}, is_quarantined=False, contract=None, source_row_index=0)
 
 
 class TestTokenManagerForkToken:
@@ -176,7 +193,8 @@ class TestTokenManagerForkToken:
             parent_token=parent_token,
             branches=["branch_a", "branch_b"],
             node_id=NodeID("gate_node"),
-            run_id="run_001",
+            member_token=_MOCK_COORDINATION.membership,
+            work_item=_mock_claim(parent_token),
         )
 
         assert len(children) == 2
@@ -222,7 +240,7 @@ class TestTokenManagerExpandToken:
             expanded_rows=expanded_rows,
             output_contract=contract,
             node_id=NodeID("gate_node"),
-            run_id="run_001",
+            member_token=_MOCK_COORDINATION.membership,
         )
 
         assert len(children) == 2
@@ -276,10 +294,7 @@ class TestTokenManagerCoalesceTokens:
         )
 
         merged_token, _join_group_id = manager.coalesce_tokens(
-            parents=[parent_a, parent_b],
-            merged_data=merged_row,
-            node_id=NodeID("coalesce_node"),
-            run_id="test-run",
+            parents=[parent_a, parent_b], merged_data=merged_row, node_id=NodeID("coalesce_node"), coordination_token=_MOCK_COORDINATION
         )
 
         assert merged_token.token_id == "merged_001"
@@ -303,29 +318,27 @@ class TestPipelineRowDeepCopy:
         # Contract is preserved (same reference is acceptable for immutable contracts)
         # SchemaContract is frozen=True, so sharing reference is safe
         assert copied.contract is contract or copied.contract == contract
-        # Data is copied (not shared)
+        # Compare rows directly: to_dict() creates fresh containers on every call.
+        assert copied is not original
         assert copied.to_dict() == original.to_dict()
-        assert copied.to_dict() is not original.to_dict()
 
-    def test_deepcopy_isolates_nested_data(self) -> None:
-        """Deepcopy should isolate nested mutable structures.
+    def test_deepcopy_creates_distinct_row_with_nested_data(self) -> None:
+        """Deepcopy should produce a distinct row with equal nested values.
 
-        Note: PipelineRow uses MappingProxyType internally which makes it immutable,
-        but the source data dict could have nested mutables. Deepcopy should still
-        produce an independent copy.
+        Nested data is deeply frozen, so the guarantee here is row identity,
+        value equality, and contract preservation, not mutable-data isolation.
         """
         import copy
 
         contract = _make_contract()
-        # Create PipelineRow - it stores immutable view internally
+        # PipelineRow freezes the input list internally.
         original = make_row({"amount": 100, "items": [1, 2, 3]}, contract=contract)
 
         copied = copy.deepcopy(original)
 
-        # Both should have same values
-        assert copied.to_dict()["items"] == [1, 2, 3]
-        # But be independent copies
-        assert copied.to_dict()["items"] is not original.to_dict()["items"]
+        assert copied is not original
+        assert copied.to_dict() == original.to_dict() == {"amount": 100, "items": [1, 2, 3]}
+        assert copied.contract is contract or copied.contract == contract
 
 
 class TestTokenInfoWithUpdatedData:
@@ -369,28 +382,3 @@ class TestTokenInfoWithUpdatedData:
         assert updated.branch_name == "my_branch"
         assert updated.fork_group_id == "fork_001"
         assert updated.expand_group_id == "expand_001"
-
-
-class TestTokenManagerCreateTokenForExistingRow:
-    """Tests for TokenManager.create_token_for_existing_row() with PipelineRow."""
-
-    def test_create_token_for_existing_row_accepts_pipeline_row(self) -> None:
-        """create_token_for_existing_row should accept PipelineRow."""
-        from elspeth.engine.tokens import TokenManager
-
-        contract = _make_contract()
-        recorder = _make_recorder()
-        recorder.create_token.return_value = _CreatedToken("new_token_001")
-        manager = TokenManager(recorder, step_resolver=_make_step_resolver())
-
-        row_data = make_row({"amount": 100}, contract=contract)
-
-        token = manager.create_token_for_existing_row(
-            row_id="existing_row_001",
-            row_data=row_data,
-        )
-
-        assert token.row_id == "existing_row_001"
-        assert token.token_id == "new_token_001"
-        assert isinstance(token.row_data, PipelineRow)
-        assert token.row_data["amount"] == 100

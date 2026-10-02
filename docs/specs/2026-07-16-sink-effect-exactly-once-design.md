@@ -3,7 +3,7 @@
 Date: 2026-07-16
 Status: revised after independent review; pending re-review
 Branch context: `codex/safety-74a343d5ad` from `release/0.7.1`
-Filigree: `elspeth-74a343d5ad`
+legacy-tracker: `elspeth-74a343d5ad`
 
 ## Purpose
 

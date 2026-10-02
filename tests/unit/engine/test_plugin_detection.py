@@ -20,6 +20,7 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from tests.fixtures.base_classes import create_observed_contract
 from tests.fixtures.factories import make_context
+from tests.fixtures.landscape import leader_coordination_token
 
 
 def _single_node_traversal(source_node_id: NodeID, node_id: NodeID, plugin: Any) -> DAGTraversalContext:
@@ -125,9 +126,12 @@ class TestNegativeNominalDispatch:
             source_on_success="default",
             traversal=_single_node_traversal(NodeID(source_node_id), transform_node_id, transform),
             scheduler=setup.factory.scheduler,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
-        ctx = make_context(run_id=run_id, landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            coordination_token=leader_coordination_token(factory, run_id), run_id=run_id, landscape=factory.plugin_audit_writer()
+        )
 
         results = processor.process_row(
             row_index=0,

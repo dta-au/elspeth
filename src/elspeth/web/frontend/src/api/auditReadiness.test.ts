@@ -142,6 +142,8 @@ describe("auditReadiness API client", () => {
               component_id: "first",
               component_type: "transform",
               detail: "first",
+              suggestion: null,
+              note: null,
             },
           ],
         },
@@ -162,6 +164,64 @@ describe("auditReadiness API client", () => {
       new Response("server error", { status: 500 }),
     );
     await expect(fetchAuditReadiness(SESSION_ID)).rejects.toMatchObject({ status: 500 });
+  });
+
+  it.each([null, "Retry the advisory review."])("preserves backend blocker suggestion %s", async (suggestion) => {
+    const body = readyBody();
+    const validation = body.validation_result as Record<string, unknown>;
+    validation.readiness = { ...READY_READINESS, completion_ready: false, blockers: [{
+      code: "advisor_signoff_blocked", component_id: "pipeline",
+      component_type: "pipeline", detail: "Review pending.", suggestion,
+      note: null,
+    }] };
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+    const snapshot = await fetchAuditReadiness(SESSION_ID);
+    expect(snapshot.validation_result.readiness.blockers[0].suggestion).toBe(suggestion);
+  });
+
+  it.each([undefined, 7, {}, [], true])("rejects malformed or missing blocker suggestion %s", async (suggestion) => {
+    const body = readyBody();
+    const validation = body.validation_result as Record<string, unknown>;
+    validation.readiness = { ...READY_READINESS, completion_ready: false, blockers: [{
+      code: "advisor_signoff_blocked", component_id: "pipeline",
+      component_type: "pipeline", detail: "Review pending.", suggestion,
+      note: null,
+    }] };
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+    await expect(fetchAuditReadiness(SESSION_ID)).rejects.toMatchObject({
+      detail: "Unexpected response shape from audit-readiness endpoint",
+    });
+  });
+
+  it.each([null, "The merge step needs a failure route."])("preserves backend blocker note %s", async (note) => {
+    const body = readyBody();
+    const validation = body.validation_result as Record<string, unknown>;
+    validation.readiness = { ...READY_READINESS, completion_ready: false, blockers: [{
+      code: "advisor_signoff_blocked", component_id: "pipeline",
+      component_type: "pipeline", detail: "Review pending.", suggestion: null, note,
+    }] };
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+    const snapshot = await fetchAuditReadiness(SESSION_ID);
+    expect(snapshot.validation_result.readiness.blockers[0].note).toBe(note);
+  });
+
+  it.each([
+    { label: "missing", note: undefined },
+    { label: "numeric", note: 7 },
+    { label: "array", note: ["Reviewer text"] },
+    { label: "object", note: { text: "Reviewer text" } },
+    { label: "boolean", note: true },
+  ])("rejects $label backend blocker note", async ({ note }) => {
+    const body = readyBody();
+    const validation = body.validation_result as Record<string, unknown>;
+    validation.readiness = { ...READY_READINESS, completion_ready: false, blockers: [{
+      code: "advisor_signoff_blocked", component_id: "pipeline",
+      component_type: "pipeline", detail: "Review pending.", suggestion: null, note,
+    }] };
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+    await expect(fetchAuditReadiness(SESSION_ID)).rejects.toMatchObject({
+      detail: "Unexpected response shape from audit-readiness endpoint",
+    });
   });
 
   it.each([
@@ -262,12 +322,7 @@ describe("auditReadiness API client", () => {
     expect(localStorage.getItem("auth_token")).toBeNull();
   });
 
-  // Defuses the token-wipe race: a 401 response that arrives AFTER a successful
-  // login (token swapped in by another caller) must not call logout() and wipe
-  // the fresh token. The guard at client.ts inside parseResponse() short-
-  // circuits when the store already shows no token at the moment the
-  // interceptor runs. Here we simulate the inverse — a 401 fired while token
-  // is null — and confirm no spurious state change occurs.
+  // An unauthenticated request has no credential that a 401 can invalidate.
   it("does not invoke logout when a 401 arrives with no token in the store", async () => {
     // Start with no token (the cold-load / pre-auth scenario).
     expect(useAuthStore.getState().token).toBeNull();

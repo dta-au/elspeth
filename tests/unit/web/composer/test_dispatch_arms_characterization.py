@@ -8,8 +8,9 @@ so they survive the deferred Phase-3 reshuffle without re-rotting.
 
 This file pins arms #1, #2, #4, #5, #7, #8, #9, and #17 of the dispatch
 loop. For each arm covered here the test asserts the audit-envelope status
-(``ComposerToolStatus``), the recorded ``error_class`` on the ``_ToolOutcome``
-(where applicable), and that invocations were buffered. They exist to make the
+(``ComposerToolStatus``), the recorded ``error_class`` and closed
+``error_category`` on the ``_ToolOutcome`` (where applicable), and that
+invocations were buffered. They exist to make the
 Phase-2 verbatim extraction of the dispatch loop provably behaviour-preserving
 for the audit trail — a dropped or reordered ``recorder.record(finish_*)`` on
 any covered arm, or a rerouted exception handler that changes the recorded
@@ -73,13 +74,15 @@ Pre-covered arms verified in ``test_compose_loop_audit_wiring.py`` and
 
 Arms characterised here (all in ``tool_batch.py``):
   #1  — JSON-decode failure (``ARG_ERROR pre-dispatch site (1/3)``)
-  #2  — non-dict arguments, valid JSON, canonicalization succeeds → TypeError
-        (``ARG_ERROR pre-dispatch site (2/3)``)
+  #2  — non-dict arguments, valid JSON, canonicalization succeeds →
+        ToolArgumentError / wire_not_object (``ARG_ERROR pre-dispatch site (2/3)``)
   #4  — discovery cache-hit (``cache_hit=True`` branch; second identical cacheable call)
-  #5  — required-paths missing (``ARG_ERROR pre-dispatch site (3/3)``)
+  #5  — required-paths missing → ToolArgumentError / missing_required_path
+        (``ARG_ERROR pre-dispatch site (3/3)``)
   #7  — advisor disabled (defense-in-depth arm)
   #8  — advisor budget exhausted (``Advisor budget exhausted`` arm)
-  #9  — advisor arg-error (``_validate_advisor_arguments`` rejects)
+  #9  — advisor arg-error (``_validate_advisor_arguments`` rejects) →
+        ToolArgumentError / schema_shape (the closed-root S gate)
   #17 — get_plugin_schema success marks (type, name) loaded
         (``tool_name == "get_plugin_schema" and result.success`` branch)
 """
@@ -87,6 +90,7 @@ Arms characterised here (all in ``tool_batch.py``):
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -95,7 +99,9 @@ from uuid import uuid4
 
 import pytest
 
-from elspeth.contracts.composer_audit import ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
 from elspeth.web.sessions.models import sessions_table
@@ -158,6 +164,8 @@ def test_server_rewrite_keeps_set_pipeline_wrapped_in_provider_transcript() -> N
         messages,
         tool_call_id="call_pipeline",
         arguments=semantic_arguments,
+        dialect=ToolContractDialect.NONE,
+        semantic=True,
     )
 
     encoded = messages[0]["tool_calls"][0]["function"]["arguments"]
@@ -187,6 +195,8 @@ def test_server_rewrite_rejects_owned_function_envelope_without_name() -> None:
             messages,
             tool_call_id="call_pipeline",
             arguments={"source": {}, "nodes": [], "edges": [], "outputs": []},
+            dialect=ToolContractDialect.NONE,
+            semantic=True,
         )
 
 
@@ -237,11 +247,34 @@ async def test_set_pipeline_invalid_provider_envelope_is_closed_arg_error_before
     assert len(result.tool_invocations) == 1
     invocation = result.tool_invocations[0]
     assert invocation.status is ComposerToolStatus.ARG_ERROR
-    assert result.tool_outcomes[0].error_class == "TypeError"
+    # S0 pin move: the recorded class is the ToolArgumentError the envelope gate
+    # builds (was a hand-written "TypeError"), and the category is wire_envelope.
+    assert result.tool_outcomes[0].error_class == "ToolArgumentError"
+    assert result.tool_outcomes[0].error_category is ToolArgumentErrorCategory.WIRE_ENVELOPE
+    assert invocation.error_category is ToolArgumentErrorCategory.WIRE_ENVELOPE
+    expected_error = "Tool 'set_pipeline' arguments must contain exactly one 'pipeline' object field."
+    assert invocation.error_message == expected_error
+    assert result.tool_outcomes[0].error_message == expected_error
     assert json.loads(invocation.arguments_canonical) == {
         "_redaction_status": "invalid_tool_arguments",
-        "error_class": "TypeError",
+        "error_class": "ToolArgumentError",
     }
+
+
+def test_provider_discovery_explains_how_to_wrap_round_trip_pipeline_arguments(
+    fake_composer_service: ComposerServiceImpl,
+) -> None:
+    tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
+    discovery = next(tool["function"] for tool in tools if tool["function"]["name"] == "get_pipeline_state")
+    mutation = next(tool["function"] for tool in tools if tool["function"]["name"] == "set_pipeline")
+
+    assert mutation["parameters"]["required"] == ["pipeline"]
+    for description in (
+        discovery["description"],
+        discovery["parameters"]["properties"]["component"]["description"],
+    ):
+        assert '"pipeline":' in description
+        assert "flat" in description
 
 
 @pytest.mark.asyncio
@@ -250,8 +283,8 @@ async def test_advisor_tool_always_present(
 ) -> None:
     """The ``request_advisor_hint`` tool is ALWAYS exposed to the composer
     LLM. There is no enable flag any more — advisor is mandatory, so the
-    tool is unconditionally part of ``_get_litellm_tools()``."""
-    tools = fake_composer_service._get_litellm_tools()
+    tool is unconditionally part of ``composer_loop_tool_definitions()``."""
+    tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
     names = {t["function"]["name"] for t in tools}
     assert "request_advisor_hint" in names
 
@@ -294,6 +327,34 @@ async def test_arm_json_decode_failure_records_arg_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["get_pipeline_state", "set_pipeline"])
+async def test_invalid_json_arg_error_sends_replayable_tool_call_history(
+    fake_composer_service: ComposerServiceImpl,
+    result_session_id: str,
+    tool_name: str,
+) -> None:
+    class CapturingLLM(_FakeComposeLLM):
+        def __init__(self) -> None:
+            first = _raw_tool_call_llm(name=tool_name, raw_arguments="{not valid json")._responses[0]
+            super().__init__((first, _fake_llm_response(content="Done.")))
+            self.requests: list[list[dict[str, Any]]] = []
+
+        async def __call__(self, messages: Any, tools: Any) -> Any:
+            self.requests.append(deepcopy(messages))
+            return await super().__call__(messages, tools)
+
+    llm = CapturingLLM()
+    result = await fake_composer_service._run_one_turn_for_test(llm=llm, session_id=result_session_id)
+
+    assert result.tool_outcomes[0].error_class == "JSONDecodeError"
+    assert len(llm.requests) >= 2
+    assistant = next(message for message in llm.requests[1] if message["role"] == "assistant" and message.get("tool_calls"))
+    arguments = assistant["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(json.loads(arguments), dict)
+    assert arguments != "{not valid json"
+
+
+@pytest.mark.asyncio
 async def test_deep_json_arguments_record_one_bounded_arg_error(
     fake_composer_service: ComposerServiceImpl,
     result_session_id: str,
@@ -315,7 +376,7 @@ async def test_arm_non_dict_arguments_records_arg_error(
     fake_composer_service: ComposerServiceImpl,
     result_session_id: str,
 ) -> None:
-    """Arm #2: valid JSON but non-dict (list) arguments → ARG_ERROR with error_class 'TypeError'.
+    """Arm #2: valid JSON but non-dict (list) arguments → ARG_ERROR, ToolArgumentError / wire_not_object.
 
     tool_batch.py — ARG_ERROR pre-dispatch site (2/3).
     The LLM produced syntactically valid JSON, but it decoded to a list
@@ -331,7 +392,12 @@ async def test_arm_non_dict_arguments_records_arg_error(
     ``is not None`` assertion would not catch a rerouted handler, so this pins
     the exact class string.
 
-    Pinning: exactly 1 invocation, ARG_ERROR status, error_class == "TypeError".
+    S0 pin move: the site used to write the hand label ``"TypeError"``
+    although nothing raised one. It now records the ``ToolArgumentError`` it
+    builds, with category ``wire_not_object``.
+
+    Pinning: exactly 1 invocation, ARG_ERROR status, error_class ==
+    "ToolArgumentError", error_category == wire_not_object.
     """
     llm = _raw_tool_call_llm(name="get_pipeline_state", raw_arguments=json.dumps([1, 2, 3]))
     result = await fake_composer_service._run_one_turn_for_test(llm=llm, session_id=result_session_id)
@@ -343,9 +409,9 @@ async def test_arm_non_dict_arguments_records_arg_error(
     assert ComposerToolStatus.ARG_ERROR in statuses, (
         f"ARG_ERROR not in recorded statuses {statuses!r}; audit trail did not record the non-dict-args failure"
     )
-    error_classes = [o.error_class for o in result.tool_outcomes]
-    assert any(ec == "TypeError" for ec in error_classes), (
-        f"No outcome has error_class='TypeError'; got {error_classes!r}. "
+    outcomes = [(o.error_class, o.error_category) for o in result.tool_outcomes]
+    assert outcomes == [("ToolArgumentError", ToolArgumentErrorCategory.WIRE_NOT_OBJECT)], (
+        f"Unexpected outcome classification {outcomes!r}. "
         "The non-dict-args ARG_ERROR arm may have been rerouted — inspect "
         "tool_batch.py (ARG_ERROR pre-dispatch site 2/3)."
     )
@@ -356,24 +422,26 @@ async def test_arm_required_paths_missing_records_arg_error(
     fake_composer_service: ComposerServiceImpl,
     result_session_id: str,
 ) -> None:
-    """Arm #5: required paths missing → ARG_ERROR with error_class 'MissingRequiredPaths'.
+    """Arm #5: required paths missing → ARG_ERROR, ToolArgumentError / missing_required_path.
 
     tool_batch.py — ARG_ERROR pre-dispatch site (3/3).
     ``set_source`` declares required: ["plugin", "on_success", "options",
     "on_validation_failure"] in its JSON schema.  Passing ``{}`` means all
     four are missing.  The loop records ``finish_arg_error`` with
-    ``error_class="MissingRequiredPaths"`` before entering the handler.
+    the ``ToolArgumentError`` it builds and category
+    ``missing_required_path`` before entering the handler (S0 pin move: the
+    site used to write ``"MissingRequiredPaths"``, a class that does not exist).
 
     Empirically verified: ``_TOOL_REQUIRED_PATHS["set_source"]`` is non-empty
     (auto-computed from the tool declaration's json_schema; the
     ``sources.py:375`` comment about the "deleted entry" refers to a prior
     hand-maintained dict, not the current auto-computed index).  Running:
         ``_TOOL_REQUIRED_PATHS.get("set_source")`` returns 4 compiled paths.
-    So ``{}`` hits the MissingRequiredPaths arm, not the Pydantic handler.
+    So ``{}`` hits the required-paths arm, not the Pydantic handler.
 
-    Pinning: exactly 1 invocation, ARG_ERROR status, and the outcome
-    carries error_class == "MissingRequiredPaths" (not the ToolArgumentError
-    sub-class that the Pydantic handler would produce on fallthrough).
+    Pinning: exactly 1 invocation, ARG_ERROR status, and the outcome carries
+    category ``missing_required_path`` (not the ``model_validation`` category
+    the Pydantic handler would produce on fallthrough).
     """
     llm = _raw_tool_call_llm(name="set_source", raw_arguments=json.dumps({}))
     result = await fake_composer_service._run_one_turn_for_test(llm=llm, session_id=result_session_id)
@@ -385,11 +453,11 @@ async def test_arm_required_paths_missing_records_arg_error(
     assert ComposerToolStatus.ARG_ERROR in statuses, (
         f"ARG_ERROR not in recorded statuses {statuses!r}; audit trail did not record the missing-paths failure"
     )
-    error_classes = [o.error_class for o in result.tool_outcomes]
-    assert any(ec == "MissingRequiredPaths" for ec in error_classes), (
-        f"No outcome has error_class='MissingRequiredPaths'; got {error_classes!r}. "
+    outcomes = [(o.error_class, o.error_category) for o in result.tool_outcomes]
+    assert outcomes == [("ToolArgumentError", ToolArgumentErrorCategory.MISSING_REQUIRED_PATH)], (
+        f"Unexpected outcome classification {outcomes!r}. "
         "Either the required-paths arm was not reached (set_source not in _TOOL_REQUIRED_PATHS) "
-        "or the error_class string changed — inspect tool_batch.py "
+        "or the classification changed — inspect tool_batch.py "
         "(ARG_ERROR pre-dispatch site 3/3)."
     )
 
@@ -533,6 +601,11 @@ async def test_arm_advisor_budget_exhausted_records_success_with_budget_exhauste
     sessions_svc = build_test_sessions_service(data_dir=tmp_path)
     svc = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings, sessions_service=sessions_svc)
 
+    from tests.fixtures.identities import ensure_test_identity
+
+    with sessions_svc._engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="arm8-test-user")
+
     # Insert a session so _run_one_turn_for_test has a valid session_id to work
     # with (mirrors the result_session_id fixture body in conftest.py).
     session_id = str(uuid4())
@@ -590,10 +663,10 @@ async def test_arm_advisor_budget_exhausted_records_success_with_budget_exhauste
 
 
 @pytest.mark.asyncio
-async def test_arm_advisor_arg_error_records_arg_error_with_type_error_class(
+async def test_arm_advisor_arg_error_records_schema_shape_arg_error(
     tmp_path: Path,
 ) -> None:
-    """Arm #9: advisor arg validation failure → ARG_ERROR with error_class 'TypeError'.
+    """Arm #9: advisor arg validation failure → ARG_ERROR, ToolArgumentError / schema_shape.
 
     tool_batch.py advisor arg-error arm (``_validate_advisor_arguments``).  When
     the advisor is enabled, the budget is not exhausted, and the arguments pass
@@ -604,9 +677,11 @@ async def test_arm_advisor_arg_error_records_arg_error_with_type_error_class(
     To land here the test must supply ALL four required keys
     (trigger, problem_summary, recent_errors, attempted_actions) so the
     required-paths gate clears, then introduce a type fault in one field.
-    ``attempted_actions="oops"`` is a string, not a list — the ``not isinstance``
-    check in ``ComposerServiceImpl._validate_advisor_arguments`` catches it and
-    returns ``error_class: "TypeError"``.
+    ``attempted_actions="oops"`` is a string, not a list. S0 pin move:
+    ``ComposerServiceImpl._validate_advisor_arguments`` now holds the arguments
+    to the closed-root flat schema S first, whose ``type`` failure raises a
+    ``ToolArgumentError`` with category ``schema_shape`` (was the hand label
+    ``"TypeError"``).
 
     This test constructs its own service (advisor enabled, default budget=4)
     to avoid mutating the shared fixture's settings.
@@ -614,11 +689,16 @@ async def test_arm_advisor_arg_error_records_arg_error_with_type_error_class(
     Pinning:
     - exactly 1 invocation
     - status == ARG_ERROR
-    - error_class == "TypeError"
+    - error_class == "ToolArgumentError", error_category == schema_shape
     """
     settings = _make_settings(tmp_path)
     sessions_svc = build_test_sessions_service(data_dir=tmp_path)
     svc = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings, sessions_service=sessions_svc)
+
+    from tests.fixtures.identities import ensure_test_identity
+
+    with sessions_svc._engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="arm9-test-user")
 
     session_id = str(uuid4())
     now = datetime.now(UTC)
@@ -636,8 +716,8 @@ async def test_arm_advisor_arg_error_records_arg_error_with_type_error_class(
             )
         )
 
-    # attempted_actions must be a list; passing a string causes
-    # _validate_advisor_arguments to return error_class="TypeError".
+    # attempted_actions must be a list; passing a string fails the S gate's
+    # ``type`` keyword (a schema_shape rejection).
     bad_args = {**_VALID_ADVISOR_ARGS, "attempted_actions": "oops"}
     first_response = _FakeLLMResponse(
         choices=[
@@ -667,11 +747,11 @@ async def test_arm_advisor_arg_error_records_arg_error_with_type_error_class(
         "_validate_advisor_arguments should reject attempted_actions='oops' (not a list) "
         "with finish_arg_error — inspect tool_batch.py (_validate_advisor_arguments arm)."
     )
-    error_classes = [o.error_class for o in result.tool_outcomes]
-    assert any(ec == "TypeError" for ec in error_classes), (
-        f"No outcome has error_class='TypeError'; got {error_classes!r}. "
-        "_validate_advisor_arguments returns error_class='TypeError' for non-list "
-        "attempted_actions — inspect tool_batch.py / ComposerServiceImpl._validate_advisor_arguments."
+    outcomes = [(o.error_class, o.error_category) for o in result.tool_outcomes]
+    assert outcomes == [("ToolArgumentError", ToolArgumentErrorCategory.SCHEMA_SHAPE)], (
+        f"Unexpected outcome classification {outcomes!r}. "
+        "_validate_advisor_arguments rejects non-list attempted_actions at the S gate — "
+        "inspect tool_batch.py / ComposerServiceImpl._validate_advisor_arguments."
     )
 
 
@@ -688,7 +768,7 @@ async def test_arm_get_plugin_schema_success_marks_type_name_loaded(
     """Arm #17: successful get_plugin_schema records (type, name) in _schemas_loaded.
 
     tool_batch.py get_plugin_schema success branch.  After a successful ``get_plugin_schema`` dispatch,
-    the loop calls ``_mark_plugin_schema_loaded(session_id, plugin_type, plugin_name)``
+    the loop calls ``schema_disclosure.mark_plugin_schema_loaded(session_id, plugin_type, plugin_name)``
     so the LLM tool-list builder can surface schema-loaded state to the model.
 
     ``fake_composer_service`` uses a mock catalog whose ``get_schema`` returns a
@@ -696,13 +776,13 @@ async def test_arm_get_plugin_schema_success_marks_type_name_loaded(
     dispatch succeed.
 
     This test pins the side-effect rather than the full audit row: if the
-    ``_mark_plugin_schema_loaded`` call is accidentally dropped or its arguments
-    transposed during the Phase-2 extraction, ``_schemas_loaded_for_session``
+    ``mark_plugin_schema_loaded`` call is accidentally dropped or its arguments
+    transposed during the Phase-2 extraction, ``schemas_loaded_for_session``
     will return an empty frozenset and the assertion will fail.
 
     Pinning:
     - exactly 1 SUCCESS invocation
-    - ``("source", "csv") in fake_composer_service._schemas_loaded_for_session(result_session_id)``
+    - ``("source", "csv") in fake_composer_service._schema_disclosure.schemas_loaded_for_session(result_session_id)``
     """
     first_response = _FakeLLMResponse(
         choices=[
@@ -731,9 +811,9 @@ async def test_arm_get_plugin_schema_success_marks_type_name_loaded(
         f"SUCCESS not in recorded statuses {statuses!r}; get_plugin_schema with valid args "
         "and a mock catalog that always returns a schema should record finish_success."
     )
-    schemas_loaded = fake_composer_service._schemas_loaded_for_session(result_session_id)
+    schemas_loaded = fake_composer_service._schema_disclosure.schemas_loaded_for_session(result_session_id)
     assert ("source", "csv") in schemas_loaded, (
-        f"('source', 'csv') not in _schemas_loaded_for_session({result_session_id!r}); "
-        f"got {schemas_loaded!r}.  _mark_plugin_schema_loaded must be called after a "
+        f"('source', 'csv') not in schemas_loaded_for_session({result_session_id!r}); "
+        f"got {schemas_loaded!r}.  mark_plugin_schema_loaded must be called after a "
         "successful get_plugin_schema dispatch — inspect tool_batch.py (get_plugin_schema success branch)."
     )

@@ -14,10 +14,23 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
+
 from elspeth.contracts import Batch, NodeType, Token
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
-from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run, register_test_node
+from elspeth.core.landscape.schema import tokens_table
+from tests.fixtures.audit_hashing import fake_error_hash
+from tests.fixtures.landscape import (
+    RecorderSetup,
+    leader_coordination_token,
+    lowered_sqlite_variable_limit,
+    make_recorder_with_run,
+    record_statement_binds,
+    register_test_node,
+)
 
 NOW = datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC)
 
@@ -28,23 +41,28 @@ def _setup_buffered_token() -> tuple[RecorderSetup, str, Batch, Token]:
     agg_node_id = register_test_node(
         setup.factory.data_flow, setup.run_id, "agg-node-1", node_type=NodeType.TRANSFORM, plugin_name="batch_stats"
     )
-    batch = setup.factory.execution.create_batch(setup.run_id, agg_node_id)
-    row = setup.factory.data_flow.create_row(
-        setup.run_id,
+    batch = setup.factory.execution.create_batch(agg_node_id, coordination_token=leader_coordination_token(setup.factory, setup.run_id))
+    _row, token = setup.factory.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"id": 1},
         source_row_index=0,
         ingest_sequence=0,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
     )
-    token = setup.factory.data_flow.create_token(row_id=row.row_id)
     return setup, agg_node_id, batch, token
 
 
 def test_single_live_buffered_outcome_is_returned() -> None:
     setup, _node_id, batch, token = _setup_buffered_token()
     ref = TokenRef(token_id=token.token_id, run_id=setup.run_id)
-    outcome_id = setup.factory.data_flow.record_token_outcome(ref, None, TerminalPath.BUFFERED, batch_id=batch.batch_id)
+    outcome_id = setup.factory.data_flow.record_token_outcome_leader(
+        ref,
+        None,
+        TerminalPath.BUFFERED,
+        batch_id=batch.batch_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
+    )
 
     live = setup.factory.barrier_restore.list_live_buffered_outcomes(ref)
 
@@ -59,8 +77,20 @@ def test_duplicate_live_buffered_outcomes_are_all_returned_in_order() -> None:
     succeeds — the verb must surface BOTH, never latest-wins."""
     setup, _node_id, batch, token = _setup_buffered_token()
     ref = TokenRef(token_id=token.token_id, run_id=setup.run_id)
-    first = setup.factory.data_flow.record_token_outcome(ref, None, TerminalPath.BUFFERED, batch_id=batch.batch_id)
-    second = setup.factory.data_flow.record_token_outcome(ref, None, TerminalPath.BUFFERED, batch_id=batch.batch_id)
+    first = setup.factory.data_flow.record_token_outcome_leader(
+        ref,
+        None,
+        TerminalPath.BUFFERED,
+        batch_id=batch.batch_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
+    )
+    second = setup.factory.data_flow.record_token_outcome_leader(
+        ref,
+        None,
+        TerminalPath.BUFFERED,
+        batch_id=batch.batch_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
+    )
 
     live = setup.factory.barrier_restore.list_live_buffered_outcomes(ref)
 
@@ -82,8 +112,20 @@ def test_flushed_token_buffered_history_is_exempt() -> None:
     BUFFERED row is dead history (the batch flushed)."""
     setup, _node_id, batch, token = _setup_buffered_token()
     ref = TokenRef(token_id=token.token_id, run_id=setup.run_id)
-    setup.factory.data_flow.record_token_outcome(ref, None, TerminalPath.BUFFERED, batch_id=batch.batch_id)
-    setup.factory.data_flow.record_token_outcome(ref, TerminalOutcome.TRANSIENT, TerminalPath.BATCH_CONSUMED, batch_id=batch.batch_id)
+    setup.factory.data_flow.record_token_outcome_leader(
+        ref,
+        None,
+        TerminalPath.BUFFERED,
+        batch_id=batch.batch_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
+    )
+    setup.factory.data_flow.record_token_outcome_leader(
+        ref,
+        TerminalOutcome.TRANSIENT,
+        TerminalPath.BATCH_CONSUMED,
+        batch_id=batch.batch_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
+    )
 
     assert setup.factory.barrier_restore.list_live_buffered_outcomes(ref) == []
     assert setup.factory.barrier_restore.find_duplicate_live_buffered_acceptances(setup.run_id) == []
@@ -98,21 +140,36 @@ def test_no_outcomes_is_empty() -> None:
 def test_run_wide_duplicate_sweep_names_only_duplicated_tokens() -> None:
     setup, _node_id, batch, token = _setup_buffered_token()
     ref = TokenRef(token_id=token.token_id, run_id=setup.run_id)
-    setup.factory.data_flow.record_token_outcome(ref, None, TerminalPath.BUFFERED, batch_id=batch.batch_id)
-    setup.factory.data_flow.record_token_outcome(ref, None, TerminalPath.BUFFERED, batch_id=batch.batch_id)
+    setup.factory.data_flow.record_token_outcome_leader(
+        ref,
+        None,
+        TerminalPath.BUFFERED,
+        batch_id=batch.batch_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
+    )
+    setup.factory.data_flow.record_token_outcome_leader(
+        ref,
+        None,
+        TerminalPath.BUFFERED,
+        batch_id=batch.batch_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
+    )
 
     # A healthy sibling token with ONE live BUFFERED row stays out of the report.
-    row2 = setup.factory.data_flow.create_row(
-        setup.run_id,
+    _row2, token2 = setup.factory.data_flow.create_row_with_token(
         setup.source_node_id,
         1,
         {"id": 2},
         source_row_index=1,
         ingest_sequence=1,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
     )
-    token2 = setup.factory.data_flow.create_token(row_id=row2.row_id)
-    setup.factory.data_flow.record_token_outcome(
-        TokenRef(token_id=token2.token_id, run_id=setup.run_id), None, TerminalPath.BUFFERED, batch_id=batch.batch_id
+    setup.factory.data_flow.record_token_outcome_leader(
+        TokenRef(token_id=token2.token_id, run_id=setup.run_id),
+        None,
+        TerminalPath.BUFFERED,
+        batch_id=batch.batch_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
     )
 
     assert setup.factory.barrier_restore.find_duplicate_live_buffered_acceptances(setup.run_id) == [(token.token_id, 2)]
@@ -130,21 +187,47 @@ def test_failed_unrouted_reconcile_read_scopes_to_failure_unrouted() -> None:
     run_id = setup.run_id
 
     # Token A: terminally FAILED via the failure-arm signature → swept.
-    df.record_token_outcome(
-        TokenRef(token_id=failed_token.token_id, run_id=run_id), TerminalOutcome.FAILURE, TerminalPath.UNROUTED, error_hash="deadbeef"
+    df.record_token_outcome_leader(
+        TokenRef(token_id=failed_token.token_id, run_id=run_id),
+        TerminalOutcome.FAILURE,
+        TerminalPath.UNROUTED,
+        error_hash=fake_error_hash("deadbeef"),
+        coordination_token=leader_coordination_token(setup.factory, run_id),
     )
 
     # Token B: BATCH_CONSUMED success residual → NOT swept.
-    row_b = df.create_row(run_id, setup.source_node_id, 1, {"id": 2}, source_row_index=1, ingest_sequence=1)
-    token_b = df.create_token(row_id=row_b.row_id)
-    df.record_token_outcome(
-        TokenRef(token_id=token_b.token_id, run_id=run_id), TerminalOutcome.TRANSIENT, TerminalPath.BATCH_CONSUMED, batch_id=batch.batch_id
+    _row_b, token_b = df.create_row_with_token(
+        setup.source_node_id,
+        1,
+        {"id": 2},
+        source_row_index=1,
+        ingest_sequence=1,
+        coordination_token=leader_coordination_token(setup.factory, run_id),
+    )
+    df.record_token_outcome_leader(
+        TokenRef(token_id=token_b.token_id, run_id=run_id),
+        TerminalOutcome.TRANSIENT,
+        TerminalPath.BATCH_CONSUMED,
+        batch_id=batch.batch_id,
+        coordination_token=leader_coordination_token(setup.factory, run_id),
     )
 
     # Token C: still live BUFFERED → NOT swept.
-    row_c = df.create_row(run_id, setup.source_node_id, 2, {"id": 3}, source_row_index=2, ingest_sequence=2)
-    token_c = df.create_token(row_id=row_c.row_id)
-    df.record_token_outcome(TokenRef(token_id=token_c.token_id, run_id=run_id), None, TerminalPath.BUFFERED, batch_id=batch.batch_id)
+    _row_c, token_c = df.create_row_with_token(
+        setup.source_node_id,
+        2,
+        {"id": 3},
+        source_row_index=2,
+        ingest_sequence=2,
+        coordination_token=leader_coordination_token(setup.factory, run_id),
+    )
+    df.record_token_outcome_leader(
+        TokenRef(token_id=token_c.token_id, run_id=run_id),
+        None,
+        TerminalPath.BUFFERED,
+        batch_id=batch.batch_id,
+        coordination_token=leader_coordination_token(setup.factory, run_id),
+    )
 
     result = setup.factory.barrier_restore.find_failed_unrouted_terminal_token_ids(
         run_id, [failed_token.token_id, token_b.token_id, token_c.token_id]
@@ -156,3 +239,47 @@ def test_failed_unrouted_reconcile_read_scopes_to_failure_unrouted() -> None:
 def test_failed_unrouted_reconcile_read_empty_input_short_circuits() -> None:
     setup, _node_id, _batch, _token = _setup_buffered_token()
     assert setup.factory.barrier_restore.find_failed_unrouted_terminal_token_ids(setup.run_id, []) == frozenset()
+
+
+# --- Bound-parameter budget (elspeth-5887 X2) ---------------------------------
+# Resume reconciles a restored barrier by reading the (FAILURE, UNROUTED)
+# terminals among its members, and a barrier's member set has no row cap, so
+# the read may not bind a list that grows with the member count. SQLite here
+# refuses a statement over 99 binds, with the shared budget lowered to 60.
+
+
+def test_failed_unrouted_reconcile_read_binds_a_bounded_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.core.landscape import bind_budget
+
+    monkeypatch.setattr(bind_budget, "BIND_BUDGET_PER_STATEMENT", 60)
+    members = 120
+    with lowered_sqlite_variable_limit(monkeypatch, 99):
+        setup = make_recorder_with_run(run_id="run-bound-1")
+        token = leader_coordination_token(setup.factory, setup.run_id)
+        token_ids: list[str] = []
+        for index in range(members):
+            _row, member = setup.factory.data_flow.create_row_with_token(
+                setup.source_node_id, index, {"id": index}, source_row_index=index, ingest_sequence=index, coordination_token=token
+            )
+            token_ids.append(member.token_id)
+        # Every member but each seventh carries the failed-flush terminal.
+        failed = frozenset(token_id for index, token_id in enumerate(token_ids) if index % 7)
+        for token_id in failed:
+            setup.factory.data_flow.record_token_outcome_leader(
+                TokenRef(token_id=token_id, run_id=setup.run_id),
+                TerminalOutcome.FAILURE,
+                TerminalPath.UNROUTED,
+                error_hash=fake_error_hash("deadbeef"),
+                coordination_token=token,
+            )
+        # Control: this connection refuses a statement that binds one parameter per member.
+        with setup.db.connection() as conn, pytest.raises(OperationalError, match="too many SQL variables"):
+            conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.token_id.in_(token_ids)))
+
+        with record_statement_binds() as binds:
+            result = setup.factory.barrier_restore.find_failed_unrouted_terminal_token_ids(setup.run_id, token_ids)
+
+    assert result == failed
+    # 60 chunked ids plus the fixed run / completed / outcome / path predicates.
+    assert binds.executions > 0
+    assert binds.max_binds <= 60 + 4, binds.statement

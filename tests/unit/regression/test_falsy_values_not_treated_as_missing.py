@@ -6,6 +6,7 @@ incorrectly treated as missing/None.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -49,6 +50,9 @@ class _ScalarResultFake:
     def scalar(self) -> int | float | None:
         return self.value
 
+    def scalar_one(self) -> int | float | None:
+        return self.value
+
 
 @dataclass(frozen=True)
 class _RowsResultFake:
@@ -56,6 +60,9 @@ class _RowsResultFake:
 
     def fetchall(self) -> tuple[Any, ...]:
         return self.rows
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.rows)
 
 
 class _SequencedConnectionFake:
@@ -92,9 +99,15 @@ class _LandscapeDBFake:
 
 
 def _run_summary_results_with(avg_duration_ms: float | None) -> list[_ScalarResultFake | _RowsResultFake]:
-    zero_count_results = [_ScalarResultFake(0) for _ in range(10)]
+    # Include the separate structural collector-group count in run summaries.
+    zero_count_results = [_ScalarResultFake(0) for _ in range(11)]
     return [
         *zero_count_results,
+        # deciding_collector_group_failures: the failed-group rows, then the
+        # run's collector nodes (none, so it returns before the member query).
+        _RowsResultFake(),
+        _RowsResultFake(),
+        # The outcome distribution.
         _RowsResultFake(),
         _ScalarResultFake(avg_duration_ms),
     ]

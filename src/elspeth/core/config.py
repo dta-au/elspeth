@@ -32,6 +32,7 @@ from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_MAX_CHUNKS,
     AUDIT_EXPORT_MAX_TOTAL_BYTES,
     AUDIT_EXPORT_MAX_TOTAL_RECORDS,
+    validate_compartment_id,
     validate_content_namespace,
     validate_credential_free_identifier,
 )
@@ -593,7 +594,9 @@ class TriggerConfig(BaseModel):
             )
 
         # Reject non-boolean expressions
-        # Per CLAUDE.md: "if bool(result)" coercion is forbidden for our data
+        # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        # Model, our data gets no coercion — an `if bool(result)` truth test is
+        # forbidden here.
         if not parser.is_boolean_expression():
             raise ValueError(
                 f"Trigger condition must be a boolean expression that returns True/False. "
@@ -629,17 +632,24 @@ class AggregationSettings(BaseModel):
     - passthrough: Batch releases all accepted rows unchanged
     - transform: Batch applies a transform function to produce results
 
+    A batch whose transform returns an error fails as a WHOLE: every
+    buffered input row goes to the ``on_error`` sink with its original
+    values (``discard`` records them failed without writing them anywhere).
+
     Example YAML:
         aggregations:
-          - name: batch_stats
-            plugin: stats_aggregation
-            on_error: discard
+          - name: amount_stats
+            plugin: batch_stats
+            input: amounts
+            on_success: stats_out
+            on_error: quarantine
             trigger:
               count: 100
             output_mode: transform
             expected_output_count: 1  # Optional: validate N->1 aggregation
             options:
-              fields: ["value"]
+              schema: {mode: observed}
+              value_field: amount
               compute_mean: true
     """
 
@@ -653,7 +663,10 @@ class AggregationSettings(BaseModel):
         description="Connection name or sink name for aggregation output",
     )
     on_error: str = Field(
-        description="Sink name for rows that fail batch processing, or 'discard'",
+        description=(
+            "Sink that receives every input row of a batch whose flush fails (each row routed with its original "
+            "values and the batch-level reason), or 'discard' to record those rows failed without routing them"
+        ),
     )
     trigger: TriggerConfig = Field(
         default_factory=TriggerConfig,
@@ -665,7 +678,7 @@ class AggregationSettings(BaseModel):
     )
     expected_output_count: int | None = Field(
         default=None,
-        description="Optional: validate aggregation produces exactly this many output rows.",
+        description="Optional exact output row count for output_mode='transform' (the default); omit for 'passthrough'.",
     )
     options: dict[str, Any] = Field(
         default_factory=dict,
@@ -696,6 +709,22 @@ class AggregationSettings(BaseModel):
         value = v.strip()
         return _validate_connection_or_sink_name(value, field_label="Aggregation input connection name")
 
+    @field_validator("on_error")
+    @classmethod
+    def validate_on_error(cls, v: str) -> str:
+        """Ensure on_error is a valid sink name or 'discard'.
+
+        Mirrors ``TransformSettings.validate_on_error``: the value becomes the
+        ``__error_<name>__`` DIVERT edge's target, so it is admitted by the
+        same label rules at parse time.
+        """
+        if not v.strip():
+            raise ValueError("on_error must be a sink name or 'discard'")
+        value = v.strip()
+        if value == "discard":
+            return value
+        return _validate_connection_or_sink_name(value, field_label="Aggregation on_error sink name")
+
     @field_validator("on_success")
     @classmethod
     def validate_on_success(cls, v: str | None) -> str | None:
@@ -706,6 +735,14 @@ class AggregationSettings(BaseModel):
             return None
         value = v.strip()
         return _validate_connection_or_sink_name(value, field_label="Aggregation on_success connection name")
+
+    @model_validator(mode="after")
+    def validate_expected_output_count_mode(self) -> "AggregationSettings":
+        """Reject a count that the selected aggregation mode does not enforce."""
+        error = self.output_mode.expected_output_count_error(self.expected_output_count)
+        if error is not None:
+            raise ValueError(error)
+        return self
 
 
 class GateSettings(BaseModel):
@@ -1015,7 +1052,8 @@ class CoalesceSettings(BaseModel):
             "How to resolve field-level collisions during union merge. "
             "'last_wins' (default) keeps the value from the last branch in declaration order — current behavior. "
             "'first_wins' keeps the first branch's value. "
-            "'fail' raises CoalesceCollisionError when any field collides. "
+            "'fail' fails the row's merge group (reason union_field_collision) when any field collides; a collision certain "
+            "from config (two branches that both guarantee the name on every merge) is refused at build. "
             "Note: 'fail' treats any field-name overlap as a collision, even if both branches produced the same value — "
             "collision detection is name-based, not value-based. "
             "Only meaningful when merge='union'; ignored for nested and select. "
@@ -1587,11 +1625,14 @@ class LandscapeExportSettings(BaseModel):
     sink: str | None = None
     format: Literal["csv", "json"] = "csv"
     signing_mode: Literal["unsigned", "hmac_sha256"] = "unsigned"
+    authentication_policy: Literal["optional", "required"] = "optional"
     signer_key_id: str = "UNSIGNED"
     signing_secret_ref: str | None = None
     signer_rotation_policy: Literal["multi_version", "single_export"] = "multi_version"
-    exporter_version: str = Field(default="landscape-exporter-v1", min_length=1, max_length=64)
-    serialization_version: str = Field(default="audit-export-v2", min_length=1, max_length=64)
+    exporter_version: Literal["landscape-exporter-auth-v2"] = "landscape-exporter-auth-v2"
+    auth_events: Literal["omitted", "deployment_snapshot"] = "omitted"
+    compartment_id: str | None = None
+    serialization_version: Literal["audit-export-v3"] = "audit-export-v3"
     chunking_algorithm_version: str = Field(default="record-framing-v1", min_length=1, max_length=64)
     include_raw_error_rows: bool = False
     total_record_limit: int | None = Field(default=None, gt=0, le=AUDIT_EXPORT_MAX_TOTAL_RECORDS)
@@ -1616,6 +1657,13 @@ class LandscapeExportSettings(BaseModel):
             raise ValueError("signing_secret_ref must be an exact environment secret reference name")
         return value
 
+    @field_validator("compartment_id")
+    @classmethod
+    def validate_compartment_marking(cls, value: str | None) -> str | None:
+        if value is not None:
+            validate_compartment_id(value)
+        return value
+
     @field_validator("spool_root", mode="before")
     @classmethod
     def validate_spool_root(cls, value: object) -> object:
@@ -1635,6 +1683,8 @@ class LandscapeExportSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_snapshot_policy(self) -> "LandscapeExportSettings":
+        if self.authentication_policy == "required" and self.signing_mode != "hmac_sha256":
+            raise ValueError("required audit export authentication forbids unsigned signing_mode")
         if self.signing_mode == "unsigned":
             if self.signer_key_id != "UNSIGNED":
                 raise ValueError("unsigned signing requires the typed UNSIGNED signer identity")
@@ -1647,6 +1697,7 @@ class LandscapeExportSettings(BaseModel):
                 raise ValueError("hmac_sha256 signing requires a signing secret reference")
 
         required = (
+            ("signing_mode", self.signing_mode),
             ("total_record_limit", self.total_record_limit),
             ("total_byte_limit", self.total_byte_limit),
             ("chunk_limit", self.chunk_limit),
@@ -1654,9 +1705,10 @@ class LandscapeExportSettings(BaseModel):
             ("per_chunk_byte_limit", self.per_chunk_byte_limit),
             ("spool_root", self.spool_root),
             ("content_store", self.content_store),
+            ("compartment_id", self.compartment_id),
         )
         if self.enabled:
-            missing = [name for name, value in required if value is None]
+            missing = [name for name, value in required if value is None or (name == "signing_mode" and name not in self.model_fields_set)]
             if missing:
                 raise ValueError(f"enabled audit export requires explicit fields: {', '.join(missing)}")
         if all(value is not None for _name, value in required):
@@ -1683,9 +1735,11 @@ class LandscapeExportSettings(BaseModel):
 
     def public_snapshot_config(self) -> dict[str, object]:
         """Return exactly the target-independent snapshot-shaping fields."""
+        if self.exporter_version != "landscape-exporter-auth-v2":
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
         if self.per_chunk_byte_limit is None or self.per_chunk_record_limit is None:
             raise ValueError("audit export chunk limits are not configured")
-        return {
+        public_config = {
             "chunking_algorithm_version": self.chunking_algorithm_version,
             "export_format": self.format,
             "exporter_version": self.exporter_version,
@@ -1696,6 +1750,11 @@ class LandscapeExportSettings(BaseModel):
             "signer_key_id": self.signer_key_id,
             "signing_mode": self.signing_mode,
         }
+        public_config["auth_events"] = self.auth_events
+        if self.compartment_id is None:
+            raise ValueError("compartment_id is required for landscape-exporter-auth-v2")
+        public_config["compartment_id"] = self.compartment_id
+        return public_config
 
     def assert_signer_rotation_allowed(self, *, existing_signer_key_id: str) -> None:
         validate_credential_free_identifier(existing_signer_key_id, "existing_signer_key_id")
@@ -3051,6 +3110,8 @@ def sanitize_node_config_for_audit(
     settings tree handled by ``_fingerprint_config_for_audit``. Keep the
     placement-specific database DSN rule here with the rest of the audit
     sanitization policy so repositories only persist the resulting payload.
+    Power Automate credentials require HMAC fingerprints even in development
+    mode, because their safe config also binds durable external effects.
     """
     import os
 
@@ -3059,7 +3120,7 @@ def sanitize_node_config_for_audit(
         raise TypeError(f"Node config must thaw to dict[str, object], got {type(thawed).__name__}: {thawed!r}")
 
     allow_raw = "ELSPETH_ALLOW_RAW_SECRETS" in os.environ and os.environ["ELSPETH_ALLOW_RAW_SECRETS"].lower() == "true"
-    sanitized = _fingerprint_secrets(thawed, fail_if_no_key=not allow_raw)
+    sanitized = _fingerprint_secrets(thawed, fail_if_no_key=plugin_name == "power_automate" or not allow_raw)
     if plugin_name == "database":
         # Node config is flat: the DSN sits at top-level `url`.
         _sanitize_dsn_option_for_audit(
@@ -3142,13 +3203,19 @@ def _fingerprint_config_for_audit(
     if "sources" in config and type(config["sources"]) is dict:
         for source in config["sources"].values():
             if type(source) is dict and "options" in source and type(source["options"]) is dict:
-                source["options"] = _fingerprint_secrets(source["options"], fail_if_no_key=fail_if_no_key)
+                source["options"] = _fingerprint_secrets(
+                    source["options"],
+                    fail_if_no_key=fail_if_no_key or ("plugin" in source and source["plugin"] == "power_automate"),
+                )
 
     # === Sink options ===
     if "sinks" in config and type(config["sinks"]) is dict:
         for sink in config["sinks"].values():
             if type(sink) is dict and "options" in sink and type(sink["options"]) is dict:
-                options = _fingerprint_secrets(sink["options"], fail_if_no_key=fail_if_no_key)
+                options = _fingerprint_secrets(
+                    sink["options"],
+                    fail_if_no_key=fail_if_no_key or ("plugin" in sink and sink["plugin"] == "power_automate"),
+                )
                 if "plugin" in sink and sink["plugin"] == "database":
                     # Database sink URLs are a plugin-specific secret-ref placement:
                     # the field is named "url" rather than a heuristic secret name.

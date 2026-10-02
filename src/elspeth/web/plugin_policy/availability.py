@@ -102,6 +102,9 @@ def build_plugin_snapshot(
             unavailable.append(PluginAvailability(plugin_id, PluginUnavailableReason.NOT_INSTALLED))
             continue
         summary = catalog_items[plugin_id]
+        if plugin_id.name == "power_automate" and plugin_id.kind in ("source", "sink") and not policy.power_automate_allowed_origins:
+            unavailable.append(PluginAvailability(plugin_id, PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING))
+            continue
         if summary.web_config_authority is WebConfigAuthority.OPERATOR_PROFILED:
             profile_states = profiles.profile_availability(
                 plugin_id,
@@ -181,6 +184,7 @@ def build_plugin_snapshot(
         selected_profile_aliases=tuple(selected_profile_aliases),
         binding_generation_fingerprint=fingerprint,
         control_modes=policy.control_modes,
+        power_automate_allowed_origins=policy.power_automate_allowed_origins,
     )
 
 
@@ -204,6 +208,11 @@ class _BoundSecretInventory:
         return self._server_store.has_secret(name)
 
     def has_user_ref(self, principal: str, name: str) -> bool:
+        # Server-only mode: this inventory reads the user store directly, so
+        # it must apply the same lockdown the service does — otherwise a
+        # user-scoped profile would report available and then fail to resolve.
+        if not self._service.user_secrets_enabled:
+            return False
         return self._user_store.has_secret(name, user_id=self._user_id, auth_provider_type=self._auth_provider)
 
     def has_ref(self, principal: str, name: str) -> bool:
@@ -220,6 +229,8 @@ class _BoundSecretInventory:
 
     def user_generation(self, principal: str, name: str) -> str | None:
         del principal
+        if not self._service.user_secrets_enabled:
+            return None
         if not self._user_store.has_secret(name, user_id=self._user_id, auth_provider_type=self._auth_provider):
             return None
         try:

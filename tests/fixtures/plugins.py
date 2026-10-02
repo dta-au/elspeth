@@ -619,7 +619,7 @@ class ErrorOnNthTransform(BaseTransform):
 
 
 class CallRecordingTransform(BaseTransform):
-    """Transform that records a single HTTP operation_call via ctx.record_call().
+    """Transform that records a single state-parented HTTP call.
 
     Used by F1 Cell-2 regression: proves re-driven transforms RE-FIRE their
     recorded calls (at-least-once) and that the re-fired call's node_state
@@ -654,16 +654,26 @@ class CallRecordingTransform(BaseTransform):
             self.on_error = on_error
 
     def process(self, row: Any, ctx: Any) -> TransformResult:
+        from elspeth.contracts.call_data import RawCallPayload
         from elspeth.contracts.enums import CallStatus, CallType
 
         # Record a synthetic HTTP call so the audit trail contains a calls row
         # linked to this node_state (state-parented: calls.state_id is set).
         # On resume, the re-drive writes a new node_state at attempt=max+1 with
         # resume_checkpoint_id set, and records another calls row linked there.
-        ctx.record_call(
+        if ctx.landscape is None or ctx.state_id is None:
+            raise RuntimeError("CallRecordingTransform requires a state-parented audit context")
+        member_token = ctx.require_member_token()
+        work_item = ctx.require_work_item()
+        call_index = ctx.landscape.allocate_call_index(ctx.state_id, member_token=member_token, work_item=work_item)
+        ctx.landscape.record_call(
+            state_id=ctx.state_id,
+            call_index=call_index,
+            member_token=member_token,
+            work_item=work_item,
             call_type=CallType.HTTP,
             status=CallStatus.SUCCESS,
-            request_data={"url": "http://test.internal/probe", "row_value": row["value"] if "value" in row else 0},
-            response_data={"status": 200},
+            request_data=RawCallPayload({"url": "http://test.internal/probe", "row_value": row["value"] if "value" in row else 0}),
+            response_data=RawCallPayload({"status": 200}),
         )
         return TransformResult.success(row, success_reason={"action": "call_recorded"})

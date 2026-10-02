@@ -7,11 +7,12 @@ import pytest
 from elspeth.contracts import NodeType
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db, make_recorder_with_run, register_test_node
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -24,12 +25,43 @@ def _setup(*, run_id: str = "run-1") -> tuple[LandscapeDB, RecorderFactory]:
 def _setup_with_token(
     *,
     run_id: str = "run-1",
-) -> tuple[LandscapeDB, RecorderFactory]:
+) -> tuple[LandscapeDB, RecorderFactory, TokenWorkItem]:
     db, factory = _setup(run_id=run_id)
     register_test_node(factory.data_flow, run_id, "transform-1", node_type=NodeType.TRANSFORM, plugin_name="transform")
-    factory.data_flow.create_row(run_id, "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-    factory.data_flow.create_token("row-1", token_id="tok-1")
-    return db, factory
+    factory.data_flow.create_row_with_token(
+        "source-0",
+        0,
+        {"name": "test"},
+        coordination_token=leader_coordination_token(factory, run_id),
+        row_id="row-1",
+        token_id="tok-1",
+        source_row_index=0,
+        ingest_sequence=0,
+    )
+    work_item = _claim_transform_work(factory, run_id=run_id, token_id="tok-1", row_id="row-1", ingest_sequence=0)
+    return db, factory, work_item
+
+
+def _claim_transform_work(
+    factory: RecorderFactory,
+    *,
+    run_id: str,
+    token_id: str,
+    row_id: str,
+    ingest_sequence: int,
+) -> TokenWorkItem:
+    member = leader_coordination_token(factory, run_id).membership
+    return factory.scheduler.enqueue_ready_claimed(
+        member_token=member,
+        token_id=token_id,
+        row_id=row_id,
+        node_id="transform-1",
+        step_index=1,
+        ingest_sequence=ingest_sequence,
+        row_payload_json='{"name":"test"}',
+        lease_owner=member.worker_id,
+        lease_seconds=300,
+    )
 
 
 class TestRecordValidationError:
@@ -38,7 +70,7 @@ class TestRecordValidationError:
     def test_returns_error_id_with_verr_prefix(self):
         _db, factory = _setup()
         error_id = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data={"name": "alice", "age": 30},
             error="Field 'age' expected str, got int",
@@ -51,7 +83,7 @@ class TestRecordValidationError:
         _db, factory = _setup()
         row_data = {"name": "alice", "age": 30}
         error_id = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="Field 'age' expected str, got int",
@@ -75,7 +107,7 @@ class TestRecordValidationError:
         _db, factory = _setup()
         row_data = {"x": 1, "y": "hello"}
         factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="bad field",
@@ -93,7 +125,7 @@ class TestRecordValidationError:
         _db, factory = _setup()
         row_data = {"name": "bob"}
         factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="error one",
@@ -101,7 +133,7 @@ class TestRecordValidationError:
             destination="quarantine",
         )
         factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="error two",
@@ -118,7 +150,7 @@ class TestRecordValidationError:
         _db, factory = _setup()
         row_data = {"k": "v"}
         id1 = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="err a",
@@ -126,7 +158,7 @@ class TestRecordValidationError:
             destination="quarantine",
         )
         id2 = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="err b",
@@ -153,7 +185,7 @@ class TestRecordValidationError:
             actual_value="not_a_number",
         )
         error_id = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="Type mismatch on 'amount'",
@@ -179,7 +211,7 @@ class TestRecordValidationError:
         db, factory = _setup()
         row_data = {"a": 1}
         error_id = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="some error",
@@ -201,7 +233,7 @@ class TestRecordValidationError:
         for run_id in ("run-A", "run-B"):
             factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
             factory.data_flow.register_node(
-                run_id=run_id,
+                coordination_token=leader_coordination_token(factory, run_id),
                 plugin_name="csv",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0",
@@ -209,19 +241,20 @@ class TestRecordValidationError:
                 node_id="source-0",
                 schema_config=_DYNAMIC_SCHEMA,
             )
-        factory.data_flow.create_row(
-            "run-A",
+        factory.data_flow.create_row_with_token(
             "source-0",
             0,
             {"name": "test"},
             row_id="row-A",
             source_row_index=0,
             ingest_sequence=0,
+            token_id="tok-A",
+            coordination_token=leader_coordination_token(factory, "run-A"),
         )
 
         with pytest.raises(AuditIntegrityError, match="cross-run contamination"):
             factory.data_flow.record_validation_error(
-                run_id="run-B",
+                coordination_token=leader_coordination_token(factory, "run-B"),
                 node_id="source-0",
                 row_id="row-A",
                 row_data={"name": "test"},
@@ -242,7 +275,7 @@ class TestRecordValidationError:
         for run_id in ("run-A", "run-B"):
             factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
             factory.data_flow.register_node(
-                run_id=run_id,
+                coordination_token=leader_coordination_token(factory, run_id),
                 plugin_name="csv",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0",
@@ -250,14 +283,15 @@ class TestRecordValidationError:
                 node_id="source-0",
                 schema_config=_DYNAMIC_SCHEMA,
             )
-        factory.data_flow.create_row(
-            "run-A",
+        factory.data_flow.create_row_with_token(
             "source-0",
             0,
             {"name": "test"},
             row_id="row-A",
             source_row_index=0,
             ingest_sequence=0,
+            token_id="tok-A",
+            coordination_token=leader_coordination_token(factory, "run-A"),
         )
 
         with pytest.raises(SAIntegrityError), db.write_connection() as conn:
@@ -284,7 +318,7 @@ class TestRecordValidationErrorNonCanonicalData:
         _db, factory = _setup()
         row_data = {"value": float("nan")}
         error_id = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="NaN not allowed",
@@ -304,7 +338,7 @@ class TestRecordValidationErrorNonCanonicalData:
         _db, factory = _setup()
         row_data = {"value": float("inf")}
         error_id = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="Infinity not allowed",
@@ -320,7 +354,7 @@ class TestRecordValidationErrorNonCanonicalData:
         _db, factory = _setup()
         row_data = {"value": float("-inf")}
         error_id = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="Negative infinity not allowed",
@@ -335,7 +369,7 @@ class TestRecordValidationErrorNonCanonicalData:
         _db, factory = _setup()
         row_data = [1, 2, 3]
         error_id = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="Expected dict, got list",
@@ -351,7 +385,7 @@ class TestRecordValidationErrorNonCanonicalData:
         _db, factory = _setup()
         row_data = "not a dict at all"
         error_id = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="Expected dict, got str",
@@ -365,7 +399,7 @@ class TestRecordValidationErrorNonCanonicalData:
     def test_none_as_row_data(self):
         _db, factory = _setup()
         error_id = factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=None,
             error="Row data was None",
@@ -381,8 +415,10 @@ class TestRecordTransformError:
     """Tests for DataFlowRepository.record_transform_error."""
 
     def test_returns_error_id_with_terr_prefix(self):
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         error_id = factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -392,7 +428,7 @@ class TestRecordTransformError:
         assert error_id.startswith("terr_")
 
     def test_roundtrip_via_get_transform_errors_for_token(self):
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         row_data = {"name": "test"}
         error_details = {
             "reason": "validation_failed",
@@ -400,6 +436,8 @@ class TestRecordTransformError:
             "error": "ZeroDivisionError: division by zero",
         }
         error_id = factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data=row_data,
@@ -420,9 +458,11 @@ class TestRecordTransformError:
         assert parsed_details["field"] == "amount"
 
     def test_stores_row_hash(self):
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         row_data = {"name": "test"}
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data=row_data,
@@ -435,9 +475,11 @@ class TestRecordTransformError:
         assert errors[0].row_hash == expected_hash
 
     def test_stores_row_data_json(self):
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         row_data = {"name": "test", "value": 42}
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data=row_data,
@@ -451,8 +493,10 @@ class TestRecordTransformError:
         assert parsed["value"] == 42
 
     def test_multiple_errors_for_same_token(self):
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -460,6 +504,8 @@ class TestRecordTransformError:
             destination="quarantine",
         )
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -472,8 +518,10 @@ class TestRecordTransformError:
         assert reasons == {"api_error", "network_error"}
 
     def test_unique_error_ids_per_call(self):
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         id1 = factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -481,6 +529,8 @@ class TestRecordTransformError:
             destination="quarantine",
         )
         id2 = factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -499,7 +549,7 @@ class TestGetValidationErrorsForRow:
         _db, factory = _setup()
         row_data = {"id": 1, "name": "alice"}
         factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="bad field",
@@ -514,7 +564,7 @@ class TestGetValidationErrorsForRow:
     def test_empty_for_unknown_hash(self):
         _db, factory = _setup()
         factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data={"exists": True},
             error="some error",
@@ -530,7 +580,7 @@ class TestGetValidationErrorsForRow:
         # Set up run-1
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -541,7 +591,7 @@ class TestGetValidationErrorsForRow:
         # Set up run-2
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         factory.data_flow.register_node(
-            run_id="run-2",
+            coordination_token=leader_coordination_token(factory, "run-2"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -551,7 +601,7 @@ class TestGetValidationErrorsForRow:
         )
         row_data = {"shared": "data"}
         factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data=row_data,
             error="run 1 error",
@@ -559,7 +609,7 @@ class TestGetValidationErrorsForRow:
             destination="quarantine",
         )
         factory.data_flow.record_validation_error(
-            run_id="run-2",
+            coordination_token=leader_coordination_token(factory, "run-2"),
             node_id="source-0",
             row_data=row_data,
             error="run 2 error",
@@ -586,7 +636,7 @@ class TestGetValidationErrorsForRun:
     def test_returns_all_errors_for_run(self):
         _db, factory = _setup()
         factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data={"a": 1},
             error="error one",
@@ -594,7 +644,7 @@ class TestGetValidationErrorsForRun:
             destination="quarantine",
         )
         factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data={"b": 2},
             error="error two",
@@ -602,7 +652,7 @@ class TestGetValidationErrorsForRun:
             destination="quarantine",
         )
         factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data={"c": 3},
             error="error three",
@@ -624,7 +674,7 @@ class TestGetValidationErrorsForRun:
         factory = make_factory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -634,7 +684,7 @@ class TestGetValidationErrorsForRun:
         )
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         factory.data_flow.register_node(
-            run_id="run-2",
+            coordination_token=leader_coordination_token(factory, "run-2"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -643,7 +693,7 @@ class TestGetValidationErrorsForRun:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.record_validation_error(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             node_id="source-0",
             row_data={"x": 1},
             error="run-1 error",
@@ -651,7 +701,7 @@ class TestGetValidationErrorsForRun:
             destination="quarantine",
         )
         factory.data_flow.record_validation_error(
-            run_id="run-2",
+            coordination_token=leader_coordination_token(factory, "run-2"),
             node_id="source-0",
             row_data={"y": 2},
             error="run-2 error",
@@ -669,7 +719,7 @@ class TestGetValidationErrorsForRun:
         _db, factory = _setup()
         for i in range(5):
             factory.data_flow.record_validation_error(
-                run_id="run-1",
+                coordination_token=leader_coordination_token(factory, "run-1"),
                 node_id="source-0",
                 row_data={f"field_{i}": i},
                 error=f"error {i}",
@@ -686,8 +736,10 @@ class TestGetTransformErrorsForToken:
     """Tests for DataFlowRepository.get_transform_errors_for_token."""
 
     def test_returns_errors_for_token(self):
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -699,8 +751,10 @@ class TestGetTransformErrorsForToken:
         assert errors[0].token_id == "tok-1"
 
     def test_empty_for_unknown_token(self):
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -711,11 +765,22 @@ class TestGetTransformErrorsForToken:
         assert errors == []
 
     def test_does_not_return_other_tokens_errors(self):
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         # Create a second token
-        factory.data_flow.create_row("run-1", "source-0", 1, {"name": "other"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-2", token_id="tok-2")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"name": "other"},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            token_id="tok-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
+        second_work_item = _claim_transform_work(factory, run_id="run-1", token_id="tok-2", row_id="row-2", ingest_sequence=1)
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -723,6 +788,8 @@ class TestGetTransformErrorsForToken:
             destination="quarantine",
         )
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=second_work_item,
             ref=TokenRef(token_id="tok-2", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "other"},
@@ -737,7 +804,7 @@ class TestGetTransformErrorsForToken:
         assert json.loads(tok2_errors[0].error_details_json)["reason"] == "llm_call_failed"
 
     def test_empty_when_no_errors_recorded(self):
-        _db, factory = _setup_with_token()
+        _db, factory, _work_item = _setup_with_token()
         errors = factory.data_flow.get_transform_errors_for_token("tok-1")
         assert errors == []
 
@@ -746,10 +813,21 @@ class TestGetTransformErrorsForRun:
     """Tests for DataFlowRepository.get_transform_errors_for_run."""
 
     def test_returns_all_errors_for_run(self):
-        _db, factory = _setup_with_token()
-        factory.data_flow.create_row("run-1", "source-0", 1, {"name": "other"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-2", token_id="tok-2")
+        _db, factory, work_item = _setup_with_token()
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"name": "other"},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            token_id="tok-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
+        second_work_item = _claim_transform_work(factory, run_id="run-1", token_id="tok-2", row_id="row-2", ingest_sequence=1)
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -757,6 +835,8 @@ class TestGetTransformErrorsForRun:
             destination="quarantine",
         )
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=second_work_item,
             ref=TokenRef(token_id="tok-2", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "other"},
@@ -769,7 +849,7 @@ class TestGetTransformErrorsForRun:
         assert reasons == {"api_error", "network_error"}
 
     def test_empty_when_no_errors_exist(self):
-        _db, factory = _setup_with_token()
+        _db, factory, _work_item = _setup_with_token()
         errors = factory.data_flow.get_transform_errors_for_run("run-1")
         assert errors == []
 
@@ -779,7 +859,7 @@ class TestGetTransformErrorsForRun:
         # Set up run-1
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -788,12 +868,21 @@ class TestGetTransformErrorsForRun:
             schema_config=_DYNAMIC_SCHEMA,
         )
         register_test_node(factory.data_flow, "run-1", "transform-1", node_type=NodeType.TRANSFORM, plugin_name="transform")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"n": "a"}, row_id="row-r1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-r1", token_id="tok-r1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"n": "a"},
+            row_id="row-r1",
+            source_row_index=0,
+            ingest_sequence=0,
+            token_id="tok-r1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
+        first_work_item = _claim_transform_work(factory, run_id="run-1", token_id="tok-r1", row_id="row-r1", ingest_sequence=0)
         # Set up run-2
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         factory.data_flow.register_node(
-            run_id="run-2",
+            coordination_token=leader_coordination_token(factory, "run-2"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -802,9 +891,20 @@ class TestGetTransformErrorsForRun:
             schema_config=_DYNAMIC_SCHEMA,
         )
         register_test_node(factory.data_flow, "run-2", "transform-1", node_type=NodeType.TRANSFORM, plugin_name="transform")
-        factory.data_flow.create_row("run-2", "source-0", 0, {"n": "b"}, row_id="row-r2", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-r2", token_id="tok-r2")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"n": "b"},
+            row_id="row-r2",
+            source_row_index=0,
+            ingest_sequence=0,
+            token_id="tok-r2",
+            coordination_token=leader_coordination_token(factory, "run-2"),
+        )
+        second_work_item = _claim_transform_work(factory, run_id="run-2", token_id="tok-r2", row_id="row-r2", ingest_sequence=0)
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=first_work_item,
             ref=TokenRef(token_id="tok-r1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"n": "a"},
@@ -812,6 +912,8 @@ class TestGetTransformErrorsForRun:
             destination="quarantine",
         )
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-2").membership,
+            work_item=second_work_item,
             ref=TokenRef(token_id="tok-r2", run_id="run-2"),
             transform_id="transform-1",
             row_data={"n": "b"},
@@ -826,10 +928,12 @@ class TestGetTransformErrorsForRun:
         assert json.loads(run2_errors[0].error_details_json)["reason"] == "network_error"
 
     def test_ordered_by_created_at(self):
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         valid_reasons = ["api_error", "network_error", "missing_field", "type_mismatch", "validation_failed"]
         for i in range(5):
             factory.data_flow.record_transform_error(
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=work_item,
                 ref=TokenRef(token_id="tok-1", run_id="run-1"),
                 transform_id="transform-1",
                 row_data={"idx": i},
@@ -852,8 +956,10 @@ class TestRecordTransformErrorNaNFallback:
 
     def test_nan_in_error_details_does_not_crash(self):
         """error_details containing NaN should use repr-based fallback."""
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         error_id = factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -872,8 +978,10 @@ class TestRecordTransformErrorNaNFallback:
 
     def test_infinity_in_error_details_does_not_crash(self):
         """error_details containing Infinity should use repr-based fallback."""
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         error_id = factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -884,8 +992,10 @@ class TestRecordTransformErrorNaNFallback:
 
     def test_normal_error_details_still_uses_canonical_json(self):
         """Normal error_details should still use canonical JSON (no fallback)."""
-        _db, factory = _setup_with_token()
+        _db, factory, work_item = _setup_with_token()
         factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -912,7 +1022,7 @@ def _setup_two_runs_with_transform() -> tuple[LandscapeDB, RecorderFactory]:
     for run_id in ("run-A", "run-B"):
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -937,12 +1047,23 @@ class TestRecordTransformErrorCrossRunPrevention:
         _db, factory = _setup_two_runs_with_transform()
 
         # Create row and token in run-A
-        factory.data_flow.create_row("run-A", "source-0", 0, {"name": "test"}, row_id="row-A", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-A", token_id="tok-A")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"name": "test"},
+            row_id="row-A",
+            source_row_index=0,
+            ingest_sequence=0,
+            token_id="tok-A",
+            coordination_token=leader_coordination_token(factory, "run-A"),
+        )
+        work_item = _claim_transform_work(factory, run_id="run-A", token_id="tok-A", row_id="row-A", ingest_sequence=0)
 
         # Attempt to record error under run-B -- must crash
         with pytest.raises(AuditIntegrityError, match="Cross-run contamination"):
             factory.data_flow.record_transform_error(
+                member_token=leader_coordination_token(factory, "run-A").membership,
+                work_item=work_item,
                 ref=TokenRef(token_id="tok-A", run_id="run-B"),
                 transform_id="transform-1",
                 row_data={"name": "test"},
@@ -952,9 +1073,11 @@ class TestRecordTransformErrorCrossRunPrevention:
 
     def test_accepts_correct_run_id(self):
         """record_transform_error must succeed when run_id matches token ownership."""
-        _db, factory = _setup_with_token(run_id="run-1")
+        _db, factory, work_item = _setup_with_token(run_id="run-1")
 
         error_id = factory.data_flow.record_transform_error(
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=work_item,
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             transform_id="transform-1",
             row_data={"name": "test"},
@@ -965,10 +1088,12 @@ class TestRecordTransformErrorCrossRunPrevention:
 
     def test_rejects_nonexistent_token(self):
         """record_transform_error must crash if token does not exist."""
-        _db, factory = _setup_with_token(run_id="run-1")
+        _db, factory, work_item = _setup_with_token(run_id="run-1")
 
         with pytest.raises(AuditIntegrityError, match="does not exist"):
             factory.data_flow.record_transform_error(
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=work_item,
                 ref=TokenRef(token_id="nonexistent-token", run_id="run-1"),
                 transform_id="transform-1",
                 row_data={"name": "test"},
@@ -990,9 +1115,16 @@ class TestRecordTransformErrorCrossRunPrevention:
         _db, factory = _setup_two_runs_with_transform()
 
         # Create row and token in run-A
-        factory.data_flow.create_row("run-A", "source-0", 0, {"name": "test"}, row_id="row-A", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-A", token_id="tok-A")
-
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"name": "test"},
+            row_id="row-A",
+            source_row_index=0,
+            ingest_sequence=0,
+            token_id="tok-A",
+            coordination_token=leader_coordination_token(factory, "run-A"),
+        )
         # Try to insert directly into transform_errors with mismatched (token_id, run_id)
         # tok-A belongs to run-A, but we try to record under run-B
         # The composite FK should reject this

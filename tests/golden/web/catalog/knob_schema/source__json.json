@@ -30,6 +30,16 @@
         "tier": "common"
       },
       {
+        "default": false,
+        "description": "For a single-source pipeline, materialize at most 64 MiB of immutable rows before processing so a failed run can resume unread rows.",
+        "kind": "checkbox",
+        "label": "Snapshot For Resume",
+        "name": "snapshot_for_resume",
+        "nullable": false,
+        "required": false,
+        "tier": "advanced"
+      },
+      {
         "default": null,
         "description": "Input JSON format. When omitted, the source auto-detects JSONL from a .jsonl filename and JSON otherwise.",
         "enum": [

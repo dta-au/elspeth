@@ -140,7 +140,8 @@ class SessionCheckoutMismatchError(ValueError):
     """Raised when a save targets a session other than the active checkout."""
 
     def __init__(self, requested_session_id: str, active_session_id: str | None) -> None:
-        super().__init__(f"Session {requested_session_id} is not the active checkout")
+        active_checkout = f"active checkout is {active_session_id}" if active_session_id is not None else "no active checkout"
+        super().__init__(f"Cannot save session {requested_session_id}: {active_checkout}")
         self.requested_session_id = requested_session_id
         self.active_session_id = active_session_id
 

@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
+from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.web.secrets.user_store import RepositoryUserSecretAuthority
 from elspeth.web.sessions.engine import create_session_engine
@@ -23,6 +24,8 @@ def test_postgres_same_key_upserts_serialize_across_independent_engines(
     first_engine = create_session_engine(external_deployment_postgres_url)
     second_engine = create_session_engine(external_deployment_postgres_url)
     initialize_session_schema(first_engine)
+    with first_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="postgres-authority-user")
     first = RepositoryUserSecretAuthority(first_engine)
     second = RepositoryUserSecretAuthority(second_engine)
     name = f"AUTHORITY_RACE_{uuid4().hex}"

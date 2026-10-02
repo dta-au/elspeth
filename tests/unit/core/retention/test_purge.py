@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
+from operator import setitem
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -19,8 +22,11 @@ from elspeth.contracts import (
     RoutingMode,
     RunStatus,
 )
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import (
     aggregation_result_outputs_table,
     aggregation_results_table,
@@ -32,10 +38,13 @@ from elspeth.core.landscape.schema import (
     operations_table,
     routing_events_table,
     rows_table,
+    run_coordination_table,
     runs_table,
     tokens_table,
 )
-from elspeth.core.retention.purge import PurgeManager
+from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.core.retention.purge import PurgeManager, _SourceOutputDependencies
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
 
@@ -59,7 +68,7 @@ def _create_run(
             run_id=run_id,
             started_at=datetime.now(UTC),
             completed_at=completed_at,
-            config_hash="cfg",
+            config_hash=fake_sha256("cfg"),
             settings_json="{}",
             canonical_version="sha256-rfc8785-v1",
             status=status,
@@ -70,6 +79,13 @@ def _create_run(
             openrouter_catalog_source="bundled",
         )
     )
+    conn.execute(run_coordination_table.insert().values(run_id=run_id, updated_at=datetime.now(UTC)))
+
+
+def _create_purge_runs(db: LandscapeDB, *run_ids: str) -> None:
+    with db.write_connection() as conn:
+        for run_id in run_ids:
+            _create_run(conn, run_id, status=RunStatus.COMPLETED, completed_at=datetime.now(UTC))
 
 
 def _create_node(
@@ -87,7 +103,7 @@ def _create_node(
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
             determinism=determinism,
-            config_hash="node_cfg",
+            config_hash=fake_sha256("node_cfg"),
             config_json="{}",
             registered_at=datetime.now(UTC),
         )
@@ -111,7 +127,7 @@ def _create_row(
             row_index=row_index,
             source_row_index=row_index,
             ingest_sequence=row_index,
-            source_data_hash=f"hash-{row_id}",
+            source_data_hash=fake_sha256(f"hash-{row_id}"),
             source_data_ref=source_data_ref,
             created_at=datetime.now(UTC),
         )
@@ -154,8 +170,8 @@ def _create_node_state(
             step_index=0,
             attempt=0,
             status=NodeStateStatus.COMPLETED,
-            input_hash="in_hash",
-            output_hash="out_hash",
+            input_hash=fake_sha256("in_hash"),
+            output_hash=fake_sha256("out_hash"),
             started_at=datetime.now(UTC),
         )
     )
@@ -200,9 +216,9 @@ def _create_call_for_state(
             call_index=0,
             call_type=CallType.HTTP,
             status=CallStatus.SUCCESS,
-            request_hash="req_hash",
+            request_hash=fake_sha256("req_hash"),
             request_ref=request_ref,
-            response_hash="res_hash",
+            response_hash=fake_sha256("res_hash"),
             response_ref=response_ref,
             created_at=datetime.now(UTC),
         )
@@ -225,9 +241,9 @@ def _create_call_for_operation(
             call_index=0,
             call_type=CallType.HTTP,
             status=CallStatus.SUCCESS,
-            request_hash="req_hash",
+            request_hash=fake_sha256("req_hash"),
             request_ref=request_ref,
-            response_hash="res_hash",
+            response_hash=fake_sha256("res_hash"),
             response_ref=response_ref,
             created_at=datetime.now(UTC),
         )
@@ -266,7 +282,7 @@ def _create_routing_event(
             routing_group_id=f"rg-{uuid4().hex[:12]}",
             ordinal=0,
             mode=RoutingMode.MOVE,
-            reason_hash="reason_hash",
+            reason_hash=fake_sha256("reason_hash"),
             reason_ref=reason_ref,
             created_at=datetime.now(UTC),
         )
@@ -297,6 +313,8 @@ class _ControlledStore(MockPayloadStore):
         if content_hash in self._fail_delete_for:
             raise OSError("delete failed")
         if content_hash in self._false_delete_for:
+            # Simulate another purge removing it before this unlink attempt.
+            super().delete(content_hash)
             return False
         return super().delete(content_hash)
 
@@ -348,6 +366,486 @@ class TestPurgeResultValidation:
 
 
 class TestFindExpiredPayloadRefs:
+    def test_source_dependency_dto_detaches_mutable_aliases_and_refuses_mutation(self) -> None:
+        children = {"metadata": "child"}
+        builder_inputs = {"input"}
+        classification_inputs = {"output": frozenset(builder_inputs)}
+        dependencies = _SourceOutputDependencies(children, classification_inputs)
+        children["metadata"] = "substituted-child"
+        classification_inputs["output"] = frozenset({"substituted-input"})
+        builder_inputs.add("additional-input")
+        assert dependencies.snapshot_children == {"metadata": "child"}
+        assert dependencies.classification_inputs == {"output": frozenset({"input"})}
+        with pytest.raises(TypeError):
+            setitem(dependencies.snapshot_children, "metadata", "substituted-child")
+        with pytest.raises(TypeError):
+            setitem(dependencies.classification_inputs, "output", frozenset({"substituted-input"}))
+
+    def test_direct_purge_preserves_duplicate_reference_counts(self, db: LandscapeDB, tmp_path: Path) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        ref = store.store(b"ordinary retained payload")
+        result = manager.purge_payloads([ref, ref])
+        assert result.deleted_count == 1
+        assert result.skipped_count == 1
+        assert not result.failed_refs
+        assert not store.exists(ref)
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "padded-metadata",
+            "large-snapshot",
+            "removed-marker-small",
+            "removed-marker-large",
+            "missing-input",
+            "large-input",
+            "malformed-input",
+            "nonmapping-input",
+            "mismatched-input-hash",
+            "missing-input-ref",
+            "invalid-input-flag",
+            "shared-output-snapshot-input",
+        ],
+    )
+    def test_source_output_classification_refuses_corruption_before_purge(self, db: LandscapeDB, tmp_path: Path, case: str) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        child_ref = store.store(b"sealed source rows")
+        original = {"source_snapshot_ref": child_ref, "source_snapshot_version": 1}
+        metadata = original if case in {"padded-metadata", "large-snapshot"} else {"other_output": "x"}
+        if case == "large-snapshot":
+            metadata = {**original, "padding": "x" * 2048}
+        elif case not in {"padded-metadata", "removed-marker-small", "shared-output-snapshot-input"}:
+            metadata = {"other_output": "x" * 2048}
+        content = canonical_json(metadata).encode()
+        if case == "padded-metadata":
+            content += b" " * 2048
+        metadata_ref = store.store(content)
+        input_data = {"source_plugin": "json", "snapshot_for_resume": True}
+        input_content = canonical_json(input_data).encode()
+        input_hash = stable_hash(input_data)
+        if case == "large-input":
+            input_data = {**input_data, "padding": "x" * 2048}
+            input_content = canonical_json(input_data).encode()
+            input_hash = stable_hash(input_data)
+        elif case == "malformed-input":
+            input_content = b"{"
+            input_hash = store.store(input_content)
+        elif case == "nonmapping-input":
+            input_content = b"[]"
+            input_hash = store.store(input_content)
+        elif case == "invalid-input-flag":
+            input_content = canonical_json({"snapshot_for_resume": "true"}).encode()
+            input_hash = store.store(input_content)
+        input_ref = store.store(input_content)
+        if case == "missing-input":
+            store.delete(input_ref)
+        elif case == "mismatched-input-hash":
+            input_hash = stable_hash({"different": "input"})
+        elif case == "missing-input-ref":
+            input_ref = None
+        with db.write_connection() as conn:
+            _create_run(conn, "source-classification", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "source-classification", "source-classification-node")
+            inputs = [(input_ref, input_hash)]
+            if case == "shared-output-snapshot-input":
+                other_input = {"source_plugin": "json"}
+                inputs.insert(0, (store.store(canonical_json(other_input).encode()), stable_hash(other_input)))
+            for index, (operation_input_ref, operation_input_hash) in enumerate(inputs):
+                conn.execute(
+                    operations_table.insert().values(
+                        operation_id=f"classification-op-{index}",
+                        run_id="source-classification",
+                        node_id="source-classification-node",
+                        operation_type="source_load",
+                        occurrence_index=index,
+                        started_at=now,
+                        status="completed",
+                        input_data_ref=operation_input_ref,
+                        input_data_hash=operation_input_hash,
+                        output_data_ref=metadata_ref,
+                        output_data_hash=stable_hash(metadata),
+                    )
+                )
+        with pytest.raises(AuditIntegrityError):
+            manager.find_expired_payload_refs(retention_days=30, as_of=now)
+        with pytest.raises(AuditIntegrityError):
+            manager.purge_payloads([metadata_ref, child_ref])
+        assert store.exists(metadata_ref)
+        assert store.exists(child_ref)
+
+    @pytest.mark.parametrize("input_data", [None, {"source_plugin": "json"}, {"snapshot_for_resume": False}])
+    @pytest.mark.parametrize("large_output", [False, True])
+    def test_canonical_non_snapshot_source_output_can_be_purged(
+        self, db: LandscapeDB, tmp_path: Path, input_data: dict[str, object] | None, large_output: bool
+    ) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        output_data = {"other_output": "x" * (2048 if large_output else 1)}
+        output_ref = store.store(canonical_json(output_data).encode())
+        input_ref = None if input_data is None else store.store(canonical_json(input_data).encode())
+        with db.write_connection() as conn:
+            _create_run(conn, "generic-source", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "generic-source", "generic-source-node")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="generic-source-op",
+                    run_id="generic-source",
+                    node_id="generic-source-node",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    input_data_ref=input_ref,
+                    input_data_hash=None if input_data is None else stable_hash(input_data),
+                    output_data_ref=output_ref,
+                    output_data_hash=stable_hash(output_data),
+                )
+            )
+        expected_refs = {output_ref} if input_ref is None else {output_ref, input_ref}
+        dependencies = manager._source_output_dependencies({output_ref})
+        assert dependencies.classification_inputs == ({} if input_ref is None else {output_ref: frozenset({input_ref})})
+        with pytest.raises(TypeError):
+            setitem(dependencies.classification_inputs, output_ref, frozenset({"substituted-input"}))
+        assert set(manager.find_expired_payload_refs(retention_days=30, as_of=now)) == expected_refs
+        result = manager.purge_payloads(sorted(expected_refs))
+        assert result.deleted_count == len(expected_refs)
+        assert not store.exists(output_ref)
+
+    @pytest.mark.parametrize("large_output", [False, True])
+    @pytest.mark.parametrize("retention_case", ["failed-output", "retained-output", "active-shared-output"])
+    def test_generic_source_output_keeps_classification_input_until_output_removed(
+        self, db: LandscapeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, large_output: bool, retention_case: str
+    ) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        output = {"other_output": "x" * (2048 if large_output else 1)}
+        output_ref = store.store(canonical_json(output).encode())
+        input_data = {"source_plugin": "json"}
+        input_ref = store.store(canonical_json(input_data).encode())
+        with db.write_connection() as conn:
+            _create_run(conn, "generic-retention", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "generic-retention", "generic-retention-node")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="generic-retention-op",
+                    run_id="generic-retention",
+                    node_id="generic-retention-node",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    input_data_ref=input_ref,
+                    input_data_hash=stable_hash(input_data),
+                    output_data_ref=output_ref,
+                    output_data_hash=stable_hash(output),
+                )
+            )
+            if retention_case == "active-shared-output":
+                active_input = {"source_plugin": "csv"}
+                active_input_ref = store.store(canonical_json(active_input).encode())
+                _create_run(conn, "shared-generic-active", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=1))
+                _create_node(conn, "shared-generic-active", "shared-generic-active-node")
+                conn.execute(
+                    operations_table.insert().values(
+                        operation_id="shared-generic-active-op",
+                        run_id="shared-generic-active",
+                        node_id="shared-generic-active-node",
+                        operation_type="source_load",
+                        started_at=now,
+                        status="completed",
+                        input_data_ref=active_input_ref,
+                        input_data_hash=stable_hash(active_input),
+                        output_data_ref=output_ref,
+                        output_data_hash=stable_hash(output),
+                    )
+                )
+        if retention_case == "active-shared-output":
+            assert manager.find_expired_payload_refs(retention_days=30, as_of=now) == []
+            return
+        if retention_case == "retained-output":
+            first = manager.purge_payloads([input_ref])
+            assert first.deleted_count == 0
+            assert first.failed_refs == (input_ref,)
+        else:
+            delete = store.delete
+
+            def fail_output(ref: str) -> bool:
+                if ref == output_ref:
+                    raise OSError("simulated output deletion failure")
+                return delete(ref)
+
+            monkeypatch.setattr(store, "delete", fail_output)
+            first = manager.purge_payloads([input_ref, output_ref])
+            assert first.deleted_count == 0
+            assert set(first.failed_refs) == {input_ref, output_ref}
+            monkeypatch.setattr(store, "delete", delete)
+        assert store.exists(input_ref)
+        assert store.exists(output_ref)
+        assert set(manager.find_expired_payload_refs(retention_days=30, as_of=now)) == {input_ref, output_ref}
+        second = manager.purge_payloads([input_ref, output_ref])
+        assert second.deleted_count == 2
+        assert not second.failed_refs
+        assert not store.exists(input_ref)
+        assert not store.exists(output_ref)
+
+    def test_cyclic_classification_dependencies_refuse_before_deleting_any_payload(self, db: LandscapeDB, tmp_path: Path) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        first_data = {"source_plugin": "json", "value": "first"}
+        second_data = {"source_plugin": "json", "value": "second"}
+        first_ref = store.store(canonical_json(first_data).encode())
+        second_ref = store.store(canonical_json(second_data).encode())
+        with db.write_connection() as conn:
+            _create_run(conn, "cyclic-generic", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "cyclic-generic", "cyclic-generic-node")
+            for index, (input_ref, output_ref) in enumerate(((first_ref, second_ref), (second_ref, first_ref))):
+                conn.execute(
+                    operations_table.insert().values(
+                        operation_id=f"cyclic-generic-op-{index}",
+                        run_id="cyclic-generic",
+                        node_id="cyclic-generic-node",
+                        operation_type="source_load",
+                        occurrence_index=index,
+                        started_at=now,
+                        status="completed",
+                        input_data_ref=input_ref,
+                        input_data_hash=input_ref,
+                        output_data_ref=output_ref,
+                        output_data_hash=output_ref,
+                    )
+                )
+        with pytest.raises(ValueError, match="cyclic source-output payload dependencies"):
+            manager.purge_payloads([first_ref, second_ref])
+        assert store.exists(first_ref)
+        assert store.exists(second_ref)
+
+    def test_active_source_output_protects_all_transitive_classification_inputs(self, db: LandscapeDB, tmp_path: Path) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        values = [{"source_plugin": label} for label in ("z", "a", "b", "c")]
+        refs = [store.store(canonical_json(value).encode()) for value in values]
+        with db.write_connection() as conn:
+            for run_id, age in (("chain-expired", 40), ("chain-active", 1)):
+                _create_run(conn, run_id, status=RunStatus.COMPLETED, completed_at=now - timedelta(days=age))
+                _create_node(conn, run_id, f"source-{run_id}")
+            for index, (input_index, output_index, run_id) in enumerate(
+                ((0, 1, "chain-expired"), (1, 2, "chain-expired"), (2, 3, "chain-active"))
+            ):
+                conn.execute(
+                    operations_table.insert().values(
+                        operation_id=f"chain-op-{index}",
+                        run_id=run_id,
+                        node_id=f"source-{run_id}",
+                        operation_type="source_load",
+                        occurrence_index=index,
+                        started_at=now,
+                        status="completed",
+                        input_data_ref=refs[input_index],
+                        input_data_hash=refs[input_index],
+                        output_data_ref=refs[output_index],
+                        output_data_hash=refs[output_index],
+                    )
+                )
+        assert manager.find_expired_payload_refs(retention_days=30, as_of=now) == []
+
+    def test_already_missing_source_metadata_remains_a_normal_partial_purge(self, db: LandscapeDB, tmp_path: Path) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        output = {"source_snapshot_ref": store.store(b"source rows"), "source_snapshot_version": 1}
+        output_ref = store.store(canonical_json(output).encode())
+        store.delete(output_ref)
+        with db.write_connection() as conn:
+            _create_run(conn, "partly-purged", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "partly-purged", "partly-purged-node")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="partly-purged-op",
+                    run_id="partly-purged",
+                    node_id="partly-purged-node",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    output_data_ref=output_ref,
+                    output_data_hash=stable_hash(output),
+                )
+            )
+        assert manager.find_expired_payload_refs(retention_days=30, as_of=now) == [output_ref]
+        result = manager.purge_payloads([output_ref])
+        assert result.deleted_count == 0
+        assert result.skipped_count == 1
+
+    def test_snapshot_purge_retries_after_input_deleted_and_child_delete_failed(
+        self, db: LandscapeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        child_ref = store.store(b"sealed source rows")
+        metadata = {"source_snapshot_ref": child_ref, "source_snapshot_version": 1}
+        metadata_ref = store.store(canonical_json(metadata).encode())
+        input_data = {"source_plugin": "json", "snapshot_for_resume": True}
+        input_ref = store.store(canonical_json(input_data).encode())
+        with db.write_connection() as conn:
+            _create_run(conn, "retry-snapshot", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "retry-snapshot", "retry-snapshot-node")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="retry-snapshot-op",
+                    run_id="retry-snapshot",
+                    node_id="retry-snapshot-node",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    input_data_ref=input_ref,
+                    input_data_hash=stable_hash(input_data),
+                    output_data_ref=metadata_ref,
+                    output_data_hash=stable_hash(metadata),
+                )
+            )
+        delete = store.delete
+
+        def fail_child_once(ref: str) -> bool:
+            if ref == child_ref:
+                raise OSError("simulated child deletion failure")
+            return delete(ref)
+
+        monkeypatch.setattr(store, "delete", fail_child_once)
+        first = manager.purge_payloads([input_ref, metadata_ref, child_ref])
+        assert first.deleted_count == 1
+        assert set(first.failed_refs) == {metadata_ref, child_ref}
+        assert not store.exists(input_ref)
+        assert store.exists(metadata_ref)
+        assert store.exists(child_ref)
+        assert set(manager.find_expired_payload_refs(retention_days=30, as_of=now)) == {input_ref, metadata_ref, child_ref}
+        monkeypatch.setattr(store, "delete", delete)
+        second = manager.purge_payloads([input_ref, metadata_ref, child_ref])
+        assert second.deleted_count == 2
+        assert second.skipped_count == 1
+        assert not store.exists(metadata_ref)
+        assert not store.exists(child_ref)
+
+    @pytest.mark.parametrize(
+        "content",
+        [b'{"source_snapshot_ref":', b"\xff", b"[]", b'{"source_snapshot_version":1}'],
+        ids=["malformed-json", "invalid-utf8", "nonmapping", "missing-marker"],
+    )
+    def test_corrupt_source_output_refuses_discovery_and_deletion(self, db: LandscapeDB, tmp_path: Path, content: bytes) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        child_ref = store.store(b"sealed source rows")
+        original = {"source_snapshot_ref": child_ref, "source_snapshot_version": 1}
+        metadata_ref = store.store(content)
+        with db.write_connection() as conn:
+            _create_run(conn, "corrupt-source", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "corrupt-source", "source-corrupt")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="corrupt-source-op",
+                    run_id="corrupt-source",
+                    node_id="source-corrupt",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    output_data_ref=metadata_ref,
+                    output_data_hash=stable_hash(original),
+                )
+            )
+        with pytest.raises(AuditIntegrityError):
+            manager.find_expired_payload_refs(retention_days=30, as_of=now)
+        with pytest.raises(AuditIntegrityError):
+            manager.purge_payloads([metadata_ref])
+        assert store.exists(child_ref)
+        assert store.exists(metadata_ref)
+
+    @pytest.mark.parametrize("version", [True, 1.0, "1", 2])
+    def test_invalid_snapshot_version_refuses_discovery_and_deletion(self, db: LandscapeDB, tmp_path: Path, version: object) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        child_ref = store.store(b"sealed source rows")
+        metadata = {"source_snapshot_ref": child_ref, "source_snapshot_version": version}
+        # Canonical JSON normalizes 1.0 to 1. Deliberately retain the corrupt
+        # float wire spelling to exercise refusal of noncanonical metadata.
+        content = json.dumps(metadata).encode() if type(version) is float else canonical_json(metadata).encode()
+        metadata_ref = store.store(content)
+        with db.write_connection() as conn:
+            _create_run(conn, "invalid-snapshot", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "invalid-snapshot", "source-invalid")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="invalid-snapshot-op",
+                    run_id="invalid-snapshot",
+                    node_id="source-invalid",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    output_data_ref=metadata_ref,
+                    output_data_hash=stable_hash(metadata),
+                )
+            )
+        with pytest.raises(AuditIntegrityError, match=r"metadata is malformed|canonical bindings"):
+            manager.find_expired_payload_refs(retention_days=30, as_of=now)
+        with pytest.raises(AuditIntegrityError, match=r"metadata is malformed|canonical bindings"):
+            manager.purge_payloads([child_ref, metadata_ref])
+        assert store.exists(child_ref)
+        assert store.exists(metadata_ref)
+
+    def test_source_snapshot_child_is_protected_by_active_run_and_purged_with_metadata(
+        self, db: LandscapeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        old = now - timedelta(days=40)
+        recent = now - timedelta(days=1)
+        spool_ref = store.store(b"sealed source rows")
+        metadata = {"source_snapshot_ref": spool_ref, "source_snapshot_version": 1}
+        metadata_ref = store.store(canonical_json(metadata).encode())
+        with db.write_connection() as conn:
+            for run_id, completed_at in (("expired-snapshot", old), ("active-snapshot", recent)):
+                _create_run(conn, run_id, status=RunStatus.COMPLETED, completed_at=completed_at)
+                _create_node(conn, run_id, f"source-{run_id}")
+                if run_id == "active-snapshot":
+                    _create_row(conn, run_id, f"source-{run_id}", "active-shared-row", row_index=0, source_data_ref=spool_ref)
+                else:
+                    conn.execute(
+                        operations_table.insert().values(
+                            operation_id=f"op-{run_id}",
+                            run_id=run_id,
+                            node_id=f"source-{run_id}",
+                            operation_type="source_load",
+                            started_at=now,
+                            status="completed",
+                            output_data_ref=metadata_ref,
+                            output_data_hash=stable_hash(metadata),
+                        )
+                    )
+
+        assert manager.find_expired_payload_refs(retention_days=30, as_of=now) == []
+        dependencies = manager._source_output_dependencies({metadata_ref})
+        assert dependencies.snapshot_children == {metadata_ref: spool_ref}
+        with pytest.raises(TypeError):
+            setitem(dependencies.snapshot_children, metadata_ref, "substituted-child")
+        with pytest.raises(ValueError, match="without its admitted child"):
+            manager.purge_payloads([metadata_ref])
+        assert store.exists(spool_ref)
+        assert store.exists(metadata_ref)
+        with db.write_connection() as conn:
+            conn.execute(runs_table.update().where(runs_table.c.run_id == "active-snapshot").values(completed_at=old))
+        monkeypatch.setattr(store, "retrieve", lambda _ref: pytest.fail("purge used unbounded retrieve"))
+        assert set(manager.find_expired_payload_refs(retention_days=30, as_of=now)) == {spool_ref, metadata_ref}
+        result = manager.purge_payloads([spool_ref, metadata_ref])
+        assert result.deleted_count == 2
+        assert not store.exists(spool_ref)
+        assert not store.exists(metadata_ref)
+
     @pytest.mark.parametrize(
         ("status", "completed_at", "match"),
         (
@@ -834,6 +1332,67 @@ class TestFindExpiredPayloadRefs:
 
 
 class TestPurgePayloads:
+    @pytest.mark.parametrize("fail_first", [False, True])
+    def test_repeated_purge_reconciles_grade_after_a_missing_payload(
+        self, db: LandscapeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_first: bool
+    ) -> None:
+        from elspeth.core.landscape.reproducibility import update_grade_after_purge
+
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        response_ref = store.store(b'{"answer":42}')
+        manager = PurgeManager(db, store)
+        with db.write_connection() as conn:
+            _create_run(conn, "run-retry-grade", status=RunStatus.COMPLETED, completed_at=datetime(2026, 1, 1, tzinfo=UTC))
+            _create_node(conn, "run-retry-grade", "node-retry-grade", determinism=Determinism.NON_DETERMINISTIC)
+            _create_row(conn, "run-retry-grade", "node-retry-grade", "row-retry-grade", row_index=0, source_data_ref=None)
+            _create_token(conn, "run-retry-grade", "row-retry-grade", "token-retry-grade")
+            _create_node_state(
+                conn,
+                state_id="state-retry-grade",
+                token_id="token-retry-grade",
+                run_id="run-retry-grade",
+                node_id="node-retry-grade",
+            )
+            _create_call_for_state(
+                conn, call_id="call-retry-grade", state_id="state-retry-grade", request_ref=None, response_ref=response_ref
+            )
+
+        calls: list[str] = []
+
+        def _transient_grade_failure(
+            db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None
+        ) -> None:
+            calls.append(coordination_token.run_id)
+            if fail_first and len(calls) == 1:
+                raise OperationalError("transient grade failure", {}, Exception("locked"))
+            update_grade_after_purge(db_obj, coordination_token=coordination_token, deleted_refs=deleted_refs)
+
+        monkeypatch.setattr("elspeth.core.retention.purge.update_grade_after_purge", _transient_grade_failure)
+        first = manager.purge_payloads([response_ref])
+        assert first.deleted_count == 1
+        assert first.grade_update_failures == (("run-retry-grade",) if fail_first else ())
+        assert not store.exists(response_ref)
+        with db.connection() as conn:
+            row = conn.execute(runs_table.select().where(runs_table.c.run_id == "run-retry-grade")).one()
+        assert row.reproducibility_grade == (
+            ReproducibilityGrade.REPLAY_REPRODUCIBLE if fail_first else ReproducibilityGrade.ATTRIBUTABLE_ONLY
+        )
+
+        refs = manager.find_expired_payload_refs(retention_days=30, as_of=datetime(2026, 3, 1, tzinfo=UTC))
+        assert refs == [response_ref]
+        for _ in range(2):
+            retry = manager.purge_payloads(refs)
+            assert retry.deleted_count == 0
+            assert retry.skipped_count == 1
+            assert retry.failed_refs == ()
+            assert retry.grade_update_failures == ()
+            with db.connection() as conn:
+                run = conn.execute(runs_table.select().where(runs_table.c.run_id == "run-retry-grade")).one()
+                seat = conn.execute(run_coordination_table.select().where(run_coordination_table.c.run_id == "run-retry-grade")).one()
+            assert run.reproducibility_grade == ReproducibilityGrade.ATTRIBUTABLE_ONLY
+            assert seat.leader_worker_id is None
+        assert set(calls) == {"run-retry-grade"}
+
     def test_purge_payloads_downgrades_replay_run_when_deleted_ref_is_replay_critical(self, db: LandscapeDB) -> None:
         """A real blob purge must downgrade replay-only runs that need that response."""
         store = MockPayloadStore()
@@ -889,6 +1448,29 @@ class TestPurgePayloads:
             assert run_record is not None
             grade = run_record.reproducibility_grade
         assert grade == ReproducibilityGrade.ATTRIBUTABLE_ONLY
+        with db.connection() as conn:
+            seat = conn.execute(run_coordination_table.select().where(run_coordination_table.c.run_id == "run-replay-critical-purge")).one()
+        assert seat.leader_worker_id is None
+
+    def test_purge_reports_a_held_seat_without_releasing_its_owner(self, db: LandscapeDB) -> None:
+        store = MockPayloadStore()
+        ref = store.store(b"payload")
+        _create_purge_runs(db, "held")
+        with db.write_connection() as conn:
+            _create_node(conn, "held", "node-held", determinism=Determinism.NON_DETERMINISTIC)
+            _create_row(conn, "held", "node-held", "row-held", row_index=0, source_data_ref=ref)
+        coordination = RunCoordinationRepository(db.engine)
+        authority = coordination.acquire_export_leadership(
+            run_id="held", worker_id=mint_worker_id("held"), window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+        )
+        result = PurgeManager(db, store).purge_payloads([ref])
+        assert result.grade_update_failures == ("held",)
+        leader = coordination.live_leader(run_id="held")
+        assert leader is not None
+        assert leader.leader_worker_id == authority.worker_id
+        with db.connection() as conn:
+            row = conn.execute(runs_table.select().where(runs_table.c.run_id == "held")).one()
+        assert row.reproducibility_grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
 
     def test_purge_payloads_counts_delete_false_as_skipped_not_failed(
         self,
@@ -913,7 +1495,7 @@ class TestPurgePayloads:
         assert result.deleted_count == 0
         assert result.skipped_count == 1
         assert result.failed_refs == ()
-        assert affected_lookup_inputs == [[]]
+        assert affected_lookup_inputs == [[stale_ref]]
 
     def test_purge_payloads_tracks_deleted_skipped_and_failures(self, db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
         store = _ControlledStore()
@@ -929,13 +1511,16 @@ class TestPurgePayloads:
         manager = PurgeManager(db, store)
 
         monkeypatch.setattr(manager, "_find_affected_run_ids", lambda refs: {"run-affected"} if refs else set())
+        _create_purge_runs(db, "run-affected")
 
         grade_updates: list[str] = []
 
-        def _record_grade_update(db_obj: LandscapeDB, run_id: str, *, deleted_refs: list[str] | None = None) -> None:
+        def _record_grade_update(
+            db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None
+        ) -> None:
             del db_obj
-            assert deleted_refs == [ok_ref, exists_error_ref]
-            grade_updates.append(run_id)
+            assert deleted_refs == [ok_ref, "missing-ref", false_ref, exists_error_ref]
+            grade_updates.append(coordination_token.run_id)
 
         monkeypatch.setattr("elspeth.core.retention.purge.update_grade_after_purge", _record_grade_update)
 
@@ -950,11 +1535,15 @@ class TestPurgePayloads:
         assert result.duration_seconds == 3.25
         assert grade_updates == ["run-affected"]
 
-    def test_purge_payloads_only_passes_deleted_refs_to_affected_run_lookup(self, db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_purge_payloads_only_passes_confirmed_absent_refs_to_affected_run_lookup(
+        self, db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         store = _ControlledStore()
         deleted_ref = store.store(b"deleted")
+        absent_ref = store.store(b"already absent")
         failed_ref = store.store(b"failed")
-        store._false_delete_for.add(failed_ref)
+        store._false_delete_for.add(absent_ref)
+        store._fail_delete_for.add(failed_ref)
 
         manager = PurgeManager(db, store)
 
@@ -970,12 +1559,12 @@ class TestPurgePayloads:
             lambda db_obj, run_id, *, deleted_refs=None: None,
         )
 
-        result = manager.purge_payloads([deleted_ref, failed_ref])
+        result = manager.purge_payloads([deleted_ref, absent_ref, failed_ref])
 
         assert result.deleted_count == 1
         assert result.skipped_count == 1
-        assert result.failed_refs == ()
-        assert captured_refs == [deleted_ref]
+        assert result.failed_refs == (failed_ref,)
+        assert captured_refs == [deleted_ref, absent_ref]
 
     def test_purge_payloads_empty_input(self, db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
         manager = PurgeManager(db, MockPayloadStore())
@@ -1002,7 +1591,7 @@ class TestPurgePayloads:
 
         Verify:
           1. deleted_count + skipped_count + len(failed_refs) == 7
-          2. Grade updates run only for runs linked to deleted refs
+          2. Grade updates run for runs linked to deleted or already absent refs
           3. Failed refs don't trigger grade updates
         """
         store = _ControlledStore()
@@ -1020,9 +1609,8 @@ class TestPurgePayloads:
 
         manager = PurgeManager(db, store)
 
-        # Map deleted refs → affected run IDs
+        # Map confirmed absent refs → affected run IDs
         def _mock_affected(refs: list[str]) -> set[str]:
-            # Only deleted refs should arrive here
             affected = set()
             if ok_ref_1 in refs:
                 affected.add("run-alpha")
@@ -1030,19 +1618,22 @@ class TestPurgePayloads:
                 affected.add("run-beta")
             if exists_check_irrelevant_ref in refs:
                 affected.add("run-gamma")
-            # Failed/skipped refs must NOT appear
+            if false_delete_ref in refs:
+                affected.add("run-already-absent")
+            # Failed refs have no evidence of absence; skipped refs do.
             assert delete_fail_ref not in refs
-            assert false_delete_ref not in refs
-            assert "missing-ref-1" not in refs
-            assert "missing-ref-2" not in refs
+            assert false_delete_ref in refs
+            assert "missing-ref-1" in refs
+            assert "missing-ref-2" in refs
             return affected
 
         monkeypatch.setattr(manager, "_find_affected_run_ids", _mock_affected)
+        _create_purge_runs(db, "run-alpha", "run-beta", "run-gamma", "run-already-absent")
 
         grade_updates: list[str] = []
         monkeypatch.setattr(
             "elspeth.core.retention.purge.update_grade_after_purge",
-            lambda db_obj, run_id, *, deleted_refs=None: grade_updates.append(run_id),
+            lambda db_obj, *, coordination_token, deleted_refs=None: grade_updates.append(coordination_token.run_id),
         )
 
         all_refs = [
@@ -1066,11 +1657,58 @@ class TestPurgePayloads:
         # Failed refs are only hard delete failures.
         assert set(result.failed_refs) == {delete_fail_ref}
 
-        # Grade updates ran for all runs linked to successful deletions
-        assert set(grade_updates) == {"run-alpha", "run-beta", "run-gamma"}
+        # Grade updates reconcile every run linked to confirmed absence.
+        assert set(grade_updates) == {"run-alpha", "run-beta", "run-gamma", "run-already-absent"}
 
         # No grade update failures (all mocked to succeed)
         assert result.grade_update_failures == ()
+
+
+def test_purge_reports_concurrent_resume_without_misclassifying_corruption(db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = MockPayloadStore()
+    ref = store.store(b"payload")
+    with db.write_connection() as conn:
+        _create_run(conn, "resuming", status=RunStatus.FAILED, completed_at=datetime.now(UTC))
+        _create_node(conn, "resuming", "source")
+        _create_row(conn, "resuming", "source", "row", row_index=0, source_data_ref=ref)
+    manager = PurgeManager(db, store)
+    find_affected = manager._find_affected_run_ids
+
+    def resume_after_snapshot(refs: list[str]) -> set[str]:
+        affected = find_affected(refs)
+        RunCoordinationRepository(db.engine).acquire_run_leadership(
+            run_id="resuming", worker_id="successor", window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+        )
+        return affected
+
+    monkeypatch.setattr(manager, "_find_affected_run_ids", resume_after_snapshot)
+    result = manager.purge_payloads([ref])
+    assert result.grade_update_failures == ("resuming",)
+    assert result.deleted_count == 1
+    with db.connection() as conn:
+        run = conn.execute(runs_table.select().where(runs_table.c.run_id == "resuming")).one()
+        seat = conn.execute(run_coordination_table.select().where(run_coordination_table.c.run_id == "resuming")).one()
+    assert run.status == RunStatus.RUNNING.value
+    assert run.reproducibility_grade is None
+    assert seat.leader_worker_id == "successor"
+
+
+def test_purge_release_failure_preserves_original_integrity_error(db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = MockPayloadStore()
+    ref = store.store(b"payload")
+    with db.write_connection() as conn:
+        _create_run(conn, "corrupt", status=RunStatus.COMPLETED, completed_at=datetime.now(UTC), reproducibility_grade="invalid")
+        _create_node(conn, "corrupt", "source")
+        _create_row(conn, "corrupt", "source", "row", row_index=0, source_data_ref=ref)
+    release_error = OperationalError("release", {}, RuntimeError("connection lost"))
+
+    def fail_release(self: RunCoordinationRepository, *, token: CoordinationToken) -> None:
+        raise release_error
+
+    monkeypatch.setattr(RunCoordinationRepository, "release_seat", fail_release)
+    with pytest.raises(AuditIntegrityError) as caught:
+        PurgeManager(db, store).purge_payloads([ref])
+    assert caught.value.__cause__ is release_error
 
 
 class TestInterruptedRunNotPurgeEligible:
@@ -1198,6 +1836,7 @@ class TestPurgeGradeUpdateFailureResilience:
         manager = PurgeManager(db, store)
 
         # Simulate 3 affected runs
+        _create_purge_runs(db, "run-ok-1", "run-bad", "run-ok-2")
         monkeypatch.setattr(
             manager,
             "_find_affected_run_ids",
@@ -1206,8 +1845,11 @@ class TestPurgeGradeUpdateFailureResilience:
 
         grade_updates: list[str] = []
 
-        def _failing_grade_update(db_obj: LandscapeDB, run_id: str, *, deleted_refs: list[str] | None = None) -> None:
+        def _failing_grade_update(
+            db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None
+        ) -> None:
             del db_obj
+            run_id = coordination_token.run_id
             assert deleted_refs == [ref]
             if run_id == "run-bad":
                 raise OperationalError(f"Transient DB failure for run '{run_id}'", {}, Exception("locked"))
@@ -1245,7 +1887,12 @@ class TestPurgeGradeUpdateFailureResilience:
             lambda refs: {"run-corrupt"} if refs else set(),
         )
 
-        def _integrity_failure(db_obj: LandscapeDB, run_id: str, *, deleted_refs: list[str] | None = None) -> None:
+        _create_purge_runs(db, "run-corrupt")
+
+        def _integrity_failure(
+            db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None
+        ) -> None:
+            run_id = coordination_token.run_id
             assert deleted_refs == [ref]
             raise AuditIntegrityError(f"NULL reproducibility_grade for run {run_id} — audit data corruption")
 
@@ -1271,7 +1918,10 @@ class TestPurgeGradeUpdateFailureResilience:
             lambda refs: {"run-fail"} if refs else set(),
         )
 
-        def _transient_fail(db_obj: LandscapeDB, run_id: str, *, deleted_refs: list[str] | None = None) -> None:
+        _create_purge_runs(db, "run-fail")
+
+        def _transient_fail(db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None) -> None:
+            run_id = coordination_token.run_id
             assert deleted_refs == [ref]
             raise OperationalError(f"Transient failure for run '{run_id}'", {}, Exception("locked"))
 
@@ -1308,8 +1958,12 @@ class TestPurgeGradeUpdateFailureResilience:
             lambda refs: {"run-buggy"} if refs else set(),
         )
 
-        def _buggy_grade_update(db_obj: LandscapeDB, run_id: str, *, deleted_refs: list[str] | None = None) -> None:
-            del db_obj, run_id, deleted_refs
+        _create_purge_runs(db, "run-buggy")
+
+        def _buggy_grade_update(
+            db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None
+        ) -> None:
+            del db_obj, coordination_token, deleted_refs
             raise TypeError("bug in our own grade-update code")
 
         monkeypatch.setattr(
@@ -1319,6 +1973,9 @@ class TestPurgeGradeUpdateFailureResilience:
 
         with pytest.raises(TypeError, match="bug in our own grade-update code"):
             manager.purge_payloads([ref])
+        with db.connection() as conn:
+            seat = conn.execute(run_coordination_table.select().where(run_coordination_table.c.run_id == "run-buggy")).one()
+        assert seat.leader_worker_id is None
 
 
 class TestPurgeUnboundedIN:

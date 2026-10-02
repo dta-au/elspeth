@@ -2,7 +2,8 @@
 
 Three modes, all anchored on query_field:
 1. Field only: use field value verbatim
-2. Field + template: render Jinja2 template with {{ query }} and {{ row }}
+2. Field + template: render Jinja2 template with {{ query }} and {{ row }},
+   the row projected to the node's declaration (ADR-051)
 3. Field + regex: extract search text via capture group
 """
 
@@ -13,20 +14,15 @@ import re
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from jinja2 import Template
-
-from jinja2 import TemplateSyntaxError, UndefinedError
-from jinja2.exceptions import SecurityError
+from jinja2 import TemplateSyntaxError
 
 from elspeth.contracts.errors import TransformErrorReason
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.regex_worker import run_regex_worker
-from elspeth.plugins.infrastructure.templates import (
-    TemplateError,
-    create_sandboxed_environment,
-)
+from elspeth.plugins.infrastructure.templates import RowProjection, SandboxedTemplate, TemplateError, TemplateRow
 
 
 @dataclass(frozen=True)
@@ -42,7 +38,9 @@ class QueryBuilder:
 
     Supports three modes:
     - Field only: query_field set, no template or pattern
-    - Template: query_field + query_template (Jinja2)
+    - Template: query_field + query_template (Jinja2); the template's ``row``
+      is ``TemplateRow.project(row, row_projection)``, so a field the node
+      does not declare never reaches the render worker (ADR-051)
     - Regex: query_field + query_pattern (re capture group)
 
     Regex mode uses a ProcessPoolExecutor (max 1 worker) for timeout enforcement.
@@ -55,20 +53,21 @@ class QueryBuilder:
         self,
         query_field: str,
         *,
+        row_projection: RowProjection,
         query_template: str | None = None,
         query_pattern: str | None = None,
         regex_timeout: float = 5.0,
     ) -> None:
         self._query_field = query_field
+        self._row_projection = row_projection
         self._regex_timeout = regex_timeout
-        self._compiled_template: Template | None = None
+        self._compiled_template: SandboxedTemplate | None = None
         self._compiled_pattern: re.Pattern[str] | None = None
         self._regex_pool: ProcessPoolExecutor | None = None
 
         if query_template is not None:
-            env = create_sandboxed_environment()
             try:
-                self._compiled_template = env.from_string(query_template)
+                self._compiled_template = SandboxedTemplate(query_template)
             except TemplateSyntaxError as e:
                 raise TemplateError(f"Invalid query template syntax: {e}") from e
 
@@ -78,16 +77,18 @@ class QueryBuilder:
             # bounds concurrent process count while amortizing spawn cost.
             self._regex_pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
 
-    def build(self, row_data: dict[str, Any]) -> QueryResult:
-        """Construct a search query from row data."""
-        if self._query_field not in row_data:
+    def build(self, row: PipelineRow) -> QueryResult:
+        """Construct a search query from a row."""
+        if self._query_field not in row:
             return QueryResult(
                 error=TransformErrorReason(
                     reason="missing_field",
                     field=self._query_field,
                 )
             )
-        extracted = row_data[self._query_field]
+        # The plain value, as the row carries it in its data (PipelineRow
+        # holds a frozen copy); the value is never converted.
+        extracted = deep_thaw(row[self._query_field])
 
         if extracted is None:
             return QueryResult(
@@ -99,33 +100,52 @@ class QueryBuilder:
             )
 
         if self._compiled_template is not None:
-            return self._build_template(extracted, row_data)
-        elif self._compiled_pattern is not None:
-            return self._build_regex(extracted)
-        else:
-            return self._build_field_only(extracted)
+            return self._build_template(extracted, row)
 
-    def _build_field_only(self, extracted: Any) -> QueryResult:
-        # Offensive isinstance guard — not defensive suppression. The `extracted`
-        # seam is typed Any because row_data is dict[str, Any] and observed-mode
-        # schemas do not enforce value types. Without this guard, a bytes value
-        # would silently PASS _validate_non_empty (bytes.strip() and bool(b"x")
-        # both succeed), producing QueryResult(query=b"...") — wrong type, no
-        # crash, corrupted audit trail. The guard makes the upstream plugin bug
-        # loud rather than letting it persist silently. Do not delete without
-        # verifying that every schema mode guarantees str at this seam.
-        if not isinstance(extracted, str):
-            raise TypeError(
-                f"query_field '{self._query_field}' expected str, got {type(extracted).__name__} "
-                f"— upstream plugin bug (Tier 2 data must not be coerced)"
-            )
+        # The ONE type check for the modes that USE the value as the query.
+        # Returned rather than raised: it is a fact about this row's data, like
+        # the missing and None cases above, so it takes the same exit. Field-only
+        # mode needs it because bytes.strip() and bool(b"x") both succeed, so a
+        # bytes value would otherwise become QueryResult(query=b"..."); regex
+        # mode needs it BEFORE the worker, so that any exception the worker
+        # raises is the worker's fault, never the row's.
+        if type(extracted) is not str:
+            return self._wrong_type(extracted)
+        if self._compiled_pattern is not None:
+            return self._build_regex(extracted)
         return self._validate_non_empty(extracted)
 
-    def _build_template(self, extracted: Any, row_data: dict[str, Any]) -> QueryResult:
+    def _wrong_type(self, extracted: Any) -> QueryResult:
+        """Reject a non-str query value: the field and the TYPE, never the value.
+
+        The value is Tier-2 row content; the audit reason names what was
+        required and what was found so the failure is attributable without
+        copying the row into it.
+        """
+        found = type(extracted).__name__
+        return QueryResult(
+            error=TransformErrorReason(
+                reason="invalid_input",
+                error_type="wrong_type",
+                field=self._query_field,
+                expected="str",
+                actual_type=found,
+                error=f"must be str, got {found}",
+            )
+        )
+
+    def _build_template(self, extracted: Any, row: PipelineRow) -> QueryResult:
         assert self._compiled_template is not None  # guaranteed by build() guard
+        # No str check here, deliberately: `{{ query }}` is a template binding
+        # like `{{ row.x }}`, and every ELSPETH template surface (LLM prompts
+        # included) interpolates a row value of any type. Field-only and regex
+        # modes USE the value as the query, so they require a str.
         try:
-            query = self._compiled_template.render(query=extracted, row=row_data)
-        except (UndefinedError, SecurityError, OverflowError, ZeroDivisionError, ArithmeticError, TypeError, ValueError) as e:
+            query = self._compiled_template.render(query=extracted, row=TemplateRow.project(row, self._row_projection))
+        except TemplateError as e:
+            # SandboxedTemplate's message is value-free by construction: a
+            # template may compute a lookup key from the row, and Jinja's own
+            # message would quote it.
             return QueryResult(
                 error=TransformErrorReason(
                     reason="template_rendering_failed",
@@ -135,7 +155,7 @@ class QueryBuilder:
             )
         return self._validate_non_empty(query)
 
-    def _build_regex(self, extracted: Any) -> QueryResult:
+    def _build_regex(self, extracted: str) -> QueryResult:
         assert self._compiled_pattern is not None  # guaranteed by build() guard
         assert self._regex_pool is not None  # created when pattern is compiled
 
@@ -165,17 +185,6 @@ class QueryBuilder:
                     max_seconds=self._regex_timeout,
                 )
             )
-        except TypeError as exc:
-            # re.Pattern.search() raises TypeError when handed a non-str value
-            # (int, bytes, list, ...). The field reached us as Tier 2 pipeline
-            # data, so a non-str here is an upstream plugin contract violation,
-            # not a regex-engine bug — crash with a message that names the
-            # actual fault (Tier 2 data must not be coerced).
-            raise TypeError(
-                f"query_field '{self._query_field}' expected str, got "
-                f"{type(extracted).__name__} — upstream plugin bug "
-                f"(Tier 2 data must not be coerced): {exc}"
-            ) from exc
         except Exception as exc:
             # _regex_worker is system-owned code — a crash is a code bug, not a data issue.
             raise RuntimeError(

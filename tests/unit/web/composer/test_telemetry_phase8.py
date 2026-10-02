@@ -1,6 +1,7 @@
 """Tests for ``elspeth.web.composer.telemetry_phase8`` (Phase 8 Task 1).
 
-Per CLAUDE.md primacy, the audit row is the legal record; these counters
+Per the ``logging-telemetry-policy`` skill §Logging Policy, the audit row is
+the legal record; these counters
 are operational signals. Each helper here is verified for:
 
 1. Correct counter slot is incremented.
@@ -41,8 +42,6 @@ from elspeth.web.composer.telemetry_phase8 import (
     SessionsTelemetry,
     record_audit_fetch_failure,
     record_interpretation_opt_out,
-    record_mode_opted_in,
-    record_mode_opted_out,
     record_session_completed,
     record_session_switched,
     record_share_link_expiry_hit,
@@ -210,8 +209,6 @@ def test_factory_registers_canonical_counter_names() -> None:
     # Phase-8-scoped equivalent for the module's own test surface.
     phase_8_expected: frozenset[str] = frozenset(
         {
-            "composer.mode.opted_out_total",
-            "composer.mode.opted_in_total",
             "composer.session.switched_total",
             "composer.tutorial.started_total",
             # composer.tutorial.completed_total — counted ONLY by
@@ -266,24 +263,6 @@ def test_factory_registers_canonical_counter_names() -> None:
 # ─────────────────────────────────────────────────────────────────────────
 
 
-def test_record_mode_opted_out_increments_counter(sessions_telemetry: SessionsTelemetry) -> None:
-    """Account-level opt-out helper: post-state-only, kwarg-free,
-    attribute-free per §B2.b.
-    """
-    record_mode_opted_out(sessions_telemetry)
-    assert observed_value(sessions_telemetry.mode_opted_out_total) == 1
-    calls = _fake_calls(sessions_telemetry.mode_opted_out_total)
-    assert calls == [(1, {}, None)]
-
-
-def test_record_mode_opted_in_increments_counter(sessions_telemetry: SessionsTelemetry) -> None:
-    """Account-level opt-in helper: symmetric to opt-out."""
-    record_mode_opted_in(sessions_telemetry)
-    assert observed_value(sessions_telemetry.mode_opted_in_total) == 1
-    calls = _fake_calls(sessions_telemetry.mode_opted_in_total)
-    assert calls == [(1, {}, None)]
-
-
 def test_record_session_switched_increments_counter(sessions_telemetry: SessionsTelemetry) -> None:
     """Per-session trust_mode switch — records both from_mode and to_mode
     attributes drawn from the per-session ``trust_mode`` vocabulary.
@@ -310,8 +289,8 @@ def test_record_session_switched_accepts_all_valid_combinations(
 ) -> None:
     """Every combination of per-session vocabulary values is accepted.
 
-    Vocabulary is intentionally NOT parametrised over ``"guided"`` /
-    ``"freeform"`` / ``"unknown"`` — those are wrong vocabulary
+    Vocabulary is intentionally NOT parametrised over ``"freeform"`` /
+    ``"unknown"`` — those are wrong vocabulary
     (account-level column) or fabricated values that the per-session
     column does not admit. Cross-vocabulary rejection is asserted by
     the test below.
@@ -321,14 +300,9 @@ def test_record_session_switched_accepts_all_valid_combinations(
 
 
 def test_record_session_switched_rejects_cross_vocabulary_account_mode(sessions_telemetry: SessionsTelemetry) -> None:
-    """B1-r2 regression: ``"guided"`` is valid for the account-level
-    ``default_composer_mode`` column and INVALID for the per-session
-    ``trust_mode`` column. A pass-1 draft sharing a single mode Literal
-    would have admitted this call. Re-running this assertion catches
-    future regressions that re-share the Literal.
-    """
+    """A composer surface label is invalid for the per-session trust-mode column."""
     with pytest.raises(ValueError, match=r"from_mode must be"):
-        record_session_switched(sessions_telemetry, from_mode="guided", to_mode="auto_commit")  # type: ignore[arg-type]
+        record_session_switched(sessions_telemetry, from_mode="freeform", to_mode="auto_commit")  # type: ignore[arg-type]
 
 
 def test_record_session_switched_rejects_fabricated_mode(sessions_telemetry: SessionsTelemetry) -> None:
@@ -372,8 +346,8 @@ def test_record_session_completed_accepts_all_valid_combinations(sessions_teleme
     UI-only vocabulary (different from the DB audit row) and
     ``run_pipeline`` has no audit row in
     ``composer_completion_events_table`` (its audit lives under
-    ``runs/``); both would violate the CLAUDE.md superset rule and
-    are rejected by the negative tests below.
+    ``runs/``); both would violate the ``logging-telemetry-policy`` skill
+    §The Superset Rule and are rejected by the negative tests below.
     """
     record_session_completed(sessions_telemetry, completion_verb=completion_verb)  # type: ignore[arg-type]
     assert observed_value(sessions_telemetry.session_completed_total) == 1
@@ -479,8 +453,6 @@ def _swap_counter(tel: SessionsTelemetry, field: str, replacement: _RaisingCount
 @pytest.mark.parametrize(
     ("field", "invoke"),
     [
-        ("mode_opted_out_total", lambda tel: record_mode_opted_out(tel)),
-        ("mode_opted_in_total", lambda tel: record_mode_opted_in(tel)),
         (
             "session_switched_total",
             lambda tel: record_session_switched(tel, from_mode="explicit_approve", to_mode="auto_commit"),
@@ -524,7 +496,7 @@ def test_record_session_switched_assert_runs_before_swallow(sessions_telemetry: 
     raising = _RaisingCounter()
     tel_with_raise = _swap_counter(sessions_telemetry, "session_switched_total", raising)
     with pytest.raises(ValueError, match=r"from_mode must be"):
-        record_session_switched(tel_with_raise, from_mode="guided", to_mode="auto_commit")  # type: ignore[arg-type]
+        record_session_switched(tel_with_raise, from_mode="freeform", to_mode="auto_commit")  # type: ignore[arg-type]
     # The exporter must never have been touched because the assert
     # fired first.
     assert raising.attempts == 0

@@ -186,14 +186,8 @@ class ExecutionService(Protocol):
         """Return current run status from the Run database record."""
         ...
 
-    async def cancel(self, run_id: UUID) -> None:
-        """Cancel a run. Sets the shutdown Event for active runs.
-
-        Idempotent — cancelling a terminal run is a no-op.
-        Note: async because cancelling a pending run calls
-        SessionService.update_run_status() directly (not via _call_async,
-        since we're in the event loop thread).
-        """
+    async def cancel(self, run_id: UUID, *, user: UserIdentity) -> None:
+        """Persist authenticated cancellation intent; terminal requests are idempotent."""
         ...
 
     async def verify_run_ownership(self, user: UserIdentity, run_id: str) -> bool:

@@ -9,13 +9,28 @@ from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.core.landscape.schema import token_lineage_frames_table
+from tests.fixtures.landscape import leader_coordination_token
 from tests.unit.core.landscape.test_token_recording import _make_row, _setup
 
 
 def test_load_lineage_paths_batches_and_orders_by_depth() -> None:
     _db, factory = _setup()
     row, root = _make_row(factory)
+    authority = leader_coordination_token(factory, "run-1")
+    work_item = factory.scheduler.enqueue_ready_claimed(
+        member_token=authority.membership,
+        token_id=root.token_id,
+        row_id=row.row_id,
+        node_id="agg-0",
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json='{"col":"value-0"}',
+        lease_owner=authority.worker_id,
+        lease_seconds=300,
+    )
     children, fork_group = factory.data_flow.fork_token(
+        member_token=authority.membership,
+        work_item=work_item,
         parent_ref=TokenRef(token_id=root.token_id, run_id="run-1"),
         row_id=row.row_id,
         branches=["path-a", "path-b"],

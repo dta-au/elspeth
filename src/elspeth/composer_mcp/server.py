@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
+from jsonschema import Draft202012Validator
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, TextContent, Tool
@@ -39,6 +40,7 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolRecorder,
     ComposerToolStatus,
+    ToolArgumentErrorCategory,
 )
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
@@ -60,11 +62,12 @@ from elspeth.web.composer.tools import (
     get_tool_definitions,
     validate_composer_file_sink_collision_policy,
 )
-from elspeth.web.composer.tools._dispatch import _validate_tool_arguments
+from elspeth.web.composer.tools._dispatch import _validate_tool_arguments, require_arguments_conform_to_schema
 from elspeth.web.composer.yaml_generator import (
     generate_public_composition_dict,
     generate_public_yaml,
 )
+from elspeth.web.credential_guard import require_no_credential_material_for_tool, require_no_credential_material_in_state
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
@@ -127,6 +130,7 @@ _SESSION_TOOL_DEFS: list[dict[str, Any]] = [
                 },
             },
             "required": [],
+            "additionalProperties": False,
         },
     },
     {
@@ -141,6 +145,7 @@ _SESSION_TOOL_DEFS: list[dict[str, Any]] = [
                 },
             },
             "required": ["session_id"],
+            "additionalProperties": False,
         },
     },
     {
@@ -155,12 +160,13 @@ _SESSION_TOOL_DEFS: list[dict[str, Any]] = [
                 },
             },
             "required": ["session_id"],
+            "additionalProperties": False,
         },
     },
     {
         "name": "list_sessions",
         "description": "List all saved composition sessions.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
+        "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     },
     {
         "name": "delete_session",
@@ -174,16 +180,31 @@ _SESSION_TOOL_DEFS: list[dict[str, Any]] = [
                 },
             },
             "required": ["session_id"],
+            "additionalProperties": False,
         },
     },
     {
         "name": "generate_yaml",
         "description": "Generate ELSPETH pipeline YAML from the current composition state.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
+        "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     },
 ]
 
 _SESSION_TOOL_NAMES: frozenset[str] = frozenset(d["name"] for d in _SESSION_TOOL_DEFS)
+
+
+# The closed-root schema each session tool advertises is also the one that
+# admits its calls (``_dispatch_tool``), as the registry schema does for the
+# composer tools. Checked against the metaschema once, at import.
+def _session_tool_validators() -> dict[str, Draft202012Validator]:
+    validators: dict[str, Draft202012Validator] = {}
+    for definition in _SESSION_TOOL_DEFS:
+        Draft202012Validator.check_schema(definition["parameters"])
+        validators[definition["name"]] = Draft202012Validator(definition["parameters"])
+    return validators
+
+
+_SESSION_TOOL_VALIDATOR_BY_NAME: dict[str, Draft202012Validator] = _session_tool_validators()
 
 
 def _build_tool_defs() -> list[dict[str, Any]]:
@@ -358,7 +379,10 @@ def _dispatch_tool(
     The result dict always has ``success``, ``state`` (serialized
     CompositionState), and may include ``data``.
     """
+    require_no_credential_material_for_tool(tool_name, arguments, surface="composer_mcp_tool_arguments")
+    require_no_credential_material_in_state(state, surface="composer_mcp_state")
     if tool_name in _SESSION_TOOL_NAMES:
+        require_arguments_conform_to_schema(tool_name, _SESSION_TOOL_VALIDATOR_BY_NAME[tool_name], arguments)
         if session_manager is None or session_checkout_ref is None:
             raise RuntimeError("session dispatch requires server-owned persistence authority")
         return _dispatch_session_tool(tool_name, arguments, state, session_manager, session_checkout_ref)
@@ -736,8 +760,10 @@ def create_server(
         except (ValueError, TypeError) as canon_exc:
             # Shared sentinel discipline (see web.composer.audit
             # build_canonicalization_sentinel docstring): captures
-            # type-name + ``str(exc)`` only for rfc8785 messages
-            # (value-free by spec) + sorted top-level argument keys.
+            # type-name + ``str(exc)`` only for the base rfc8785
+            # CanonicalizationError (its messages are type/rule strings;
+            # the domain subclasses echo the value) + sorted top-level
+            # argument keys.
             # Audit-trail forensic fingerprint without leak risk.
             sentinel = build_canonicalization_sentinel(canon_exc, arguments)
             arguments_canonical = canonical_json(sentinel)
@@ -747,6 +773,7 @@ def create_server(
         result_dict: dict[str, Any] | None = None
         status: ComposerToolStatus = ComposerToolStatus.SUCCESS
         error_class: str | None = None
+        error_category: ToolArgumentErrorCategory | None = None
         error_message: str | None = None
         # Captured for ARG_ERROR/PLUGIN_CRASH paths so result_canonical can
         # mirror what the LLM saw (Solution-architect review H4 — the LLM
@@ -754,15 +781,17 @@ def create_server(
         # is recorded).
         error_payload_for_audit: dict[str, Any] | None = None
         clear_session_after_audit = False
+        checkout_refused = False
 
-        def _argument_error_result(exc: Exception) -> CallToolResult:
-            nonlocal status, error_class, error_message, error_payload_for_audit
+        def _argument_error_result(exc: BaseException, category: ToolArgumentErrorCategory) -> CallToolResult:
+            nonlocal status, error_class, error_category, error_message, error_payload_for_audit
             # Bad LLM arguments only. ToolArgumentError messages are
             # safe by construction; the canonicalization pre-dispatch
-            # ValueError path uses class-name only to avoid echoing raw
-            # argument values.
+            # path records the class canonical_json actually raised and
+            # uses class-name only to avoid echoing raw argument values.
             status = ComposerToolStatus.ARG_ERROR
             error_class = type(exc).__name__
+            error_category = category
             error_message = type(exc).__name__
             # Build a structured payload so the LLM and the audit row
             # see the same string (Solution-architect H4 symmetry fix).
@@ -778,9 +807,9 @@ def create_server(
 
         def _capture_plugin_crash(exc: Exception) -> None:
             nonlocal status, error_class, error_message
-            # PLUGIN_CRASH path. CLAUDE.md "Plugin Ownership": let
-            # the exception propagate. Record the crash before re-raise
-            # so the audit trail captures the bug.
+            # PLUGIN_CRASH path. Per docs/guides/data-trust-and-error-handling.md
+            # §Plugin Ownership: let the exception propagate. Record the crash
+            # before re-raise so the audit trail captures the bug.
             status = ComposerToolStatus.PLUGIN_CRASH
             error_class = type(exc).__name__
             error_message = type(exc).__name__
@@ -788,14 +817,14 @@ def create_server(
         try:
             if canonicalization_failed is not None:
                 # Pre-dispatch ARG_ERROR: malformed LLM arguments.
-                return _argument_error_result(ValueError(f"arguments not canonicalizable ({type(canonicalization_failed).__name__})"))
+                return _argument_error_result(canonicalization_failed, ToolArgumentErrorCategory.CANONICALIZATION)
 
             if name in _COMPOSER_TOOL_NAMES:
                 try:
                     argument_error = _validate_tool_arguments(name, arguments, state_ref[0], raise_on_error=True)
                     assert argument_error is None
                 except ToolArgumentError as exc:
-                    return _argument_error_result(exc)
+                    return _argument_error_result(exc, exc.category)
 
             if name == "preview_pipeline" and runtime_preflight is not None:
                 try:
@@ -838,7 +867,18 @@ def create_server(
                     session_checkout_ref=session_checkout_ref,
                 )
             except ToolArgumentError as exc:
-                return _argument_error_result(exc)
+                return _argument_error_result(exc, exc.category)
+            except SessionCheckoutMismatchError as exc:
+                # Expected refusal: dispatch completed without changing state.
+                # Persist the same safe diagnostic the MCP client receives.
+                checkout_refused = True
+                result_dict = {
+                    "success": False,
+                    "error": str(exc),
+                    "code": "session_checkout_mismatch",
+                    "requested_session_id": exc.requested_session_id,
+                    "active_session_id": exc.active_session_id,
+                }
             except Exception as exc:
                 _capture_plugin_crash(exc)
                 raise
@@ -894,6 +934,8 @@ def create_server(
                 result_dict = None
                 raise
 
+            if checkout_refused:
+                return CallToolResult(content=[TextContent(type="text", text=response_text)], isError=True)
             return [TextContent(type="text", text=response_text)]
         finally:
             finished_at = datetime.now(UTC)
@@ -956,6 +998,7 @@ def create_server(
                 finished_at=finished_at,
                 latency_ms=latency_ms,
                 actor="composer-mcp:cli",
+                error_category=error_category,
             )
             try:
                 audit_recorder.record(invocation)
@@ -1039,7 +1082,7 @@ async def run_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path)
 
 # ---------------------------------------------------------------------------
 # WORKAROUND — Linux-only kernel guard against orphan busy-spin.
-# Tracked by filigree issue elspeth-7f99eba6ef. See _install_parent_death_signal_workaround
+# Tracked by archived issue elspeth-7f99eba6ef. See _install_parent_death_signal_workaround
 # docstring for full diagnosis and deletion criteria.
 # ---------------------------------------------------------------------------
 def _install_parent_death_signal_workaround() -> None:
@@ -1065,7 +1108,7 @@ def _install_parent_death_signal_workaround() -> None:
     platforms (macOS, Windows, BSD) remain vulnerable and need either an
     SDK upgrade or a portable watchdog (e.g. periodic ``getppid()`` poll).
 
-    REVIEW SCHEDULE — filigree issue ``elspeth-7f99eba6ef`` tracks the
+    REVIEW SCHEDULE — archived issue ``elspeth-7f99eba6ef`` tracks the
     deletion criteria. Re-evaluate at every MCP SDK upgrade. Delete this
     function and its caller in ``main()`` when:
 
@@ -1074,7 +1117,7 @@ def _install_parent_death_signal_workaround() -> None:
     2. A behavioural test confirms unclean parent-kill produces clean
        child exit *without* this workaround.
 
-    Sibling vulnerability: ``filigree-mcp`` (separate codebase, same SDK)
+    Sibling vulnerability: the retired issue tracker MCP server (same SDK)
     has the identical bug and needs its own fix; this workaround does not
     cover it.
     """
@@ -1119,7 +1162,7 @@ def _install_parent_death_signal_workaround() -> None:
 def main() -> None:
     """CLI entry point for elspeth-composer MCP server."""
     # WORKAROUND first — see _install_parent_death_signal_workaround
-    # docstring and filigree issue elspeth-7f99eba6ef.
+    # docstring and archived issue elspeth-7f99eba6ef.
     _install_parent_death_signal_workaround()
 
     parser = argparse.ArgumentParser(

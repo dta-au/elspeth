@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from typing import Annotated, Any, Final, cast
+from typing import Annotated, Any, Final, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.enums import OutputMode
 from elspeth.core.config import RuntimeNodeName
+from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     PatchNodeOptionsArgumentsModel,
     SpliceTransformArgumentsModel,
+    _JsonInteger,
+    _NodeTriggerModel,
+    _OmittableString,
     _StrictTimeoutSeconds,
 )
 from elspeth.web.composer.state import (
@@ -24,6 +30,7 @@ from elspeth.web.composer.state import (
     NodeSpec,
     NodeType,
     SourceSpec,
+    ValidationEntry,
     _batch_aware_placement_error,
     _batch_aware_required_input_fields_error,
     _validate_gate_expression,
@@ -35,6 +42,7 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools._common import (
     _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _STEP_DESCRIPTION_DESCRIPTION,
+    EmptyToolArgumentsModel,
     ToolContext,
     ToolResult,
     _apply_merge_patch,
@@ -63,18 +71,33 @@ from elspeth.web.composer.tools._common import (
     _validate_transform_provider_config_policy,
     review_reconciliation_failure_message,
 )
+from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
+from elspeth.web.composer.tools.blobs import _llm_authored_inline_prompt_surface_error
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
 )
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
+    approved_prompt_artifact_hash_from_options,
     composition_review_contract_error,
     reconcile_authoritative_reviews,
     serialize_authoring_review_options,
 )
 
 _NODE_ROUTING_OPTION_PATCH_KEYS: Final[frozenset[str]] = frozenset({"input", "on_success", "on_error", "routes", "fork_to"})
+
+
+class _UpsertNodeTriggerModel(_NodeTriggerModel):
+    """Admit the positive trigger bounds disclosed by incremental authoring.
+
+    Full-state admission retains its separate shape-only trigger contract;
+    TriggerConfig applies these domain bounds during semantic validation.
+    """
+
+    count: _JsonInteger | None = Field(default=None, ge=1)
+    timeout_seconds: StrictFloat | None = Field(default=None, gt=0)
 
 
 class _UpsertNodeArgumentsModel(BaseModel):
@@ -91,14 +114,14 @@ class _UpsertNodeArgumentsModel(BaseModel):
     branches: list[str] | dict[str, str] | None = None
     policy: str | None = None
     merge: str | None = None
-    trigger: dict[str, Any] | None = None
-    output_mode: str | None = None
-    expected_output_count: int | None = None
+    trigger: _UpsertNodeTriggerModel | None = None
+    output_mode: Literal["passthrough", "transform"] | None = None
+    expected_output_count: _JsonInteger | None = None
     timeout_seconds: _StrictTimeoutSeconds | None = None
     description: str | None = None
     scope_name: str | None = None
     scope_opener: str | None = None
-    scope_policy: str | None = None
+    scope_policy: Literal["require_all", "best_effort"] | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -120,8 +143,8 @@ class _RemoveByIdArgumentsModel(BaseModel):
 
 
 class _SetMetadataPatchModel(BaseModel):
-    name: str | None = None
-    description: str | None = None
+    name: _OmittableString = None
+    description: _OmittableString = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -137,6 +160,7 @@ def _handle_list_transforms(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_transforms arguments")
     return _discovery_result(
         state,
         {
@@ -148,6 +172,7 @@ def _handle_list_transforms(
 
 _LIST_TRANSFORMS_DECLARATION = ToolDeclaration(
     name="list_transforms",
+    response_contract=PLUGIN_INVENTORY_RESPONSE_CONTRACT,
     handler=_handle_list_transforms,
     kind=ToolKind.DISCOVERY,
     description=(
@@ -170,6 +195,7 @@ def _handle_list_sinks(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_sinks arguments")
     return _discovery_result(
         state,
         {
@@ -181,6 +207,7 @@ def _handle_list_sinks(
 
 _LIST_SINKS_DECLARATION = ToolDeclaration(
     name="list_sinks",
+    response_contract=PLUGIN_INVENTORY_RESPONSE_CONTRACT,
     handler=_handle_list_sinks,
     kind=ToolKind.DISCOVERY,
     description=(
@@ -205,6 +232,12 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "node_type": {
             "type": "string",
             "enum": ["transform", "gate", "aggregation", "coalesce", "row_union", "queue", "collector"],
+            "description": (
+                "Node kind. Choose transform for a per-row plugin, aggregation for a batch-aware plugin with optional triggers, "
+                "collector for a batch-aware plugin closing a declared EXPAND scope, gate for conditional routing or fan-out, "
+                "queue for explicit fan-in, coalesce to merge branch fields, or row_union to release original branch rows "
+                "without merging. Supply only fields supported by the chosen kind."
+            ),
         },
         "plugin": {
             "type": ["string", "null"],
@@ -214,16 +247,18 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": (
                 "Connection-name string this node CONSUMES: must equal an upstream's on_success "
-                "(or routes value, or on_error), NOT the upstream node's id — connections match "
-                "by string, not by graph topology."
+                "(or routes value or fork_to connection), NOT the upstream node's id — connections match "
+                "by string, not by graph topology. For queue use its shared connection name; for coalesce "
+                "and row_union use the first branch connection as the required placeholder, while branches "
+                "provide the actual consuming bindings."
             ),
         },
         "on_success": {
             "type": ["string", "null"],
             "description": (
                 "Output connection, consumed by a downstream input/sink_name (matched by string). "
-                "Required for transform/aggregation/row_union; null for gates (they route via "
-                "condition/routes). A row_union MUST publish to a processing connection, never "
+                "Required for transform/collector/row_union. Aggregation may omit it to publish under its own node id. "
+                "Gates use routes/fork_to; queues omit it. A row_union MUST publish to a processing connection, never "
                 "directly to a sink. A coalesce normally publishes under its own node id; its "
                 "optional on_success may name only a sink."
             ),
@@ -234,20 +269,24 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "description": (
                 "Node-level error policy (transform/aggregation/gate): 'discard' or a declared sink name. "
                 "For a gate it covers row expression-evaluation errors and is authored here, never as an "
-                "edge; omit it to preserve fail-fast behavior."
+                "edge; omit it to preserve fail-fast behavior. A failed aggregation batch applies this policy to every buffered row; discard records quarantine outcomes."
             ),
         },
         "options": {
             "type": "object",
             "description": (
-                "Plugin-specific config (transform/aggregation only). The schema: block declares what "
-                "ARRIVES at the node, never its transformed result; declare arriving types on the "
-                "SOURCE schema or via an upstream type_coerce (observed CSV fields arrive as str)." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
+                "Plugin-specific config for transform, aggregation, and collector nodes; a queue permits only its optional "
+                "description. Other structural kinds do not take plugin configuration. The schema: block declares what "
+                "ARRIVES for consumed fields and the OUTPUT type for fields the node creates. "
+                "Convert arriving values at the source or with an upstream type_coerce; an output declaration checks values but does not convert them. "
+                "An int satisfies float. Row-column options use the field name carried by upstream rows, normally a normalized header or source field_mapping target."
+                + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
             ),
         },
         "condition": {"type": ["string", "null"], "description": "Boolean expression (gate only). Evaluated per row."},
         "routes": {
             "type": ["object", "null"],
+            "additionalProperties": {"type": "string"},
             "description": (
                 "Gate route mapping {true: ..., false: ...}; each value is a sink, a connection, or "
                 "'discard' for an audited gate_discarded terminal drop. Mutually exclusive with fork_to."
@@ -274,7 +313,7 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         },
         "merge": {
             "type": ["string", "null"],
-            "description": "Field merge strategy (coalesce only). Omitting it means 'union', the runtime default — union's schema rules are enforced either way.",
+            "description": "Field merge strategy (coalesce only). Omitting it means 'union', the runtime default. A shared union field needs one compatible actual type on every branch; any counts as a type.",
         },
         "trigger": {
             "type": ["object", "null"],
@@ -300,11 +339,14 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "output_mode": {
             "type": ["string", "null"],
             "enum": ["passthrough", "transform", None],
-            "description": "Aggregation output mode (aggregation only). Defaults to 'transform' if omitted.",
+            "description": "Aggregation output mode (aggregation only). Defaults to 'transform'. Passthrough keeps the same row tokens and admits only a batch plugin that flushes exactly one row per buffered row; check its catalogue aggregation_output_modes. Otherwise use transform.",
         },
         "expected_output_count": {
             "type": ["integer", "null"],
-            "description": "Expected aggregation output row count; omit when output count depends on group_by distinct values.",
+            "description": (
+                "Expected aggregation output row count for output_mode='transform' (the default); omit for 'passthrough'. "
+                "Also omit when output count depends on group_by distinct values."
+            ),
         },
         "timeout_seconds": {
             "type": ["number", "null"],
@@ -427,6 +469,13 @@ _UPSERT_EDGE_DECLARATION = ToolDeclaration(
             "edge_type": {
                 "type": "string",
                 "enum": ["on_success", "on_error", "route_true", "route_false", "fork"],
+                "description": (
+                    "Connection kind. Use on_success for a direct success relationship; on_error only from a transform or "
+                    "aggregation to a sink; route_true or route_false for gate routes; fork for a gate fan-out relationship. "
+                    "Gate expression errors use the gate node's on_error field instead. Edges targeting sinks also update "
+                    "the producer's corresponding runtime routing field; other edges are display relationships and do not "
+                    "replace node connection fields."
+                ),
             },
             "label": {"type": ["string", "null"], "description": "Display label."},
         },
@@ -512,6 +561,7 @@ _SET_METADATA_DECLARATION = ToolDeclaration(
             "patch": {
                 "type": "object",
                 "description": "Partial metadata update. Only included fields are changed.",
+                "additionalProperties": False,
                 "properties": {
                     "name": {"type": "string"},
                     "description": {"type": "string"},
@@ -561,7 +611,7 @@ def _execute_upsert_queue_node(
         branches=branches,
         policy=validated.policy,
         merge=validated.merge,
-        trigger=validated.trigger,
+        trigger=validated.trigger.model_dump(exclude_unset=True) if validated.trigger is not None else None,
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
         timeout_seconds=validated.timeout_seconds,
@@ -586,7 +636,18 @@ def _execute_upsert_node(
     context: ToolContext,
 ) -> ToolResult:
     """Add or update a pipeline node."""
-    validated = cast(_UpsertNodeArgumentsModel, _validate_mutation_arguments(_UpsertNodeArgumentsModel, args, "upsert_node arguments"))
+    validated = _validate_mutation_arguments(_UpsertNodeArgumentsModel, args, "upsert_node arguments")
+    if validated.node_type == "aggregation" and (validated.output_mode is None or validated.output_mode in OutputMode):
+        mode = OutputMode.TRANSFORM if validated.output_mode is None else OutputMode(validated.output_mode)
+        count_error = mode.expected_output_count_error(validated.expected_output_count)
+        if count_error is not None:
+            return _failure_result(
+                state,
+                count_error,
+                error_code="aggregation_expected_output_count_mode_invalid",
+                rejected_component=f"node:{validated.id}",
+                with_state_validation=False,
+            )
     node_id = validated.id
     node_type = validated.node_type
     plugin = validated.plugin
@@ -660,11 +721,24 @@ def _execute_upsert_node(
 
         batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, validated.output_mode)
         if batch_placement_error is not None:
-            return _failure_result(state, batch_placement_error)
+            return _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced")
 
         batch_required_error = _batch_aware_required_input_fields_error(node_id, plugin, node_options)
         if batch_required_error is not None:
-            return _failure_result(state, batch_required_error)
+            return _failure_result(state, batch_required_error, error_code="batch_required_fields_invalid")
+
+        # Before prevalidation, which withholds a top-level inline_content marker
+        # as a deferred value: an LLM-authored blob in an llm prompt surface or
+        # model refuses with the wire_blob_inline_ref text on every path.
+        prompt_surface_error = _llm_authored_inline_prompt_surface_error(
+            context,
+            tool_name="upsert_node",
+            node_id=node_id,
+            plugin=plugin,
+            options=review_options,
+        )
+        if prompt_surface_error is not None:
+            return _failure_result(state, prompt_surface_error)
 
         prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
         if prevalidation_error is not None:
@@ -699,7 +773,9 @@ def _execute_upsert_node(
         if parity_error is not None:
             return _failure_result(state, f"Node '{node_id}': {parity_error}", error_code="gate_route_labels_mismatch")
     if node_type == "aggregation":
-        trigger_error = _validate_aggregation_trigger(validated.trigger)
+        trigger_error = _validate_aggregation_trigger(
+            validated.trigger.model_dump(exclude_unset=True) if validated.trigger is not None else None
+        )
         if trigger_error is not None:
             return _failure_result(state, f"Node '{node_id}': {trigger_error}")
 
@@ -725,7 +801,7 @@ def _execute_upsert_node(
         branches=branches,
         policy=validated.policy,
         merge=validated.merge,
-        trigger=validated.trigger,
+        trigger=validated.trigger.model_dump(exclude_unset=True) if validated.trigger is not None else None,
         output_mode=validated.output_mode,
         expected_output_count=validated.expected_output_count,
         timeout_seconds=validated.timeout_seconds,
@@ -1075,10 +1151,7 @@ def _execute_splice_transform(
     context: ToolContext,
 ) -> ToolResult:
     """Atomically insert one transform on an existing direct linear path."""
-    validated = cast(
-        SpliceTransformArgumentsModel,
-        _validate_mutation_arguments(SpliceTransformArgumentsModel, args, "splice_transform arguments"),
-    )
+    validated = _validate_mutation_arguments(SpliceTransformArgumentsModel, args, "splice_transform arguments")
     predecessor_id = validated.predecessor_id
     successor_id = validated.successor_id
     node_args = validated.node
@@ -1203,7 +1276,6 @@ def _execute_splice_transform(
         outputs=state.outputs,
         metadata=state.metadata,
         version=state.version,
-        guided_session=state.guided_session,
     )
     canonical_error = _composition_canonical_interpretation_requirement_error(
         proposed,
@@ -1238,10 +1310,10 @@ def _execute_splice_transform(
         return _failure_result(state, review_contract_error)
     profile_validation = context.catalog.validate_composition_state(reconciled)
     if not profile_validation.validation.is_valid:
-        return _failure_result(
+        return _splice_validation_rejection(
             state,
-            "Spliced pipeline failed context-aware validation.",
-            error_code="splice_validation_failed",
+            candidate_errors=profile_validation.validation.errors,
+            prior_errors=context.catalog.validate_composition_state(state).validation.errors,
         )
     new_state = replace(reconciled, version=state.version + 1)
     return _mutation_result(
@@ -1259,6 +1331,63 @@ def _execute_splice_transform(
     )
 
 
+_SPLICE_VALIDATION_FAILED_MESSAGE: Final[str] = "Spliced pipeline failed context-aware validation."
+
+
+def _rejection_subject_ref(component: str) -> str | None:
+    """The ``rejected_component`` ref for a validation component, when it has one.
+
+    The ref grammar covers only ``source`` / ``source:<name>`` /
+    ``node:<id>`` / ``output:<name>``. A pipeline-wide entry has no single
+    subject and stays unattributed.
+    """
+    if component == "source" or component.startswith(("source:", "node:", "output:")):
+        return component
+    return None
+
+
+def _splice_validation_rejection(
+    state: CompositionState,
+    *,
+    candidate_errors: Sequence[ValidationEntry],
+    prior_errors: Sequence[ValidationEntry],
+) -> ToolResult:
+    """Reject a splice whose candidate fails context-aware validation, naming why.
+
+    The leading ``splice_validation_failed`` entry is unchanged. After it come
+    the candidate's errors that the pre-splice state did not already have,
+    each re-filed as a ``rejected_mutation`` entry with its subject in
+    ``rejected_component``. Two consumers keep only ``rejected_mutation``
+    entries from a rejection: the dispatch-time
+    ``normalize_tool_result_validation``, which rebuilds every other entry
+    from the unchanged ``updated_state``, and the planner's
+    ``_rejection_entries``. An ordinary candidate entry would reach neither
+    surface. Before this, only the generic sentence survived, so no surface
+    could see what the splice broke.
+
+    ``plugin_identity`` is cleared: the entry was not produced from a name
+    this handler resolved through the policy view, and absence is the safe
+    value.
+    """
+    prior_keys = {(entry.component, entry.error_code, entry.message) for entry in prior_errors}
+    forwarded = tuple(
+        replace(
+            entry,
+            component="rejected_mutation",
+            plugin_identity=None,
+            rejected_component=_rejection_subject_ref(entry.component),
+        )
+        for entry in candidate_errors
+        if (entry.component, entry.error_code, entry.message) not in prior_keys
+    )
+    rejection = _failure_result(state, _SPLICE_VALIDATION_FAILED_MESSAGE, error_code="splice_validation_failed")
+    leading, *standing = rejection.validation.errors
+    return replace(
+        rejection,
+        validation=replace(rejection.validation, errors=(leading, *forwarded, *standing)),
+    )
+
+
 def _execute_upsert_edge(
     args: dict[str, Any],
     state: CompositionState,
@@ -1271,7 +1400,7 @@ def _execute_upsert_edge(
     working pipeline.  Edges to non-output nodes are visual only.
     """
     del context  # unused; signature uniformity with the other handlers.
-    validated = cast(_UpsertEdgeArgumentsModel, _validate_mutation_arguments(_UpsertEdgeArgumentsModel, args, "upsert_edge arguments"))
+    validated = _validate_mutation_arguments(_UpsertEdgeArgumentsModel, args, "upsert_edge arguments")
     from_node = validated.from_node
     to_node = validated.to_node
     edge_type = validated.edge_type
@@ -1336,7 +1465,34 @@ def _execute_upsert_edge(
     if invariant_error is not None:
         message, error_code = invariant_error
         return _failure_result(state, message, error_code=error_code)
-    return _mutation_result(new_state, (from_node, to_node))
+    reconciled = _reconcile_graph_mutation_reviews(state, new_state)
+    if type(reconciled) is ToolResult:
+        return reconciled
+    return _mutation_result(cast(CompositionState, reconciled), (from_node, to_node))
+
+
+def _reconcile_graph_mutation_reviews(
+    state: CompositionState,
+    proposed: CompositionState,
+) -> CompositionState | ToolResult:
+    """Reconcile resolved reviews after a graph-only mutation.
+
+    ``upsert_edge``, ``remove_node`` and ``remove_edge`` change graph facts
+    that resolved review hashes bind: a gate's routes, and every predecessor
+    on an LLM's upstream path. Skipping reconciliation left such a review
+    ``resolved`` against a drifted anchor. No pending site was enumerated,
+    and Execute raised a bare drift ``ValueError`` instead of reopening the
+    review. The failure mapping is the one ``splice_transform`` and
+    ``upsert_node`` use.
+    """
+    try:
+        return reconcile_authoritative_reviews(state, proposed)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
+            error_code="review_reconciliation_failed",
+        )
 
 
 def _execute_remove_node(
@@ -1346,7 +1502,7 @@ def _execute_remove_node(
 ) -> ToolResult:
     """Remove a node and its edges."""
     del context  # unused; signature uniformity with the other handlers.
-    validated = cast(_RemoveByIdArgumentsModel, _validate_mutation_arguments(_RemoveByIdArgumentsModel, args, "remove_node arguments"))
+    validated = _validate_mutation_arguments(_RemoveByIdArgumentsModel, args, "remove_node arguments")
     node_id = validated.id
 
     # Collect affected nodes before removal (edges that reference this node)
@@ -1360,7 +1516,10 @@ def _execute_remove_node(
     if new_state is None:
         return _failure_result(state, f"Node '{node_id}' not found.")
 
-    return _mutation_result(new_state, tuple(sorted(affected)))
+    reconciled = _reconcile_graph_mutation_reviews(state, new_state)
+    if type(reconciled) is ToolResult:
+        return reconciled
+    return _mutation_result(cast(CompositionState, reconciled), tuple(sorted(affected)))
 
 
 def _execute_remove_edge(
@@ -1370,7 +1529,7 @@ def _execute_remove_edge(
 ) -> ToolResult:
     """Remove an edge."""
     del context  # unused; signature uniformity with the other handlers.
-    validated = cast(_RemoveByIdArgumentsModel, _validate_mutation_arguments(_RemoveByIdArgumentsModel, args, "remove_edge arguments"))
+    validated = _validate_mutation_arguments(_RemoveByIdArgumentsModel, args, "remove_edge arguments")
     edge_id = validated.id
 
     # Find the edge to get affected nodes
@@ -1385,7 +1544,10 @@ def _execute_remove_edge(
     if not _sink_route_still_expressed(new_state, edge):
         new_state = _clear_removed_sink_edge_route(new_state, edge)
 
-    return _mutation_result(new_state, affected)
+    reconciled = _reconcile_graph_mutation_reviews(state, new_state)
+    if type(reconciled) is ToolResult:
+        return reconciled
+    return _mutation_result(cast(CompositionState, reconciled), affected)
 
 
 def _execute_set_metadata(
@@ -1395,7 +1557,7 @@ def _execute_set_metadata(
 ) -> ToolResult:
     """Update pipeline metadata."""
     del context  # unused; signature uniformity with the other handlers.
-    validated = cast(_SetMetadataArgumentsModel, _validate_mutation_arguments(_SetMetadataArgumentsModel, args, "set_metadata arguments"))
+    validated = _validate_mutation_arguments(_SetMetadataArgumentsModel, args, "set_metadata arguments")
     patch = validated.patch.model_dump(exclude_none=True)
 
     new_state = state.with_metadata(patch)
@@ -1470,6 +1632,7 @@ def _execute_patch_node_options(
             argument="patch_node_options arguments",
             expected="object conforming to PatchNodeOptionsArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
     node_id = validated.node_id
     patch: Mapping[str, Any] = validated.patch
@@ -1495,6 +1658,19 @@ def _execute_patch_node_options(
     if runtime_owned_error is not None:
         error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in patch else None
         return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code)
+    if (
+        current.plugin == "llm"
+        and current.options.get(PROMPT_TEMPLATE_PARTS_KEY) is not None
+        and "prompt_template" in patch
+        and patch["prompt_template"] != current.options.get("prompt_template")
+        and PROMPT_TEMPLATE_PARTS_KEY not in patch
+    ):
+        return _failure_result(
+            state,
+            f"Node '{node_id}': edit prompt_template_parts to change this structured prompt, "
+            "preserving its interpretation_ref entries; prompt_template is compiled from those parts.",
+            error_code="prompt_template_parts_required",
+        )
     patch = _canonicalize_authored_interpretation_requirements(
         patch,
         component_id=node_id,
@@ -1534,8 +1710,60 @@ def _execute_patch_node_options(
         plugin_error = _validate_plugin_name(context, "transform", current.plugin)
         if plugin_error is not None:
             return _plugin_policy_failure(state, plugin_error)
+        # The batch-aware guards upsert_node, splice_transform and set_pipeline
+        # run, in the same order. Without them a required_input_fields patch
+        # on a batch-aware node reached plugin construction, whose fail-closed
+        # FrameworkBugError escaped the tool and ended the turn as a 500.
+        batch_placement_error = _batch_aware_placement_error(node_id, current.node_type, current.plugin, current.output_mode)
+        if batch_placement_error is not None:
+            return _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced")
+        batch_required_error = _batch_aware_required_input_fields_error(node_id, current.plugin, new_options)
+        if batch_required_error is not None:
+            return _failure_result(state, batch_required_error, error_code="batch_required_fields_invalid")
 
-        prevalidation_error = _prevalidate_transform_for_context(context, current.plugin, new_options)
+        # Same refusal upsert_node and splice_transform apply, on the merged options.
+        prompt_surface_error = _llm_authored_inline_prompt_surface_error(
+            context,
+            tool_name="patch_node_options",
+            node_id=node_id,
+            plugin=current.plugin,
+            options=new_options,
+        )
+        if prompt_surface_error is not None:
+            return _failure_result(state, prompt_surface_error)
+
+    new_node = replace(current, options=new_options)
+    # Third canonical mutation boundary: a patch that would break a queue's
+    # intrinsic contract is rejected before creating the candidate state.
+    queue_contract_error = queue_node_contract_error(new_node)
+    if queue_contract_error is not None:
+        return _failure_result(state, queue_contract_error)
+    proposed_state = state.with_node(new_node)
+    invariant_error = _post_mutation_invariant_error(proposed_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
+    try:
+        # Reconciliation invalidates inherited approval and renders structured
+        # prompts. Verify the stored evidence first so an unrelated patch cannot
+        # heal a corrupt digest, then validate the exact reconciled candidate.
+        if (
+            current.plugin == "llm"
+            and "approved_prompt_artifact_hash" in current.options
+            and current.options["approved_prompt_artifact_hash"] != approved_prompt_artifact_hash_from_options(current.options)
+        ):
+            raise ValueError("Stored approved_prompt_artifact_hash does not match the current prompt artifact")
+        new_state = reconcile_authoritative_reviews(state, proposed_state)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
+            error_code="review_reconciliation_failed",
+        )
+    reconciled_node = next(node for node in new_state.nodes if node.id == node_id)
+    reconciled_options = reconciled_node.options
+    if current.node_type in ("transform", "aggregation", "collector") and current.plugin is not None:
+        prevalidation_error = _prevalidate_transform_for_context(context, current.plugin, reconciled_options)
         if prevalidation_error is not None:
             return _failure_result(
                 state,
@@ -1549,39 +1777,17 @@ def _execute_patch_node_options(
         # the prevalidation above already validated the LOWERED executable. The
         # raw provider-config policy would false-positive on the absent private
         # retry budget (see set_pipeline in sessions.py for the full rationale).
-        if "profile" not in new_options:
-            provider_policy_error = _validate_transform_provider_config_policy(new_options, plugin=current.plugin)
+        if "profile" not in reconciled_options:
+            provider_policy_error = _validate_transform_provider_config_policy(reconciled_options, plugin=current.plugin)
             if provider_policy_error is not None:
                 return _failure_result(state, f"Node '{node_id}': {provider_policy_error}")
 
         # S2: confine nested provider_config persist_directory (RAG retrieval).
         # A merge-patch can introduce an escaping path just as upsert_node can.
-        provider_path_error = _validate_transform_provider_config_path(new_options, context.data_dir, session_id=context.session_id)
+        provider_path_error = _validate_transform_provider_config_path(reconciled_options, context.data_dir, session_id=context.session_id)
         if provider_path_error is not None:
             return _failure_result(state, f"Node '{node_id}': {provider_path_error}")
 
-    new_node = replace(current, options=new_options)
-    # Third canonical mutation boundary: a patch that would break a queue's
-    # intrinsic contract (unknown option, non-string description) is rejected
-    # by the single shared guard before with_node, leaving state atomically
-    # unchanged. Returns None for every non-queue node, so this is a no-op for
-    # transform/gate/aggregation/coalesce patches.
-    queue_contract_error = queue_node_contract_error(new_node)
-    if queue_contract_error is not None:
-        return _failure_result(state, queue_contract_error)
-    proposed_state = state.with_node(new_node)
-    invariant_error = _post_mutation_invariant_error(proposed_state)
-    if invariant_error is not None:
-        message, error_code = invariant_error
-        return _failure_result(state, message, error_code=error_code)
-    try:
-        new_state = reconcile_authoritative_reviews(state, proposed_state)
-    except (KeyError, TypeError, ValueError) as exc:
-        return _failure_result(
-            state,
-            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
-            error_code="review_reconciliation_failed",
-        )
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
         return _failure_result(state, review_contract_error)
@@ -1632,6 +1838,8 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
     description="Apply a shallow merge-patch to a node's options. Use this for option-only edits. "
     "Keys in the patch overwrite existing keys. "
     "Keys set to null are deleted. Missing keys are unchanged. "
+    "For an existing structured LLM prompt, edit prompt_template_parts and preserve interpretation_ref entries; "
+    "prompt_template is compiled from those parts. Changed prompt context requires fresh review. "
     "Do not use this for node routing fields such as on_success/on_error/input/routes; "
     "use upsert_edge or upsert_node for routing edits. Gate on_error is node-level and must use upsert_node.",
     json_schema={
@@ -1648,9 +1856,11 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
                     "Node-level routing fields such as on_success, on_error, input, routes, "
                     "and fork_to are siblings of options; edit them with upsert_edge or upsert_node. "
                     "For a gate, edit on_error only with upsert_node. "
-                    "A patched schema: block declares what ARRIVES at the node, never its transformed "
-                    "result; to change what arrives, declare the type on the SOURCE schema "
-                    "(patch_source_options) or insert a type_coerce upstream." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
+                    "If prompt_template_parts exists, edit that structure while preserving interpretation_ref entries; "
+                    "do not change only the compiled prompt_template. "
+                    "A patched schema declares arriving types for consumed fields and output types for created fields. "
+                    "To convert an arriving value, change the source contract (patch_source_options) or insert a type_coerce upstream; a declaration does not convert."
+                    + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
         },
@@ -1732,10 +1942,21 @@ def _prepare_transform_candidate(
         return _plugin_policy_failure(state, plugin_error)
     batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, output_mode)
     if batch_placement_error is not None:
-        return _failure_result(state, batch_placement_error)
+        return _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced")
     batch_required_error = _batch_aware_required_input_fields_error(node_id, plugin, review_options)
     if batch_required_error is not None:
-        return _failure_result(state, batch_required_error)
+        return _failure_result(state, batch_required_error, error_code="batch_required_fields_invalid")
+
+    # Same refusal upsert_node and patch_node_options apply (both splice arms).
+    prompt_surface_error = _llm_authored_inline_prompt_surface_error(
+        context,
+        tool_name=tool_name,
+        node_id=node_id,
+        plugin=plugin,
+        options=review_options,
+    )
+    if prompt_surface_error is not None:
+        return _failure_result(state, prompt_surface_error)
 
     prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
     if prevalidation_error is not None:
@@ -1802,12 +2023,25 @@ def _handle_splice_transform(
     )
 
 
+def _splice_inserted_node_id_schema() -> dict[str, object]:
+    """The inserted transform's id: RuntimeNodeName's schema plus the reserved labels it refuses.
+
+    The same disclosure the canonical set_pipeline ``nodes[].id`` carries.
+    """
+    schema: dict[str, object] = dict(TypeAdapter(RuntimeNodeName).json_schema())
+    _disclose_node_name_constraints(schema)
+    schema["description"] = "Unique ID for the inserted transform."
+    return schema
+
+
 _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
     name="splice_transform",
     handler=_handle_splice_transform,
     kind=ToolKind.MUTATION,
     description=(
         "Insert one transform between a predecessor and successor on an existing direct linear on_success path. "
+        "Requires exactly one direct visual on_success edge between the endpoints, no routed error branches on either "
+        "endpoint, and no other consumers or visual branches on that path. "
         "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs. "
         "Returns `inserted_node_id`, `predecessor_id`, `successor_id`, `derived_connection` (the on_success carried "
         "over), `replaced_edge_id`, and `new_edge_id`; repeating an identical splice returns `already_applied`: true "
@@ -1826,11 +2060,13 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
             },
             "node": {
                 "type": "object",
+                "description": (
+                    "The single transform to insert: provide id, plugin, and options; optionally on_error and description. "
+                    "Do not supply node_type, input, or on_success: the tool authors the transform kind and derives routing "
+                    "from the insertion point."
+                ),
                 "properties": {
-                    "id": {
-                        **TypeAdapter(RuntimeNodeName).json_schema(),
-                        "description": "Unique ID for the inserted transform.",
-                    },
+                    "id": _splice_inserted_node_id_schema(),
                     "plugin": {"type": "string", "description": "Transform plugin name."},
                     "options": {
                         "type": "object",

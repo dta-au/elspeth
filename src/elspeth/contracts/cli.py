@@ -14,11 +14,12 @@ class ProgressEvent:
     pipelines. The CLI subscribes to these events and renders progress output.
 
     elspeth-5069612f3c — ``rows_routed`` is split into MOVE (intentional gate
-    ``route_to_sink``) and DIVERT (transform ``on_error`` reroute) buckets so
+    ``route_to_sink``) and DIVERT (``on_error`` reroute) buckets so
     the in-flight progress signal mirrors the terminal-state taxonomy. All
-    counters are REQUIRED at construction time: per CLAUDE.md fabrication
-    test, defaulting an absent value to ``0`` would make "we don't know"
-    indistinguishable from "definitely zero" on the wire. The engine
+    counters are REQUIRED at construction time: an absent value stays absent
+    rather than being coerced to ``0``, because a fabricated zero is
+    indistinguishable from a measured zero — defaulting here would put
+    "we don't know" on the wire as "definitely zero". The engine
     emitters at ``orchestrator/core.py`` already populate every field on
     every emission; making them required crashes any future drift loudly
     at the producer site rather than silently substituting ``0`` downstream.
@@ -29,7 +30,7 @@ class ProgressEvent:
         rows_failed: Rows that failed processing.
         rows_quarantined: Rows that were quarantined for investigation.
         rows_routed_success: Rows redirected by gate ``route_to_sink`` MOVE.
-        rows_routed_failure: Rows redirected by transform/config-gate ``on_error`` DIVERT.
+        rows_routed_failure: Rows redirected by transform/config-gate/aggregation ``on_error`` DIVERT.
         elapsed_seconds: Time elapsed since run started.
     """
 

@@ -281,11 +281,11 @@ For `enforce_tier_model` (always the dominant gate), categorize:
   `composer-cache-markers` — LLM tool-call protocol boundary (Tier 3)
 - Owners `web-secrets`, `web-blobs`, `web-catalog`, `web-middleware`,
   `web-validation` — Tier 3 data ingestion
-- L1 entries with a tracked refactor follow-up in filigree
+- L1 entries with a tracked refactor follow-up
 
 **Always suspect (queue for SME review):**
 - Owner is empty / `-` / `(none)` — missing attribution
-- Owner contains a filigree ticket ID (e.g. `P2-2026-02-02-76r`) — temporary
+- Owner contains an issue reference — temporary
   exemption that may have outlived its ticket
 - Owner is `bugfix` — generic spot-fix label, often masks deferred refactor
 - Owner is `feature` — review whether the pattern is repeated across many
@@ -346,23 +346,20 @@ From the agent reports, produce:
 
 1. **Audit summary doc** at `docs/audit/YYYY-MM-DD-cicd-allowlist-audit.md`
    with the inventory, growth rate, and per-category verdict.
-2. **Filigree subtickets** under parent `elspeth-0e60f3effc` ("CI allowlist
-   revalidation") — one per confirmed-fixable category, citing the specific
-   allowlist keys and the SME verdict.
+2. **Local issue drafts** — one per confirmed-fixable category, citing the
+   specific allowlist keys and the SME verdict. The operator triages and uploads
+   selected findings to GitHub Issues separately.
    - This audit produces tickets about *exemption-corpus debt* (entries the
      enforcer correctly flagged but were exempted on weak grounds), not about
      *enforcer-script bugs* (false negatives, missing checks).
-   - The parent's 41 pre-2026-06-30 children about enforcer-script bugs live
-     only in the archived store (`.weft/filigree/filigree.db`, under
-     `elspeth-297b8f5c5d`) and were not recovered. Check there before filing
-     what may be a duplicate, and verify any archived finding against HEAD —
-     some are already fixed in the tree.
-3. **Process tickets** for structural findings:
+   - Compare prior audit reports before drafting duplicates, and verify old
+     findings against HEAD; some may already be fixed.
+3. **Local process issue drafts** for structural findings:
    - If growth rate > 25% in the audit window: ticket for a ratchet
      (per-PR allowlist-delta budget, or required burn-down lane).
    - If a rule has > 30% of all suppressions: ticket for rule split / re-tier.
    - If near-expiry entries exist: ticket for triage before expiry.
-4. **Update the parent epic baseline** with the new total + date.
+4. **Record the baseline in the audit report** with the new total + date.
 
 ## Output contract
 
@@ -370,13 +367,13 @@ The audit produces exactly these artifacts:
 
 - `docs/audit/YYYY-MM-DD-cicd-allowlist-audit.md` (the summary)
 - `docs/audit/findings/<agent-role>.md` per dispatched SME agent
-- Filigree subtickets under `elspeth-0e60f3effc` (only for *new* fixable findings)
-- Updated baseline note on the parent epic
+- Local issue drafts in the report (only for *new* fixable findings)
+- Updated baseline note in the audit report
 
 ## What this skill does NOT do
 
-- Doesn't fix anything — only audits. Each fixable subticket goes back through
-  normal claim/work/close flow with proper review.
+- Doesn't fix anything or publish issues — only audits. The operator triages
+  local drafts before separately uploading selected findings to GitHub Issues.
 - Doesn't modify enforcer scripts. Rule-split or rule-fix proposals become
   subtickets, not edits.
 - Doesn't trust author reasons. Every suspect-category entry requires
@@ -412,7 +409,5 @@ The audit produces exactly these artifacts:
   CLI in `elspeth-lints/src/elspeth_lints/core/cli.py`; CI in
   `.github/workflows/enforce-allowlist-judge-gates.yaml`; design notes in
   `notes/cicd-judge-cli-prototype-plan.md`.
-- Parent filigree epic `elspeth-0e60f3effc` — for the standing
-  "CI allowlist revalidation" track.
 - Prior audit: `docs/audit/2026-05-19-cicd-allowlist-audit.md` (the first
   application of this skill).

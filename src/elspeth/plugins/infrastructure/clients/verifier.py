@@ -395,9 +395,9 @@ class CallVerifier:
         if call_data.state != CallDataState.AVAILABLE:
             # Payload was expected but is missing (purged or store not configured)
             if call_data.state in (CallDataState.PURGED, CallDataState.STORE_NOT_CONFIGURED, CallDataState.HASH_ONLY):
-                # When response_hash exists, perform hash-based
-                # verification even though the full payload is missing. Per CLAUDE.md:
-                # "Hashes survive payload deletion — integrity is always verifiable."
+                # When response_hash exists, perform hash-based verification even
+                # though the full payload is missing — "Hashes survive payload
+                # deletion" (docs/release/guarantees.md §1.4 Payload Retention).
                 if call.response_hash is not None:
                     # Hash comparison is only valid when comparison settings are
                     # equivalent to exact match (no ignore_paths, no ignore_order).

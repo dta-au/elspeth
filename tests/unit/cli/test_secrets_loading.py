@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +13,13 @@ from typer.testing import CliRunner
 from elspeth.core.security.secret_loader import SecretRef
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _restore_secret_environment() -> Iterator[None]:
+    """Restore environment writes made by the real CLI secret loader."""
+    with patch.dict("os.environ"):
+        yield
 
 
 class _GetSecretRecorder:

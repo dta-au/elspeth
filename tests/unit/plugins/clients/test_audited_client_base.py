@@ -6,7 +6,10 @@ import threading
 
 import pytest
 
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase
+from tests.fixtures.mock_audit import mock_audit_authority
 
 
 class ConcreteAuditedClient(AuditedClientBase):
@@ -21,7 +24,7 @@ class _ExecutionCounterFake:
     def __init__(self) -> None:
         self._counter = itertools.count()
 
-    def allocate_call_index(self, _state_id: str) -> int:
+    def allocate_call_index(self, _state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         return next(self._counter)
 
 
@@ -38,6 +41,7 @@ class TestCallIndexThreadSafety:
         """Multiple threads should get unique call indices."""
         execution = _ExecutionCounterFake()
         client = ConcreteAuditedClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="test-state",
             run_id="test-run",
@@ -74,6 +78,7 @@ class TestCallIndexThreadSafety:
         """Repeated test to increase chance of catching race conditions."""
         execution = _ExecutionCounterFake()
         client = ConcreteAuditedClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id=f"test-state-{iteration}",
             run_id=f"test-run-{iteration}",

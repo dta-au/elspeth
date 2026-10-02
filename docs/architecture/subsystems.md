@@ -6,10 +6,13 @@ no longer the maintained subsystem map.
 
 Use the root [ARCHITECTURE.md](../../ARCHITECTURE.md) instead:
 
-- [Level 2 container diagram](../../ARCHITECTURE.md#level-2-container-diagram)
-  for the current subsystem map.
-- [Level 3 component diagrams](../../ARCHITECTURE.md#level-3-component-diagrams)
-  for engine, plugin, landscape, and web component detail.
+- [Code boundaries](../../ARCHITECTURE.md#code-boundaries) for the current
+  subsystem map.
+- [Web component view](../../ARCHITECTURE.md#web-component-view) for browser,
+  API, Composer, sessions, coordination, and execution.
+- [Pipeline path](../../ARCHITECTURE.md#pipeline-path) and
+  [persistence](../../ARCHITECTURE.md#persistence-and-evidence) for the shared
+  engine and Landscape boundaries.
 - [ADR index](adr/README.md) for decisions that changed subsystem boundaries.
 
 Operational procedures remain in the [runbook index](../runbooks/index.md).

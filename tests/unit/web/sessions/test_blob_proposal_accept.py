@@ -13,7 +13,6 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretBytes
 from sqlalchemy import select, update
-from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
@@ -41,8 +40,10 @@ from elspeth.web.sessions.routes.composer import proposals as proposals_routes
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 class _ExecutionServiceFake:
@@ -59,14 +60,12 @@ class _ExecutionServiceFake:
 
 
 def _make_app(tmp_path: Path, user_id: str = "alice") -> tuple[FastAPI, SessionServiceImpl]:
-    engine = create_session_engine(
-        "sqlite:///:memory:",
-        poolclass=StaticPool,
-        connect_args={"check_same_thread": False},
-    )
+    engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=user_id)
     telemetry = build_sessions_telemetry()
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=telemetry,
         log=structlog.get_logger("test"),
@@ -90,6 +89,7 @@ def _make_app(tmp_path: Path, user_id: str = "alice") -> tuple[FastAPI, SessionS
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=SecretBytes(b"\x00" * 32),
     )
+    wire_test_pipeline_user_authority(app, identity_id=user_id, engine=engine)
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     app.state.catalog_service = catalog
@@ -248,7 +248,7 @@ def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp
             composer_model_identifier="openai/gpt-5-mini",
             composer_model_version="gpt-5-mini-2026-05-01",
             composer_provider="openai",
-            composer_skill_hash="sha256:composer-skill",
+            composer_skill_hash=fake_sha256("composer-skill"),
             tool_arguments_hash=stable_hash(arguments),
         )
     )
@@ -318,7 +318,7 @@ def test_accept_update_blob_proposal_remains_blocked_by_second_pending_reference
             composer_model_identifier="openai/gpt-5-mini",
             composer_model_version="gpt-5-mini-2026-05-01",
             composer_provider="openai",
-            composer_skill_hash="sha256:composer-skill",
+            composer_skill_hash=fake_sha256("composer-skill"),
             tool_arguments_hash=stable_hash(arguments),
         )
 
@@ -382,7 +382,7 @@ def test_accept_delete_blob_proposal_commits_without_composition_state_delta(tmp
             composer_model_identifier="openai/gpt-5-mini",
             composer_model_version="gpt-5-mini-2026-05-01",
             composer_provider="openai",
-            composer_skill_hash="sha256:composer-skill",
+            composer_skill_hash=fake_sha256("composer-skill"),
         )
     )
 
@@ -471,7 +471,7 @@ def test_retry_after_blob_effect_before_proposal_settlement_does_not_reexecute(
             composer_model_identifier="openai/gpt-5-mini",
             composer_model_version="gpt-5-mini-2026-05-01",
             composer_provider="openai",
-            composer_skill_hash="sha256:composer-skill",
+            composer_skill_hash=fake_sha256("composer-skill"),
             tool_arguments_hash=stable_hash(arguments),
         )
     )
@@ -626,7 +626,7 @@ async def test_accept_update_blob_proposal_serializes_against_reject(
         composer_model_identifier="openai/gpt-5-mini",
         composer_model_version="gpt-5-mini-2026-05-01",
         composer_provider="openai",
-        composer_skill_hash="sha256:composer-skill",
+        composer_skill_hash=fake_sha256("composer-skill"),
         tool_arguments_hash=stable_hash(arguments),
     )
     entered_tool = threading.Event()
@@ -731,7 +731,7 @@ async def test_cancelled_accept_update_blob_proposal_still_terminalizes_before_r
         composer_model_identifier="openai/gpt-5-mini",
         composer_model_version="gpt-5-mini-2026-05-01",
         composer_provider="openai",
-        composer_skill_hash="sha256:composer-skill",
+        composer_skill_hash=fake_sha256("composer-skill"),
         tool_arguments_hash=stable_hash(arguments),
     )
     entered_tool = threading.Event()

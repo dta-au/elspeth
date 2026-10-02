@@ -10,10 +10,20 @@ Two surfaces consume :class:`ComposerToolInvocation`:
 
 1. The standalone composer MCP server appends one JSONL line per invocation
    to a per-session events sidecar.
-2. The web composer service buffers invocations during the compose loop;
-   the route handler persists each as a ``role=tool`` chat message with
-   the audit sidecar carried inside the existing ``tool_calls`` JSON
-   column under a ``_kind`` discriminator.
+2. The web composer service buffers complete invocation records. Its compose
+   loop persists redacted assistant/tool responses, state revisions, and
+   rejection evidence during phase P4. Those tool rows do not contain the
+   invocation envelope; successful P4 clears the corresponding exception
+   replay trail. Other route drains persist redacted invocation envelopes in
+   chat-message ``tool_calls`` under the ``_kind=audit`` discriminator, using
+   ``role=audit`` or linked ``role=tool`` rows as appropriate.
+
+Buffered invocation fields and durable response fields are distinct contracts.
+P4 response content can retain a successful dispatch's Composer version and
+redacted failure classification, while state bindings identify persisted
+revisions. It does not separately persist every invocation field, such as
+``version_before`` or dispatch timing. Session revision numbers and Composer
+dispatch versions are separate version domains.
 
 Layer: L0 (contracts). Imports nothing above. Canonical-JSON serialization
 and SHA-256 hashing happen at L3 construction sites (recorders/dispatchers),
@@ -52,15 +62,70 @@ class ComposerToolStatus(StrEnum):
     CANCELLED  — dispatch was intentionally cancelled by its coordinator.
                  This is a lifecycle outcome, not a plugin defect.
     PLUGIN_CRASH — any exception class other than ``ToolArgumentError``
-                 escaped the handler. Per CLAUDE.md "Plugin Ownership"
-                 this is a Tier-1/2 plugin bug; the audit record fixes
-                 the time and arguments at which the bug fired.
+                 escaped the handler. Plugins are system code, so this is
+                 a Tier-1/2 plugin bug (see
+                 docs/guides/data-trust-and-error-handling.md §Plugin Ownership);
+                 the audit record fixes the time and arguments at which
+                 the bug fired.
     """
 
     SUCCESS = "success"
     ARG_ERROR = "arg_error"
     CANCELLED = "cancelled"
     PLUGIN_CRASH = "plugin_crash"
+
+
+class ToolArgumentErrorCategory(StrEnum):
+    """Closed, value-free reason an ``ARG_ERROR`` dispatch was rejected.
+
+    ``error_class`` names the exception class actually raised; this names
+    the stage and kind of the rejection, so shape errors (which a provider
+    grammar could have prevented) are distinguishable from value errors
+    (which no grammar prevents).
+
+    Wire stage — the provider's argument text never reached the semantic
+    contract:
+
+    WIRE_JSON_INVALID  — ``bounded_json_loads`` rejected the text as JSON.
+    WIRE_JSON_BOUNDS   — the JSON exceeded the bounded-decoder limits.
+    WIRE_NOT_OBJECT    — valid JSON, but not a JSON object.
+    WIRE_ENVELOPE      — the web ``set_pipeline`` ``{"pipeline": {...}}``
+                         envelope was malformed.
+
+    Semantic stage — the arguments were checked against the tool contract:
+
+    CANONICALIZATION      — the arguments are not canonical JSON.
+    MISSING_REQUIRED_PATH — a schema-required (nested) path is absent.
+    SCHEMA_SHAPE          — the flat Draft 2020-12 schema failed on a
+                            keyword a provider grammar can express.
+    SCHEMA_BOUND          — the schema failed on a keyword no provider
+                            grammar expresses (length, ``not``, ...).
+    MODEL_VALIDATION      — the pydantic arguments model rejected them.
+
+    Value stage — the arguments were well-formed but not acceptable:
+
+    PROMPT_BUDGET                      — advisor prompt-size cap.
+    DISCOVERY_ONLY                     — a mutation tool on a read-only path.
+    DUPLICATE_RESOLVED_INTERPRETATION  — interpretation already resolved.
+    RATE_CAP_PER_SESSION_DAY / RATE_CAP_PER_TERM — interpretation caps.
+    SEMANTIC_RULE                      — any other handler rule.
+    """
+
+    WIRE_JSON_INVALID = "wire_json_invalid"
+    WIRE_JSON_BOUNDS = "wire_json_bounds"
+    WIRE_NOT_OBJECT = "wire_not_object"
+    WIRE_ENVELOPE = "wire_envelope"
+    CANONICALIZATION = "canonicalization"
+    MISSING_REQUIRED_PATH = "missing_required_path"
+    SCHEMA_SHAPE = "schema_shape"
+    SCHEMA_BOUND = "schema_bound"
+    MODEL_VALIDATION = "model_validation"
+    PROMPT_BUDGET = "prompt_budget"
+    DISCOVERY_ONLY = "discovery_only"
+    DUPLICATE_RESOLVED_INTERPRETATION = "duplicate_resolved_interpretation"
+    RATE_CAP_PER_SESSION_DAY = "rate_cap_per_session_day"
+    RATE_CAP_PER_TERM = "rate_cap_per_term"
+    SEMANTIC_RULE = "semantic_rule"
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +158,8 @@ class ComposerToolInvocation:
 
     ``error_class`` / ``error_message``
         Populated on ``ARG_ERROR``, ``CANCELLED``, and ``PLUGIN_CRASH``.
+        ``error_class`` is the name of the exception class actually raised
+        (or constructed) at the recording site, never a hand-written label.
         ``error_message``
         is already-redacted at the dispatch boundary — for
         ``ToolArgumentError`` this is ``exc.args[0]``, which the structured
@@ -126,13 +193,35 @@ class ComposerToolInvocation:
         Stable string identifying who drove the dispatch.
         ``"composer-mcp:cli"`` or ``"composer-web:user-{user_id}"``.
 
-    Immutability
-    ------------
-    Every field is a scalar, ``StrEnum``, ``datetime``, or ``str|None``;
-    per the CLAUDE.md "Frozen Dataclass Immutability" → "Scalar-Only
-    Fields Need No Guard" rule, ``frozen=True`` alone is sufficient.
-    No ``__post_init__`` freeze guard is needed and none is defined —
-    "Don't add guards that do nothing."
+    ``error_category``
+        The closed :class:`ToolArgumentErrorCategory` of an ``ARG_ERROR``.
+        Required on ``ARG_ERROR`` and ``None`` on every other status.
+
+    ``strict_sent``
+        The ``strict`` key sent for this tool on the call that produced it:
+        ``True``, ``False`` (an explicit ``strict: false`` was sent), or
+        ``None`` (no key was sent: the ``none`` tool-contract dialect, a tool
+        name that was not in the sent list, or a surface that sends no wire
+        schema, such as standalone MCP).
+
+    ``wire_conformant``
+        Whether the provider-authored arguments validated against the wire
+        schema they were sent under. Classification only: the flat registry
+        schema remains the admission contract. ``None`` exactly where no
+        arguments were decoded. There is no implication between the two
+        facts: a decoded call on the ``none`` dialect has
+        ``strict_sent=None`` and a boolean ``wire_conformant``.
+
+    Immutability and the cross-field check
+    --------------------------------------
+    Every field is a scalar, ``StrEnum``, ``datetime``, or ``str|None``, so
+    ``frozen=True`` alone is sufficient. Deep-freezing exists because
+    ``frozen=True`` leaves container contents mutable through the attribute
+    reference; a scalar-only record has no container to reach through, so
+    no freeze guard is defined. ``__post_init__`` exists for the
+    status/category cross-field check (an argument rejection must say which
+    closed category rejected it, and no other status may carry one) and for
+    the exact-``bool``-or-``None`` type check on the two wire facts.
     """
 
     tool_call_id: str
@@ -153,6 +242,21 @@ class ComposerToolInvocation:
     cache_hit: bool = False
     authority_arguments_canonical: str | None = None
     authority_arguments_hash: str | None = None
+    error_category: ToolArgumentErrorCategory | None = None
+    strict_sent: bool | None = None
+    wire_conformant: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.error_category is not None and type(self.error_category) is not ToolArgumentErrorCategory:
+            raise TypeError("ComposerToolInvocation.error_category must be a ToolArgumentErrorCategory")
+        if self.strict_sent is not None and type(self.strict_sent) is not bool:
+            raise TypeError(f"ComposerToolInvocation.strict_sent must be bool or None, got {type(self.strict_sent).__name__}")
+        if self.wire_conformant is not None and type(self.wire_conformant) is not bool:
+            raise TypeError(f"ComposerToolInvocation.wire_conformant must be bool or None, got {type(self.wire_conformant).__name__}")
+        if self.status is ComposerToolStatus.ARG_ERROR and self.error_category is None:
+            raise ValueError("ComposerToolInvocation with status ARG_ERROR requires an error_category")
+        if self.status is not ComposerToolStatus.ARG_ERROR and self.error_category is not None:
+            raise ValueError(f"ComposerToolInvocation with status {self.status.value} must not carry an error_category")
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-friendly dict for sidecar serialization.
@@ -160,12 +264,15 @@ class ComposerToolInvocation:
         ``started_at``/``finished_at`` are emitted as ISO-8601 strings so
         the dict is directly ``json.dumps``-able. ``status`` becomes its
         string value. The output shape is the canonical sidecar payload
-        used by both standalone-MCP JSONL lines and web-composer
-        ``role=tool`` chat-message ``tool_calls`` entries (under the
-        ``_kind=audit`` discriminator).
+        used by standalone-MCP JSONL lines and as input to web-composer
+        invocation-envelope projections. Web storage applies its redaction
+        policy before persisting those envelopes under ``_kind=audit``.
+        Compose-loop P4 response rows use a separate projection and do not
+        serialize this complete record.
         """
         raw = asdict(self)
         raw["status"] = self.status.value
+        raw["error_category"] = self.error_category.value if self.error_category is not None else None
         raw["started_at"] = self.started_at.isoformat()
         raw["finished_at"] = self.finished_at.isoformat()
         if self.authority_arguments_canonical is None and self.authority_arguments_hash is None:
@@ -183,15 +290,19 @@ class ComposerToolRecorder(Protocol):
       events sidecar (``{scratch}/{session_id}.events.jsonl``). When the
       session_id is unresolved (the very first ``new_session`` call), the
       recorder buffers in memory and flushes on first resolution.
-    - Web composer: in-memory buffer surfaced on
-      :class:`ComposerResult` (and on partial-state errors) so the
-      route handler can persist as ``role=tool`` chat messages inside
-      the same DB transaction as the assistant message.
+    - Web composer: in-memory buffer consumed by compose-loop processing,
+      route drains. P4 commits redacted
+      response/state/rejection evidence inside the loop; already persisted
+      tool turns do not replay their invocations through exception carriers.
+      Route drains persist redacted invocation
+      envelopes through their own transactional storage paths.
 
     Recorder calls happen synchronously from the dispatch site. Every
     code path through the dispatcher MUST call ``record(...)`` before
-    returning — audit primacy is contractual (CLAUDE.md: "if it's not
-    recorded, it didn't happen"). The standalone MCP and web-composer
+    returning — audit primacy is contractual: audit fires first,
+    synchronously, and an unrecorded dispatch did not happen (see the
+    ``logging-telemetry-policy`` skill §The Primacy Test).
+    The standalone MCP and web-composer
     dispatch sites both implement the same try/finally shape used by
     ``AuditedLLMClient.chat_completion`` to make "audit fires before
     return" structurally enforceable.

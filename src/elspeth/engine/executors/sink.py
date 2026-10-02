@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
-from typing import TYPE_CHECKING
+from types import MappingProxyType
+from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
 
@@ -31,20 +31,26 @@ from elspeth.contracts.declaration_contracts import (
     DeclarationContractViolation,
 )
 from elspeth.contracts.diversion import RowDiversion
-from elspeth.contracts.enums import NodeStateStatus, RoutingMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import NodeStateStatus, RoutingMode, RunMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     FrameworkBugError,
+    HeaderSpelledDeclarationViolation,
     OrchestrationInvariantError,
     PluginContractViolation,
+    RunLeadershipLostError,
+    RunMembershipLostError,
     SinkDiversionReason,
     SinkTransactionalInvariantError,
 )
+from elspeth.contracts.field_spelling import DeclaredSpellings
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
-from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.hashing import canonical_json_loads, stable_hash
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
+from elspeth.contracts.sink_effect_http import HTTPSinkEffectCapability, SinkEffectHTTPEnvironment, SinkEffectHTTPPostFactory
 from elspeth.contracts.sink_effects import (
     SinkEffectAttemptAction,
     SinkEffectAttemptState,
@@ -54,6 +60,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPipelineMembersInput,
     SinkEffectReservationRequest,
     SinkEffectRole,
+    SinkEffectRuntimeBinding,
 )
 from elspeth.core.canonical import canonical_json as pipeline_canonical_json
 from elspeth.core.clock import Clock
@@ -66,10 +73,12 @@ from elspeth.core.operations import _render_exception
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.declaration_dispatch import run_boundary_checks
+from elspeth.engine.executors.replay_sink_effect import VirtualReplaySinkEffect
 from elspeth.engine.executors.sink_effects import (
     SinkEffectCoordinator,
     SinkEffectExecutionRequest,
     SinkEffectExecutionSeam,
+    _SinkEffectAdapter,
 )
 from elspeth.engine.executors.sink_required_fields import _format_optional_missing_fields_context
 from elspeth.engine.spans import SpanFactory
@@ -158,6 +167,7 @@ class SinkExecutor:
         shutdown_event: threading.Event | None = None,
         check_coordination_latch: Callable[[], None] | None = None,
         make_shutdown_error: Callable[[], BaseException] | None = None,
+        sink_effect_bindings: Mapping[str, SinkEffectRuntimeBinding] | None = None,
     ) -> None:
         """Initialize executor.
 
@@ -189,10 +199,29 @@ class SinkExecutor:
         self._shutdown_event = shutdown_event
         self._check_coordination_latch = check_coordination_latch
         self._make_shutdown_error = make_shutdown_error
+        self._sink_effect_bindings = MappingProxyType(dict(sink_effect_bindings or {}))
+
+    def _http_factory_for_sink(self, sink_name: str, sink: SinkProtocol, ctx: PluginContext) -> SinkEffectHTTPPostFactory | None:
+        binding = self._sink_effect_bindings.get(sink_name)
+        if binding is not None and (binding.sink is not sink or binding.sink_name != sink_name):
+            raise OrchestrationInvariantError("sink HTTP binding does not match the current sink")
+        factory = None if binding is None else binding.http_post_factory
+        if ctx.run_mode is not RunMode.LIVE:
+            if factory is not None:
+                raise OrchestrationInvariantError("nonlive sink cannot carry HTTP authority")
+            return None
+        if isinstance(sink, HTTPSinkEffectCapability):
+            if not isinstance(factory, SinkEffectHTTPPostFactory):
+                raise OrchestrationInvariantError("HTTP sink requires its admitted nominal HTTP factory")
+            if factory.safe_config_fingerprint != stable_hash(sink.config):
+                raise OrchestrationInvariantError("sink HTTP factory safe configuration changed")
+        elif factory is not None:
+            raise OrchestrationInvariantError("non-HTTP sink cannot carry HTTP authority")
+        return factory
 
     def _require_coordination_token(self) -> CoordinationToken:
         """The leader token every fenced sink-effect verb requires (ADR-048)."""
-        if self._coordination_token is None:
+        if not isinstance(self._coordination_token, CoordinationToken):
             raise OrchestrationInvariantError(
                 "effect-capable sink execution requires the run's coordination token: durable sink effects are "
                 "leader-fenced Landscape writes with no unfenced arm (ADR-048). Construct SinkExecutor with "
@@ -213,6 +242,7 @@ class SinkExecutor:
         per_token_ms = duration_ms / len(states)
         for _, state in states:
             self._execution.complete_node_state(
+                member_token=self._require_coordination_token().membership,
                 state_id=state.state_id,
                 status=NodeStateStatus.FAILED,
                 duration_ms=per_token_ms,
@@ -244,6 +274,8 @@ class SinkExecutor:
                 duration_ms=0.0,
                 error=cleanup_error,
             )
+        except (RunLeadershipLostError, RunMembershipLostError):
+            raise
         except contract_errors.TIER_1_ERRORS:
             raise  # Audit corruption during cleanup is higher priority than original error
         except Exception as cleanup_exc:
@@ -285,7 +317,8 @@ class SinkExecutor:
                     sink.input_schema.model_validate(row)
                 except ValidationError as e:
                     raise PluginContractViolation(
-                        f"Sink '{sink.name}' input validation failed: {e}. This indicates an upstream transform/source schema bug."
+                        f"Sink '{sink.name}' input validation failed: {safe_validation_error_text(e, sink.input_schema)}. "
+                        "This indicates an upstream transform/source schema bug."
                     ) from e
 
         if sink.declared_required_fields:
@@ -429,7 +462,7 @@ class SinkExecutor:
         this same ``except`` branch. This call is a third such write.
         """
         operation = self._execution.begin_operation(
-            run_id=self._run_id,
+            coordination_token=self._require_coordination_token(),
             node_id=sink_node_id,
             operation_type="sink_write",
             input_data=scrub_payload_for_audit({"sink_plugin": sink_name}),
@@ -438,6 +471,7 @@ class SinkExecutor:
         # interpolate row values, so it is scrubbed before it reaches the audit
         # trail, and an unrenderable message degrades to the (secret-free) type.
         self._execution.complete_operation(
+            coordination_token=self._require_coordination_token(),
             operation_id=operation.operation_id,
             status="failed",
             error=_render_exception(violation),
@@ -473,7 +507,8 @@ class SinkExecutor:
             if failing_row_id is not None:
                 context["failing_row_id"] = failing_row_id
             try:
-                self._data_flow.record_token_outcome(
+                self._data_flow.record_token_outcome_leader(
+                    coordination_token=self._require_coordination_token(),
                     ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
                     outcome=TerminalOutcome.FAILURE,
                     path=TerminalPath.UNROUTED,
@@ -499,7 +534,29 @@ class SinkExecutor:
         node_id: str,
         row_contracts: Sequence[SchemaContract | None] | None,
     ) -> None:
-        """Run Layer 1 boundary contracts once per row before sink validation."""
+        """Run Layer 1 boundary contracts once per row before sink validation.
+
+        The field-name spelling rule's runtime residual runs first (operator
+        ruling 2026-09-25): a name this sink declares — schema field, required
+        field, or a column option such as a custom ``headers`` key — that is the
+        header spelling of a field the row carries would never meet it:
+        silently inert when optional, a Tier-1 "missing required field" when
+        required, a crash at write for a custom header key. It is the root cause
+        of what the contracts below would report about the same name, so it
+        speaks first. The build refused every case a participating, closed
+        upstream proves; this settles the rest on the row. It also covers
+        failsink rows: the diversion enrichment adds ``__diversion_*`` keys, which
+        no declaration spells. The sink seam routes no contract violation, so
+        both callers end the run with every token's terminal recorded.
+        """
+        declared_spellings = DeclaredSpellings.of(reads=sink.declared_read_fields, creates=())
+        # Resolved through each token's own contract — the one a lookup of the
+        # row would use — on the failsink path too, whose enriched rows carry
+        # no contract of their own but keep every field of the token's.
+        for token, row in zip(tokens, rows, strict=True):
+            spellings = declared_spellings.in_row(row_keys=frozenset(row), forwarded_keys=(), contract=token.row_data.contract)
+            if spellings:
+                raise HeaderSpelledDeclarationViolation(component=f"Sink '{sink.name}'", spellings=spellings)
         for row_index, (token, row) in enumerate(zip(tokens, rows, strict=True)):
             row_contract = None if row_contracts is None else row_contracts[row_index]
             run_boundary_checks(
@@ -517,10 +574,21 @@ class SinkExecutor:
             )
 
     def _merge_batch_contract(self, tokens: list[TokenInfo]) -> SchemaContract:
-        """Merge the sink-bound tokens' row contracts into one batch contract.
+        """Describe the sink-bound tokens' row contracts with one batch contract.
 
-        A merge failure is a framework bug (contracts that reached a sink should
-        always be batch-mergeable); TIER_1/audit-integrity errors propagate
+        The tokens of one batch can come from several producers — two observed
+        sources feeding one sink, two fork branches, a transform's rows beside
+        rows that bypassed it — and each producer's contract is a truthful
+        description of its own rows. ``SchemaContract.merge_for_batch`` is the
+        J1 description join (ADR-050): a field the producers type differently
+        is described as ``object``, nullable is OR, required is AND. It never
+        raises on a type difference, so a heterogeneous batch is written, not
+        aborted (before ADR-050 two observed sources disagreeing on ``id``
+        ended the run here with exit 4).
+
+        What can still fail is a contract that is not a contract at all — a
+        duplicate normalized name, a ``python_type`` outside the allowed set —
+        and that is a framework bug; TIER_1/audit-integrity errors propagate
         untouched.
         """
         contract_merge_start = time.perf_counter()
@@ -566,12 +634,12 @@ class SinkExecutor:
                         (
                             token.token_id,
                             sink_node_id,
-                            ctx.run_id,
                             step_in_pipeline,
                             row,
                         )
                         for token, row in zip(tokens, rows, strict=True)
-                    )
+                    ),
+                    coordination_token=self._require_coordination_token(),
                 )
                 all_states.extend(zip(tokens, opened_states, strict=True))
             else:
@@ -579,13 +647,15 @@ class SinkExecutor:
                     state = self._execution.begin_node_state(
                         token_id=token.token_id,
                         node_id=sink_node_id,
-                        run_id=ctx.run_id,
+                        member_token=self._require_coordination_token().membership,
                         step_index=step_in_pipeline,
                         input_data=input_dict,
                         attempt=token.resume_attempt_offset,
                         resume_checkpoint_id=token.resume_checkpoint_id,
                     )
                     all_states.append((token, state))
+        except (RunLeadershipLostError, RunMembershipLostError):
+            raise
         except contract_errors.TIER_1_ERRORS as e:
             if all_states:
                 self._best_effort_cleanup(all_states, e, "begin_node_state")
@@ -685,6 +755,7 @@ class SinkExecutor:
         sink_name: str,
         sink_node_id: str,
         join_group_id_by_token: Mapping[str, str | None],
+        ctx: PluginContext,
     ) -> _EffectPrimaryWrite:
         """Publish one primary batch through the durable effect coordinator."""
         if self._factory is None:
@@ -705,7 +776,7 @@ class SinkExecutor:
             self._validate_sink_input(sink, rows, contracts=row_contracts)
         except (DeclarationContractViolation, AggregateDeclarationContractViolation, PluginContractViolation) as violation:
             self._complete_states_failed(
-                states=[(token, state) for token, state in all_states if isinstance(state, NodeStateOpen)],
+                states=[(token, state) for token, state in all_states if type(state) is NodeStateOpen],
                 duration_ms=0.0,
                 error=self._build_boundary_error(exc=violation, phase="sink_write"),
             )
@@ -726,11 +797,10 @@ class SinkExecutor:
             "error_hash": pending_outcome.error_hash,
             "outcome": pending_outcome.outcome.value,
             "path": pending_outcome.path.value,
-            "scheduler_pending_sink": pending_outcome.scheduler_pending_sink,
         }
         canonical_rows: list[dict[str, object]] = []
         for row in rows:
-            normalized = json.loads(pipeline_canonical_json(row))
+            normalized = canonical_json_loads(pipeline_canonical_json(row))
             if type(normalized) is not dict:  # pragma: no cover - rows are dictionaries by construction
                 raise OrchestrationInvariantError("sink-effect row canonicalization did not produce a mapping")
             canonical_rows.append(normalized)
@@ -778,6 +848,14 @@ class SinkExecutor:
             for member in identity.members
         )
         sink._reset_diversion_log()
+        effect_adapter: SinkProtocol | VirtualReplaySinkEffect
+        if ctx.run_mode is RunMode.LIVE:
+            effect_adapter = sink
+        else:
+            if ctx.replay_from is None:
+                raise OrchestrationInvariantError("replay sink execution requires a source run")
+            effect_adapter = VirtualReplaySinkEffect(factory=self._factory, source_run_id=ctx.replay_from, sink_node_id=sink_node_id)
+        http_factory = self._http_factory_for_sink(sink_name, sink, ctx)
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
@@ -787,6 +865,12 @@ class SinkExecutor:
             shutdown_event=self._shutdown_event,
             check_coordination_latch=self._check_coordination_latch,
             make_shutdown_error=self._make_shutdown_error,
+            http_post_factory=http_factory,
+            http_environment=(
+                SinkEffectHTTPEnvironment(telemetry_emit=ctx.telemetry_emit, rate_limit_registry=ctx.rate_limit_registry)
+                if http_factory is not None
+                else None
+            ),
         ).execute_with_lease_wait(
             SinkEffectExecutionRequest(
                 reservation=reservation,
@@ -800,7 +884,7 @@ class SinkExecutor:
                 ),
                 finalization_members=finalization_members,
             ),
-            sink,  # type: ignore[arg-type]  # capability was statically admitted before execution
+            cast(_SinkEffectAdapter, effect_adapter),  # live capability was admitted; replay adapter is owned
         )
         requested_token_ids = tuple(member.token_id for member in identity.members)
         durable_members = self._execution.sink_effects.get_members_for_tokens(
@@ -990,9 +1074,23 @@ class SinkExecutor:
         if self._factory is None or failsink.node_id is None:
             raise OrchestrationInvariantError("linked failsink effects require an owning factory and sink node")
         failsink_node_id = failsink.node_id
-        run = self._factory.run_lifecycle.get_run(self._run_id)
+        timestamp_run_id = self._run_id
+        if ctx.run_mode is not RunMode.LIVE:
+            if ctx.replay_from is None:
+                raise OrchestrationInvariantError("replay failsink execution requires a source run")
+            timestamp_run_id = ctx.replay_from
+        run = self._factory.run_lifecycle.get_run(timestamp_run_id)
         if run is None:
             raise OrchestrationInvariantError("linked failsink effect run is missing")
+        seen_run_ids = {run.run_id}
+        while run.replay_from_run_id is not None:
+            if run.replay_from_run_id in seen_run_ids:
+                raise AuditIntegrityError("linked failsink source run ancestry contains a cycle")
+            seen_run_ids.add(run.replay_from_run_id)
+            source_run = self._factory.run_lifecycle.get_run(run.replay_from_run_id)
+            if source_run is None:
+                raise AuditIntegrityError("linked failsink source run ancestry is missing")
+            run = source_run
         stable_timestamp = run.started_at.astimezone(UTC).isoformat()
         enriched_rows: list[dict[str, object]] = []
         enriched_by_token: dict[str, dict[str, object]] = {}
@@ -1036,12 +1134,12 @@ class SinkExecutor:
             # outcomes so no diverted token is left in progress.
             boundary_error = self._build_boundary_error(exc=violation, phase="failsink_write")
             self._complete_states_failed(
-                states=[(token, state) for token, state in failsink_states if isinstance(state, NodeStateOpen)],
+                states=[(token, state) for token, state in failsink_states if type(state) is NodeStateOpen],
                 duration_ms=0.0,
                 error=boundary_error,
             )
             self._complete_states_failed(
-                states=[(token, state) for token, _index, state in primary_divert_states if isinstance(state, NodeStateOpen)],
+                states=[(token, state) for token, _index, state in primary_divert_states if type(state) is NodeStateOpen],
                 duration_ms=0.0,
                 error=boundary_error,
             )
@@ -1113,6 +1211,16 @@ class SinkExecutor:
             for member in identity.members
         )
         failsink._reset_diversion_log()
+        effect_adapter: SinkProtocol | VirtualReplaySinkEffect
+        if ctx.run_mode is RunMode.LIVE:
+            effect_adapter = failsink
+        else:
+            if ctx.replay_from is None:
+                raise OrchestrationInvariantError("replay failsink execution requires a source run")
+            effect_adapter = VirtualReplaySinkEffect(
+                factory=self._factory, source_run_id=ctx.replay_from, sink_node_id=failsink_node_id, role=SinkEffectRole.FAILSINK
+            )
+        http_factory = self._http_factory_for_sink(failsink_name, failsink, ctx)
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
@@ -1122,6 +1230,12 @@ class SinkExecutor:
             shutdown_event=self._shutdown_event,
             check_coordination_latch=self._check_coordination_latch,
             make_shutdown_error=self._make_shutdown_error,
+            http_post_factory=http_factory,
+            http_environment=(
+                SinkEffectHTTPEnvironment(telemetry_emit=ctx.telemetry_emit, rate_limit_registry=ctx.rate_limit_registry)
+                if http_factory is not None
+                else None
+            ),
         ).execute_with_lease_wait(
             SinkEffectExecutionRequest(
                 reservation=reservation,
@@ -1132,7 +1246,7 @@ class SinkExecutor:
                 ),
                 finalization_members=finalization_members,
             ),
-            failsink,  # type: ignore[arg-type]
+            cast(_SinkEffectAdapter, effect_adapter),
         )
         durable = self._execution.sink_effects.get_members(result.effect.effect_id)
         if any(member.prepared_disposition != "accepted" for member in durable):
@@ -1144,12 +1258,14 @@ class SinkExecutor:
             reason: SinkDiversionReason = {"diversion_reason": f"effect-diversion:{reason_hash}"}
             if isinstance(current, NodeStateOpen):
                 self._execution.record_routing_event(
+                    member_token=self._require_coordination_token().membership,
                     state_id=current.state_id,
                     edge_id=failsink_edge_id,
                     mode=RoutingMode.DIVERT,
                     reason=reason,
                 )
                 self._execution.complete_node_state(
+                    member_token=self._require_coordination_token().membership,
                     state_id=current.state_id,
                     status=NodeStateStatus.FAILED,
                     output_data={"diverted_to": failsink_name, "reason_hash": reason_hash},
@@ -1234,6 +1350,7 @@ class SinkExecutor:
             current = self._execution.get_node_state(primary_state.state_id)
             if isinstance(current, NodeStateOpen):
                 self._execution.complete_node_state(
+                    member_token=self._require_coordination_token().membership,
                     state_id=current.state_id,
                     status=NodeStateStatus.FAILED,
                     output_data={"discarded": True, "reason": recovery_stable_reason},
@@ -1248,7 +1365,8 @@ class SinkExecutor:
             # failures, not transient failsink bookkeeping.
             existing = self._data_flow.get_token_outcome(token.token_id)
             if existing is None:
-                self._data_flow.record_token_outcome(
+                self._data_flow.record_token_outcome_leader(
+                    coordination_token=self._require_coordination_token(),
                     ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
                     outcome=TerminalOutcome.FAILURE,
                     path=TerminalPath.SINK_DISCARDED,
@@ -1270,6 +1388,8 @@ class SinkExecutor:
             for token, _idx, _state in primary_divert_states:
                 try:
                     on_token_written(token)
+                except (RunLeadershipLostError, RunMembershipLostError):
+                    raise
                 except contract_errors.TIER_1_ERRORS:
                     raise
                 except Exception as exc:
@@ -1345,6 +1465,11 @@ class SinkExecutor:
         """
         if not tokens:
             return None, DiversionCounts()
+        # Refuse a replaced caller before opening sink node states or
+        # reserving an effect. The adapter-level guard still rechecks before
+        # publication, but that later check cannot undo admission audit writes.
+        if self._check_coordination_latch is not None:
+            self._check_coordination_latch()
         if effect_mode is None:
             raise OrchestrationInvariantError(
                 f"Sink '{sink_name}' reached execution without a validated effect mode; legacy publication is forbidden"
@@ -1395,6 +1520,7 @@ class SinkExecutor:
             sink_name=sink_name,
             sink_node_id=sink_node_id,
             join_group_id_by_token=join_group_id_by_token,
+            ctx=primary_ctx,
         )
         diversions = effect_write.diversions
 
@@ -1418,6 +1544,8 @@ class SinkExecutor:
                     raise AuditIntegrityError("durable effect partition disagrees with accepted primary tokens")
                 try:
                     on_token_written(token)
+                except (RunLeadershipLostError, RunMembershipLostError):
+                    raise
                 except contract_errors.TIER_1_ERRORS:
                     raise
                 except Exception as exc:

@@ -1,24 +1,3 @@
-/**
- * ReadinessRowDetail (Phase 2C)
- *
- * Drawer/popover content for one row of the audit-readiness panel.
- *
- * For the `validation` row it re-humanises the structured findings through the
- * SAME humaniser the rail strip uses (humaniseValidationMessage) so that
- * engine-grade dumps — raw pydantic "Field required" traces, schema-contract
- * violations, interpretation-review-pending strings — never render verbatim on
- * this novice surface (elspeth-901a404926). Each finding shows its plain
- * headline; any raw text is preserved behind a "Technical details" disclosure
- * for the engineer read. Other rows render their backend detail string
- * (multi-line preserved) unchanged.
- *
- * Jump-to-component buttons name the target by its plain step phrase ("the
- * 'rate each row' step") rather than the internal node id (e.g.
- * `guided_xform_1`), which is itself a lingo leak. Unresolvable ids are shown
- * as plain text — they may refer to source/sink names the user can grep for.
- *
- * Phase 8 will add a telemetry emit here for audit-row-click. No emit yet.
- */
 import { useEffect, useId, useMemo, useRef } from "react";
 
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
@@ -27,10 +6,10 @@ import { useSessionStore } from "../../stores/sessionStore";
 import type { ReadinessRow, ValidationError } from "../../types/api";
 import { stepLabelForNodeId } from "../chat/interpretationStepLabel";
 import {
-  humaniseValidationMessage,
+  humaniseExecutionError,
   makePhraseFor,
 } from "@/lib/validationHumaniser";
-import { UNKNOWN_COMPONENT_PHRASE } from "../chat/guided/pipelineGloss";
+import { UNKNOWN_COMPONENT_PHRASE } from "../chat/pipelineGloss";
 
 export interface ReadinessRowDetailProps {
   row: ReadinessRow;
@@ -67,7 +46,7 @@ export function ReadinessRowDetail({
   const humanisedFindings =
     validationErrors && validationErrors.length > 0
       ? validationErrors.map((err) =>
-          humaniseValidationMessage(err.message, phraseFor, stepLabelFor),
+          humaniseExecutionError(err, phraseFor, stepLabelFor),
         )
       : null;
   const technicalDetails =

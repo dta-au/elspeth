@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import threading
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,15 +34,18 @@ from elspeth.web.catalog.schemas import (
     PluginSchemaInfo,
     PluginSummary,
 )
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import (
     CompositionState,
     PipelineMetadata,
 )
 from elspeth.web.config import WebSettings
+from tests.unit.web.composer._helpers import _composer_service_with_session
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures required for all compose-loop tests in this file.
@@ -54,10 +58,10 @@ from elspeth.web.config import WebSettings
 def _composer_available(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bypass API-key check so tests focus on compose behavior, not credentials."""
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.fixture(autouse=True)
@@ -187,7 +191,7 @@ def _make_settings(**overrides: Any) -> WebSettings:
 def _make_llm_response(
     content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
-) -> _FakeLLMResponse:
+) -> _AdmittedLLMCompletion:
     fake_tool_calls: list[_FakeToolCall] | None = None
     if tool_calls:
         fake_tool_calls = [
@@ -201,7 +205,7 @@ def _make_llm_response(
             for tc in tool_calls
         ]
     message = _FakeMessage(content=content, tool_calls=fake_tool_calls)
-    return _FakeLLMResponse(choices=[_FakeChoice(message=message)])
+    return _admit_composer_llm_completion(_FakeLLMResponse(choices=[_FakeChoice(message=message)]))
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +242,9 @@ class TestUnknownToolNameComposeLoopAuditShape:
         4. ``payload["data"]["error"]`` contains the literal substring
            ``"Unknown tool: this_tool_does_not_exist"`` — the error message
            produced by ``_failure_result`` at ``tools.py:5731``.
-        5. The compose loop continues after the unknown-tool-call turn:
-           ``result.message`` is the LLM's self-correction text from turn 2.
+        5. The compose loop continues after the unknown-tool-call turn,
+           then reconciles the still-empty build request through the provider
+           before returning its concrete clarification question.
 
         Spec refs: §4.2.6 disposition table (added row: unknown tool name →
         SUCCESS-with-semantic-failure); §5.7.5 (audit status clarified).
@@ -248,7 +253,7 @@ class TestUnknownToolNameComposeLoopAuditShape:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Turn 1: LLM emits a hallucinated (unknown) tool name.
@@ -264,13 +269,32 @@ class TestUnknownToolNameComposeLoopAuditShape:
         # Turn 2: LLM self-corrects with a text response after receiving the
         # failure payload as a role=tool message.
         self_correction = _make_llm_response(content="I apologise — that tool does not exist. Let me try again.")
+        clarification = _make_llm_response(content="Which data source should the pipeline use?")
+        responses = iter((unknown_tool_call, self_correction, clarification))
+        provider_messages: list[list[dict[str, Any]]] = []
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.side_effect = [unknown_tool_call, self_correction]
-            result = await service.compose("Build a pipeline", [], state)
+        async def scripted_provider(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> _AdmittedLLMCompletion:
+            # The service extends one shared message list between calls.
+            # Snapshot each provider boundary before those later mutations.
+            provider_messages.append(deepcopy(messages))
+            return next(responses)
 
-        # Assert 5: compose loop continued; turn 2 text is the result message.
-        assert "apologise" in result.message or "sorry" in result.message.lower() or result.message
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+            mock_llm.side_effect = scripted_provider
+            result = await service.compose("Build a pipeline", [], state, session_id=session_id)
+
+        # Assert 5: one neutral reconciliation turn follows the failed
+        # dispatch; the provider supplies the final clarification.
+        assert mock_llm.await_count == 3
+        assert "Which data source should the pipeline use?" in result.message
+        reconciliation_prefix = "[composer-system] No composition-state mutation completed successfully this turn"
+        assert not any(
+            message["content"].startswith(reconciliation_prefix) for message in provider_messages[1] if message["role"] == "user"
+        )
+        assert (
+            sum(message["content"].startswith(reconciliation_prefix) for message in provider_messages[2] if message["role"] == "user") == 1
+        )
+        assert any(message["role"] == "tool" and message["tool_call_id"] == "call_unknown" for message in provider_messages[1])
 
         # Find the invocation for the hallucinated tool name.
         unknown_invocations = [inv for inv in result.tool_invocations if inv.tool_name == "this_tool_does_not_exist"]
@@ -301,11 +325,10 @@ class TestUnknownToolNameComposeLoopAuditShape:
         assert payload["success"] is False, (
             f"Expected payload['success'] to be False (semantic failure recorded in the payload), got {payload['success']!r}."
         )
-        assert "data" in payload, f"Expected 'data' key in result_canonical payload, got keys: {list(payload.keys())}."
-        assert "error" in payload["data"], f"Expected 'error' key in payload['data'], got keys: {list(payload['data'].keys())}."
-        assert "Unknown tool: this_tool_does_not_exist" in payload["data"]["error"], (
-            f"Expected 'Unknown tool: this_tool_does_not_exist' in payload['data']['error'], got: {payload['data']['error']!r}."
-        )
+        assert "data" not in payload
+        rejection = payload["validation"]["errors"][0]
+        assert rejection["component"] == "rejected_mutation"
+        assert "Unknown tool: this_tool_does_not_exist" in rejection["message"]
 
 
 # ---------------------------------------------------------------------------

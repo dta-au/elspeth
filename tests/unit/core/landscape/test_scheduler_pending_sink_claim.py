@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import event, insert, select, update
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -18,11 +19,14 @@ from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     nodes_table,
     rows_table,
+    run_coordination_table,
+    run_workers_table,
     runs_table,
     scheduler_events_table,
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 
 RUN_ID = "run-pending-sink-admission"
@@ -84,14 +88,14 @@ def pending_sink() -> Iterator[tuple[Tier1Engine, TokenSchedulerRepository, str,
             {
                 "pending_outcome": TerminalOutcome.FAILURE.value,
                 "pending_path": TerminalPath.ON_ERROR_ROUTED.value,
-                "pending_error_hash": "a" * 64,
+                "pending_error_hash": "a" * 16,
                 "pending_error_message": None,
             },
             id="on-error-missing-error-message",
         ),
         pytest.param(
             {
-                "pending_error_hash": "a" * 64,
+                "pending_error_hash": "a" * 16,
                 "pending_error_message": "stale error",
             },
             id="success-with-error-evidence",
@@ -115,7 +119,11 @@ def test_claim_pending_sink_rejects_incomplete_bundle_without_mutation(
     before = _durable_image(engine, work_item_id)
 
     with pytest.raises(AuditIntegrityError, match="complete durable sink bundle"):
-        repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redrive-worker", lease_seconds=30)
+        repo.claim_pending_sink(
+            coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="redrive-worker", leader_epoch=1),
+            lease_owner="redrive-worker",
+            lease_seconds=30,
+        )
 
     assert _durable_image(engine, work_item_id) == before
 
@@ -145,7 +153,7 @@ def test_claim_pending_sink_rejects_incomplete_bundle_without_mutation(
             {
                 "pending_outcome": TerminalOutcome.FAILURE.value,
                 "pending_path": TerminalPath.ON_ERROR_ROUTED.value,
-                "pending_error_hash": "a" * 64,
+                "pending_error_hash": "a" * 16,
                 "pending_error_message": "boom",
             },
             id="on-error-routed",
@@ -172,7 +180,7 @@ def test_claim_pending_sink_accepts_complete_legal_bundle(
 
     before = landscape_database_now(engine)
     claimed = repo.claim_pending_sink(
-        run_id=RUN_ID,
+        coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="redrive-worker", leader_epoch=1),
         lease_owner="redrive-worker",
         lease_seconds=30,
     )
@@ -209,7 +217,11 @@ def test_claim_pending_sink_update_rechecks_bundle_atomically(
 
     try:
         with pytest.raises(AuditIntegrityError, match="complete durable sink bundle"):
-            repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redrive-worker", lease_seconds=30)
+            repo.claim_pending_sink(
+                coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="redrive-worker", leader_epoch=1),
+                lease_owner="redrive-worker",
+                lease_seconds=30,
+            )
     finally:
         event.remove(engine, "before_cursor_execute", invalidate_bundle_between_select_and_update)
 
@@ -228,7 +240,7 @@ def _seed_prerequisites(engine: Tier1Engine) -> str:
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=NOW,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -248,7 +260,7 @@ def _seed_prerequisites(engine: Tier1Engine) -> str:
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=NOW,
                 )
@@ -261,17 +273,38 @@ def _seed_prerequisites(engine: Tier1Engine) -> str:
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="row-hash",
+                source_data_hash=fake_sha256("row-hash"),
                 created_at=NOW,
             )
         )
         conn.execute(insert(tokens_table).values(token_id="token-1", row_id="row-1", run_id=RUN_ID, created_at=NOW))
+        database_now = datetime.now(UTC)
+        for worker_id, role in (("producer-worker", "follower"), ("redrive-worker", "leader")):
+            conn.execute(
+                insert(run_workers_table).values(
+                    run_id=RUN_ID,
+                    worker_id=worker_id,
+                    role=role,
+                    status="active",
+                    registered_at=database_now,
+                    heartbeat_expires_at=database_now + timedelta(hours=1),
+                )
+            )
+        conn.execute(
+            insert(run_coordination_table).values(
+                run_id=RUN_ID,
+                leader_worker_id="redrive-worker",
+                leader_epoch=1,
+                leader_heartbeat_expires_at=database_now + timedelta(hours=1),
+                updated_at=database_now,
+            )
+        )
     return payload
 
 
 def _seed_pending_sink(repo: TokenSchedulerRepository, *, payload: str) -> str:
     item = repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer-worker"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -279,9 +312,12 @@ def _seed_pending_sink(repo: TokenSchedulerRepository, *, payload: str) -> str:
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="producer-worker", lease_seconds=30)
+    claimed = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer-worker"), lease_owner="producer-worker", lease_seconds=30
+    )
     assert claimed is not None
     repo.mark_pending_sink(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer-worker"),
         work_item_id=item.work_item_id,
         row_payload_json=payload,
         sink_name="sink-a",
@@ -306,3 +342,59 @@ def _durable_image(engine: Tier1Engine, work_item_id: str) -> tuple[dict[str, An
             ).mappings()
         )
     return row, events
+
+
+@pytest.mark.parametrize("second_token", ("token-2", "missing-token"))
+def test_terminal_batch_is_all_or_nothing(pending_sink: tuple[Tier1Engine, TokenSchedulerRepository, str, str], second_token: str) -> None:
+    """The batch terminalizer never commits a prefix when one member is absent."""
+    engine, repo, first_id, payload = pending_sink
+    with engine.begin() as conn:
+        conn.execute(insert(tokens_table).values(token_id="token-2", row_id="row-1", run_id=RUN_ID, created_at=NOW))
+    member = WorkerMembershipToken(run_id=RUN_ID, worker_id="producer-worker")
+    second = repo.enqueue_ready_claimed(
+        member_token=member,
+        token_id="token-2",
+        row_id="row-1",
+        node_id="normalize",
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=payload,
+        lease_owner=member.worker_id,
+        lease_seconds=30,
+    )
+    repo.mark_pending_sink(
+        member_token=member,
+        work_item_id=second.work_item_id,
+        expected_lease_owner=member.worker_id,
+        row_payload_json=payload,
+        sink_name="sink-a",
+        outcome=TerminalOutcome.SUCCESS.value,
+        path=TerminalPath.DEFAULT_FLOW.value,
+        error_hash=None,
+        error_message=None,
+    )
+    before = (_durable_image(engine, first_id), _durable_image(engine, second.work_item_id))
+    leader = CoordinationToken(run_id=RUN_ID, worker_id="redrive-worker", leader_epoch=1)
+    if second_token == "missing-token":
+        with pytest.raises(AuditIntegrityError, match="missing token_id"):
+            repo.mark_pending_sink_terminal_many(
+                coordination_token=leader,
+                token_ids=("token-1", second_token),
+                expected_lease_owner=member.worker_id,
+            )
+        assert (_durable_image(engine, first_id), _durable_image(engine, second.work_item_id)) == before
+    else:
+        assert (
+            repo.mark_pending_sink_terminal_many(
+                coordination_token=leader,
+                token_ids=("token-1", second_token),
+                expected_lease_owner=member.worker_id,
+            )
+            == 2
+        )
+        assert _durable_image(engine, first_id)[0]["status"] == TokenWorkStatus.TERMINAL.value
+        assert _durable_image(engine, second.work_item_id)[0]["status"] == TokenWorkStatus.TERMINAL.value
+        events = _durable_image(engine, first_id)[1]
+        terminal_events = [event for event in events if event["event_type"] == "mark_pending_sink_terminal"]
+        assert {event["token_id"] for event in terminal_events} == {"token-1", "token-2"}
+        assert [event["work_item_id"] for event in terminal_events] == sorted((first_id, second.work_item_id))

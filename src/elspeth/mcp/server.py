@@ -149,7 +149,12 @@ _TOOLS: dict[str, _ToolDef] = {
         },
     ),
     "get_run_summary": _ToolDef(
-        description="Get summary statistics for a run: counts, durations, errors, outcome distribution",
+        description=(
+            "Get summary statistics for a run: counts, durations, errors, outcome distribution. "
+            "errors.transform and errors.collector_group count terminally failed tokens (a transform error decided "
+            "them, or their collector group failed as a whole); errors.total adds validation errors to both. "
+            "counts.collector_groups_failed counts failed groups, a different unit that no error total includes"
+        ),
         args=_ArgSpec(required_str=("run_id",)),
         handler=lambda a, args: a.get_run_summary(args["run_id"]),
         schema_properties={
@@ -297,6 +302,14 @@ _TOOLS: dict[str, _ToolDef] = {
             "operation_id": {"type": "string", "description": "Operation ID to query"},
         },
     ),
+    "list_verification_decisions": _ToolDef(
+        description="Read persisted match, mismatch, and unavailable comparisons for all external calls in a verify run",
+        args=_ArgSpec(required_str=("run_id",)),
+        handler=lambda a, args: a.list_verification_decisions(args["run_id"]),
+        schema_properties={
+            "run_id": {"type": "string", "description": "Current verification run ID"},
+        },
+    ),
     "explain_token": _ToolDef(
         description="Get complete lineage for a token: source row, node states, calls, routing, errors, outcome",
         args=_ArgSpec(
@@ -435,7 +448,14 @@ _TOOLS: dict[str, _ToolDef] = {
         },
     ),
     "get_error_analysis": _ToolDef(
-        description="Analyze errors: grouped by type, by node, with sample data for pattern matching",
+        description=(
+            "Analyze errors: grouped by type, by node, with sample data for pattern matching. "
+            "transform_errors.total and by_transform count terminally failed tokens; "
+            "transform_errors.sample_details are raw transform-error ATTEMPT records, which include "
+            "attempts a later retry recovered, so they are never a failure count; "
+            "collector_group_failures counts failed collector groups and the member tokens they failed, "
+            "by collector node and recorded reason code"
+        ),
         args=_ArgSpec(required_str=("run_id",)),
         handler=lambda a, args: a.get_error_analysis(args["run_id"]),
         schema_properties={
@@ -471,7 +491,11 @@ _TOOLS: dict[str, _ToolDef] = {
         schema_properties={},
     ),
     "get_failure_context": _ToolDef(
-        description="\U0001f50d Deep dive: Get comprehensive context about failures in a run (failed states, errors, patterns)",
+        description=(
+            "\U0001f50d Deep dive: Get comprehensive context about failures in a run (failed states, errors, patterns). "
+            "transform_errors lists transform-error ATTEMPT records, which include attempts a later retry recovered; "
+            "the patterns counts are the lengths of these limited listings, never failed-token counts"
+        ),
         args=_ArgSpec(
             required_str=("run_id",),
             optional_int=(("limit", 10),),

@@ -31,9 +31,12 @@ from elspeth.contracts.enums import (
     TerminalPath,
 )
 from elspeth.contracts.events import (
+    ChromaWriteStatistics,
+    DataverseLoadStatistics,
     GateEvaluated,
     PhaseAction,
     PipelinePhase,
+    RAGRetrievalStatistics,
     TelemetryEvent,
     TokenCompleted,
     TransformCompleted,
@@ -556,6 +559,21 @@ class TestGranularityFilteringMatrix:
     # True = should emit, False = should filter
     EXPECTED_MATRIX: ClassVar[dict[type, dict[TelemetryGranularity, bool]]] = {
         # Lifecycle events: always emit at any granularity
+        DataverseLoadStatistics: {
+            TelemetryGranularity.LIFECYCLE: True,
+            TelemetryGranularity.ROWS: True,
+            TelemetryGranularity.FULL: True,
+        },
+        RAGRetrievalStatistics: {
+            TelemetryGranularity.LIFECYCLE: True,
+            TelemetryGranularity.ROWS: True,
+            TelemetryGranularity.FULL: True,
+        },
+        ChromaWriteStatistics: {
+            TelemetryGranularity.LIFECYCLE: True,
+            TelemetryGranularity.ROWS: True,
+            TelemetryGranularity.FULL: True,
+        },
         RunStarted: {
             TelemetryGranularity.LIFECYCLE: True,
             TelemetryGranularity.ROWS: True,
@@ -638,6 +656,37 @@ class TestGranularityFilteringMatrix:
 
         # Create one instance of each event type
         events_by_type: dict[type, TelemetryEvent] = {
+            DataverseLoadStatistics: DataverseLoadStatistics(
+                timestamp=base_ts,
+                run_id=run_id,
+                node_id="source-1",
+                plugin_name="dataverse",
+                pages_fetched=1,
+                rows_yielded=2,
+                rows_rejected=0,
+                load_state="exhausted",
+            ),
+            RAGRetrievalStatistics: RAGRetrievalStatistics(
+                timestamp=base_ts,
+                run_id=run_id,
+                node_id="transform-1",
+                plugin_name="rag_retrieval",
+                provider="chroma",
+                total_queries=1,
+                total_chunks=2,
+                quarantine_count=0,
+                score_count=1,
+                score_mean=0.75,
+                score_std=None,
+            ),
+            ChromaWriteStatistics: ChromaWriteStatistics(
+                timestamp=base_ts,
+                run_id=run_id,
+                node_id="sink-1",
+                plugin_name="chroma",
+                total_written=3,
+                total_bytes=256,
+            ),
             RunStarted: make_run_started(run_id, base_ts),
             RunFinished: make_run_finished(run_id, base_ts),
             PhaseChanged: make_phase_changed(run_id, base_ts),

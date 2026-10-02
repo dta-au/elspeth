@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import event, select
 
 from elspeth.contracts import Determinism, NodeType, RoutingMode, RunStatus
-from elspeth.contracts.errors import AuditIntegrityError, ContractMergeError
+from elspeth.contracts.errors import AuditIntegrityError, ContractMergeError, FrameworkBugError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.landscape import LandscapeDB
@@ -70,7 +70,7 @@ class TestRegisterNodeDsnSanitization:
 
     def _register_database_node(self, factory: RecorderFactory, config: dict[str, object]) -> object:
         return factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="database",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -121,7 +121,7 @@ class TestRegisterNodeDsnSanitization:
         _db, factory = _setup()
 
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -142,7 +142,7 @@ class TestRegisterNodeDsnSanitization:
         self._register_database_node(factory, {"url": self._DSN})
 
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
-        records = list(LandscapeExporter(db).export_run("run-1"))
+        records = list(LandscapeExporter(db, compartment_id="test-compartment").export_run("run-1"))
         node_records = [r for r in records if r["record_type"] == "node"]
         assert node_records, "expected the registered node in the export"
         assert "s3cr3t-pw" not in json.dumps(node_records)
@@ -161,7 +161,7 @@ class TestRegisterNode:
         _db, factory = _setup()
         config = {"key": "value", "nested": {"a": 1}}
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -176,7 +176,7 @@ class TestRegisterNode:
     def test_generates_node_id_when_not_provided(self) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -189,7 +189,7 @@ class TestRegisterNode:
     def test_uses_explicit_node_id(self) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -202,7 +202,7 @@ class TestRegisterNode:
     def test_stores_sequence_in_pipeline(self) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="field_mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -215,7 +215,7 @@ class TestRegisterNode:
     def test_sequence_none_by_default(self) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -227,7 +227,7 @@ class TestRegisterNode:
     def test_stores_determinism(self) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="llm_classifier",
             node_type=NodeType.TRANSFORM,
             plugin_version="2.0.0",
@@ -240,7 +240,7 @@ class TestRegisterNode:
     def test_determinism_defaults_to_deterministic(self) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="field_mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -263,7 +263,7 @@ class TestRegisterNode:
     def test_all_determinism_variants(self, determinism: Determinism) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="test_plugin",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -276,7 +276,7 @@ class TestRegisterNode:
     def test_stores_node_type(self) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="threshold_gate",
             node_type=NodeType.GATE,
             plugin_version="1.0.0",
@@ -299,7 +299,7 @@ class TestRegisterNode:
     def test_all_node_type_variants(self, node_type: NodeType) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="test_plugin",
             node_type=node_type,
             plugin_version="1.0.0",
@@ -311,7 +311,7 @@ class TestRegisterNode:
     def test_stores_plugin_name_and_version(self) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="3.2.1",
@@ -324,7 +324,7 @@ class TestRegisterNode:
     def test_stores_run_id(self) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -337,7 +337,7 @@ class TestRegisterNode:
         _db, factory = _setup()
         schema = SchemaConfig.from_dict({"mode": "observed"})
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -346,35 +346,10 @@ class TestRegisterNode:
         )
         assert node.schema_mode == "observed"
 
-    def test_stores_schema_hash_when_provided(self) -> None:
-        _db, factory = _setup()
-        node = factory.data_flow.register_node(
-            run_id="run-1",
-            plugin_name="csv",
-            node_type=NodeType.SOURCE,
-            plugin_version="1.0.0",
-            config={},
-            schema_hash="abc123hash",
-            schema_config=_DYNAMIC_SCHEMA,
-        )
-        assert node.schema_hash == "abc123hash"
-
-    def test_schema_hash_none_by_default(self) -> None:
-        _db, factory = _setup()
-        node = factory.data_flow.register_node(
-            run_id="run-1",
-            plugin_name="csv",
-            node_type=NodeType.SOURCE,
-            plugin_version="1.0.0",
-            config={},
-            schema_config=_DYNAMIC_SCHEMA,
-        )
-        assert node.schema_hash is None
-
     def test_registered_at_is_set(self) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -386,7 +361,7 @@ class TestRegisterNode:
     def test_two_nodes_get_distinct_ids(self) -> None:
         _db, factory = _setup()
         node_a = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -394,7 +369,7 @@ class TestRegisterNode:
             schema_config=_DYNAMIC_SCHEMA,
         )
         node_b = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="field_mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -406,7 +381,7 @@ class TestRegisterNode:
     def test_config_hash_changes_with_different_config(self) -> None:
         _db, factory = _setup()
         node_a = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -414,7 +389,7 @@ class TestRegisterNode:
             schema_config=_DYNAMIC_SCHEMA,
         )
         node_b = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -426,7 +401,7 @@ class TestRegisterNode:
     def test_config_hash_stable_for_same_config(self) -> None:
         _db, factory = _setup()
         node_a = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -435,7 +410,7 @@ class TestRegisterNode:
             schema_config=_DYNAMIC_SCHEMA,
         )
         node_b = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -448,7 +423,7 @@ class TestRegisterNode:
     def test_empty_config(self) -> None:
         _db, factory = _setup()
         node = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="null_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -471,7 +446,7 @@ class TestRegisterEdge:
     def test_creates_edge(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -480,7 +455,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -489,7 +464,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         edge = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="src",
             to_node_id="xfm",
             label="continue",
@@ -502,7 +477,7 @@ class TestRegisterEdge:
     def test_generates_edge_id_when_not_provided(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -511,7 +486,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -520,7 +495,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         edge = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="src",
             to_node_id="sink",
             label="continue",
@@ -532,7 +507,7 @@ class TestRegisterEdge:
     def test_uses_explicit_edge_id(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -541,7 +516,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -550,7 +525,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         edge = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="src",
             to_node_id="sink",
             label="continue",
@@ -562,7 +537,7 @@ class TestRegisterEdge:
     def test_stores_label(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="gate",
             node_type=NodeType.GATE,
             plugin_version="1.0.0",
@@ -571,7 +546,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -580,7 +555,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         edge = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="gate",
             to_node_id="sink",
             label="high_risk",
@@ -591,7 +566,7 @@ class TestRegisterEdge:
     def test_stores_default_mode(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="gate",
             node_type=NodeType.GATE,
             plugin_version="1.0.0",
@@ -600,7 +575,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -609,7 +584,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         edge = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="gate",
             to_node_id="sink",
             label="route_to_sink",
@@ -620,7 +595,7 @@ class TestRegisterEdge:
     def test_created_at_is_set(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -629,7 +604,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -638,7 +613,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         edge = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="src",
             to_node_id="sink",
             label="continue",
@@ -649,7 +624,7 @@ class TestRegisterEdge:
     def test_two_edges_get_distinct_ids(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -658,7 +633,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="xfm",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -667,7 +642,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -676,14 +651,14 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         edge_a = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="src",
             to_node_id="xfm",
             label="continue",
             mode=RoutingMode.MOVE,
         )
         edge_b = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="xfm",
             to_node_id="sink",
             label="continue",
@@ -698,7 +673,7 @@ class TestRegisterEdge:
     def test_all_routing_mode_variants(self, mode: RoutingMode) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -707,7 +682,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -716,7 +691,7 @@ class TestRegisterEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         edge = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="src",
             to_node_id="sink",
             label="continue",
@@ -736,7 +711,7 @@ class TestGetNode:
     def test_roundtrip(self) -> None:
         _db, factory = _setup()
         original = factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -762,7 +737,7 @@ class TestGetNode:
     def test_returns_none_for_unknown_run(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -780,7 +755,7 @@ class TestGetNode:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
 
         factory.data_flow.register_node(
-            run_id="run-A",
+            coordination_token=leader_coordination_token(factory, "run-A"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -789,7 +764,7 @@ class TestGetNode:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-B",
+            coordination_token=leader_coordination_token(factory, "run-B"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="2.0.0",
@@ -825,7 +800,7 @@ class TestGetNodes:
     def test_returns_all_nodes_for_run(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -835,7 +810,7 @@ class TestGetNodes:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -845,7 +820,7 @@ class TestGetNodes:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -861,7 +836,7 @@ class TestGetNodes:
         _db, factory = _setup()
         # Register out of order
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -871,7 +846,7 @@ class TestGetNodes:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -881,7 +856,7 @@ class TestGetNodes:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -897,7 +872,7 @@ class TestGetNodes:
     def test_null_sequence_sorted_last(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -907,7 +882,7 @@ class TestGetNodes:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="unsequenced",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -916,7 +891,7 @@ class TestGetNodes:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -942,7 +917,7 @@ class TestGetNodes:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
 
         factory.data_flow.register_node(
-            run_id="run-A",
+            coordination_token=leader_coordination_token(factory, "run-A"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -951,7 +926,7 @@ class TestGetNodes:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-B",
+            coordination_token=leader_coordination_token(factory, "run-B"),
             plugin_name="json",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -971,7 +946,7 @@ class TestGetNodes:
     def test_multiple_nodes_preserves_attributes(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -982,7 +957,7 @@ class TestGetNodes:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="gate",
             node_type=NodeType.GATE,
             plugin_version="2.0.0",
@@ -1008,7 +983,7 @@ class TestGetNodes:
         _db, factory = _setup()
         # Register multiple nodes with NULL sequence — order must be stable
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="pluginC",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1017,7 +992,7 @@ class TestGetNodes:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="pluginA",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1026,7 +1001,7 @@ class TestGetNodes:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="pluginB",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1059,7 +1034,7 @@ class TestGetEdges:
     def test_returns_all_edges_for_run(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -1068,7 +1043,7 @@ class TestGetEdges:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="xfm",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1077,7 +1052,7 @@ class TestGetEdges:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -1086,14 +1061,14 @@ class TestGetEdges:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="src",
             to_node_id="xfm",
             label="continue",
             mode=RoutingMode.MOVE,
         )
         factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="xfm",
             to_node_id="sink",
             label="continue",
@@ -1105,7 +1080,7 @@ class TestGetEdges:
     def test_empty_list_when_no_edges(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -1128,7 +1103,7 @@ class TestGetEdges:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
 
         factory.data_flow.register_node(
-            run_id="run-A",
+            coordination_token=leader_coordination_token(factory, "run-A"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -1137,7 +1112,7 @@ class TestGetEdges:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-A",
+            coordination_token=leader_coordination_token(factory, "run-A"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -1146,7 +1121,7 @@ class TestGetEdges:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_edge(
-            run_id="run-A",
+            coordination_token=leader_coordination_token(factory, "run-A"),
             from_node_id="src",
             to_node_id="sink",
             label="continue",
@@ -1161,7 +1136,7 @@ class TestGetEdges:
     def test_edges_ordered_by_creation(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -1170,7 +1145,7 @@ class TestGetEdges:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="xfm1",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1179,7 +1154,7 @@ class TestGetEdges:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="xfm2",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1188,7 +1163,7 @@ class TestGetEdges:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -1197,21 +1172,21 @@ class TestGetEdges:
             schema_config=_DYNAMIC_SCHEMA,
         )
         edge_1 = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="src",
             to_node_id="xfm1",
             label="continue",
             mode=RoutingMode.MOVE,
         )
         edge_2 = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="xfm1",
             to_node_id="xfm2",
             label="continue",
             mode=RoutingMode.MOVE,
         )
         edge_3 = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="xfm2",
             to_node_id="sink",
             label="continue",
@@ -1233,7 +1208,7 @@ class TestGetEdge:
     def test_roundtrip(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -1242,7 +1217,7 @@ class TestGetEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -1251,7 +1226,7 @@ class TestGetEdge:
             schema_config=_DYNAMIC_SCHEMA,
         )
         original = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="src",
             to_node_id="sink",
             label="continue",
@@ -1288,7 +1263,7 @@ class TestGetEdgeMap:
     def test_returns_correct_mapping(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="gate",
             node_type=NodeType.GATE,
             plugin_version="1.0.0",
@@ -1297,7 +1272,7 @@ class TestGetEdgeMap:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink_a",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -1306,7 +1281,7 @@ class TestGetEdgeMap:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink_b",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -1315,14 +1290,14 @@ class TestGetEdgeMap:
             schema_config=_DYNAMIC_SCHEMA,
         )
         edge_a = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="gate",
             to_node_id="sink_a",
             label="high_risk",
             mode=RoutingMode.MOVE,
         )
         edge_b = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="gate",
             to_node_id="sink_b",
             label="low_risk",
@@ -1347,7 +1322,7 @@ class TestGetEdgeMap:
     def test_multiple_source_nodes_with_different_labels(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -1356,7 +1331,7 @@ class TestGetEdgeMap:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="gate",
             node_type=NodeType.GATE,
             plugin_version="1.0.0",
@@ -1365,7 +1340,7 @@ class TestGetEdgeMap:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="xfm",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1374,7 +1349,7 @@ class TestGetEdgeMap:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -1383,21 +1358,21 @@ class TestGetEdgeMap:
             schema_config=_DYNAMIC_SCHEMA,
         )
         e1 = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="src",
             to_node_id="gate",
             label="continue",
             mode=RoutingMode.MOVE,
         )
         e2 = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="gate",
             to_node_id="xfm",
             label="continue",
             mode=RoutingMode.MOVE,
         )
         e3 = factory.data_flow.register_edge(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             from_node_id="gate",
             to_node_id="sink",
             label="escalate",
@@ -1421,7 +1396,7 @@ class TestGetNodeContracts:
     def test_returns_none_none_when_no_contracts_set(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -1447,7 +1422,7 @@ class TestGetNodeContracts:
     def test_crashes_for_unknown_run_by_default(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -1461,7 +1436,7 @@ class TestGetNodeContracts:
     def test_returns_none_none_for_unknown_run_when_allowed(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -1484,7 +1459,7 @@ class TestGetNodeContracts:
             locked=True,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1505,7 +1480,7 @@ class TestGetNodeContracts:
             locked=True,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1531,7 +1506,7 @@ class TestGetNodeContracts:
             locked=True,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1556,7 +1531,7 @@ class TestGetNodeContracts:
             locked=True,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1585,7 +1560,7 @@ class TestUpdateNodeOutputContract:
     def test_sets_output_contract_on_node_without_one(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -1604,7 +1579,9 @@ class TestUpdateNodeOutputContract:
             ),
             locked=True,
         )
-        factory.data_flow.update_node_output_contract("run-1", "src", new_contract)
+        factory.data_flow.update_node_output_contract(
+            "src", new_contract, member_token=leader_coordination_token(factory, "run-1").membership
+        )
 
         _, out = factory.data_flow.get_node_contracts("run-1", "src")
         assert out is not None
@@ -1617,7 +1594,7 @@ class TestUpdateNodeOutputContract:
             locked=True,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1642,7 +1619,7 @@ class TestUpdateNodeOutputContract:
             locked=True,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1660,7 +1637,9 @@ class TestUpdateNodeOutputContract:
 
         event.listen(db.engine, "before_cursor_execute", capture_update)
         try:
-            factory.data_flow.update_node_output_contract("run-1", "xfm", contract)
+            factory.data_flow.update_node_output_contract(
+                "xfm", contract, member_token=leader_coordination_token(factory, "run-1").membership
+            )
         finally:
             event.remove(db.engine, "before_cursor_execute", capture_update)
 
@@ -1674,7 +1653,7 @@ class TestUpdateNodeOutputContract:
             locked=True,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1691,12 +1670,14 @@ class TestUpdateNodeOutputContract:
             )
 
         with pytest.raises(AuditIntegrityError, match="output contract hash mismatch"):
-            factory.data_flow.update_node_output_contract("run-1", "xfm", contract)
+            factory.data_flow.update_node_output_contract(
+                "xfm", contract, member_token=leader_coordination_token(factory, "run-1").membership
+            )
 
     def test_rejects_hash_without_output_contract_json(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1713,16 +1694,16 @@ class TestUpdateNodeOutputContract:
 
         with pytest.raises(AuditIntegrityError, match="hash exists without JSON"):
             factory.data_flow.update_node_output_contract(
-                "run-1",
                 "xfm",
                 _make_contract(fields=(_make_field("id", int),), locked=True),
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
     def test_update_compare_and_swaps_on_stored_hash(self) -> None:
         db, factory = _setup()
         original = _make_contract(fields=(_make_field("id", int),), locked=True)
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1740,9 +1721,9 @@ class TestUpdateNodeOutputContract:
         event.listen(db.engine, "before_cursor_execute", capture_update)
         try:
             factory.data_flow.update_node_output_contract(
-                "run-1",
                 "xfm",
                 _make_contract(fields=(_make_field("extra", str),), locked=True),
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
         finally:
             event.remove(db.engine, "before_cursor_execute", capture_update)
@@ -1766,7 +1747,7 @@ class TestUpdateNodeOutputContract:
             )
             base = _make_contract(fields=(_make_field("base", int),), locked=True)
             first.data_flow.register_node(
-                run_id="run-1",
+                coordination_token=leader_coordination_token(first, "run-1"),
                 plugin_name="mapper",
                 node_type=NodeType.TRANSFORM,
                 plugin_version="1.0.0",
@@ -1781,7 +1762,9 @@ class TestUpdateNodeOutputContract:
             def update(factory: RecorderFactory, contract: SchemaContract) -> None:
                 try:
                     barrier.wait(timeout=5)
-                    factory.data_flow.update_node_output_contract("run-1", "xfm", contract)
+                    factory.data_flow.update_node_output_contract(
+                        "xfm", contract, member_token=leader_coordination_token(factory, "run-1").membership
+                    )
                 except BaseException as exc:  # pragma: no cover - asserted below
                     failures.append(exc)
 
@@ -1812,7 +1795,7 @@ class TestUpdateNodeOutputContract:
         db, factory = _setup()
         original = _make_contract(fields=(_make_field("id", int),), locked=True)
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1822,12 +1805,17 @@ class TestUpdateNodeOutputContract:
             schema_config=_DYNAMIC_SCHEMA,
         )
 
-        with pytest.raises(ContractMergeError, match="id"):
+        # A node's emissions carry one declared type per field (ADR-050), so
+        # an emission typing a recorded field differently is a bug in owned
+        # code: the writer re-raises the neutral ContractMergeError as
+        # FrameworkBugError, value-free (the field and the two type names).
+        with pytest.raises(FrameworkBugError, match="'id' has conflicting types 'int' and 'str'") as raised:
             factory.data_flow.update_node_output_contract(
-                "run-1",
                 "xfm",
                 _make_contract(fields=(_make_field("id", str),), locked=True),
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
+        assert isinstance(raised.value.__cause__, ContractMergeError)
 
         _, stored = factory.data_flow.get_node_contracts("run-1", "xfm")
         assert stored == original
@@ -1845,7 +1833,7 @@ class TestUpdateNodeOutputContract:
             locked=True,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1866,7 +1854,9 @@ class TestUpdateNodeOutputContract:
             ),
             locked=True,
         )
-        factory.data_flow.update_node_output_contract("run-1", "xfm", updated_contract)
+        factory.data_flow.update_node_output_contract(
+            "xfm", updated_contract, member_token=leader_coordination_token(factory, "run-1").membership
+        )
 
         _, out_after = factory.data_flow.get_node_contracts("run-1", "xfm")
         assert out_after is not None
@@ -1890,7 +1880,7 @@ class TestUpdateNodeOutputContract:
             locked=True,
         )
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -1907,7 +1897,9 @@ class TestUpdateNodeOutputContract:
             fields=(_make_field("y", str),),
             locked=True,
         )
-        factory.data_flow.update_node_output_contract("run-1", "xfm", output_contract)
+        factory.data_flow.update_node_output_contract(
+            "xfm", output_contract, member_token=leader_coordination_token(factory, "run-1").membership
+        )
 
         inp_after, out_after = factory.data_flow.get_node_contracts("run-1", "xfm")
         assert inp_after is not None
@@ -1919,7 +1911,7 @@ class TestUpdateNodeOutputContract:
     def test_roundtrip_preserves_updated_fields(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -1936,7 +1928,7 @@ class TestUpdateNodeOutputContract:
             ),
             locked=True,
         )
-        factory.data_flow.update_node_output_contract("run-1", "src", contract)
+        factory.data_flow.update_node_output_contract("src", contract, member_token=leader_coordination_token(factory, "run-1").membership)
 
         _, out = factory.data_flow.get_node_contracts("run-1", "src")
         assert out is not None
@@ -1947,3 +1939,105 @@ class TestUpdateNodeOutputContract:
         assert "alpha" in field_names
         assert "beta" in field_names
         assert "gamma" in field_names
+
+
+class TestResumeAcrossTheDeclarationChange:
+    """ADR-050 T13: a run recorded BEFORE the declaration change meets the new stamp on resume.
+
+    Its node record says ``T, source: inferred`` (what per-emission inference
+    wrote). There is no refusal and no compatibility shim by design, and the
+    node writer raises on a TYPE difference only, so the outcome depends on
+    the field (ADR-050 §Negative): where the declaration changed the type
+    (``int`` recorded, ``object`` declared) the resume ends at that node's
+    evolution with ``FrameworkBugError``; where the declared type equals the
+    recorded one the emission folds and the record's ``source`` flips
+    ``inferred`` → ``declared``. The implementation-compatibility check
+    cannot refuse either earlier, because a base-class change moves none of
+    the per-node evidence it compares.
+    """
+
+    def test_a_pre_change_record_aborts_at_the_first_stamped_emission(self) -> None:
+        db, factory = _setup()
+        # Fields in normalized-name order: the record round-trips sorted, and
+        # the preserved-record assertion below compares whole contracts.
+        pre_change = _make_contract(
+            mode="OBSERVED",
+            fields=(
+                FieldContract(normalized_name="copies", original_name="copies", python_type=int, required=False, source="inferred"),
+                FieldContract(normalized_name="id", original_name="id", python_type=int, required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            plugin_name="value_transform",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0.0",
+            config={},
+            node_id="xfm",
+            output_contract=pre_change,
+            schema_config=_DYNAMIC_SCHEMA,
+        )
+        post_change = _make_contract(
+            mode="OBSERVED",
+            fields=(
+                FieldContract(
+                    normalized_name="copies", original_name="copies", python_type=object, required=True, source="declared", nullable=True
+                ),
+                FieldContract(normalized_name="id", original_name="id", python_type=int, required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        # A declared ``any`` field's contract type is ``object``; the conflict
+        # names it ``any``, the schema vocabulary (G2, 4bb77fbd5).
+        with pytest.raises(FrameworkBugError, match="'copies' has conflicting types 'int' and 'any'"):
+            factory.data_flow.update_node_output_contract(
+                "xfm", post_change, member_token=leader_coordination_token(factory, "run-1").membership
+            )
+        _, stored = factory.data_flow.get_node_contracts("run-1", "xfm")
+        assert stored == pre_change
+        db.close()
+
+    def test_a_pre_change_record_whose_type_matches_folds_with_source_declared(self) -> None:
+        """Measured, not refused: an equal type folds and only the recorded ``source`` changes."""
+        db, factory = _setup()
+        pre_change = _make_contract(
+            mode="OBSERVED",
+            fields=(
+                FieldContract(normalized_name="item_index", original_name="item_index", python_type=int, required=False, source="inferred"),
+            ),
+            locked=True,
+        )
+        factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            plugin_name="json_explode",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0.0",
+            config={},
+            node_id="xfm",
+            output_contract=pre_change,
+            schema_config=_DYNAMIC_SCHEMA,
+        )
+        post_change = _make_contract(
+            mode="OBSERVED",
+            fields=(
+                FieldContract(normalized_name="item_index", original_name="item_index", python_type=int, required=True, source="declared"),
+            ),
+            locked=True,
+        )
+        factory.data_flow.update_node_output_contract(
+            "xfm", post_change, member_token=leader_coordination_token(factory, "run-1").membership
+        )
+        _, stored = factory.data_flow.get_node_contracts("run-1", "xfm")
+        assert stored is not None
+        assert [(fc.normalized_name, fc.python_type, fc.source) for fc in stored.fields] == [("item_index", int, "declared")]
+        assert stored.version_hash() != pre_change.version_hash()
+        db.close()
+
+    def test_the_implementation_compatibility_check_cannot_refuse_it(self) -> None:
+        """Measured: the per-node evidence compared on resume has no base-class hash."""
+        from dataclasses import fields as dataclass_fields
+
+        from elspeth.engine.orchestrator.landscape_registration import NodeAuditMetadata
+
+        assert {field.name for field in dataclass_fields(NodeAuditMetadata)} == {"plugin_version", "determinism", "source_file_hash"}

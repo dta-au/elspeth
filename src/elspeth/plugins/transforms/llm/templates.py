@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from jinja2 import TemplateSyntaxError, UndefinedError
-from jinja2.exceptions import SecurityError, TemplateRuntimeError
+from jinja2 import TemplateSyntaxError
 
-from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.canonical import canonical_json
-from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment
+from elspeth.plugins.infrastructure.templates import (
+    SandboxedTemplate,
+    TemplateError,
+    TemplateRow,
+    template_row_values,
+    withheld_error_detail,
+)
 
 if TYPE_CHECKING:
     from elspeth.contracts.schema_contract import SchemaContract
@@ -50,6 +53,12 @@ class PromptTemplate:
         - {{ row.field_name }} - access row fields
         - {{ lookup.key }} - access lookup data
 
+    A row reaches the template as a ``TemplateRow``: the field values its node
+    declares in ``required_input_fields`` only (the whole row under the ``[]``
+    opt-out), readable by normalized or original name, with ``row.get(name)``
+    as the one method. The row object, its schema contract, their API and any
+    undeclared field are not reachable from a template (ADR-051).
+
     Example:
         template = PromptTemplate(
             '''
@@ -69,7 +78,7 @@ class PromptTemplate:
 
         # result.prompt = rendered string
         # result.template_hash = hash of template
-        # result.variables_hash = hash of row data
+        # result.variables_hash = hash of what the template could see of the row
         # result.rendered_hash = hash of final prompt
         # result.lookup_hash = hash of lookup data
     """
@@ -106,11 +115,8 @@ class PromptTemplate:
         self._lookup_source = lookup_source
         self._lookup_hash = _sha256(canonical_json(lookup_snapshot)) if lookup_snapshot is not None else None
 
-        # Use sandboxed environment for security
-        self._env = create_sandboxed_environment()
-
         try:
-            self._template = self._env.from_string(template_string)
+            self._template = SandboxedTemplate(template_string)
         except TemplateSyntaxError as e:
             raise TemplateError(f"Invalid template syntax: {e}") from e
 
@@ -134,60 +140,33 @@ class PromptTemplate:
         """File path for lookup data, or None."""
         return self._lookup_source
 
-    def render(
-        self,
-        row: dict[str, Any] | PipelineRow,
-        *,
-        contract: SchemaContract | None = None,
-    ) -> str:
+    def render(self, row: TemplateRow | dict[str, Any]) -> str:
         """Render template with row data.
 
         Args:
-            row: Row data (dict or PipelineRow, accessed as row.* in template)
-            contract: Optional schema contract for dual-name resolution.
-                If provided, templates can use original names like
-                {{ row["'Amount USD'"] }} in addition to normalized names.
+            row: What the template sees as ``row``: a ``TemplateRow``
+                (``TemplateRow.project(pipeline_row, projection)`` — the row's
+                declared fields only, by either spelling), or a mapping of
+                template variables such as a multi-query query's context
+                (``QuerySpec.build_template_context``). A ``PipelineRow`` is
+                never passed: the packer refuses it as a framework bug.
 
         Returns:
             Rendered prompt string
 
         Raises:
-            TemplateError: If rendering fails (undefined variable, sandbox violation, etc.)
+            TemplateError: If rendering fails (undefined variable, a read of an
+                undeclared field, sandbox violation, etc.)
         """
-        # Use PipelineRow directly when provided; otherwise wrap dict for
-        # dual-name access only when contract is explicitly supplied.
-        row_context: Any
-        if isinstance(row, PipelineRow):
-            row_context = row
-        elif contract is not None:
-            row_context = PipelineRow(row, contract)
-        else:
-            row_context = row
-
-        # Build context with namespaced data
         context: dict[str, Any] = {
-            "row": row_context,
+            "row": row,
             "lookup": self._lookup_data if self._lookup_data is not None else {},
         }
-
-        return self._render_context(context)
-
-    def _render_context(self, context: Mapping[str, Any]) -> str:
-        """Render an explicit template context through the shared sandbox."""
-        try:
-            return self._template.render(**context)
-        except UndefinedError as e:
-            raise TemplateError(f"Undefined variable: {e}") from e
-        except SecurityError as e:
-            raise TemplateError(f"Sandbox violation: {e}") from e
-        except (TemplateSyntaxError, TemplateRuntimeError, ArithmeticError, TypeError, ValueError) as e:
-            raise TemplateError(f"Template rendering failed: {e}") from e
+        return self._template.render(**context)
 
     def render_static_with_metadata(self) -> RenderedPrompt:
         """Render a source prompt with lookup data and no row binding."""
-        prompt = self._render_context(
-            {"lookup": self._lookup_data if self._lookup_data is not None else {}},
-        )
+        prompt = self._template.render(lookup=self._lookup_data if self._lookup_data is not None else {})
         return RenderedPrompt(
             prompt=prompt,
             template_hash=self._template_hash,
@@ -201,36 +180,45 @@ class PromptTemplate:
 
     def render_with_metadata(
         self,
-        row: dict[str, Any] | PipelineRow,
+        row: TemplateRow | dict[str, Any],
         *,
         contract: SchemaContract | None = None,
     ) -> RenderedPrompt:
         """Render template and return with audit metadata.
 
         Args:
-            row: Row data (dict or PipelineRow, accessed as row.* in template)
-            contract: Optional schema contract for dual-name resolution.
-                If provided, templates can use original names and the
-                contract hash will be included in the returned metadata.
+            row: What the template sees as ``row`` (see ``render``).
+            contract: The row's schema contract, hashed into
+                ``contract_hash`` when given. It does not change what the
+                template sees.
 
         Returns:
-            RenderedPrompt with prompt string and all hashes
+            RenderedPrompt with prompt string and all hashes. ``variables_hash``
+            is the hash of exactly what the template could see: a projected
+            row's declared field values (ADR-051), not the whole row.
 
         Raises:
-            TemplateError: If rendering fails or row contains non-canonicalizable values
-                (e.g., NaN, Infinity)
+            TemplateError: If rendering fails or a visible value is not
+                canonicalizable (e.g., NaN, Infinity)
         """
-        prompt = self.render(row, contract=contract)
+        prompt = self.render(row)
 
-        # Compute variables hash using canonical JSON (row data only)
-        # Always hash the raw row data (normalized keys) for determinism
-        row_for_hash = row.to_dict() if isinstance(row, PipelineRow) else row
+        # The variables hash covers what the template could see: a projected
+        # row's declared values (normalized keys), never an undeclared column;
+        # a query context (``QuerySpec.build_template_context``) contributes
+        # its variables, its nested ``source_row`` likewise projected.
+        row_for_hash = (
+            template_row_values(row)
+            if type(row) is TemplateRow
+            else {key: template_row_values(value) if type(value) is TemplateRow else value for key, value in row.items()}
+        )
         # Wrap ValueError/TypeError from canonical_json (NaN/Infinity rejection, non-serializable types)
-        # This ensures row-scoped failures don't crash the entire run (Tier 2 trust model)
+        # This ensures row-scoped failures don't crash the entire run (Tier 2 trust model).
+        # The canonicalizer's own message quotes the offending value, so only its type is kept.
         try:
             variables_hash = _sha256(canonical_json(row_for_hash))
         except (ValueError, TypeError) as e:
-            raise TemplateError(f"Cannot compute variables hash: {e}") from e
+            raise TemplateError(f"Cannot compute variables hash: {withheld_error_detail(e)}") from e
 
         # Compute rendered prompt hash
         rendered_hash = _sha256(prompt)

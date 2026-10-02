@@ -26,6 +26,13 @@
 > Tukey upper fence (`q3 + 3×IQR`) ≤ 50 µs. This note reports current
 > enforcement without rewriting the criterion accepted in this ADR.
 
+> **Current implementation note (2026-09-26).** §Decision step 1's
+> `input_fields = frozenset(input_row.contract.fields)` has not been the
+> derivation since `08b6d4e27`. `derive_effective_input_fields` takes the
+> contract fields the input row's payload carries, so an optional field the
+> row lacks is not an input. The batch-flush site uses the same helper (see
+> ADR-009's 2026-09-26 note).
+
 ## Context
 
 ADR-007 establishes opt-in propagation declared via `BaseTransform.passes_through_input`. Static DAG analysis now trusts that declaration — the validator walks through annotated transforms and propagates predecessor guarantees downstream, mirroring runtime behaviour.
@@ -73,6 +80,25 @@ Without the registration: a transform with `on_error="quarantine_sink"` would ca
 > only. The sink and aggregation-flush seams record and re-raise regardless of
 > tier; whether `AggregationSettings.on_error` means anything is open.
 
+> **Correction 2026-09-23 (elspeth-d2e3f29d10).** The open question in limit
+> (2) above is closed for RETURNED errors: `AggregationSettings.on_error` is now
+> wired. The DAG builder adds the aggregation's `__error_<name>__` DIVERT edge
+> (refusing an unknown sink), and when a batch transform returns
+> `TransformResult.error` the whole batch follows it — every buffered row to the
+> named sink as `(failure, on_error_routed)`, or `(failure,
+> quarantined_at_source)` under `discard` — with one DIVERT routing_event on the
+> flush node_state and one `transform_errors` row per member. It is closed for
+> an unregistered `PluginContractViolation` too (operator ruling 2026-09-23,
+> elspeth-5887fb7928 B2): one raised at the aggregation or collector flush
+> before anything is recorded — the buffered-input schema preflight, the batch
+> plugin itself, the result's canonical hashing or its output checks — fails
+> the whole batch exactly as a returned error does (at a collector, the group
+> fails). Three things still abort: a `TIER_1_ERRORS` subclass (registration
+> stays load-bearing), the batch-flush declaration cross-check (it records each
+> member's terminal before raising), and any other exception from the plugin.
+> The sink seam still records and re-raises. The 2026-08-21 correction above is
+> left as written; this note supersedes only its last clause.
+
 ### Audit-recording path
 
 `NodeStateGuard.__exit__` (L2 engine) now populates the new `ExecutionError.context` field (L0 contract) from `PluginContractViolation.to_audit_dict()` when the raised exception is a `PluginContractViolation` or subclass. The `isinstance` check is a Tier-2/Tier-1 boundary discriminator — not defensive programming — and it benefits every `PluginContractViolation` subclass that defines `to_audit_dict()`, not just the pass-through case. The full 9-key structured payload (transform, transform_node_id, run_id, row_id, token_id, static_contract, runtime_observed, divergence_set, exception_type) reaches the Landscape and is queryable via `json_extract(error_data, '$.context.<key>')`.
@@ -96,7 +122,7 @@ discriminator via `AuditEvidenceBase` — no regression.
 
 ### Tier placement for cross-check data
 
-The cross-check crosses trust tiers. Each tier is explicit per CLAUDE.md's Three-Tier Trust Model:
+The cross-check crosses trust tiers. Each tier is explicit per the three-tier trust model (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model):
 
 | Input / Output | Tier | Handling |
 |---|---|---|
@@ -140,7 +166,7 @@ Future ADRs may extend the pattern. This ADR establishes the architectural templ
 
 ### Neutral Consequences
 
-- `NodeStateGuard.__exit__` gains an `isinstance(exc_val, PluginContractViolation)` discriminator. This is a Tier-2/Tier-1 boundary type-check, not defensive programming (CLAUDE.md permits `isinstance` at trust boundaries).
+- `NodeStateGuard.__exit__` gains an `isinstance(exc_val, PluginContractViolation)` discriminator. This is a Tier-2/Tier-1 boundary type-check, not defensive programming (the trust model permits `isinstance` at trust boundaries — docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
 - Landscape-unavailable failure mode: when DB recording itself fails, `__exit__` raises `AuditIntegrityError` chaining the original violation. Triage SQL filtering on `error_exception_type = 'PassThroughContractViolation'` returns zero rows in this scenario — the telemetry counter (incremented before the raise) is the reliable secondary signal. Documented in §Observability of the implementation plan.
 - Cross-check is skipped entirely when `transform.passes_through_input` is False. Non-annotated transforms pay exactly the cost of one attribute read per row — negligible.
 
@@ -184,5 +210,5 @@ parent-class change does not weaken it.
 - Decision and implementation record: commits `329213880` and `d22115c5c`
 - Companion ADR: `ADR-007: Pass-through contract propagation — declaration, semantics, and composer parity`
 - Related bug report: `elspeth-87f6d5dea5` (composer/runtime schema-contract divergence)
-- CLAUDE.md §Three-Tier Trust Model (tier boundary rules)
-- CLAUDE.md §Plugin Ownership (plugin bugs must crash)
+- docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model (tier boundary rules)
+- docs/guides/data-trust-and-error-handling.md §Plugin Ownership: System Code, Not User Code (plugin bugs must crash)

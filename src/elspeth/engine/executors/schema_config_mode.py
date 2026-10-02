@@ -161,7 +161,7 @@ def verify_schema_config_mode(
     allowed_declared_fields = _allowed_declared_fields(output_schema_config)
     required_output_fields = output_schema_config.get_effective_guaranteed_fields()
 
-    for emitted in emitted_rows:
+    for emitted_index, emitted in enumerate(emitted_rows):
         if emitted.contract is None:
             raise FrameworkBugError(f"Transform {plugin_name!r} emitted row with no contract. Framework invariant violated.")
 
@@ -200,6 +200,7 @@ def verify_schema_config_mode(
             continue
 
         payload: SchemaConfigModePayload = {
+            "emitted_index": emitted_index,
             "declared_mode": declared_mode,
             "observed_mode": observed_mode,
             "declared_locked": declared_locked,

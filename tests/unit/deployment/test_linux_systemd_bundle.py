@@ -38,7 +38,7 @@ def test_portable_service_uses_dedicated_identity_and_install_locations() -> Non
     assert "Group=elspeth" in lines
     assert "WorkingDirectory=/opt/elspeth" in lines
     assert "EnvironmentFile=/etc/elspeth/elspeth-web.env" in lines
-    assert "/home/john" not in _service_text()
+    assert "/home/" not in _service_text()
 
 
 def test_portable_service_creates_private_persistent_state() -> None:
@@ -63,6 +63,9 @@ def test_portable_service_retains_restart_and_hardening_contract() -> None:
     lines = _active_service_lines()
 
     assert "Restart=on-failure" in lines
+    # ProcessRecovery asks Uvicorn to drain through SIGTERM. Systemd otherwise
+    # considers that signal clean and on-failure would leave the service down.
+    assert "RestartForceExitStatus=SIGTERM" in lines
     expected_hardening = {
         "NoNewPrivileges=yes",
         "PrivateTmp=yes",
@@ -110,7 +113,9 @@ def test_linux_environment_example_sets_production_composer_limits() -> None:
 
     assert assignments["ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS"] == "15"
     assert assignments["ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS"] == "10"
-    assert assignments["ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS"] == "85"
+    assert assignments["ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS"] == "180"
+    assert assignments["ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS"] == "240"
+    assert assignments["ELSPETH_WEB__COMPOSER_TRANSPORT_HEADROOM_SECONDS"] == "30"
     assert assignments["ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE"] == "10"
 
 

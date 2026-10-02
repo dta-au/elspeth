@@ -12,8 +12,9 @@ import pytest
 import structlog
 from sqlalchemy import event, insert, select, update
 from sqlalchemy.engine import Connection, Engine, Transaction
+from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.conftest import _make_session
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.enums import CreationModality
@@ -31,8 +32,8 @@ from elspeth.web.sessions.models import (
     blobs_table,
     composer_completion_events_table,
     composition_states_table,
-    guided_operations_table,
     session_operation_fences_table,
+    session_operation_receipts_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import SessionArchiveDisposition
@@ -42,7 +43,9 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 @pytest.fixture
 def service(engine, tmp_path) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
+    return FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -261,7 +264,7 @@ async def test_fenced_mutation_cas_and_state_write_share_commit_or_rollback(serv
     completed_at = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
-            insert(guided_operations_table).values(
+            insert(session_operation_receipts_table).values(
                 session_id=str(fork_parent.id),
                 operation_id=str(uuid4()),
                 kind="session_fork",
@@ -270,7 +273,6 @@ async def test_fenced_mutation_cas_and_state_write_share_commit_or_rollback(serv
                 lease_token=None,
                 lease_expires_at=None,
                 attempt=1,
-                result_kind="session",
                 result_session_id=str(created.id),
                 response_hash="b" * 64,
                 created_at=completed_at,
@@ -550,7 +552,6 @@ def test_blob_reservation_facets_are_kind_and_operation_scoped(service, engine, 
                 record=pending,
                 max_storage_per_session=1024,
                 idempotent=False,
-                guided_operation_write_fence=None,
             ),
         )
     authority.release(read_context)
@@ -569,7 +570,6 @@ def test_blob_reservation_facets_are_kind_and_operation_scoped(service, engine, 
             record=pending,
             max_storage_per_session=1024,
             idempotent=False,
-            guided_operation_write_fence=None,
         ),
     )
     authority.release(first)
@@ -584,7 +584,6 @@ def test_blob_reservation_facets_are_kind_and_operation_scoped(service, engine, 
             second,
             lambda transaction: transaction.blobs.mark_blob_ready(
                 blob_id=blob_id,
-                guided_operation_write_fence=None,
             ),
         )
     assert (
@@ -592,7 +591,6 @@ def test_blob_reservation_facets_are_kind_and_operation_scoped(service, engine, 
             second,
             lambda transaction: transaction.blobs.discard_pending_blob(
                 blob_id=blob_id,
-                guided_operation_write_fence=None,
             ),
         )
         is False
@@ -642,9 +640,8 @@ def test_fork_transaction_constructor_failure_does_not_leak_registry_entry(engin
     with engine.begin() as conn, pytest.raises(TypeError):
         coordination_repository._ForkCreationTransaction(
             conn,
-            parent_session_id=str(uuid4()),
-            child_session_id=str(uuid4()),
-            guided_operation=object(),  # type: ignore[arg-type]
+            fork_authority=object(),
+            receipt=object(),
             database_now=datetime.now(UTC),
             child_created=True,
         )

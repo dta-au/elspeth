@@ -42,11 +42,12 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationEventRecord,
     InterpretationKind,
     InterpretationSource,
+    InterpretationSurfaceOrigin,
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.proposals import build_tool_proposal_summary
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import REQUEST_INTERPRETATION_REVIEW_KIND_VALUES, ToolArgumentError
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -91,7 +92,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
 # Fixtures
@@ -106,12 +107,16 @@ def engine():
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
+    from tests.fixtures.identities import ensure_test_identity
+
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return eng
 
 
 @pytest.fixture
 def service(engine) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -453,9 +458,10 @@ async def _fake_create_pending_interpretation_event(**kwargs: Any) -> Interpreta
         arguments_hash=None,
         hash_domain_version=None,
         interpretation_source=InterpretationSource.USER_APPROVED,
+        surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
         runtime_model_identifier_at_resolve=None,
         runtime_model_version_at_resolve=None,
-        resolved_prompt_template_hash=None,
+        approved_prompt_artifact_hash=None,
     )
 
 
@@ -1781,6 +1787,17 @@ async def test_request_interpretation_review_rejects_prompt_template_kind() -> N
     assert "backend" in message.lower()
     assert "finalization" in message.lower()
 
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+    assistance = LLMTransform.get_agent_assistance()
+    assert assistance is not None
+    hints = " ".join(assistance.composer_hints)
+    assert "backend automatically stages and surfaces llm_prompt_template" in hints
+    assert "do not author or request that review" in hints
+    assert "stage an llm_prompt_template review" not in hints
+    assert "put both interpretation_requirements" not in hints
+    assert "carry forward existing pending LLM interpretation requirements" in hints
+
 
 @pytest.mark.asyncio
 async def test_request_interpretation_review_vague_term_still_rejects_jinja_metacharacters(
@@ -2155,20 +2172,21 @@ async def test_12_llm_draft_metacharacters_raise_no_db_write(service: SessionSer
 # --------------------------------------------------------------------------- #
 
 
-def test_07_proposal_summary_text() -> None:
+@pytest.mark.parametrize("kind", REQUEST_INTERPRETATION_REVIEW_KIND_VALUES)
+def test_07_proposal_summary_text(kind: str) -> None:
     """Spec test 7: build_tool_proposal_summary returns the expected text
     and ``affects=('interpretation',)``."""
     summary = build_tool_proposal_summary(
         tool_name="request_interpretation_review",
         arguments={
             "affected_node_id": "rate_node",
-            "kind": "vague_term",
+            "kind": kind,
             "user_term": "cool",
             "llm_draft": "Visually appealing.",
         },
         redacted_arguments={
             "affected_node_id": "rate_node",
-            "kind": "vague_term",
+            "kind": kind,
             "user_term": "cool",
             "llm_draft": "Visually appealing.",
         },
@@ -2176,7 +2194,10 @@ def test_07_proposal_summary_text() -> None:
     assert summary.summary == "Surface an interpretation draft for user review."
     assert "cool" not in summary.summary
     assert summary.affects == ("interpretation",)
-    assert "subjective" in summary.rationale.lower() or "underspecified" in summary.rationale.lower()
+    assert "interpretation or assumption" in summary.rationale
+    assert "accepted into the pipeline" in summary.rationale
+    assert "subjective" not in summary.rationale
+    assert "prompt template" not in summary.rationale
 
 
 # --------------------------------------------------------------------------- #
@@ -3575,6 +3596,15 @@ async def test_omitted_draft_resolves_staged_invented_source_draft(
     rows = await service.list_interpretation_events(session_id, status="pending")
     assert len(rows) == 1
     assert rows[0].llm_draft == draft
+
+    from elspeth.plugins.sources.csv_source import CSVSource
+
+    assistance = CSVSource.get_agent_assistance()
+    assert assistance is not None
+    hints = " ".join(assistance.composer_hints)
+    assert "omit llm_draft" in hints
+    assert "server uses the exact staged source draft" in hints
+    assert "llm_draft equal to the exact CSV text" not in hints
 
 
 @pytest.mark.asyncio

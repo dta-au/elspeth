@@ -1,7 +1,7 @@
 """Regenerate the Foundation-knowledge tool-inventory bullets in the composer skill.
 
 Closes the skill-markdown growth surface diagnosed in ``elspeth-6c9972ccbf``
-Step 5 falsification (filigree comment 1468): adding a new composer tool
+Step 5 falsification (archived tracker comment 1468): adding a new composer tool
 previously required hand-editing
 ``src/elspeth/web/composer/skills/pipeline_composer.md`` to enumerate the
 tool in its Foundation-knowledge category bullet, in addition to declaring

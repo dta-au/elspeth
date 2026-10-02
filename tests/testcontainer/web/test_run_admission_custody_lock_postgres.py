@@ -35,7 +35,9 @@ from typing import Any
 import pytest
 import structlog
 from sqlalchemy import Engine, event
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.postgres_target import postgres_test_target
+from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer.test_tools import _empty_state, _insert_user_message, _trained_tool_context
 
 from elspeth.contracts.blobs import BlobActiveRunError, BlobNotFoundError, BlobRecord
@@ -130,11 +132,15 @@ async def _operation(service: SessionServiceImpl, session_id: uuid.UUID, kind: S
 async def _seed_session_with_blob(
     service: SessionServiceImpl,
     blob_service: BlobServiceImpl,
+    engine: Engine,
     *,
     reference_blob: bool,
 ) -> tuple[Any, Any, BlobRecord]:
     """One session, one blob, and one saved state that does or does not reference it."""
-    session = await service.create_session(f"alice-{uuid.uuid4().hex[:8]}", "Lock domain", "local")
+    owner_id = f"alice-{uuid.uuid4().hex[:8]}"
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=owner_id)
+    session = await service.create_session(owner_id, "Lock domain", "local")
     async with _operation(service, session.id, SessionOperationKind.CREATE) as create:
         blob = await blob_service.create_blob(session.id, "tickets.csv", _BLOB_CONTENT, "text/csv", session_operation_context=create)
     sources = {
@@ -232,7 +238,7 @@ def test_create_run_waits_for_session_custody_lock_postgres(
 ) -> None:
     """The bare custody lock excludes run admission (the original 3d1d1fcb6c proof)."""
     service = postgres_service
-    session, state, _blob = asyncio.run(_seed_session_with_blob(service, blob_service, reference_blob=False))
+    session, state, _blob = asyncio.run(_seed_session_with_blob(service, blob_service, postgres_engine, reference_blob=False))
 
     lock_held = threading.Event()
     release = threading.Event()
@@ -294,7 +300,7 @@ def test_delete_blob_past_its_guard_excludes_run_admission_on_another_replica(
     commit after the delete commits — never inside the guard window.
     """
     service = postgres_service
-    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, reference_blob=True))
+    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, postgres_engine, reference_blob=True))
 
     parked, release, park_listener = _park_after_statement(postgres_engine, "INSERT INTO blob_deletion_cleanups")
     attempted, backend, probe_listener = _install_advisory_lock_probe(second_engine)
@@ -358,10 +364,11 @@ def test_update_blob_past_its_guard_excludes_run_admission_on_another_replica(
     second_engine: Engine,
     second_service: SessionServiceImpl,
     blob_service: BlobServiceImpl,
+    tmp_path: Path,
 ) -> None:
     """update-vs-run: same proof through the composer's update_blob custody transaction."""
     service = postgres_service
-    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, reference_blob=True))
+    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, postgres_engine, reference_blob=True))
     new_content = "id,value\n1,beta\n"
     message_content = f"Use this exact content:\n{new_content}"
     user_message_id = _insert_user_message(postgres_engine, str(session.id), message_content)
@@ -374,18 +381,22 @@ def test_update_blob_past_its_guard_excludes_run_admission_on_another_replica(
 
     def update_blob() -> None:
         try:
-            update_outcome.append(
-                _execute_update_blob(
-                    {"blob_id": str(blob.id), "content": new_content},
-                    _empty_state(),
-                    _trained_tool_context(
-                        session_engine=postgres_engine,
-                        session_id=str(session.id),
-                        user_message_id=user_message_id,
-                        user_message_content=message_content,
-                    ),
+            with fenced_operation_context(postgres_engine, session.id) as compose:
+                update_outcome.append(
+                    _execute_update_blob(
+                        {"blob_id": str(blob.id), "content": new_content},
+                        _empty_state(),
+                        _trained_tool_context(
+                            data_dir=str(tmp_path),
+                            session_engine=postgres_engine,
+                            session_id=str(session.id),
+                            session_operation_context=compose,
+                            session_operation_authority=service.session_operation_authority,
+                            user_message_id=user_message_id,
+                            user_message_content=message_content,
+                        ),
+                    )
                 )
-            )
         except BaseException as exc:
             update_outcome.append(exc)
             parked.set()
@@ -416,11 +427,16 @@ def test_update_blob_past_its_guard_excludes_run_admission_on_another_replica(
 
     assert run_created.wait(timeout=15)
     runner.join(timeout=15)
-    assert failures == []
+    # The queued admission acquires the session lock before the update has
+    # released its COMPOSE operation, so it must refuse that live fence.
+    # Admission can succeed after the complete replacement operation ends.
+    assert [type(exc) for exc in failures] == [SessionOperationConflictError], failures
     assert len(update_outcome) == 1
     result = update_outcome[0]
     assert not isinstance(result, BaseException), result
     assert result.success is True, result.to_dict()
+    run = _admit_run(second_service, session.id, state.id)
+    assert run.status == "pending"
     updated = asyncio.run(_get_blob(second_service, blob_service, session.id, blob.id))
     assert updated is not None
     assert Path(updated.storage_path).read_bytes() == new_content.encode()
@@ -434,10 +450,11 @@ def test_run_admitted_first_is_observed_by_blob_delete_and_update(
     postgres_service: SessionServiceImpl,
     second_service: SessionServiceImpl,
     blob_service: BlobServiceImpl,
+    tmp_path: Path,
 ) -> None:
     """The mirror order: a committed pending run is visible to both guards on the other replica."""
     service = postgres_service
-    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, reference_blob=True))
+    session, state, blob = asyncio.run(_seed_session_with_blob(service, blob_service, postgres_engine, reference_blob=True))
     run = _admit_run(second_service, session.id, state.id)
     assert run.status == "pending"
 
@@ -447,15 +464,20 @@ def test_run_admitted_first_is_observed_by_blob_delete_and_update(
     new_content = "id,value\n1,gamma\n"
     message_content = f"Use this exact content:\n{new_content}"
     user_message_id = _insert_user_message(postgres_engine, str(session.id), message_content)
-    result = _execute_update_blob(
-        {"blob_id": str(blob.id), "content": new_content},
-        _empty_state(),
-        _trained_tool_context(
-            session_engine=postgres_engine,
-            session_id=str(session.id),
-            user_message_id=user_message_id,
-            user_message_content=message_content,
-        ),
-    )
+    with fenced_operation_context(postgres_engine, session.id) as compose:
+        result = _execute_update_blob(
+            {"blob_id": str(blob.id), "content": new_content},
+            _empty_state(),
+            _trained_tool_context(
+                data_dir=str(tmp_path),
+                session_engine=postgres_engine,
+                session_id=str(session.id),
+                session_operation_context=compose,
+                session_operation_authority=service.session_operation_authority,
+                user_message_id=user_message_id,
+                user_message_content=message_content,
+            ),
+        )
     assert result.success is False, result.to_dict()
+    assert result.validation.errors[0].message == str(BlobActiveRunError(str(blob.id), run_id=str(run.id)))
     assert Path(blob.storage_path).read_bytes() == _BLOB_CONTENT

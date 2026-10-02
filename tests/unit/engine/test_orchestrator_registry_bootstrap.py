@@ -29,6 +29,7 @@ import pytest
 # reloading that module replays every production contract registration in one
 # place.
 import elspeth.engine.executors.declaration_contract_bootstrap  # noqa: F401
+from tests.fixtures.audit_hashing import fake_sha256
 
 
 @pytest.fixture()
@@ -278,13 +279,14 @@ def test_bootstrap_passes_when_registry_exactly_matches_manifest(_isolate_both_r
     # Must not raise.
     prepare_for_run()
     assert declaration_registry_is_frozen()
-    assert len(EXPECTED_CONTRACT_SITES) == 7
+    assert len(EXPECTED_CONTRACT_SITES) == 8
     assert frozenset(EXPECTED_CONTRACT_SITES.keys()) == frozenset(
         {
             "passes_through_input",
             "declared_output_fields",
             "declared_required_fields",
             "schema_config_mode",
+            "output_declaration_completeness",
             "can_drop_rows",
             "source_guaranteed_fields",
             "sink_required_fields",
@@ -415,6 +417,9 @@ def test_resume_calls_prepare_for_run() -> None:
     prepare_for_run() call the registries are never frozen — leaving a window
     where register_declaration_contract() could succeed after bootstrap.
     """
+    from collections.abc import Callable
+    from typing import Never
+
     from elspeth.contracts import Checkpoint, ResumePoint
     from elspeth.engine.orchestrator import PipelineConfig
     from elspeth.engine.orchestrator import resume as resume_module
@@ -433,7 +438,15 @@ def test_resume_calls_prepare_for_run() -> None:
     def fake_prepare_for_run() -> None:
         calls.append("prepare_for_run")
 
-    def fake_reconstruct_resume_state(self, resume_point, payload_store, *, worker_id=None):  # type: ignore[no-untyped-def]
+    def fake_reconstruct_resume_state(
+        self: ResumeCoordinator,
+        resume_point: ResumePoint,
+        payload_store: MockPayloadStore,
+        *,
+        worker_id: str | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+        on_resume_point_refreshed: Callable[[ResumePoint], None] | None = None,
+    ) -> Never:
         assert calls == ["prepare_for_run"], (
             "Orchestrator.resume() must invoke prepare_for_run() before reconstructing resume state (ADR-010 §Decision 3)"
         )
@@ -469,7 +482,7 @@ def test_resume_calls_prepare_for_run() -> None:
                 runs_table.insert().values(
                     run_id="run-resume-bootstrap",
                     started_at=datetime.now(UTC),
-                    config_hash="cfg",
+                    config_hash=fake_sha256("cfg"),
                     settings_json="{}",
                     canonical_version="sha256-rfc8785-v1",
                     status=RunStatus.FAILED,
@@ -497,28 +510,30 @@ def test_resume_calls_prepare_for_run() -> None:
             "validate",
             lambda self, cp, graph: ResumeCheck(can_resume=True),
         )
+        # This unit isolates registry-bootstrap ordering; implementation
+        # compatibility is an earlier prerequisite, like topology above.
+        # Its real metadata refusal paths have dedicated compatibility tests.
+        monkeypatch.setattr(
+            resume_module,
+            "check_implementation_compatibility",
+            lambda factory, run_id, config, graph: ResumeCheck(can_resume=True),
+        )
         config = PipelineConfig(
             sources={"primary": as_source(ListSource([]))},
             transforms=[],
             sinks={"output": as_sink(CollectSink("output"))},
         )
 
-        # WS5 Task 2 (spec §8): the entry guard's group-satisfiability arm
-        # also runs BEFORE prepare_for_run, and it reads the graph's binding
-        # registry — so the graph stub must model that contract (no bound
-        # groups). A bare object() here fails the guard with AttributeError
-        # before the bootstrap ordering under test is ever reached.
-        from elspeth.core.dag.group_bindings import GroupBindingRegistry
-
-        class _EmptyBindingGraph:
-            def get_group_bindings(self) -> GroupBindingRegistry:
-                return GroupBindingRegistry(bindings=())
+        # Entry guards inspect graph nodes and group bindings before registry
+        # bootstrap. An owned empty graph supplies both real contracts while
+        # reconstruction remains the stop point for this ordering test.
+        from elspeth.core.dag import ExecutionGraph
 
         with pytest.raises(ReconstructReached):
             orchestrator.resume(
                 resume_point=resume_point,
                 config=config,
-                graph=_EmptyBindingGraph(),  # type: ignore[arg-type]
+                graph=ExecutionGraph(),
                 payload_store=MockPayloadStore(),
             )
     finally:

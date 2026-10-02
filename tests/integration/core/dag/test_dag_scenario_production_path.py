@@ -19,7 +19,6 @@ from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.dag import GraphValidationError
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter
 from elspeth.core.landscape.data_flow import tokens as data_flow_tokens
-from elspeth.core.landscape.scheduler import barrier as scheduler_barrier
 from elspeth.core.landscape.scheduler import dispositions as scheduler_dispositions
 from elspeth.core.landscape.scheduler import queue as scheduler_queue
 from elspeth.core.landscape.scheduler import work_items as scheduler_work_items
@@ -186,7 +185,6 @@ def _install_repeat_run_identity_order(monkeypatch: pytest.MonkeyPatch, *, rever
     monkeypatch.setattr(data_flow_tokens, "generate_id", _deterministic_token_id_factory())
     work_item_id = _ordered_work_item_id(reverse=reverse)
     monkeypatch.setattr(scheduler_queue, "make_work_item_id", work_item_id)
-    monkeypatch.setattr(scheduler_barrier, "make_work_item_id", work_item_id)
     monkeypatch.setattr(scheduler_work_items, "work_item_id", work_item_id)
 
     def ordered_ready_values(**kwargs: Any) -> dict[str, object]:
@@ -218,7 +216,7 @@ def _archive_repeat_run_files(case: HarnessCaseSpec, runtime_root: Path) -> Path
 def _portable_records(database_path: Path, run_id: str) -> list[dict[str, Any]]:
     db = LandscapeDB(f"sqlite:///{database_path}")
     try:
-        return list(LandscapeExporter(db).export_run(run_id))
+        return list(LandscapeExporter(db, compartment_id="dag-corpus").export_run(run_id))
     finally:
         db.close()
 
@@ -857,8 +855,6 @@ def test_b2_coalesce_failure_and_collision_cases_declare_exact_run_oracles(
     if case_id == "union-collision-fail":
         assert isinstance(case.expected, RunExpectation)
         assert case.expected.status == "failed"
-        assert case.expected.expected_error is not None
-        assert case.expected.expected_error.exception_type == "CoalesceCollisionError"
     else:
         assert isinstance(case.expected, SemanticRunExpectation)
 
@@ -927,11 +923,23 @@ def test_b2_coalesce_full_matrix_declares_exact_contracts(tmp_path: Path) -> Non
             if collision_policy == "fail":
                 assert isinstance(case.expected, RunExpectation)
                 projection = case.expected.projection
-                assert case.expected.status == "failed"
-                assert case.expected.expected_error is not None
-                assert case.expected.expected_error.exception_type == "CoalesceCollisionError"
+                # A data-dependent collision (the observed source's fields,
+                # carried on every branch) is a routed row fault: every token
+                # terminal, every consumed token failed with the closed reason
+                # and its FAILED hold carrying the collision record — never an
+                # abort (the case pinned the abort-at-row-1 defect before E7).
+                assert (case.expected.status, case.expected.rows_succeeded, case.expected.rows_failed) == ("failed", 0, 3)
                 assert case.expected.sink_outputs == ()
-                assert all(work.final_status == "blocked" for work in projection.scheduler_work[1:])
+                assert all(work.final_status == "terminal" for work in projection.scheduler_work)
+                assert [(d.outcome, d.path) for d in projection.terminal_dispositions].count(("failure", "unrouted")) == 3
+                failed_holds = [
+                    state for state in projection.node_states if state.node_key.startswith("coalesce:") and state.status == "failed"
+                ]
+                assert len(failed_holds) == 3
+                for state in failed_holds:
+                    assert state.error is not None and state.context_after is not None
+                    assert json.loads(state.error)["failure_reason"] == "union_field_collision"
+                    assert set(json.loads(state.context_after)["union_field_collisions"]) == {"id", "value"}
             else:
                 assert isinstance(case.expected, SemanticRunExpectation)
                 assert (case.expected.status, case.expected.rows_succeeded, case.expected.rows_failed) == ("completed", 1, 0)
@@ -1420,13 +1428,11 @@ def _assert_declared_run_evidence(
     assert evidence.runtime.sink_outputs == case.expected.sink_outputs
     if isinstance(case.expected, RunExpectation):
         assert evidence.runtime.durable_projection == case.expected.projection
-        assert evidence.runtime.observed_error == case.expected.expected_error
     else:
         assert evidence.runtime.durable_projection is not None
         semantic_projection = semantic_runtime_projection(evidence.runtime.durable_projection)
         assert semantic_runtime_projection_sha256(semantic_projection) == case.expected.projection_sha256
         assert semantic_runtime_projection_counts(semantic_projection) == case.expected.projection_counts
-        assert evidence.runtime.observed_error is None
 
     assert evidence.audit.attempted is True
     assert evidence.audit.total_records > 0
@@ -1439,7 +1445,7 @@ def _assert_declared_run_evidence(
         assert evidence.audit.kind == "exact"
         assert evidence.audit.portable_projection == evidence.runtime.durable_projection
         assert evidence.audit.portable_export_unavailable is None
-    elif case.expected.expected_error is None:
+    elif case.expected.status != "failed":
         assert evidence.audit.kind == "exact"
         assert evidence.audit.portable_projection == case.expected.projection
         assert evidence.audit.portable_export_unavailable is None
@@ -1702,6 +1708,28 @@ def test_exact_runtime_projection_rejects_corrupted_portable_manifest_material(
     install_corpus_plugin_manager(monkeypatch)
 
     with pytest.raises(AssertionError, match=r"portable manifest integrity"):
+        run_scenario_case(scenario, case, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("record_type", "field", "value"),
+    (
+        ("audit_export_config", "public_config", {}),
+        ("auth_event_coverage", "selected_count", 0),
+        ("auth_event_coverage", "policy", "deployment_snapshot"),
+    ),
+)
+def test_exact_runtime_projection_rejects_corrupted_export_declarations(
+    record_type: str,
+    field: str,
+    value: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("linear", "happy-path")
+    _mutate_portable_export(monkeypatch, record_type=record_type, field=field, value=value)
+    install_corpus_plugin_manager(monkeypatch)
+    with pytest.raises(AssertionError, match=rf"portable {record_type} integrity"):
         run_scenario_case(scenario, case, tmp_path)
 
 
@@ -2290,6 +2318,54 @@ def test_linear_happy_path_has_exact_production_evidence(
     assert audit_counts["edge"] == 3
     assert audit_counts["row"] == 3
     assert evidence.audit.source_operation_count == 1
+
+
+@pytest.mark.parametrize(
+    ("export_compartment", "error_type", "error_message"),
+    [
+        ("other-corpus", AssertionError, "portable audit_export_config integrity: public_config differs"),
+        (None, ValueError, "compartment_id must match"),
+    ],
+)
+def test_exact_corpus_export_rejects_changed_or_missing_compartment_marking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    export_compartment: str | None,
+    error_type: type[Exception],
+    error_message: str,
+) -> None:
+    scenario, case = _declared_case("linear", "happy-path")
+    install_corpus_plugin_manager(monkeypatch)
+    monkeypatch.setattr(corpus_harness, "CORPUS_EXPORT_COMPARTMENT_ID", export_compartment)
+
+    with pytest.raises(error_type, match=error_message):
+        corpus_harness.run_scenario_case(scenario, case, tmp_path)
+
+
+def test_semantic_run_settings_normalize_default_authentication_policy_only(tmp_path: Path) -> None:
+    _scenario, case = _declared_case("linear", "happy-path")
+    settings = corpus_harness.render_settings(case, tmp_path).settings.model_dump(mode="json")
+    semantic = corpus_harness._semantic_run_settings(settings)
+    landscape_settings = semantic["landscape"]
+    assert isinstance(landscape_settings, dict)
+    export_settings = landscape_settings["export"]
+    assert isinstance(export_settings, dict)
+    assert export_settings["exporter_version"] == "landscape-exporter-auth-v2"
+    assert export_settings["compartment_id"] is None
+    assert "authentication_policy" not in export_settings
+
+    raw_landscape_settings = settings["landscape"]
+    assert isinstance(raw_landscape_settings, dict)
+    raw_export_settings = raw_landscape_settings["export"]
+    assert isinstance(raw_export_settings, dict)
+    raw_export_settings["authentication_policy"] = "required"
+
+    explicit_semantic = corpus_harness._semantic_run_settings(settings)
+    explicit_landscape_settings = explicit_semantic["landscape"]
+    assert isinstance(explicit_landscape_settings, dict)
+    explicit_export_settings = explicit_landscape_settings["export"]
+    assert isinstance(explicit_export_settings, dict)
+    assert explicit_export_settings["authentication_policy"] == "required"
 
 
 def test_exact_runtime_projection_linear_matches_declared_durable_and_export(
@@ -2937,6 +3013,8 @@ def test_checkpoint_terminal_refusal_rejects_non_exact_error_subclass(
     class DerivedNonResumableRunError(NonResumableRunError):
         pass
 
+    from elspeth.contracts.checkpoint import ResumeRefusalCause
+
     scenario, case = _declared_case("checkpoint-deterministic-resume", "reopen-resume")
     production_resume = inspect.unwrap(Orchestrator.resume)
     resume_calls = 0
@@ -2949,6 +3027,7 @@ def test_checkpoint_terminal_refusal_rejects_non_exact_error_subclass(
         raise DerivedNonResumableRunError(
             resume_point.checkpoint.run_id,
             "Run is terminal (status 'completed'); successful terminal runs are immutable",
+            cause=ResumeRefusalCause.RUN_TERMINAL,
         )
 
     monkeypatch.setattr(Orchestrator, "run", inspect.unwrap(Orchestrator.run))
@@ -3009,6 +3088,38 @@ def test_checkpoint_full_history_pin_rejects_observed_semantic_settings_hash_dri
             runtime_root=tmp_path,
             settings=rendered.settings,
         )
+
+
+def test_checkpoint_full_history_pin_covers_non_run_audit_material_outside_frozen_surface(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.fixtures.dag_scenario_corpus.oracle_freeze import canonical_bytes, frozen_surface
+
+    scenario, case = _declared_case("checkpoint-deterministic-resume", "reopen-resume")
+    assert isinstance(case.expected, SummaryRunExpectation)
+    assert case.expected.resumed_full_projection_sha256 is not None
+    install_corpus_plugin_manager(monkeypatch)
+    evidence = corpus_harness.run_scenario_case(scenario, case, tmp_path)
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+    operation = next(record for record in projection.audit_records if record.record_type == "operation")
+    material = json.loads(operation.material)
+    assert material["status"] == "completed"
+    material["status"] = "failed"
+    mutated_record = operation.model_copy(update={"material": json.dumps(material, sort_keys=True, separators=(",", ":"))})
+    mutated_projection = projection.model_copy(
+        update={"audit_records": tuple(mutated_record if record is operation else record for record in projection.audit_records)}
+    )
+    mutated_evidence = evidence.model_copy(
+        update={"runtime": evidence.runtime.model_copy(update={"durable_projection": mutated_projection})}
+    )
+    assert canonical_bytes(frozen_surface(mutated_evidence)) == canonical_bytes(frozen_surface(evidence))
+    rendered = corpus_harness.render_settings(case, tmp_path)
+    assert (
+        corpus_harness.stable_run_projection_sha256(mutated_projection, runtime_root=tmp_path, settings=rendered.settings)
+        != case.expected.resumed_full_projection_sha256
+    )
 
 
 def test_checkpoint_full_history_pin_rejects_consistent_node_identity_suffix_drift(

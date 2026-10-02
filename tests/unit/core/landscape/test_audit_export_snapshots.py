@@ -110,8 +110,9 @@ def _derivation_config(*, signed: bool = False) -> AuditExportDerivationConfig:
         source_status="completed",
         source_completed_at=COMPLETED_AT_TEXT,
         export_format="json",
-        exporter_version="landscape-exporter-v2",
-        serialization_version="audit-export-v2",
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id="test-compartment",
+        serialization_version="audit-export-v3",
         chunking_algorithm_version="complete-frame-v1",
         include_raw_error_rows=False,
         per_chunk_record_limit=100,
@@ -123,7 +124,8 @@ def _derivation_config(*, signed: bool = False) -> AuditExportDerivationConfig:
 
 
 def _registry_key() -> AuditExportSnapshotRegistryKey:
-    bundle = derive_audit_export_bundle([{"record_type": "run"}], _derivation_config())
+    config = _derivation_config()
+    bundle = derive_audit_export_bundle(_covered_records(config), config)
     return AuditExportSnapshotRegistryKey(
         source_run_id=bundle.config.source_run_id,
         exporter_version=bundle.config.exporter_version,
@@ -139,13 +141,35 @@ def _registry_key() -> AuditExportSnapshotRegistryKey:
     )
 
 
+def _covered_records(config: AuditExportDerivationConfig, records: list[dict[str, object]] | None = None) -> list[dict[str, object]]:
+    covered = list(records) if records is not None else [{"record_type": "run"}]
+    if not any(record["record_type"] == "audit_export_config" for record in covered):
+        covered.append({"record_type": "audit_export_config", "public_config": config.public_snapshot_config()})
+    if not any(record["record_type"] == "auth_event_coverage" for record in covered):
+        if config.auth_events != "omitted":
+            raise ValueError("deployment_snapshot test records require explicit auth_event_coverage")
+        covered.append(
+            {
+                "record_type": "auth_event_coverage",
+                "policy": "omitted",
+                "selection_cutoff": None,
+                "selected_count": None,
+                "reason": "not_requested",
+                "selection_basis": None,
+            }
+        )
+    return covered
+
+
 def _candidate(
     store: _MemoryContentStore,
     *,
     records: list[dict[str, object]] | None = None,
     signed: bool = False,
+    config: AuditExportDerivationConfig | None = None,
 ) -> AuditExportSnapshotCandidate:
-    bundle = derive_audit_export_bundle(records or [{"record_type": "run"}], _derivation_config(signed=signed))
+    derivation = config or _derivation_config(signed=signed)
+    bundle = derive_audit_export_bundle(_covered_records(derivation, records), derivation)
     for chunk in bundle.chunks:
         assert (
             store.put_immutable(
@@ -213,6 +237,137 @@ def _candidate(
         for chunk in bundle.chunks
     )
     return AuditExportSnapshotCandidate(snapshot=snapshot, chunks=chunks)
+
+
+def test_reader_rejects_resigned_false_auth_event_coverage(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _MemoryContentStore()
+    config = replace(_derivation_config(signed=True), auth_events="deployment_snapshot")
+    records = [
+        {"record_type": "run"},
+        {
+            "record_type": "auth_event_coverage",
+            "policy": "deployment_snapshot",
+            "selection_cutoff": COMPLETED_AT_TEXT,
+            "selected_count": 1,
+            "reason": "deployment_snapshot",
+            "selection_basis": "visible_rows_at_or_before_run_completion",
+        },
+    ]
+    # Model a signer bypassing producer admission: every cryptographic binding
+    # is recomputed honestly around a semantically false coverage declaration.
+    with monkeypatch.context() as producer:
+        producer.setattr("elspeth.contracts.audit_export._coverage_checked_records", lambda records, config: iter(records))
+        config_record = {"record_type": "audit_export_config", "public_config": config.public_snapshot_config()}
+        false_candidate = _candidate(store, records=[*records, config_record], signed=True, config=config)
+        true_records = [records[0], {**records[1], "selected_count": 0}]
+        true_candidate = _candidate(store, records=[*true_records, config_record], signed=True, config=config)
+        false_config_candidate = _candidate(
+            store,
+            records=[
+                *true_records,
+                {
+                    "record_type": "audit_export_config",
+                    "public_config": {**config.public_snapshot_config(), "include_raw_error_rows": True},
+                },
+            ],
+            signed=True,
+            config=config,
+        )
+    from elspeth.core.landscape.execution.audit_export_snapshots import _verify_snapshot_graph
+
+    _verify_snapshot_graph(
+        true_candidate.snapshot,
+        true_candidate.chunks,
+        resolve_registered=store.content.__getitem__,
+        signed_manifest_verifier=_signed_manifest_verifier,
+        record_signature_verifier=_record_signature_verifier,
+    )
+    with pytest.raises(AuditIntegrityError, match="coverage"):
+        _verify_snapshot_graph(
+            false_candidate.snapshot,
+            false_candidate.chunks,
+            resolve_registered=store.content.__getitem__,
+            signed_manifest_verifier=_signed_manifest_verifier,
+            record_signature_verifier=_record_signature_verifier,
+        )
+    with pytest.raises(AuditIntegrityError, match="public_export_config_hash"):
+        _verify_snapshot_graph(
+            false_config_candidate.snapshot,
+            false_config_candidate.chunks,
+            resolve_registered=store.content.__getitem__,
+            signed_manifest_verifier=_signed_manifest_verifier,
+            record_signature_verifier=_record_signature_verifier,
+        )
+
+
+def test_reader_verifies_compartment_marking_and_refuses_resigned_omission(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.core.landscape.execution.audit_export_snapshots import _verify_snapshot_graph
+
+    store = _MemoryContentStore()
+    config = replace(
+        _derivation_config(signed=True),
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id="research-a",
+    )
+    config_record = {"record_type": "audit_export_config", "public_config": config.public_snapshot_config()}
+    coverage = {
+        "record_type": "auth_event_coverage",
+        "policy": "omitted",
+        "selection_cutoff": None,
+        "selected_count": None,
+        "reason": "not_requested",
+        "selection_basis": None,
+    }
+    valid = _candidate(store, records=[{"record_type": "run"}, config_record, coverage], signed=True, config=config)
+    _verify_snapshot_graph(
+        valid.snapshot,
+        valid.chunks,
+        resolve_registered=store.content.__getitem__,
+        signed_manifest_verifier=_signed_manifest_verifier,
+        record_signature_verifier=_record_signature_verifier,
+    )
+
+    # Even a signer that re-signs every byte cannot remove the required v2
+    # field and have the registered reader accept the artifact.
+    missing = {key: value for key, value in config.public_snapshot_config().items() if key != "compartment_id"}
+    with monkeypatch.context() as producer:
+        producer.setattr("elspeth.contracts.audit_export._coverage_checked_records", lambda records, config: iter(records))
+        forged = _candidate(
+            store,
+            records=[{"record_type": "run"}, {"record_type": "audit_export_config", "public_config": missing}, coverage],
+            signed=True,
+            config=config,
+        )
+    with pytest.raises(AuditIntegrityError, match="coverage"):
+        _verify_snapshot_graph(
+            forged.snapshot,
+            forged.chunks,
+            resolve_registered=store.content.__getitem__,
+            signed_manifest_verifier=_signed_manifest_verifier,
+            record_signature_verifier=_record_signature_verifier,
+        )
+
+
+@pytest.mark.parametrize("unsupported_version", ["landscape-exporter-v1", "landscape-exporter-auth-v1"])
+@pytest.mark.parametrize("signed", [False, True])
+def test_reader_refuses_unsupported_version_before_registered_content_read(unsupported_version: str, signed: bool) -> None:
+    from elspeth.core.landscape.execution.audit_export_snapshots import _verify_snapshot_graph
+
+    store = _MemoryContentStore()
+    candidate = _candidate(store, signed=signed)
+    forged_snapshot = replace(candidate.snapshot, exporter_version=unsupported_version)
+
+    def unexpected_read(_ref: str) -> bytes:
+        pytest.fail("unsupported snapshot reached registered content read")
+
+    with pytest.raises(AuditIntegrityError, match="exporter_version"):
+        _verify_snapshot_graph(
+            forged_snapshot,
+            candidate.chunks,
+            resolve_registered=unexpected_read,
+            signed_manifest_verifier=_signed_manifest_verifier,
+            record_signature_verifier=_record_signature_verifier if signed else None,
+        )
 
 
 def _repository(db: LandscapeDB) -> AuditExportSnapshotRepository:
@@ -416,12 +571,40 @@ def test_bound_winner_reader_resolves_only_registered_store_content() -> None:
             signed_manifest_verifier=lambda _content, _descriptor: None,
         )
 
-        assert list(effect_input.reader.iter_verified_chunks()) == [b'{"record_type":"run"}\n']
+        chunks = list(effect_input.reader.iter_verified_chunks())
+        assert chunks == [store.content[chunk.content_ref] for chunk in candidate.chunks]
+        assert [json.loads(line)["record_type"] for chunk in chunks for line in chunk.splitlines()] == [
+            "run",
+            "audit_export_config",
+            "auth_event_coverage",
+        ]
         manifest = effect_input.reader.read_verified_signed_manifest()
         assert manifest.endswith(b"}") and not manifest.endswith(b"\n")
         assert {item.descriptor.object_kind for item in store.opened} == {"data_chunk", "final_manifest"}
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("signed", [False, True])
+def test_reader_verifies_a_double_beyond_2_53_printed_in_integer_notation(signed: bool) -> None:
+    """RFC 8785 prints 1e17 as ``100000000000000000``; the reader must decode it as the double.
+
+    A plain ``json.loads`` reads the literal back as an ``int`` beyond 2**53,
+    which the canonical encoder refuses when the reader re-derives the frame.
+    """
+    from elspeth.core.landscape.execution.audit_export_snapshots import _verify_snapshot_graph
+
+    store = _MemoryContentStore()
+    candidate = _candidate(store, records=[{"record_type": "run", "settings": {"threshold": 1e17}}], signed=signed)
+    assert b'"threshold":100000000000000000' in store.content[candidate.chunks[0].content_ref]
+
+    _verify_snapshot_graph(
+        candidate.snapshot,
+        candidate.chunks,
+        resolve_registered=store.content.__getitem__,
+        signed_manifest_verifier=_signed_manifest_verifier if signed else (lambda _content, _descriptor: None),
+        record_signature_verifier=_record_signature_verifier if signed else None,
+    )
 
 
 def test_bound_winner_rejects_chunk_seal_not_derived_from_registered_bytes() -> None:
@@ -558,7 +741,7 @@ def test_registration_rejects_forged_graph_before_registry_insert() -> None:
     (
         pytest.param(
             "public_export_config_hash",
-            "registry_key_hash",
+            "public_export_config_hash",
             lambda snapshot: snapshot.public_export_config_hash,
             id="public_export_config_hash",
         ),
@@ -662,9 +845,10 @@ def test_bound_winner_rejects_record_hmac_not_derived_from_unsigned_record_bytes
     resolver = AuditExportContentStoreResolver()
     resolver.register(store)
     candidate = _candidate(store, signed=True)
-    emitted = json.loads(store.content[candidate.chunks[0].content_ref])
+    frames = store.content[candidate.chunks[0].content_ref].splitlines(keepends=True)
+    emitted = json.loads(frames[0])
     emitted["signature"] = "0" * 64
-    forged_content = canonical_json(emitted).encode("utf-8") + b"\n"
+    forged_content = canonical_json(emitted).encode("utf-8") + b"\n" + b"".join(frames[1:])
     assert len(forged_content) == candidate.chunks[0].size_bytes
     content_ref = store.put_immutable(forged_content, candidate_id="forged", object_kind="data_chunk")
     chunk = replace(

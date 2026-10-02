@@ -56,13 +56,20 @@ Find tokens for a row:
 
 ```bash
 sqlite3 runs/audit.db "
-  SELECT token_id, row_id, branch_name, created_at
-  FROM tokens
-  WHERE run_id = '<RUN_ID>'
-    AND row_id = '<ROW_ID>'
-  ORDER BY created_at, token_id;
+  SELECT t.token_id, t.row_id, f.depth, f.kind, f.member_key, t.created_at
+  FROM tokens t
+  LEFT JOIN token_lineage_frames f
+    ON f.run_id = t.run_id
+   AND f.token_id = t.token_id
+  WHERE t.run_id = '<RUN_ID>'
+    AND t.row_id = '<ROW_ID>'
+  ORDER BY t.created_at, t.token_id, f.depth;
 "
 ```
+
+A token has one lineage frame per fork or expand it descends from (`depth` 0
+is the outermost); for a `fork` frame, `member_key` is the branch name. A token
+that never forked or expanded has no frame (NULL columns).
 
 ### Step 3: Use `elspeth explain`
 
@@ -92,12 +99,12 @@ sqlite3 -header -column runs/audit.db "
   SELECT
     t.row_id,
     t.token_id,
-    t.branch_name,
     o.completed,
     o.outcome,
     o.path,
     o.sink_name,
     o.batch_id,
+    o.error_hash,
     o.recorded_at
   FROM tokens t
   LEFT JOIN token_outcomes o
@@ -169,7 +176,7 @@ Transform errors for the row:
 
 ```bash
 sqlite3 -header -column runs/audit.db "
-  SELECT te.transform_id, te.token_id, te.destination, te.error_hash, te.created_at
+  SELECT te.transform_id, te.token_id, te.destination, te.error_details_json, te.created_at
   FROM transform_errors te
   JOIN tokens t
     ON t.run_id = te.run_id
@@ -178,6 +185,10 @@ sqlite3 -header -column runs/audit.db "
     AND t.row_id = '<ROW_ID>';
 "
 ```
+
+`error_details_json` is the recorded reason. A `transform_errors` row is
+attempt evidence; the token's terminal outcome, and the `error_hash` that goes
+with it, are in `token_outcomes` (Step 4).
 
 ### Step 7: Source-Validation Discards (No Token Exists)
 

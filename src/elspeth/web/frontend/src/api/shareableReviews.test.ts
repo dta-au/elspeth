@@ -256,21 +256,24 @@ describe("shareableReviews API client", () => {
     expect(response.composition_snapshot.nodes).toEqual([]);
   });
 
-  it("fetchSharedInspect accepts a null created_by_username (pre-field snapshot)", async () => {
-    // The backend sends null for snapshots minted before it froze the
-    // sharer's username into the blob; those bytes are signed and cannot be
-    // backfilled, so null is a valid wire value, not a shape error.
+  it("fetchSharedInspect rejects a null created_by_username", async () => {
     _mockJsonResponse(_buildValidSharedInspectBody({ created_by_username: null }));
-    const response = await fetchSharedInspect("legacy-token");
-    expect(response.created_by_username).toBeNull();
-    expect(response.created_by_user_id).toBe("alice");
+    await expect(fetchSharedInspect("any-token")).rejects.toMatchObject({
+      detail: expect.stringContaining("shared-inspect"),
+    });
   });
 
   it("fetchSharedInspect rejects a body with created_by_username absent", async () => {
-    // Null is a value the backend chooses; an absent key means producer drift.
     const body = _buildValidSharedInspectBody();
     delete body.created_by_username;
     _mockJsonResponse(body);
+    await expect(fetchSharedInspect("any-token")).rejects.toMatchObject({
+      detail: expect.stringContaining("shared-inspect"),
+    });
+  });
+
+  it("fetchSharedInspect rejects a blank created_by_username", async () => {
+    _mockJsonResponse(_buildValidSharedInspectBody({ created_by_username: "  \t " }));
     await expect(fetchSharedInspect("any-token")).rejects.toMatchObject({
       detail: expect.stringContaining("shared-inspect"),
     });

@@ -28,12 +28,15 @@ settings(max_examples=50, deadline=None) for stable CI execution.
 from __future__ import annotations
 
 import pytest
-from hypothesis import HealthCheck, event, given, settings
+from hypothesis import HealthCheck, event, find, given, settings
 from hypothesis import strategies as st
 
 from elspeth.web.composer.redaction import (
     _STABLE_RESPONSE_SENTINELS,
     MANIFEST,
+    CreateBlobArgumentsModel,
+    SetSourceFromBlobArgumentsModel,
+    SetSourceFromBlobsArgumentsModel,
     _SensitiveMarker,
     redact_tool_call_arguments,
     redact_tool_call_response,
@@ -42,6 +45,23 @@ from elspeth.web.composer.redaction import (
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
 _CONTAINER_PATH_MARKERS = ("[*]", "{*}")
+
+
+@pytest.mark.parametrize(
+    "model,field",
+    [
+        (CreateBlobArgumentsModel, "description"),
+        (SetSourceFromBlobArgumentsModel, "plugin"),
+        (SetSourceFromBlobArgumentsModel, "on_validation_failure"),
+        (SetSourceFromBlobsArgumentsModel, "on_validation_failure"),
+    ],
+)
+def test_argument_strategies_cover_omitted_and_supplied_nonnull_fields(model, field: str) -> None:
+    strategy = st.from_type(model)
+    omitted = find(strategy, lambda payload: field not in payload.model_fields_set)
+    supplied = find(strategy, lambda payload: field in payload.model_fields_set)
+    assert field not in omitted.model_dump(exclude_unset=True)
+    assert isinstance(supplied.model_dump(exclude_unset=True)[field], str)
 
 
 def _is_container_descent_path(path: str) -> bool:

@@ -1,4 +1,5 @@
 import {
+  type JSX,
   useCallback,
   useEffect,
   useRef,
@@ -13,9 +14,12 @@ import type { UserProfile } from "@/types/index";
 interface UserMenuProps {
   onOpenSettings: () => void;
   onSignOut: () => void;
-  /** Present only when the signed-in user is the env-flagged dev admin
-   *  (/api/auth/me dev_admin); absent, the item is not rendered. */
-  onOpenUserManagement?: () => void;
+  /** Present only when the server reports that the signed-in user holds at
+   *  least one people-administration capability; absent, no entry renders.
+   *  The App owns that decision so this menu never infers it from a role. */
+  onOpenPeopleAccess?: () => void;
+  onOpenMailbox?: () => void;
+  onOpenLibrary?: () => void;
 }
 
 /**
@@ -67,7 +71,9 @@ function showsSecondaryUsername(user: UserProfile): boolean {
 export function UserMenu({
   onOpenSettings,
   onSignOut,
-  onOpenUserManagement,
+  onOpenPeopleAccess,
+  onOpenMailbox,
+  onOpenLibrary,
 }: UserMenuProps): JSX.Element {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -122,13 +128,25 @@ export function UserMenu({
     onOpenSettings();
   }, [onOpenSettings]);
 
-  // Same focus-return-before-unmount move as onSettings: the user-management
-  // dialog's focus trap needs a live element to save and restore.
-  const onUserManagement = useCallback(() => {
+  // Same focus-return-before-unmount move as onSettings: the People & access
+  // panel's focus trap needs a live element to save and restore.
+  const onPeopleAccess = useCallback(() => {
     triggerRef.current?.focus();
     setOpen(false);
-    onOpenUserManagement?.();
-  }, [onOpenUserManagement]);
+    onOpenPeopleAccess?.();
+  }, [onOpenPeopleAccess]);
+
+  const onMailbox = useCallback(() => {
+    triggerRef.current?.focus();
+    setOpen(false);
+    onOpenMailbox?.();
+  }, [onOpenMailbox]);
+
+  const onLibrary = useCallback(() => {
+    triggerRef.current?.focus();
+    setOpen(false);
+    onOpenLibrary?.();
+  }, [onOpenLibrary]);
 
   const onSignOutClick = useCallback(() => {
     setOpen(false);
@@ -234,15 +252,15 @@ export function UserMenu({
               Composer preferences
             </Button>
           </li>
-          {onOpenUserManagement !== undefined && (
+          {user !== null && onOpenMailbox !== undefined && <li className="user-menu-item">
+            <Button variant="bare" onClick={onMailbox} className="user-menu-action">Mailbox</Button>
+          </li>}
+          {user !== null && onOpenLibrary !== undefined && <li className="user-menu-item">
+            <Button variant="bare" onClick={onLibrary} className="user-menu-action">Shared library</Button>
+          </li>}
+          {onOpenPeopleAccess !== undefined && (
             <li className="user-menu-item">
-              <Button
-                variant="bare"
-                onClick={onUserManagement}
-                className="user-menu-action"
-              >
-                User management
-              </Button>
+              <Button variant="bare" onClick={onPeopleAccess} className="user-menu-action">People &amp; access</Button>
             </li>
           )}
           <li className="user-menu-item">

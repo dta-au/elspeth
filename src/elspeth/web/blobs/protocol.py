@@ -26,8 +26,6 @@ from elspeth.contracts.blobs import BlobForkCleanupResult as BlobForkCleanupResu
 from elspeth.contracts.blobs import BlobForkFenceLostError as BlobForkFenceLostError
 from elspeth.contracts.blobs import BlobForkPlanEntry as BlobForkPlanEntry
 from elspeth.contracts.blobs import BlobForkWriteFence as BlobForkWriteFence
-from elspeth.contracts.blobs import BlobGuidedOperationFenceLostError as BlobGuidedOperationFenceLostError
-from elspeth.contracts.blobs import BlobGuidedOperationWriteFence as BlobGuidedOperationWriteFence
 from elspeth.contracts.blobs import BlobInProgressForkError as BlobInProgressForkError
 from elspeth.contracts.blobs import BlobIntegrityError as BlobIntegrityError
 from elspeth.contracts.blobs import BlobNotFoundError as BlobNotFoundError
@@ -40,7 +38,9 @@ from elspeth.contracts.blobs import BlobServiceProtocol as BlobServiceProtocol
 from elspeth.contracts.blobs import BlobStateError as BlobStateError
 from elspeth.contracts.blobs import BlobStatus as BlobStatus
 from elspeth.contracts.blobs import FinalizeBlobStatus as FinalizeBlobStatus
+from elspeth.contracts.blobs import IdentityStorageQuotaExceededError as IdentityStorageQuotaExceededError
 from elspeth.contracts.blobs import InlineCustodyRequest as InlineCustodyRequest
+from elspeth.contracts.blobs import StorageAccountingUnavailableError as StorageAccountingUnavailableError
 from elspeth.contracts.blobs import StorageMimeType as StorageMimeType
 from elspeth.contracts.blobs import fork_blob_id as fork_blob_id
 from elspeth.contracts.blobs import names_same_blob as names_same_blob

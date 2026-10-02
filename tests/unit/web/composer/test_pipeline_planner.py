@@ -7,8 +7,8 @@ candidate state as a provider result.
 
 from __future__ import annotations
 
-import ast
 import asyncio
+import inspect
 import json
 import threading
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -24,11 +24,14 @@ from uuid import uuid4
 
 import pytest
 import structlog
+from litellm import ModelResponse, Usage
 from litellm.exceptions import APIError as LiteLLMAPIError
+from litellm.exceptions import BadGatewayError, ServiceUnavailableError
+from litellm.exceptions import Timeout as LiteLLMTimeout
 from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttemptLedTo,
     ComposerPlannerAttemptOutcome,
@@ -36,7 +39,7 @@ from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerCode,
     ComposerPlannerInformationClass,
 )
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -45,16 +48,11 @@ from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import pipeline_planner
 from elspeth.web.composer.audit import BufferingRecorder, planner_attempt_audit_envelope
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
-from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError
-from elspeth.web.composer.guided.planning import GuidedCandidateBindingRejected, guided_redacted_current_state_context
-from elspeth.web.composer.guided.prompts import load_step_planner_skill
-from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.pipeline_planner import (
     _FINALIZER_OWNS_NOTHING,
     _REPEAT_NOTICE,
     _REPEAT_NOTICE_WITHHELD,
     PLANNER_DISCOVERY_TOOL_NAMES,
-    PipelineCandidatePolicyRejection,
     PipelinePlannerError,
     PlannerBudgetPolicy,
     PlannerConversationContext,
@@ -64,32 +62,22 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerOriginatingMessage,
     PlannerPriorUserRequest,
     PlannerRequestLifecycle,
-    PlannerTerminalContract,
-    PlannerTerminalMaterialization,
     _allowlisted_candidate_feedback,
     _candidate_shape_hash,
     _derive_finalizer_owned_refs,
     _entry_component_ref,
     _feedback_error_codes,
     _FinalizerOwnedRefs,
-    _materialize_terminal_payload,
     _parse_response_tool_calls,
     _ParsedToolCall,
     _project_planner_plugin_contract,
     _rejection_fingerprint,
     _serialize_provider_discovery_result,
-    _transform_node_count,
     plan_pipeline,
     planner_tool_definitions,
 )
-from elspeth.web.composer.pipeline_proposal import (
-    AbsentBase,
-    PipelineProposal,
-    PlannerSurface,
-    pipeline_draft_hash,
-)
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, planner_plugin_contract
-from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import (
     CoalesceUnionTypeDetail,
@@ -111,12 +99,13 @@ from elspeth.web.composer.tools.generation import explain_validation_code, expla
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     RAW_HTML_CLEANUP_REVIEW_DRAFT,
     RAW_HTML_CLEANUP_USER_TERM,
-    pipeline_decision_artifact_hash,
 )
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import (
@@ -127,10 +116,12 @@ from elspeth.web.plugin_policy.models import (
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, composition_proposals_table
+from elspeth.web.sessions.models import blobs_table, chat_messages_table, composition_proposals_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.session_fences import fenced_operation_context
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 _TEST_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -186,7 +177,28 @@ _FIXED_SCAFFOLDING_BASELINE_BYTES = 106 * 1024
 # repair guidance is per-ERROR text rather than scaffolding, and
 # pipeline_composer.md is not the skill this request carries (the harness
 # renders pipeline_capabilities.md), so both measured +0 B.
-_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
+# Power Automate source/sink catalog expansion (2026-10-01): measured with the
+# same live request, omitting only those two summaries in the catalog control.
+# The scaffold is 119,326 B without them and 120,149 B with them: +823 B,
+# comprising +759 B in the discovery digest and +64 B in outer JSON escaping.
+# System-message and tool-palette bytes are identical. This additive allowance
+# preserves the existing 72 B headroom and the original 10% band for prior
+# scaffolding; it does not reset the general baseline to the grown request.
+_POWER_AUTOMATE_CATALOG_CANONICAL_BYTES = 823
+# CSV schema recovery guidance (2026-10-02): actual initial requests measured
+# against HEAD's archived source with the same interpreter/catalog. The live
+# scaffold grew 120,149 -> 120,729 B; the small-catalog control grew
+# 118,454 -> 119,034 B. Both +580 B deltas are exclusively inspect_source's
+# static declaration (1,127 -> 1,707 B); system/payload bytes and every other
+# tool are unchanged. Batch error guidance rides repair responses, adding
+# zero initial-request bytes. Keep the prior 72 B headroom and original 10%
+# scaffolding band instead of trimming actionable CSV guidance to fit it.
+_CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES = 580
+_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
+    int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
+    + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
+    + _CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES
+)
 
 
 @dataclass
@@ -221,11 +233,11 @@ class _Response:
 
 
 class _ScriptedCompletion:
-    def __init__(self, *responses: _Response | BaseException) -> None:
+    def __init__(self, *responses: _Response | ModelResponse | BaseException) -> None:
         self._responses = list(responses)
         self.requests: list[dict[str, Any]] = []
 
-    async def __call__(self, **kwargs: Any) -> _Response:
+    async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
         self.requests.append(deepcopy(kwargs))
         response = self._responses.pop(0)
         if isinstance(response, BaseException):
@@ -580,6 +592,7 @@ def _pipeline_with_short_form_llm_review(data_dir: Path) -> dict[str, Any]:
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                    "system_prompt": "You summarise text. Reply with a one-sentence summary only.",
                     "prompt_template": "Summarise {{ row.text }}",
                     "required_input_fields": ["text"],
                     "interpretation_requirements": [
@@ -636,6 +649,8 @@ def _model(completion: _ScriptedCompletion, **overrides: object) -> PlannerModel
         "api_retry_base_seconds": 0.0,
         "discovery_reasoning_effort": "none",
         "candidate_reasoning_effort": "none",
+        "tool_contract_dialect": ToolContractDialect.NONE,
+        "escape_hatch_tool_contract_dialect": ToolContractDialect.NONE,
     }
     values.update(overrides)
     return PlannerModelConfig(**values)  # type: ignore[arg-type]
@@ -700,18 +715,10 @@ async def _plan(
     current_state: CompositionState | None = None,
     provider_current_state: Mapping[str, Any] | None = None,
     intent: str = "Build the requested pipeline.",
-    surface: PlannerSurface = PlannerSurface.FREEFORM,
-    profile: str | None = None,
-    eligible_deferred_intent_ids: tuple[str, ...] = (),
-    claim_evaluator: Any = None,
     rendered_skill: str | None = None,
-    supersedes_draft_hash: str | None = None,
     candidate_finalizer: Any = None,
-    candidate_acceptance: Any = None,
-    unproducible_output_fields: tuple[str, ...] = (),
     conversation_context: PlannerConversationContext | None = None,
     information_aware: bool = False,
-    terminal_contract: PlannerTerminalContract | None = None,
     schemas_loaded: frozenset[tuple[str, str]] = frozenset(),
     mark_schema_loaded: Any = None,
     catalog_service: Any = None,
@@ -739,38 +746,41 @@ async def _plan(
             unresolved_classes=(),
         )
         policy_context = patch.object(planner_module.PlannerDiscoveryPolicy, "initial", return_value=full_policy)
-    with policy_context:
+    origin = originating_message or _origin()
+    custody = custody_config or _custody(tmp_path)
+    operation_scope = (
+        fenced_operation_context(custody.session_engine, origin.session_id)
+        if custody.session_engine is not None and custody.session_operation_context is None
+        else nullcontext(custody.session_operation_context)
+    )
+    with policy_context, operation_scope as operation_context:
+        if custody.session_engine is not None and custody.session_operation_context is None:
+            custody = replace(
+                custody,
+                session_operation_context=operation_context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(custody.session_engine),
+            )
         return await plan_pipeline(
             intent=intent,
             current_state=current_state or _empty_state(),
             provider_current_state=(
                 provider_current_state if provider_current_state is not None else (current_state or _empty_state()).to_dict()
             ),
-            reviewed_facts={"request": "Build the requested pipeline."},
-            reviewed_planner_context={"request": "Build the requested pipeline."},
-            unproducible_output_fields=unproducible_output_fields,
             schemas_loaded=schemas_loaded,
             mark_schema_loaded=mark_schema_loaded,
-            eligible_deferred_intent_ids=eligible_deferred_intent_ids,
-            claim_evaluator=claim_evaluator,
-            supersedes_draft_hash=supersedes_draft_hash,
-            surface=surface,
-            profile=profile or ("tutorial" if surface is PlannerSurface.TUTORIAL_PROFILE else "ordinary"),
             conversation_context=conversation_context,
             policy_catalog=policy_catalog,
             plugin_snapshot=plugin_snapshot,
-            originating_message=originating_message or _origin(),
+            originating_message=origin,
             base=AbsentBase(),
             model_config=_model(completion, **dict(model_overrides or {})),
             rendered_skill=rendered_skill or f"{load_pipeline_capability_core()}\n\nYou are the bounded ELSPETH pipeline planner.",
             repair_budget=repair_budget,
             budget_policy=budget or _budget(),
-            custody_config=custody_config or _custody(tmp_path),
+            custody_config=custody,
             lifecycle=lifecycle or _lifecycle(),
             recorder=recorder or BufferingRecorder(),
             candidate_finalizer=candidate_finalizer or (lambda candidate: candidate),
-            candidate_acceptance=candidate_acceptance,
-            terminal_contract=terminal_contract,
         )
 
 
@@ -798,20 +808,13 @@ def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> N
     }
     assert set(PLANNER_DISCOVERY_TOOL_NAMES) == expected_discovery
 
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     assert {tool["function"]["name"] for tool in tools[:-1]} == expected_discovery
     terminal = tools[-1]["function"]
     assert terminal["name"] == "emit_pipeline_proposal"
     assert terminal["parameters"] == {
         "type": "object",
-        "properties": {
-            "pipeline": canonical_set_pipeline_schema(),
-            "claimed_deferred_intent_ids": {
-                "type": "array",
-                "items": {"type": "string", "format": "uuid"},
-                "uniqueItems": True,
-            },
-        },
+        "properties": {"pipeline": canonical_set_pipeline_schema()},
         "required": ["pipeline"],
         "additionalProperties": False,
     }
@@ -820,316 +823,12 @@ def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> N
     assert '"base"' not in serialized
 
 
-@pytest.mark.asyncio
-async def test_request_owned_terminal_contract_drives_schema_manifest_and_materialization(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The exact advertised delta is validated and materialized before canonical admission."""
-    import elspeth.web.composer.pipeline_planner as planner_module
-
-    selected_schema = {
-        "type": "object",
-        "properties": {"route": {"type": "string"}},
-        "required": ["route"],
-        "additionalProperties": False,
-    }
-    canonical = _pipeline(tmp_path)
-    materialized: list[Mapping[str, Any]] = []
-
-    def materialize(delta: Mapping[str, Any]) -> Mapping[str, Any]:
-        materialized.append(delta)
-        candidate = deepcopy(canonical)
-        candidate["source"]["on_success"] = delta["route"]
-        return candidate
-
-    selected_instruction = "Emit only this request's selected terminal projection."
-    contract = PlannerTerminalContract(
-        schema=selected_schema,
-        materialize=materialize,
-        instruction=selected_instruction,
-    )
-    manifests: list[Any] = []
-    real_builder = planner_module.build_planner_capability_manifest
-
-    def capture_manifest(**kwargs: Any) -> Any:
-        manifest = real_builder(**kwargs)
-        manifests.append(manifest)
-        return manifest
-
-    monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)
-    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": {"route": "rows"}})))
-
-    result = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        terminal_contract=contract,
-    )
-
-    assert result.proposal.pipeline["source"]["on_success"] == "rows"
-    assert materialized == [{"route": "rows"}]
-    advertised = completion.requests[0]["tools"][-1]["function"]["parameters"]["properties"]["pipeline"]
-    assert advertised == selected_schema
-    request_payload = json.loads(completion.requests[0]["messages"][1]["content"])
-    assert request_payload["instruction"] == selected_instruction
-    assert manifests[0].canonical_schema_hash == stable_hash(selected_schema)
-
-
-@pytest.mark.asyncio
-async def test_typed_terminal_materializer_rejection_repairs_then_succeeds(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """Schema-valid guided deltas rejected by binding stay inside the repair loop."""
-
-    selected_schema = {
-        "type": "object",
-        "properties": {"route": {"type": "string"}},
-        "required": ["route"],
-        "additionalProperties": False,
-    }
-    canonical = _pipeline(tmp_path)
-    attempts: list[Mapping[str, Any]] = []
-
-    def materialize(delta: Mapping[str, Any]) -> Mapping[str, Any]:
-        attempts.append(delta)
-        if len(attempts) == 1:
-            raise GuidedCandidateBindingRejected(
-                "guided planner candidate delta violates reviewed mutation authority",
-                error_code="guided_delta_authority_violation",
-                connectivity={},
-            )
-        candidate = deepcopy(canonical)
-        candidate["source"]["on_success"] = delta["route"]
-        return candidate
-
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": {"route": "first_slip"}})),
-        _response(("emit_pipeline_proposal", {"pipeline": {"route": "rows"}})),
-    )
-
-    result = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=PlannerSurface.GUIDED_STAGED,
-        terminal_contract=PlannerTerminalContract(schema=selected_schema, materialize=materialize),
-    )
-
-    assert result.proposal.repair_count == 1
-    assert attempts == [{"route": "first_slip"}, {"route": "rows"}]
-    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
-    assert feedback["validation"]["errors"][0]["error_code"] == "guided_delta_authority_violation"
-
-
-@pytest.mark.asyncio
-async def test_selected_terminal_contract_is_reused_for_repair_and_escape_hatch(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    selected_schema = {
-        "type": "object",
-        "properties": {"route": {"type": "string"}},
-        "required": ["route"],
-        "additionalProperties": False,
-    }
-    canonical = _pipeline(tmp_path)
-
-    def materialize(delta: Mapping[str, Any]) -> Mapping[str, Any]:
-        candidate = deepcopy(canonical)
-        candidate["source"]["on_success"] = delta["route"]
-        return candidate
-
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": {"unexpected": "value"}})),
-        _response(("emit_pipeline_proposal", {"pipeline": {"unexpected": "again"}})),
-    )
-    contract = PlannerTerminalContract(schema=selected_schema, materialize=materialize)
-
-    with pytest.raises(PipelinePlannerError, match="repair budget exhausted"):
-        await _plan(
-            tmp_path=tmp_path,
-            tool_context=tool_context,
-            completion=completion,
-            repair_budget=0,
-            terminal_contract=contract,
-            model_overrides={
-                "escape_hatch_model": "anthropic/advisor",
-                "escape_hatch_provider": "test-provider",
-            },
-        )
-
-    assert len(completion.requests) == 2
-    for request in completion.requests:
-        assert request["tools"][-1]["function"]["parameters"]["properties"]["pipeline"] == selected_schema
-
-
-@pytest.mark.asyncio
-async def test_terminal_materializer_owned_configuration_stays_out_of_repair_feedback(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    private_canary = "PRIVATE-MATERIALIZER-OPTION-CANARY"
-    selected_schema = {
-        "type": "object",
-        "properties": {"route": {"type": "string"}},
-        "required": ["route"],
-        "additionalProperties": False,
-    }
-
-    def materialize(_delta: Mapping[str, Any]) -> PlannerTerminalMaterialization:
-        candidate = _pipeline(tmp_path)
-        candidate["source"]["options"]["unknown_private_option"] = private_canary
-        return PlannerTerminalMaterialization(
-            pipeline=candidate,
-            config_owned_refs=frozenset({"source"}),
-        )
-
-    completion = _ScriptedCompletion(
-        _response_with_call_id("materialized-first", "emit_pipeline_proposal", {"pipeline": {"route": "rows"}}),
-        _response_with_call_id("materialized-repeat", "emit_pipeline_proposal", {"pipeline": {"route": "rows"}}),
-    )
-    with pytest.raises(PipelinePlannerError, match="short-circuited"):
-        await _plan(
-            tmp_path=tmp_path,
-            tool_context=tool_context,
-            completion=completion,
-            repair_budget=5,
-            terminal_contract=PlannerTerminalContract(schema=selected_schema, materialize=materialize),
-        )
-
-    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
-    assert [entry["component"] for entry in feedback["validation"]["errors"]] == ["pipeline"]
-    assert "detail" not in feedback["validation"]["errors"][0]
-    assert private_canary not in canonical_json(completion.requests)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "invalid_claims",
-    [
-        [str(uuid4())],
-        ["00000000-0000-4000-8000-000000000311", "00000000-0000-4000-8000-000000000311"],
-    ],
-)
-@pytest.mark.parametrize("surface", (PlannerSurface.FREEFORM, PlannerSurface.GUIDED_FULL))
-async def test_ineligible_and_duplicate_deferred_claims_use_bounded_terminal_repair(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    invalid_claims: list[str],
-    surface: PlannerSurface,
-) -> None:
-    completion = _ScriptedCompletion(
-        _response(
-            (
-                "emit_pipeline_proposal",
-                {"pipeline": _pipeline(tmp_path), "claimed_deferred_intent_ids": invalid_claims},
-            )
-        ),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    result = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, surface=surface)
-
-    assert result.proposal.repair_count == 1
-    feedback = completion.requests[1]["messages"][-1]
-    assert feedback["role"] == "tool"
-    assert "deferred_intent_claim" in feedback["content"]
-
-
-@pytest.mark.asyncio
-async def test_guided_claims_are_verified_from_candidate_and_unproven_claims_repair(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    intent_id = "00000000-0000-4000-8000-000000000312"
-    completion = _ScriptedCompletion(
-        _response(
-            (
-                "emit_pipeline_proposal",
-                {"pipeline": _pipeline(tmp_path), "claimed_deferred_intent_ids": [intent_id]},
-            )
-        ),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-    evaluations = 0
-
-    def reject_unproven(_candidate: CompositionState, claims: tuple[str, ...]) -> tuple[str, ...]:
-        nonlocal evaluations
-        evaluations += 1
-        if claims:
-            raise DeferredIntentClaimError("unproven")
-        return ()
-
-    result = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=PlannerSurface.GUIDED_STAGED,
-        eligible_deferred_intent_ids=(intent_id,),
-        claim_evaluator=reject_unproven,
-    )
-
-    assert evaluations == 2
-    assert result.proposal.covered_deferred_intent_ids == ()
-    assert result.proposal.repair_count == 1
-    assert "deferred_intent_claim" in completion.requests[1]["messages"][-1]["content"]
-
-
-@pytest.mark.asyncio
-async def test_guided_required_claims_are_evaluated_when_the_model_omits_the_claim_list(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    intent_id = "00000000-0000-4000-8000-000000000314"
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(
-            (
-                "emit_pipeline_proposal",
-                {"pipeline": _pipeline(tmp_path), "claimed_deferred_intent_ids": [intent_id]},
-            )
-        ),
-    )
-    evaluations: list[tuple[str, ...]] = []
-
-    def require_claim(_candidate: CompositionState, claims: tuple[str, ...]) -> tuple[str, ...]:
-        evaluations.append(claims)
-        if claims != (intent_id,):
-            raise DeferredIntentClaimError("omitted required deferred intent coverage")
-        return claims
-
-    result = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=PlannerSurface.GUIDED_STAGED,
-        eligible_deferred_intent_ids=(intent_id,),
-        claim_evaluator=require_claim,
-    )
-
-    assert evaluations == [(), (intent_id,)]
-    assert result.proposal.covered_deferred_intent_ids == (intent_id,)
-    assert result.proposal.repair_count == 1
-    assert "deferred_intent_claim" in completion.requests[1]["messages"][-1]["content"]
-
-
-@pytest.mark.asyncio
-async def test_eligible_deferred_claims_require_a_mechanical_evaluator(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    with pytest.raises(ValueError, match="claim_evaluator"):
-        await _plan(
-            tmp_path=tmp_path,
-            tool_context=tool_context,
-            completion=_ScriptedCompletion(),
-            surface=PlannerSurface.GUIDED_STAGED,
-            eligible_deferred_intent_ids=("00000000-0000-4000-8000-000000000313",),
-            claim_evaluator=None,
-        )
+def test_planner_has_no_request_selected_terminal_contract() -> None:
+    assert not hasattr(pipeline_planner, "PlannerTerminalContract")
+    assert not hasattr(pipeline_planner, "canonical_planner_terminal_contract")
+    assert "terminal_contract" not in inspect.signature(plan_pipeline).parameters
+    assert "terminal_contract" not in inspect.signature(planner_tool_definitions).parameters
+    assert "terminal_contract" not in inspect.signature(pipeline_planner.planner_terminal_tool_definition).parameters
 
 
 @pytest.mark.asyncio
@@ -1233,10 +932,8 @@ def test_candidate_shape_hash_is_identity_blind_not_structure_preserving(tmp_pat
     VALUES inside an identical structure". That inference does not hold. The
     hash is IDENTITY-blind, not merely value-free: a repair that renamed every
     node, re-pointed every route and swapped a plugin produces the SAME hash.
-    Three real rejection codes — ``guided_reviewed_name_shadowed``,
-    ``guided_route_target_unknown`` and ``guided_output_alias_collision`` —
-    prescribe exactly those edits, so a model following good guidance produces
-    the signature that was read as blindness.
+    Rejections can prescribe exactly those edits, so a model following
+    repair guidance can produce the signature that was read as blindness.
 
     The two tests above pin what it DOES retain. This one pins what it does
     not, so the next reader takes the instrument's resolution from an assertion
@@ -1274,7 +971,7 @@ async def test_authored_short_form_node_review_is_canonicalized_into_the_sealed_
 ) -> None:
     """The durable proposal — not only the transient candidate — carries the full form.
 
-    Regression for the guided first-run tutorial 500: the planner authors the
+    Regression for a first-run tutorial 500: the planner authors the
     skill's short-form ``{kind, user_term, draft}`` review; canonicalisation must
     reach ``safe_pipeline`` so the sealed proposal a later accept/commit re-reads
     is already valid, not a latent re-crash.
@@ -1425,164 +1122,6 @@ def test_state_aware_canonicalization_uses_trusted_existing_source_and_node_ids(
     }
 
 
-@pytest.mark.asyncio
-async def test_plan_preserves_custom_review_identity_through_internal_reconciliation_and_draft_hash(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    source_options = {
-        "path": str(tmp_path / "blobs" / _TEST_SESSION_ID / "input.csv"),
-        "schema": {"mode": "observed"},
-    }
-    node_options = {
-        "schema": {"mode": "observed"},
-        "mapping": {"name": "name"},
-        "select_only": True,
-    }
-    node = NodeSpec(
-        id="cleanup",
-        node_type="transform",
-        plugin="field_mapper",
-        input="rows",
-        on_success="clean",
-        on_error="discard",
-        options=node_options,
-        condition=None,
-        routes=None,
-        fork_to=None,
-        branches=None,
-        policy=None,
-        merge=None,
-    )
-    resolved = {
-        "id": "trusted-node-custom-id",
-        "kind": "pipeline_decision",
-        "user_term": RAW_HTML_CLEANUP_USER_TERM,
-        "status": "resolved",
-        "draft": RAW_HTML_CLEANUP_REVIEW_DRAFT,
-        "event_id": "node-event",
-        "accepted_value": "approved",
-        "accepted_artifact_hash": pipeline_decision_artifact_hash(
-            node,
-            (node,),
-            user_term=RAW_HTML_CLEANUP_USER_TERM,
-        ),
-        "resolved_prompt_template_hash": None,
-    }
-    current = CompositionState(
-        source=SourceSpec(
-            plugin="csv",
-            on_success="rows",
-            options=source_options,
-            on_validation_failure="discard",
-        ),
-        nodes=(replace(node, options={**node_options, INTERPRETATION_REQUIREMENTS_KEY: [resolved]}),),
-        edges=(),
-        outputs=(
-            OutputSpec(
-                name="clean",
-                plugin="json",
-                options={
-                    "path": "outputs/result.jsonl",
-                    "schema": {"mode": "observed"},
-                    "format": "jsonl",
-                    "mode": "write",
-                    "collision_policy": "auto_increment",
-                },
-                on_write_failure="discard",
-            ),
-        ),
-        metadata=PipelineMetadata(),
-        version=7,
-    )
-    pipeline = {
-        "source": {
-            "plugin": "csv",
-            "on_success": "rows",
-            "options": source_options,
-            "on_validation_failure": "discard",
-        },
-        "nodes": [
-            {
-                "id": "cleanup",
-                "node_type": "transform",
-                "plugin": "field_mapper",
-                "input": "rows",
-                "on_success": "clean",
-                "on_error": "discard",
-                "options": {
-                    **node_options,
-                    INTERPRETATION_REQUIREMENTS_KEY: [
-                        {
-                            "kind": "pipeline_decision",
-                            "user_term": RAW_HTML_CLEANUP_USER_TERM,
-                            "draft": RAW_HTML_CLEANUP_REVIEW_DRAFT,
-                        }
-                    ],
-                },
-            }
-        ],
-        "edges": [],
-        "outputs": [
-            {
-                "sink_name": "clean",
-                "plugin": "json",
-                "options": {
-                    "path": "outputs/result.jsonl",
-                    "schema": {"mode": "observed"},
-                    "format": "jsonl",
-                    "mode": "write",
-                    "collision_policy": "auto_increment",
-                },
-                "on_write_failure": "discard",
-            }
-        ],
-    }
-    observed_statuses: list[str] = []
-    claim_id = "00000000-0000-4000-8000-000000000413"
-
-    def evaluate(candidate_state: CompositionState, claimed_ids: tuple[str, ...]) -> tuple[str, ...]:
-        requirement = candidate_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]
-        observed_statuses.append(requirement["status"])
-        return claimed_ids
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=_ScriptedCompletion(
-            _response(
-                (
-                    "emit_pipeline_proposal",
-                    {
-                        "pipeline": pipeline,
-                        "claimed_deferred_intent_ids": [claim_id],
-                    },
-                )
-            )
-        ),
-        current_state=current,
-        eligible_deferred_intent_ids=(claim_id,),
-        claim_evaluator=evaluate,
-        surface=PlannerSurface.GUIDED_STAGED,
-    )
-
-    sealed = deep_thaw(proposal.proposal.pipeline)
-    requirement = sealed["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
-    assert requirement["id"] == "trusted-node-custom-id"
-    assert requirement["status"] == "pending"
-    assert observed_statuses == ["resolved"]
-    assert proposal.proposal.draft_hash == pipeline_draft_hash(
-        pipeline=sealed,
-        base=proposal.proposal.base,
-        reviewed_anchor_hash=proposal.proposal.reviewed_anchor_hash,
-        surface=proposal.proposal.surface,
-        repair_count=proposal.proposal.repair_count,
-        skill_hash=proposal.proposal.skill_hash,
-        covered_deferred_intent_ids=proposal.proposal.covered_deferred_intent_ids,
-        supersedes_draft_hash=proposal.proposal.supersedes_draft_hash,
-    )
-
-
 def _web_authored_policy_pair() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
     """RESTRICTED (web-authored) authority over full catalog availability."""
     full_catalog = create_catalog_service()
@@ -1665,65 +1204,6 @@ async def test_real_planner_call_builds_manifest_from_exact_audited_inputs(
     assert len(captured) == 1
     assert captured[0].rendered_prompt_hash == recorder.llm_calls[0].messages_hash
     assert captured[0].effective_tool_hash == recorder.llm_calls[0].tools_spec_hash
-
-
-@pytest.mark.asyncio
-async def test_real_planner_surface_paths_share_exact_capabilities_tools_and_audit(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import elspeth.web.composer.pipeline_planner as planner_module
-
-    captured: list[Any] = []
-    real_builder = planner_module.build_planner_capability_manifest
-
-    def capture_manifest(**kwargs: Any) -> Any:
-        manifest = real_builder(**kwargs)
-        captured.append(manifest)
-        return manifest
-
-    monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)
-    step_3_planner = load_step_planner_skill(GuidedStep.STEP_3_TRANSFORMS)
-    scenarios = (
-        (PlannerSurface.FREEFORM, "ordinary", build_system_prompt(None)),
-        (PlannerSurface.GUIDED_STAGED, "ordinary", step_3_planner),
-        (PlannerSurface.TUTORIAL_PROFILE, "tutorial", step_3_planner),
-    )
-    requests: list[dict[str, Any]] = []
-    audits: list[Any] = []
-
-    for surface, profile, rendered_skill in scenarios:
-        completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
-        recorder = BufferingRecorder()
-        await _plan(
-            tmp_path=tmp_path,
-            tool_context=tool_context,
-            completion=completion,
-            recorder=recorder,
-            surface=surface,
-            profile=profile,
-            rendered_skill=rendered_skill,
-        )
-        requests.append(completion.requests[0])
-        audits.append(recorder.llm_calls[0])
-
-    assert [(manifest.surface, manifest.profile) for manifest in captured] == [
-        (surface, profile) for surface, profile, _rendered_skill in scenarios
-    ]
-    assert len({manifest.planner_implementation_id for manifest in captured}) == 1
-    assert len({manifest.capability_core_hash for manifest in captured}) == 1
-    assert len({manifest.canonical_schema_hash for manifest in captured}) == 1
-    assert len({manifest.effective_tool_hash for manifest in captured}) == 1
-    assert requests[0]["messages"][0]["content"] == build_system_prompt(None)
-    assert requests[1]["messages"][0]["content"] == step_3_planner
-    assert requests[2]["messages"][0]["content"] == step_3_planner
-    assert requests[1]["tools"] == requests[2]["tools"] == requests[0]["tools"]
-    for manifest, request, audit_call in zip(captured, requests, audits, strict=True):
-        assert manifest.rendered_prompt_hash == stable_hash(request["messages"])
-        assert manifest.effective_tool_hash == stable_hash(request["tools"])
-        assert audit_call.messages_hash == manifest.rendered_prompt_hash
-        assert audit_call.tools_spec_hash == manifest.effective_tool_hash
 
 
 @pytest.mark.asyncio
@@ -1817,11 +1297,12 @@ async def test_provider_input_mutation_is_audited_once_before_integrity_failure(
 
 
 @pytest.mark.asyncio
-async def test_unexpected_completion_exception_propagates_without_provider_audit(
+async def test_unexpected_completion_exception_preserves_identity_and_terminal_audit(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    failure = RuntimeError("local completion adapter defect")
+    secret = "LOCAL-COMPLETION-ADAPTER-DEFECT-SECRET"  # secret-scan: allow-this-line
+    failure = RuntimeError(secret)
     recorder = BufferingRecorder()
 
     with pytest.raises(RuntimeError) as caught:
@@ -1833,7 +1314,11 @@ async def test_unexpected_completion_exception_propagates_without_provider_audit
         )
 
     assert caught.value is failure
-    assert recorder.llm_calls == ()
+    (call,) = recorder.llm_calls
+    assert call.status is ComposerLLMCallStatus.API_ERROR
+    assert call.error_class == "RuntimeError"
+    assert call.error_message == "RuntimeError"
+    assert secret not in canonical_json([call.to_dict()])
 
 
 @pytest.mark.asyncio
@@ -1866,10 +1351,18 @@ async def test_discovery_round_uses_real_read_only_tool_then_terminal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("catalog_inventory", ["live", "small"])
 async def test_initial_request_declares_supplied_information_and_omits_redundant_discovery(
     tmp_path: Path,
     tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+    catalog_inventory: str,
 ) -> None:
+    if catalog_inventory == "small":
+        from elspeth.web.composer import planner_authoring_aids
+
+        monkeypatch.setattr(planner_authoring_aids, "read_litellm_model_list", lambda: ("bedrock/test-model",))
+        monkeypatch.setattr(planner_authoring_aids, "get_catalog_values", lambda _catalog: frozenset({"openai/gpt-4o"}))
     completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
 
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
@@ -1879,19 +1372,21 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
     # decline-eligible from turn 1, so the affordance notice follows it.
     payload = json.loads(request["messages"][1]["content"])
     assert 'starting with "DECLINE: "' in str(request["messages"][-1]["content"])
-    # The full catalog carries a policy-visible llm surface and both aids
-    # land complete on this deployment, so model.catalog and
-    # expression.grammar are manifest-SUPPLIED from turn 1 (F3/F5): the
-    # payload names the aid channel and drops the keys from the discoverable
-    # classes, while their palette tools stay advertised below.
-    assert payload["information_manifest"]["supplied"] == {
+    # Complete catalogs are supplied immediately; a grown live catalog must
+    # explicitly retain discovery for the whole provider lists it deferred.
+    supplied = {
         "pipeline_state": "current_projection",
         "plugin_selection": "policy_snapshot",
-        "model_catalog": "authoring_aids",
         "expression_grammar": "authoring_aids",
     }
+    deferred = bool(payload["authoring_aids"]["model_catalog"]["catalog"]["models_omitted"])
+    if catalog_inventory == "small":
+        assert not deferred
+    if not deferred:
+        supplied["model_catalog"] = "authoring_aids"
+    assert payload["information_manifest"]["supplied"] == supplied
     assert "plugin.schema" in payload["information_manifest"]["discoverable_classes"]
-    assert "model.catalog" not in payload["information_manifest"]["discoverable_classes"]
+    assert ("model.catalog" in payload["information_manifest"]["discoverable_classes"]) is deferred
     assert "expression.grammar" not in payload["information_manifest"]["discoverable_classes"]
     assert payload["information_manifest"]["unresolved"] == []
     assert "unresolved_classes" not in payload["information_manifest"]
@@ -1910,6 +1405,14 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
         "tools": request["tools"],
     }
     assert len(canonical_json(fixed_scaffolding).encode("utf-8")) <= _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
+    if catalog_inventory == "live":
+        # Positive control for the byte gate: the measured 72 B headroom
+        # cannot silently absorb unrelated static-guidance growth. Mutate a
+        # real declaration, keeping request data and the other tools fixed.
+        enlarged_scaffolding = deepcopy(fixed_scaffolding)
+        source_tool = next(tool for tool in enlarged_scaffolding["tools"] if tool["function"]["name"] == "inspect_source")
+        source_tool["function"]["description"] += "x" * 73
+        assert len(canonical_json(enlarged_scaffolding).encode("utf-8")) > _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
 
 
 @pytest.mark.asyncio
@@ -2068,17 +1571,6 @@ def test_blob_discovery_information_is_operation_specific_and_order_sensitive() 
     assert inspected.manifest.covers(f"blob.inspection:{blob_id}")
 
 
-def test_restricted_policy_never_advertises_unavailable_preview_or_state_round_trip() -> None:
-    import elspeth.web.composer.pipeline_planner as planner_module
-
-    policy = planner_module.PlannerDiscoveryPolicy.initial(PlannerSurface.GUIDED_STAGED)
-    names = [tool["function"]["name"] for tool in planner_tool_definitions(policy)]
-
-    assert "preview_pipeline" not in names
-    assert "get_pipeline_state" not in names
-    assert "set_pipeline_arguments" not in names
-
-
 def _generic_document_abstract_pipeline(data_dir: Path) -> dict[str, Any]:
     return {
         "source": {
@@ -2125,6 +1617,7 @@ def _generic_document_abstract_pipeline(data_dir: Path) -> dict[str, Any]:
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                    "system_prompt": "You write abstracts of documents. Reply with the abstract only.",
                     "prompt_template": "Write an abstract of {{ row.document_content }}",
                     "required_input_fields": ["document_content"],
                     "response_field": "abstract",
@@ -2218,7 +1711,7 @@ async def test_generic_linear_plan_reuses_initial_information_and_needs_one_disc
         if message["role"] != "tool":
             continue
         contract = json.loads(message["content"])["data"]
-        assert set(contract) == {"plugin_id", "schema_hash", "json_schema", "knob_schema", "composer_hints"}
+        assert set(contract) == {"plugin_id", "schema_hash", "json_schema", "knob_schema", "composer_hints", "aggregation_output_modes"}
     assert final_messages[-1]["content"] == "All declared information gaps are closed; emit the terminal proposal now."
 
 
@@ -2242,7 +1735,7 @@ async def test_failed_selected_schema_does_not_emit_false_gap_closure(
                 name="csv",
                 plugin_type="source",
                 description="Noncanonical selected schema.",
-                json_schema={"type": "object", "default": object()},
+                json_schema={"type": "object", "description": "x" * (49 * 1024)},
                 knob_schema={"fields": []},
             ),
         )
@@ -2460,7 +1953,7 @@ async def test_second_no_gain_event_mixed_batch_completes_protocol_before_hatch(
     assert [invocation.tool_name for invocation in recorder.invocations] == ["get_plugin_schema", "get_plugin_schema"]
 
 
-def test_noncanonical_schema_serializer_fails_closed() -> None:
+def test_noncanonical_schema_serializer_raises_framework_bug() -> None:
     current_state = _empty_state()
     result = ToolResult(
         success=True,
@@ -2482,96 +1975,63 @@ def test_noncanonical_schema_serializer_fails_closed() -> None:
         arguments={"plugin_type": "transform", "name": "noncanonical_transform"},
     )
 
-    payload = json.loads(
+    with pytest.raises(FrameworkBugError):
         _serialize_provider_discovery_result(
             call=call,
             result=result,
-            surface=PlannerSurface.FREEFORM,
-            provider_current_state=current_state.to_dict(),
         )
+
+
+def test_admitted_schema_projection_ignores_original_payload() -> None:
+    from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult
+    from elspeth.web.composer.tools._generation_schema_response import PLUGIN_SCHEMA_RESPONSE_CONTRACT
+
+    state = _empty_state()
+    schema = create_catalog_service().get_schema("source", "csv")
+    result = ToolResult(success=True, updated_state=state, validation=state.validate(), affected_nodes=(), data=schema)
+    call = _ParsedToolCall(call_id="schema", name="get_plugin_schema", raw_arguments="{}", arguments={})
+    expected = _serialize_provider_discovery_result(call=call, result=result)
+    admitted = AdmittedDiscoveryResult(
+        replace(result, data={"private": "NEVER_READ"}), PLUGIN_SCHEMA_RESPONSE_CONTRACT.admit(schema), PLUGIN_SCHEMA_RESPONSE_CONTRACT
     )
-
-    assert payload["success"] is False
-    assert payload["data"]["error_code"] == "schema_projection_unavailable"
-    assert payload["data"]["next_tool"] == "get_plugin_assistance"
+    assert _serialize_provider_discovery_result(call=call, result=admitted) == expected
 
 
-def _node_component_read(current_state: CompositionState) -> tuple[_ParsedToolCall, ToolResult]:
-    result = ToolResult(
-        success=True,
-        updated_state=current_state,
-        validation=current_state.validate(),
-        affected_nodes=(),
-        data={"node": {"id": "map-1"}},
+@pytest.mark.parametrize("component", [None, "source", "node", "output"])
+def test_admitted_state_projection_ignores_original_payload(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    component: str | None,
+) -> None:
+    from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult
+    from elspeth.web.composer.tools.sessions import _execute_get_pipeline_state
+    from elspeth.web.composer.tools.state_responses import PIPELINE_STATE_RESPONSE_CONTRACT
+
+    state = _state_with_all_provider_disclosure_canaries(tmp_path)
+    if component == "node":
+        component = state.nodes[0].id
+    elif component == "output":
+        component = state.outputs[0].name
+    arguments = {} if component is None else {"component": component}
+    result = _execute_get_pipeline_state(arguments, state, tool_context)
+    assert result.success, [entry.error_code for entry in result.validation.errors]
+    call = _ParsedToolCall(call_id="state", name="get_pipeline_state", raw_arguments=json.dumps(arguments), arguments=arguments)
+    expected = _serialize_provider_discovery_result(
+        call=call,
+        result=result,
     )
-    call = _ParsedToolCall(
-        call_id="call-1",
-        name="get_pipeline_state",
-        raw_arguments='{"component":"map_fields"}',
-        arguments={"component": "map_fields"},
+    admitted = AdmittedDiscoveryResult(
+        replace(result, data={"private": "NEVER_READ"}),
+        PIPELINE_STATE_RESPONSE_CONTRACT.admit(result.data),
+        PIPELINE_STATE_RESPONSE_CONTRACT,
     )
-    return call, result
-
-
-def test_malformed_projection_node_candidate_raises_instead_of_failing_closed() -> None:
-    """A node candidate in the policy-owned server-computed projection that
-    cannot honour the fixed block contract is an internal invariant failure:
-    it must raise, not be laundered into surface_projection_unavailable."""
-    current_state = _empty_state()
-    call, result = _node_component_read(current_state)
-
-    with pytest.raises(TypeError):
+    assert (
         _serialize_provider_discovery_result(
             call=call,
-            result=result,
-            surface=PlannerSurface.GUIDED_STAGED,
-            provider_current_state={"nodes": ["malformed-candidate"]},
+            result=admitted,
         )
-
-
-def test_unmatched_projection_node_read_still_fails_closed() -> None:
-    """Well-formed candidates that simply do not match the selected id keep
-    the closed surface_projection_unavailable outcome."""
-    current_state = _empty_state()
-    call, result = _node_component_read(current_state)
-
-    payload = json.loads(
-        _serialize_provider_discovery_result(
-            call=call,
-            result=result,
-            surface=PlannerSurface.GUIDED_STAGED,
-            provider_current_state={"nodes": [{"id": "other-node"}]},
-        )
+        == expected
     )
-
-    assert payload["success"] is False
-    assert payload["data"]["error_code"] == "surface_projection_unavailable"
-
-
-def test_malformed_projection_output_candidate_raises_instead_of_failing_closed() -> None:
-    """Owned output candidates obey the same invariant posture as nodes."""
-    current_state = _empty_state()
-    result = ToolResult(
-        success=True,
-        updated_state=current_state,
-        validation=current_state.validate(),
-        affected_nodes=(),
-        data={"output": {"sink_name": "rows"}},
-    )
-    call = _ParsedToolCall(
-        call_id="call-output",
-        name="get_pipeline_state",
-        raw_arguments='{"component":"rows"}',
-        arguments={"component": "rows"},
-    )
-
-    with pytest.raises(TypeError):
-        _serialize_provider_discovery_result(
-            call=call,
-            result=result,
-            surface=PlannerSurface.GUIDED_STAGED,
-            provider_current_state={"outputs": ["malformed-candidate"]},
-        )
 
 
 @pytest.mark.asyncio
@@ -2613,716 +2073,55 @@ async def test_schema_fact_survives_rejection_while_issue_specific_discovery_add
     assert no_gain[0]["information_keys"] == ["plugin.schema:source/csv"]
 
 
-@pytest.mark.asyncio
-async def test_staged_guided_pipeline_state_discovery_preserves_initial_redacted_projection(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """A staged planner cannot recover an option value withheld at turn zero."""
-    withheld_canary = "WITHHELD-STAGED-OPTION-CANARY"
-    current_state = CompositionState(
-        source=SourceSpec(
-            plugin="csv",
-            on_success="rows",
-            options={
-                "path": f"blobs/{_TEST_SESSION_ID}/{withheld_canary}.csv",
-                "schema": {"mode": "observed"},
-            },
-            on_validation_failure="discard",
-        ),
-        nodes=(),
-        edges=(),
-        outputs=(
-            OutputSpec(
-                name="rows",
-                plugin="json",
-                options={
-                    "path": "outputs/result.jsonl",
-                    "schema": {"mode": "observed"},
-                    "format": "jsonl",
-                    "mode": "write",
-                    "collision_policy": "auto_increment",
-                },
-                on_write_failure="discard",
-            ),
-        ),
-        metadata=PipelineMetadata(),
-        version=4,
-    )
-    provider_state = guided_redacted_current_state_context(current_state)
-    completion = _ScriptedCompletion(
-        _response(("get_pipeline_state", {})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+@pytest.fixture
+def restricted_discovery_producer(tmp_path: Path, tool_context: ToolContext) -> Any:
+    """Real discovery handlers with bounded storage and secret collaborators."""
+    import hashlib
+
+    from elspeth.web.composer.tools import blobs, sources
+    from elspeth.web.composer.tools._dispatch import execute_discovery_tool_with_context
+    from tests.unit.web.composer.test_tools import _SecretServiceDouble
+
+    path = tmp_path / "discovery.csv"
+    content = b"name,value\nexample,1\n"
+    path.write_bytes(content)
+    record = {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "filename": path.name,
+        "storage_path": str(path),
+        "mime_type": "text/csv",
+        "size_bytes": len(content),
+        "content_hash": hashlib.sha256(content).hexdigest(),
+        "status": "ready",
+        "created_by": "assistant",
+        "creation_modality": "verbatim",
+    }
+    secret_service = _SecretServiceDouble()
+    secret_service.list_refs.return_value = []
+    secret_service.has_ref.return_value = False
+    engine = create_session_engine("sqlite://")
+    context = replace(
+        tool_context,
+        data_dir=tmp_path,
+        session_id=_TEST_SESSION_ID,
+        session_engine=engine,
+        secret_service=secret_service,
+        user_id="disclosure-test",
+        baseline=_empty_state(),
     )
 
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current_state,
-        provider_current_state=provider_state,
-        surface=PlannerSurface.GUIDED_STAGED,
-    )
+    def produce(tool_name: str) -> ToolResult:
+        return execute_discovery_tool_with_context(tool_name, dict(_DISCOVERY_TEST_ARGUMENTS[tool_name]), _empty_state(), context)
 
-    initial_payload = completion.requests[0]["messages"][-1]["content"]
-    assert withheld_canary not in initial_payload
-    discovery_payload = next(message["content"] for message in completion.requests[1]["messages"] if message["role"] == "tool")
-    assert withheld_canary not in discovery_payload
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("component", "expected_data_key"),
-    [
-        ("source", "sources"),
-        ("map_fields", "node"),
-        ("mapped", "output"),
-    ],
-)
-async def test_staged_guided_component_discovery_preserves_redacted_component_shape(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    component: str,
-    expected_data_key: str,
-) -> None:
-    current_state = _state_with_disclosure_canaries(tmp_path)
-    provider_state = guided_redacted_current_state_context(current_state)
-    completion = _ScriptedCompletion(
-        _response(("get_pipeline_state", {"component": component})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current_state,
-        provider_current_state=provider_state,
-        surface=PlannerSurface.GUIDED_STAGED,
-    )
-
-    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
-    payload = json.loads(tool_message["content"])
-    assert set(payload["data"]) == {expected_data_key}
-    if expected_data_key == "sources":
-        assert payload["data"]["sources"] == provider_state["sources"]
-    elif expected_data_key == "node":
-        assert payload["data"]["node"] == provider_state["nodes"][0]
-    else:
-        assert payload["data"]["output"] == provider_state["outputs"][0]
-    assert all(canary not in tool_message["content"] for canary in _DISCLOSURE_CANARIES)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "profile"),
-    [
-        (PlannerSurface.GUIDED_STAGED, "ordinary"),
-        (PlannerSurface.TUTORIAL_PROFILE, "tutorial"),
-    ],
-)
-async def test_redacted_planner_set_pipeline_arguments_read_fails_closed(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    surface: PlannerSurface,
-    profile: str,
-) -> None:
-    withheld_canary = "WITHHELD-ROUND-TRIP-CANARY"
-    current_state = CompositionState(
-        source=SourceSpec(
-            plugin="csv",
-            on_success="rows",
-            options={
-                "path": f"blobs/{_TEST_SESSION_ID}/{withheld_canary}.csv",
-                "schema": {"mode": "observed"},
-            },
-            on_validation_failure="discard",
-        ),
-        nodes=(),
-        edges=(),
-        outputs=(
-            OutputSpec(
-                name="rows",
-                plugin="json",
-                options={
-                    "path": "outputs/result.jsonl",
-                    "schema": {"mode": "observed"},
-                    "format": "jsonl",
-                    "mode": "write",
-                    "collision_policy": "auto_increment",
-                },
-                on_write_failure="discard",
-            ),
-        ),
-        metadata=PipelineMetadata(),
-        version=4,
-    )
-    completion = _ScriptedCompletion(
-        _response(("get_pipeline_state", {"component": "set_pipeline_arguments"})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current_state,
-        provider_current_state=guided_redacted_current_state_context(current_state),
-        surface=surface,
-        profile=profile,
-    )
-
-    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
-    payload = json.loads(tool_message["content"])
-    assert payload["success"] is False
-    assert payload["data"]["error_code"] == "surface_projection_unavailable"
-    assert withheld_canary not in tool_message["content"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "profile"),
-    [
-        (PlannerSurface.GUIDED_STAGED, "ordinary"),
-        (PlannerSurface.TUTORIAL_PROFILE, "tutorial"),
-    ],
-)
-@pytest.mark.parametrize(
-    "arguments",
-    [
-        {"unexpected": True},
-        {"component": "missing-component"},
-    ],
-)
-async def test_redacted_planner_preserves_canonical_failed_state_read(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    surface: PlannerSurface,
-    profile: str,
-    arguments: Mapping[str, Any],
-) -> None:
-    current_state = _state_with_disclosure_canaries(tmp_path)
-    completion = _ScriptedCompletion(
-        _response(("get_pipeline_state", dict(arguments))),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current_state,
-        provider_current_state=guided_redacted_current_state_context(current_state),
-        surface=surface,
-        profile=profile,
-    )
-
-    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
-    payload = json.loads(tool_message["content"])
-    assert payload["success"] is False
-    assert payload["data"].get("error_code") != "surface_projection_unavailable"
-    if "unexpected" in arguments:
-        # The argument rejection rides under ``data`` as ``argument_error``,
-        # never as a second ``success`` / ``validation`` beside the envelope's
-        # own (SYS-R3-1): the envelope's ``validation`` here is the STATE's.
-        assert set(payload["data"]) == {"argument_error"}
-        assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
-    else:
-        assert payload["data"]["error"] == (
-            "Component 'missing-component' not found. Specify 'source', a node ID, an output name, "
-            "or a full-state alias ('full', 'all', 'pipeline', or empty string)."
-        )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "profile", "restricted"),
-    [
-        (PlannerSurface.FREEFORM, "ordinary", False),
-        (PlannerSurface.GUIDED_FULL, "ordinary", False),
-        (PlannerSurface.GUIDED_STAGED, "ordinary", True),
-        (PlannerSurface.TUTORIAL_PROFILE, "tutorial", True),
-    ],
-)
-@pytest.mark.parametrize("failed", [False, True])
-async def test_pipeline_state_disclosure_projects_the_whole_restricted_envelope(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    surface: PlannerSurface,
-    profile: str,
-    restricted: bool,
-    failed: bool,
-) -> None:
-    current_state = _state_with_validation_message_canary(tmp_path)
-    provider_state = guided_redacted_current_state_context(current_state) if restricted else current_state.to_dict()
-    arguments = {"component": "missing-component"} if failed else {}
-    completion = _ScriptedCompletion(
-        _response(("get_pipeline_state", arguments)),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current_state,
-        provider_current_state=provider_state,
-        surface=surface,
-        profile=profile,
-    )
-
-    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
-    payload = json.loads(tool_message["content"])
-    assert payload["success"] is not failed
-    if restricted:
-        assert _VALIDATION_MESSAGE_CANARY not in tool_message["content"]
-        assert set(payload["validation"]) == {
-            "is_valid",
-            "errors",
-            "warnings",
-            "suggestions",
-            "semantic_contracts",
-            "graph_repair_suggestions",
-        }
-        for entries in (
-            payload["validation"]["errors"],
-            payload["validation"]["warnings"],
-            payload["validation"]["suggestions"],
-        ):
-            assert all(set(entry) <= {"component", "severity", "error_code"} for entry in entries)
-        if failed:
-            assert payload["data"]["error"] == (
-                "Component 'missing-component' not found. Specify 'source', a node ID, an output name, "
-                "or a full-state alias ('full', 'all', 'pipeline', or empty string)."
-            )
-    else:
-        assert _VALIDATION_MESSAGE_CANARY in tool_message["content"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "profile", "restricted"),
-    [
-        (PlannerSurface.FREEFORM, "ordinary", False),
-        (PlannerSurface.GUIDED_FULL, "ordinary", False),
-        (PlannerSurface.GUIDED_STAGED, "ordinary", True),
-        (PlannerSurface.TUTORIAL_PROFILE, "tutorial", True),
-    ],
-)
-@pytest.mark.parametrize("failed", [False, True])
-async def test_pipeline_state_disclosure_closes_hidden_topology_validation_components(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    surface: PlannerSurface,
-    profile: str,
-    restricted: bool,
-    failed: bool,
-) -> None:
-    current_state = _state_with_hidden_topology_component_canaries(tmp_path)
-    provider_state = guided_redacted_current_state_context(current_state) if restricted else current_state.to_dict()
-    if restricted:
-        assert _HIDDEN_CONNECTION_COMPONENT_CANARY not in canonical_json(provider_state)
-        assert _HIDDEN_EDGE_COMPONENT_CANARY not in canonical_json(provider_state)
-    arguments = {"component": "missing-component"} if failed else {}
-    completion = _ScriptedCompletion(
-        _response(("get_pipeline_state", arguments)),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current_state,
-        provider_current_state=provider_state,
-        surface=surface,
-        profile=profile,
-    )
-
-    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
-    payload = json.loads(tool_message["content"])
-    entries = payload["validation"]["errors"]
-    codes = {entry.get("error_code") for entry in entries}
-    assert {"duplicate_connection_producer", "edge_unknown_node"} <= codes
-    assert all(
-        entry["severity"] == "high"
-        for entry in entries
-        if entry.get("error_code") in {"duplicate_connection_producer", "edge_unknown_node"}
-    )
-    if restricted:
-        assert _HIDDEN_CONNECTION_COMPONENT_CANARY not in tool_message["content"]
-        assert _HIDDEN_EDGE_COMPONENT_CANARY not in tool_message["content"]
-        assert {entry["component"] for entry in entries} == {"pipeline"}
-    else:
-        components = {entry["component"] for entry in entries}
-        assert f"connection:{_HIDDEN_CONNECTION_COMPONENT_CANARY}" in components
-        assert f"edge:{_HIDDEN_EDGE_COMPONENT_CANARY}" in components
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "profile", "restricted"),
-    [
-        (PlannerSurface.FREEFORM, "ordinary", False),
-        (PlannerSurface.GUIDED_FULL, "ordinary", False),
-        (PlannerSurface.GUIDED_STAGED, "ordinary", True),
-        (PlannerSurface.TUTORIAL_PROFILE, "tutorial", True),
-    ],
-)
-@pytest.mark.parametrize("failed", [False, True])
-async def test_list_sources_disclosure_closes_authoritative_validation_envelope(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    surface: PlannerSurface,
-    profile: str,
-    restricted: bool,
-    failed: bool,
-) -> None:
-    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
-    provider_state = guided_redacted_current_state_context(current_state) if restricted else current_state.to_dict()
-    arguments = {"unexpected": True} if failed else {}
-    completion = _ScriptedCompletion(
-        _response(("list_sources", arguments)),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current_state,
-        provider_current_state=provider_state,
-        surface=surface,
-        profile=profile,
-    )
-
-    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
-    payload = json.loads(tool_message["content"])
-    assert payload["success"] is not failed
-    if failed:
-        # ``data`` carries the argument rejection under its own name. It must
-        # not restate the envelope's ``success`` (a twin) or shadow the
-        # envelope's ``validation``, which on this arm is the STATE's and whose
-        # errors are the pipeline's, not the argument's (SYS-R3-1).
-        assert set(payload["data"]) == {"argument_error"}
-        assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
-        assert payload["validation"]["errors"] != [payload["data"]["argument_error"]]
-    else:
-        assert isinstance(payload["data"], dict)
-        assert isinstance(payload["data"]["available"], list)
-        assert isinstance(payload["data"]["prohibited"], list)
-    if restricted:
-        assert all(canary not in tool_message["content"] for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
-        for entries in (
-            payload["validation"]["errors"],
-            payload["validation"]["warnings"],
-            payload["validation"]["suggestions"],
-        ):
-            assert {entry["component"] for entry in entries} <= {"pipeline"}
-    else:
-        assert _VALIDATION_MESSAGE_CANARY in tool_message["content"]
-        assert _HIDDEN_CONNECTION_COMPONENT_CANARY in tool_message["content"]
-        assert _HIDDEN_EDGE_COMPONENT_CANARY in tool_message["content"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "profile", "restricted"),
-    [
-        (PlannerSurface.FREEFORM, "ordinary", False),
-        (PlannerSurface.GUIDED_FULL, "ordinary", False),
-        (PlannerSurface.GUIDED_STAGED, "ordinary", True),
-        (PlannerSurface.TUTORIAL_PROFILE, "tutorial", True),
-    ],
-)
-@pytest.mark.parametrize("failed", [False, True])
-async def test_preview_pipeline_disclosure_fails_closed_when_authoritative_data_is_unsafe(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    surface: PlannerSurface,
-    profile: str,
-    restricted: bool,
-    failed: bool,
-) -> None:
-    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
-    provider_state = guided_redacted_current_state_context(current_state) if restricted else current_state.to_dict()
-    arguments = {"unexpected": True} if failed else {}
-    completion = _ScriptedCompletion(
-        _response(("preview_pipeline", arguments)),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current_state,
-        provider_current_state=provider_state,
-        surface=surface,
-        profile=profile,
-    )
-
-    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
-    payload = json.loads(tool_message["content"])
-    if restricted:
-        assert all(canary not in tool_message["content"] for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
-        if failed:
-            assert payload["success"] is False
-            # Same shape on the RESTRICTED surface, which is where it matters
-            # most: ``_closed_provider_discovery_payload`` strips messages from
-            # the envelope's validation and then passes ``data`` through
-            # verbatim, so a second validation envelope under ``data`` would
-            # defeat that closure (SYS-R3-1).
-            assert set(payload["data"]) == {"argument_error"}
-            assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
-            assert payload["data"].get("error_code") != "surface_projection_unavailable"
-        else:
-            assert payload["success"] is False
-            assert set(payload["data"]) == {"error", "error_code"}
-            assert payload["data"]["error_code"] == "surface_projection_unavailable"
-            assert "runtime_preflight" not in payload
-    else:
-        assert payload["success"] is not failed
-        assert _VALIDATION_MESSAGE_CANARY in tool_message["content"]
-        assert _HIDDEN_CONNECTION_COMPONENT_CANARY in tool_message["content"]
-        assert _HIDDEN_EDGE_COMPONENT_CANARY in tool_message["content"]
-        if not failed:
-            assert "preview_is_valid" in payload["data"]
-
-
-@pytest.mark.parametrize(
-    "surface",
-    [PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE],
-)
-@pytest.mark.parametrize("tool_name", sorted(PLANNER_DISCOVERY_TOOL_NAMES))
-def test_every_restricted_discovery_success_uses_the_closed_provider_envelope(
-    tmp_path: Path,
-    surface: PlannerSurface,
-    tool_name: str,
-) -> None:
-    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
-    provider_state = guided_redacted_current_state_context(current_state)
-    authoritative_data = {"inspection": "diagnostic"} if tool_name == "get_pipeline_state" else {"safe_tool_marker": tool_name}
-    result = ToolResult(
-        success=True,
-        updated_state=current_state,
-        validation=current_state.validate(),
-        affected_nodes=(),
-        data=authoritative_data,
-    )
-    call = _ParsedToolCall(
-        call_id="call-1",
-        name=tool_name,
-        raw_arguments="{}",
-        arguments={},
-    )
-
-    payload = json.loads(
-        _serialize_provider_discovery_result(
-            call=call,
-            result=result,
-            surface=surface,
-            provider_current_state=provider_state,
-        )
-    )
-
-    assert all(canary not in canonical_json(payload) for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
-    if tool_name == "get_pipeline_state":
-        assert payload["success"] is True
-        assert payload["data"] == provider_state
-    elif tool_name == "preview_pipeline":
-        assert payload["success"] is False
-        assert payload["data"]["error_code"] == "surface_projection_unavailable"
-    elif tool_name == "get_plugin_schema":
-        assert payload["success"] is False
-        assert payload["data"]["error_code"] == "schema_projection_unavailable"
-        assert payload["data"]["next_tool"] == "get_plugin_assistance"
-    else:
-        assert payload["success"] is True
-        assert payload["data"] == authoritative_data
-
-
-@pytest.mark.parametrize(
-    "surface",
-    [PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE],
-)
-def test_restricted_preview_projection_strips_the_structural_preview_block(
-    tmp_path: Path,
-    surface: PlannerSurface,
-) -> None:
-    """elspeth-229e9e8195: the additive ``structural_preview`` block must not
-    leak through the restricted provider envelope — a restricted preview
-    success fail-closes to the closed error payload, block included."""
-    canary = "STRUCTURAL_PREVIEW_NOTE_CANARY_51C9"
-    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
-    provider_state = guided_redacted_current_state_context(current_state)
-    result = ToolResult(
-        success=True,
-        updated_state=current_state,
-        validation=current_state.validate(),
-        affected_nodes=(),
-        data={
-            "is_valid": False,
-            "structural_preview": {
-                "is_valid": False,
-                "confidence": "equivalent",
-                "masking_applied": False,
-                "failing_checks": [],
-                "errors": [],
-                "note": canary,
-            },
-        },
-    )
-    call = _ParsedToolCall(call_id="call-1", name="preview_pipeline", raw_arguments="{}", arguments={})
-
-    serialized = _serialize_provider_discovery_result(
-        call=call,
-        result=result,
-        surface=surface,
-        provider_current_state=provider_state,
-    )
-
-    assert canary not in serialized
-    assert "structural_preview" not in serialized
-    payload = json.loads(serialized)
-    assert payload["success"] is False
-    assert payload["data"]["error_code"] == "surface_projection_unavailable"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "profile"),
-    [
-        (PlannerSurface.GUIDED_STAGED, "ordinary"),
-        (PlannerSurface.TUTORIAL_PROFILE, "tutorial"),
-    ],
-)
-@pytest.mark.parametrize(
-    ("component", "collision_kind", "expected_data_key"),
-    [
-        ("source", "node", "sources"),
-        ("full", "node", "node"),
-        ("all", "output", "output"),
-        ("pipeline", "node", "node"),
-    ],
-)
-async def test_redacted_planner_selector_collisions_follow_authoritative_precedence(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    surface: PlannerSurface,
-    profile: str,
-    component: str,
-    collision_kind: str,
-    expected_data_key: str,
-) -> None:
-    current_state = _state_with_disclosure_canaries(tmp_path)
-    if collision_kind == "node":
-        current_state = replace(
-            current_state,
-            nodes=(replace(current_state.nodes[0], id=component),),
-        )
-    else:
-        current_state = replace(
-            current_state,
-            nodes=(replace(current_state.nodes[0], on_success=component),),
-            outputs=(replace(current_state.outputs[0], name=component),),
-        )
-    provider_state = guided_redacted_current_state_context(current_state)
-    completion = _ScriptedCompletion(
-        _response(("get_pipeline_state", {"component": component})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current_state,
-        provider_current_state=provider_state,
-        surface=surface,
-        profile=profile,
-    )
-
-    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
-    payload = json.loads(tool_message["content"])
-    assert set(payload["data"]) == {expected_data_key}
-    assert all(canary not in tool_message["content"] for canary in _DISCLOSURE_CANARIES)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("component", [None, "", "full", "all", "pipeline", " FULL "])
-@pytest.mark.parametrize(
-    ("surface", "profile"),
-    [
-        (PlannerSurface.GUIDED_STAGED, "ordinary"),
-        (PlannerSurface.TUTORIAL_PROFILE, "tutorial"),
-    ],
-)
-async def test_redacted_planner_full_state_aliases_return_the_same_surface_projection(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    component: str | None,
-    surface: PlannerSurface,
-    profile: str,
-) -> None:
-    current_state = _state_with_disclosure_canaries(tmp_path)
-    provider_state = guided_redacted_current_state_context(current_state)
-    arguments = {} if component is None else {"component": component}
-    completion = _ScriptedCompletion(
-        _response(("get_pipeline_state", arguments)),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current_state,
-        provider_current_state=provider_state,
-        surface=surface,
-        profile=profile,
-    )
-
-    tool_message = next(message for message in completion.requests[1]["messages"] if message["role"] == "tool")
-    payload = json.loads(tool_message["content"])
-    assert payload["data"] == provider_state
-    assert all(canary not in tool_message["content"] for canary in _DISCLOSURE_CANARIES)
-
-
-@pytest.mark.asyncio
-async def test_staged_guided_discovery_reread_after_rejection_stays_redacted(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    current_state = _state_with_disclosure_canaries(tmp_path)
-    completion = _ScriptedCompletion(
-        _response(("get_pipeline_state", {})),
-        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
-        _response(("get_pipeline_state", {})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current_state,
-        provider_current_state=guided_redacted_current_state_context(current_state),
-        surface=PlannerSurface.GUIDED_STAGED,
-    )
-
-    tool_messages = [
-        message["content"]
-        for message in completion.requests[-1]["messages"]
-        if message["role"] == "tool" and message["tool_call_id"] in {"call-1"}
-    ]
-    state_reads = [
-        content for content in tool_messages if json.loads(content).get("data", {}).get("schema") == "guided.current-state-context.v1"
-    ]
-    assert len(state_reads) == 1
-    no_gain = [content for content in tool_messages if json.loads(content).get("error_code") == "DISCOVERY_NO_GAIN"]
-    assert len(no_gain) == 1
-    assert all(all(canary not in content for canary in _DISCLOSURE_CANARIES) for content in state_reads)
+    with (
+        patch.object(blobs, "_sync_list_blobs", autospec=True, return_value=[]),
+        patch.object(blobs, "_sync_list_ready_blob_inline_descriptors", autospec=True, return_value=[]),
+        patch.object(blobs, "_sync_get_blob", autospec=True, return_value=record),
+        patch.object(blobs, "_locked_read_ready_blob", autospec=True, return_value=(record, content)),
+        patch.object(sources, "_sync_get_blob", autospec=True, return_value=record),
+    ):
+        yield produce
+    engine.dispose()
 
 
 _DISCOVERY_TEST_ARGUMENTS: Mapping[str, Mapping[str, Any]] = {
@@ -3349,25 +2148,13 @@ _DISCOVERY_TEST_ARGUMENTS: Mapping[str, Mapping[str, Any]] = {
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "profile", "redacted"),
-    [
-        (PlannerSurface.FREEFORM, "ordinary", False),
-        (PlannerSurface.GUIDED_FULL, "ordinary", False),
-        (PlannerSurface.GUIDED_STAGED, "ordinary", True),
-        (PlannerSurface.TUTORIAL_PROFILE, "tutorial", True),
-    ],
-)
-async def test_every_planner_discovery_tool_honors_surface_state_disclosure(
+async def test_every_freeform_planner_discovery_tool_returns_admitted_state(
     tmp_path: Path,
     tool_context: ToolContext,
-    surface: PlannerSurface,
-    profile: str,
-    redacted: bool,
 ) -> None:
     assert set(_DISCOVERY_TEST_ARGUMENTS) == set(PLANNER_DISCOVERY_TOOL_NAMES)
     current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
-    provider_state = guided_redacted_current_state_context(current_state) if redacted else current_state.to_dict()
+    provider_state = current_state.to_dict()
     calls = tuple((name, dict(_DISCOVERY_TEST_ARGUMENTS[name])) for name in PLANNER_DISCOVERY_TOOL_NAMES)
     completion = _ScriptedCompletion(
         _response(*calls),
@@ -3380,8 +2167,6 @@ async def test_every_planner_discovery_tool_honors_surface_state_disclosure(
         completion=completion,
         current_state=current_state,
         provider_current_state=provider_state,
-        surface=surface,
-        profile=profile,
         model_overrides={"max_tool_calls_per_turn": len(calls)},
     )
 
@@ -3391,14 +2176,11 @@ async def test_every_planner_discovery_tool_honors_surface_state_disclosure(
     assert len(tool_messages) == len(calls)
     for index, (name, _arguments) in enumerate(calls, start=1):
         content = tool_messages[f"call-{index}"]
-        if redacted:
-            assert all(canary not in content for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
-        else:
-            assert _VALIDATION_MESSAGE_CANARY in content
-            assert _HIDDEN_CONNECTION_COMPONENT_CANARY in content
-            assert _HIDDEN_EDGE_COMPONENT_CANARY in content
-            if name == "get_pipeline_state":
-                assert _DISCLOSURE_CANARIES[1] in content
+        assert _VALIDATION_MESSAGE_CANARY in content
+        assert _HIDDEN_CONNECTION_COMPONENT_CANARY in content
+        assert _HIDDEN_EDGE_COMPONENT_CANARY in content
+        if name == "get_pipeline_state":
+            assert _DISCLOSURE_CANARIES[1] in content
 
 
 @pytest.mark.asyncio
@@ -3411,12 +2193,14 @@ async def test_parallel_discovery_results_remain_correlated_by_tool_call_id(
 
     original = planner_module.execute_discovery_tool_with_context
     rendezvous = threading.Barrier(2)
+    expected_data: dict[str, Any] = {}
 
     def synchronized_discovery(*args: Any, **kwargs: Any) -> Any:
         tool_name = args[0]
         rendezvous.wait(timeout=2)
         result = original(*args, **kwargs)
-        return replace(result, data={"marker": tool_name})
+        expected_data[tool_name] = json.loads(pipeline_planner.serialize_tool_result(result))["data"]
+        return result
 
     monkeypatch.setattr(planner_module, "execute_discovery_tool_with_context", synchronized_discovery)
     completion = _ScriptedCompletion(
@@ -3428,9 +2212,10 @@ async def test_parallel_discovery_results_remain_correlated_by_tool_call_id(
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
 
     tool_messages = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
-    assert [(message["tool_call_id"], json.loads(message["content"])["data"]["marker"]) for message in tool_messages] == [
-        ("call-1", "list_sources"),
-        ("call-2", "list_sinks"),
+    assert expected_data["list_sources"] != expected_data["list_sinks"], "correlation witness must discriminate the two payloads"
+    assert [(message["tool_call_id"], json.loads(message["content"])["data"]) for message in tool_messages] == [
+        ("call-1", expected_data["list_sources"]),
+        ("call-2", expected_data["list_sinks"]),
     ]
     assert {call.tool_call_id: call.tool_name for call in recorder.invocations} == {
         "call-1": "list_sources",
@@ -3506,22 +2291,36 @@ async def test_parallel_discovery_cancellation_closes_every_audit_before_return(
     import elspeth.web.composer.pipeline_planner as planner_module
 
     original = planner_module.execute_discovery_tool_with_context
-    rendezvous = threading.Barrier(2)
     both_workers_entered = threading.Event()
+    both_workers_finished = threading.Event()
     release_workers = threading.Event()
+    entered_count = 0
     finished_count = 0
-    finished_lock = threading.Lock()
+    worker_lock = threading.Lock()
 
     def controlled_discovery(*args: Any, **kwargs: Any) -> Any:
-        nonlocal finished_count
-        rendezvous.wait(timeout=2)
-        both_workers_entered.set()
-        release_workers.wait(timeout=5)
+        nonlocal entered_count, finished_count
+        with worker_lock:
+            entered_count += 1
+            if entered_count == 2:
+                both_workers_entered.set()
+        # Only the test releases these workers. A wall-clock timeout here
+        # could let discovery succeed before cancellation on a loaded host.
+        release_workers.wait()
         try:
             return original(*args, **kwargs)
         finally:
-            with finished_lock:
+            with worker_lock:
                 finished_count += 1
+                if finished_count == 2:
+                    both_workers_finished.set()
+
+    async def wait_for_workers(event: threading.Event) -> None:
+        # Keep a loop timer active even when thread completion does not wake
+        # the selector promptly in a constrained test environment.
+        async with asyncio.timeout(30):
+            while not event.is_set():
+                await asyncio.sleep(0.01)
 
     monkeypatch.setattr(planner_module, "execute_discovery_tool_with_context", controlled_discovery)
     recorder = BufferingRecorder()
@@ -3536,8 +2335,12 @@ async def test_parallel_discovery_cancellation_closes_every_audit_before_return(
         )
     )
     try:
-        await asyncio.wait_for(asyncio.to_thread(both_workers_entered.wait, 2), timeout=3)
+        # Await actual entry rather than ignoring Event.wait's False timeout
+        # result and cancelling a planner that has not dispatched either call.
+        await wait_for_workers(both_workers_entered)
         task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=30)
+        assert task in done, "planner cancellation waited for blocked discovery workers"
         with pytest.raises(asyncio.CancelledError):
             await task
         assert len(recorder.invocations) == 2
@@ -3548,14 +2351,15 @@ async def test_parallel_discovery_cancellation_closes_every_audit_before_return(
         assert events[-1] == "settled:cancelled"
     finally:
         release_workers.set()
+        if not task.done():
+            task.cancel()
+            done, _pending = await asyncio.wait({task}, timeout=30)
+            assert task in done, "planner did not settle after discovery workers were released"
+            await asyncio.gather(task, return_exceptions=True)
 
-    for _attempt in range(200):
-        with finished_lock:
-            if finished_count == 2:
-                break
-        await asyncio.sleep(0.01)
+    await wait_for_workers(both_workers_finished)
     await asyncio.sleep(0)
-    with finished_lock:
+    with worker_lock:
         assert finished_count == 2
     assert tuple(call.to_dict() for call in recorder.invocations) == closed_snapshot
 
@@ -3613,54 +2417,6 @@ async def test_live_authoring_aids_ride_in_the_reviewed_context_user_message(
     system_messages = [message for message in request["messages"] if message["role"] == "system"]
     assert all("set_pipeline_exemplar" not in message["content"] for message in system_messages)
     assert all("composer_hints" not in message["content"] for message in system_messages)
-    assert all('"authoring_aids"' not in message["content"] for message in system_messages)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "profile"),
-    [
-        (PlannerSurface.GUIDED_STAGED, "ordinary"),
-        (PlannerSurface.TUTORIAL_PROFILE, "tutorial"),
-    ],
-)
-async def test_authoring_aids_reach_guided_staged_and_tutorial_surfaces(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    surface: PlannerSurface,
-    profile: str,
-) -> None:
-    """The live aids ride in the planner user message on EVERY surface.
-
-    The guided-staged and tutorial planners enter through the same
-    ``_plan_pipeline_inner`` message assembly as freeform (their surface is a
-    ``plan_pipeline`` argument, not a different code path), so the digest and
-    worked exemplars must appear in their sole reviewed-context user message
-    under the guided step skill exactly as they do under the freeform skill —
-    and the payload must stay out of the (hash-pinned) step system text.
-    """
-    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=surface,
-        profile=profile,
-        rendered_skill=load_step_planner_skill(GuidedStep.STEP_3_TRANSFORMS),
-    )
-
-    request = completion.requests[0]
-    user_messages = [message for message in request["messages"] if message["role"] == "user"]
-    assert len(user_messages) == 1
-    payload = json.loads(user_messages[0]["content"])
-    full_catalog = create_catalog_service()
-    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
-    expected = build_planner_authoring_aids(PolicyCatalogView.for_trained_operator(full_catalog, plugin_snapshot))
-    assert payload["authoring_aids"] == json.loads(canonical_json(expected))
-    assert "discovery_digest" in payload["authoring_aids"]
-    system_messages = [message for message in request["messages"] if message["role"] == "system"]
-    assert all("set_pipeline_exemplar" not in message["content"] for message in system_messages)
     assert all('"authoring_aids"' not in message["content"] for message in system_messages)
 
 
@@ -3767,135 +2523,6 @@ async def test_missing_source_candidate_fails_closed_before_full_candidate_is_ac
             "schema_violations": [{"path": "pipeline", "rule": "oneOf"}],
         }
     ]
-
-
-@pytest.mark.asyncio
-async def test_nodeless_revision_candidate_gets_one_coded_nudge_then_valve(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """A guided revision that nets zero transforms is nudged once, not shipped.
-
-    Tutorial op 1152d7e3 (2026-07-22): after blind repairs the planner
-    "converged" by dropping every node — a bare passthrough whose metadata
-    still claimed to scrape/summarize/clean. On a revision turn (a rejected
-    draft is superseded, so the operator explicitly asked for changes) a
-    candidate with zero transform/aggregation nodes must draw ONE coded
-    rejection; re-emitting the same nodeless pipeline is the escape valve
-    confirming a deliberate pass-through (9137456ad omit-valve pattern).
-    """
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=PlannerSurface.GUIDED_STAGED,
-        supersedes_draft_hash=stable_hash("superseded-draft"),
-    )
-
-    assert proposal.proposal.repair_count == 1
-    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
-    assert feedback["success"] is False
-    codes = [error["error_code"] for error in feedback["validation"]["errors"]]
-    assert codes == ["proposal_missing_requested_transforms"]
-    assert feedback["validation"]["errors"][0]["explanation"]
-    assert feedback["validation"]["errors"][0]["suggested_fix"]
-
-
-@pytest.mark.asyncio
-async def test_two_defect_nodeless_unproducible_revision_gets_one_coherent_rejection(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """T1xT3 (acceptance-r2 final review, must-fix 2): one instruction, not two.
-
-    A guided revision candidate can carry BOTH defects at once: zero
-    transform/aggregation nodes AND reviewed output fields no source declares
-    or observes. The nodeless nudge's omit-valve ("re-emit the same pipeline
-    unchanged ... the confirmation will be accepted") and the satisfiability
-    guard ("re-emitting ... will be rejected again") are contradictory repair
-    instructions; against the default repair budget of 2 the pair is a
-    guaranteed unrepairable path. The satisfiability guard must fire FIRST —
-    its feedback names the missing fields, adding a transform clears both
-    guards in one turn, and the omit-valve promise is only ever made when it
-    is true.
-    """
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_short_form_llm_review(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=PlannerSurface.GUIDED_STAGED,
-        supersedes_draft_hash=stable_hash("superseded-draft"),
-        unproducible_output_fields=("rating",),
-        repair_budget=2,  # the production default (composer_planner_repair_budget)
-    )
-
-    # One rejection, then the transformful re-emit lands: the contradictory
-    # pair cannot exhaust the budget because only ONE guard ever speaks.
-    assert proposal.proposal.repair_count == 1
-    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
-    assert feedback["success"] is False
-    codes = [error["error_code"] for error in feedback["validation"]["errors"]]
-    assert codes == ["passthrough_cannot_produce_declared_fields"]
-    # The surviving message names the missing fields ...
-    assert "rating" in feedback["validation"]["errors"][0]["detail"]
-    # ... and the contradictory omit-valve never reaches the model: no error
-    # carries the nodeless-nudge code, and nothing in the feedback promises
-    # that an unchanged re-emit will be accepted.
-    assert "proposal_missing_requested_transforms" not in codes
-    assert "will be accepted" not in json.dumps(feedback)
-
-
-@pytest.mark.asyncio
-async def test_transformful_revision_candidate_passes_without_nudge(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_short_form_llm_review(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=PlannerSurface.GUIDED_STAGED,
-        supersedes_draft_hash=stable_hash("superseded-draft"),
-    )
-
-    assert proposal.proposal.repair_count == 0
-
-
-@pytest.mark.asyncio
-async def test_nodeless_initial_guided_plan_is_not_nudged(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    # The initial step_3 auto-proposal (no superseded draft — the operator has
-    # not asked for a revision) may legitimately be a plain pass-through; the
-    # guard must not tax every simple walk with a nudge cycle.
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=PlannerSurface.GUIDED_STAGED,
-        supersedes_draft_hash=None,
-    )
-
-    assert proposal.proposal.repair_count == 0
 
 
 def test_allowlisted_candidate_feedback_enriches_node_shape_codes() -> None:
@@ -4022,18 +2649,6 @@ def test_feedback_error_codes_rejects_malformed_internal_envelopes(feedback: dic
         _feedback_error_codes(feedback)
 
 
-@pytest.mark.parametrize(
-    "pipeline",
-    (
-        {},
-        {"nodes": [{}]},
-    ),
-)
-def test_transform_node_count_rejects_malformed_validated_pipeline(pipeline: dict[str, Any]) -> None:
-    with pytest.raises((KeyError, TypeError)):
-        _transform_node_count(pipeline)
-
-
 def test_coalesce_feedback_rejects_missing_internal_reachability_fact(monkeypatch: pytest.MonkeyPatch) -> None:
     import elspeth.web.composer.pipeline_planner as planner_module
 
@@ -4067,7 +2682,7 @@ def test_derive_finalizer_owned_refs_splits_config_from_routing_ownership(tmp_pa
 
     Routing-only rewires (the auto-wire splice pattern) must NOT claim the
     component's configuration — that is exactly the candidate-global
-    over-withholding that made guided repair blind — while introduced
+    over-withholding that made repair blind — while introduced
     components and non-routing content changes must.
     """
     candidate = _pipeline(tmp_path)
@@ -4323,13 +2938,13 @@ async def test_finalizer_mutation_keeps_model_authored_component_detail(
 ) -> None:
     """The F14 disagreement regression (elspeth-5904b1683a).
 
-    The finalizer mutates a server-owned component's OPTIONS (the guided
-    binder pattern — here a VALID private replacement, since candidate
+    The finalizer mutates a server-owned component's OPTIONS (here a VALID
+    private replacement, since candidate
     validation fails fast on the first bad component) while the model's own
     node carries an invalid option. The repair feedback must keep the node's
     true component id and validator detail — the regressed candidate-global
-    predicate withheld both because the binder always mutates the candidate,
-    so every guided repair turn was blind and exhaustion was deterministic.
+    predicate withheld both because the finalizer always mutates the candidate,
+    so every repair turn was blind and exhaustion was deterministic.
     With its own mistake visible, the model's second candidate converges, and
     the private bound value never crosses into the transcript.
     """
@@ -4338,7 +2953,7 @@ async def test_finalizer_mutation_keeps_model_authored_component_detail(
     def finalize(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
         finalized = deepcopy(dict(candidate))
         # Reviewed-authority binding: a valid, private replacement value the
-        # provider context deliberately redacts (the guided binder pattern).
+        # provider context deliberately redacts.
         finalized["source"]["options"]["path"] = str(tmp_path / "blobs" / _TEST_SESSION_ID / f"{private_value}.csv")
         return finalized
 
@@ -4373,7 +2988,6 @@ async def test_finalizer_mutation_keeps_model_authored_component_detail(
         tool_context=tool_context,
         completion=completion,
         repair_budget=1,
-        surface=PlannerSurface.GUIDED_STAGED,
         candidate_finalizer=finalize,
     )
 
@@ -4427,7 +3041,6 @@ async def test_repeated_rejection_with_withheld_facts_short_circuits_budget(
             tool_context=tool_context,
             completion=completion,
             repair_budget=5,
-            surface=PlannerSurface.GUIDED_STAGED,
             candidate_finalizer=finalize,
         )
 
@@ -4615,6 +3228,48 @@ def test_gate_on_error_repair_feedback_carries_sink_connectivity_and_guidance() 
     assert "upsert_node" in entry["suggested_fix"]
     assert "private_error_sink_canary" not in entry.get("explanation", "")
     assert "private_error_sink_canary" not in entry.get("suggested_fix", "")
+
+
+def test_aggregation_on_error_repair_feedback_carries_sink_connectivity_and_guidance() -> None:
+    """elspeth-d2e3f29d10 parity: a ghost aggregation on_error sink is refused
+    by the runtime builder too, so the planner's repair turn gets the same
+    connectivity facts and catalogue guidance a transform or gate gets —
+    including for a closer-shaped value, which is NOT relaxed for an
+    aggregation (rule 6 bans aggregations inside bound regions)."""
+    base = _dangling_destination_state()
+    aggregation = NodeSpec(
+        id="stats",
+        node_type="aggregation",
+        plugin="batch_stats",
+        input="rows",
+        on_success="cleaned",
+        on_error="private_batch_sink_canary",
+        options={"schema": {"mode": "observed"}, "value_field": "amount"},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+        trigger={"count": 2},
+        output_mode="transform",
+    )
+    state = replace(base, sources={"source": replace(base.sources["source"], on_success="rows")}, nodes=(aggregation,))
+    validation = state.validate()
+    assert ("node:stats", "aggregation_on_error_unknown_sink") in {(e.component, e.error_code) for e in validation.errors}
+    result = ToolResult(success=False, updated_state=state, validation=validation, affected_nodes=())
+
+    feedback = _allowlisted_candidate_feedback(result)
+
+    entry = next(item for item in feedback["validation"]["errors"] if item["error_code"] == "aggregation_on_error_unknown_sink")
+    assert entry["connectivity"] == {
+        "dangling_on_error": "private_batch_sink_canary",
+        "declared_sinks": ["cleaned"],
+    }
+    assert "aggregation" in entry["explanation"].lower()
+    assert "declared_sinks" in entry["suggested_fix"]
+    assert "private_batch_sink_canary" not in entry.get("explanation", "")
+    assert "private_batch_sink_canary" not in entry.get("suggested_fix", "")
 
 
 def test_route_destination_feedback_rejects_missing_internal_fact(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4813,6 +3468,33 @@ async def test_exact_request_bytes_and_post_call_cost_caps_fail_closed(
 
 
 @pytest.mark.asyncio
+async def test_calculated_azure_cost_enforces_planner_continuation_cap(tmp_path: Path, tool_context: ToolContext) -> None:
+    response = ModelResponse(
+        model="private-azure-deployment-2026-07-09",
+        usage=Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120),
+        choices=[{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+    )
+    response._hidden_params = {}
+    completion = _ScriptedCompletion(response)
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError, match="cost continuation cap"):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            budget=_budget(max_cumulative_provider_cost=Decimal("0.0004")),
+            model_overrides={"model_identifier": "openai/gpt-4o-2024-08-06", "provider": "openai"},
+        )
+
+    assert len(completion.requests) == 1
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].provider_cost == pytest.approx(0.00045)
+    assert recorder.llm_calls[0].provider_cost_source == "litellm.cost_per_token"
+
+
+@pytest.mark.asyncio
 async def test_missing_provider_cost_is_audited_before_fail_closed(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -4825,6 +3507,33 @@ async def test_missing_provider_cost_is_audited_before_fail_closed(
 
     assert len(recorder.llm_calls) == 1
     assert recorder.llm_calls[0].provider_cost is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_deployment_pricing_is_audited_before_fail_closed(tmp_path: Path, tool_context: ToolContext) -> None:
+    response = ModelResponse(
+        model="gpt-5.6-sol-2026-07-09",
+        usage=Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120),
+        choices=[{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+    )
+    response._hidden_params = {}
+    completion = _ScriptedCompletion(response)
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError, match="provider cost metadata"):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={"model_identifier": "openai/gpt-5.6-sol-datazone", "provider": "openai"},
+        )
+
+    assert len(completion.requests) == 1
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].model_requested == "openai/gpt-5.6-sol-datazone"
+    assert recorder.llm_calls[0].provider_cost is None
+    assert recorder.llm_calls[0].provider_cost_source == "not_available"
 
 
 def test_budget_policy_is_frozen_slotted_and_rejects_non_decimal_cost() -> None:
@@ -4924,13 +3633,6 @@ def _sourceless_pipeline(data_dir: Path) -> dict[str, Any]:
     return pipeline
 
 
-def _binder_style_finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Stand in for ``bind_guided_reviewed_components``'s sources contract."""
-    if candidate.get("sources") is None and candidate.get("source") is None:
-        raise AuditIntegrityError("guided planner candidate does not identify reviewed sources")
-    return candidate
-
-
 @pytest.mark.asyncio
 async def test_freeform_sources_omitted_candidate_gets_bounded_no_source_repair(
     tmp_path: Path,
@@ -4953,46 +3655,9 @@ async def test_freeform_sources_omitted_candidate_gets_bounded_no_source_repair(
 
 
 @pytest.mark.asyncio
-async def test_guided_sources_omitted_candidate_gets_bounded_repair_not_integrity_error(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """Guided planning rejects the source omission before its finalizer.
-
-    The canonical schema guard spends one repair turn, so the binder-style
-    finalizer never receives the malformed shape and cannot raise its
-    ``AuditIntegrityError`` backstop.
-    """
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=PlannerSurface.GUIDED_STAGED,
-        candidate_finalizer=_binder_style_finalizer,
-    )
-
-    assert proposal.proposal.repair_count == 1
-    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _MISSING_SOURCE_SCHEMA_FEEDBACK
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "finalizer"),
-    [
-        (PlannerSurface.FREEFORM, None),
-        (PlannerSurface.GUIDED_STAGED, _binder_style_finalizer),
-    ],
-)
 async def test_repeated_sources_omitted_candidates_each_get_schema_feedback(
     tmp_path: Path,
     tool_context: ToolContext,
-    surface: PlannerSurface,
-    finalizer: Any,
 ) -> None:
     """Each provider-invalid source omission gets canonical schema feedback.
 
@@ -5012,8 +3677,6 @@ async def test_repeated_sources_omitted_candidates_each_get_schema_feedback(
         tool_context=tool_context,
         completion=completion,
         repair_budget=2,
-        surface=surface,
-        candidate_finalizer=finalizer,
     )
 
     assert proposal.proposal.repair_count == 2
@@ -5022,324 +3685,6 @@ async def test_repeated_sources_omitted_candidates_each_get_schema_feedback(
     assert first == _MISSING_SOURCE_SCHEMA_FEEDBACK
     assert second == _MISSING_SOURCE_SCHEMA_FEEDBACK
     assert "repeat_notice" not in second
-
-
-@pytest.mark.asyncio
-async def test_binder_candidate_shape_defect_gets_bounded_schema_repair(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """An UNTYPED binder candidate-shape complaint still repairs, never 500s.
-
-    Every binder site in ``src/`` raises the typed
-    ``GuidedCandidateBindingRejected`` (elspeth-989c4108ef finished the
-    conversion), so this arm is production-unreachable and the stubbed
-    finalizer below is the only way to reach it. It is kept deliberately: the
-    canonical-schema fallback is the fail-closed net for a future untyped
-    site, and losing it would turn an authoring slip into a terminal 500.
-    """
-    attempts: list[Mapping[str, Any]] = []
-
-    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-        attempts.append(candidate)
-        if len(attempts) == 1:
-            raise AuditIntegrityError("guided planner candidate sources differ from reviewed authority")
-        return candidate
-
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=PlannerSurface.GUIDED_STAGED,
-        candidate_finalizer=finalizer,
-    )
-
-    assert proposal.proposal.repair_count == 1
-    assert len(attempts) == 2
-    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _CANONICAL_SCHEMA_FEEDBACK
-
-
-def _binding_rejection() -> GuidedCandidateBindingRejected:
-    return GuidedCandidateBindingRejected(
-        "guided planner candidate routing references unknown destinations",
-        error_code="guided_route_target_unknown",
-        connectivity={
-            "dangling_references": ["csv_rows"],
-            "declared_sinks": ["output"],
-            "consumable_connections": [],
-        },
-    )
-
-
-def _binding_rejection_expected_feedback() -> dict[str, Any]:
-    explanation, suggested_fix = explain_validation_code("guided_route_target_unknown") or ("", "")
-    assert explanation and suggested_fix  # the catalogue entry is part of the contract
-    return {
-        "success": False,
-        "validation": {
-            "is_valid": False,
-            "errors": [
-                {
-                    "component": "pipeline",
-                    "severity": "high",
-                    "error_code": "guided_route_target_unknown",
-                    "error_class": "ValidationError",
-                    "explanation": explanation,
-                    "suggested_fix": suggested_fix,
-                    "connectivity": {
-                        "dangling_references": ["csv_rows"],
-                        "declared_sinks": ["output"],
-                        "consumable_connections": [],
-                    },
-                }
-            ],
-        },
-        # No "guidance": the entry already carries the catalogue's
-        # (explanation, suggested_fix), so calling explain_validation_error
-        # would return byte-equivalent text for a whole provider turn
-        # (elspeth-41b406c9fc).
-    }
-
-
-@pytest.mark.asyncio
-async def test_typed_binding_rejection_gets_coded_repair_with_connectivity_facts(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """A typed binder rejection repairs with its code and facts, not a bare schema complaint.
-
-    elspeth-572c642dbf: the binder stopped silently rewriting ambiguous or
-    unproven sink aliases and rejects instead. That rejection must reach the
-    planner as ONE budgeted repair turn carrying the closed code, the
-    catalogue guidance, and the custody-safe connectivity facts — the generic
-    canonical-schema fallback names neither the dangling value nor any valid
-    destination, which is exactly the blindness that exhausted repair budgets
-    before (elspeth-5904b1683a).
-    """
-    attempts: list[Mapping[str, Any]] = []
-
-    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-        attempts.append(candidate)
-        if len(attempts) == 1:
-            raise _binding_rejection()
-        return candidate
-
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=PlannerSurface.GUIDED_STAGED,
-        candidate_finalizer=finalizer,
-    )
-
-    assert proposal.proposal.repair_count == 1
-    assert len(attempts) == 2
-    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _binding_rejection_expected_feedback()
-
-
-@pytest.mark.asyncio
-async def test_repeated_typed_binding_rejection_draws_the_repeat_notice(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """An identical typed rejection re-fired on the next attempt is named as a repeat."""
-    attempts: list[Mapping[str, Any]] = []
-
-    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-        attempts.append(candidate)
-        if len(attempts) <= 2:
-            raise _binding_rejection()
-        return candidate
-
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        repair_budget=2,
-        surface=PlannerSurface.GUIDED_STAGED,
-        candidate_finalizer=finalizer,
-    )
-
-    assert proposal.proposal.repair_count == 2
-    first = json.loads(completion.requests[1]["messages"][-1]["content"])
-    second = json.loads(completion.requests[2]["messages"][-1]["content"])
-    assert first == _binding_rejection_expected_feedback()
-    assert second == {**_binding_rejection_expected_feedback(), "repeat_notice": _REPEAT_NOTICE}
-
-
-def test_repeated_terminal_binding_rejection_never_says_re_emit() -> None:
-    """A repeat of a rejection no delta can clear draws the terminal notice, not "re-emit".
-
-    Two binder shapes are unclearable by resubmission: the reviewed
-    failure-route check runs before any delta is read, and an edge_patch
-    against a correction target with no writable routing field fails whatever
-    the patch says. Their taught fixes say "do not re-emit" / "decline in
-    plain text"; the generic repeat notice appended after them says "keep
-    every other part byte-identical, and re-emit". Same message, opposite
-    imperatives (elspeth-68721c71d7, final LLM review). The terminal notice
-    names the repetition without contradicting the fix.
-    """
-    from elspeth.web.composer.pipeline_planner import _REPEAT_NOTICE_TERMINAL, _binding_rejection_feedback
-
-    def repeated(code: str, **facts: Any) -> Mapping[str, Any]:
-        rejection = GuidedCandidateBindingRejected("guided planner candidate delta", error_code=code, connectivity=facts)
-        return _binding_rejection_feedback(rejection, repeated_fingerprint=True)
-
-    policy = repeated("guided_delta_reviewed_failure_route_required", routes=["quarantine"])
-    unwritable = repeated("guided_delta_authority_violation", delta_member="edge_patch", owner_kind="node")
-    for feedback in (policy, unwritable):
-        assert feedback["repeat_notice"] == _REPEAT_NOTICE_TERMINAL
-        assert "byte-identical" not in feedback["repeat_notice"]
-        assert "re-emit" not in feedback["repeat_notice"]
-
-    # Every other shape under the same code is clearable and keeps the
-    # ordinary notice: the terminal predicate matches the exact fact SHAPE,
-    # not the code, so a widened shape does not silently inherit "terminal".
-    clearable = repeated("guided_delta_authority_violation", delta_member="edge_patch", unexpected_keys=["target"])
-    widened = repeated("guided_delta_authority_violation", delta_member="edge_patch", owner_kind="node", extra="x")
-    assert clearable["repeat_notice"] == _REPEAT_NOTICE
-    assert widened["repeat_notice"] == _REPEAT_NOTICE
-
-    # A first (non-repeated) terminal rejection carries no notice at all.
-    first = _binding_rejection_feedback(
-        GuidedCandidateBindingRejected(
-            "guided planner candidate delta",
-            error_code="guided_delta_reviewed_failure_route_required",
-            connectivity={"routes": ["quarantine"]},
-        ),
-        repeated_fingerprint=False,
-    )
-    assert "repeat_notice" not in first
-
-
-def test_terminal_binding_rejections_are_exactly_the_codes_whose_fix_says_do_not_re_emit() -> None:
-    """The terminal predicate and the taught prose name the same rejections.
-
-    Derived from the catalogue, not a hand list: every registered entry
-    whose ``suggested_fix`` tells the planner not to re-emit must be
-    terminal for a bare rejection under that code, and the one sub-case
-    clause (edge_patch + owner_kind) must still be taught in the
-    ``guided_delta_authority_violation`` fix. Deleting either the prose or
-    the predicate arm turns this red.
-    """
-    from elspeth.web.composer.pipeline_planner import _binding_rejection_is_terminal
-    from elspeth.web.composer.tools.generation import _VALIDATION_ERROR_PATTERNS, explain_validation_code
-
-    do_not_re_emit = {pattern for pattern, _explanation, fix in _VALIDATION_ERROR_PATTERNS if "Do not re-emit" in fix}
-    assert do_not_re_emit == {"guided_delta_reviewed_failure_route_required"}
-    for code in do_not_re_emit:
-        assert code.isidentifier(), code
-        bare = GuidedCandidateBindingRejected("guided planner candidate delta", error_code=code, connectivity={})
-        assert _binding_rejection_is_terminal(bare), code
-
-    guidance = explain_validation_code("guided_delta_authority_violation")
-    assert guidance is not None
-    assert "'edge_patch'+'owner_kind': no edge_patch succeeds" in guidance[1]
-    owner_only = GuidedCandidateBindingRejected(
-        "guided planner candidate delta",
-        error_code="guided_delta_authority_violation",
-        connectivity={"delta_member": "edge_patch", "owner_kind": "node"},
-    )
-    assert _binding_rejection_is_terminal(owner_only)
-
-
-def test_binding_rejection_fingerprint_discriminates_on_the_fact_key_set() -> None:
-    """Same code + same delta member but a different fact SHAPE is a different rejection.
-
-    ``guided_delta_authority_violation`` fires from four edge_patch shapes
-    (not-a-dict, unexpected_keys, missing to_node, owner_kind) and
-    ``guided_delta_unknown_stable_id`` from two node_patch shapes (bad
-    stable_id, node_occurrences). Discriminating on ``delta_member`` alone
-    fingerprinted them identically, so a candidate that CORRECTLY repaired
-    the first shape and then tripped the second drew the repeat notice —
-    "keep every other part byte-identical and re-emit" — beside a taught fix
-    saying the opposite (elspeth-68721c71d7, workflow finding). The key SET is
-    a structural label the binder authors, never a candidate value, so a
-    genuine repeat (same shape) still fingerprints the same.
-    """
-    from elspeth.web.composer.pipeline_planner import _binding_rejection_fingerprint
-
-    def rejection(**facts: Any) -> GuidedCandidateBindingRejected:
-        return GuidedCandidateBindingRejected(
-            "guided planner candidate delta", error_code="guided_delta_authority_violation", connectivity=facts
-        )
-
-    unexpected = rejection(delta_member="edge_patch", unexpected_keys=["target"], allowed_keys=["stable_id", "to_node"])
-    owner = rejection(delta_member="edge_patch", owner_kind="node")
-    not_a_dict = rejection(delta_member="edge_patch", allowed_keys=["stable_id", "to_node"])
-    assert len({_binding_rejection_fingerprint(r) for r in (unexpected, owner, not_a_dict)}) == 3
-
-    # The same shape with different VALUES is still the same rejection: values
-    # are candidate content and must never enter the fingerprint. The keys are
-    # given in a different ORDER too: the shape is a set, not a sequence.
-    again = rejection(allowed_keys=["stable_id", "to_node"], unexpected_keys=["label"], delta_member="edge_patch")
-    assert _binding_rejection_fingerprint(again) == _binding_rejection_fingerprint(unexpected)
-
-    # Existing discriminators keep their meaning.
-    other_member = rejection(delta_member="node_patch", owner_kind="node")
-    assert _binding_rejection_fingerprint(other_member) != _binding_rejection_fingerprint(owner)
-
-    # ``guided_delta_nonincident_route`` fires for two faults the prose teaches
-    # apart — endpoints outside the owners vs an id reusing an existing edge —
-    # so they ship under different keys and fingerprint apart (final red-team F3).
-    def nonincident(**facts: Any) -> GuidedCandidateBindingRejected:
-        return GuidedCandidateBindingRejected(
-            "guided planner candidate delta", error_code="guided_delta_nonincident_route", connectivity=facts
-        )
-
-    endpoints = nonincident(edge_id="e1", incident_owners=["n1"])
-    id_reuse = nonincident(reused_edge_id="e1", incident_owners=["n1"])
-    assert _binding_rejection_fingerprint(endpoints) != _binding_rejection_fingerprint(id_reuse)
-
-
-@pytest.mark.asyncio
-async def test_candidate_policy_rejection_gets_closed_bounded_repair(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """A post-validation semantic obligation consumes repair budget, not the route."""
-
-    attempts: list[CompositionState] = []
-
-    def require_requested_delta(candidate: CompositionState) -> None:
-        attempts.append(candidate)
-        if len(attempts) == 1:
-            raise PipelineCandidatePolicyRejection("guided_correction_unchanged")
-
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        candidate_acceptance=require_requested_delta,
-    )
-
-    assert proposal.proposal.repair_count == 1
-    assert len(attempts) == 2
-    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
-    assert _feedback_error_codes(feedback) == ("guided_correction_unchanged",)
-    assert feedback["validation"]["errors"][0]["explanation"]
-    assert feedback["validation"]["errors"][0]["suggested_fix"]
 
 
 @pytest.mark.asyncio
@@ -5362,7 +3707,6 @@ async def test_finalizer_integrity_error_outside_candidate_shape_stays_terminal(
             tmp_path=tmp_path,
             tool_context=tool_context,
             completion=completion,
-            surface=PlannerSurface.GUIDED_STAGED,
             candidate_finalizer=finalizer,
         )
 
@@ -5434,7 +3778,7 @@ def test_planner_rejects_over_budget_tool_json_as_malformed_response(raw_argumen
     )
 
     with pytest.raises(PipelinePlannerError) as caught:
-        _parse_response_tool_calls(response, max_tool_calls=3)
+        _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
 
     assert caught.value.code == "MALFORMED_RESPONSE"
 
@@ -5447,9 +3791,11 @@ def test_planner_rejects_excessive_tool_call_container_before_argument_parsing()
     )
 
     with pytest.raises(PipelinePlannerError, match="tool call") as caught:
-        _parse_response_tool_calls(response, max_tool_calls=3)
+        _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
 
-    assert caught.value.code == "MALFORMED_RESPONSE"
+    # The cap is the per-turn tool-call budget, not a malformed response
+    # (see test_pipeline_planner_protocol_rejections.py for the loop path).
+    assert caught.value.code == "TOOL_CALLS_EXHAUSTED"
 
 
 def test_planner_rejects_duplicate_provider_tool_call_ids() -> None:
@@ -5469,7 +3815,7 @@ def test_planner_rejects_duplicate_provider_tool_call_ids() -> None:
     )
 
     with pytest.raises(PipelinePlannerError, match="duplicate") as caught:
-        _parse_response_tool_calls(response, max_tool_calls=3)
+        _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
 
     assert caught.value.code == "MALFORMED_RESPONSE"
 
@@ -5485,7 +3831,41 @@ def test_planner_rejects_invalid_provider_tool_call_ids(call_id: str) -> None:
     response = _response_with_call_id(call_id, "list_sources", {})
 
     with pytest.raises(PipelinePlannerError, match="tool call metadata") as caught:
-        _parse_response_tool_calls(response, max_tool_calls=3)
+        _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
+
+    assert caught.value.code == "MALFORMED_RESPONSE"
+
+
+@pytest.mark.parametrize("field", ["call_id", "function_name"])
+def test_planner_rejects_credential_shaped_tool_call_metadata_before_admission(field: str) -> None:
+    credential = "ghp_" + "a" * 36
+    call_id = credential if field == "call_id" else "call-1"
+    name = credential if field == "function_name" else "get_pipeline_state"
+    response = _response_with_call_id(call_id, name, {})
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        _parse_response_tool_calls(
+            response,
+            max_tool_calls=3,
+            dialect=ToolContractDialect.NONE,
+            sent_tool_names=frozenset({"get_pipeline_state"}),
+        )
+
+    assert caught.value.to_payload()["failure_code"] == "credential_material_rejected"
+    assert caught.value.to_payload()["surface"] == "composer_planner_response"
+    assert credential not in str(caught.value)
+    assert credential not in canonical_json(caught.value.to_payload())
+
+
+@pytest.mark.parametrize("name", ["", " ", "\u2003"])
+def test_planner_rejects_blank_provider_tool_names(name: str) -> None:
+    response = _Response(
+        choices=[_Choice(message=_Message(content=None, tool_calls=[_ToolCall(id="call-1", function=_Function(name, "{}"))]))],
+        usage=_planner_usage(),
+    )
+
+    with pytest.raises(PipelinePlannerError, match="tool call metadata") as caught:
+        _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
 
     assert caught.value.code == "MALFORMED_RESPONSE"
 
@@ -5507,7 +3887,7 @@ def test_planner_preserves_valid_distinct_provider_tool_call_order() -> None:
         usage=_planner_usage(),
     )
 
-    _message, calls = _parse_response_tool_calls(response, max_tool_calls=3)
+    _message, calls = _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
 
     assert len(signed_call_id) > 256
     assert [call.call_id for call in calls] == [signed_call_id, "second"]
@@ -5558,6 +3938,53 @@ async def test_discovery_crash_is_audited_from_preopened_envelope(
     assert recorder.invocations[0].status.value == "plugin_crash"
     assert recorder.invocations[0].error_message == "RuntimeError"
     assert raw_canary not in canonical_json(recorder.invocations[0].to_dict())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", [{"grammar": 17}, {"grammar": "safe", "private": "CANARY"}, None])
+async def test_selected_response_corruption_is_audited_before_success(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+    data: Any,
+) -> None:
+    from elspeth.contracts.errors import FrameworkBugError
+
+    original = pipeline_planner.execute_discovery_tool_with_context
+
+    def corrupt(*args: Any, **kwargs: Any) -> ToolResult:
+        return replace(original(*args, **kwargs), data=data)
+
+    monkeypatch.setattr(pipeline_planner, "execute_discovery_tool_with_context", corrupt)
+    recorder = BufferingRecorder()
+    completion = _ScriptedCompletion(
+        _response(("get_expression_grammar", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    with pytest.raises(FrameworkBugError):
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+    assert len(completion.requests) == 1
+    assert len(recorder.invocations) == 1
+    assert recorder.invocations[0].status.value == "plugin_crash"
+    assert recorder.invocations[0].error_class == "FrameworkBugError"
+    assert "CANARY" not in canonical_json(recorder.invocations[0].to_dict())
+
+
+def test_tool_result_envelope_omits_data_without_traversal() -> None:
+    from inspect import signature
+
+    from elspeth.contracts.freeze import deep_thaw
+
+    assert "include_data" in signature(ToolResult.to_dict).parameters
+    state = _empty_state()
+    result = ToolResult(success=True, updated_state=state, validation=state.validate(), affected_nodes=(), data={"grammar": "text"})
+    expected = result.to_dict()
+    assert result.to_dict(include_data=True) == expected
+    del expected["data"]
+    with patch("elspeth.web.composer.tools._common.deep_thaw", spec=deep_thaw, side_effect=AssertionError("data traversed")):
+        assert result.to_dict(include_data=False) == expected
+        with pytest.raises(AssertionError, match="data traversed"):
+            result.to_dict()
 
 
 @pytest.mark.asyncio
@@ -5771,6 +4198,112 @@ async def test_each_transient_api_retry_consumes_and_audits_a_wire_attempt(
 
 
 @pytest.mark.asyncio
+async def test_service_unavailable_on_second_planning_call_audits_each_retry(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    secret = "UPSTREAM-RESPONSE-BODY-SECRET"
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        ServiceUnavailableError(message=secret, llm_provider="test-provider", model="test/planner"),
+        ServiceUnavailableError(message=secret, llm_provider="test-provider", model="test/planner"),
+    )
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={"max_api_attempts": 2},
+        )
+
+    assert caught.value.code == "PROVIDER_ERROR"
+    assert len(completion.requests) == 3
+    assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2, 3]
+    assert [call.status for call in recorder.llm_calls] == [
+        ComposerLLMCallStatus.SUCCESS,
+        ComposerLLMCallStatus.API_ERROR,
+        ComposerLLMCallStatus.API_ERROR,
+    ]
+    assert [call.error_class for call in recorder.llm_calls] == [None, "ServiceUnavailableError", "ServiceUnavailableError"]
+    # This unit path has no quota authority, so physical ordinals rather than
+    # database attempt IDs distinguish the three dispatched calls.
+    assert secret not in str(caught.value)
+    assert secret not in canonical_json([call.to_dict() for call in recorder.llm_calls])
+
+
+@pytest.mark.asyncio
+async def test_bad_gateway_is_not_retried_and_is_audited(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        BadGatewayError(message="UPSTREAM-RESPONSE-BODY-SECRET", llm_provider="test-provider", model="test/planner")
+    )
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={"max_api_attempts": 3},
+        )
+
+    assert caught.value.code == "PROVIDER_ERROR"
+    assert len(completion.requests) == 1
+    assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.API_ERROR]
+    assert recorder.llm_calls[0].error_class == "BadGatewayError"
+
+
+@pytest.mark.asyncio
+async def test_sdk_timeout_records_timeout_instead_of_provider_outage(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        LiteLLMTimeout(message="UPSTREAM-RESPONSE-BODY-SECRET", llm_provider="test-provider", model="test/planner")
+    )
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert caught.value.code == "TIMEOUT"
+    assert len(completion.requests) == 1
+    assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.TIMEOUT]
+    assert recorder.llm_calls[0].error_class == "Timeout"
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_failure_does_not_invent_provider_call(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_request_construction(**_kwargs: Any) -> Any:
+        raise ValueError("pre-dispatch")
+
+    monkeypatch.setattr("elspeth.web.composer.pipeline_planner.build_planner_request_kwargs", fail_request_construction)
+    completion = _ScriptedCompletion()
+    recorder = BufferingRecorder()
+    loop = asyncio.get_running_loop()
+    clock_origin = loop.time()
+
+    # This tests request-construction audit attribution, not deadline behavior.
+    # Host scheduling must not expire the unrelated budget before the rejection;
+    # the dedicated deadline tests separately exercise timeout enforcement.
+    with patch.object(loop, "time", lambda: clock_origin), pytest.raises(ValueError, match="pre-dispatch"):
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert completion.requests == []
+    assert recorder.llm_calls == ()
+
+
+@pytest.mark.asyncio
 async def test_total_provider_call_bound_is_independent_of_logical_turns(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -5832,7 +4365,9 @@ async def _session_context(*, content: str = "Use this CSV: name,score\nada,42\n
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    service = DualFencedSessionServiceHarness(
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.pipeline-planner-custody"),
@@ -5850,6 +4385,207 @@ async def _session_context(*, content: str = "Use this CSV: name,score\nada,42\n
         content=content,
         user_id="planner-user",
     )
+
+
+@pytest.mark.asyncio
+async def test_credential_tool_call_id_refusal_is_atomic_before_history_dispatch_or_persistence(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    engine, origin = await _session_context()
+    credential = "ghp_" + "a" * 36
+    mixed_response = _Response(
+        choices=[
+            _Choice(
+                message=_Message(
+                    content=None,
+                    tool_calls=[
+                        _ToolCall(
+                            id="call-clean",
+                            function=_Function(
+                                name="get_plugin_schema",
+                                arguments=json.dumps({"plugin_type": "source", "name": "csv"}),
+                            ),
+                        ),
+                        _ToolCall(
+                            id=credential,
+                            function=_Function(name="get_pipeline_state", arguments="{}"),
+                        ),
+                    ],
+                )
+            )
+        ],
+        usage=_planner_usage(),
+    )
+    completion = _ScriptedCompletion(
+        mixed_response,
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+    state = _empty_state()
+    state_before = state.to_dict()
+    schemas_marked: list[tuple[str, str]] = []
+    finalized_candidates: list[object] = []
+
+    def mark_schema_loaded(plugin_type: str, plugin_name: str) -> None:
+        schemas_marked.append((plugin_type, plugin_name))
+
+    def finalize_candidate(candidate: object) -> object:
+        finalized_candidates.append(candidate)
+        return candidate
+
+    with engine.begin() as conn:
+        message_count_before = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            originating_message=origin,
+            custody_config=PlannerCustodyConfig(
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                max_storage_per_session=1_000_000,
+                secret_service=None,
+                runtime_preflight=None,
+            ),
+            current_state=state,
+            mark_schema_loaded=mark_schema_loaded,
+            candidate_finalizer=finalize_candidate,
+        )
+
+    assert caught.value.to_payload()["failure_code"] == "credential_material_rejected"
+    assert credential not in str(caught.value)
+    assert len(completion.requests) == 1
+    assert credential not in canonical_json(completion.requests)
+    assert recorder.invocations == ()
+    assert schemas_marked == []
+    assert finalized_candidates == []
+    assert state.to_dict() == state_before
+    assert credential not in canonical_json([call.to_dict() for call in recorder.llm_calls])
+    assert credential not in canonical_json([attempt.to_dict() for attempt in recorder.planner_attempts])
+    with engine.begin() as conn:
+        assert conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one() == message_count_before
+        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
+        assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
+    assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "credential_field",
+    ["model_returned", "provider_request_id", "finish_reason", "combined_reasoning"],
+)
+async def test_planner_provider_metadata_refusal_is_atomic_before_audit_history_or_persistence(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    credential_field: str,
+) -> None:
+    engine, origin = await _session_context()
+    credential = "ghp_" + "a" * 36
+    response = _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}))
+    if credential_field == "model_returned":
+        response.model = credential
+    elif credential_field == "provider_request_id":
+        response.id = credential
+    elif credential_field == "finish_reason":
+        response.choices[0].__dict__["finish_reason"] = credential
+    else:
+        response.model = credential
+        response.choices[0].message.__dict__["reasoning_content"] = credential
+    completion = _ScriptedCompletion(
+        response,
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+    state = _empty_state()
+    state_before = state.to_dict()
+    schemas_marked: list[tuple[str, str]] = []
+    finalized_candidates: list[object] = []
+
+    def mark_schema_loaded(plugin_type: str, plugin_name: str) -> None:
+        schemas_marked.append((plugin_type, plugin_name))
+
+    def finalize_candidate(candidate: object) -> object:
+        finalized_candidates.append(candidate)
+        return candidate
+
+    with engine.begin() as conn:
+        message_count_before = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            originating_message=origin,
+            custody_config=PlannerCustodyConfig(
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                max_storage_per_session=1_000_000,
+                secret_service=None,
+                runtime_preflight=None,
+            ),
+            current_state=state,
+            mark_schema_loaded=mark_schema_loaded,
+            candidate_finalizer=finalize_candidate,
+        )
+
+    assert caught.value.surface == "composer_planner_response"
+    assert caught.value.to_payload()["failure_code"] == "credential_material_rejected"
+    assert credential not in repr(caught.value.to_payload())
+    assert len(completion.requests) == 1
+    assert credential not in canonical_json(completion.requests)
+    assert recorder.invocations == ()
+    assert schemas_marked == []
+    assert finalized_candidates == []
+    assert state.to_dict() == state_before
+    assert len(recorder.llm_calls) == 1
+    refused_call = recorder.llm_calls[0]
+    assert refused_call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE
+    assert refused_call.error_message == "credential_material_rejected"
+    assert refused_call.model_returned is None
+    assert refused_call.provider_request_id is None
+    assert refused_call.finish_reason is None
+    assert credential not in canonical_json([refused_call.to_dict()])
+    assert credential not in canonical_json([attempt.to_dict() for attempt in recorder.planner_attempts])
+    with engine.begin() as conn:
+        assert conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one() == message_count_before
+        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
+        assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
+    assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
+
+
+@pytest.mark.asyncio
+async def test_planner_provider_metadata_ordinary_controls_are_retained(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    response = _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}))
+    response.model = "provider/planner-v2"
+    response.id = "ordinary-request-id"
+    response.choices[0].__dict__["finish_reason"] = "provider-stop"
+    completion = _ScriptedCompletion(response)
+    recorder = BufferingRecorder()
+
+    result = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+    )
+
+    assert isinstance(result.proposal, PipelineProposal)
+    assert len(completion.requests) == 1
+    assert len(recorder.llm_calls) == 1
+    call = recorder.llm_calls[0]
+    assert call.status is ComposerLLMCallStatus.SUCCESS
+    assert call.model_returned == "provider/planner-v2"
+    assert call.provider_request_id == "ordinary-request-id"
+    assert call.finish_reason == "provider-stop"
 
 
 @pytest.mark.asyncio
@@ -5975,108 +4711,6 @@ async def test_real_inline_custody_returns_only_blob_id_and_ready_row(
 
 
 @pytest.mark.asyncio
-async def test_defer_finalize_carries_custody_preparation_and_writes_no_blob_mid_plan(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    # elspeth-1e3ad83d89: guided-full defers inline-custody finalization into
-    # the atomic staging settlement, because the blob row's lineage FK needs
-    # the originating chat message that surface only inserts at settlement.
-    # Finalizing mid-plan here IS the defect, so the discriminating half of
-    # this test is the empty blobs table under a proposal that already
-    # references its blob_id.
-    engine, origin = await _session_context()
-    raw_content = "name,score\nada,42\n"
-    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path)})))
-
-    result = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        originating_message=origin,
-        custody_config=PlannerCustodyConfig(
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            max_storage_per_session=1_000_000,
-            secret_service=None,
-            runtime_preflight=None,
-            defer_finalize=True,
-        ),
-    )
-
-    assert result.custody_result == "ready"
-    assert result.custody_preparation is not None
-    public = result.proposal.to_dict()
-    assert "inline_blob" not in canonical_json(public)
-    assert raw_content not in canonical_json(public)
-    assert public["pipeline"]["source"]["blob_id"]
-    with engine.begin() as conn:
-        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
-    assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
-
-
-@pytest.mark.asyncio
-async def test_pending_custody_view_resolves_only_its_exact_blob_id(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    # elspeth-282f392fae fail-closed pin: the deferred-custody view may stand
-    # in for exactly the one blob this plan settles. Any OTHER blob_id keeps
-    # the database verdict — with no row, that is a rejection.
-    from dataclasses import replace as dc_replace
-    from uuid import uuid4
-
-    from elspeth.web.composer.pipeline_custody import pending_custody_blob_view
-    from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate
-
-    engine, origin = await _session_context()
-    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path)})))
-    result = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        originating_message=origin,
-        custody_config=PlannerCustodyConfig(
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            max_storage_per_session=1_000_000,
-            secret_service=None,
-            runtime_preflight=None,
-            defer_finalize=True,
-        ),
-    )
-    assert result.custody_preparation is not None
-    view = pending_custody_blob_view(result.custody_preparation, data_dir=str(tmp_path))
-
-    full_catalog = create_catalog_service()
-    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
-    context = ToolContext(
-        catalog=PolicyCatalogView.for_trained_operator(full_catalog, plugin_snapshot),
-        plugin_snapshot=plugin_snapshot,
-        data_dir=str(tmp_path),
-        session_engine=engine,
-        session_id=origin.session_id,
-        _interpretation_requirements_are_internal=True,
-        _pending_custody=view,
-    )
-    safe_pipeline = deep_thaw(result.custody_preparation.arguments)
-
-    matching = build_set_pipeline_candidate(safe_pipeline, _empty_state(), context)
-    assert matching.acceptable
-
-    foreign = deepcopy(safe_pipeline)
-    foreign["source"]["blob_id"] = str(uuid4())
-    mismatched = build_set_pipeline_candidate(foreign, _empty_state(), context)
-    assert not mismatched.acceptable
-    assert "not found" in mismatched.result.data["error"]
-
-    wrong_session = dc_replace(context, _pending_custody=dc_replace(view, session_id=str(uuid4())))
-    rejected = build_set_pipeline_candidate(safe_pipeline, _empty_state(), wrong_session)
-    assert not rejected.acceptable
-    assert "not found" in rejected.result.data["error"]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("model_returned", "expected_model_version"),
     [
@@ -6159,33 +4793,106 @@ async def test_route_lifecycle_rate_rejection_happens_before_provider_attempt(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_seconds", [85.0, 180.0], ids=["previous-deadline", "deployed-deadline"])
+async def test_multiturn_authoring_settles_with_deployed_deadline(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    timeout_seconds: float,
+) -> None:
+    """Three real planner turns consume 120 simulated seconds, without sleeping."""
+    loop = asyncio.get_running_loop()
+    clock_origin = loop.time()
+    elapsed = 0.0
+
+    class TimedCompletion(_ScriptedCompletion):
+        async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
+            nonlocal elapsed
+            elapsed += 40.0
+            return await super().__call__(**kwargs)
+
+    completion = TimedCompletion(
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv"})),
+        _response(("get_plugin_schema", {"plugin_type": "sink", "name": "json"})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+    events: list[str] = []
+    with patch.object(loop, "time", lambda: clock_origin + elapsed):
+        operation = _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={"timeout_seconds": timeout_seconds},
+            lifecycle=_lifecycle(events),
+        )
+        if timeout_seconds == 85.0:
+            with pytest.raises(PipelinePlannerError, match="wall-clock") as error:
+                await operation
+            assert error.value.code == "TIMEOUT"
+            assert events[-1] == "settled:failed"
+        else:
+            result = await operation
+            assert deep_thaw(result.proposal.pipeline) == _pipeline(tmp_path)
+            assert events[-1] == "settled:complete"
+
+    assert elapsed == 120.0
+    assert len(completion.requests) == 3
+    assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2, 3]
+    assert [invocation.tool_name for invocation in recorder.invocations] == ["get_plugin_schema", "get_plugin_schema"]
+    assert any(message["role"] == "tool" for message in completion.requests[1]["messages"])
+    assert sum(message["role"] == "tool" for message in completion.requests[2]["messages"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_absolute_deadline_audits_slow_provider_timeout_and_settles(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    clock_origin = real_time()
+    provider_started_at: float | None = None
+    provider_cancelled = False
+
+    def deadline_clock() -> float:
+        # Run the real preflight without charging CI scheduling delays to this
+        # provider-timeout test. Once the provider enters, consume the original
+        # one-second budget using real elapsed time and asyncio's real timer.
+        # The sync-phase deadline tests separately cover preflight timeouts.
+        if provider_started_at is None:
+            return clock_origin
+        return clock_origin + real_time() - provider_started_at
+
     class SlowCompletion(_ScriptedCompletion):
         async def __call__(self, **kwargs: Any) -> _Response:
+            nonlocal provider_started_at, provider_cancelled
             self.requests.append(deepcopy(kwargs))
-            await asyncio.sleep(60)
+            provider_started_at = real_time()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                provider_cancelled = True
+                raise
             raise AssertionError("unreachable")
 
     completion = SlowCompletion()
     recorder = BufferingRecorder()
     events: list[str] = []
-    with pytest.raises(PipelinePlannerError, match="wall-clock"):
+    with patch.object(loop, "time", deadline_clock), pytest.raises(PipelinePlannerError, match="wall-clock") as error:
         await _plan(
             tmp_path=tmp_path,
             tool_context=tool_context,
             completion=completion,
             recorder=recorder,
-            # The absolute deadline now includes the worker-offloaded initial
-            # policy validation. Leave enough time to reach the deliberately
-            # hanging provider so this test remains specifically about its
-            # audited timeout path under xdist load.
             model_overrides={"timeout_seconds": 1.0},
             lifecycle=_lifecycle(events),
         )
-    assert recorder.llm_calls[0].status.value == "timeout"
+    assert len(completion.requests) == 1
+    assert provider_cancelled
+    assert error.value.code == "TIMEOUT"
+    (call,) = recorder.llm_calls
+    assert call.status is ComposerLLMCallStatus.TIMEOUT
     assert events[-1] == "settled:failed"
 
 
@@ -6398,7 +5105,10 @@ async def test_settlement_cancellation_after_success_carries_both_planner_eviden
             usage=_planner_usage(),
         ),
         _response(("emit_pipeline_proposal", {"pipeline": {}}), ("emit_pipeline_proposal", {"pipeline": {}})),
-        _response(("emit_pipeline_proposal", {"pipeline": {}}), ("list_sources", {})),
+        # NOTE: the terminal-sibling shape (emit_pipeline_proposal batched with
+        # a discovery call) left this matrix when it became a repairable
+        # protocol rejection — see
+        # test_pipeline_planner_protocol_rejections.py::test_terminal_batched_with_discovery_*.
     ],
     ids=[
         "choices",
@@ -6409,7 +5119,6 @@ async def test_settlement_cancellation_after_success_carries_both_planner_eviden
         "arguments-json",
         "arguments-object",
         "multiple-terminal",
-        "terminal-sibling",
     ],
 )
 async def test_malformed_provider_tool_call_matrix_fails_without_dispatch(
@@ -6600,8 +5309,20 @@ async def test_discovery_pressure_notice_injected_at_two_turns_remaining(
         _response(("list_sources", {})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
     )
+    recorder = BufferingRecorder()
+    loop = asyncio.get_running_loop()
+    clock_origin = loop.time()
 
-    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+    # This tests turn-count steering through the real planner and provider
+    # parser. Host scheduling must not consume its unrelated wall-clock budget;
+    # the deadline tests above separately exercise timeout enforcement.
+    with patch.object(loop, "time", lambda: clock_origin):
+        proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert len(completion.requests) == 2
+    assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
+    assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
 
     # max_discovery_turns defaults to 3: after the first discovery turn two
     # remain, which is exactly when the budget-pressure steering must land.
@@ -6889,46 +5610,12 @@ async def test_escape_hatch_non_terminal_reply_reraises_original_exhaustion(
     assert not isinstance(excinfo.value, PlannerDeclined)
 
 
-@pytest.mark.asyncio
-async def test_escape_hatch_finalizer_rejection_records_candidate_classification_before_original_exhaustion(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-    recorder = BufferingRecorder()
-    finalizer_calls = 0
+def test_attempt_classification_retains_known_diagnostic_but_closes_unknown_codes() -> None:
+    from elspeth.web.composer.pipeline_planner import _closed_planner_rejection_codes
 
-    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-        nonlocal finalizer_calls
-        finalizer_calls += 1
-        if finalizer_calls == 2:
-            raise _binding_rejection()
-        return candidate
-
-    with pytest.raises(PipelinePlannerError) as caught:
-        await _plan(
-            tmp_path=tmp_path,
-            tool_context=tool_context,
-            completion=completion,
-            recorder=recorder,
-            repair_budget=0,
-            candidate_finalizer=finalizer,
-            model_overrides={
-                "escape_hatch_model": "openrouter/advisor-under-test",
-                "escape_hatch_provider": "openrouter",
-            },
-        )
-
-    assert caught.value.code == "REPAIR_EXHAUSTED"
-    hatch_attempt = recorder.planner_attempts[-1]
-    assert hatch_attempt.phase is ComposerPlannerAttemptPhase.HATCH
-    assert hatch_attempt.outcome is ComposerPlannerAttemptOutcome.CANDIDATE_REJECTED
-    assert hatch_attempt.rejection_codes == ("validation_error",)
-    assert hatch_attempt.planner_code is None
-    assert hatch_attempt.led_to is ComposerPlannerAttemptLedTo.TERMINAL
+    assert _closed_planner_rejection_codes(
+        ("source_on_success_dangling", "PRIVATE_UNREGISTERED_CODE", "prefix source_on_success_dangling suffix")
+    ) == ("source_on_success_dangling", "validation_error")
 
 
 @pytest.mark.asyncio
@@ -7109,36 +5796,19 @@ async def test_escape_hatch_retains_actual_terminal_candidate_and_safe_result(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rejection_kind", ("canonical_schema", "missing_source", "deferred_claim"))
+@pytest.mark.parametrize("rejection_kind", ("canonical_schema", "missing_source"))
 async def test_escape_hatch_retains_terminal_candidate_across_pre_custody_rejections(
     tmp_path: Path,
     tool_context: ToolContext,
     rejection_kind: str,
 ) -> None:
     model_arguments: dict[str, Any] = {"pipeline": _pipeline(tmp_path)}
-    plan_overrides: dict[str, Any] = {}
     expected_code = rejection_kind
     if rejection_kind == "canonical_schema":
         model_arguments["pipeline"]["source"]["plugin"] = 123
     elif rejection_kind == "missing_source":
         model_arguments["pipeline"] = _sourceless_pipeline(tmp_path)
         expected_code = "canonical_schema"
-    else:
-        intent_id = "00000000-0000-4000-8000-000000000315"
-        model_arguments["claimed_deferred_intent_ids"] = [intent_id]
-
-        def reject_claims(_candidate: CompositionState, claims: tuple[str, ...]) -> tuple[str, ...]:
-            if claims:
-                raise DeferredIntentClaimError("unproven")
-            return ()
-
-        plan_overrides = {
-            "surface": PlannerSurface.GUIDED_STAGED,
-            "eligible_deferred_intent_ids": (intent_id,),
-            "claim_evaluator": reject_claims,
-        }
-        expected_code = "deferred_intent_claim"
-
     completion = _ScriptedCompletion(
         _response_with_call_id("rejected-proposal", "emit_pipeline_proposal", model_arguments),
         _response_with_call_id("hatch-proposal", "emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}),
@@ -7153,7 +5823,6 @@ async def test_escape_hatch_retains_terminal_candidate_across_pre_custody_reject
             "escape_hatch_model": "openrouter/advisor-under-test",
             "escape_hatch_provider": "openrouter",
         },
-        **plan_overrides,
     )
 
     hatch_messages = completion.requests[1]["messages"]
@@ -7222,55 +5891,6 @@ async def test_escape_hatch_retains_argument_rejection_without_copying_raw_data_
 
 
 @pytest.mark.asyncio
-async def test_escape_hatch_transcript_never_exposes_guided_finalizer_authority(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    private_authority = "PRIVATE-FINALIZER-SINK-CANARY"
-    finalizer_attempts = 0
-
-    def finalize(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-        nonlocal finalizer_attempts
-        finalizer_attempts += 1
-        finalized = deepcopy(dict(candidate))
-        if finalizer_attempts == 1:
-            finalized["source"]["on_success"] = private_authority
-        return finalized
-
-    raw_candidate = _pipeline(tmp_path)
-    # The raw candidate already contains the same scalar in a harmless
-    # location.  A scalar-set scrub must not mistake that for authority to
-    # reveal the finalizer's private routing association.
-    raw_candidate["metadata"] = {"description": private_authority}
-    completion = _ScriptedCompletion(
-        _response_with_call_id("guided-rejection", "emit_pipeline_proposal", {"pipeline": raw_candidate}),
-        _response_with_call_id("guided-hatch", "emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}),
-    )
-
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        repair_budget=0,
-        surface=PlannerSurface.GUIDED_STAGED,
-        candidate_finalizer=finalize,
-        model_overrides={
-            "escape_hatch_model": "openrouter/advisor-under-test",
-            "escape_hatch_provider": "openrouter",
-        },
-    )
-
-    hatch_messages = completion.requests[1]["messages"]
-    retained_arguments = json.loads(hatch_messages[-3]["tool_calls"][0]["function"]["arguments"])
-    assert retained_arguments["pipeline"]["source"]["on_success"] == "rows"
-    assert retained_arguments["pipeline"]["metadata"]["description"] == private_authority
-    feedback = json.loads(hatch_messages[-2]["content"])
-    assert _feedback_error_codes(feedback) == ("source_on_success_dangling",)
-    assert "connectivity" not in feedback["validation"]["errors"][0]
-    assert private_authority not in hatch_messages[-2]["content"]
-
-
-@pytest.mark.asyncio
 async def test_escape_hatch_finalizer_change_uses_json_type_exact_comparison(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -7297,7 +5917,6 @@ async def test_escape_hatch_finalizer_change_uses_json_type_exact_comparison(
         tool_context=tool_context,
         completion=completion,
         repair_budget=0,
-        surface=PlannerSurface.GUIDED_STAGED,
         candidate_finalizer=finalize,
         model_overrides={
             "escape_hatch_model": "openrouter/advisor-under-test",
@@ -7625,15 +6244,15 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     It is pinned in both directions deliberately. Withholding too little is a
     custody leak; withholding too much is the failure recorded in
     ``_allowlisted_candidate_feedback``'s own docstring, where a
-    candidate-global predecessor predicate "made guided repair permanently
-    blind" because the guided binder always mutates the candidate. The
+    candidate-global predecessor predicate made repair permanently blind
+    because the finalizer always mutates the candidate. The
     forwarding arm below is what keeps a model-authored-to-model-authored
     edge repairable, and it is load-bearing for diagnosing repair thrash
     (elspeth-15c60e7c66): whether the planner was shown ``extra_fields``
     decides whether a wasted repair turn is an observability defect or a
     briefing one.
     """
-    guided_binder_owns_reviewed_ends = _FinalizerOwnedRefs(
+    finalizer_owns_reviewed_ends = _FinalizerOwnedRefs(
         config=frozenset({"source", "output:json_out"}),
         routing=frozenset(),
     )
@@ -7660,7 +6279,7 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     # payload, so the repair turn gets the fields it must act on.
     between_transforms = _allowlisted_candidate_feedback(
         cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "node:field_mapper_1"))),
-        finalizer_owned=guided_binder_owns_reviewed_ends,
+        finalizer_owned=finalizer_owns_reviewed_ends,
     )
     assert between_transforms["validation"]["errors"][0]["contract"] == {
         "producer": "llm_1",
@@ -7676,7 +6295,7 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     # assertion fail, and it is the only one that fails.
     from_reviewed_source = _allowlisted_candidate_feedback(
         cast(Any, SimpleNamespace(validation=_summary("source", "web_scrape_1", "node:web_scrape_1"))),
-        finalizer_owned=guided_binder_owns_reviewed_ends,
+        finalizer_owned=finalizer_owns_reviewed_ends,
     )
     assert "contract" not in from_reviewed_source["validation"]["errors"][0]
 
@@ -7688,7 +6307,7 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     # assertion as coverage of the cross-reference.
     into_reviewed_sink = _allowlisted_candidate_feedback(
         cast(Any, SimpleNamespace(validation=_summary("llm_1", "output:json_out", "output:json_out"))),
-        finalizer_owned=guided_binder_owns_reviewed_ends,
+        finalizer_owned=finalizer_owns_reviewed_ends,
     )
     assert "contract" not in into_reviewed_sink["validation"]["errors"][0]
 
@@ -7711,7 +6330,7 @@ def test_schema_contract_detail_withholding_follows_the_participants_not_the_ent
     # made again here.
     unattributable = _allowlisted_candidate_feedback(
         cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "rejected_mutation"))),
-        finalizer_owned=guided_binder_owns_reviewed_ends,
+        finalizer_owned=finalizer_owns_reviewed_ends,
     )
     assert "contract" not in unattributable["validation"]["errors"][0]
 
@@ -7734,8 +6353,8 @@ def test_connectivity_facts_are_withheld_per_change_kind_not_per_component(monke
     branch at all. Exercising a function is not covering a branch.
 
     Both failure directions are live here. Over-withholding is not theoretical:
-    the code comment at that branch records guided session 277fb6c4 burning its
-    WHOLE repair budget re-emitting a coalesce because nothing named the
+    a missing connection name can burn a whole repair budget re-emitting a
+    coalesce because nothing identifies the
     connections that actually existed. Under-withholding discloses
     finalizer-written routing destinations. The middle row below is the whole
     point of scoping ownership per CHANGE KIND rather than per component — a
@@ -7794,7 +6413,7 @@ def test_connectivity_facts_are_withheld_per_change_kind_not_per_component(monke
 
     # Ownership of an UNRELATED component must not withhold anything here —
     # the predecessor candidate-global predicate did exactly that, and it is
-    # what made guided repair permanently blind.
+    # what made repair permanently blind.
     unrelated = entry_for(_FinalizerOwnedRefs(config=frozenset({"source"})))
     assert unrelated["connectivity"] == facts["co"]
     assert unrelated["component"] == "node:co"
@@ -8261,6 +6880,49 @@ async def test_escape_hatch_fires_on_discovery_cycle(
     assert "discovery guards" in notice
 
 
+@pytest.mark.parametrize("field", ["pricing_model", "escape_hatch_pricing_model"])
+@pytest.mark.parametrize("value", ["", " ", 42])
+def test_planner_rejects_invalid_pricing_identity(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        _model(_ScriptedCompletion(), **{field: value})
+
+
+def test_planner_rejects_advisor_pricing_without_advisor() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_pricing_model requires escape_hatch_model"):
+        _model(_ScriptedCompletion(), escape_hatch_pricing_model="azure/gpt-4o")
+
+
+@pytest.mark.asyncio
+async def test_primary_and_escape_hatch_use_independent_pricing_identities(tmp_path: Path, tool_context: ToolContext) -> None:
+    responses = [
+        _response_with_call_id("discovery-a", "list_sources", {}),
+        _response_with_call_id("discovery-b", "list_sources", {}),
+        _response_with_call_id("discovery-c", "list_sources", {}),
+        _response_with_call_id("hatch", "emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}),
+    ]
+    for response in responses:
+        response.usage = {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+    completion = _ScriptedCompletion(*responses)
+    recorder = BufferingRecorder()
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        model_overrides={
+            "model_identifier": "openai/primary-datazone",
+            "pricing_model": "openai/gpt-4o-2024-08-06",
+            "escape_hatch_model": "openai/advisor-datazone",
+            "escape_hatch_provider": "openai",
+            "escape_hatch_pricing_model": "openai/gpt-4o-mini-2024-07-18",
+        },
+    )
+    assert [request["model"] for request in completion.requests] == ["openai/primary-datazone"] * 3 + ["openai/advisor-datazone"]
+    assert [call.model_requested for call in recorder.llm_calls] == ["openai/primary-datazone"] * 3 + ["openai/advisor-datazone"]
+    assert [call.provider_cost for call in recorder.llm_calls] == pytest.approx([0.00045] * 3 + [0.000027])
+    assert all(call.provider_cost_source == "litellm.cost_per_token" for call in recorder.llm_calls)
+
+
 @pytest.mark.asyncio
 async def test_discovery_cycle_without_hatch_still_raises(
     tmp_path: Path,
@@ -8290,10 +6952,8 @@ async def test_discovery_reread_after_candidate_rejection_is_not_a_cycle(
     ``get_plugin_schema`` (and ``explain_validation_error``) "when repairing
     against a validation rejection", but the repetition guard's window spanned
     the whole request: any re-read of a key seen before the rejection tripped
-    DISCOVERY_CYCLE. Live guided sessions bad64533-08a1 and b3acc846-7b89
-    (2026-07-22) died exactly this way — discovery, candidate, repair rounds,
-    then a legitimate state re-read fired the guard and the opus hatch could
-    not save them. The window is scoped per repair round: a candidate
+    DISCOVERY_CYCLE. A legitimate state re-read after discovery, candidate,
+    and repair rounds fired the guard. The window is scoped per repair round: a candidate
     rejection resets it.
     """
     completion = _ScriptedCompletion(
@@ -8435,6 +7095,43 @@ async def test_prose_reply_gets_bounded_nudge_then_converges(
     # The prose reply is discarded from the conversation (parallel to the
     # truncation repair) and audited with its own discriminant.
     assert recorder.llm_calls[0].error_message == "PROSE_REPLY"
+
+
+@pytest.mark.asyncio
+async def test_unadmitted_prose_is_staged_on_the_recorder_as_a_withheld_reply(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The nudge discards the reply from the conversation and nothing else
+    keeps it: ``ComposerLLMCall`` stores no response text. The planner has no
+    session to write to, so it stages the words on the recorder and the caller
+    persists them."""
+    prose = "Before I build this: which column holds the colour?"
+    completion = _ScriptedCompletion(
+        _text_response(prose),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert [(reply.origin, reply.content) for reply in recorder.withheld_replies] == [("planner_prose_unadmitted", prose)]
+
+
+@pytest.mark.asyncio
+async def test_a_published_decline_is_not_staged_as_withheld(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Only UNADMITTED prose is withheld. An admitted ``DECLINE:`` reply is
+    published verbatim, so recording it would double-count the model's words."""
+    completion = _ScriptedCompletion(_text_response("DECLINE: no installed plugin can read that format."))
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PlannerDeclined):
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder, information_aware=True)
+
+    assert recorder.withheld_replies == ()
 
 
 @pytest.mark.asyncio
@@ -8811,6 +7508,7 @@ async def test_planner_schema_discovery_failure_never_marks_the_session_tracker(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("complete_model_catalog_aid")
 async def test_aid_deferral_arms_keep_the_manifest_discoverable(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -8852,7 +7550,20 @@ async def test_aid_deferral_arms_keep_the_manifest_discoverable(
     assert {"list_models", "get_expression_grammar"} <= names
 
 
+@pytest.fixture
+def complete_model_catalog_aid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise supplied-aid semantics independently of SDK catalog growth."""
+    from elspeth.web.composer import planner_authoring_aids
+
+    monkeypatch.setattr(planner_authoring_aids, "read_litellm_model_list", lambda: ("bedrock/test-model",))
+    monkeypatch.setattr(planner_authoring_aids, "get_catalog_values", lambda _catalog: frozenset({"openai/gpt-4o"}))
+    catalog = planner_authoring_aids.planner_model_catalog()
+    assert catalog["models_omitted"] == []
+    assert catalog["models_by_provider"] == {"bedrock": ["bedrock/test-model"], "openrouter": ["openai/gpt-4o"]}
+
+
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("complete_model_catalog_aid")
 async def test_aid_supplied_no_gain_pair_in_one_turn_never_escalates(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -8884,6 +7595,8 @@ async def test_aid_supplied_no_gain_pair_in_one_turn_never_escalates(
     )
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    initial_payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    assert initial_payload["information_manifest"]["supplied"]["model_catalog"] == "authoring_aids"
     assert len(completion.requests) == 2
     # Not the hatch: the follow-up turn stays on the planner model.
     assert completion.requests[1]["model"] == "anthropic/claude-planner"
@@ -8893,6 +7606,7 @@ async def test_aid_supplied_no_gain_pair_in_one_turn_never_escalates(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("complete_model_catalog_aid")
 async def test_aid_supplied_no_gain_calls_across_turns_never_escalate(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -8918,6 +7632,8 @@ async def test_aid_supplied_no_gain_calls_across_turns_never_escalate(
     )
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    initial_payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    assert initial_payload["information_manifest"]["supplied"]["model_catalog"] == "authoring_aids"
     assert len(completion.requests) == 3
     assert [request["model"] for request in completion.requests] == ["anthropic/claude-planner"] * 3
     for request_index in (1, 2):
@@ -8929,6 +7645,7 @@ async def test_aid_supplied_no_gain_calls_across_turns_never_escalate(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("complete_model_catalog_aid")
 async def test_aid_supplied_tools_stay_in_the_palette_after_a_discovery_turn(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -9508,8 +8225,7 @@ async def test_planner_attempt_trail_names_reject_repair_accept(
 
     The terminal disposition only carries the LAST failure's codes, so a run
     whose final attempt failed at a non-candidate layer reported
-    rejection_codes=[] and the whole repair history was invisible (guided
-    session 5a5082e6, op 408acf3a). The per-attempt trail names each round —
+    rejection_codes=[] and the whole repair history was invisible. The per-attempt trail names each round —
     and the success-path summary closes the churn-observability gap
     (assessment item 5) at the same time.
     """
@@ -9983,45 +8699,6 @@ async def test_authored_condition_satisfies_the_stated_threshold(
 
 
 @pytest.mark.asyncio
-async def test_threshold_guard_reads_the_current_stage_intent_not_the_message_transcript(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """Guided-staged provenance: earlier-stage text must not trip a later stage.
-
-    ``sessions/routes/composer/guided.py:3263-3268`` deliberately splits the
-    two: ``planner_intent`` is the CURRENT stage's instruction alone, while the
-    root-plus-instruction concatenation goes to
-    ``PlannerOriginatingMessage.content``. The guard reads ``intent``, so a
-    threshold stated at an earlier stage cannot reject a later stage's legal
-    fan-out. Pinned here because the split lives in a route, one refactor away
-    from being "simplified" into a single concatenated string.
-    """
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        surface=PlannerSurface.GUIDED_STAGED,
-        intent="Fan every row out to both the high_value and standard sinks.",
-        originating_message=PlannerOriginatingMessage(
-            session_id=_TEST_SESSION_ID,
-            message_id="00000000-0000-4000-8000-000000000001",
-            content=(
-                "Route rows with amount > 500 to high_value and everything else to standard.\n\n"
-                "Fan every row out to both the high_value and standard sinks."
-            ),
-            user_id="user-1",
-        ),
-    )
-
-    assert proposal.proposal.repair_count == 0
-
-
-@pytest.mark.asyncio
 async def test_reasoning_effort_rides_planner_phases(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -10272,192 +8949,6 @@ async def test_schema_precheck_diagnostics_log_only_closed_schema_classifiers(
     assert all("message" not in entry for entry in diagnostic["entries"])
     assert {entry["rule"] for entry in diagnostic["entries"]} <= {"pattern", "maxLength", "not", "type"}
     assert all(entry["schema_path"].startswith("properties/") for entry in diagnostic["entries"])
-
-
-def _binder_rejection(error_code: str, **facts: Any) -> GuidedCandidateBindingRejected:
-    return GuidedCandidateBindingRejected(
-        "guided planner candidate delta violates reviewed mutation authority",
-        error_code=error_code,
-        connectivity=facts,
-    )
-
-
-@pytest.mark.asyncio
-async def test_two_different_binder_defects_do_not_share_a_repeat_fingerprint(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """A second, DIFFERENT binder defect is not a repeat of the first.
-
-    Ten binder sites share ``guided_delta_authority_violation``, so a code-only
-    fingerprint told a planner that had genuinely fixed one defect that its
-    rejection set was "EXACTLY the same" and to keep every other part
-    byte-identical — advice that can steer it into reverting the fix.
-    """
-    attempts: list[Mapping[str, Any]] = []
-
-    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-        attempts.append(candidate)
-        if len(attempts) == 1:
-            raise _binder_rejection("guided_delta_authority_violation", component_kind="sources")
-        if len(attempts) == 2:
-            raise _binder_rejection("guided_delta_authority_violation", component_kind="nodes")
-        return candidate
-
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        repair_budget=2,
-        surface=PlannerSurface.GUIDED_STAGED,
-        candidate_finalizer=finalizer,
-    )
-
-    assert proposal.proposal.repair_count == 2
-    first = json.loads(completion.requests[1]["messages"][-1]["content"])
-    second = json.loads(completion.requests[2]["messages"][-1]["content"])
-    assert "repeat_notice" not in first
-    assert "repeat_notice" not in second
-
-
-@pytest.mark.asyncio
-async def test_identical_binder_defect_still_draws_the_repeat_notice(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """Discrimination must not cost the genuine-repeat signal: same code, same facts."""
-    attempts: list[Mapping[str, Any]] = []
-
-    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-        attempts.append(candidate)
-        if len(attempts) <= 2:
-            raise _binder_rejection("guided_delta_authority_violation", component_kind="sources", delta_member="source_routes")
-        return candidate
-
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        repair_budget=2,
-        surface=PlannerSurface.GUIDED_STAGED,
-        candidate_finalizer=finalizer,
-    )
-
-    assert proposal.proposal.repair_count == 2
-    second = json.loads(completion.requests[2]["messages"][-1]["content"])
-    assert second["repeat_notice"] == _REPEAT_NOTICE
-
-
-@pytest.mark.asyncio
-async def test_materializer_schema_defects_are_located_in_the_repair_feedback(
-    tmp_path: Path,
-    tool_context: ToolContext,
-) -> None:
-    """The post-materialize argument-model check names every failing field path.
-
-    This gate runs on the MATERIALIZED candidate, so its locations can name a
-    field the server bound; the located paths and pydantic's own closed error
-    types are structural either way, and no rejected value crosses.
-    """
-    value_canary = "MATERIALIZED_VALUE_CANARY"
-    materializations: list[Mapping[str, Any]] = []
-
-    def materialize(payload: Mapping[str, Any]) -> Mapping[str, Any]:
-        materializations.append(payload)
-        materialized = deepcopy(dict(payload))
-        if len(materializations) == 1:
-            materialized["nodes"] = [{"id": value_canary, "node_type": "transform", "input": 7, "options": {}}]
-            materialized["edges"] = value_canary
-        return materialized
-
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-
-    proposal = await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        repair_budget=1,
-        terminal_contract=PlannerTerminalContract(
-            schema=dict(canonical_set_pipeline_schema()),
-            materialize=materialize,
-        ),
-    )
-
-    assert proposal.proposal.repair_count == 1
-    content = completion.requests[1]["messages"][-1]["content"]
-    feedback = json.loads(content)
-    (entry,) = feedback["validation"]["errors"]
-    assert entry["error_code"] == "canonical_schema"
-    located = {violation["path"]: violation["rule"] for violation in entry["schema_violations"]}
-    assert "nodes/0/input" in located
-    assert "edges" in located
-    assert value_canary not in content
-
-
-def test_finalizer_owned_schema_defects_are_reported_without_their_location() -> None:
-    """The argument-model projection obeys the same custody rule its siblings do.
-
-    This gate runs on the MATERIALIZED candidate and ``sources`` is a mapping,
-    so a violation path can name a component by a name only the server holds:
-    on a guided surface the finalizer keys that mapping by a REVIEWED source's
-    user-given name. Defence in depth — the guided delta schema types every
-    member, so no planner-authored input reaches this arm today, which is why
-    the arm's inputs are synthesized here rather than driven through a plan.
-    """
-    reviewed_canary = "reviewed_private_source_name"
-
-    def materialize(payload: Mapping[str, Any]) -> PlannerTerminalMaterialization:
-        return PlannerTerminalMaterialization(
-            pipeline={
-                "sources": {
-                    reviewed_canary: {"plugin": 7, "on_success": "rows"},
-                    "authored_open": {"plugin": 7, "on_success": "rows"},
-                },
-                "nodes": [],
-                "edges": [],
-                "outputs": [],
-            },
-            config_owned_refs=frozenset({f"source:{reviewed_canary}"}),
-        )
-
-    pipeline_result, owned_refs, feedback, repeated = _materialize_terminal_payload(
-        payload={},
-        terminal_contract=PlannerTerminalContract(schema=dict(canonical_set_pipeline_schema()), materialize=materialize),
-        seen_rejection_fingerprints=set(),
-    )
-
-    assert pipeline_result is None
-    assert repeated is False
-    assert owned_refs.config == frozenset({f"source:{reviewed_canary}"})
-    assert feedback is not None
-    (entry,) = feedback["validation"]["errors"]
-    assert entry["error_code"] == "canonical_schema"
-    violations = entry["schema_violations"]
-    # The model-authored source keeps its location and its value-free rule
-    # detail; the finalizer-owned one is reported as an unlocated rule with
-    # the detail stripped, so neither the name nor a measure of its content
-    # crosses. The canary is the load-bearing assertion: an unlocated path is
-    # spelled "pipeline", which a root-level violation would also produce.
-    assert {violation["path"] for violation in violations} == {"sources/authored_open/plugin", "pipeline"}
-    assert reviewed_canary not in canonical_json(feedback)
-    by_path = {violation["path"]: violation for violation in violations}
-    assert by_path["pipeline"] == {"path": "pipeline", "rule": "string_type"}
-    assert by_path["sources/authored_open/plugin"]["detail"]
 
 
 def test_candidate_rejection_fingerprint_discriminates_disjoint_component_sets() -> None:
@@ -10780,7 +9271,7 @@ def test_argument_rejection_projections_split_by_surface() -> None:
         "error_class": "ToolArgumentError",
     }
 
-    payload = pipeline_planner._allowlisted_argument_error_payload(error)
+    payload = pipeline_planner.argument_error_response(error).to_wire()
     assert tuple(payload) == ("argument_error",)
     assert payload["argument_error"] == entry
     assert "success" not in payload, "the envelope's success already says the call failed"
@@ -10794,27 +9285,21 @@ def test_argument_rejection_projections_split_by_surface() -> None:
     )
 
 
-def test_discovery_argument_rejection_builds_its_data_inline() -> None:
-    """The discovery ARG_ERROR result's ``data=`` IS the payload constructor call.
-
-    Built inline, the payload has no local, alias or ``cast`` target for a later
-    store to travel through, and ``ToolResult.__post_init__`` freezes it before
-    any other statement runs — the closure c6f857aa0 applied to the
-    APPROVAL_REQUIRED payload, for the same reason. Read from the AST rather
-    than from behaviour because what is pinned is that no OTHER shape can be
-    written here: a re-introduced ``feedback = _allowlisted_argument_feedback(exc)``
-    fed to ``data=dict(feedback)`` (the shape this replaced) reds this test
-    while shipping a payload a behavioural assertion on one example might miss.
-    """
-    tree = ast.parse(Path(pipeline_planner.__file__).read_text(encoding="utf-8"))
-    fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "execute_one_discovery"]
-    assert len(fns) == 1, "premise: one execute_one_discovery in the planner"
-    results = [
-        node for node in ast.walk(fns[0]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ToolResult"
-    ]
-    assert len(results) == 1, "premise: the discovery arm constructs exactly one ToolResult"
-    (data_kw,) = [kw for kw in results[0].keywords if kw.arg == "data"]
-    assert isinstance(data_kw.value, ast.Call), "data= must be the payload constructor call, not a name or a dict"
-    assert isinstance(data_kw.value.func, ast.Name)
-    assert data_kw.value.func.id == "_allowlisted_argument_error_payload"
-    assert not data_kw.value.keywords and len(data_kw.value.args) == 1
+def test_discovery_argument_rejection_uses_owned_snapshot() -> None:
+    """Exception fields stay frozen and original data cannot control disclosure."""
+    state = _empty_state()
+    error = ToolArgumentError(argument="plugin_type", expected="kind", actual_type="str", code="DISCOVERY_ONLY")
+    response = pipeline_planner.argument_error_response(error)
+    expected = response.to_wire()
+    with pytest.raises(AttributeError):
+        error.argument = "PRIVATE_MUTATED_ARGUMENT"
+    result = ToolResult(
+        success=False, updated_state=state, validation=state.validate(), affected_nodes=(), data={"private": "PRIVATE_DATA"}
+    )
+    rejection = pipeline_planner._PlannerArgumentRejection(result, response)
+    encoded = _serialize_provider_discovery_result(
+        call=_ParsedToolCall(call_id="arg-error", name="get_plugin_schema", raw_arguments="{}", arguments={}),
+        result=rejection,
+    )
+    assert json.loads(encoded)["data"] == expected
+    assert "PRIVATE" not in encoded

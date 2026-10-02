@@ -71,12 +71,12 @@ class TestSerializeDatetime:
         assert result[2]["time"] == "2026-01-29T12:00:00+00:00"
 
     def test_rejects_nan(self) -> None:
-        """NaN values are rejected per CLAUDE.md audit integrity requirements."""
+        """NaN values are rejected (engine-patterns-reference skill §Canonical JSON)."""
         with pytest.raises(AuditIntegrityError, match="NaN"):
             serialize_datetime(float("nan"))
 
     def test_rejects_infinity(self) -> None:
-        """Infinity values are rejected per CLAUDE.md audit integrity requirements."""
+        """Infinity values are rejected (engine-patterns-reference skill §Canonical JSON)."""
         with pytest.raises(AuditIntegrityError, match="Infinity"):
             serialize_datetime(float("inf"))
 
@@ -403,7 +403,7 @@ class TestCSVFormatter:
         assert flat["outer.name"] == "test"
 
     def test_csv_formatter_rejects_nan_in_list(self) -> None:
-        """CSV formatter must reject NaN in lists per CLAUDE.md audit integrity.
+        """CSV formatter must reject NaN in lists (engine-patterns-reference skill §Canonical JSON).
 
         Bug: P2-2026-01-31-csv-formatter-nan-in-lists
 

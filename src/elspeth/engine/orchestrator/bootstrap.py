@@ -1,6 +1,6 @@
 """Framework bootstrap: registry assertion + freeze before any DAG execution.
 
-Extracted from ``orchestrator/core.py`` (filigree elspeth-9e71ae82a4) so the
+Extracted from ``orchestrator/core.py`` (archived issue elspeth-9e71ae82a4) so the
 run-lifecycle coordinator can import it without a circular import through the
 ``core`` facade. ``core.py`` re-exports :func:`prepare_for_run` — the public
 import path ``elspeth.engine.orchestrator.prepare_for_run`` (and the legacy

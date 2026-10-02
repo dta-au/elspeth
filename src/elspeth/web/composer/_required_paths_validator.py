@@ -182,9 +182,10 @@ def _optional_ancestor_present(value: object, ancestor: RequiredPath) -> bool:
     schema set. A future schema with an optional sub-object inside array items
     (e.g., ``tags: array<{ details?: { name: required } }>``) WOULD produce
     such an ancestor, and the all-or-nothing semantics here can't express
-    "present in some items, absent in others." Per CLAUDE.md offensive
-    programming: crash loudly with a diagnostic that points the maintainer at
-    the extension site, rather than silently producing wrong validation.
+    "present in some items, absent in others." Per the engine-patterns-reference
+    skill §Offensive Programming Examples: crash loudly with a diagnostic that
+    points the maintainer at the extension site, rather than silently producing
+    wrong validation.
     """
     if not ancestor:
         return True

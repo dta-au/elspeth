@@ -52,9 +52,10 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.helpers.composer_lease import install_fenced_compose_adapter
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _make_session(
@@ -69,6 +70,7 @@ def _make_session(
 ) -> None:
     """Insert a session row with every NOT NULL column populated."""
     now = created_at or datetime.now(UTC)
+    ensure_test_identity(conn, identity_id=user_id, provider=auth_provider_type)
     conn.execute(
         insert(models.sessions_table).values(
             id=session_id,
@@ -145,7 +147,9 @@ def composer_test_client(tmp_path: Path) -> TestClient:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    session_service = DualFencedSessionServiceHarness(
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
+    session_service = FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -260,6 +264,7 @@ def _build_audit_readiness_app(
         composer_max_composition_turns=15,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
+        composer_boot_probe_enabled=False,
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=b"\x00" * 32,
         plugin_allowlist=("transform:passthrough",),
@@ -273,6 +278,12 @@ def _build_audit_readiness_app(
 
         app.dependency_overrides[get_current_user] = _unauthenticated
     else:
+        wire_test_pipeline_user_authority(
+            app,
+            identity_id=authed_user_id,
+            provider=settings.auth_provider,
+            engine=app.state.session_engine,
+        )
         identity = UserIdentity(user_id=authed_user_id, username=authed_user_id)
 
         async def _mock_user() -> UserIdentity:
@@ -449,6 +460,8 @@ def _seed_session_with_state(
     # paths inside the persisted CompositionState satisfy
     # web/paths.py's resolve_data_path() invariants.
     async def _seed() -> UUID:
+        with client.app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=settings.auth_provider)
         record = await session_service.create_session(
             user_id=user_id,
             title="audit-readiness fixture",
@@ -487,6 +500,8 @@ def _seed_session_without_state(
     settings: WebSettings = client.app.state.settings
 
     async def _seed() -> UUID:
+        with client.app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=settings.auth_provider)
         record = await session_service.create_session(
             user_id=user_id,
             title="audit-readiness empty fixture",
@@ -590,6 +605,8 @@ def _seed_session_with_mismatched_auth_provider(
     settings: WebSettings = client.app.state.settings
 
     async def _seed() -> UUID:
+        with client.app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=user_id, provider=auth_provider_type)
         record = await session_service.create_session(
             user_id=user_id,
             title="audit-readiness mismatched-provider fixture",
@@ -661,6 +678,20 @@ def inject_commit_OperationalError() -> object:
         event.listen(engine, "commit", _raise)
 
     return _install
+
+
+# The composer's strict-transport resolver (S1 T8) reads these base-URL and
+# api-version variables, and pytest loads ``.env``; scrub them so a web
+# integration test's tool wire never depends on the developer's shell. Not in
+# the root conftest: the live provider tests under tests/integration/plugins/
+# read Azure settings from the environment.
+_COMPOSER_ROUTE_ENV = ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENROUTER_API_BASE", "AZURE_API_VERSION")
+
+
+@pytest.fixture(autouse=True)
+def _scrub_composer_route_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _COMPOSER_ROUTE_ENV:
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)

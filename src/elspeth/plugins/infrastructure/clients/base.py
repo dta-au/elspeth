@@ -5,10 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from elspeth.contracts import CallType
+from elspeth.contracts.call_governance import LLMCallGovernance
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 
 if TYPE_CHECKING:
-    from elspeth.contracts import Call, CallStatus, CallType
+    from elspeth.contracts import Call, CallStatus
     from elspeth.contracts.audit_protocols import CallRecorder
     from elspeth.contracts.call_data import CallPayload
     from elspeth.contracts.contexts import LimiterProtocol
@@ -64,6 +69,10 @@ class AuditedClientBase:
         operation_id: str | None = None,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
+        coordination_token: CoordinationToken | None = None,
+        member_token: WorkerMembershipToken | None = None,
+        work_item: TokenWorkItem | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
     ) -> None:
         """Initialize audited client.
 
@@ -87,6 +96,31 @@ class AuditedClientBase:
         self._telemetry_emit = telemetry_emit
         self._limiter = limiter
         self._token_id = token_id
+        self._coordination_token = coordination_token
+        self._member_token = member_token
+        self._work_item = work_item
+        self._llm_call_governance = llm_call_governance
+
+    def _before_llm_call(self) -> str | None:
+        """Check host admission immediately before a chargeable dispatch."""
+        if self._llm_call_governance is not None:
+            return self._llm_call_governance.before_call()
+        return None
+
+    def _require_coordination_token(self) -> CoordinationToken:
+        if not isinstance(self._coordination_token, CoordinationToken):
+            raise FrameworkBugError("Operation audit requires the executor's leader token")
+        return self._coordination_token
+
+    def _require_member_token(self) -> WorkerMembershipToken:
+        if not isinstance(self._member_token, WorkerMembershipToken):
+            raise FrameworkBugError("Row audit requires the executor's member token")
+        return self._member_token
+
+    def _require_work_item(self) -> TokenWorkItem:
+        if not isinstance(self._work_item, TokenWorkItem):
+            raise FrameworkBugError("Row audit requires the executor's claimed work item")
+        return self._work_item
 
     def _telemetry_token_id(self) -> str | None:
         """Get token_id for telemetry correlation when available."""
@@ -111,10 +145,12 @@ class AuditedClientBase:
             (not just this client)
         """
         if self._operation_id is not None:
-            return self._execution.allocate_operation_call_index(self._operation_id)
+            return self._execution.allocate_operation_call_index(self._operation_id, coordination_token=self._require_coordination_token())
         if self._state_id is None:
             raise FrameworkBugError("Audited client has neither state_id nor operation_id")
-        return self._execution.allocate_call_index(self._state_id)
+        return self._execution.allocate_call_index(
+            self._state_id, member_token=self._require_member_token(), work_item=self._require_work_item()
+        )
 
     def _record_call(
         self,
@@ -126,19 +162,23 @@ class AuditedClientBase:
         response_data: CallPayload | None = None,
         error: CallPayload | None = None,
         latency_ms: float | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        llm_call_attempt: str | None = None,
+        source_call_id: str | None = None,
     ) -> Call:
         """Record a call under the configured audit parent.
 
-        ``resolved_prompt_template_hash`` is the Phase 5b Task 9 cross-DB
+        ``approved_prompt_artifact_hash`` is the Phase 5b Task 9 cross-DB
         anchor: when an LLM transform is downstream of a resolved
         interpretation event, the runtime reads the SHA-256 from
-        ``options.resolved_prompt_template_hash`` on the node config and
+        ``options.approved_prompt_artifact_hash`` on the node config and
         forwards it here. ``None`` for non-LLM calls and for LLM transforms
         that never went through an interpretation surface.
         """
         if self._operation_id is not None:
-            return self._execution.record_operation_call(
+            call = self._execution.record_operation_call(
+                coordination_token=self._require_coordination_token(),
                 operation_id=self._operation_id,
                 call_index=call_index,
                 call_type=call_type,
@@ -147,11 +187,20 @@ class AuditedClientBase:
                 response_data=response_data,
                 error=error,
                 latency_ms=latency_ms,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+                token_usage=token_usage,
+                source_call_id=source_call_id,
             )
+            if call_type is CallType.LLM and self._llm_call_governance is not None and source_call_id is None:
+                if llm_call_attempt is None:
+                    raise FrameworkBugError("Governed LLM audit outcome has no admitted attempt")
+                self._llm_call_governance.after_call(llm_call_attempt, call.call_id)
+            return call
         if self._state_id is None:
             raise FrameworkBugError("Audited client has neither state_id nor operation_id")
-        return self._execution.record_call(
+        call = self._execution.record_call(
+            member_token=self._require_member_token(),
+            work_item=self._require_work_item(),
             state_id=self._state_id,
             call_index=call_index,
             call_type=call_type,
@@ -160,8 +209,15 @@ class AuditedClientBase:
             response_data=response_data,
             error=error,
             latency_ms=latency_ms,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+            token_usage=token_usage,
+            source_call_id=source_call_id,
         )
+        if call_type is CallType.LLM and self._llm_call_governance is not None and source_call_id is None:
+            if llm_call_attempt is None:
+                raise FrameworkBugError("Governed LLM audit outcome has no admitted attempt")
+            self._llm_call_governance.after_call(llm_call_attempt, call.call_id)
+        return call
 
     def _acquire_rate_limit(self) -> None:
         """Acquire rate limit permission before making external call.
@@ -175,7 +231,9 @@ class AuditedClientBase:
         if self._limiter is not None:
             self._limiter.acquire()
 
-    def update_call_context(self, state_id: str, token_id: str | None = None) -> None:
+    def update_call_context(
+        self, state_id: str, token_id: str | None = None, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem
+    ) -> None:
         """Update the per-call audit scoping on a shared client.
 
         Used by providers that reuse a single client instance across multiple
@@ -189,12 +247,18 @@ class AuditedClientBase:
         self._state_id = state_id
         self._operation_id = None
         self._token_id = token_id
+        self._member_token = member_token
+        self._work_item = work_item
+        self._coordination_token = None
 
-    def update_operation_call_context(self, operation_id: str) -> None:
+    def update_operation_call_context(self, operation_id: str, *, coordination_token: CoordinationToken) -> None:
         """Update the audit scoping to an operation parent."""
         self._state_id = None
         self._operation_id = operation_id
         self._token_id = None
+        self._coordination_token = coordination_token
+        self._member_token = None
+        self._work_item = None
 
     def close(self) -> None:
         """Release any resources held by the client.

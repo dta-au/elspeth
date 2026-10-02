@@ -10,6 +10,8 @@ import yaml
 from sqlalchemy import insert
 from typer.testing import CliRunner
 
+from tests.fixtures.audit_hashing import fake_sha256
+
 # Note: In Click 8.0+, mix_stderr is no longer a CliRunner parameter.
 # Stderr output is combined with stdout by default when using CliRunner.invoke()
 runner = CliRunner()
@@ -724,7 +726,7 @@ class TestJoinCommand:
 
         run_id = "run-terminal-001"
         settings_path = _make_minimal_settings(tmp_path)
-        _seed_running_run(tmp_path, run_id=run_id, config_hash="any", status="completed", live_leader=False)
+        _seed_running_run(tmp_path, run_id=run_id, config_hash=fake_sha256("any"), status="completed", live_leader=False)
 
         result = runner.invoke(
             app,
@@ -743,7 +745,7 @@ class TestJoinCommand:
         settings_path = _make_minimal_settings(tmp_path)
 
         # Seed with a deliberately wrong config_hash so the admission check refuses.
-        _seed_running_run(tmp_path, run_id=run_id, config_hash="totally-wrong-hash", live_leader=True)
+        _seed_running_run(tmp_path, run_id=run_id, config_hash=fake_sha256("totally-wrong-hash"), live_leader=True)
 
         result = runner.invoke(
             app,
@@ -980,7 +982,7 @@ class TestJoinCommand:
 
         with (
             patch("elspeth.plugins.infrastructure.runtime_factory.instantiate_plugins_from_config", return_value=plugins),
-            patch("elspeth.cli._build_resume_graphs", return_value=(object(), execution_graph)),
+            patch("elspeth.cli._build_resume_graph", return_value=execution_graph),
             patch("elspeth.engine.orchestrator.follower.build_follower_processor") as mock_build_follower,
         ):
             result = runner.invoke(
@@ -1033,7 +1035,7 @@ class TestJoinCommand:
 
         run_id = "run-json-banner-005"
         settings_path = _make_minimal_settings(tmp_path)
-        _seed_running_run(tmp_path, run_id=run_id, config_hash="any", live_leader=False)
+        _seed_running_run(tmp_path, run_id=run_id, config_hash=fake_sha256("any"), live_leader=False)
 
         banner = "Using database from settings.yaml"
 
@@ -1178,8 +1180,8 @@ class TestRunResumeEviction:
                 return_value=mock_resume_point,
             ),
             patch(
-                "elspeth.core.checkpoint.recovery.RecoveryManager.get_unprocessed_rows",
-                return_value=[],
+                "elspeth.core.checkpoint.recovery.RecoveryManager.count_active_scheduler_work",
+                return_value=0,
             ),
             patch(
                 "elspeth.core.checkpoint.recovery.RecoveryManager.count_blocked_barrier_items",

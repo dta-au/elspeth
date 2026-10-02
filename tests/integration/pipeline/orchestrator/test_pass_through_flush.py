@@ -14,9 +14,9 @@ removed the call site at ``processor.py:1082`` or ``:1192``; this
 integration test catches that — the cross-check must be reachable from the
 production execution path, not just callable in isolation.
 
-Per CLAUDE.md "Critical Implementation Patterns": integration tests MUST
-use ``ExecutionGraph.from_plugin_instances()`` rather than constructing
-graph state by hand.
+Per the ``engine-patterns-reference`` skill §Test Path Integrity: integration
+tests MUST use ``ExecutionGraph.from_plugin_instances()`` rather than
+constructing graph state by hand.
 """
 
 from __future__ import annotations

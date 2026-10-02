@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from tests.fixtures.factories import make_context
+from tests.fixtures.mock_audit import mock_item_audit_authority
 from tests.unit.plugins.transforms.aws.test_guardrails_client import FakeExecution
 
-from elspeth.contracts import Determinism
+from elspeth.contracts import Determinism, RunMode
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability, WebConfigAuthority
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.aws.bedrock_prompt_shield import AWSBedrockPromptShield
@@ -16,6 +18,7 @@ from elspeth.plugins.transforms.aws.guardrails_client import (
     GuardrailServiceError,
     GuardrailUsage,
 )
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.testing import make_pipeline_row
 
 
@@ -44,9 +47,38 @@ def _decision(*, detected: bool = False, intervened: bool = False) -> GuardrailD
 def _started_transform(config: dict[str, object] | None = None) -> tuple[AWSBedrockPromptShield, Any]:
     transform = AWSBedrockPromptShield(config or _config())
     transform._sdk_client = object()
-    context = make_context(landscape=FakeExecution())
+    context = make_context(landscape=FakeExecution(), **mock_item_audit_authority())
     transform.on_start(context)
     return transform, context
+
+
+def test_replay_start_constructs_no_bedrock_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden_build(_region: str) -> object:
+        raise AssertionError("Bedrock client constructed in replay")
+
+    monkeypatch.setattr("elspeth.plugins.transforms.aws._guardrail_transform.build_bedrock_runtime_client", forbidden_build)
+    transform = AWSBedrockPromptShield(_config())
+    ctx = SimpleNamespace(
+        landscape=object(),
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        run_mode=RunMode.REPLAY,
+    )
+    transform.on_start(ctx)
+    assert isinstance(transform._sdk_client, ReplayOnlySDK)
+    transform.close()
+
+
+def test_verify_start_defers_bedrock_client_until_admitted_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden_build(_region: str) -> object:
+        raise AssertionError("Bedrock client constructed before verify admission")
+
+    monkeypatch.setattr("elspeth.plugins.transforms.aws._guardrail_transform.build_bedrock_runtime_client", forbidden_build)
+    transform = AWSBedrockPromptShield(_config())
+    ctx = SimpleNamespace(landscape=object(), run_id="run-1", telemetry_emit=lambda _event: None, run_mode=RunMode.VERIFY)
+    transform.on_start(ctx)
+    assert isinstance(transform._sdk_client, DeferredAWSClient)
+    transform.close()
 
 
 def test_prompt_shield_config_requires_closed_private_binding() -> None:

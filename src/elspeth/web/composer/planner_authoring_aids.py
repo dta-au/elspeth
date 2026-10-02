@@ -60,7 +60,17 @@ from elspeth.plugins.transforms.llm.model_catalog import (
 )
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
+from elspeth.web.composer._schema_response_grammar import (
+    _JSON_SCHEMA_MAP_KEYS,
+    _JSON_SCHEMA_PROSE_KEYS,
+    _JSON_SCHEMA_SCALAR_KEYS,
+    _JSON_SCHEMA_SCHEMA_LIST_KEYS,
+    _JSON_SCHEMA_SINGLE_SCHEMA_KEYS,
+    SchemaKeywordInvalid,
+    validate_json_schema_scalar,
+)
 from elspeth.web.composer.plugin_policy_disclosure import ProhibitedPluginDisclosure, prohibited_plugin_section
+from elspeth.web.composer.tools._generation_schema_response import PluginSchemaSnapshot
 from elspeth.web.composer.tools.generation import get_expression_grammar
 
 # The registered shield-review constants are the contract's single source of
@@ -110,6 +120,7 @@ class _PluginDigestEntry(TypedDict):
     purpose_omitted: NotRequired[_OmittedPublicText]
     not_for_omitted: NotRequired[_OmittedPublicText]
     capability_tags: NotRequired[list[str]]
+    aggregation_output_modes: NotRequired[list[str]]
     profile_aliases: NotRequired[list[str]]
 
 
@@ -144,6 +155,7 @@ class _SchemaContractEvidenceEntry(TypedDict):
     schema_hash: str
     json_schema: dict[str, object]
     knob_schema: dict[str, object]
+    aggregation_output_modes: list[str]
 
 
 class _SchemaContractEvidenceOmission(TypedDict):
@@ -320,6 +332,7 @@ class _PlannerAuthoringAids(TypedDict, total=False):
     """Closed section vocabulary for the live planner-authoring payload."""
 
     purpose: Required[str]
+    user_disclosure: Required[_RulesAid]
     source_custody: _SourceCustodyAid
     fork_coalesce: _ForkCoalesceAid
     fork_row_union: _ForkRowUnionAid
@@ -426,6 +439,26 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     "downstream consumer sets input to the coalesce id. Do not author "
     "on_success on a coalesce unless it routes directly to a sink.",
     "Give each branch transform its own output field (an llm node's response_field) so the union merge carries every branch's result on one row.",
+    "A field shared by union branches must have one compatible actual type on every branch; any is a type, not a wildcard. A provable rewrite can retain that type; otherwise use a new field or declare compatible output types on the branches' last nodes. Declarations do not convert values.",
+    # Session 60ab6a67: this exemplar modelled llm branches with a user prompt
+    # only, and a planner asked for an A/B of two prompts cloned it key for
+    # key — both arms shipped with no system prompt.
+    "Every llm node carries BOTH prompt roles: options.system_prompt (the "
+    "model's role and task constraints) and options.prompt_template (the row "
+    "data and the requested reply). Validation rejects an llm node missing "
+    "either. When the user supplies only one role, keep theirs verbatim and "
+    "author the other from the task, or ask. Arms that differ only in role or "
+    "persona keep the SAME prompt_template and vary system_prompt — which is "
+    "itself a reason to fork: system_prompt is shared by every query on a "
+    "node, so a per-arm system prompt cannot be expressed as multi_query.",
+    "For a single-variable A/B comparison, vary only the requested experimental variable. "
+    "Keep model/profile, sampling settings, input rows, prompt_template, response_format, "
+    "and output_fields constraints equal unless one is the requested variable. Both arms "
+    "use the same enum values and extraction rules; output field names may differ to keep "
+    "results distinct. Structured output on one arm and free text on the other changes "
+    "the experiment. Compare the saved branch options before claiming only one variable differs.",
+    "Cleanup field_mapper mapping keys are existing INPUT fields; values are the desired OUTPUT names. "
+    "Its schema inherits arriving fields by their carried names and may also declare created target output types. Declare an arriving name as rows carry it (normally the normalized header or source mapping target); a target declaration does not convert its value.",
     "Do not author interpretation_requirements rows for llm_prompt_template "
     "or llm_model_choice — required LLM reviews auto-stage on every llm "
     "node. Author rows only for the planner-owned kinds (vague_term wired "
@@ -639,6 +672,37 @@ _WEB_SCRAPE_HTTP_IDENTITY_RULES: Final[tuple[str, ...]] = (
 )
 
 
+_USER_DISCLOSURE_RULES: Final[tuple[str, ...]] = (
+    "Separate observations, hypotheses, and verified causes when explaining a run. "
+    "Saved configuration does not prove the provider request bytes, and provider receipt does not prove model compliance. "
+    "If wire or execution evidence is unavailable, say which claim cannot be checked; do not conclude that one prompt "
+    "role overrode another or that a sampling setting caused an output without evidence that isolates that cause.",
+    "Preserve supplied literal prompts character-for-character, including capitalization, punctuation, and whitespace. "
+    "Do not silently normalize or improve them. If a required adaptation would change the supplied literal, "
+    "explain the needed change and obtain the user's decision before making it.",
+    "In your user-facing reply, answer the user's design questions as well as explaining what you authored, "
+    "including when the turn stops at review cards. Compare the actual saved prompt text with the user's words "
+    "before describing it: say 'verbatim' or 'exactly as written' only for unchanged text. Adding row variables, "
+    "rewording a question, or adding output instructions is an adaptation. Name those adaptations and distinguish "
+    "them from an unchanged system prompt; a review card does not replace this explanation.",
+    "Disclose each LLM node's selected profile alias, or its discovery-backed literal model. Name the concrete "
+    "model behind a profile only when the current session's served evidence supplies that binding; otherwise "
+    "say the profile is operator-managed and the concrete model is not exposed here. Never infer a model or "
+    "version from an alias. Operator custody exempts a profile from model-choice approval, not disclosure.",
+    "Explain the saved failure policies before asking the user to proceed. For on_error='discard', "
+    "on_validation_failure='discard', or on_write_failure='discard', identify which rows can be absent from "
+    "the output while their failure remains recorded in the audit trail. A require_all merge needs every "
+    "branch: if one branch is lost, that input has a recorded failed merge and no combined output row. "
+    "Do not promise all input rows reach the CSV when those policies permit missing rows. Describe a named "
+    "failure sink instead when that is the configured policy; do not claim quarantine exists when it does not.",
+    "If consistent presentation is needed, author explicit prompt instructions for plain text, Markdown, "
+    "hex-code case, and explanatory suffixes as appropriate to the user's request, and disclose additions "
+    "as your formatting choices on the review card. 'One short phrase' alone does not prohibit Markdown. "
+    "Prompt instructions are not a guarantee of exact formatting: use a supported structured contract when "
+    "exact values are required. Do not silently rewrite approved prompts or normalize audited responses.",
+)
+
+
 def _model_custody_rules(profile_alias: str | None) -> list[str]:
     """Model-provisioning custody with the sanctioned alternative rendered live.
 
@@ -705,7 +769,7 @@ _WEB_MULTI_QUERY_RETRY_RULE: Final[str] = (
 # (correctly) rejects as an uncontrolled write path. The two variants are
 # module constants so the gating is testable without asserting prose.
 _LLM_ON_ERROR_QUARANTINE_RULE: Final[str] = (
-    "on_error='discard' silently drops failed rows. When the user needs "
+    "on_error='discard' removes failed rows from output while retaining their audit outcomes. Disclose this choice. When the user needs "
     "failures retained or inspected, route on_error to a dedicated "
     "quarantine sink instead of discard."
 )
@@ -751,20 +815,21 @@ def _llm_on_error_rules(*, output_control: str | None) -> list[str]:
 
 
 _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
-    "An llm node writes the model's reply as ONE raw string into the field "
-    "named by options.response_field (default llm_response). Prompt text that "
-    "asks for JSON or named keys does NOT create row fields — nothing is "
-    "flattened out of the reply.",
-    "Downstream nodes may require only that response field (plus fields "
-    "passed through from the node's input). To obtain several named result "
-    "fields from one llm node, use one of the TWO blessed shapes: the "
-    "plugin's multi_query mechanism (its schema declares the per-query "
-    "output fields), or — in single-prompt mode — the top-level "
-    "response_format + output_fields pair, whose extracted fields land "
+    "In single-prompt mode an llm node writes the raw reply to options.response_field "
+    "(default llm_response). Asking for JSON or named keys in free text alone does NOT "
+    "create row fields. Configured output_fields extracts and types the named fields.",
+    "options.required_input_fields names upstream columns and bounds the row visible to templates. "
+    "Never require this node's generated outputs as upstream inputs. The plugin derives generated "
+    "field names and types from response_field and output_fields. options.schema.fields can declare "
+    "output types (ADR-050); schema alone does not extract fields from a reply. Upstream pass-through "
+    "guarantees come from the upstream producer.",
+    "Downstream nodes may require the actual generated fields and fields passed through from upstream. "
+    "To obtain named typed results, use the plugin's queries mechanism with per-query output_fields, "
+    "or — in single-prompt mode — the top-level response_format + output_fields pair, whose extracted fields land "
     "UNPREFIXED: each entry becomes a row field named exactly its suffix.",
-    "If a prompt asks for structured JSON anyway, the JSON arrives as one "
-    "string in the response field; wire a schema-proven parser transform "
-    "when downstream nodes need its keys as row fields.",
+    "Preserve downstream requirements for fields those consumers use. Do not erase them or widen "
+    "their schema to any/flexible to silence a contradiction in the plugin's output contract; "
+    "report that contradiction with the configured output_fields and the exact downstream names.",
     # Session 891b7b1e: a free-text 'reply with only the category word'
     # prompt fed reference_join key_field with on_miss:fail + on_error:
     # discard — one 'Billing.' or lowercase reply silently drops the row.
@@ -782,8 +847,8 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     # Session 891b7b1e: hitting an Any/str edge mismatch, the planner
     # widened field_mapper AND the sink's fixed schema to 'any' instead of
     # narrowing once at a type_coerce.
-    "A producer's any-typed field (json_explode, blob_json_expand, "
-    "value_transform outputs) is narrowed by inserting a type_coerce "
+    "A value_transform target has its authored schema.fields output type, or the type its expression proves over declared inputs; an unresolved result is any. "
+    "A json_explode or blob_json_expand element is any: narrow it by inserting a type_coerce "
     "transform (options.conversions: [{field, to}]) with its defined "
     "per-conversion error path — never by widening every downstream "
     "consumer's declared type to 'any', which erases the contract the "
@@ -796,8 +861,9 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     '{"field_a": "field_a", "field_b": "field_b"} — a query without '
     "input_fields is rejected.",
     "The per-query prompt key is 'template' (a Jinja2 override), NOT "
-    "prompt_template. The top-level options.prompt_template is STILL "
-    "required and is the fallback for any query that omits template.",
+    "prompt_template. The top-level options.prompt_template is the fallback for queries without "
+    "a template; it is optional when every query supplies its own template. Keep BOTH prompt roles: "
+    "one shared system_prompt plus each query's effective user template.",
     # run-3 E2: the output contract — each query KEY prefixes its output row
     # fields, so downstream nodes can require them by exact name.
     "Each query key names its output row fields by PREFIX: the raw reply "
@@ -815,17 +881,25 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "max_tokens). In mapping form the mapping key supplies the query name; "
     "in LIST form each entry additionally REQUIRES its own name key. There "
     "is NO per-query response_field or schema — output naming comes "
-    "exclusively from the query-key prefix, and the node-level schema block "
-    "declares any guaranteed prefixed fields.",
+    "from the query-key prefix and output_fields suffix. Node-level schema output declarations use "
+    "the exact generated names and must admit the configured output_fields types.",
+    "For example, two queries good_colour_pair and approximate_hex can each map input_fields "
+    "{shade: colour} and declare output_fields [{suffix: answer, type: string}]. The LLM input "
+    "required_input_fields is [colour]; good_colour_pair_answer and approximate_hex_answer are generated "
+    "outputs that downstream contracts may require, never this node's upstream input requirements.",
     # run-4 P4: no interpretation delivery exists for per-query templates.
     "NEVER put {{interpretation:...}} tokens inside a queries.*.template — "
     "review resolution rewrites only the node-level prompt_template/"
     "prompt_template_parts, so a per-query token survives resolution and is "
     "rejected at the compose gate. Reviewed slots belong in the node-level "
-    "template; per-query templates reference plain query variables only.",
+    "template. A per-query template sees only 'row' and 'lookup': reference "
+    "each of its input_fields variables as {{ row.<variable> }} (a source column is {{ row.source_row.<column> }} only when the node declares it in required_input_fields; lookups are "
+    "{{ lookup.<key> }}); a bare {{ <variable> }} is rejected by the plugin "
+    "schema as an undefined name (session 94f6f00c: the planner's first "
+    "set_pipeline followed the old bare-name teaching and was rejected).",
     "Sink hygiene: the auto-appended <response_field>_usage / _model operational row "
     "fields ride the row automatically — do not map or require them into "
-    "sinks unless the user asked for token/model reporting.",
+    "sinks unless the user asked for token/model reporting. If <response_field>_usage is declared, its type is any.",
     # elspeth-15b400881f: the live planner named the three business columns in
     # its reply but left the CSV sink observed, so the first accepted row — not
     # reviewed configuration — chose the persisted header.  Keep the ownership
@@ -834,7 +908,7 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     # sink's fields are a consumer/output-shape declaration rather than a
     # producer guarantee.
     "When the user-facing output has known named business columns, declare "
-    "them in sink schema.fields with their types; do NOT leave that sink in "
+    "them in sink schema.fields with their types and carried names; do NOT leave that sink in "
     "mode: observed after promising those columns, because an observed CSV "
     "sink locks its header from the first accepted row. If the user asked for "
     "exactly those columns, put a schema-proven select-only projection "
@@ -857,6 +931,16 @@ def _llm_output_contract_rules(*, output_control: str | None) -> list[str]:
 
 
 _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
+    "On a surface advertising request_interpretation_review, use currently pending review sites "
+    "assigned to the planner in the review ownership matrix. For kinds backed by persisted requirements, use current state or the latest "
+    "mutation echo, not historical tool calls. If the matching requirement is already resolved, skip it; "
+    "do not re-stage unchanged content to obtain another approval. After a missing-pending-site rejection, "
+    "reconcile current status before retrying; absence alone does not authorize inventing a review row.",
+    "source_data_contract is a computed review site: current missing source fields establish the demand, "
+    "with no persisted interpretation_requirements row needed before the call. For a source the composer "
+    "cannot preflight, request that review using the source target and user_term='source_data_contract'; "
+    "omit llm_draft so the server computes it. Do not author a row or field list, and do not call it when "
+    "there is no current missing-field demand or the source content is composer-authored.",
     "pipeline_decision user_term values are a CLOSED registry — choose ONLY "
     "from registered_pipeline_decision_user_terms above. A minted term is "
     "unresolvable and poisons its review card.",
@@ -1081,102 +1165,6 @@ _SCHEMA_EVIDENCE_MAX_ENTRIES: Final[int] = 8
 _SCHEMA_EVIDENCE_MAX_OMISSIONS: Final[int] = 16
 _SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES: Final[int] = 96 * 1024
 
-_JSON_SCHEMA_PROSE_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "$comment",
-        "title",
-        "description",
-        "examples",
-        "example",
-        "composer_description",
-        "composer_placeholder",
-        # UI-disclosure hint (elspeth-9cca900d41): presentational, not
-        # audit-bearing (mirrors knob_schema._attach_tier's own docstring).
-        # The knob_schema projection already treats "tier" as prose
-        # (_contract_knob_schema's own prose_keys); this is the raw
-        # json_schema side of the same fact, since pydantic bakes
-        # json_schema_extra={"composer_tier": ...} onto the property's
-        # generated schema the same way it does composer_description.
-        "composer_tier",
-    }
-)
-_JSON_SCHEMA_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "$schema",
-        "$id",
-        "$ref",
-        "$anchor",
-        "$dynamicRef",
-        "$dynamicAnchor",
-        "$vocabulary",
-        "type",
-        "const",
-        "enum",
-        "default",
-        "pattern",
-        "format",
-        "contentEncoding",
-        "contentMediaType",
-        "deprecated",
-        "readOnly",
-        "writeOnly",
-        "nullable",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "multipleOf",
-        "minLength",
-        "maxLength",
-        "minItems",
-        "maxItems",
-        "uniqueItems",
-        "minProperties",
-        "maxProperties",
-        "minContains",
-        "maxContains",
-    }
-)
-_JSON_SCHEMA_MAP_KEYS: Final[frozenset[str]] = frozenset({"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"})
-_JSON_SCHEMA_SINGLE_SCHEMA_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "items",
-        "contains",
-        "not",
-        "if",
-        "then",
-        "else",
-        "propertyNames",
-        "additionalProperties",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-        "contentSchema",
-    }
-)
-_JSON_SCHEMA_SCHEMA_LIST_KEYS: Final[frozenset[str]] = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
-_JSON_SCHEMA_STRING_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "$schema",
-        "$id",
-        "$ref",
-        "$anchor",
-        "$dynamicRef",
-        "$dynamicAnchor",
-        "pattern",
-        "format",
-        "contentEncoding",
-        "contentMediaType",
-    }
-)
-_JSON_SCHEMA_BOOLEAN_SCALAR_KEYS: Final[frozenset[str]] = frozenset({"deprecated", "readOnly", "writeOnly", "nullable", "uniqueItems"})
-_JSON_SCHEMA_NUMERIC_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
-    {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"}
-)
-_JSON_SCHEMA_NONNEGATIVE_INTEGER_KEYS: Final[frozenset[str]] = frozenset(
-    {"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "minContains", "maxContains"}
-)
-_JSON_SCHEMA_TYPES: Final[frozenset[str]] = frozenset({"null", "boolean", "object", "array", "number", "string", "integer"})
-
 
 class _SchemaContractProjectionUnsupported(ValueError):
     """A schema carries semantics this bounded projection cannot preserve."""
@@ -1197,45 +1185,20 @@ _DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES: Final[int] = 1024
 # aid carries identifier lists only for the providers an llm node can actually
 # declare: the whole litellm inventory canonicalizes to ~57 KiB, which costs
 # more across a multi-turn plan than the discovery turns it would save. The
-# ceiling is sized for the live OpenRouter catalog (measured 2026-08-18: 9.6
-# KiB against the bundled slice, 20.5 KiB against a 330-model live snapshot).
-_MODEL_CATALOG_MAX_CANONICAL_BYTES: Final[int] = 32 * 1024
+# initial-scaffold gate leaves 10,516 bytes for this aid on the measured
+# LiteLLM 1.102 request (119,398 total cap minus 108,882 other bytes). Allocate
+# 8 KiB to the catalog itself, leaving room for its guidance/wrapper. Catalog
+# growth must defer complete provider lists, not grow every planner request.
+_MODEL_CATALOG_MAX_CANONICAL_BYTES: Final[int] = 8 * 1024
 _EXPRESSION_GRAMMAR_MAX_CANONICAL_BYTES: Final[int] = 8 * 1024
 
 
 def _contract_json_schema_scalar(key: str, value: object) -> object:
-    """Validate the closed scalar-keyword vocabulary before copying it."""
-    if key in _JSON_SCHEMA_STRING_SCALAR_KEYS:
-        if type(value) is not str:
-            raise _SchemaContractProjectionUnsupported
-    elif key in _JSON_SCHEMA_BOOLEAN_SCALAR_KEYS:
-        if type(value) is not bool:
-            raise _SchemaContractProjectionUnsupported
-    elif key in _JSON_SCHEMA_NUMERIC_SCALAR_KEYS:
-        if type(value) not in {int, float} or (type(value) is float and not math.isfinite(value)):
-            raise _SchemaContractProjectionUnsupported
-        numeric_value = cast(int | float, value)
-        if key == "multipleOf" and numeric_value <= 0:
-            raise _SchemaContractProjectionUnsupported
-    elif key in _JSON_SCHEMA_NONNEGATIVE_INTEGER_KEYS:
-        if type(value) is not int or value < 0:
-            raise _SchemaContractProjectionUnsupported
-    elif key == "type":
-        if type(value) is str:
-            if value not in _JSON_SCHEMA_TYPES:
-                raise _SchemaContractProjectionUnsupported
-        elif type(value) is list:
-            if not value or any(type(item) is not str or item not in _JSON_SCHEMA_TYPES for item in value) or len(set(value)) != len(value):
-                raise _SchemaContractProjectionUnsupported
-        else:
-            raise _SchemaContractProjectionUnsupported
-    elif key == "enum":
-        if type(value) is not list or not value:
-            raise _SchemaContractProjectionUnsupported
-    elif key == "$vocabulary" and (
-        type(value) is not dict or any(type(name) is not str or type(required) is not bool for name, required in value.items())
-    ):
-        raise _SchemaContractProjectionUnsupported
+    """Use the neutral keyword domains, retaining policy refusal identity."""
+    try:
+        validate_json_schema_scalar(key, value)
+    except SchemaKeywordInvalid as exc:
+        raise _SchemaContractProjectionUnsupported from exc
     return deepcopy(value)
 
 
@@ -1280,6 +1243,7 @@ class PlannerPluginContract:
     json_schema: Mapping[str, object]
     knob_schema: Mapping[str, object]
     composer_hints: tuple[str, ...]
+    aggregation_output_modes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         freeze_fields(self, "json_schema", "knob_schema", "composer_hints")
@@ -1291,6 +1255,7 @@ class PlannerPluginContract:
             "json_schema": deep_thaw(self.json_schema),
             "knob_schema": deep_thaw(self.knob_schema),
             "composer_hints": list(self.composer_hints),
+            "aggregation_output_modes": list(self.aggregation_output_modes),
         }
 
 
@@ -1298,18 +1263,47 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
     """Project one admitted schema into the planner's bounded JIT contract."""
     if type(schema) is not PluginSchemaInfo:
         raise TypeError("schema must be an admitted PluginSchemaInfo")
-    _assert_projection_input_bounds(schema.json_schema)
-    _assert_projection_input_bounds(schema.knob_schema)
-    _assert_projection_input_bounds(schema.composer_hints)
-    json_schema = _contract_json_schema(schema.json_schema)
-    knob_schema = _contract_knob_schema(schema.knob_schema)
+    return _planner_plugin_contract(
+        schema.plugin_type, schema.name, schema.json_schema, schema.knob_schema, schema.composer_hints, schema.aggregation_output_modes
+    )
+
+
+def planner_plugin_contract_from_snapshot(schema: PluginSchemaSnapshot) -> PlannerPluginContract:
+    """Project canonical admitted schema leaves without reopening producer data."""
+    if type(schema) is not PluginSchemaSnapshot:
+        raise TypeError("schema must be an admitted PluginSchemaSnapshot")
+    return _planner_plugin_contract(
+        schema.plugin_type,
+        schema.name,
+        schema.json_schema.to_wire(),
+        schema.knob_schema.to_wire(),
+        schema.composer_hints,
+        schema.aggregation_output_modes,
+    )
+
+
+def _planner_plugin_contract(
+    plugin_type: PluginKind,
+    name: str,
+    raw_json_schema: Mapping[str, object],
+    raw_knob_schema: Mapping[str, object],
+    composer_hints: tuple[str, ...],
+    aggregation_output_modes: tuple[str, ...] = (),
+) -> PlannerPluginContract:
+    _assert_projection_input_bounds(raw_json_schema)
+    _assert_projection_input_bounds(raw_knob_schema)
+    _assert_projection_input_bounds(composer_hints)
+    _assert_projection_input_bounds(aggregation_output_modes)
+    json_schema = _contract_json_schema(raw_json_schema)
+    knob_schema = _contract_knob_schema(raw_knob_schema)
     if type(json_schema) is bool:
         raise _SchemaContractProjectionUnsupported
     projected = {
-        "plugin_id": f"{schema.plugin_type}/{schema.name}",
+        "plugin_id": f"{plugin_type}/{name}",
         "json_schema": json_schema,
         "knob_schema": knob_schema,
-        "composer_hints": list(schema.composer_hints),
+        "composer_hints": list(composer_hints),
+        "aggregation_output_modes": list(aggregation_output_modes),
     }
     try:
         projected_size = len(canonical_json(projected).encode("utf-8"))
@@ -1317,13 +1311,14 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
         raise _SchemaContractProjectionUnsupported from exc
     if projected_size > _PLANNER_CONTRACT_MAX_CANONICAL_BYTES:
         raise _SchemaContractProjectionUnsupported
-    contract_shape = {"json_schema": json_schema, "knob_schema": knob_schema}
+    contract_shape = {"json_schema": json_schema, "knob_schema": knob_schema, "aggregation_output_modes": list(aggregation_output_modes)}
     return PlannerPluginContract(
-        plugin_id=f"{schema.plugin_type}/{schema.name}",
+        plugin_id=f"{plugin_type}/{name}",
         schema_hash=stable_hash(contract_shape),
         json_schema=deep_freeze(json_schema),
         knob_schema=deep_freeze(knob_schema),
-        composer_hints=tuple(schema.composer_hints),
+        composer_hints=tuple(composer_hints),
+        aggregation_output_modes=tuple(aggregation_output_modes),
     )
 
 
@@ -1526,9 +1521,7 @@ def _collapse_uniform_variant_fields(fields: list[dict[str, object]]) -> list[di
 
     ``web/catalog/knob_schema`` lowers a discriminated union to a FLAT form by
     re-emitting every shared knob once per variant, separated only by
-    ``visible_when`` (``knob_schema.py:522``). That shape is what the guided
-    form renderer needs — ``SchemaFormTurn.tsx`` compares one field to one
-    scalar, so its predicate grammar has no set operator — but on the planner
+    ``visible_when`` (``knob_schema.py:522``). On the planner
     contract it is repetition the model gains nothing from: the ``llm``
     transform lowers to 114 fields carrying 36 distinct bodies, 39,093 bytes of
     a 49,152-byte budget the whole selection shares (elspeth-623c69c59f).
@@ -1710,6 +1703,7 @@ def build_schema_contract_evidence(
             "schema_hash": projected_contract.schema_hash,
             "json_schema": json_schema,
             "knob_schema": knob_schema,
+            "aggregation_output_modes": list(projected_contract.aggregation_output_modes),
         }
         prospective = _schema_evidence_envelope(
             policy_hash=snapshot.policy_hash,
@@ -1791,6 +1785,8 @@ def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
             entry["not_for"] = plugin.usage_when_not_to_use
         if plugin.capability_tags:
             entry["capability_tags"] = list(plugin.capability_tags)
+        if plugin.aggregation_output_modes:
+            entry["aggregation_output_modes"] = list(plugin.aggregation_output_modes)
         entries.append(entry)
     return entries
 
@@ -1948,7 +1944,8 @@ _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
     "the bounded contract for a chosen plugin. An entry's not_for is that plugin's own stated "
     "prohibition and is binding on selection: when the value you intend to "
     "write matches it, choose a different plugin or reshape the value upstream "
-    "first. capability_tags is the plugin's declared capability vocabulary. "
+    "first. capability_tags is the plugin's declared capability vocabulary; aggregation_output_modes lists class-derived batch admission modes. "
+    "A config_fields summary may show a named enum alias as object; use get_plugin_schema's current enum values for the chosen plugin. "
     "The budget block reports canonical_bytes_used and omitted_public_text_count. "
     "When public purpose or prohibition prose is omitted, its whole sha256 and details_via marker "
     "replace it; follow details_via before selecting that plugin because omitted prohibition text is still binding. "
@@ -2059,44 +2056,41 @@ def planner_model_catalog() -> _ModelCatalog:
             "omitted_provider_count": 0,
         },
     }
-    if _model_catalog_size(catalog) > _MODEL_CATALOG_MAX_CANONICAL_BYTES:
-        # Whole lists or none. A sliced identifier list reads as a complete
-        # one, and binding a slug this deployment does not serve is the exact
-        # rejection the carried catalog exists to prevent — so an oversized
-        # catalog falls back to the counts plus a marker per dropped provider
-        # and the listing tool stays the way to reach the identifiers.
-        catalog["models_omitted"] = [
+    # Defer the largest whole lists first so growth in one provider does not
+    # erase smaller providers' usable inventory. Never carry a sliced list:
+    # the exact complete inventory remains reachable through list_models.
+    for provider, identifiers in sorted(
+        models_by_provider.items(), key=lambda item: (-len(canonical_json(item[1]).encode("utf-8")), item[0])
+    ):
+        if _model_catalog_size(catalog) <= _MODEL_CATALOG_MAX_CANONICAL_BYTES:
+            break
+        catalog["models_omitted"].append(
             {
                 "provider": provider,
                 "model_count": len(identifiers),
                 "details_via": _MODEL_CATALOG_DETAILS_VIA,
             }
-            for provider, identifiers in sorted(models_by_provider.items())
-        ]
+        )
+        del catalog["models_by_provider"][provider]
         catalog["budget"]["omitted_provider_count"] = len(catalog["models_omitted"])
-        catalog["models_by_provider"] = {}
-        _model_catalog_size(catalog)
+    catalog["models_omitted"].sort(key=lambda omission: omission["provider"])
     if _model_catalog_size(catalog) > _MODEL_CATALOG_MAX_CANONICAL_BYTES:
         raise RuntimeError("model_catalog_budget_invariant")
     return catalog
 
 
 _MODEL_CATALOG_GUIDANCE: Final[str] = (
-    "This model catalog is rendered at prompt build from the same catalog the "
-    "list_models tool serves and is current for this deployment. A slug in "
-    "models_by_provider is served: bind it directly, with no discovery call. "
-    "provider_model_counts and total_models are every provider the catalog "
-    "knows, so a provider absent from models_by_provider is still a real "
-    "provider — its identifiers were not carried. authorable_providers is the "
-    "closed set an llm node's provider option may name; identifiers are "
-    "carried only for those, because a slug from any other provider cannot be "
-    "authored here. A provider named in authorable_providers with no "
-    "provider_model_counts entry has no catalogued identifiers on this "
-    "deployment — those endpoints are operator-configured. Each models_omitted "
-    "entry names a provider whose identifiers exceeded the byte budget and "
-    "carries its model_count and a details_via marker; follow the marker "
-    "before binding a slug for that provider. Never invent a slug and never "
-    "recall one from training: an unserved slug is rejected at preflight."
+    "Current at prompt build, this is the catalog list_models serves. Bind a "
+    "served models_by_provider slug directly, with no discovery call. "
+    "provider_model_counts and total_models include every known provider; "
+    "absence from models_by_provider means identifiers were not carried. "
+    "authorable_providers is the closed llm provider-option set; only its "
+    "identifiers are carried or authorable. An authorable provider absent from "
+    "provider_model_counts has no catalogued identifiers: its endpoints are "
+    "operator-configured. Each models_omitted entry names an over-budget "
+    "provider with model_count and details_via; follow that marker before "
+    "binding its slug. Never invent a slug or recall one from training: "
+    "preflight rejects an unserved slug."
 )
 
 _EXPRESSION_GRAMMAR_GUIDANCE: Final[str] = (
@@ -2310,6 +2304,7 @@ def fork_coalesce_exemplar_args(
         node_id: str,
         branch: str,
         response_field: str,
+        system_prompt: str,
         question: str,
         *,
         prompt_template_parts: list[dict[str, Any]] | None = None,
@@ -2317,6 +2312,12 @@ def fork_coalesce_exemplar_args(
     ) -> _ExemplarNode:
         options: dict[str, Any] = {
             "profile": profile_alias,
+            # BOTH prompt roles, on every llm node. This exemplar once modelled
+            # a user prompt only; session 60ab6a67 (an A/B of two prompts)
+            # cloned it key for key and shipped both arms with no system
+            # prompt. The role and reply constraints live here; the row data
+            # and the question live in prompt_template.
+            "system_prompt": system_prompt,
             "prompt_template": question,
             "required_input_fields": ["ticket_id", "body"],
             "response_field": response_field,
@@ -2356,12 +2357,14 @@ def fork_coalesce_exemplar_args(
                 "assess_sentiment",
                 "branch_a",
                 "sentiment",
+                "You assess the sentiment of customer support tickets. Reply with one short phrase and nothing else.",
                 "What is the sentiment of support ticket {{ row.ticket_id }}: {{ row.body }}? Reply with one short phrase.",
             ),
             _branch_llm(
                 "assess_urgency",
                 "branch_b",
                 "urgency",
+                "You triage customer support tickets by urgency. Reply with the single category word and nothing else.",
                 # Authored CLASSIFICATION semantics: the category set is the
                 # planner's invention, so the vague_term review is staged and
                 # wired below — the review-staging pattern in miniature.
@@ -2765,6 +2768,7 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
     summaries = _plugin_summaries(catalog)
     visible = _visible_plugin_names(catalog, summaries)
     aids: _PlannerAuthoringAids = {
+        "user_disclosure": {"rules": list(_USER_DISCLOSURE_RULES)},
         "purpose": (
             "Server-rendered worked exemplars and catalog digest from the live "
             "policy-visible catalog. These shapes validate against the current deployment. "

@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import Determinism, TransformResult
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
@@ -32,6 +33,7 @@ from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
+from tests.fixtures.mock_audit import mock_audit_authority
 
 # A valid OpenRouter catalog model id. The litellm-derived catalog dropped the
 # retired ``anthropic/claude-3-opus``; OpenRouterConfig now rejects models not
@@ -453,6 +455,9 @@ class TestSingleQueryProcessing:
             rate_limit_registry=None,
             shutdown_event=None,
             payload_store=None,
+            llm_call_governance=None,
+            call_mode_session=None,
+            run_mode=RunMode.LIVE,
         )
         transform.on_start(ctx)
 
@@ -514,6 +519,7 @@ class TestRowProcessingWithPipelining:
         """Create plugin context with landscape, state_id, and token."""
         token = make_token("row-1")
         return make_context(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             state_id="test-state-id",
             token=token,
@@ -867,6 +873,7 @@ class TestMultiRowPipelining:
             for i, row in enumerate(rows):
                 token = make_token(f"row-{i}")
                 ctx = make_context(
+                    **mock_audit_authority("test-run"),
                     run_id="test-run",
                     state_id=f"state-{i}",
                     token=token,
@@ -903,7 +910,7 @@ class TestMultiRowPipelining:
     def test_connect_output_cannot_be_called_twice(self, collector: CollectorOutputPort, mock_recorder: _ExecutionRecorderDouble) -> None:
         """connect_output() raises if called more than once."""
         transform = LLMTransform(make_config())
-        init_ctx = make_context(run_id="test", landscape=mock_recorder)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=mock_recorder)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
@@ -937,6 +944,7 @@ class TestHTTPSpecificBehavior:
         """Create plugin context with landscape, state_id, and token."""
         token = make_token("row-1")
         return make_context(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             state_id="test-state-id",
             token=token,
@@ -1093,7 +1101,8 @@ class TestHTTPSpecificBehavior:
         assert result.reason is not None
         assert result.reason["reason"] == "missing_output_field"
         assert result.reason["field"] == "rationale"
-        assert "score" in result.reason["available_fields"]
+        # The response's own keys are external content: never listed (C3).
+        assert "available_fields" not in result.reason
 
     def test_handles_connection_error(
         self,
@@ -1174,6 +1183,7 @@ class TestResourceCleanup:
         assert transform._recorder is None
 
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             state_id="test-state-id",
             landscape=mock_recorder,

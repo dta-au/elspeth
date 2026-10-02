@@ -15,12 +15,16 @@ must exist in the DAG builder.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.config import SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.dag.wiring import WiredTransform
@@ -34,6 +38,7 @@ class MockSource:
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_validation_failure = "discard"
     on_success = "output"
@@ -41,6 +46,11 @@ class MockSource:
 
 class MockSink:
     """Minimal sink implementing enough of SinkProtocol for the builder."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
 
     name = "mock_sink"
     input_schema = None
@@ -58,6 +68,23 @@ _SENTINEL = object()
 class MockFieldAddingTransform:
     """Mock transform with configurable output fields and required inputs."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     input_schema = None
     output_schema = None
     on_error: str | None = None
@@ -71,6 +98,8 @@ class MockFieldAddingTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(
         self,

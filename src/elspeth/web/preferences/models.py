@@ -19,22 +19,8 @@ string→datetime coercion entirely), which is too aggressive for a
 Tier-3 boundary whose contract is "validate, coerce where the standard
 wire format permits, never fabricate".
 
-The Literal ``ComposerMode`` still rejects ``"kiosk"`` and any other
-out-of-set value on both models, and ``extra="forbid"`` rejects typos.
-
-The Literal ``ComposerMode`` is the single source of truth for the
-permitted-values set. It is paired with:
-  - the DB-level CHECK constraint on ``user_preferences_table``
-  - the Tier-1 read guard in ``PreferencesService._row_to_prefs``
-  - the ``MODES`` Record in the frontend's
-    ``api/preferencesDecoder.ts``, which is keyed by the ``ComposerMode``
-    TS union so a frontend-side addition is a compile error there
-
-Extending the set requires updating all four call sites in lockstep —
-the Literal here, the CHECK in ``sessions/models.py``, the service read
-guard, and the decoder's Record. Only the first three are Python; the
-decoder is the cross-language one, and adding a value here without it
-makes the decoder reject a now-valid payload.
+The Composer has one authoring surface, freeform, so preferences carry no
+mode selector. ``extra="forbid"`` rejects retired mode-setting requests.
 
 Separately from the permitted-VALUES covenant above, the FIELD SET of
 ``ComposerPreferences`` is itself a closed cross-language contract. The
@@ -52,8 +38,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-ComposerMode = Literal["guided", "freeform"]
-
 # First-run tutorial resume stage (elspeth-918f4434b3). Mirrors the frontend
 # ``TutorialStep`` union (tutorialMachine.ts) minus ``"welcome"`` — the
 # Welcome bookend is never persisted (nothing has started; ``None`` is the
@@ -62,10 +46,10 @@ ComposerMode = Literal["guided", "freeform"]
 # ``sessions/models.py``, the Tier-1 read guard in
 # ``PreferencesService._row_to_prefs``, and the ``STAGES`` Record in the
 # frontend's ``api/preferencesDecoder.ts`` in lockstep — same rule, and the
-# same four sites, as ``ComposerMode`` above. The decoder fails closed on an
+# same four sites. The decoder fails closed on an
 # unlisted stage, so adding a value here without it makes the frontend reject
 # a payload the server considers valid.
-TutorialStage = Literal["guided", "run", "audit", "graduation"]
+TutorialStage = Literal["build", "run", "audit", "graduation"]
 
 
 class ComposerPreferences(BaseModel):
@@ -75,15 +59,14 @@ class ComposerPreferences(BaseModel):
     user, the response payload represents the in-server *default* — there
     has been no write event to associate a timestamp with, and fabricating
     ``self._now()`` here would put a value in the audit-visible field that
-    the system never actually wrote (CLAUDE.md fabrication test). The
-    no-row GET path and the empty-PATCH-on-no-row path both return
-    ``updated_at=None``; every other response returns the real write time.
+    the system never actually wrote: absence is evidence, and a fabricated
+    timestamp is indistinguishable from a recorded one. The no-row GET path
+    and the empty-PATCH-on-no-row path both return ``updated_at=None``;
+    every other response returns the real write time.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    default_mode: ComposerMode
-    banner_dismissed_at: datetime | None
     freeform_intro_dismissed_at: datetime | None
     tutorial_completed_at: datetime | None
     # In-progress tutorial resume state. All four are NULL when no tutorial
@@ -103,28 +86,19 @@ class ComposerPreferences(BaseModel):
 class UpdateComposerPreferencesRequest(BaseModel):
     """Partial-update payload for PATCH.
 
-    Every field is independently optional; the service writes only the
+    Fields are optional except for the coupled completion intent;
+    the service writes only the
     fields the caller actually set. An empty PATCH is a no-op (the
     request succeeds; ``updated_at`` is bumped if any row already
     exists; if no row exists, none is created — see PreferencesService
     Panel C2 guard for the no-insert contract).
 
-    ``banner_dismissed_at`` semantics:
-
-      - Field absent from JSON → unchanged.
-      - JSON ``null`` → clear the banner dismissal (the banner re-shows
-        on next session — there is no separate "un-dismiss" RPC).
-      - ISO-8601 datetime string → set to that value (records the
-        dismissal time).
-
-    This field uses ``model_fields_set`` in the service so the
-    re-show affordance can distinguish "not mentioned" from "clear it".
-
     ``tutorial_completed_at`` semantics:
 
       - Field absent from JSON → unchanged.
       - JSON ``null`` → clear/reset the tutorial completion gate.
-      - ISO-8601 datetime string → set to that value.
+      - ISO-8601 datetime string → set to that value; requires an explicit
+        ``tutorial_completed_via``.
 
     This field uses ``model_fields_set`` in the service so the reset
     affordance can distinguish "not mentioned" from "clear it".
@@ -134,16 +108,14 @@ class UpdateComposerPreferencesRequest(BaseModel):
     absent-vs-explicit-null discrimination via ``model_fields_set``. They
     interact with ``tutorial_completed_at`` through the service's
     completion-clears-progress rule: a PATCH that sets OR clears
-    ``tutorial_completed_at`` also clears any resume fields it does not
-    itself supply, because completing (or resetting for a retake — the e2e
+    ``tutorial_completed_at`` clears resume state and rejects populated
+    resume fields in the same request, because completing (or resetting for a retake — the e2e
     harness recipe) terminates any in-progress tutorial. See
     ``PreferencesService.update_composer_preferences``.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    default_mode: ComposerMode | None = None
-    banner_dismissed_at: datetime | None = None
     freeform_intro_dismissed_at: datetime | None = None
     tutorial_completed_at: datetime | None = None
     tutorial_stage: TutorialStage | None = None
@@ -151,16 +123,19 @@ class UpdateComposerPreferencesRequest(BaseModel):
     tutorial_run_id: str | None = None
     tutorial_source_data_hash: str | None = None
     show_advanced: bool | None = None
-    # Request-only telemetry discriminator (never persisted, not in the GET
-    # payload): qualifies a completion write as an explicit tutorial exit
-    # (the in-tutorial "Exit tutorial" / exit-to-freeform opt-out,
-    # elspeth-61591e64bb). Without it the server's payload-shape inference
-    # would bucket an exit as "skip". Only meaningful alongside a non-null
-    # ``tutorial_completed_at`` in the same PATCH — enforced below.
-    tutorial_completed_via: Literal["exit"] | None = None
+    # Request-only completion intent.
+    tutorial_completed_via: Literal["complete", "skip", "exit"] | None = None
 
     @model_validator(mode="after")
     def _via_requires_completion_write(self) -> "UpdateComposerPreferencesRequest":
-        if self.tutorial_completed_via is not None and self.tutorial_completed_at is None:
+        if "tutorial_completed_at" in self.model_fields_set and any(
+            value is not None
+            for value in (self.tutorial_stage, self.tutorial_session_id, self.tutorial_run_id, self.tutorial_source_data_hash)
+        ):
+            raise ValueError("tutorial completion or reset cannot include populated progress fields")
+        if self.tutorial_completed_at is not None:
+            if self.tutorial_completed_via is None:
+                raise ValueError("tutorial_completed_at requires tutorial_completed_via")
+        elif "tutorial_completed_via" in self.model_fields_set:
             raise ValueError("tutorial_completed_via requires a non-null tutorial_completed_at in the same PATCH")
         return self

@@ -42,11 +42,6 @@ function compositionWithSource(version: number) {
   };
 }
 
-/**
- * The SAME authored content re-issued at a new version — a settlement that
- * wrote a row but authored nothing (a post-completion guided chat persists
- * exactly this, elspeth-986801d218).
- */
 function compositionAtNewVersion(version: number) {
   return {
     version,
@@ -90,7 +85,7 @@ function makePendingEvent(
     hash_domain_version: null,
     runtime_model_identifier_at_resolve: null,
     runtime_model_version_at_resolve: null,
-    resolved_prompt_template_hash: null,
+    approved_prompt_artifact_hash: null,
   };
 }
 
@@ -298,6 +293,7 @@ describe("subscriptions — validation result side effects", () => {
           {
             component_type: "edge",
             component_id: "rater",
+            error_code: "schema_contract_violation",
             message:
               "Schema contract violation: edge 'rater' → 'cleaner'\n  Consumer expects field 'score'",
           },
@@ -310,7 +306,7 @@ describe("subscriptions — validation result side effects", () => {
     expect(message).toContain("Validation failed");
     // The raw engine dump is replaced by a plain-language headline; the dump
     // and the internal-id prefix never reach the novice chat register.
-    expect(message).toContain("aren't connected correctly");
+    expect(message).toContain("incompatible data");
     expect(message).not.toContain("Schema contract violation");
     expect(message).not.toContain("[edge]");
     expect(message).not.toContain("rater");
@@ -814,6 +810,18 @@ describe("subscriptions — validation result side effects", () => {
     expect(injectSystemMessage).toHaveBeenCalledTimes(1);
   });
 
+  it("refreshes the displayed finding when only its structured code changes", () => {
+    const injectSystemMessage = vi.fn();
+    useSessionStore.setState({ activeSessionId: "sess-1", injectSystemMessage } as never);
+    useExecutionStore.setState({ validationResult: null } as never);
+    initStoreSubscriptions();
+    const error = { component_type: "source", component_id: "s1", message: "unchanged detail", suggestion: null };
+    useExecutionStore.setState({ validationResult: { is_valid: false, errors: [{...error, error_code: null}], warnings: [] } } as never);
+    useExecutionStore.setState({ validationResult: { is_valid: false, errors: [{...error, error_code: "schema_contract_violation"}], warnings: [] } } as never);
+    expect(injectSystemMessage).toHaveBeenCalledTimes(2);
+    expect(injectSystemMessage.mock.calls[1][0]).toContain("incompatible data");
+  });
+
   it("does not repeat side effects for a fresh object with the same validation outcome", () => {
     const injectSystemMessage = vi.fn();
     const sendMessage = vi.fn().mockResolvedValue(undefined);
@@ -879,7 +887,7 @@ describe("auto-validate on composition-state version change", () => {
     await waitFor(() => expect(validate).toHaveBeenCalledTimes(2));
   });
 
-  it("does not auto-validate a metadata-only guided exit state", async () => {
+  it("does not auto-validate a metadata-only state", async () => {
     const validate = vi.fn().mockResolvedValue(undefined);
     useExecutionStore.setState({ validate } as never);
 
@@ -1538,19 +1546,6 @@ describe("subscriptions — run rehydration on session activation", () => {
   });
 });
 
-// ── Content-equal version bumps (elspeth-986801d218) ─────────────────────────
-//
-// A settlement that writes a composition_states row but authors NOTHING still
-// bumps `version` — a post-completion guided chat does exactly that, so the
-// reply has a state to hang off. Both version-keyed subscribers used to treat
-// that as an edit: one cleared the validation verdict, the other POSTed
-// /validate, and `useCompletionOutcome` read executionReady=false in between,
-// flipping the completed heading off "Pipeline ready" for the round trip.
-// Asking a question about a pipeline must not un-verify it.
-//
-// Discrimination in every test below is the CONTENT, not the version: the
-// same version pair fires or skips depending only on whether the authored
-// sources/nodes/edges/outputs/metadata changed.
 describe("content-equal version bumps carry the verdict forward", () => {
   /** The cached readiness the badge, the Execute button and the ambient sync
    *  all match on `composition_version` before they will use. */

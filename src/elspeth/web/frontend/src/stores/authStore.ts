@@ -1,10 +1,12 @@
 import { create } from "zustand";
 import type { UserProfile, ApiError } from "../types/index";
 import * as api from "../api/client";
+import { advanceAuthGeneration, isCurrentAuthGeneration } from "../api/authSession";
 import { usePreferencesStore } from "./preferencesStore";
 import { usePluginCatalogStore } from "./pluginCatalogStore";
 
 const TOKEN_KEY = "auth_token";
+let pendingLogoutCleanup: Promise<void> | null = null;
 
 interface AuthState {
   token: string | null;
@@ -25,6 +27,9 @@ export const useAuthStore = create<AuthState>((set) => ({
   isLoading: true, // starts true; loadFromStorage resolves it
 
   async login(username: string, password: string) {
+    const generation = advanceAuthGeneration();
+    if (pendingLogoutCleanup) await pendingLogoutCleanup;
+    if (!isCurrentAuthGeneration(generation)) return false;
     // Deliberately does NOT touch isLoading: that flag drives AuthGuard's
     // "Checking authentication" spinner, which REPLACES the LoginPage in
     // the tree. Flipping it during an interactive attempt unmounted the
@@ -38,14 +43,17 @@ export const useAuthStore = create<AuthState>((set) => ({
     set({ loginError: null });
     try {
       const { access_token } = await api.login(username, password);
+      if (!isCurrentAuthGeneration(generation)) return false;
       localStorage.setItem(TOKEN_KEY, access_token);
-      set({ token: access_token });
+      set({ token: access_token, user: null });
 
-      const user = await api.fetchCurrentUser();
+      const user = await api.fetchCurrentUser({ logoutOnUnauthorized: false });
+      if (!isCurrentAuthGeneration(generation)) return false;
       usePluginCatalogStore.getState().clear();
       set({ user, isLoading: false });
       return true;
     } catch (err) {
+      if (!isCurrentAuthGeneration(generation)) return false;
       const apiErr = err as ApiError;
       const message =
         apiErr.status === 401
@@ -59,13 +67,18 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   async loginWithToken(token: string) {
+    const generation = advanceAuthGeneration();
+    if (pendingLogoutCleanup) await pendingLogoutCleanup;
+    if (!isCurrentAuthGeneration(generation)) return;
     usePluginCatalogStore.getState().clear();
     localStorage.setItem(TOKEN_KEY, token);
-    set({ token, loginError: null, isLoading: true });
+    set({ token, user: null, loginError: null, isLoading: true });
     try {
-      const user = await api.fetchCurrentUser();
+      const user = await api.fetchCurrentUser({ logoutOnUnauthorized: false });
+      if (!isCurrentAuthGeneration(generation)) return;
       set({ user, isLoading: false });
     } catch {
+      if (!isCurrentAuthGeneration(generation)) return;
       set({
         token: null,
         user: null,
@@ -77,31 +90,44 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   async logout() {
-    localStorage.removeItem(TOKEN_KEY);
-    usePluginCatalogStore.getState().clear();
-    set({ token: null, user: null, loginError: null, isLoading: false });
-    const [
-      { useSessionStore },
-      { useExecutionStore },
-      { useBlobStore },
-      { useSecretsStore },
-      { useShareableReviewStore },
-    ] = await Promise.all([
+    advanceAuthGeneration();
+    // New logins await this barrier before publishing their credentials. The
+    // old principal's caches must be cleared, not abandoned on replacement.
+    const cleanup = pendingLogoutCleanup ?? Promise.all([
       import("./sessionStore"),
       import("./executionStore"),
       import("./blobStore"),
       import("./secretsStore"),
       import("./shareableReviewStore"),
-    ]);
-    useSessionStore.getState().reset?.();
-    useExecutionStore.getState().reset?.();
-    useBlobStore.getState().reset();
-    useSecretsStore.getState().reset();
-    useShareableReviewStore.getState().reset();
-    usePreferencesStore.getState().reset();
+      import("./interpretationEventsStore"),
+    ]).then(([
+      { useSessionStore },
+      { useExecutionStore },
+      { useBlobStore },
+      { useSecretsStore },
+      { useShareableReviewStore },
+      { useInterpretationEventsStore },
+    ]) => {
+      useSessionStore.getState().reset?.();
+      useExecutionStore.getState().reset?.();
+      useBlobStore.getState().reset();
+      useSecretsStore.getState().reset();
+      useShareableReviewStore.getState().reset();
+      useInterpretationEventsStore.setState(useInterpretationEventsStore.getInitialState(), true);
+      usePreferencesStore.getState().reset();
+    });
+    pendingLogoutCleanup = cleanup;
+    localStorage.removeItem(TOKEN_KEY);
+    usePluginCatalogStore.getState().clear();
+    set({ token: null, user: null, loginError: null, isLoading: false });
+    await cleanup;
+    if (pendingLogoutCleanup === cleanup) pendingLogoutCleanup = null;
   },
 
   async loadFromStorage() {
+    const generation = advanceAuthGeneration();
+    if (pendingLogoutCleanup) await pendingLogoutCleanup;
+    if (!isCurrentAuthGeneration(generation)) return;
     const token = localStorage.getItem(TOKEN_KEY);
     if (!token) {
       usePluginCatalogStore.getState().clear();
@@ -109,12 +135,14 @@ export const useAuthStore = create<AuthState>((set) => ({
       set({ isLoading: false });
       return;
     }
-    set({ token });
+    set({ token, user: null });
     usePluginCatalogStore.getState().clear();
     try {
-      const user = await api.fetchCurrentUser();
+      const user = await api.fetchCurrentUser({ logoutOnUnauthorized: false });
+      if (!isCurrentAuthGeneration(generation)) return;
       set({ user, isLoading: false });
     } catch {
+      if (!isCurrentAuthGeneration(generation)) return;
       // Token invalid or expired -- clear it
       localStorage.removeItem(TOKEN_KEY);
       usePreferencesStore.getState().reset();

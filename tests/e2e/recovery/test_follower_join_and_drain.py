@@ -52,8 +52,9 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import RunStatus
+from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError, RunWorkerEvictedError
+from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError, RunMembershipLostError
 from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.core.landscape.schema import (
     group_losses_table,
@@ -80,7 +81,7 @@ from tests.e2e.recovery.harness import (
 from tests.e2e.recovery.test_suspended_winner_fences import (
     _work_item,
 )
-from tests.fixtures.landscape import expire_leader_seat, member_token_for
+from tests.fixtures.landscape import expire_leader_seat, leader_token_for, member_token_for
 
 if TYPE_CHECKING:
     from scripts.state_engine_profile_reporter import RuntimeProfileReporter
@@ -396,9 +397,9 @@ class TestFollowerDispositions:
 
         # Follower claims and marks terminal.
         claimed = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
         assert claimed is not None and claimed.token_id == token_id
         assert claimed.lease_owner == follower_id
@@ -407,6 +408,7 @@ class TestFollowerDispositions:
         crashed.repo.mark_terminal(
             work_item_id=claimed.work_item_id,
             expected_lease_owner=follower_id,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
 
         item = _work_item(crashed.db, token_id)
@@ -435,9 +437,9 @@ class TestFollowerDispositions:
         token_id, _wid = _seed_ready_row(crashed, ingest_sequence=6)
 
         claimed = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
         assert claimed is not None and claimed.token_id == token_id
 
@@ -445,9 +447,11 @@ class TestFollowerDispositions:
         barrier_key = "barrier_0"
         crashed.repo.mark_blocked(
             work_item_id=claimed.work_item_id,
+            row_payload_json=claimed.row_payload_json,
             queue_key=None,
             barrier_key=barrier_key,
             expected_lease_owner=follower_id,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
 
         item = _work_item(crashed.db, token_id)
@@ -484,9 +488,9 @@ class TestFollowerDispositions:
         token_id, _wid = _seed_ready_row(crashed, ingest_sequence=7)
 
         claimed = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
         assert claimed is not None and claimed.token_id == token_id
 
@@ -501,6 +505,7 @@ class TestFollowerDispositions:
             work_item_id=claimed.work_item_id,
             expected_lease_owner=follower_id,
             group_losses=(group_loss,),
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
 
         # Group-loss record committed in the SAME transaction as mark_failed.
@@ -523,9 +528,9 @@ class TestFollowerDispositions:
         # Re-seed to get a fresh LEASED row for the idempotency call.
         _token_id2, _wid2 = _seed_ready_row(crashed, ingest_sequence=8)
         claimed2 = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
         assert claimed2 is not None
         # Same (closer_name, group_id, member_key) → idempotent.
@@ -540,6 +545,7 @@ class TestFollowerDispositions:
             work_item_id=claimed2.work_item_id,
             expected_lease_owner=follower_id,
             group_losses=(group_loss_dup,),
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
         with crashed.db.engine.connect() as conn:
             loss_count = conn.execute(
@@ -578,9 +584,9 @@ class TestFollowerDispositions:
         token_id, _wid = _seed_ready_row(crashed, ingest_sequence=9)
 
         claimed = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
         assert claimed is not None and claimed.token_id == token_id
 
@@ -598,6 +604,7 @@ class TestFollowerDispositions:
             error_hash=None,
             error_message=None,
             expected_lease_owner=follower_id,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
 
         item = _work_item(crashed.db, token_id)
@@ -714,7 +721,12 @@ class TestFollowerLifecycle:
 
         from elspeth.contracts.plugin_context import PluginContext
 
-        ctx = PluginContext(run_id=crashed.run_id, config={}, landscape=None)
+        ctx = PluginContext(
+            run_id=crashed.run_id,
+            config={},
+            landscape=None,
+            member_token=follower_token,
+        )
         follower.run(ctx)
 
         # wait_fn called ≥ once (idle backoff triggered) and loop exited cleanly.
@@ -749,7 +761,12 @@ class TestFollowerLifecycle:
 
         from elspeth.contracts.plugin_context import PluginContext
 
-        ctx = PluginContext(run_id=crashed.run_id, config={}, landscape=None)
+        ctx = PluginContext(
+            run_id=crashed.run_id,
+            config={},
+            landscape=None,
+            member_token=follower_token,
+        )
         follower.run(ctx)  # must return normally (not raise)
 
         # depart_worker CAS active → departed; idempotent if §D already departed.
@@ -793,7 +810,12 @@ class TestFollowerLifecycle:
 
         from elspeth.contracts.plugin_context import PluginContext
 
-        ctx = PluginContext(run_id=crashed.run_id, config={}, landscape=None)
+        ctx = PluginContext(
+            run_id=crashed.run_id,
+            config={},
+            landscape=None,
+            member_token=follower_token,
+        )
         # Design §B.1 step 5: seat-dead raises FollowerSeatDeadError (after
         # clean depart) so the CLI can surface the 'elspeth resume' guidance.
         with pytest.raises(FollowerSeatDeadError) as exc_info:
@@ -839,7 +861,12 @@ class TestFollowerLifecycle:
 
         from elspeth.contracts.plugin_context import PluginContext
 
-        ctx = PluginContext(run_id=crashed.run_id, config={}, landscape=None)
+        ctx = PluginContext(
+            run_id=crashed.run_id,
+            config={},
+            landscape=None,
+            member_token=follower_token,
+        )
         with pytest.raises(KeyboardInterrupt):
             follower.run(ctx)
 
@@ -886,26 +913,24 @@ class TestFollowerEnqueueFence:
         from tests.e2e.recovery.harness import _observed_contract
 
         data = {"id": 100, "value": 1000}
-        child_row = crashed.factory.data_flow.create_row(
-            run_id=crashed.run_id,
+        child_row, child_token = crashed.factory.data_flow.create_row_with_token(
             source_node_id=crashed.source_node_id,
             row_index=100,
             data=data,
             source_row_index=100,
             ingest_sequence=100,
+            coordination_token=leader_token_for(crashed.db, crashed.run_id),
         )
-        child_token = crashed.factory.data_flow.create_token(row_id=child_row.row_id)
 
         # enqueue_ready with worker_id=follower_id (membership fence live).
         crashed.repo.enqueue_ready(
-            run_id=crashed.run_id,
             token_id=child_token.token_id,
             row_id=child_row.row_id,
             node_id=crashed.journal_node_id,
             step_index=crashed.journal_step_index,
             ingest_sequence=100,
             row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-            worker_id=follower_id,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
 
         # Child row is READY.
@@ -941,26 +966,24 @@ class TestFollowerEnqueueFence:
         from tests.e2e.recovery.harness import _observed_contract
 
         data = {"id": 101, "value": 1010}
-        child_row = crashed.factory.data_flow.create_row(
-            run_id=crashed.run_id,
+        child_row, child_token = crashed.factory.data_flow.create_row_with_token(
             source_node_id=crashed.source_node_id,
             row_index=101,
             data=data,
             source_row_index=101,
             ingest_sequence=101,
+            coordination_token=leader_token_for(crashed.db, crashed.run_id),
         )
-        child_token = crashed.factory.data_flow.create_token(row_id=child_row.row_id)
 
-        with pytest.raises(RunWorkerEvictedError) as exc_info:
+        with pytest.raises(RunMembershipLostError) as exc_info:
             crashed.repo.enqueue_ready(
-                run_id=crashed.run_id,
                 token_id=child_token.token_id,
                 row_id=child_row.row_id,
                 node_id=crashed.journal_node_id,
                 step_index=crashed.journal_step_index,
                 ingest_sequence=101,
                 row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-                worker_id=follower_id,
+                member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
             )
 
         assert exc_info.value.worker_id == follower_id
@@ -1069,32 +1092,31 @@ def _seed_real_follower_ready_item(
         source_node_id = str(conn.execute(select(rows_table.c.source_node_id).where(rows_table.c.run_id == run_id).limit(1)).scalar_one())
 
     ingest_sequence = 10_000 + abs(row_data["id"])
-    row = factory.data_flow.create_row(
-        run_id=run_id,
+    row, token = factory.data_flow.create_row_with_token(
         source_node_id=source_node_id,
         row_index=ingest_sequence,
         data=row_data,
         source_row_index=ingest_sequence,
         ingest_sequence=ingest_sequence,
+        coordination_token=leader_token_for(factory._db, run_id),
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
     factory.execution.record_completed_node_state(
         token_id=token.token_id,
         node_id=source_node_id,
-        run_id=run_id,
         step_index=0,
         input_data=row_data,
         output_data=row_data,
         duration_ms=0,
+        coordination_token=leader_token_for(factory._db, run_id),
     )
     factory.scheduler.enqueue_ready(
-        run_id=run_id,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=target_node_id,
         step_index=target_step_index,
         ingest_sequence=ingest_sequence,
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(row_data, _observed_contract(row_data))),
+        member_token=leader_token_for(factory._db, run_id).membership,
     )
     return token.token_id
 
@@ -1112,7 +1134,7 @@ def _run_real_follower(
     """Run one real follower through CLI graph/lifecycle and FollowerProcessor."""
 
     from elspeth.cli import (
-        _build_resume_graphs,
+        _build_resume_graph,
         _instantiate_plugins_for_runtime_preflight,
         _preflight_execution_sinks,
         _start_follower_plugin_lifecycle,
@@ -1136,6 +1158,13 @@ def _run_real_follower(
     result = Orchestrator(db).run(config, graph=graph, settings=settings, payload_store=payload_store)
     run_id = result.run_id
     factory = RecorderFactory(db, payload_store=payload_store)
+    with db.engine.begin() as conn:
+        conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value, completed_at=None))
+    factory.run_coordination.acquire_run_leadership(
+        run_id=run_id,
+        worker_id=f"worker:{run_id}:real-leader",
+        window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+    )
     source_node_id = graph.get_sources()[0]
     target_node_id = graph.get_next_node(source_node_id)
     assert target_node_id is not None
@@ -1148,13 +1177,6 @@ def _run_real_follower(
         target_step_index=graph.get_node_step_map()[target_node_id],
     )
 
-    with db.engine.begin() as conn:
-        conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value, completed_at=None))
-    factory.run_coordination.acquire_run_leadership(
-        run_id=run_id,
-        worker_id=f"worker:{run_id}:real-leader",
-        window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
-    )
     member_token = Orchestrator(db).join_run(
         run_id,
         settings,
@@ -1170,7 +1192,7 @@ def _run_real_follower(
         follower_plugins,
         purpose=SinkEffectExecutionPurpose.FOLLOWER,
     )
-    _validation_graph, execution_graph = _build_resume_graphs(settings, follower_plugins)
+    execution_graph = _build_resume_graph(settings, follower_plugins)
     follower_config = assemble_and_validate_pipeline_config(
         sources=follower_plugins.sources,
         transforms=follower_plugins.transforms,
@@ -1190,12 +1212,14 @@ def _run_real_follower(
         clock=clock,
         scheduler_lease_seconds=scheduler_lease_seconds,
         scheduler_heartbeat_seconds=scheduler_heartbeat_seconds,
+        retry_config=RuntimeRetryConfig.from_settings(settings.retry),
     )
     ctx = PluginContext(
         run_id=run_id,
         config=resolve_config(settings),
         landscape=factory.plugin_audit_writer(),
         payload_store=payload_store,
+        member_token=member_token,
     )
 
     def _stop_after_idle(_seconds: float) -> None:
@@ -1282,6 +1306,77 @@ gates:
         assert item["status"] == TokenWorkStatus.TERMINAL.value
         assert item["pending_sink_name"] is None
         assert not output_path.exists()
+    finally:
+        db.close()
+
+
+@pytest.mark.timeout(120)
+def test_real_follower_holds_the_row_that_reached_the_aggregation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A follower that crosses a transform in-claim holds the TRANSFORMED row (elspeth-5887fb7928 AC-R4).
+
+    The follower has no aggregation executor: the leader adopts the member
+    from this BLOCKED row, with no live stash. Before the fix the follower's
+    drain derived the barrier key from the claim-start item (the transform
+    node), found none, and raised "no queue or barrier key … processor bug"
+    in a live run. Had it found one, the row would still have been the
+    READY-time payload without the transform's ``n``.
+    """
+    from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+    from elspeth.core.landscape.schema import nodes_table
+
+    def _typed_contract(row: dict[str, Any]) -> SchemaContract:
+        return SchemaContract(
+            mode="OBSERVED",
+            fields=tuple(
+                FieldContract(normalized_name=key, original_name=key, python_type=type(value), required=False, source="inferred")
+                for key, value in row.items()
+            ),
+            locked=True,
+        )
+
+    # The shared seed types every field `object`, while the fresh run typed id
+    # and value `int`. The transform's output-contract evolution would then
+    # refuse the merge before the barrier is ever reached, which is a different
+    # defect family. Seed with the types the fresh run observed.
+    import tests.e2e.recovery.harness as harness
+
+    monkeypatch.setattr(harness, "_observed_contract", _typed_contract)
+    db, run_id, token_id, _plugins, _output_path = _run_real_follower(
+        tmp_path,
+        processing_yaml="""
+transforms:
+  - name: lift
+    plugin: value_transform
+    input: processing
+    on_success: lifted
+    on_error: discard
+    options:
+      schema: {mode: observed}
+      operations:
+        - target: n
+          expression: "row['value'] * 10"
+aggregations:
+  - name: summarise
+    plugin: batch_stats
+    input: lifted
+    on_success: output
+    on_error: discard
+    trigger: {count: 100}
+    options:
+      value_field: n
+      schema: {mode: observed}
+""",
+        row_data={"id": 7, "value": 4},
+    )
+    try:
+        item = _work_item(db, token_id)
+        with db.engine.connect() as conn:
+            aggregation_node_id = conn.execute(
+                select(nodes_table.c.node_id).where(nodes_table.c.run_id == run_id, nodes_table.c.plugin_name == "batch_stats")
+            ).scalar_one()
+        assert item["status"] == TokenWorkStatus.BLOCKED.value
+        assert item["barrier_key"] == aggregation_node_id
+        assert json.loads(item["row_payload_json"])["row"]["data"] == {"id": 7, "value": 4, "n": 40}
     finally:
         db.close()
 

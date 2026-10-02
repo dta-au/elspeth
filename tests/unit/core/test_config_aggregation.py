@@ -307,6 +307,29 @@ class TestAggregationSettings:
         )
         assert settings.options == {"fields": ["value"], "compute_mean": True}
 
+    @pytest.mark.parametrize("on_error", ["discard", " quarantine ", "batch_errors"])
+    def test_on_error_accepts_discard_or_a_sink_name(self, on_error: str) -> None:
+        """on_error is the __error_<name>__ DIVERT edge target (elspeth-d2e3f29d10), admitted like a transform's."""
+        from elspeth.core.config import AggregationSettings
+
+        settings = AggregationSettings(name="stats", plugin="batch_stats", input="source_out", on_error=on_error)
+
+        assert settings.on_error == on_error.strip()
+
+    @pytest.mark.parametrize(
+        ("on_error", "fragment"),
+        [
+            pytest.param("  ", "on_error must be a sink name or 'discard'", id="blank"),
+            pytest.param("__errors", "starts with '__'", id="dunder"),
+            pytest.param("has space", "invalid characters", id="chars"),
+        ],
+    )
+    def test_on_error_rejects_what_the_transform_validator_rejects(self, on_error: str, fragment: str) -> None:
+        from elspeth.core.config import AggregationSettings
+
+        with pytest.raises(ValidationError, match=fragment):
+            AggregationSettings(name="stats", plugin="batch_stats", input="source_out", on_error=on_error)
+
 
 class TestElspethSettingsAggregations:
     """Tests for aggregations in ElspethSettings."""

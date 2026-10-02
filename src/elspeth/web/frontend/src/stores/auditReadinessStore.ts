@@ -339,20 +339,6 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
   },
 
   carrySnapshotForward(sessionId: string, fromVersion: number, toVersion: number) {
-    // A version bump that authored NOTHING (a post-completion guided chat
-    // persists a byte-identical composition row) leaves the cached readiness
-    // exactly as true as it was, but every consumer matches on
-    // `composition_version`: without this the Checks badge flips to
-    // "Checking", ExecuteButton's advisory snapshot goes undefined, and the
-    // server runs a second full validation + audit projection — once per
-    // question, forever, on a surface that never used to bump the version.
-    //
-    // Guarded on `fromVersion` the way the auto-validate subscriber guards on
-    // "landed": only the snapshot fetched FOR the content-equal predecessor
-    // may move. A snapshot from some older version is not known to describe
-    // this content, and stamping it forward would assert a readiness the
-    // server never gave. The caller owns the content-equality proof
-    // (`compositionContentEqual`); this owns the identity check.
     set((state) => {
       const cached = state.snapshotsBySession[sessionId];
       if (

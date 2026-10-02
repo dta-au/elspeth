@@ -57,9 +57,11 @@ def test_cli_accepts_with_matching_surface(tmp_path: Path) -> None:
     assert _cli_verify(tmp_path, REVISION, surface="freeform") == 0
 
 
-def test_cli_rejects_surface_mismatch(tmp_path: Path) -> None:
+def test_cli_rejects_unknown_surface(tmp_path: Path) -> None:
     write_evidence(tmp_path, REVISION, build_valid_evidence(surface="freeform"))
-    assert _cli_verify(tmp_path, REVISION, surface="guided_full") == 1
+    with pytest.raises(SystemExit) as excinfo:
+        _cli_verify(tmp_path, REVISION, surface="unrecognised")
+    assert excinfo.value.code == 2
 
 
 def test_cli_rejects_fake_provider_evidence(tmp_path: Path) -> None:
@@ -110,14 +112,14 @@ def test_run_collect_redact_persist_then_cli_verify(tmp_path: Path) -> None:
     report = la.run_live(
         base_url="https://staging.example",
         api_key="dummy-not-a-real-key",
-        surface="guided_staged",
+        surface="freeform",
         fixture=tmp_path / "colours.csv",
         intent=tmp_path / "request.txt",
         revision=REVISION,
         evidence_dir=evidence_dir,
         collector=collector,
     )
-    assert report.surface == "guided_staged"
+    assert report.surface == "freeform"
 
     persisted = evidence_dir / REVISION / la.RUN_LLM_CALLS_FILE
     calls = json.loads(persisted.read_text(encoding="utf-8"))
@@ -126,7 +128,7 @@ def test_run_collect_redact_persist_then_cli_verify(tmp_path: Path) -> None:
     assert file_mode & (stat.S_IWGRP | stat.S_IWOTH) == 0
 
     # The redacted, persisted evidence re-verifies through the plain CLI path.
-    assert _cli_verify(evidence_dir, REVISION, surface="guided_staged") == 0
+    assert _cli_verify(evidence_dir, REVISION, surface="freeform") == 0
 
 
 # --------------------------------------------------------------------------- #

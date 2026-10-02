@@ -15,7 +15,7 @@ from typing import Any, ClassVar, Self, cast
 import structlog
 from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
-from elspeth.contracts import Determinism
+from elspeth.contracts import CallType, Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.aws_s3 import S3_MAX_KEY_BYTES, validate_relative_s3_path
 from elspeth.contracts.aws_textract import (
@@ -28,14 +28,17 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
 from elspeth.contracts.errors import (
+    AuditIntegrityError,
     BucketRegionVerificationEvidence,
     FrameworkBugError,
     TransformErrorCategory,
     TransformErrorReason,
 )
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust, WebConfigAuthority
+from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -43,6 +46,7 @@ from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputP
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_bucket_region import (
     S3_HEAD_BUCKET_SDK_ALLOWANCE_SECONDS,
     BucketRegionCoordinator,
@@ -70,6 +74,7 @@ from elspeth.plugins.transforms.aws.textract_config_shared import (
     TextractExtractFields,
     TextractQueryConfig,
     require_non_whitespace,
+    textract_created_output_fields,
     validate_textract_credential_fields,
 )
 from elspeth.plugins.transforms.aws.textract_regions import TEXTRACT_INVARIANT_PROBE_REGION, TEXTRACT_REGIONS
@@ -81,6 +86,16 @@ from elspeth.plugins.transforms.aws.textract_result import (
 
 _BUCKET_PATTERN = re.compile(r"^[0-9A-Za-z.\-_]*$")
 _TEXTRACT_SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
+
+# Hard ceilings on what an author may configure. Each row holds the shared
+# execution worker until its job reaches a terminal status or the poll deadline
+# passes, and retains the whole result in memory, so these may be lowered but
+# never raised; the defaults sit at the ceilings.
+MAX_POLL_TIMEOUT_SECONDS = 3600.0
+MAX_BATCH_WAIT_TIMEOUT_SECONDS = 3900.0
+MAX_RESULT_PAGES = 1000
+MAX_BLOCKS = 200_000
+MAX_RESULT_BYTES = 50_000_000
 
 # Textract raises InvalidS3ObjectException whenever it cannot READ the object —
 # it does not distinguish authorization failures from missing or corrupt files.
@@ -181,11 +196,28 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
     poll_interval_seconds: float = Field(default=1.0, gt=0, description="Initial delay between non-terminal job-status polls.")
     poll_backoff_multiplier: float = Field(default=1.5, ge=1, description="Multiplier applied to successive job-status poll delays.")
     poll_max_interval_seconds: float = Field(default=10.0, gt=0, description="Maximum delay between job-status polls.")
-    poll_timeout_seconds: float = Field(default=3600.0, gt=0, description="Total submit-through-terminal-status deadline in seconds.")
-    batch_wait_timeout_seconds: float = Field(default=3900.0, gt=0, description="Maximum engine wait for one pipelined document row.")
-    max_result_pages: int = Field(default=1000, gt=0, description="Maximum GetDocumentAnalysis result pages retained for one document.")
-    max_blocks: int = Field(default=200_000, gt=0, description="Maximum combined Textract block count for one document.")
-    max_result_bytes: int = Field(default=50_000_000, gt=0, description="Maximum canonical JSON bytes retained for one document result.")
+    poll_timeout_seconds: float = Field(
+        default=MAX_POLL_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_POLL_TIMEOUT_SECONDS,
+        description="Total submit-through-terminal-status deadline in seconds.",
+    )
+    batch_wait_timeout_seconds: float = Field(
+        default=MAX_BATCH_WAIT_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_BATCH_WAIT_TIMEOUT_SECONDS,
+        description="Maximum engine wait for one pipelined document row.",
+    )
+    max_result_pages: int = Field(
+        default=MAX_RESULT_PAGES,
+        gt=0,
+        le=MAX_RESULT_PAGES,
+        description="Maximum GetDocumentAnalysis result pages retained for one document.",
+    )
+    max_blocks: int = Field(default=MAX_BLOCKS, gt=0, le=MAX_BLOCKS, description="Maximum combined Textract block count for one document.")
+    max_result_bytes: int = Field(
+        default=MAX_RESULT_BYTES, gt=0, le=MAX_RESULT_BYTES, description="Maximum canonical JSON bytes retained for one document result."
+    )
 
     @field_validator(
         "poll_interval_seconds",
@@ -308,7 +340,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:903f8009398889a4"
+    source_file_hash: str | None = "sha256:bd472cf7bdb1f53b"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -396,6 +428,13 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         )
 
         self.declared_output_fields = frozenset(cfg.all_output_field_names())
+        self._created_output_fields = textract_created_output_fields(
+            text_field=cfg.text_field,
+            page_count_field=cfg.page_count_field,
+            metadata_field=cfg.metadata_field,
+            result_field=cfg.result_field,
+            facet_fields=tuple(self._facet_fields.values()),
+        )
         self._reject_input_options_naming_created_fields(
             {
                 "bucket_field": cfg.bucket_field,
@@ -414,7 +453,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._recorder: PluginAuditWriter | None = None
         self._run_id = ""
         self._node_id = ""
-        self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
+        self._telemetry_emit: Callable[[TelemetryEvent], None] = _warn_telemetry_before_start
         self._limiter: Any = None
         self._sdk_client: TextractSDKClient | None = None
         self._s3_sdk_client: S3HeadBucketSDKClient | None = None
@@ -468,6 +507,10 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             projected["key"] = relative_key
         return projected
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The configured output targets, typed as ``NormalizedTextractResult`` fixes them (ADR-050)."""
+        return self._created_output_fields
+
     def on_start(self, ctx: LifecycleContext) -> None:
         super().on_start(ctx)
         if ctx.landscape is None:
@@ -485,6 +528,32 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._bucket_region_coordinator = BucketRegionCoordinator()
         created_s3 = False
         created_textract = False
+        if ctx.run_mode is RunMode.REPLAY:
+            if self._s3_sdk_client is None:
+                self._s3_sdk_client = ReplayOnlySDK()
+            if self._sdk_client is None:
+                self._sdk_client = ReplayOnlySDK()
+            return
+        if ctx.run_mode is RunMode.VERIFY:
+            if self._s3_sdk_client is None:
+                self._s3_sdk_client = DeferredAWSClient(
+                    lambda: build_s3_head_bucket_sdk_client(
+                        region=self._region,
+                        aws_access_key_id=self._aws_access_key_id,
+                        aws_secret_access_key=self._aws_secret_access_key,
+                        aws_session_token=self._aws_session_token,
+                    )
+                )
+            if self._sdk_client is None:
+                self._sdk_client = DeferredAWSClient(
+                    lambda: build_textract_sdk_client(
+                        region=self._region,
+                        aws_access_key_id=self._aws_access_key_id,
+                        aws_secret_access_key=self._aws_secret_access_key,
+                        aws_session_token=self._aws_session_token,
+                    )
+                )
+            return
         try:
             if self._s3_sdk_client is None:
                 self._s3_sdk_client = build_s3_head_bucket_sdk_client(
@@ -550,13 +619,15 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._recorder = None
         self._limiter = None
 
-    def _get_row_client(self, state_id: str, *, token_id: str | None) -> TextractClient:
+    def _get_row_client(self, state_id: str, *, ctx: TransformContext, token_id: str | None) -> TextractClient:
         with self._row_clients_lock:
             if state_id in self._row_clients:
                 return self._row_clients[state_id]
             if self._recorder is None or self._sdk_client is None or not self._run_id:
                 raise FrameworkBugError("Amazon Textract transform used before on_start")
             client = TextractClient(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 execution=self._recorder,
                 state_id=state_id,
                 run_id=self._run_id,
@@ -566,6 +637,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 max_response_bytes=self._max_result_bytes,
                 limiter=self._limiter,
                 token_id=token_id,
+                call_mode_session=ctx.call_mode_session,
             )
             self._row_clients[state_id] = client
             return client
@@ -576,7 +648,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         if ctx.token is None:
             raise FrameworkBugError("Amazon Textract batch processing requires token identity")
         try:
-            return self._process_single_with_state(row, ctx.state_id, token_id=ctx.token.token_id)
+            return self._process_single_with_state(row, ctx.state_id, token_id=ctx.token.token_id, ctx=ctx)
         finally:
             # The row client is created lazily at the SDK call, so a row that
             # was rejected before reaching it never registered one.
@@ -700,7 +772,9 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             digest.update(encoded)
         return digest.hexdigest()
 
-    def _process_single_with_state(self, row: PipelineRow, state_id: str, *, token_id: str | None) -> TransformResult:
+    def _process_single_with_state(
+        self, row: PipelineRow, state_id: str, *, ctx: TransformContext, token_id: str | None
+    ) -> TransformResult:
         if not self._run_id or not self._node_id or token_id is None:
             raise FrameworkBugError("Amazon Textract processing requires run, node, and token identity")
         if self._shutdown.is_set():
@@ -712,7 +786,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         try:
             verification = self._bucket_region_coordinator.verify(
                 bucket,
-                lambda: self._verify_bucket_region_live(bucket, state_id=state_id, token_id=token_id),
+                lambda: self._verify_bucket_region_live(bucket, state_id=state_id, token_id=token_id, ctx=ctx),
             )
         except BucketRegionUnverifiedError as error:
             return TransformResult.error(
@@ -727,6 +801,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             key=key,
             version=version,
             verification=verification,
+            ctx=ctx,
         )
         return self._with_bucket_region_verification(result, verification)
 
@@ -740,6 +815,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         key: str,
         version: str | None,
         verification: BucketRegionVerification,
+        ctx: TransformContext,
     ) -> TransformResult:
         if verification.region != self._region:
             return TransformResult.error(
@@ -751,7 +827,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 retryable=False,
             )
         started_at = time.monotonic()
-        client = self._get_row_client(state_id, token_id=token_id)
+        client = self._get_row_client(state_id, token_id=token_id, ctx=ctx)
         request_token = self._client_request_token(
             run_id=self._run_id,
             node_id=self._node_id,
@@ -760,6 +836,26 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             key=key,
             version=version,
         )
+        source_token_fingerprint: str | None = None
+        session = ctx.call_mode_session
+        if session is not None:
+            source_parent = session.source_parent_identity(
+                call_type=CallType.HTTP,
+                current_state_id=state_id,
+                current_operation_id=None,
+            )
+            source_token_id = source_parent.source_token_id
+            if not source_token_id:
+                raise AuditIntegrityError("Textract source call parent has no token identity")
+            source_token = self._client_request_token(
+                run_id=source_parent.source_run_id,
+                node_id=source_parent.source_node_id,
+                token_id=source_token_id,
+                bucket=bucket,
+                key=key,
+                version=version,
+            )
+            source_token_fingerprint = hashlib.sha256(source_token.encode("utf-8")).hexdigest()
         try:
             receipt = client.start_document_analysis(
                 bucket=bucket,
@@ -769,6 +865,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 queries=self._query_requests,
                 client_request_token=request_token,
                 audit_identity=self._audit_location_identity(key),
+                source_client_request_token_fingerprint=source_token_fingerprint,
             )
         except TextractIdempotencyInvariantError as error:
             raise FrameworkBugError("Amazon Textract idempotency invariant failed") from error
@@ -839,10 +936,12 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         result.success_reason["metadata"]["bucket_region_verification"] = evidence
         return result
 
-    def _verify_bucket_region_live(self, bucket: str, *, state_id: str, token_id: str) -> BucketRegionProof:
+    def _verify_bucket_region_live(self, bucket: str, *, ctx: TransformContext, state_id: str, token_id: str) -> BucketRegionProof:
         if self._recorder is None or self._s3_sdk_client is None or not self._run_id:
             raise FrameworkBugError("Amazon Textract bucket verification used before on_start")
         return HeadBucketClient(
+            member_token=ctx.require_member_token(),
+            work_item=ctx.require_work_item(),
             execution=self._recorder,
             state_id=state_id,
             run_id=self._run_id,
@@ -850,6 +949,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             region=self._region,
             sdk_client=self._s3_sdk_client,
             token_id=token_id,
+            call_mode_session=ctx.call_mode_session,
         ).verify_bucket_region(bucket, audit_identity=self._audit_location_identity(None))
 
     def _poll_and_collect(
@@ -1067,7 +1167,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             self._shutdown = threading.Event()
             state_id = ctx.state_id or "textract-invariant-probe-state"
             token_id = ctx.token.token_id if ctx.token is not None else "textract-invariant-probe-token"
-            return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id)
+            return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id, ctx=ctx)
         finally:
             self._recorder = prior_recorder
             self._run_id = prior_run_id

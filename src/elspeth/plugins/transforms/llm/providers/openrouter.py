@@ -3,7 +3,8 @@
 Handles raw HTTP transport with full Tier 3 boundary validation:
 - JSON parsing with NaN/Infinity rejection
 - Content extraction from choices[0].message.content
-- Null content → ContentPolicyError
+- Missing content with explicit refusal or filtering → ContentPolicyError
+- Malformed, unexplained missing, or budget-exhausted output → LLMClientError
 - Non-finite usage values → LLMClientError
 - HTTP status code → typed exception mapping
 
@@ -25,13 +26,17 @@ import httpx
 import structlog
 from pydantic import Field, field_validator
 
-from elspeth.contracts import CallStatus, CallType
+from elspeth.contracts import CallStatus, CallType, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
+from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
+from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import ValueSource
+from elspeth.core.llm_pricing import provider_cost_from_response
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
     CONTEXT_LENGTH_PATTERNS,
@@ -41,6 +46,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     NetworkError,
     RateLimitError,
     ServerError,
+    public_llm_error_category,
 )
 from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed
 from elspeth.plugins.llm.config_validation import (
@@ -50,13 +56,21 @@ from elspeth.plugins.llm.config_validation import (
     normalize_openrouter_base_url,
     validate_openrouter_base_url,
 )
+from elspeth.plugins.llm.pricing import observe_http_provider_cost
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult, ParsedFinishReason, parse_finish_reason
+from elspeth.plugins.transforms.llm.provider import (
+    LLMAuditParent,
+    LLMQueryResult,
+    ParsedFinishReason,
+    observe_http_token_usage,
+    parse_finish_reason,
+)
 from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 __all__ = [
@@ -155,17 +169,20 @@ def _validate_chat_completion_response(response: httpx.Response) -> tuple[dict[s
     content = message["content"]
     raw_finish_reason = first_choice.get("finish_reason")
 
-    if content is None:
-        raise ContentPolicyError("LLM returned null content (likely content-filtered by provider)")
-
-    if not isinstance(content, str):
+    if content is not None and not isinstance(content, str):
         raise LLMClientError(f"Expected string content, got {type(content).__name__}", retryable=False)
 
-    if not content.strip():
+    if content is None or not content.strip():
+        refusal = message.get("refusal")
+        missing_content = "null content" if content is None else "empty content"
+        if raw_finish_reason == "content_filter" or (isinstance(refusal, str) and refusal.strip()):
+            raise ContentPolicyError(f"LLM returned {missing_content}: provider refused or filtered the response")
+        if raw_finish_reason == "length":
+            raise LLMClientError("LLM exhausted the output token budget before returning content", retryable=False)
         if raw_finish_reason == "tool_calls":
             raise LLMClientError("LLM returned tool_calls response (not supported by ELSPETH)", retryable=False)
-        # finish_reason is provider-controlled data — never interpolated.
-        raise ContentPolicyError("LLM returned empty content")
+        # Missing content alone does not establish a content-policy refusal.
+        raise LLMClientError(f"LLM returned {missing_content} without an explicit refusal", retryable=False)
 
     raw_usage = data.get("usage")
     if isinstance(raw_usage, dict):
@@ -275,7 +292,7 @@ class OpenRouterLLMProvider:
 
     The underlying OpenRouter transport is HTTP, so AuditedHTTPClient records
     the raw transport row. The LLM semantic row is recorded here so
-    ``calls.resolved_prompt_template_hash`` remains attached only to
+    ``calls.approved_prompt_artifact_hash`` remains attached only to
     ``CallType.LLM`` rows.
     """
 
@@ -289,7 +306,10 @@ class OpenRouterLLMProvider:
         run_id: str,
         telemetry_emit: TelemetryEmitCallback,
         limiter: Any = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        llm_call_governance: LLMCallGovernance | None = None,
+        pricing_model: str | None = None,
+        call_mode_session: CallModeSession | None = None,
     ) -> None:
         # Pre-build auth headers — avoids storing the raw API key as a named attribute
         self._request_headers = {
@@ -310,7 +330,10 @@ class OpenRouterLLMProvider:
         # Phase 5b Task 9 — cross-DB hash anchor. Forwarded to every HTTP
         # post() call so the Landscape ``calls`` row carries the matching
         # SHA-256.
-        self._resolved_prompt_template_hash = resolved_prompt_template_hash
+        self._approved_prompt_artifact_hash = approved_prompt_artifact_hash
+        self._llm_call_governance = llm_call_governance
+        self._pricing_model = pricing_model
+        self._call_mode_session = call_mode_session
 
         # Client cache with reference counting for parallel multi-query safety.
         # Multiple parallel queries share the same row parent, so _get_http_client()
@@ -325,7 +348,7 @@ class OpenRouterLLMProvider:
         messages: Sequence[ChatMessage],
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
@@ -347,8 +370,10 @@ class OpenRouterLLMProvider:
             RateLimitError: HTTP 429 (retryable)
             ServerError: HTTP 5xx (retryable)
             NetworkError: Connection/timeout failures (retryable)
-            ContentPolicyError: Null content from provider (not retryable)
-            LLMClientError: Other failures (not retryable)
+            ContentPolicyError: Missing content with explicit provider refusal
+                or filtering (not retryable)
+            LLMClientError: Malformed, unexplained missing, budget-exhausted
+                output, or other failures (not retryable)
         """
         cache_key = audit_parent.cache_key
         llm_request_payload = self._build_llm_request_payload(
@@ -358,18 +383,30 @@ class OpenRouterLLMProvider:
             max_tokens=max_tokens,
             response_format=response_format,
         )
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            self._call_mode_session.preflight_verify_request(
+                call_type=CallType.LLM,
+                request_data=llm_request_payload.to_dict(),
+                current_state_id=audit_parent.state_id,
+                current_operation_id=audit_parent.operation_id,
+            )
         logical_start = time.perf_counter()
 
+        replaying = self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY
+        attempt_id = self._llm_call_governance.before_call() if self._llm_call_governance is not None and not replaying else None
         http_client = self._get_http_client(audit_parent)
         primary_error: BaseException | None = None
+        observed_usage = TokenUsage.unknown()
+        observed_response_body = b""
         try:
             # Build request body
             wire = wire_messages(messages)
             request_body: dict[str, Any] = {
                 "model": model,
                 "messages": wire,
-                "temperature": temperature,
             }
+            if temperature is not None:
+                request_body["temperature"] = temperature
             if max_tokens is not None:
                 request_body["max_tokens"] = max_tokens
             if response_format is not None:
@@ -382,6 +419,8 @@ class OpenRouterLLMProvider:
                     json=request_body,
                     headers={"Content-Type": "application/json"},
                 )
+                observed_usage = observe_http_token_usage(response.content)
+                observed_response_body = response.content
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
                 status_code = e.response.status_code
@@ -423,15 +462,23 @@ class OpenRouterLLMProvider:
                 model=response_model,
                 usage=usage,
                 raw_response=data,
+                attempt_id=attempt_id,
             )
             return result
         except LLMClientError as exc:
             primary_error = exc
+            observed_cost, observed_cost_source = observe_http_provider_cost(
+                observed_response_body, model_requested=self._pricing_model or model
+            )
             self._record_logical_llm_error(
                 audit_parent=audit_parent,
                 started_at=logical_start,
                 request_payload=llm_request_payload,
                 exc=exc,
+                usage=observed_usage,
+                provider_cost=observed_cost,
+                provider_cost_source=observed_cost_source,
+                attempt_id=attempt_id,
             )
             raise
         except BaseException as exc:
@@ -450,7 +497,9 @@ class OpenRouterLLMProvider:
                     error=cleanup_error,
                     suppressed=primary_error is not None,
                     logger=logger,
-                    **audit_parent.client_kwargs(),
+                    state_id=audit_parent.state_id,
+                    token_id=audit_parent.token_id,
+                    operation_id=audit_parent.operation_id,
                 )
                 if primary_error is None:
                     raise cleanup_error
@@ -460,7 +509,7 @@ class OpenRouterLLMProvider:
         *,
         model: str,
         messages: Sequence[ChatMessage],
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         response_format: dict[str, Any] | None,
     ) -> LLMCallRequest:
@@ -486,10 +535,13 @@ class OpenRouterLLMProvider:
         model: str,
         usage: TokenUsage,
         raw_response: dict[str, Any],
+        attempt_id: str | None,
     ) -> None:
         """Record the semantic LLM call that the HTTP transport fulfilled."""
+        pricing_model = self._pricing_model or request_payload.model
+        provider_cost, provider_cost_source = provider_cost_from_response(raw_response, pricing_model=pricing_model)
         call_index = audit_parent.allocate_call_index(self._recorder)
-        audit_parent.record_call(
+        call = audit_parent.record_call(
             self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
@@ -498,12 +550,23 @@ class OpenRouterLLMProvider:
             response_data=LLMCallResponse(
                 content=content,
                 model=model,
+                pricing_model=pricing_model,
+                provider_cost=provider_cost,
+                provider_cost_source=provider_cost_source,
                 usage=usage,
                 raw_response=raw_response,
             ),
+            token_usage=usage,
             latency_ms=(time.perf_counter() - started_at) * 1000,
-            resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+            call_mode_session=self._call_mode_session,
         )
+        if self._llm_call_governance is not None and (
+            self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY
+        ):
+            if attempt_id is None:
+                raise RuntimeError("Governed LLM call has no admission attempt")
+            self._llm_call_governance.after_call(attempt_id, call.call_id)
 
     def _record_logical_llm_error(
         self,
@@ -512,67 +575,50 @@ class OpenRouterLLMProvider:
         started_at: float,
         request_payload: LLMCallRequest,
         exc: LLMClientError,
+        usage: TokenUsage,
+        provider_cost: float | None,
+        provider_cost_source: ComposerLLMProviderCostSource,
+        attempt_id: str | None,
     ) -> None:
         call_index = audit_parent.allocate_call_index(self._recorder)
         message = str(exc) or type(exc).__name__
-        audit_parent.record_call(
+        call = audit_parent.record_call(
             self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
             status=CallStatus.ERROR,
+            token_usage=usage,
             request_data=request_payload,
             error=LLMCallError(
                 type=type(exc).__name__,
                 message=message,
                 retryable=exc.retryable,
+                category=public_llm_error_category(exc),
+                pricing_model=self._pricing_model or request_payload.model,
+                provider_cost=provider_cost,
+                provider_cost_source=provider_cost_source,
             ),
             latency_ms=(time.perf_counter() - started_at) * 1000,
-            resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=self._approved_prompt_artifact_hash,
+            call_mode_session=self._call_mode_session,
         )
+        if self._llm_call_governance is not None and (
+            self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY
+        ):
+            if attempt_id is None:
+                raise RuntimeError("Governed LLM call has no admission attempt")
+            self._llm_call_governance.after_call(attempt_id, call.call_id)
 
-    def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited OpenRouter call under an operation parent."""
-        http_client = AuditedHTTPClient(
-            execution=self._recorder,
-            state_id=None,
-            operation_id=operation_id,
-            run_id=self._run_id,
-            telemetry_emit=self._telemetry_emit,
-            timeout=self._timeout,
-            base_url=self._base_url,
-            headers=self._request_headers,
-            limiter=self._limiter,
+        self.execute_query(
+            [ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")],
+            model=model,
+            temperature=0.0,
+            # The allowance includes reasoning tokens as well as reply text.
+            max_tokens=256,
+            audit_parent=LLMAuditParent.for_operation(operation_id=operation_id, coordination_token=coordination_token),
         )
-        try:
-            request_body: dict[str, Any] = {
-                "model": model,
-                "messages": wire_messages([ChatMessage(role="user", content="This is a pre-flight smoke test. Please reply with ok.")]),
-                "temperature": 0.0,
-                # Underlying providers behind OpenRouter enforce different minimums
-                # on max_output_tokens. Azure-backed routes require >= 16; values
-                # below that 400 with "integer_below_min_value". 32 gives margin
-                # without materially affecting smoke-test cost.
-                "max_tokens": 32,
-            }
-            response = http_client.post(
-                "/chat/completions",
-                json=request_body,
-                headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
-            _validate_chat_completion_response(response)
-        except httpx.HTTPStatusError as e:
-            status_code = e.response.status_code
-            detail = _summarize_http_error_body(e)
-            if status_code == 429:
-                raise RateLimitError(f"Rate limited (HTTP {status_code}){detail}") from e
-            if status_code >= 500:
-                raise ServerError(f"Server error (HTTP {status_code}){detail}") from e
-            raise LLMClientError(f"HTTP {status_code}{detail}", retryable=False) from e
-        except httpx.RequestError as e:
-            raise NetworkError(f"Network error: {e}") from e
-        finally:
-            http_client.close()
 
     def _get_http_client(self, audit_parent: LLMAuditParent) -> AuditedHTTPClient:
         """Get or create AuditedHTTPClient for an audit parent (thread-safe).
@@ -591,6 +637,7 @@ class OpenRouterLLMProvider:
                     base_url=self._base_url,
                     headers=self._request_headers,
                     limiter=self._limiter,
+                    call_mode_session=self._call_mode_session,
                     **audit_parent.client_kwargs(),
                 )
                 self._http_client_refs[cache_key] = 0

@@ -87,7 +87,10 @@ are *roles*, not data to distribute. They belong to a single elected
 row (one per run, created by `begin_run`). Followers claim READY work,
 process transforms, and dispose via the existing lease-fenced verbs; they
 hold no run-long memory that gates completion, so run quiescence is fully
-DB-derivable. Distributing ingest, barriers, or sinks would each need its own
+DB-derivable. A follower retries transient failures under the run's own
+`settings.retry` (equal to the leader's by the admission config_hash), and a
+re-claim after a lease rotation starts above the token's recorded node_state
+attempts (amended 2026-09-26). Distributing ingest, barriers, or sinks would each need its own
 ADR (ADR-026 already requires one for concurrent source iteration).
 
 Uniformity rule: every run, including N=1, runs the full protocol (seat at

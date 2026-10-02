@@ -2,10 +2,12 @@
 """Tests for plugin protocols."""
 
 from collections.abc import Iterator, Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 from elspeth.contracts import Determinism, PipelineRow, SourceRow
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.testing import make_contract, make_pipeline_row
 from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import make_factory
@@ -166,6 +168,24 @@ class TestTransformProtocol:
 
         class DoubleTransform:
             name = "double"
+
+            @property
+            def declared_read_fields(self) -> frozenset[str]:
+                # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+                return frozenset(self.declared_input_fields)
+
+            @property
+            def declared_created_fields(self) -> frozenset[str]:
+                # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+                return frozenset(self.declared_output_fields)
+
+            def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+                # TransformProtocol stamp table: this fake publishes no declared output types.
+                return {}
+
+            def carried_output_sources(self) -> dict[str, str]:
+                return {}
+
             input_schema = InputSchema
             output_schema = OutputSchema
             routes: ClassVar[dict[str, str]] = {}
@@ -176,6 +196,8 @@ class TestTransformProtocol:
             source_file_hash: str | None = None
             is_batch_aware = False  # Batch support (structural aggregation)
             supports_row_mode_when_batch_aware = False  # Batch-aware transforms only
+            requires_aggregation_batch_context = False  # Reads ctx.aggregation_batch (aggregation-only)
+            flush_emits_one_row_per_buffered_row = False  # One output row per buffered row (passthrough-capable)
             requires_runtime_preflight = False  # Optional engine-time readiness check
             creates_tokens = False  # Deaggregation (multi-row output)
             passes_through_input = False  # ADR-007: pass-through contract flag
@@ -185,6 +207,8 @@ class TestTransformProtocol:
             # rewritten. Fail-closed default, mirroring BaseTransform.
             preserves_input_values = False
             removed_input_fields = frozenset()
+            renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+            header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
             can_drop_rows = False  # ADR-012: empty-emission governance flag
             declared_input_fields: frozenset[str] = frozenset()
             declared_string_input_fields: frozenset[str] = frozenset()  # elspeth-b19dfe41fb string-scan surface

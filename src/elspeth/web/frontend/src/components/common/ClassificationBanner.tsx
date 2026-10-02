@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 /**
  * Operator-declared protective-marking banner (PSPF markings up to PROTECTED,
  * plus the CABINET caveat). Declared server-side via

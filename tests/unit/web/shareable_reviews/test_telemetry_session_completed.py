@@ -42,6 +42,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from elspeth.web.shareable_reviews.service import ShareableReviewService
 from elspeth.web.shareable_reviews.signer import ShareTokenSigner
+from tests.fixtures.identities import ensure_test_identity
 
 _VALID_SIGNING_KEY = b"k" * 32
 
@@ -115,6 +116,7 @@ class _ReadinessServiceFake:
 @dataclass(frozen=True, slots=True)
 class _ShareReviewSettingsFake:
     shareable_link_lifetime_seconds: int
+    compartment_id: str | None
 
 
 @pytest.fixture
@@ -176,6 +178,8 @@ def session_engine_with_row(  # type: ignore[no-untyped-def]
     """Insert the parent session + composition_state rows so the FK on
     ``composer_completion_events`` resolves at audit-insert time.
     """
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=session_record.user_id)
     authority = SQLiteLocalSessionOperationAuthority(engine)
     monkeypatch.setattr(coordination_repository, "_new_session_id", lambda: session_record.id)
     created = authority.create_session_with_initial_fence(
@@ -286,7 +290,7 @@ def _build_service_with_fresh_telemetry(  # type: ignore[no-untyped-def]
     session_service = _SessionServiceFake(session_record=session_record, state_record=state_record)
     execution_service = _ExecutionServiceFake(validation=_ok_validation())
     readiness_service = _ReadinessServiceFake(readiness=readiness)
-    settings = _ShareReviewSettingsFake(shareable_link_lifetime_seconds=30 * 24 * 3600)
+    settings = _ShareReviewSettingsFake(shareable_link_lifetime_seconds=30 * 24 * 3600, compartment_id="own")
 
     telemetry = build_sessions_telemetry()
 

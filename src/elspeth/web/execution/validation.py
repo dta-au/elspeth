@@ -43,6 +43,7 @@ from elspeth.web.composer.state import (
     CompositionState,
 )
 from elspeth.web.composer.yaml_generator import LoweredPipelineDocument
+from elspeth.web.config import WebSettings
 from elspeth.web.execution._validation_authoring import (
     _DEFAULT_PLUGIN_POLICY_SUGGESTION as _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION,
 )
@@ -80,9 +81,14 @@ from elspeth.web.execution._validation_materialization import (
     validate_llm_base_url_policy,
     validate_llm_retry_budget_policy,
     validate_llm_tracing_policy,
-    validate_managed_identity_policy,
 )
-from elspeth.web.execution._validation_model import PhaseFailure, PhaseReport, _blocked_readiness
+from elspeth.web.execution._validation_model import (
+    AuthoredValidatedState,
+    InterpretationValidatedState,
+    PhaseFailure,
+    PhaseReport,
+    _blocked_readiness,
+)
 from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
 from elspeth.web.execution._validation_runtime import (
     _GraphBuilder,
@@ -109,16 +115,20 @@ from elspeth.web.execution.preflight import (
 )
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import (
+    CHECK_INTERPRETATION_REVIEW,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
     CHECK_SETTINGS,
     CHECK_VALUE_SOURCE_COMPLIANCE,
     VALIDATION_BLOCKING_CHECK_NAMES,
+    SemanticEdgeContractResponse,
     ValidationCheck,
     ValidationError,
     ValidationReadiness,
     ValidationResult,
 )
 from elspeth.web.interpretation_state import (
+    INTERPRETATION_REVIEW_DRIFT_CODE,
+    InterpretationReviewIntegrityError,
     InterpretationReviewPending,
     materialize_state_for_authoring,
     materialize_state_for_execution,
@@ -172,6 +182,62 @@ _DEFAULT_PLUGIN_POLICY_SUGGESTION = _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION
 def _apply_phase[T](ledger: ValidationLedger, outcome: PhaseReport[T] | PhaseFailure) -> T:
     """Apply one typed outcome; failures terminate through ``PhaseTermination``."""
     return outcome.apply(ledger)
+
+
+def _interpretation_review_drift_failure(
+    exc: InterpretationReviewIntegrityError,
+    *,
+    semantic_contracts: tuple[SemanticEdgeContractResponse, ...],
+) -> PhaseFailure:
+    """Readiness failure for resolved review evidence the strict materializer refused.
+
+    /execute maps the same error to a structured 409; here it becomes the
+    interpretation-review check's failure so /validate reports a blocker
+    instead of letting the exception escape as a 500. Fixed copy naming the
+    component and review kind: the raw integrity message (hash domains) is
+    not carried. The review is deliberately NOT reopened — re-approving over
+    drifted evidence is an operator ruling, not a validation side effect.
+    """
+    detail = f"The approved {exc.kind.value} review for {exc.component_type} {exc.component_id!r} no longer matches the current pipeline."
+    return PhaseFailure(
+        passed_checks=(),
+        failed_check=ValidationCheck(
+            name=CHECK_INTERPRETATION_REVIEW,
+            passed=False,
+            detail=detail,
+            affected_nodes=(exc.component_id,) if exc.component_type == "transform" else (),
+            outcome_code=None,
+        ),
+        errors=(
+            ValidationError(
+                component_id=exc.component_id,
+                component_type=exc.component_type,
+                message=detail,
+                suggestion=("Restore the reviewed value, or replace this component so its review is staged again, before running."),
+                error_code=INTERPRETATION_REVIEW_DRIFT_CODE,
+            ),
+        ),
+        readiness=_blocked_readiness(
+            code=INTERPRETATION_REVIEW_DRIFT_CODE,
+            detail=detail,
+            component_id=exc.component_id,
+            component_type=exc.component_type,
+            authoring_valid=True,
+        ),
+        semantic_contracts=semantic_contracts,
+    )
+
+
+def _review_interpretations_or_drift_failure(
+    authored: AuthoredValidatedState,
+    *,
+    allow_pending_placeholders: bool,
+) -> PhaseReport[InterpretationValidatedState] | PhaseFailure:
+    """The interpretation-review phase outcome, with resolved-review drift as its failure."""
+    try:
+        return review_interpretations(authored, allow_pending_placeholders=allow_pending_placeholders)
+    except InterpretationReviewIntegrityError as exc:
+        return _interpretation_review_drift_failure(exc, semantic_contracts=authored.semantic_contracts)
 
 
 def _build_edge_contract_suggestion(
@@ -235,7 +301,7 @@ def _identity_state_for_compiled_ids(authored_state: CompositionState) -> Compos
     hashes the strictly materialized authored options, and hashing those same
     bytes from both preflight lanes is what keeps ids stable across the
     tolerant/strict seam (elspeth-ba01834a57 seam B — the tolerant materializer
-    masks placeholders and omits ``resolved_prompt_template_hash``, so
+    masks placeholders and omits ``approved_prompt_artifact_hash``, so
     lane-local materialization would mint a different id per lane). Only when
     strict materialization is impossible on the tolerant lane does identity
     fall back to the authoring-masked state: such a state cannot execute yet,
@@ -358,6 +424,7 @@ def validate_pipeline(
     secret_wiring_policy: SecretWiringPolicy | None = None,
     user_id: str | None = None,
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
+    blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
     allow_pending_interpretation_placeholders: bool = False,
     session_id: str | None = None,
 ) -> ValidationResult:
@@ -381,6 +448,7 @@ def validate_pipeline(
         secret_wiring_policy=secret_wiring_policy,
         user_id=user_id,
         blob_get_metadata=blob_get_metadata,
+        blob_get_content=blob_get_content,
         allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
         session_id=session_id,
     )
@@ -398,6 +466,7 @@ def _validate_pipeline_impl(
     secret_wiring_policy: SecretWiringPolicy | None = None,
     user_id: str | None = None,
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
+    blob_get_content: Callable[[UUID], tuple[BlobRecord, bytes]] | None = None,
     allow_pending_interpretation_placeholders: bool = False,
     session_id: str | None = None,
     dependencies: ValidationDependencies,
@@ -434,9 +503,9 @@ def _validate_pipeline_impl(
         yaml_generator: YamlGenerator module/object with generate_yaml() method.
         secret_service: Optional secret resolver for validating secret refs.
         user_id: User ID for scoped secret resolution (required if secret_service is set).
-        blob_get_metadata: Optional sync metadata lookup for validate-time
-            inline-content blob checks. Runtime content reads stay in the
-            execution preflight; validate checks metadata only.
+        blob_get_metadata: Sync metadata lookup scoped to this session and fence.
+        blob_get_content: Sync verified metadata/content read under the same
+            session fence. Inline markers fail readiness when this is absent.
         allow_pending_interpretation_placeholders: When true, composer
             authoring preflight masks unresolved ``{{interpretation:<term>}}``
             tokens before YAML generation. Runtime execution leaves this false.
@@ -527,7 +596,7 @@ def _validate_pipeline_impl(
     )
     interpretation_validated = _apply_phase(
         ledger,
-        review_interpretations(
+        _review_interpretations_or_drift_failure(
             batch_validated,
             allow_pending_placeholders=allow_pending_interpretation_placeholders,
         ),
@@ -540,16 +609,13 @@ def _validate_pipeline_impl(
             data_dir=settings.data_dir,
             session_id=session_id,
             blob_get_metadata=blob_get_metadata,
+            blob_get_content=blob_get_content,
             load_yaml=dependencies.load_yaml,
         ),
     )
-    managed_identity_validated = _apply_phase(
-        ledger,
-        validate_managed_identity_policy(materialized),
-    )
     retry_budget_validated = _apply_phase(
         ledger,
-        validate_llm_retry_budget_policy(managed_identity_validated),
+        validate_llm_retry_budget_policy(materialized),
     )
     base_url_validated = _apply_phase(
         ledger,
@@ -577,6 +643,7 @@ def _validate_pipeline_impl(
         ledger,
         load_runtime_settings(
             provider_validated,
+            operator_settings=settings if isinstance(settings, WebSettings) else None,
             secret_service=secret_service,
             user_id=user_id,
             load_yaml=dependencies.load_yaml,
@@ -726,6 +793,7 @@ def _trained_operator_validation_context(
         usable_profile_aliases=plugin_snapshot.usable_profile_aliases,
         selected_profile_aliases=plugin_snapshot.selected_profile_aliases,
         control_modes=plugin_snapshot.control_modes,
+        power_automate_allowed_origins=plugin_snapshot.power_automate_allowed_origins,
         binding_generation_fingerprint=plugin_snapshot.binding_generation_fingerprint,
         authority=PluginSnapshotAuthority.TRAINED_OPERATOR,
     )

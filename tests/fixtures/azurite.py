@@ -16,12 +16,12 @@ import pytest
 
 
 def _find_azurite_bin() -> str | None:
-    """Locate the Azurite CLI binary."""
+    """Locate the blob-only Azurite CLI binary."""
     repo_root = Path(__file__).resolve().parents[2]
-    local_bin = repo_root / "node_modules" / ".bin" / "azurite"
+    local_bin = repo_root / "node_modules" / ".bin" / "azurite-blob"
     if local_bin.exists():
         return str(local_bin)
-    return shutil.which("azurite")
+    return shutil.which("azurite-blob")
 
 
 def _get_free_port() -> int:

@@ -15,9 +15,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
+from tests.fixtures.mock_audit import mock_audit_authority, mock_item_audit_authority
+
 chromadb = pytest.importorskip("chromadb")
 
-from elspeth.contracts.enums import CallStatus, CallType  # noqa: E402
+from elspeth.contracts.call_mode import CallModeSession, ReplayCallEvidence  # noqa: E402
+from elspeth.contracts.enums import CallStatus, CallType, RunMode  # noqa: E402
 from elspeth.core.security.web import SSRFSafeRequest  # noqa: E402
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError  # noqa: E402
 from elspeth.plugins.infrastructure.clients.retrieval.chroma import (  # noqa: E402
@@ -38,8 +43,10 @@ class _RecordedCall:
 class _FakeExecutionRecorder:
     call_indices: dict[str, int] = field(default_factory=dict)
     recorded_calls: list[dict[str, Any]] = field(default_factory=list)
+    operation_calls: list[dict[str, Any]] = field(default_factory=list)
+    operation_index_tokens: list[CoordinationToken] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         index = self.call_indices.get(state_id, 0)
         self.call_indices[state_id] = index + 1
         return index
@@ -47,6 +54,14 @@ class _FakeExecutionRecorder:
     def record_call(self, **kwargs: Any) -> _RecordedCall:
         self.recorded_calls.append(kwargs)
         return _RecordedCall(call_id=f"call-{len(self.recorded_calls)}")
+
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
+        self.operation_index_tokens.append(coordination_token)
+        return len(self.operation_calls)
+
+    def record_operation_call(self, **kwargs: Any) -> _RecordedCall:
+        self.operation_calls.append(kwargs)
+        return _RecordedCall(call_id=f"operation-call-{len(self.operation_calls)}")
 
     def only_recorded_call(self) -> dict[str, Any]:
         assert len(self.recorded_calls) == 1
@@ -299,6 +314,7 @@ class TestChromaSearchProvider:
             "programming languages",
             top_k=2,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id="token-1",
         )
@@ -312,6 +328,7 @@ class TestChromaSearchProvider:
             "topic",
             top_k=5,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -329,6 +346,7 @@ class TestChromaSearchProvider:
             "exact match for the query text",
             top_k=10,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -336,6 +354,7 @@ class TestChromaSearchProvider:
             "exact match for the query text",
             top_k=10,
             min_score=0.9,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -347,6 +366,7 @@ class TestChromaSearchProvider:
             "retrieval",
             top_k=3,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -358,6 +378,7 @@ class TestChromaSearchProvider:
             "anything",
             top_k=5,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -386,6 +407,7 @@ class TestChromaSearchProvider:
             "test document",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -402,6 +424,7 @@ class TestChromaSearchProvider:
             "test content",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -490,6 +513,7 @@ class TestChromaSearchProvider:
             "document",
             top_k=5,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -516,6 +540,7 @@ class TestChromaSearchProvider:
             "test",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id="token-1",
         )
@@ -542,6 +567,7 @@ class TestChromaScoreNormalization:
             "test document",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="s1",
             token_id=None,
         )
@@ -553,6 +579,7 @@ class TestChromaScoreNormalization:
             "test document",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="s1",
             token_id=None,
         )
@@ -564,6 +591,7 @@ class TestChromaScoreNormalization:
             "test document",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="s1",
             token_id=None,
         )
@@ -601,6 +629,7 @@ class TestCallTypeCorrectness:
             "test",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id="token-1",
         )
@@ -628,7 +657,7 @@ class TestTier3ResultBoundary:
             patch.object(provider._collection, "query", return_value={"ids": [["doc1"]]}),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
     def test_non_mapping_metadata_raises_retrieval_error(self):
         """A truthy non-mapping metadata from a corrupt index must become RetrievalError.
@@ -658,7 +687,7 @@ class TestTier3ResultBoundary:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
     def test_none_inner_list_raises_retrieval_error(self):
         """If SDK returns None where inner list expected, should get RetrievalError."""
@@ -681,7 +710,7 @@ class TestTier3ResultBoundary:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
     def test_none_distances_raises_retrieval_error(self):
         """If SDK returns None for distances inner list, should get RetrievalError."""
@@ -704,7 +733,7 @@ class TestTier3ResultBoundary:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
     @pytest.mark.parametrize(
         "results",
@@ -756,7 +785,7 @@ class TestTier3ResultBoundary:
             patch.object(provider._collection, "query", return_value=results),
             pytest.raises(RetrievalError, match=r"structure|metadata|document ID"),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -848,7 +877,7 @@ class TestDistanceTypeValidation:
             ),
             pytest.raises(RetrievalError, match=r"non-numeric distance.*collection may need to be rebuilt"),
         ):
-            provider.search("test", top_k=2, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=2, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
 
 class TestPostQueryFailureAudit:
@@ -877,7 +906,7 @@ class TestPostQueryFailureAudit:
             patch.object(provider._collection, "query", return_value={"ids": [["doc1"]]}),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -908,7 +937,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -939,7 +968,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -965,7 +994,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -1001,7 +1030,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError, match="mismatched"),
         ):
-            provider.search("test", top_k=2, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=2, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -1037,7 +1066,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -1066,7 +1095,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError, match="metadata"),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -1098,7 +1127,7 @@ class TestDocTypeValidation:
                 "metadatas": [[{}, {}]],
             },
         ):
-            chunks = provider.search("test", top_k=2, min_score=0.0, state_id="s1", token_id=None)
+            chunks = provider.search("test", top_k=2, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
             # Non-string doc should be skipped; only "real doc" should appear
             assert all(isinstance(c.content, str) for c in chunks)
             assert len(chunks) == 1
@@ -1131,7 +1160,7 @@ class TestDocTypeValidation:
                 "metadatas": [[{}]],
             },
         ):
-            chunks = provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            chunks = provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert len(chunks) == 1
         assert provider.last_skipped_count == 0
@@ -1260,7 +1289,7 @@ class TestCountErrorBoundary:
         provider._collection = _FailingCountCollection(ConnectionError("refused"))
 
         with pytest.raises(RetrievalError) as exc_info:
-            provider.search("query", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("query", top_k=5, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         # Must be retryable (transient infrastructure failure)
         assert exc_info.value.retryable is True
@@ -1275,7 +1304,7 @@ class TestCountErrorBoundary:
         provider._collection = _FailingCountCollection(chromadb.errors.NotFoundError("collection gone"))
 
         with pytest.raises(RetrievalError) as exc_info:
-            provider.search("query", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("query", top_k=5, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         # NotFoundError is permanent
         assert exc_info.value.retryable is False
@@ -1290,7 +1319,7 @@ class TestCountErrorBoundary:
         provider._collection = _FailingCountCollection(TypeError("bad argument"))
 
         with pytest.raises(TypeError, match="bad argument"):
-            provider.search("query", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("query", top_k=5, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
     @pytest.mark.parametrize("bad_count", [True, -1, 1.5, "1"])
     def test_malformed_count_is_audited_retrieval_error(self, bad_count: object) -> None:
@@ -1298,7 +1327,7 @@ class TestCountErrorBoundary:
         provider._collection = _RawCountCollection(bad_count)
 
         with pytest.raises(RetrievalError, match="count"):
-            provider.search("query", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("query", top_k=5, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -1329,6 +1358,214 @@ class TestNegativeL2DistanceBoundary:
             ),
             pytest.raises(RetrievalError, match="negative"),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
+
+
+class TestChromaCallMode:
+    def test_verify_readiness_rejects_source_before_sdk_construction(self) -> None:
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.VERIFY
+        session.admit_verify_call.side_effect = RuntimeError("missing source readiness")
+        with patch("elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.Client") as client:
+            provider = ChromaSearchProvider(
+                config=ChromaSearchProviderConfig(collection="missing-source"),
+                execution=_fake_execution(),
+                run_id="verify-run",
+                call_mode_session=session,
+            )
+            with pytest.raises(RuntimeError, match="missing source readiness"):
+                provider.runtime_preflight(operation_id="operation-1", coordination_token=mock_audit_authority()["coordination_token"])
+            client.assert_not_called()
+
+    def test_verify_search_rejects_source_before_sdk_construction(self) -> None:
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.VERIFY
+        session.admit_verify_call.side_effect = RuntimeError("ambiguous source search")
+        with patch("elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.Client") as client:
+            provider = ChromaSearchProvider(
+                config=ChromaSearchProviderConfig(collection="ambiguous-source"),
+                execution=_fake_execution(),
+                run_id="verify-run",
+                call_mode_session=session,
+            )
+            with pytest.raises(RuntimeError, match="ambiguous source search"):
+                provider.search("query", 1, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+            client.assert_not_called()
+
+    def test_verify_readiness_records_and_compares_collection_count(self) -> None:
+        collection_name = f"ready-{uuid.uuid4().hex[:12]}"
+        collection = chromadb.Client().get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
+        collection.add(documents=["ready text"], ids=["doc-1"])
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.VERIFY
+        execution = _fake_execution()
+        provider = ChromaSearchProvider(
+            config=ChromaSearchProviderConfig(collection=collection_name),
+            execution=execution,
+            run_id="verify-run",
+            call_mode_session=session,
+        )
+        token = mock_audit_authority(run_id="verify-run")["coordination_token"]
+        readiness = provider.runtime_preflight(operation_id="operation-1", coordination_token=token)
+        assert readiness.count == 1
+        assert execution.operation_index_tokens == [token]
+        assert execution.operation_calls[0]["coordination_token"] is token
+        assert execution.operation_calls[0]["response_data"].to_dict() == {"collection_count": 1}
+        session.admit_verify_call.assert_called_once()
+        session.verify_call.assert_called_once()
+        assert session.verify_call.call_args.kwargs["current_operation_id"] == "operation-1"
+
+    def test_verify_compares_retained_ordered_chunks(self) -> None:
+        collection_name = f"verify-{uuid.uuid4().hex[:12]}"
+        collection = chromadb.Client().get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
+        collection.add(documents=["verified text"], ids=["doc-1"])
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.VERIFY
+        execution = _fake_execution()
+        provider = ChromaSearchProvider(
+            config=ChromaSearchProviderConfig(collection=collection_name),
+            execution=execution,
+            run_id="verify-run",
+            call_mode_session=session,
+        )
+        chunks = provider.search("verified text", 1, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+        assert chunks[0].content == "verified text"
+        session.admit_verify_call.assert_called_once()
+        session.verify_call.assert_called_once()
+        compared = session.verify_call.call_args.kwargs["live_response_data"]
+        assert compared["chunks"][0]["content"] == "verified text"
+        assert compared["chunks"][0]["source_id"] == "doc-1"
+
+    def test_replay_reconstructs_chunks_without_constructing_sdk_client(self) -> None:
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.REPLAY
+        session.replay_call.return_value = ReplayCallEvidence(
+            source_call_id="source-vector",
+            status=CallStatus.SUCCESS,
+            response_data={
+                "result_count": 1,
+                "skipped_count": 1,
+                "top_score": 0.75,
+                "collection_count": 2,
+                "chunks": [{"content": "retained text", "score": 0.75, "source_id": "doc-1", "metadata": {"section": 2}}],
+                "skipped_items": [{"reason": "empty_content", "id": "doc-2"}],
+            },
+            error_data=None,
+            latency_ms=4,
+        )
+        execution = _fake_execution()
+        with patch("elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.Client") as client:
+            provider = ChromaSearchProvider(
+                config=ChromaSearchProviderConfig(collection="retained-col"),
+                execution=execution,
+                run_id="replay-run",
+                call_mode_session=session,
+            )
+            chunks = provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+        client.assert_not_called()
+        assert [(c.content, c.score, c.source_id) for c in chunks] == [("retained text", 0.75, "doc-1")]
+        assert provider.last_skipped_reasons == [{"reason": "empty_content", "id": "doc-2"}]
+        assert execution.only_recorded_call()["source_call_id"] == "source-vector"
+
+    def test_replay_rejects_old_summary_only_vector_record_without_sdk_call(self) -> None:
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.REPLAY
+        session.replay_call.return_value = ReplayCallEvidence(
+            source_call_id="old-vector",
+            status=CallStatus.SUCCESS,
+            response_data={"result_count": 1, "skipped_count": 0, "top_score": 0.8},
+            error_data=None,
+            latency_ms=1,
+        )
+        execution = _fake_execution()
+        with patch("elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.Client") as client:
+            provider = ChromaSearchProvider(
+                config=ChromaSearchProviderConfig(collection="retained-col"),
+                execution=execution,
+                run_id="replay-run",
+                call_mode_session=session,
+            )
+            with pytest.raises(RetrievalError, match="complete chunk"):
+                provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+        client.assert_not_called()
+        assert execution.recorded_calls == []
+
+    def test_replay_rejects_corrupt_top_score_before_new_call(self) -> None:
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.REPLAY
+        session.replay_call.return_value = ReplayCallEvidence(
+            source_call_id="corrupt-vector",
+            status=CallStatus.SUCCESS,
+            response_data={
+                "result_count": 1,
+                "skipped_count": 0,
+                "top_score": 0.1,
+                "collection_count": 1,
+                "chunks": [{"content": "retained text", "score": 0.75, "source_id": "doc-1", "metadata": {}}],
+                "skipped_items": [],
+            },
+            error_data=None,
+            latency_ms=1,
+        )
+        execution = _fake_execution()
+        provider = ChromaSearchProvider(
+            config=ChromaSearchProviderConfig(collection="retained-col"),
+            execution=execution,
+            run_id="replay-run",
+            call_mode_session=session,
+        )
+        with pytest.raises(RetrievalError, match="summary disagrees"):
+            provider.search("query", 5, 0.0, **mock_item_audit_authority(), state_id="state-1", token_id=None)
+        assert execution.recorded_calls == []
+
+    def test_replay_readiness_uses_archived_operation_count(self) -> None:
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.REPLAY
+        session.replay_call.return_value = ReplayCallEvidence(
+            source_call_id="source-readiness",
+            status=CallStatus.SUCCESS,
+            response_data={"collection_count": 3},
+            error_data=None,
+            latency_ms=1,
+        )
+        execution = _fake_execution()
+        with patch("elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.Client") as client:
+            provider = ChromaSearchProvider(
+                config=ChromaSearchProviderConfig(collection="retained-col"),
+                execution=execution,
+                run_id="replay-run",
+                call_mode_session=session,
+            )
+            readiness = provider.runtime_preflight(
+                operation_id="operation-1", coordination_token=mock_audit_authority()["coordination_token"]
+            )
+            with pytest.raises(RetrievalError, match="audited operation parent"):
+                provider.check_readiness()
+        client.assert_not_called()
+        assert readiness.count == 3
+        assert execution.operation_calls[0]["source_call_id"] == "source-readiness"
+
+    def test_replay_readiness_rejects_missing_count_without_sdk_access(self) -> None:
+        session = MagicMock(spec=CallModeSession)
+        session.mode = RunMode.REPLAY
+        session.replay_call.return_value = ReplayCallEvidence(
+            source_call_id="old-readiness",
+            status=CallStatus.SUCCESS,
+            response_data={"reachable": True},
+            error_data=None,
+            latency_ms=1,
+        )
+        execution = _fake_execution()
+        with patch("elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.Client") as client:
+            provider = ChromaSearchProvider(
+                config=ChromaSearchProviderConfig(collection="retained-col"),
+                execution=execution,
+                run_id="replay-run",
+                call_mode_session=session,
+            )
+            with pytest.raises(RetrievalError, match="valid retained collection count"):
+                provider.runtime_preflight(operation_id="operation-1", coordination_token=mock_audit_authority()["coordination_token"])
+        client.assert_not_called()
+        assert execution.operation_calls == []

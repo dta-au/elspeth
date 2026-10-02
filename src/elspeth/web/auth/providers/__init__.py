@@ -103,6 +103,9 @@ class IdPProfile:
     id_token_algorithms: tuple[str, ...] = ("RS256",)
     """Pinned. The validator never reads the algorithm from the token header."""
 
+    token_issuer_aliases: tuple[str, ...] = ()
+    """Exact additional token issuer spellings; discovery still uses resolve_issuer."""
+
     userinfo: bool = False
     """Whether a userinfo call is part of this profile's login."""
 
@@ -144,6 +147,10 @@ _GOOGLE = IdPProfile(
     # domain any Google account in the world is a valid login, so this is
     # required rather than defaulted.
     specific_required=("google_hosted_domain",),
+    # Discovery publishes the HTTPS issuer; Google's token contract also
+    # permits this exact spelling. It is not a discovery URL or origin alias.
+    # https://developers.google.com/identity/openid-connect/openid-connect
+    token_issuer_aliases=("accounts.google.com",),
 )
 _OIDC = IdPProfile(
     name="oidc",

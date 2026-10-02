@@ -74,6 +74,7 @@ class StartPermitState(StrEnum):
     PENDING = "pending"
     START_PERMITTED = "start_permitted"
     CANCELLED_BEFORE_PERMIT = "cancelled_before_permit"
+    REFUSED = "refused"
 
 
 class RunSagaState(StrEnum):
@@ -86,6 +87,7 @@ class RunSagaState(StrEnum):
     CANCEL_PENDING = "cancel_pending"
     TERMINAL = "terminal"
     TERMINAL_CANCELLED = "terminal_cancelled"
+    ADMISSION_REFUSAL_PENDING = "admission_refusal_pending"
 
 
 class CancellationSource(StrEnum):

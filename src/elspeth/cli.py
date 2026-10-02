@@ -17,13 +17,14 @@ import typer
 import yaml
 from dynaconf.vendor.ruamel.yaml.parser import ParserError as YamlParserError
 from dynaconf.vendor.ruamel.yaml.scanner import ScannerError as YamlScannerError
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 import elspeth.contracts.errors as contract_errors
 from elspeth import __version__
 from elspeth.config_loading import load_settings
 from elspeth.contracts import ExecutionResult, SecretResolutionInput
 from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import (
     AbandonRefusedError,
     CommencementGateFailedError,
@@ -31,28 +32,35 @@ from elspeth.contracts.errors import (
     EmptyResumeStateError,
     GracefulShutdownError,
     IncompleteSourceResumeError,
+    RunWorkerEvictedError,
+    VerificationMismatchError,
+    WriteLockHeldError,
 )
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.preflight import PreflightResult
 from elspeth.contracts.types import AggregationName
 from elspeth.core.checkpoint.recovery import NonResumableRunError
-from elspeth.core.config import ElspethSettings, SourceSettings, resolve_config
+from elspeth.core.config import ElspethSettings, resolve_config
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.security.config_secrets import SecretLoadError, load_secrets_from_config
+from elspeth.core.template_materialization import TemplateFileError
 from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
-    from elspeth.contracts import SinkProtocol, SourceProtocol
+    from elspeth.contracts import SinkProtocol
     from elspeth.contracts.coordination import WorkerMembershipToken
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.contracts.run_result import RunResult
+    from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
     from elspeth.core.config import SecretsConfig
     from elspeth.core.landscape import LandscapeDB
     from elspeth.core.rate_limit import RateLimitRegistry
     from elspeth.engine import Orchestrator, PipelineConfig
     from elspeth.engine.orchestrator import RowPlugin
+    from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateNonliveConstruction
     from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
     from elspeth.telemetry import TelemetryManager
     from elspeth.web.auth.audit import AuthAuditRecorder
@@ -71,14 +79,129 @@ app = typer.Typer(
 composer_app = typer.Typer(help="Composer web UI commands.")
 composer_users_app = typer.Typer(help="Local composer user management commands.")
 doctor_app = typer.Typer(help="Deployment readiness checks.")
+audit_export_app = typer.Typer(help="Verify delivered audit-export evidence.")
 app.add_typer(composer_app, name="composer")
 composer_app.add_typer(composer_users_app, name="users")
 app.add_typer(doctor_app, name="doctor")
+app.add_typer(audit_export_app, name="audit-export")
+
+
+def _parse_audit_export_key_references(values: list[str] | None) -> dict[str, str]:
+    """Parse exact signer-to-environment references without reading secrets."""
+    import re
+
+    from elspeth.contracts.audit_export import validate_credential_free_identifier
+
+    environment_reference = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
+    references: dict[str, str] = {}
+    for value in values or ():
+        if value.count("=") != 1:
+            raise typer.BadParameter(
+                "each key reference must be SIGNER_KEY_ID=ENVIRONMENT_VARIABLE",
+                param_hint="--key-ref",
+            )
+        signer_key_id, reference = value.split("=", 1)
+        try:
+            validate_credential_free_identifier(signer_key_id, "signer_key_id")
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--key-ref") from exc
+        if environment_reference.fullmatch(reference) is None:
+            raise typer.BadParameter(
+                "key reference values must be environment variable names",
+                param_hint="--key-ref",
+            )
+        if signer_key_id in references:
+            raise typer.BadParameter(
+                f"duplicate key reference for signer {signer_key_id!r}",
+                param_hint="--key-ref",
+            )
+        references[signer_key_id] = reference
+    return references
+
+
+@audit_export_app.command("verify")
+def verify_delivered_audit_export(
+    path: Path = typer.Argument(..., help="Delivered JSON file or portable CSV bundle directory."),
+    key_ref: list[str] | None = typer.Option(
+        None,
+        "--key-ref",
+        metavar="SIGNER_KEY_ID=ENVIRONMENT_VARIABLE",
+        help="Retained signing-key reference. Repeat for every historical signer that may be verified.",
+    ),
+    allow_unsigned: bool = typer.Option(
+        False,
+        "--allow-unsigned",
+        help="Allow an integrity-only result for a deliberately unsigned export.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit one stable JSON result object."),
+) -> None:
+    """Verify the manifest, record chain, content hashes, and delivered files."""
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.core.audit_export_verifier import (
+        AuditExportVerificationError,
+        environment_audit_export_verification_key_resolver,
+        verify_audit_export,
+    )
+
+    references = _parse_audit_export_key_references(key_ref)
+    resolver = environment_audit_export_verification_key_resolver(references) if references else None
+    try:
+        report = verify_audit_export(
+            path,
+            key_resolver=resolver,
+            require_authenticated=not allow_unsigned,
+        )
+    except AuditExportVerificationError as exc:
+        failure_code = exc.code
+        failure_message = str(exc)
+    except (AuditIntegrityError, OSError) as exc:
+        failure_code = "invalid_export"
+        failure_message = str(exc)
+    else:
+        payload = {
+            "authenticated": report.authenticated,
+            "artifact_digest": report.artifact_digest,
+            "chunk_content_hashes": list(report.chunk_content_hashes),
+            "chunk_count": report.chunk_count,
+            "code": "ok",
+            "format": report.format,
+            "manifest_content_hash": report.manifest_content_hash,
+            "record_count": report.record_count,
+            "run_id": report.run_id,
+            "signer_key_id": report.signer_key_id,
+            "snapshot_id": report.snapshot_id,
+            "status": "verified",
+            "total_bytes": report.total_bytes,
+        }
+        if json_output:
+            typer.echo(json.dumps(payload, sort_keys=True))
+        else:
+            authentication = "authenticated" if report.authenticated else "integrity-only (authenticated: false)"
+            typer.echo(
+                f"VERIFIED {authentication}: format={report.format} run_id={report.run_id} "
+                f"snapshot_id={report.snapshot_id} signer={report.signer_key_id} "
+                f"artifact_digest={report.artifact_digest}"
+            )
+        return
+
+    failure = {
+        "authenticated": False,
+        "code": failure_code,
+        "message": failure_message,
+        "status": "failed",
+    }
+    if json_output:
+        typer.echo(json.dumps(failure, sort_keys=True))
+    else:
+        typer.echo(f"FAILED [{failure_code}]: {failure_message}", err=True)
+    raise typer.Exit(1)
 
 
 def _preflight_follower_sink_effects(
     sinks: Mapping[str, SinkProtocol],
     configured_modes: Mapping[str, str],
+    *,
+    runtime_bindings: Mapping[str, SinkEffectRuntimeBinding] | None = None,
 ) -> object:
     """Fail closed over resolved follower sinks before any startup work."""
     from elspeth.contracts.sink_effects import SinkEffectInputKind
@@ -88,6 +211,7 @@ def _preflight_follower_sink_effects(
         sinks,
         configured_modes=configured_modes,
         required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        runtime_bindings=runtime_bindings,
     )
 
 
@@ -100,6 +224,7 @@ def _start_follower_plugin_lifecycle(
     ctx: PluginContext,
     started_transforms: list[RowPlugin] | None = None,
     started_sinks: dict[str, SinkProtocol] | None = None,
+    runtime_bindings: Mapping[str, SinkEffectRuntimeBinding] | None = None,
 ) -> None:
     """Consume admission and optionally record successfully-started plugins."""
     from elspeth.contracts.sink_effects import SinkEffectInputKind
@@ -110,6 +235,8 @@ def _start_follower_plugin_lifecycle(
         configured_modes=configured_modes,
         required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
         admission=admission,
+        runtime_bindings=runtime_bindings,
+        run_mode=ctx.run_mode,
     )
     for transform in transforms:
         transform.on_start(ctx)
@@ -125,6 +252,7 @@ def _instantiate_plugins_for_runtime_preflight(
     settings: ElspethSettings,
     *,
     purpose: object | None = None,
+    power_automate_nonlive: PowerAutomateNonliveConstruction | None = None,
 ) -> PluginBundle:
     """Construct runtime plugins under the constructor-safe preflight posture."""
     from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
@@ -133,6 +261,13 @@ def _instantiate_plugins_for_runtime_preflight(
     resolved_purpose = SinkEffectExecutionPurpose.FRESH if purpose is None else purpose
     if not isinstance(resolved_purpose, SinkEffectExecutionPurpose):
         raise TypeError("Runtime preflight purpose must be exact SinkEffectExecutionPurpose")
+    if power_automate_nonlive is not None:
+        return instantiate_plugins_from_config(
+            settings,
+            preflight_mode=True,
+            sink_effect_purpose=resolved_purpose,
+            power_automate_nonlive=power_automate_nonlive,
+        )
     return instantiate_plugins_from_config(
         settings,
         preflight_mode=True,
@@ -308,6 +443,22 @@ def _emit_schema_compatibility_error(
     typer.echo(str(error), err=True)
 
 
+def _emit_worker_evicted_event(error: RunWorkerEvictedError, output_format: Literal["console", "json"]) -> None:
+    """Carry observed coordination loss to both CLI consumers."""
+    if output_format == "json":
+        payload = {
+            "event": "evicted",
+            "run_id": error.run_id,
+            "worker_id": error.worker_id,
+            "message": str(error),
+        }
+        if error.reason is not None:
+            payload["reason"] = error.reason
+        typer.echo(json.dumps(payload), err=True)
+    else:
+        typer.echo(str(error), err=True)
+
+
 @app.callback()
 def main(
     version: bool | None = typer.Option(
@@ -363,6 +514,7 @@ def _ensure_output_directories(
     config: ElspethSettings,
     *,
     execution_sink_names: Collection[str] | None = None,
+    include_sink_directories: bool = True,
 ) -> list[str]:
     """Ensure required output directories exist, creating them if needed.
 
@@ -433,6 +585,8 @@ def _ensure_output_directories(
         errors.append(f"Payload store directory is not writable: {payload_path.resolve()}")
 
     # 3. Ensure sink output directories exist (for file-based sinks)
+    if not include_sink_directories:
+        return errors
     for sink_name, sink_config in config.sinks.items():
         if execution_sink_names is not None and sink_name not in execution_sink_names:
             continue
@@ -455,6 +609,194 @@ def _ensure_output_directories(
                     errors.append(f"Sink '{sink_name}' output path parent exists but is not a directory: {resolved_sink_parent}")
 
     return errors
+
+
+def _admit_cli_nonlive_run(config: ElspethSettings) -> None:
+    """Check source-run authority before plugin construction or preflight I/O."""
+    if config.run_mode is RunMode.LIVE:
+        return
+    from elspeth.cli_helpers import resolve_audit_passphrase
+    from elspeth.contracts.call_mode import RuntimeRunMode
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_modes import admit_nonlive_settings, admit_source_run
+    from elspeth.plugins.infrastructure.run_mode_capabilities import (
+        admit_nonlive_plugin_classes,
+        precheck_nonlive_plugin_names,
+    )
+
+    admit_nonlive_settings(config)
+    precheck_nonlive_plugin_names(config)
+    passphrase = resolve_audit_passphrase(config.landscape)
+    db = LandscapeDB.from_url(
+        config.landscape.url,
+        passphrase=passphrase,
+        create_tables=False,
+        read_only=True,
+    )
+    try:
+        admit_source_run(db, RuntimeRunMode(config.run_mode, config.replay_from))
+    finally:
+        db.close()
+    admit_nonlive_plugin_classes(config)
+
+
+def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[str], object | None]:
+    """Check source-run authority before secrets, file templates, or plugins."""
+    from sqlalchemy.engine.url import make_url
+
+    from elspeth.cli_helpers import resolve_audit_passphrase
+    from elspeth.contracts.call_mode import RuntimeRunMode
+    from elspeth.core.config import ConcurrencySettings, LandscapeSettings, TelemetrySettings
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
+    from elspeth.engine.orchestrator.run_modes import admit_source_run
+    from elspeth.plugins.infrastructure.run_mode_capabilities import precheck_nonlive_plugin_names_from_raw
+
+    raw_config = _load_raw_yaml(settings_path)
+    mode = _raw_run_mode_before_secrets(raw_config)
+    if mode is RunMode.LIVE:
+        return mode, frozenset(), None
+
+    # Dynaconf can change invocation authority via environment overrides.
+    # Require these fields in YAML so source-run admission uses the same DB and
+    # ID that the subsequent full settings load will see.
+    if any(name in os.environ for name in ("ELSPETH_REPLAY_FROM", "ELSPETH_LANDSCAPE", "ELSPETH_LANDSCAPE__URL")):
+        raise ValueError("Replay/verify source run and Landscape must be literal YAML settings")
+    forbidden_env_prefixes = (
+        "ELSPETH_CONCURRENCY",
+        "ELSPETH_DEPENDS_ON",
+        "ELSPETH_COLLECTION_PROBES",
+        "ELSPETH_COMMENCEMENT_GATES",
+        "ELSPETH_TELEMETRY",
+        "ELSPETH_SOURCES",
+        "ELSPETH_TRANSFORMS",
+        "ELSPETH_AGGREGATIONS",
+        "ELSPETH_COLLECTORS",
+        "ELSPETH_SINKS",
+    )
+    if any(name == prefix or name.startswith(f"{prefix}__") for name in os.environ for prefix in forbidden_env_prefixes):
+        raise ValueError("Replay/verify admission fields must be literal YAML settings")
+    secrets_config = _parse_raw_secrets_config(raw_config)
+    if secrets_config.source == "keyvault":
+        raise ValueError("Replay/verify cannot fetch Key Vault secrets")
+    requested_plugins = precheck_nonlive_plugin_names_from_raw(raw_config)
+    try:
+        replay_from = TypeAdapter(str).validate_python(raw_config.get("replay_from"), strict=True)
+    except ValidationError as exc:
+        raise ValueError("Replay/verify requires a literal replay_from run ID") from exc
+    if not replay_from.strip():
+        raise ValueError("Replay/verify requires a literal replay_from run ID")
+    raw_landscape = raw_config.get("landscape", {})
+    landscape = LandscapeSettings.model_validate(raw_landscape)
+    if landscape.export.enabled:
+        raise ValueError("Replay/verify with Landscape export is unsupported")
+    raw_concurrency = raw_config.get("concurrency", {})
+    if ConcurrencySettings.model_validate(raw_concurrency).max_workers != 1:
+        raise ValueError("Replay/verify requires concurrency.max_workers=1")
+    raw_telemetry = raw_config.get("telemetry", {})
+    if TelemetrySettings.model_validate(raw_telemetry).enabled:
+        raise ValueError("Replay/verify with telemetry exporters is unsupported")
+    for side_channel in ("depends_on", "collection_probes", "commencement_gates"):
+        if raw_config.get(side_channel):
+            raise ValueError(f"Replay/verify with {side_channel} is unsupported")
+    parsed_url = make_url(landscape.url)
+    if (
+        parsed_url.get_backend_name() == "sqlite"
+        and parsed_url.database is not None
+        and parsed_url.database != ":memory:"
+        and not parsed_url.database.startswith("file:")
+        and not Path(parsed_url.database).exists()
+    ):
+        raise contract_errors.OrchestrationInvariantError(f"Replay/verify source run {replay_from!r} does not exist")
+    db = LandscapeDB.from_url(
+        landscape.url,
+        passphrase=resolve_audit_passphrase(landscape),
+        create_tables=False,
+        read_only=True,
+    )
+    try:
+        admit_source_run(db, RuntimeRunMode(mode, replay_from))
+        from elspeth.contracts.json_parser import parse_json_strict
+
+        source = RecorderFactory.read_only(db).run_lifecycle.get_run(replay_from)
+        if source is None:
+            raise ValueError(f"Replay/verify source run {replay_from!r} disappeared during admission")
+        source_settings, parse_error = parse_json_strict(source.settings_json)
+        if parse_error is not None or type(source_settings) is not dict:
+            raise ValueError(f"Replay/verify source run {replay_from!r} has invalid settings_json")
+        from elspeth.plugins.infrastructure.power_automate_nonlive import (
+            admit_power_automate_archive,
+            has_power_automate_components,
+            project_power_automate_nonlive,
+        )
+
+        if has_power_automate_components(raw_config) or has_power_automate_components(source_settings):
+            archive = admit_power_automate_archive(RecorderFactory.read_only(db), replay_from)
+            project_power_automate_nonlive(raw_config, archive)
+            source_settings = archive
+    finally:
+        db.close()
+    return mode, requested_plugins, source_settings
+
+
+def _install_nonlive_plugin_scope(mode: RunMode, requested_plugins: frozenset[str]) -> None:
+    """Keep exact built-in discovery active through the CLI command."""
+    if mode is RunMode.LIVE:
+        return
+    from contextlib import ExitStack
+
+    import click
+
+    from elspeth.plugins.infrastructure.manager import scoped_plugin_manager
+    from elspeth.plugins.infrastructure.run_mode_capabilities import build_nonlive_plugin_manager
+
+    context = click.get_current_context()
+    manager = build_nonlive_plugin_manager(requested_plugins)
+    stack = ExitStack()
+    stack.enter_context(scoped_plugin_manager(manager))
+    context.call_on_close(stack.close)
+
+
+def _refuse_cli_nonlive_resume(settings_path: Path, run_id: str, database: str | None) -> None:
+    """Check persisted mode before resume can resolve secrets or build plugins."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from elspeth.cli_helpers import resolve_audit_passphrase
+    from elspeth.core.config import LandscapeSettings
+    from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
+    from elspeth.engine.orchestrator.run_modes import refuse_nonlive_resume
+
+    raw_config = _load_raw_yaml(settings_path)
+    mode = _raw_run_mode_before_secrets(raw_config)
+    if mode is not RunMode.LIVE:
+        raise ValueError("Replay/verify runs cannot be resumed until mode-aware resume is implemented")
+    raw_landscape = raw_config.get("landscape", {})
+    landscape = LandscapeSettings.model_validate(raw_landscape)
+    if database is not None:
+        database_path = Path(database).expanduser().resolve()
+        if not database_path.exists():
+            return  # The ordinary resume path reports the existing CLI error.
+        db_url = f"sqlite:///{database_path}"
+    else:
+        if "${" in landscape.url:
+            raise ValueError("Resume requires a literal Landscape URL before secret resolution")
+        db_url = landscape.url
+    try:
+        db = LandscapeDB.from_url(
+            db_url,
+            passphrase=resolve_audit_passphrase(landscape) if landscape.backend == "sqlcipher" else None,
+            create_tables=False,
+            read_only=True,
+        )
+    except (OSError, RuntimeError, SQLAlchemyError, SchemaCompatibilityError):
+        return  # Normal resume diagnostics handle inaccessible or stale DBs.
+    try:
+        try:
+            refuse_nonlive_resume(db, run_id)
+        except (ValueError, SQLAlchemyError, SchemaCompatibilityError):
+            return  # Corrupt/foreign audit state is classified by resume.
+    finally:
+        db.close()
 
 
 def _validate_existing_sqlite_db_url(db_url: str, *, source: str) -> None:
@@ -524,6 +866,22 @@ def _load_raw_yaml(config_path: Path) -> dict[str, Any]:
     return raw_config
 
 
+def _raw_run_mode_before_secrets(raw_config: Mapping[str, Any]) -> RunMode:
+    """Resolve mode with the same case-insensitive key semantics as settings loading."""
+    mode_keys = [key for key in raw_config if type(key) is str and key.casefold() == "run_mode"]
+    if len(mode_keys) > 1:
+        raise ValueError("Ambiguous run_mode keys before secret resolution")
+    raw_mode = raw_config[mode_keys[0]] if mode_keys else RunMode.LIVE
+    try:
+        mode = RunMode(raw_mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported run_mode before secret resolution: {raw_mode!r}") from exc
+    env_modes = [value for key, value in os.environ.items() if key.casefold() == "elspeth_run_mode"]
+    if len(env_modes) > 1 or (env_modes and env_modes[0] != mode.value):
+        raise ValueError("run_mode environment override must match the literal YAML value before execution")
+    return mode
+
+
 def _parse_raw_secrets_config(raw_config: Mapping[str, Any]) -> SecretsConfig:
     """Extract and validate the literal ``secrets`` block from raw (unexpanded) YAML.
 
@@ -545,6 +903,8 @@ def _parse_raw_secrets_config(raw_config: Mapping[str, Any]) -> SecretsConfig:
 
 def _load_settings_with_secrets(
     settings_path: Path,
+    *,
+    source_settings: object | None = None,
 ) -> tuple[ElspethSettings, list[SecretResolutionInput]]:
     """Load settings with Key Vault secret resolution.
 
@@ -579,15 +939,52 @@ def _load_settings_with_secrets(
     # Extract and validate secrets config
     secrets_config = _parse_raw_secrets_config(raw_config)
 
+    # A non-live run must never contact Key Vault before mode admission. The
+    # raw mode is literal here: secret expansion has not happened yet, and an
+    # unknown value cannot safely be treated as live for this early boundary.
+    run_mode = _raw_run_mode_before_secrets(raw_config)
+    if run_mode is not RunMode.LIVE and secrets_config.source == "keyvault":
+        raise ValueError("Replay/verify cannot fetch Key Vault secrets")
+    from elspeth.config_loading import load_nonlive_settings
+    from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateArchive, has_power_automate_components
+
+    if type(source_settings) is PowerAutomateArchive:
+        loaded = load_nonlive_settings(settings_path, archive=source_settings)
+        return loaded.settings, []
+    if run_mode is not RunMode.LIVE and has_power_automate_components(raw_config):
+        raise ValueError("Power Automate nonlive loading requires admitted archive context")
+
     # Phase 2: Load secrets from Key Vault if configured
     # Returns resolution records for later audit recording
     secret_resolutions = load_secrets_from_config(secrets_config)
 
     # Phase 3: Full config loading with Dynaconf (resolves ${VAR})
     # Now that secrets are in os.environ, Dynaconf can resolve them
-    config = load_settings(settings_path)
+    config = load_settings(settings_path, source_settings=source_settings)
 
     return config, secret_resolutions
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedCLISettings:
+    settings: ElspethSettings
+    secret_resolutions: tuple[SecretResolutionInput, ...]
+    power_automate_nonlive: PowerAutomateNonliveConstruction | None = None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "secret_resolutions")
+
+
+def _load_runtime_settings_with_secrets(settings_path: Path, *, source_settings: object | None = None) -> LoadedCLISettings:
+    """Carry explicit offline construction authority beside ordinary settings."""
+    from elspeth.config_loading import load_nonlive_settings
+    from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateArchive
+
+    if type(source_settings) is PowerAutomateArchive:
+        loaded = load_nonlive_settings(settings_path, archive=source_settings)
+        return LoadedCLISettings(loaded.settings, (), loaded.power_automate_nonlive)
+    config, resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
+    return LoadedCLISettings(config, tuple(resolutions))
 
 
 def _execution_sinks_for_graph(
@@ -631,6 +1028,8 @@ def _preflight_execution_sinks(
         sinks,
         configured_modes=modes,
         required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        runtime_bindings=bindings,
+        run_mode=config.run_mode,
     )
     return sinks, modes, admission
 
@@ -659,7 +1058,7 @@ def _configure_execution_sinks_for_resume(execution_sinks: Mapping[str, SinkProt
             raise typer.Exit(1) from None
 
 
-def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object) -> None:
+def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object, source_settings: object | None = None) -> None:
     """Run adapter-class eligibility before secrets or other startup work."""
     from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
     from elspeth.plugins.infrastructure.runtime_factory import (
@@ -670,6 +1069,17 @@ def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object
     if not isinstance(purpose, SinkEffectExecutionPurpose):
         raise TypeError("Raw sink effect preflight purpose must be exact SinkEffectExecutionPurpose")
     raw_config = _load_raw_yaml(settings_path)
+    from elspeth.plugins.infrastructure.power_automate_nonlive import (
+        PowerAutomateArchive,
+        has_power_automate_components,
+        project_power_automate_nonlive,
+    )
+
+    projected_nonlive = type(source_settings) is PowerAutomateArchive
+    if type(source_settings) is PowerAutomateArchive:
+        raw_config, _ = project_power_automate_nonlive(raw_config, source_settings)
+    elif has_power_automate_components(raw_config) and _raw_run_mode_before_secrets(raw_config) is not RunMode.LIVE:
+        raise ValueError("Power Automate nonlive preflight requires admitted archive context")
     # Supported ${VAR} expansion must complete before configuration-dependent
     # mode/URL/dialect resolution (elspeth-19f2382cf4). Key Vault-mapped
     # variables are only populated by the later secret-loading phase, so sinks
@@ -679,7 +1089,7 @@ def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object
     validate_sink_effect_eligibility_from_raw_config(
         raw_config,
         purpose=purpose,
-        expand_env_placeholders=True,
+        expand_env_placeholders=not projected_nonlive,
         deferrable_env_vars=deferrable_env_vars,
     )
     if purpose is SinkEffectExecutionPurpose.FRESH:
@@ -688,9 +1098,17 @@ def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object
             validate_sink_effect_eligibility_from_raw_config(
                 raw_config,
                 purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
-                expand_env_placeholders=True,
+                expand_env_placeholders=not projected_nonlive,
                 deferrable_env_vars=deferrable_env_vars,
             )
+
+
+def _require_marked_export(config: ElspethSettings) -> None:
+    """Reject unmarked export settings before run or resume side effects."""
+    export_config = config.landscape.export
+    if not export_config.enabled:
+        return
+    export_config.public_snapshot_config()
 
 
 @app.command()
@@ -735,11 +1153,15 @@ def run(
 
     # Load and validate config with Key Vault secrets (same flow as other commands)
     try:
+        mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
+        _install_nonlive_plugin_scope(mode, requested_plugins)
         if execute and not dry_run:
             from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
 
-            _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
-        config, secret_resolutions = _load_settings_with_secrets(settings_path)
+            _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH, source_settings=source_settings)
+        loaded_settings = _load_runtime_settings_with_secrets(settings_path, source_settings=source_settings)
+        config, secret_resolutions = loaded_settings.settings, list(loaded_settings.secret_resolutions)
+        _require_marked_export(config)
     except FileNotFoundError:
         typer.echo(f"Error: Settings file not found: {settings}", err=True)
         raise typer.Exit(1) from None
@@ -758,16 +1180,27 @@ def run(
     except SinkEffectCapabilityError as e:
         typer.echo(f"Sink effect preflight failed: {e}", err=True)
         raise typer.Exit(1) from None
-    except ValueError as e:
+    except (ValueError, TemplateFileError, contract_errors.OrchestrationInvariantError) as e:
         typer.echo(f"Configuration error: {e}", err=True)
         raise typer.Exit(1) from None
     except SecretLoadError as e:
         typer.echo(f"Error loading secrets: {e}", err=True)
         raise typer.Exit(1) from None
 
+    # Non-live admission precedes plugin construction, which may initialize
+    # SDK clients or credentials. A missing source run cannot reach either.
+    try:
+        _admit_cli_nonlive_run(config)
+    except (OSError, RuntimeError, ValueError, contract_errors.OrchestrationInvariantError) as e:
+        typer.echo(f"Replay/verify admission failed: {e}", err=True)
+        raise typer.Exit(1) from None
+
     # Instantiate plugins before graph construction
     try:
-        plugins = _instantiate_plugins_for_runtime_preflight(config)
+        if loaded_settings.power_automate_nonlive is None:
+            plugins = _instantiate_plugins_for_runtime_preflight(config)
+        else:
+            plugins = _instantiate_plugins_for_runtime_preflight(config, power_automate_nonlive=loaded_settings.power_automate_nonlive)
     except contract_errors.TIER_1_ERRORS:
         raise  # Tier 1 errors must crash with full traceback, not Exit(1)
     except Exception as e:
@@ -830,7 +1263,7 @@ def run(
 
     # Executable admission: validate the projected pipeline sinks before any
     # output/payload/database directory can be created. Dry-run/configuration
-    # assembly above intentionally remains side-effect and capability-gate free.
+    # assembly above remains free of sink publication preflight.
     try:
         execution_sinks, execution_sink_modes, sink_effect_admission = _preflight_execution_sinks(config, plugins)
     except contract_errors.TIER_1_ERRORS:
@@ -842,7 +1275,11 @@ def run(
     # Ensure output directories exist BEFORE attempting to create resources
     # Creates directories automatically, only errors if creation fails
     # NOTE: Only when actually executing (not dry-run or validation-only)
-    dir_errors = _ensure_output_directories(config, execution_sink_names=execution_sinks)
+    dir_errors = _ensure_output_directories(
+        config,
+        execution_sink_names=execution_sinks,
+        include_sink_directories=config.run_mode is RunMode.LIVE,
+    )
     if dir_errors:
         typer.echo("Output directory errors:", err=True)
         for dir_error in dir_errors:
@@ -864,8 +1301,11 @@ def run(
     from elspeth.plugins.infrastructure.probe_factory import build_collection_probes
 
     try:
-        probes = build_collection_probes(config.collection_probes) if config.collection_probes else []
-        preflight = resolve_preflight(config, settings_path, probes=probes, runner=bootstrap_and_run)
+        if config.run_mode is RunMode.LIVE:
+            probes = build_collection_probes(config.collection_probes) if config.collection_probes else []
+            preflight = resolve_preflight(config, settings_path, probes=probes, runner=bootstrap_and_run)
+        else:
+            preflight = PreflightResult(dependency_runs=(), gate_results=())
     except (DependencyFailedError, CommencementGateFailedError, ValueError) as e:
         typer.echo(f"Pre-flight check failed: {e}", err=True)
         raise typer.Exit(1) from None
@@ -886,8 +1326,6 @@ def run(
         raise typer.Exit(4) from e
 
     # Execute pipeline with pre-instantiated plugins
-    from elspeth.contracts.errors import RunWorkerEvictedError
-
     try:
         execution_result = _execute_pipeline_with_instances(
             config,
@@ -920,27 +1358,22 @@ def run(
             _emit_interrupted_resume_guidance_from_url(config.landscape.url, passphrase, e.run_id)
         raise typer.Exit(3)  # noqa: B904 -- distinct exit code: 0=success, 1=error, 3=interrupted
     except RunWorkerEvictedError as e:
-        if output_format == "json":
-            import json as json_mod_evicted
-
-            typer.echo(
-                json_mod_evicted.dumps(
-                    {
-                        "event": "evicted",
-                        "run_id": e.run_id,
-                        "worker_id": e.worker_id,
-                        "message": str(e),
-                    }
-                ),
-                err=True,
-            )
-        else:
-            typer.echo(f"\nWorker evicted from run {e.run_id}.", err=True)
-            typer.echo("Worker identity is single-use. Re-admit under a fresh identity if appropriate.", err=True)
+        _emit_worker_evicted_event(e, output_format)
         raise typer.Exit(3)  # noqa: B904 — eviction is an interrupted-style exit
+    except WriteLockHeldError as e:
+        _emit_write_lock_held(e, output_format)
+        raise typer.Exit(1) from e
     except SchemaCompatibilityError as e:
         _emit_schema_compatibility_error(e, output_format, operation="pipeline execution")
         raise typer.Exit(1) from None
+    except VerificationMismatchError as e:
+        if output_format == "json":
+            import json as json_mod
+
+            typer.echo(json_mod.dumps({"event": "verification_mismatch", "error": str(e), "error_type": type(e).__name__}), err=True)
+        else:
+            typer.echo(f"Verification mismatch: {e}", err=True)
+        raise typer.Exit(2) from None
     except contract_errors.TIER_1_ERRORS as e:
         # Tier 1 violations and framework bugs MUST be clearly distinguishable
         # from config errors. These indicate database corruption, tampering,
@@ -1209,14 +1642,29 @@ def explain(
                     typer.echo("Token or row not found, or no terminal tokens exist yet.", err=True)
                 raise typer.Exit(1) from None
 
+            verification_decisions = factory.execution.get_verification_decisions_for_calls(
+                resolved_run_id, {call.call_id for call in lineage_result.calls}
+            )
+
             # Output based on mode
             if json_output:
-                typer.echo(json_module.dumps(dataclass_to_dict(lineage_result), indent=2))
+                lineage_data = dataclass_to_dict(lineage_result)
+                lineage_data["verification_decisions"] = [dataclass_to_dict(decision) for decision in verification_decisions]
+                typer.echo(json_module.dumps(lineage_data, indent=2))
                 raise typer.Exit(0)
 
             if no_tui:
                 formatter = LineageTextFormatter()
                 typer.echo(formatter.format(lineage_result))
+                if verification_decisions:
+                    typer.echo("--- Verification decisions ---")
+                    for decision in verification_decisions:
+                        verdict = "UNAVAILABLE" if decision.is_match is None else "MATCH" if decision.is_match else "MISMATCH"
+                        typer.echo(
+                            f"  {decision.current_call_id}: {verdict}; "
+                            f"source run={decision.source_run_id} call={decision.source_call_id}; "
+                            f"differences={decision.differences_json}"
+                        )
                 raise typer.Exit(0)
 
         # TUI mode
@@ -1383,6 +1831,8 @@ def _orchestrator_context(
         transforms.append(transform)
 
     # Build PipelineConfig
+    from elspeth.engine.orchestrator.preflight import execution_sink_bindings_for_runtime
+
     pipeline_config = _PipelineConfig(
         sources=plugins.sources,
         transforms=transforms,
@@ -1393,6 +1843,7 @@ def _orchestrator_context(
         coalesce_settings=(list(config.coalesce) if config.coalesce else []),
         sink_effect_modes=effective_sink_effect_modes,
         sink_effect_admission=sink_effect_admission,
+        sink_effect_bindings=execution_sink_bindings_for_runtime(config, plugins.sink_effect_bindings),
         escalation_fixpoint_bound=graph.escalation_fixpoint_bound,
     )
 
@@ -1567,6 +2018,18 @@ def _execute_pipeline_with_instances(
 
 
 def bootstrap_and_run(settings_path: Path) -> RunResult:
+    """Run a dependency pipeline under exact discovery when non-live."""
+    from elspeth.plugins.infrastructure.manager import scoped_plugin_manager
+    from elspeth.plugins.infrastructure.run_mode_capabilities import build_nonlive_plugin_manager
+
+    mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
+    if mode is RunMode.LIVE:
+        return _bootstrap_and_run_impl(settings_path)
+    with scoped_plugin_manager(build_nonlive_plugin_manager(requested_plugins)):
+        return _bootstrap_and_run_impl(settings_path, source_settings=source_settings)
+
+
+def _bootstrap_and_run_impl(settings_path: Path, *, source_settings: object | None = None) -> RunResult:
     """Load config, instantiate plugins, build graph, and run a sub-pipeline.
 
     This is the programmatic equivalent of ``elspeth run --execute`` used by
@@ -1581,10 +2044,16 @@ def bootstrap_and_run(settings_path: Path) -> RunResult:
     from elspeth.plugins.infrastructure.probe_factory import build_collection_probes
     from elspeth.plugins.infrastructure.runtime_factory import make_sink_factory
 
-    _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
-    config, secret_resolutions = _load_settings_with_secrets(settings_path)
+    _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH, source_settings=source_settings)
+    loaded_settings = _load_runtime_settings_with_secrets(settings_path, source_settings=source_settings)
+    config, secret_resolutions = loaded_settings.settings, list(loaded_settings.secret_resolutions)
+    _require_marked_export(config)
+    _admit_cli_nonlive_run(config)
 
-    plugins = _instantiate_plugins_for_runtime_preflight(config)
+    if loaded_settings.power_automate_nonlive is None:
+        plugins = _instantiate_plugins_for_runtime_preflight(config)
+    else:
+        plugins = _instantiate_plugins_for_runtime_preflight(config, power_automate_nonlive=loaded_settings.power_automate_nonlive)
     execution_sinks, execution_sink_modes, sink_effect_admission = _preflight_execution_sinks(config, plugins)
 
     graph = ExecutionGraph.from_plugin_instances(
@@ -1603,12 +2072,19 @@ def bootstrap_and_run(settings_path: Path) -> RunResult:
     )
     graph.validate()
 
-    dir_errors = _ensure_output_directories(config, execution_sink_names=execution_sinks)
+    dir_errors = _ensure_output_directories(
+        config,
+        execution_sink_names=execution_sinks,
+        include_sink_directories=config.run_mode is RunMode.LIVE,
+    )
     if dir_errors:
         raise ValueError(f"Failed to create output directories: {'; '.join(dir_errors)}")
 
-    probes = build_collection_probes(config.collection_probes) if config.collection_probes else []
-    preflight = resolve_preflight(config, settings_path, probes=probes, runner=bootstrap_and_run)
+    if config.run_mode is RunMode.LIVE:
+        probes = build_collection_probes(config.collection_probes) if config.collection_probes else []
+        preflight = resolve_preflight(config, settings_path, probes=probes, runner=bootstrap_and_run)
+    else:
+        preflight = PreflightResult(dependency_runs=(), gate_results=())
 
     passphrase = resolve_audit_passphrase(config.landscape)
     if passphrase is not None and config.landscape.dump_to_jsonl:
@@ -1726,10 +2202,13 @@ def validate(
 
     settings_path = Path(settings).expanduser()
 
-    # Load and validate config with Key Vault secrets (same flow as 'run' command)
-    # This ensures ${VAR} placeholders are resolved correctly for keyvault-backed configs
+    # Share run's admission before secrets, file templates, or plugin imports.
     try:
-        config, _secret_resolutions = _load_settings_with_secrets(settings_path)
+        mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
+        _install_nonlive_plugin_scope(mode, requested_plugins)
+        loaded_settings = _load_runtime_settings_with_secrets(settings_path, source_settings=source_settings)
+        config, _secret_resolutions = loaded_settings.settings, loaded_settings.secret_resolutions
+        _admit_cli_nonlive_run(config)
     except (YamlParserError, YamlScannerError) as e:
         # YAML syntax errors from Dynaconf/ruamel (malformed YAML) - show helpful message
         _format_validation_error(
@@ -1776,7 +2255,7 @@ def validate(
             hint="Check field names, types, and required values.",
         )
         raise typer.Exit(1) from None
-    except ValueError as e:
+    except (ValueError, contract_errors.OrchestrationInvariantError) as e:
         # Environment variable expansion errors (must be AFTER ValidationError!)
         error_msg = str(e)
         if "environment variable" in error_msg.lower():
@@ -1802,7 +2281,10 @@ def validate(
 
     # Instantiate plugins BEFORE graph construction
     try:
-        plugins = instantiate_plugins_from_config(config)
+        if loaded_settings.power_automate_nonlive is None:
+            plugins = instantiate_plugins_from_config(config)
+        else:
+            plugins = instantiate_plugins_from_config(config, power_automate_nonlive=loaded_settings.power_automate_nonlive)
     except ValueError as e:
         # Plugin configuration errors (e.g., invalid schema for sink type)
         error_msg = str(e)
@@ -1976,6 +2458,12 @@ def _composer_auth_audit_recorder(landscape_url: str) -> AuthAuditRecorder:
     from sqlalchemy.engine.url import make_url
 
     from elspeth.web.auth.audit import AuthAuditRecorder
+    from elspeth.web.compartments import is_compartment_id
+
+    compartment_id = os.environ.get("ELSPETH_WEB__COMPARTMENT_ID")
+    if compartment_id is not None and not is_compartment_id(compartment_id):
+        typer.echo("Error: compartment_id must match [a-z0-9][a-z0-9-]{0,62}", err=True)
+        raise typer.Exit(1)
 
     parsed = make_url(landscape_url)
     sqlite_landscape = parsed.drivername.split("+", 1)[0] == "sqlite"
@@ -1991,10 +2479,11 @@ def _composer_auth_audit_recorder(landscape_url: str) -> AuthAuditRecorder:
         # Mirrors AuthAuditRecorder.from_settings: only a SQLite Landscape is
         # created on first write; an external store is provisioned by doctor.
         create_tables=sqlite_landscape,
+        compartment_id=compartment_id,
     )
 
 
-def _composer_retirement_recorder(landscape_url: str) -> Callable[[IdentityRetired], None]:
+def _composer_retirement_recorder(recorder: AuthAuditRecorder) -> Callable[[IdentityRetired], None]:
     """The CLI's audit sink for a retirement: the SAME Landscape row app.py writes.
 
     A credential deletion disables the identity and retires its binding, and
@@ -2005,7 +2494,6 @@ def _composer_retirement_recorder(landscape_url: str) -> Callable[[IdentityRetir
     allows; it writes ``identity_disabled`` with ``cause=credential_deleted``
     through the same recorder, resolved from the same URL rule.
     """
-    recorder = _composer_auth_audit_recorder(landscape_url)
 
     def record(outcome: IdentityRetired) -> None:
         recorder.record_identity_retired(
@@ -2038,12 +2526,22 @@ def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> Retir
     user to. So ``add`` binds the real authority, with the real audit sink,
     behind a first-call open.
     """
+    from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
     from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
 
-    def retire(username: str) -> None:
+    def retire(
+        username: str,
+        operator_reason: str,
+        credential_exists: Callable[[], bool],
+        delete_credential: Callable[[], None],
+    ) -> bool:
         engine = _composer_session_engine(session_db_url)
         try:
-            local_identity_retirer(RepositoryIdentityAuthority(engine), _composer_retirement_recorder(landscape_url))(username)
+            with _composer_auth_audit_recorder(landscape_url) as recorder:
+                return local_identity_retirer(
+                    RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
+                    _composer_retirement_recorder(recorder),
+                )(username, operator_reason, credential_exists, delete_credential)
         finally:
             engine.dispose()
 
@@ -2126,6 +2624,11 @@ def composer_users_add(
 @composer_users_app.command("remove")
 def composer_users_remove(
     username: str = typer.Argument(..., help="Local composer username to remove."),
+    reason: str = typer.Option(
+        ...,
+        "--reason",
+        help="Why the account is being removed. Recorded in the audit trail, as People & access records it.",
+    ),
     data_dir: Path = typer.Option(
         Path("data"),
         "--data-dir",
@@ -2154,9 +2657,23 @@ def composer_users_remove(
     ),
 ) -> None:
     """Remove a local Composer web user and retire the identity it was bound to."""
-    from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
+    from elspeth.web.auth.local import LocalAuthCredentialChanged
+    from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+    from elspeth.web.coordination.identity_authority import (
+        LOCAL_DELETION_REASON_MAX_LENGTH,
+        LastActiveAdminProtected,
+        RepositoryIdentityAuthority,
+        local_identity_retirer,
+    )
     from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 
+    # Checked before anything is opened: a refusal here touches neither store.
+    if not reason.strip():
+        typer.echo("Error: --reason must say why the account is being removed.", err=True)
+        raise typer.Exit(1)
+    if len(reason.strip()) > LOCAL_DELETION_REASON_MAX_LENGTH:
+        typer.echo(f"Error: --reason must be at most {LOCAL_DELETION_REASON_MAX_LENGTH} characters.", err=True)
+        raise typer.Exit(1)
     db_path = _resolve_composer_auth_db(data_dir=data_dir, auth_db=auth_db)
     if not db_path.exists():
         typer.echo(f"Error: composer auth database not found: {db_path}", err=True)
@@ -2166,32 +2683,49 @@ def composer_users_remove(
         raise typer.Exit(1)
     resolved_session_db_url = _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=session_db_url)
     session_engine = _composer_session_engine(resolved_session_db_url)
-    provider = _composer_auth_provider(
-        db_path,
-        retire_identity=local_identity_retirer(
-            RepositoryIdentityAuthority(session_engine),
-            _composer_retirement_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url)),
-        ),
-    )
     # The store must carry the current schema BEFORE the credential goes:
     # a deletion whose retirement then fails is the inheritance defect with
     # extra steps. Same create-or-validate rule the web app applies to this
     # URL at boot -- an empty store is initialised, a stale one is refused
     # unaltered, and the credential is untouched either way until this
     # returns.
-    if session_engine.dialect.name == "sqlite":
-        sqlite_store = session_engine.url.database
-        if sqlite_store is not None and sqlite_store != ":memory:":
-            Path(sqlite_store).parent.mkdir(parents=True, exist_ok=True)
     try:
-        initialize_session_schema(session_engine)
-    except SessionSchemaError as exc:
-        typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
-        raise typer.Exit(1) from exc
-    try:
-        if not provider.delete_user(username):
-            typer.echo(f"Error: composer user not found: {username}", err=True)
-            raise typer.Exit(1)
+        if session_engine.dialect.name == "sqlite":
+            sqlite_store = session_engine.url.database
+            if sqlite_store is not None and sqlite_store != ":memory:":
+                Path(sqlite_store).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            initialize_session_schema(session_engine)
+        except SessionSchemaError as exc:
+            typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        with _composer_auth_audit_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url)) as recorder:
+            provider = _composer_auth_provider(
+                db_path,
+                retire_identity=local_identity_retirer(
+                    RepositoryIdentityAuthority(session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply),
+                    _composer_retirement_recorder(recorder),
+                ),
+            )
+            try:
+                deletion = provider.delete_user(username, reason=reason)
+            except LocalAuthCredentialChanged as exc:
+                typer.echo(f"Error: {exc}", err=True)
+                raise typer.Exit(1) from exc
+            except LastActiveAdminProtected as exc:
+                # Refused before the credential was touched. ``bootstrap-admin``
+                # only answers when NO active administrator exists, so it is
+                # not the way to make the second one.
+                typer.echo(
+                    f"Error: {username} is the last active administrator, and removing this account would leave "
+                    "the deployment with nobody able to administer it. Nothing was removed.\n"
+                    "Give another person the admin role first (People & access, Roles), then run this command again.",
+                    err=True,
+                )
+                raise typer.Exit(1) from exc
+            if not deletion.removed_anything:
+                typer.echo(f"Error: composer user not found: {username}", err=True)
+                raise typer.Exit(1)
     finally:
         session_engine.dispose()
     typer.echo(f"Removed composer user {username} from {db_path}")
@@ -2206,6 +2740,7 @@ def composer_users_bootstrap_admin(
     provider: str = typer.Argument(..., help="Identity provider of the subject: local, oidc, entra, vanguard or google."),
     subject: str = typer.Argument(..., help="The IdP subject (``sub``) of the person who becomes the first admin."),
     username: str | None = typer.Option(None, "--username", help="Username for a row that does not exist yet; defaults to the subject."),
+    organisation_id: str | None = typer.Option(None, "--organisation-id", help="Organisation ID for a row that does not exist yet."),
     note: str = typer.Option(..., "--note", help="Why this bootstrap is happening; written to the activation's audit row."),
     data_dir: Path = typer.Option(Path("data"), "--data-dir", help="Web data directory."),
     session_db_url: str | None = typer.Option(
@@ -2219,10 +2754,10 @@ def composer_users_bootstrap_admin(
         help="Landscape URL for the activation audit rows; defaults to ELSPETH_WEB__LANDSCAPE_URL, then <data-dir>/runs/audit.db.",
     ),
     quota_tokens_per_day: int | None = typer.Option(
-        None, "--quota-tokens-per-day", min=1, help="The D31 allowance row; both quota options or neither."
+        None, "--quota-tokens-per-day", min=1, max=2**63 - 1, help="The D31 allowance row; both quota options or neither."
     ),
     quota_storage_bytes: int | None = typer.Option(
-        None, "--quota-storage-bytes", min=1, help="The D31 allowance row; both quota options or neither."
+        None, "--quota-storage-bytes", min=1, max=2**63 - 1, help="The D31 allowance row; both quota options or neither."
     ),
 ) -> None:
     """Make the first administrator, once: the operator's lockout recovery (spec D20).
@@ -2253,7 +2788,12 @@ def composer_users_bootstrap_admin(
     # Narrowed by the closed-set check above; the Literal cannot be
     # constructed from a str any other way.
     provider_type = cast("AuthProviderType", provider)
-    claims = IdentityClaims(provider=provider_type, subject=subject, username=subject if username is None else username)
+    claims = IdentityClaims(
+        provider=provider_type,
+        subject=subject,
+        username=subject if username is None else username,
+        organisation_id=organisation_id,
+    )
     resolved_session_db_url = _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=session_db_url)
     session_engine = _composer_session_engine(resolved_session_db_url)
     recorder = _composer_auth_audit_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url))
@@ -2271,6 +2811,12 @@ def composer_users_bootstrap_admin(
             note=event.note,
             role=None if event.role is None else event.role.role,
             role_id=None if event.role is None else event.role.role_id,
+            # The grants the bound row already held. ``bootstrap_admin``
+            # binds an existing identity as well as creating one, and since
+            # R9 that row can be a re-pended administrator whose deployment
+            # ``admin`` never lapsed -- in which case this command grants
+            # nothing and the trail says so here rather than nowhere.
+            retained_roles=tuple((grant.role, grant.scope) for grant in event.retained_roles),
             tokens_per_day=quota_tokens_per_day if event.quota_written else None,
             storage_bytes=quota_storage_bytes if event.quota_written else None,
             on_behalf_of=event.on_behalf_of,
@@ -2278,6 +2824,7 @@ def composer_users_bootstrap_admin(
         )
 
     try:
+        recorder.start()
         if session_engine.dialect.name == "sqlite":
             sqlite_store = session_engine.url.database
             if sqlite_store is not None and sqlite_store != ":memory:":
@@ -2288,7 +2835,11 @@ def composer_users_bootstrap_admin(
             typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
             raise typer.Exit(1) from exc
         try:
-            activated = RepositoryIdentityAuthority(session_engine).bootstrap_admin(
+            from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+
+            activated = RepositoryIdentityAuthority(
+                session_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply
+            ).bootstrap_admin(
                 claims=claims,
                 note=note,
                 quota_tokens_per_day=quota_tokens_per_day,
@@ -2305,7 +2856,10 @@ def composer_users_bootstrap_admin(
             typer.echo(f"Error: the identity for {provider}:{subject} is a service identity; admin is a human role", err=True)
             raise typer.Exit(1) from exc
     finally:
-        session_engine.dispose()
+        try:
+            recorder.close()
+        finally:
+            session_engine.dispose()
     typer.echo(f"Bootstrapped admin {activated.record.username} ({activated.record.identity_id}) for {provider}:{subject}")
 
 
@@ -2536,7 +3090,7 @@ def _execute_resume_with_instances(
     Args:
         config: Validated ElspethSettings
         graph: Validated ExecutionGraph
-        plugins: Pre-instantiated plugins (with NullSource)
+        plugins: Pre-instantiated original plugins for compatibility validation
         resume_point: Resume point information
         payload_store: Payload store for retrieving row data
         db: LandscapeDB connection (caller owns close lifecycle)
@@ -2568,30 +3122,27 @@ def _execute_resume_with_instances(
         )
 
 
-def _build_resume_graphs(
+def _build_resume_graph(
     settings_config: ElspethSettings,
     plugins: PluginBundle,
-) -> tuple[ExecutionGraph, ExecutionGraph]:
-    """Build both validation and execution graphs for resume from pre-instantiated plugins.
+) -> ExecutionGraph:
+    """Build one validated graph for resume admission and execution.
 
-    Returns:
-        Tuple of (validation_graph, execution_graph):
-        - validation_graph: Uses original source for topology hash matching
-        - execution_graph: Uses the same original topology/source IDs; runtime
-          plugin instances are swapped to NullSource later because resume data
-          comes from stored payloads
+    Resume reads row data from stored payloads. Both phases use the original
+    source topology and plugin identities without binding the same one-shot
+    plugin input types twice.
     """
     gate_settings = list(settings_config.gates)
     coalesce_settings = list(settings_config.coalesce) if settings_config.coalesce else None
     row_union_settings = list(settings_config.row_unions) if settings_config.row_unions else None
     scope_settings = list(settings_config.scopes) if settings_config.scopes else None
 
-    # Both resume graphs use the ORIGINAL source topology to match the topology
+    # The resume graph uses the ORIGINAL source topology to match the topology
     # hash and source node IDs computed during the original run. The runtime
-    # PluginBundle is swapped to NullSource separately before execution; graph
-    # identity must not change just because resume does not reopen sources.
+    # Source instances also remain original for implementation compatibility;
+    # the resume lifecycle does not reopen or invoke those sources.
     execution_sinks = _execution_sinks_for_graph(settings_config, plugins.sinks)
-    validation_graph = ExecutionGraph.from_plugin_instances(
+    graph = ExecutionGraph.from_plugin_instances(
         sources=plugins.sources,
         source_settings_map=plugins.source_settings_map,
         transforms=plugins.transforms,
@@ -2605,25 +3156,8 @@ def _build_resume_graphs(
         scope_settings=scope_settings,
         max_bound_region_depth=settings_config.max_bound_region_depth,
     )
-    validation_graph.validate()
-
-    execution_graph = ExecutionGraph.from_plugin_instances(
-        sources=plugins.sources,
-        source_settings_map=plugins.source_settings_map,
-        transforms=plugins.transforms,
-        sinks=execution_sinks,
-        aggregations=plugins.aggregations,
-        gates=gate_settings,
-        coalesce_settings=coalesce_settings,
-        queues=settings_config.queues,
-        row_union_settings=row_union_settings,
-        collectors=plugins.collectors,
-        scope_settings=scope_settings,
-        max_bound_region_depth=settings_config.max_bound_region_depth,
-    )
-    execution_graph.validate()
-
-    return validation_graph, execution_graph
+    graph.validate()
+    return graph
 
 
 def _emit_interrupted_resume_guidance(db: LandscapeDB, run_id: str) -> None:
@@ -2747,6 +3281,68 @@ def _emit_leaderless_run_guidance(db: LandscapeDB, run_id: str) -> None:
         typer.echo(f"Resumability check failed ({type(exc).__name__}: {exc}); probe with: elspeth resume {run_id}")
 
 
+class _RegisteredWorkerDiagnostic(TypedDict):
+    worker_id: str
+    role: str
+    status: str
+    hostname: str | None
+    pid: int | None
+
+
+class _WriteLockHeldEvent(TypedDict):
+    event: Literal["write_lock_held"]
+    run_id: str
+    message: str
+    registered_workers: list[_RegisteredWorkerDiagnostic]
+    lock_owner_identified: Literal[False]
+    guidance: str
+
+
+def _emit_write_lock_held(error: WriteLockHeldError, output_format: str) -> None:
+    """Present registration candidates to the authorized local CLI operator.
+
+    The registry is not lock-owner detection. Generic exception messages and
+    server consumers deliberately omit this local operational roster.
+    """
+    guidance = (
+        "Registration records may be stale and PIDs may be reused; the actual lock holder may not be listed. "
+        "Verify the process identity on the recorded host/container and in its PID namespace before stopping it; "
+        "retry after the lock is released."
+    )
+    if not error.workers:
+        guidance = "No registered worker candidates available; the registry may be empty or unreadable. " + guidance
+    if output_format == "json":
+        payload: _WriteLockHeldEvent = {
+            "event": "write_lock_held",
+            "run_id": error.run_id,
+            "message": str(error),
+            "registered_workers": [
+                {
+                    "worker_id": worker.worker_id,
+                    "role": worker.role,
+                    "status": worker.status,
+                    "hostname": worker.hostname,
+                    "pid": worker.pid,
+                }
+                for worker in error.workers
+            ],
+            "lock_owner_identified": False,
+            "guidance": guidance,
+        }
+        typer.echo(json.dumps(payload), err=True)
+    else:
+        typer.echo(str(error), err=True)
+        if error.workers:
+            typer.echo("Registered worker candidates (not confirmed lock holders):", err=True)
+            for worker in error.workers:
+                typer.echo(
+                    f"  worker={worker.worker_id!r} role={worker.role!r} status={worker.status!r} "
+                    f"hostname={worker.hostname!r} pid={worker.pid!r}",
+                    err=True,
+                )
+        typer.echo(guidance, err=True)
+
+
 def _emit_not_resumable_event(
     error: EmptyResumeStateError | IncompleteSourceResumeError | NonResumableRunError,
     output_format: str,
@@ -2774,16 +3370,14 @@ def _emit_not_resumable_event(
     ``OrchestrationInvariantError`` and would otherwise be swallowed by
     the fatal-traceback path.
 
-    :class:`NonResumableRunError` is the ``resume()`` entry guard's
-    precondition refusal (run status not resumable — e.g. RUNNING). The
-    CLI's ``can_resume`` pre-flight catches the common case with a clean
-    exit 1; the guard raise is only reachable in the race window where the
-    run's status changes between pre-flight and ``--execute``, and it must
-    land on this same operator surface rather than the exit-4
-    framework-bug traceback path.
+    :class:`NonResumableRunError` carries the cause selected by the actual
+    status, checkpoint or leadership admission decision. Advisory checks and
+    enforcing guards share this surface, including a second check that
+    refuses after the first preflight passed. Later hint queries must not
+    replace that observed cause.
     """
     if isinstance(error, NonResumableRunError):
-        reason = "run_status_not_resumable"
+        reason = error.cause.value
         # str(error) already carries the "Cannot resume run ..." prefix;
         # use the bare reason so neither output path doubles it up.
         message = error.reason
@@ -2875,6 +3469,7 @@ def resume(
         if execute:
             from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
 
+            _refuse_cli_nonlive_resume(settings_path, run_id, database)
             _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.RESUME)
         settings_config, _secret_resolutions = _load_settings_with_secrets(settings_path)
     except FileNotFoundError:
@@ -2892,7 +3487,7 @@ def resume(
     except SinkEffectCapabilityError as e:
         typer.echo(f"Sink effect preflight failed: {e}", err=True)
         raise typer.Exit(1) from None
-    except ValueError as e:
+    except (ValueError, contract_errors.OrchestrationInvariantError) as e:
         typer.echo(f"Configuration error: {e}", err=True)
         raise typer.Exit(1) from None
     except SecretLoadError as e:
@@ -2997,9 +3592,9 @@ def resume(
         checkpoint_manager = CheckpointManager(db)
         recovery_manager = RecoveryManager(db, checkpoint_manager)
 
-        # Build both graphs from the same plugin instances
+        # Use the validated graph for admission and execution.
         try:
-            validation_graph, execution_graph = _build_resume_graphs(settings_config, plugins)
+            execution_graph = _build_resume_graph(settings_config, plugins)
         except contract_errors.TIER_1_ERRORS:
             raise  # Tier 1 errors must crash with full traceback, not Exit(1)
         except Exception as e:
@@ -3007,24 +3602,18 @@ def resume(
             raise typer.Exit(1) from None
 
         # Check if run can be resumed (with topology validation)
-        check = recovery_manager.can_resume(run_id, validation_graph)
+        check = recovery_manager.can_resume(run_id, execution_graph)
 
         if not check.can_resume:
-            typer.echo(f"Cannot resume run {run_id}: {check.reason}", err=True)
-            # elspeth-5dd23f4df9: this pre-flight is the refusal an operator
-            # actually sees for a leaderless run (the source gate fires here,
-            # before --execute). Name the verb that can finalize it.
-            _echo_leaderless_abandon_hint(run_id, *_leaderless_abandon_hint_or_failure(db, run_id))
-            raise typer.Exit(1)
+            assert check.reason is not None and check.cause is not None
+            raise NonResumableRunError(run_id, check.reason, cause=check.cause)
 
         # Get resume point information
-        resume_point = recovery_manager.get_resume_point(run_id, validation_graph)
-        if resume_point is None:
-            typer.echo(f"Error: Could not get resume point for run {run_id}", err=True)
-            raise typer.Exit(1)
+        resume_point = recovery_manager.get_resume_point(run_id, execution_graph)
 
-        # Get count of unprocessed rows
-        unprocessed_row_ids = recovery_manager.get_unprocessed_rows(run_id)
+        # Resume re-drives the run's durable scheduler work; it never
+        # re-derives a source row.
+        scheduler_work_items = recovery_manager.count_active_scheduler_work(run_id)
 
         # F1: buffered barrier tokens live in the scheduler journal, not the
         # checkpoint — "what will be restored" is the journal's BLOCKED
@@ -3040,7 +3629,7 @@ def resume(
                 "has_barrier_scalars": resume_point.barrier_scalars is not None,
                 "blocked_barrier_rows": blocked_barrier_rows,
             },
-            "unprocessed_rows": len(unprocessed_row_ids),
+            "scheduler_work_items": scheduler_work_items,
         }
 
         if output_format == "json" and not execute:
@@ -3059,7 +3648,7 @@ def resume(
             else:
                 typer.echo("  Has barrier scalars: No")
             typer.echo(f"  Blocked barrier rows (journal): {blocked_barrier_rows}")
-            typer.echo(f"  Unprocessed rows: {len(unprocessed_row_ids)}")
+            typer.echo(f"  Scheduler work items (to re-drive): {scheduler_work_items}")
 
         if not execute:
             if output_format != "json":
@@ -3094,8 +3683,6 @@ def resume(
         # _configure_execution_sinks_for_resume BEFORE admission was issued,
         # so the admission receipt binds the live post-resume mode
         # (elspeth-fc9906e398).
-        from elspeth.plugins.sources.null_source import NullSource
-
         resume_sinks = {}
 
         for sink_name, sink in execution_sinks.items():
@@ -3148,30 +3735,18 @@ def resume(
 
             resume_sinks[sink_name] = sink
 
-        # Override sources with NullSource for resume (data comes from payloads).
-        # Per ADR-025 §2 each named source becomes its own NullSource so the
-        # execution graph mirrors the original source-name set.
+        # Keep original source implementations for the enforcing resume
+        # compatibility check. Resume skips source start/load/cleanup and
+        # obtains rows from persisted payloads, so substitution is unnecessary
+        # and would compare the original audit evidence against another plugin.
         from dataclasses import replace
 
-        from elspeth.core.config import SourceSettings as _SourceSettings
-
-        null_resume_sources: dict[str, SourceProtocol] = {}
-        null_resume_settings: dict[str, SourceSettings] = {}
-        for source_name, original_source in plugins.sources.items():
-            null_source = NullSource({})
-            null_source.on_success = original_source.on_success
-            null_resume_sources[source_name] = null_source
-            null_resume_settings[source_name] = _SourceSettings(plugin="null", on_success=original_source.on_success)
         resume_plugins = replace(
             plugins,
-            sources=null_resume_sources,
-            source_settings_map=null_resume_settings,
             sinks=resume_sinks,  # Use append-mode sinks
         )
 
-        # Execute resume with execution graph (NullSource)
-        from elspeth.contracts.errors import RunWorkerEvictedError
-
+        # Execute resume from persisted rows with the original plugin evidence.
         try:
             result = _execute_resume_with_instances(
                 config=settings_config,
@@ -3212,24 +3787,11 @@ def resume(
             _emit_not_resumable_event(e, output_format, db=db)
             raise typer.Exit(1) from e
         except RunWorkerEvictedError as e:
-            if output_format == "json":
-                import json as json_mod_evicted
-
-                typer.echo(
-                    json_mod_evicted.dumps(
-                        {
-                            "event": "evicted",
-                            "run_id": e.run_id,
-                            "worker_id": e.worker_id,
-                            "message": str(e),
-                        }
-                    ),
-                    err=True,
-                )
-            else:
-                typer.echo(f"\nWorker evicted from run {e.run_id}.", err=True)
-                typer.echo("Worker identity is single-use. Re-admit under a fresh identity if appropriate.", err=True)
+            _emit_worker_evicted_event(e, output_format)
             raise typer.Exit(3)  # noqa: B904 — eviction is an interrupted-style exit
+        except WriteLockHeldError as e:
+            _emit_write_lock_held(e, output_format)
+            raise typer.Exit(1) from e
         except contract_errors.TIER_1_ERRORS as e:
             # Tier 1 violations and framework bugs MUST be clearly distinguishable
             # from config errors — same pattern as the `run` command handler.
@@ -3294,6 +3856,7 @@ def resume(
                             "rows_processed": result.rows_processed,
                             "rows_succeeded": result.rows_succeeded,
                             "rows_failed": result.rows_failed,
+                            "collector_groups_failed": result.collector_groups_failed,
                             "status": result.status.value,
                             "exit_code": resume_exit_code,
                         },
@@ -3306,6 +3869,7 @@ def resume(
             typer.echo(f"  Rows processed: {result.rows_processed}")
             typer.echo(f"  Rows succeeded: {result.rows_succeeded}")
             typer.echo(f"  Rows failed: {result.rows_failed}")
+            typer.echo(f"  Collector groups failed: {result.collector_groups_failed}")
             typer.echo(f"  Status: {result.status.value}")
 
         if resume_exit_code != 0:
@@ -3414,6 +3978,12 @@ def export_resume(
         )
         raise typer.Exit(1)
 
+    try:
+        _require_marked_export(settings_config)
+    except ValueError as exc:
+        typer.echo(f"Configuration error: {exc}", err=True)
+        raise typer.Exit(1) from None
+
     # Resolve database URL (same discipline as `resume`)
     if database:
         db_path = Path(database).expanduser().resolve()
@@ -3467,8 +4037,8 @@ def export_resume(
             "run_status": run.status.value if run is not None else None,
             "export_status": (run.export_status.value if run is not None and run.export_status is not None else None),
             "export_error": run.export_error if run is not None else None,
-            "eligible": refusal is None,
-            "reason": refusal,
+            "eligible": refusal.can_resume,
+            "reason": refusal.reason,
         }
 
         if output_format != "json":
@@ -3477,13 +4047,17 @@ def export_resume(
             if export_info["export_error"]:
                 typer.echo(f"Export error: {export_info['export_error']}")
 
-        if refusal is not None:
+        if not refusal.can_resume:
+            assert refusal.cause is not None
             if output_format == "json":
                 import json as json_module
 
-                typer.echo(json_module.dumps(export_info, indent=2))
+                typer.echo(
+                    json_module.dumps({**export_info, "event": "export_resume_refused", "cause": refusal.cause.value}, indent=2),
+                    err=True,
+                )
             else:
-                typer.echo(f"Cannot resume export for run {run_id}: {refusal}", err=True)
+                typer.echo(f"Cannot resume export for run {run_id}: {refusal.reason}", err=True)
             raise typer.Exit(1)
 
         if not execute:
@@ -3533,6 +4107,26 @@ def export_resume(
                 audit_export_content_store_resolver=audit_export_content_store_resolver,
                 worker_id=mint_worker_id(run_id),
             )
+        except WriteLockHeldError as e:
+            _emit_write_lock_held(e, output_format)
+            raise typer.Exit(1) from e
+        except NonResumableRunError as e:
+            if output_format == "json":
+                typer.echo(
+                    json.dumps(
+                        {
+                            "event": "export_resume_refused",
+                            "run_id": run_id,
+                            "reason": e.reason,
+                            "cause": e.cause.value,
+                            "preflight": export_info,
+                        }
+                    ),
+                    err=True,
+                )
+            else:
+                typer.echo(f"Cannot resume export for run {run_id}: {e.reason}", err=True)
+            raise typer.Exit(1) from e
         except contract_errors.TIER_1_ERRORS:
             raise  # Tier 1 errors must crash with full traceback, not Exit(1)
         except Exception as e:
@@ -3704,8 +4298,14 @@ def abandon(
             "refusal": preflight.refusal,
         }
         if not preflight.admissible:
+            assert preflight.refusal_cause is not None
             if output_format == "json":
-                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": preflight.refusal}), err=True)
+                typer.echo(
+                    json.dumps(
+                        {"event": "abandon_refused", "run_id": run_id, "reason": preflight.refusal, "cause": preflight.refusal_cause.value}
+                    ),
+                    err=True,
+                )
             else:
                 typer.echo(f"\nCannot abandon run {run_id}: {preflight.refusal}", err=True)
             raise typer.Exit(1)
@@ -3738,19 +4338,22 @@ def abandon(
 
         try:
             outcome = abandon_leaderless_run(db, run_id)
+        except WriteLockHeldError as e:
+            _emit_write_lock_held(e, output_format)
+            raise typer.Exit(1) from e
         except AbandonRefusedError as e:
-            # The state moved between the preflight above and the verb's own
-            # preflight (another operator finalized or resumed it first).
+            # Preserve the verb's second preflight decision, including races
+            # with finalization, disappearance or a newly live leader.
             if output_format == "json":
-                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason}), err=True)
+                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason, "cause": e.cause.value}), err=True)
             else:
                 typer.echo(f"\nCannot abandon run {run_id}: {e.reason}", err=True)
             raise typer.Exit(1) from e
         except NonResumableRunError as e:
-            # The takeover CAS lost: the seat came back to life after the
-            # preflight read it as dead. Zero mutation (ADR-030 §B.4).
+            # Preserve the enforcing admission's cause without inferring it
+            # from the exception class or querying the seat again.
             if output_format == "json":
-                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason}), err=True)
+                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason, "cause": e.cause.value}), err=True)
             else:
                 typer.echo(f"\nCannot abandon run {run_id}: {e.reason}", err=True)
             raise typer.Exit(1) from e
@@ -3822,7 +4425,7 @@ def join(
     """
     import traceback
 
-    from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError, RunWorkerEvictedError
+    from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError
     from elspeth.core.landscape import LandscapeDB
 
     # Settings are REQUIRED — the joiner must produce the same config_hash
@@ -3861,6 +4464,13 @@ def join(
     except SecretLoadError as e:
         typer.echo(f"Error loading secrets: {e}", err=True)
         raise typer.Exit(1) from None
+
+    # Followers have a separate context and external-call lifecycle. Until
+    # replay/verify carry a shared comparison authority across workers, a
+    # follower must not enter a run that suppresses external sink effects.
+    if settings_config.run_mode is not RunMode.LIVE:
+        typer.echo("Follower join is unavailable for replay and verify runs; use one worker.", err=True)
+        raise typer.Exit(1)
 
     try:
         plugins = _instantiate_plugins_for_runtime_preflight(
@@ -4012,7 +4622,7 @@ def join(
         # Build the execution graph for the follower (needed to recognise
         # barrier / sink nodes for hand-off routing).
         try:
-            _validation_graph, execution_graph = _build_resume_graphs(settings_config, plugins)
+            execution_graph = _build_resume_graph(settings_config, plugins)
         except contract_errors.TIER_1_ERRORS:
             raise
         except Exception as e:
@@ -4060,6 +4670,7 @@ def join(
         active_db = follower_db if follower_db is not None else db
 
         # Build and run the follower processor.
+        from elspeth.contracts.config import RuntimeRetryConfig
         from elspeth.contracts.plugin_context import PluginContext
         from elspeth.core.config import AggregationSettings as _AggregationSettings
         from elspeth.core.landscape.factory import RecorderFactory
@@ -4082,6 +4693,9 @@ def join(
             agg_transform.node_id = node_id
             follower_transforms.append(agg_transform)
 
+        from elspeth.engine.orchestrator.preflight import execution_sink_bindings_for_runtime
+
+        execution_sink_bindings = execution_sink_bindings_for_runtime(settings_config, plugins.sink_effect_bindings)
         pipeline_config = PipelineConfig(
             config=resolve_config(settings_config),
             sources=plugins.sources,
@@ -4092,6 +4706,7 @@ def join(
             coalesce_settings=(list(settings_config.coalesce) if settings_config.coalesce else []),
             sink_effect_modes=execution_sink_modes,
             sink_effect_admission=sink_effect_admission,
+            sink_effect_bindings=execution_sink_bindings,
             escalation_fixpoint_bound=execution_graph.escalation_fixpoint_bound,
         )
 
@@ -4103,6 +4718,7 @@ def join(
             payload_store=payload_store,
             concurrency_config=follower_concurrency_config,
             telemetry=follower_telemetry_manager,
+            retry_config=RuntimeRetryConfig.from_settings(settings_config.retry),
         )
 
         ctx = PluginContext(
@@ -4114,6 +4730,7 @@ def join(
             concurrency_config=follower_concurrency_config,
             shutdown_event=follower_shutdown_event,
             telemetry_emit=emit_follower_telemetry,
+            member_token=member_token,
         )
 
         # Call on_start for all transforms and sinks — mirrors the leader's
@@ -4133,29 +4750,14 @@ def join(
                 ctx=ctx,
                 started_transforms=started_follower_transforms,
                 started_sinks=started_follower_sinks,
+                runtime_bindings=execution_sink_bindings,
             )
 
             follower_run_entered = True
             follower_proc.run(ctx)
         except RunWorkerEvictedError as e:
             try:
-                if output_format == "json":
-                    import json as json_mod
-
-                    typer.echo(
-                        json_mod.dumps(
-                            {
-                                "event": "evicted",
-                                "run_id": run_id,
-                                "worker_id": e.worker_id,
-                                "message": str(e),
-                            }
-                        ),
-                        err=True,
-                    )
-                else:
-                    typer.echo(f"\nFollower evicted from run {run_id}.", err=True)
-                    typer.echo("Worker identity is single-use. Re-admit under a fresh identity if appropriate.", err=True)
+                _emit_worker_evicted_event(e, output_format)
                 raise typer.Exit(3)
             except BaseException as pending_exc:
                 cleanup_pending_exc = pending_exc
@@ -4614,7 +5216,7 @@ def health(
 def web(
     port: int = typer.Option(8451, help="Port to listen on"),
     host: str = typer.Option("127.0.0.1", help="Host to bind to"),
-    auth: str = typer.Option("local", help="Auth provider: local, oidc, entra, vanguard, google"),
+    auth: str | None = typer.Option(None, help="Auth provider: local, oidc, entra, vanguard, google"),
     reload: bool = typer.Option(False, help="Enable auto-reload for development"),
 ) -> None:
     """Start the ELSPETH web application."""
@@ -4646,9 +5248,12 @@ def web(
     # exists.
     from elspeth.web.auth.providers import registered_provider_names
 
+    # An explicit CLI choice takes precedence; otherwise preserve the provider
+    # supplied to the app factory through its normal environment settings.
+    selected_auth = auth if auth is not None else os.environ.get("ELSPETH_WEB__AUTH_PROVIDER")
     selectable = registered_provider_names()
-    if auth not in selectable:
-        typer.echo(f"Error: unknown auth provider {auth!r}. Choose one of: {', '.join(selectable)}", err=True)
+    if selected_auth is not None and selected_auth not in selectable:
+        typer.echo(f"Error: unknown auth provider {selected_auth!r}. Choose one of: {', '.join(selectable)}", err=True)
         raise typer.Exit(1)
 
     # Bridge CLI args to create_app() via environment variables.
@@ -4656,7 +5261,8 @@ def web(
     # so we set ELSPETH_WEB__* env vars that settings_from_env() reads.
     os.environ["ELSPETH_WEB__HOST"] = host
     os.environ["ELSPETH_WEB__PORT"] = str(port)
-    os.environ["ELSPETH_WEB__AUTH_PROVIDER"] = auth
+    if selected_auth is not None:
+        os.environ["ELSPETH_WEB__AUTH_PROVIDER"] = selected_auth
 
     uvicorn.run(
         "elspeth.web.app:create_app",

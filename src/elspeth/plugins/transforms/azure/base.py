@@ -26,11 +26,12 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.contexts import LifecycleContext, LimiterProtocol, TransformContext
 from elspeth.contracts.errors import CapacityError, FrameworkBugError, PluginRetryableError, is_capacity_error
+from elspeth.contracts.events import TelemetryEvent
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
-from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
@@ -169,10 +170,15 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         schema = create_schema_from_config(cfg.schema_config, schema_name, allow_coercion=False)
         self.input_schema = schema
         self.output_schema = schema
+        # The operator's schema is this node's output declaration too: a
+        # guardrail passes the row through unchanged, so every field the
+        # operator types is a carried field whose declaration the ONE stamp
+        # writes onto the emitted contract (ADR-050 Decision 2).
+        self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
 
         self._recorder: PluginAuditWriter | None = None
         self._run_id: str = ""
-        self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
+        self._telemetry_emit: Callable[[TelemetryEvent], None] = _warn_telemetry_before_start
         self._limiter: LimiterProtocol | None = None
 
         self._http_clients: dict[str, Any] = {}  # state_id -> AuditedHTTPClient
@@ -276,6 +282,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
             requested_state_id: str,
             *,
             token_id: str | None = None,
+            ctx: TransformContext,
         ) -> Any:
             del requested_state_id, token_id
             return client
@@ -286,6 +293,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
                 probe_rows[0],
                 state_id,
                 token_id=token_id,
+                ctx=ctx,
             )
         finally:
             if had_client_override:
@@ -313,7 +321,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         token_id = ctx.token.token_id if ctx.token is not None else None
 
         try:
-            return self._process_single_with_state(row, state_id, token_id=token_id)
+            return self._process_single_with_state(row, state_id, token_id=token_id, ctx=ctx)
         finally:
             # Clean up cached HTTP client for this state_id
             with self._http_clients_lock:
@@ -327,6 +335,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> TransformResult:
         """Process a single row with explicit state_id.
 
@@ -366,6 +375,12 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
 
             validated_fields.append((field_name, value))
 
+        if not validated_fields:
+            return TransformResult.error(
+                {"reason": "no_scannable_fields"},
+                retryable=False,
+            )
+
         capacity_retry_started_at = time.monotonic()
         capacity_retry_deadline = capacity_retry_started_at + float(self._max_capacity_retry_seconds)
 
@@ -377,12 +392,14 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
                 token_id=token_id,
                 retry_started_at=capacity_retry_started_at,
                 retry_deadline=capacity_retry_deadline,
+                ctx=ctx,
             )
             if violation is not None:
                 return violation
 
+        # Pass through unchanged, under the node's declared contract.
         return TransformResult.success(
-            self._align_output_row_contract(row),
+            PipelineRow(row.to_dict(), self._align_output_contract(self._apply_declared_output_field_contracts(row.contract))),
             success_reason={"action": "validated"},
         )
 
@@ -393,10 +410,11 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> TransformResult | None:
         """Run one Azure field analysis attempt and classify non-capacity failures."""
         try:
-            return self._analyze_field(value, field_name, state_id, token_id=token_id)
+            return self._analyze_field(value, field_name, state_id, token_id=token_id, ctx=ctx)
         except httpx.HTTPStatusError as e:
             status_code = e.response.status_code
             if is_capacity_error(status_code):
@@ -434,6 +452,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
         retry_started_at: float | None = None,
         retry_deadline: float | None = None,
     ) -> TransformResult | None:
@@ -447,7 +466,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
                 return self._capacity_retry_shutdown_result(started_at)
 
             try:
-                return self._analyze_field_once(value, field_name, state_id, token_id=token_id)
+                return self._analyze_field_once(value, field_name, state_id, token_id=token_id, ctx=ctx)
             except CapacityError as e:
                 if self._capacity_retry_shutdown.is_set():
                     return self._capacity_retry_shutdown_result(started_at)
@@ -503,6 +522,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> TransformResult | None:
         """Analyze a single field value. Subclasses must implement.
 
@@ -526,7 +546,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
             raise MalformedResponseError(f"Invalid JSON in {label}: {parse_error}")
         return data
 
-    def _get_http_client(self, state_id: str, *, token_id: str | None = None) -> Any:
+    def _get_http_client(self, state_id: str, *, ctx: TransformContext, token_id: str | None = None) -> Any:
         """Get or create audited HTTP client for a state_id.
 
         Clients are cached to preserve call_index across retries.
@@ -542,6 +562,8 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
                 if self._recorder is None:
                     raise RuntimeError(f"{self.name}: recorder not initialized — call on_start() before processing")
                 self._http_clients[state_id] = AuditedHTTPClient(
+                    member_token=ctx.require_member_token(),
+                    work_item=ctx.require_work_item(),
                     execution=self._recorder,
                     state_id=state_id,
                     run_id=self._run_id,
@@ -552,6 +574,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
                         "Content-Type": "application/json",
                     },
                     limiter=self._limiter,
+                    call_mode_session=ctx.call_mode_session,
                     token_id=token_id,
                 )
             return self._http_clients[state_id]

@@ -13,10 +13,11 @@ Layer: L0 (contracts). Imports nothing above contracts.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, fields
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields, require_int
 
@@ -24,16 +25,36 @@ ComposerLLMProviderCostSource = Literal[
     "not_available",
     "response_usage.cost",
     "_hidden_params.response_cost",
+    "litellm.cost_per_token",
 ]
 
 PROVIDER_COST_SOURCE_NOT_AVAILABLE: ComposerLLMProviderCostSource = "not_available"
 PROVIDER_COST_SOURCE_RESPONSE_USAGE_COST: ComposerLLMProviderCostSource = "response_usage.cost"
 PROVIDER_COST_SOURCE_HIDDEN_PARAMS_RESPONSE_COST: ComposerLLMProviderCostSource = "_hidden_params.response_cost"
+PROVIDER_COST_SOURCE_COST_PER_TOKEN: ComposerLLMProviderCostSource = "litellm.cost_per_token"
 _VALID_PROVIDER_COST_SOURCES = {
     PROVIDER_COST_SOURCE_NOT_AVAILABLE,
     PROVIDER_COST_SOURCE_RESPONSE_USAGE_COST,
     PROVIDER_COST_SOURCE_HIDDEN_PARAMS_RESPONSE_COST,
+    PROVIDER_COST_SOURCE_COST_PER_TOKEN,
 }
+
+# Recorded in place of a served-endpoint name that is present but outside the
+# closed provider-name shape. Fixed and value-free: provider bytes that fail
+# the shape never reach the audit row.
+PROVIDER_SERVED_UNRECOGNISED: Final[str] = "unrecognised"
+
+# The closed shape of an OpenRouter served-endpoint name (the response's
+# top-level ``provider`` field): 1-64 characters, letters, digits, space, dot,
+# underscore and hyphen, starting and ending with a letter or digit. Every
+# ``provider_name`` the OpenRouter endpoints API listed for the measured
+# planner, advisor and default models on 2026-09-23 fits it (longest: 14).
+_PROVIDER_SERVED_SHAPE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,62}[A-Za-z0-9])?")
+
+
+def is_provider_served_name(value: str) -> bool:
+    """Return whether ``value`` has the closed served-endpoint-name shape."""
+    return _PROVIDER_SERVED_SHAPE.fullmatch(value) is not None
 
 
 class ComposerLLMCallStatus(StrEnum):
@@ -46,6 +67,21 @@ class ComposerLLMCallStatus(StrEnum):
     BAD_REQUEST_ERROR = "bad_request_error"
     MALFORMED_RESPONSE = "malformed_response"
     CANCELLED = "cancelled"
+
+
+class ToolContractDialect(StrEnum):
+    """The shape of the tool list a composer model call was sent.
+
+    ``NONE`` is the flat registry schema (plus the web set_pipeline
+    envelope) with no ``strict`` key: today's bytes. ``OPENAI_STRICT`` makes
+    every optional property of a strict-capable tool required and nullable,
+    and stamps every tool with an explicit ``strict`` flag. The web wire
+    projection builds one tool list per dialect; the LLM-call audit record
+    reads the dialect, so the type lives here rather than under ``web/``.
+    """
+
+    OPENAI_STRICT = "openai_strict"
+    NONE = "none"
 
 
 def _require_non_empty_str(value: object, field_name: str, *, optional: bool = False) -> None:
@@ -93,10 +129,10 @@ class ComposerLLMCall:
     ``cache_creation_input_tokens``, ``cache_read_input_tokens``) capture
     provider-reported prompt-cache statistics. They default to ``None``
     because most providers do not report cache metadata when caching is
-    not active for the call. Per the CLAUDE.md fabrication policy, an
-    absent cache field stays ``None`` rather than coerced to zero — an
-    auditor can then distinguish "no cache reported" from "cache reported
-    zero hits."
+    not active for the call. An absent cache field stays ``None`` rather
+    than coerced to zero: absence is evidence, and a fabricated zero is
+    indistinguishable from a measured one. An auditor can therefore
+    distinguish "no cache reported" from "cache reported zero hits."
 
     ``reasoning_tokens`` and the reasoning artifact fields capture
     provider-reported reasoning metadata from APIs that expose it (for
@@ -140,6 +176,22 @@ class ComposerLLMCall:
     sent: the configured value when set, or ``None`` when the operator left it
     unset and it was omitted from the request. The audit row mirrors the request
     so a reviewer can correlate failures with the precise sampling regime.
+
+    ``provider_served`` is the endpoint that served the call, as OpenRouter
+    names it in the response's top-level ``provider`` field (one model id is
+    routed across many endpoints). It is provider-authored, so unlike the
+    strings above it is persisted only in a closed, public-safe shape: the
+    capture point records a conforming name verbatim, any other present value
+    as the fixed :data:`PROVIDER_SERVED_UNRECOGNISED` token, and absence as
+    ``None``. This contract enforces the same shape, because the persisted
+    audit projection exposes the field.
+
+    ``tool_contract_dialect`` and ``strict_tool_count`` say which
+    :class:`ToolContractDialect` the transmitted tool list was sent under and
+    how many of its tools carried ``strict: true``. The capture point derives
+    both from the same ``tools`` list that ``tools_spec_hash`` covers. They are
+    both ``None`` when the call carried no tools, and a ``none`` dialect always
+    has a count of ``0``.
     """
 
     model_requested: str
@@ -168,17 +220,39 @@ class ComposerLLMCall:
     reasoning_details: Any | None = None
     thinking_blocks: Any | None = None
     provider_cost: float | None = None
+    # Catalog identity configured for fallback pricing, independent of routing.
+    pricing_model: str | None = None
     provider_cost_source: ComposerLLMProviderCostSource = PROVIDER_COST_SOURCE_NOT_AVAILABLE
     max_completion_tokens_requested: int | None = None
     planner_policy_hash: str | None = None
     planner_call_ordinal: int | None = None
+    call_id: str | None = None
+    provider_served: str | None = None
+    tool_contract_dialect: ToolContractDialect | None = None
+    strict_tool_count: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.status) is not ComposerLLMCallStatus:
             raise TypeError(f"status must be ComposerLLMCallStatus, got {type(self.status).__name__}: {self.status!r}")
+        if self.tool_contract_dialect is not None and type(self.tool_contract_dialect) is not ToolContractDialect:
+            raise TypeError(f"tool_contract_dialect must be ToolContractDialect or None, got {type(self.tool_contract_dialect).__name__}")
+        if self.strict_tool_count is not None:
+            if type(self.strict_tool_count) is not int:
+                raise TypeError(f"strict_tool_count must be int or None, got {type(self.strict_tool_count).__name__}")
+            if self.strict_tool_count < 0:
+                raise ValueError(f"strict_tool_count must be >= 0, got {self.strict_tool_count}")
+        if (self.tool_contract_dialect is None) != (self.strict_tool_count is None):
+            raise ValueError("tool_contract_dialect and strict_tool_count must be supplied together")
+        if self.tool_contract_dialect is ToolContractDialect.NONE and self.strict_tool_count != 0:
+            raise ValueError("a tool list sent under the none dialect carries no strict tools")
         _require_non_empty_str(self.model_requested, "model_requested")
+        _require_non_empty_str(self.pricing_model, "pricing_model", optional=True)
+        _require_non_empty_str(self.call_id, "call_id", optional=True)
         _require_non_empty_str(self.model_returned, "model_returned", optional=True)
         _require_non_empty_str(self.provider_request_id, "provider_request_id", optional=True)
+        _require_non_empty_str(self.provider_served, "provider_served", optional=True)
+        if self.provider_served is not None and not is_provider_served_name(self.provider_served):
+            raise ValueError("provider_served must match the closed served-endpoint-name shape")
         # An empty/whitespace finish_reason is not "the provider said nothing"
         # — absence is ``None``. A blank string reaching here is a defect in
         # the extraction site, not provider data worth recording.
@@ -264,6 +338,7 @@ class ComposerLLMCall:
         """JSON-friendly dict for sidecar serialization."""
         raw = {field.name: deep_thaw(getattr(self, field.name)) for field in fields(self)}
         raw["status"] = self.status.value
+        raw["tool_contract_dialect"] = self.tool_contract_dialect.value if self.tool_contract_dialect is not None else None
         raw["started_at"] = self.started_at.isoformat()
         raw["finished_at"] = self.finished_at.isoformat()
         return raw
@@ -278,139 +353,4 @@ class ComposerLLMCallRecorder(Protocol):
 
     def resolve_session(self, session_id: str) -> None:
         """Hint that the session_id is now resolved."""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# ComposerChatTurn — per-step-chat audit record (Phase A slice 5)
-# ---------------------------------------------------------------------------
-
-
-class ComposerChatTurnStatus(StrEnum):
-    """Outcome of one per-step chat turn (Phase A slice 5).
-
-    Mirrors :class:`ComposerLLMCallStatus` for symmetry, but a distinct
-    enum because chat turns also have outcomes that don't apply to bare
-    LLM calls (e.g. ``SYNTHETIC_UNAVAILABLE`` for the auto-drop synthetic
-    message; the underlying LLM call may have ``TIMEOUT`` status but the
-    chat turn surfaces a synthetic assistant message and is recorded as
-    ``SYNTHETIC_UNAVAILABLE``). ``INVARIANT_VIOLATED`` records a defective
-    model response that raised before an assistant chat message landed.
-    """
-
-    SUCCESS = "success"
-    SYNTHETIC_UNAVAILABLE = "synthetic_unavailable"
-    INVARIANT_VIOLATED = "invariant_violated"
-
-
-class ComposerChatInitiator(StrEnum):
-    """Who started the chat turn.
-
-    ``user`` — the human typed a message into the chat input.
-    ``step_entry_opener`` — a Phase A.5 proactive opener fired by the server
-    when ``session.step`` changed.  Phase A only emits ``user``; the
-    discriminator is wired now so the audit schema is stable across phases.
-    """
-
-    USER = "user"
-    STEP_ENTRY_OPENER = "step_entry_opener"
-
-
-@dataclass(frozen=True, slots=True)
-class ComposerChatTurn:
-    """One per-step chat turn as recorded for composer audit (Phase A slice 5).
-
-    Sibling to :class:`ComposerLLMCall`.  Where ``ComposerLLMCall``
-    records a *single outbound model request*, ``ComposerChatTurn``
-    records the higher-level *conversational turn* — which step the user
-    was on, who initiated it (user vs. proactive opener), the monotonic
-    per-session sequence number, and integrity hashes for the messages
-    exchanged.  An auditor can query "show me every chat turn at
-    ``step=step_1_source`` for run X" without joining through
-    ``ComposerLLMCall``.
-
-    Phase A is advisory-only — no tool calls, no rejected tool calls.
-    Phase B adds ``tool_calls`` / ``rejected_tool_calls`` fields.  Their
-    absence in Phase A is recorded honestly (``tool_calls`` defaults to
-    empty tuple), not fabricated.
-
-    ``user_message_hash`` and ``assistant_message_hash`` are canonical
-    stable hashes over the literal message strings.  Construction sites
-    in L3 compute them via :func:`elspeth.core.canonical.stable_hash`;
-    this record holds the hash only, never the raw text (the raw text is
-    Tier-3 user input or LLM output and must not enter the audit row).
-
-    ``latency_ms`` is end-to-end on the server: from user message
-    accepted at the route to assistant message persisted in
-    ``chat_history``.  On the synthetic-unavailable path it is still
-    populated (the time spent waiting for the failing LLM call).
-
-    ``turn_token`` is the guided occurrence token the user message was
-    submitted under (validated against ``guided_turn_token`` before the
-    turn settles), mirroring ``ChatTurn.turn_token`` on the session side
-    (elspeth-ea80e34fdc).  Without it an auditor cannot tell which
-    occurrence a chat turn answered — a retry of an earlier occurrence
-    and a fresh message at the current one are indistinguishable after
-    the fact.  A ``USER`` turn always has one; a ``STEP_ENTRY_OPENER``
-    is server-initiated with no submitted token and must carry ``None``.
-    """
-
-    step: str
-    initiator: ComposerChatInitiator
-    chat_turn_seq: int
-    user_message_hash: str
-    assistant_message_hash: str
-    latency_ms: int
-    model: str
-    status: ComposerChatTurnStatus
-    started_at: datetime
-    finished_at: datetime
-    turn_token: str | None
-    error_class: str | None = None
-
-    def __post_init__(self) -> None:
-        _require_non_empty_str(self.step, "step")
-        _require_non_empty_str(self.user_message_hash, "user_message_hash")
-        _require_non_empty_str(self.assistant_message_hash, "assistant_message_hash")
-        _require_non_empty_str(self.model, "model")
-        _require_datetime(self.started_at, "started_at")
-        _require_datetime(self.finished_at, "finished_at")
-        if self.finished_at < self.started_at:
-            raise ValueError("finished_at must be >= started_at")
-        require_int(self.chat_turn_seq, "chat_turn_seq", min_value=0)
-        require_int(self.latency_ms, "latency_ms", min_value=0)
-        if type(self.initiator) is not ComposerChatInitiator:
-            raise TypeError(f"initiator must be ComposerChatInitiator, got {type(self.initiator).__name__}")
-        if type(self.status) is not ComposerChatTurnStatus:
-            raise TypeError(f"status must be ComposerChatTurnStatus, got {type(self.status).__name__}")
-        _require_non_empty_str(self.turn_token, "turn_token", optional=True)
-        if self.initiator is ComposerChatInitiator.USER and self.turn_token is None:
-            raise ValueError("turn_token must be populated when initiator is USER")
-        if self.initiator is ComposerChatInitiator.STEP_ENTRY_OPENER and self.turn_token is not None:
-            raise ValueError("turn_token must be None when initiator is STEP_ENTRY_OPENER")
-        _require_non_empty_str(self.error_class, "error_class", optional=True)
-        if self.status is ComposerChatTurnStatus.SUCCESS and self.error_class is not None:
-            raise ValueError("error_class must be None when status is SUCCESS")
-        failed_statuses = (
-            ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
-            ComposerChatTurnStatus.INVARIANT_VIOLATED,
-        )
-        if self.status in failed_statuses and self.error_class is None:
-            raise ValueError(f"error_class must be populated when status is {self.status.value}")
-
-    def to_dict(self) -> dict[str, Any]:
-        """JSON-friendly dict for sidecar serialization (mirror of ComposerLLMCall.to_dict)."""
-        raw = {field.name: deep_thaw(getattr(self, field.name)) for field in fields(self)}
-        raw["status"] = self.status.value
-        raw["initiator"] = self.initiator.value
-        raw["started_at"] = self.started_at.isoformat()
-        raw["finished_at"] = self.finished_at.isoformat()
-        return raw
-
-
-class ComposerChatTurnRecorder(Protocol):
-    """Append-only sink for :class:`ComposerChatTurn` records (Phase A slice 5)."""
-
-    def record_chat_turn(self, turn: ComposerChatTurn) -> None:
-        """Persist or buffer one chat-turn record."""
         ...

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts.enums import NodeType
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig, get_raw_node_required_fields
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.contracts.types import CollectorName, NodeID
 from elspeth.core.config import CoalesceSettings, CollectorSettings, GateSettings, ScopeSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
@@ -23,10 +27,17 @@ class _Source:
     on_success = "rows"
     _output_schema_config = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
 
 
 class _Sink:
     name = "out"
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
     _on_write_failure = "discard"
@@ -38,6 +49,23 @@ class _Sink:
 
 class _MultiRowTransform:
     """Stub multi-row transform (creates_tokens=True) — a scope opener."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
 
     input_schema = None
     output_schema = None
@@ -52,6 +80,8 @@ class _MultiRowTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         # .name is the PLUGIN name (matches TransformSettings.plugin below via
@@ -64,6 +94,27 @@ class _MultiRowTransform:
 
 class _BatchTransform:
     """Stub batch-aware transform — the collector plugin."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        # BatchTransformProtocol presence requirement: this fake requires no field.
+        return frozenset()
 
     input_schema = None
     output_schema = None
@@ -78,6 +129,8 @@ class _BatchTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         self.name = "stitch"
@@ -87,6 +140,23 @@ class _BatchTransform:
 
 class _PlainTransform:
     """Stub plain transform for per-branch fork chains (not a scope opener/closer)."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
 
     input_schema = None
     output_schema = None
@@ -100,6 +170,8 @@ class _PlainTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str) -> None:
         self.name = name

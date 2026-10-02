@@ -1,4 +1,5 @@
 import {
+  type JSX,
   type KeyboardEvent,
   useCallback,
   useEffect,
@@ -9,7 +10,6 @@ import {
 } from "react";
 
 import { useAuditReadinessSync } from "@/components/audit/useAuditReadinessSync";
-import { projectCompletedGuidedHistory } from "@/components/chat/guided/GuidedHistory";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { InlineRunResults } from "@/components/execution/InlineRunResults";
 import { CatalogButton } from "@/components/sidebar/CatalogButton";
@@ -28,6 +28,7 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { RunStatus } from "@/types/index";
 import { useWorkspacePaneController } from "./WorkspacePaneContext";
+import { ApprovalsView } from "./ApprovalsView";
 import { ChecksView } from "./ChecksView";
 import { PipelineSpecView } from "./PipelineSpecView";
 import {
@@ -39,7 +40,10 @@ import {
 import { ARTIFACT_TABS, type ArtifactTab } from "./workspaceTypes";
 
 const TAB_LABELS: Record<ArtifactTab, string> = {
-  graph: "Graph",
+  /* The tab id stays "graph" (deep links, the command palette and stored pane
+     state all key on it); only the visible name is "Workflow". */
+  graph: "Workflow",
+  approvals: "Approvals",
   spec: "Spec",
   yaml: "YAML",
   checks: "Checks",
@@ -126,10 +130,16 @@ function activeArtifact(
   tab: ArtifactTab,
   runAvailable: boolean,
   checksValidationContent: React.ReactNode,
+  openFullscreen: () => void,
 ): JSX.Element {
   switch (tab) {
     case "graph":
-      return <GraphView />;
+      // Fullscreen is the graph's fourth canvas control (under fit view).
+      // Only this mount passes the handler: GraphModal renders the same
+      // GraphView and must not offer to open itself.
+      return <GraphView onFullscreen={openFullscreen} />;
+    case "approvals":
+      return <ApprovalsView />;
     case "spec":
       return <PipelineSpecView />;
     case "yaml":
@@ -147,11 +157,23 @@ function activeArtifact(
  *  carries a non-colour form — the finding count, ✓ for the all-clear, ! for
  *  a zero-count failure. Only the no-verdict tones (neutral, busy) remain
  *  plain dots. */
-function checksBadgeGlyph(status: WorkspaceStatus): string | null {
+function checksBadgeGlyph(status: WorkspaceStatus): React.ReactNode {
   if (status.issueCount > 0) return String(status.issueCount);
   switch (status.tone) {
     case "success":
-      return "✓";
+      // A text check falls back to a host font: Inter's Latin subset does
+      // not contain U+2713, making visual baselines differ across runners.
+      return (
+        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="M3 8l3.2 3.2L13 4.5"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      );
     case "error":
     case "warning":
       // One shared glyph: today a zero-count warning is unreachable (every
@@ -190,7 +212,7 @@ export function ArtifactWorkspace({
   runAvailable?: boolean;
   /** Mounts the Plugin-catalog trigger in the toolbar. App passes the same
    *  availability fact that used to gate the action bar's More-actions
-   *  popover (!guidedBuildActive); the tutorial shell leaves it false. */
+   *  popover; the tutorial shell leaves it false. */
   catalogAvailable?: boolean;
   /** Tutorial-shell content override for the Checks tab's validation half
    *  (PipelineValidationSummary); see ChecksView. */
@@ -222,6 +244,7 @@ export function ArtifactWorkspaceSurface({
   const { activeArtifactTab, availableArtifactTabs } = state;
   const tabRefs = useRef<Record<ArtifactTab, HTMLButtonElement | null>>({
     graph: null,
+    approvals: null,
     spec: null,
     yaml: null,
     checks: null,
@@ -275,15 +298,6 @@ export function ArtifactWorkspaceSurface({
   );
   const auditErrorsBySession = useAuditReadinessStore(
     (s) => s.errorBySession,
-  );
-  const hasGuidedHistory = useSessionStore(
-    (s) =>
-      s.guidedSession !== null &&
-      projectCompletedGuidedHistory(
-        s.guidedSession.history,
-        s.guidedSession.step,
-        s.guidedSession.terminal,
-      ).length > 0,
   );
   // Ambient audit sync for the badge: while the Checks panel is mounted its
   // own useAuditReadinessSync instance owns the fetch, so this one stands
@@ -346,7 +360,7 @@ export function ArtifactWorkspaceSurface({
   const announceFallback = useCallback((requested: ArtifactTab): void => {
     setAnnouncement((current) => ({
       id: current.id + 1,
-      message: `${TAB_LABELS[requested]} is unavailable. Showing Graph.`,
+      message: `${TAB_LABELS[requested]} is unavailable. Showing ${TAB_LABELS.graph}.`,
     }));
   }, []);
 
@@ -554,38 +568,10 @@ export function ArtifactWorkspaceSurface({
             );
           })}
         </div>
-        {/* Right cluster (2026-08-15 UX review): Plugin catalog precedes
-            Focus graph in DOM order — visual order IS tab order (WCAG 2.4.3;
-            no CSS `order` on interactive controls), and Focus graph keeps
-            its long-standing terminal-edge position whether or not the
-            catalog renders. Focus graph itself must NEVER be removed in
-            favour of a canvas gesture: it is the only keyboard-operable
-            trigger for GraphModal (palette "Show graph" and Ctrl+Shift+G
-            deliberately pass focusMode:false), and the canvas's click
-            gestures are already bound (empty-click deselects, double-click
-            zooms). */}
+        {/* Right cluster: session-wide tools only. The graph's Fullscreen
+            control is one of the Workflow canvas's own controls (GraphView). */}
         <div className="artifact-toolbar-actions">
-          {/* Sole opener of the History drawer since the action-bar chips
-              retired with the Checks tab: gated on the same completed-history
-              fact the drawer itself closes on, and its id is the drawer's
-              focus-restore fallback (WorkspaceInspector). */}
-          {hasGuidedHistory && (
-            <Button
-              compact
-              id="artifact-history-trigger"
-              aria-expanded={state.inspectorOpen}
-              aria-controls="workspace-inspector"
-              onClick={(event) =>
-                actions.openInspector("history", event.currentTarget)
-              }
-            >
-              History
-            </Button>
-          )}
           {catalogAvailable && <CatalogButton />}
-          <Button compact onClick={focusGraph}>
-            Focus graph
-          </Button>
         </div>
       </div>
       <p
@@ -629,7 +615,7 @@ export function ArtifactWorkspaceSurface({
                 key={`${activeSessionId ?? "no-session"}:${tab}`}
                 label={`${activeLabel} artifact`}
               >
-                {activeArtifact(tab, runAvailable, checksValidationContent)}
+                {activeArtifact(tab, runAvailable, checksValidationContent, focusGraph)}
               </ErrorBoundary>
             )}
           </div>

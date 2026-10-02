@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import socket
 import urllib.parse
 from datetime import UTC, datetime
 from typing import Any
@@ -12,6 +13,8 @@ import pytest
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit import Call
+from elspeth.contracts.call_mode import ReplaySSRFRequest
+from elspeth.contracts.enums import RunMode
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
@@ -77,6 +80,94 @@ def _config(**overrides: Any) -> dict[str, Any]:
     }
     config.update(overrides)
     return config
+
+
+def test_blob_fetch_fixed_url_needs_no_url_column(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.transforms.blob_fetch as blob_fetch_module
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    fixed_url = "https://example.test/data.csv"
+    seen: list[str] = []
+
+    def _validate(url: str, *, allowed_ranges: Any = ()) -> SSRFSafeRequest:
+        del allowed_ranges
+        seen.append(url)
+        return _safe_request_for(url)
+
+    monkeypatch.setattr(blob_fetch_module, "validate_url_for_ssrf", _validate)
+    options = _config(url=fixed_url, schema={"mode": "observed"})
+    options.pop("url_field")
+    transform = BlobFetch(options)
+    transform._payload_store = _PayloadStoreFake()
+    response = httpx.Response(
+        200,
+        content=b"id,name\n1,alice\n",
+        headers={"content-type": "text/csv"},
+        request=httpx.Request("GET", "https://203.0.113.10:443/data.csv"),
+    )
+    monkeypatch.setattr(transform, "_fetch_url", lambda _safe, _ctx: (response, fixed_url, _call()))
+
+    result = transform.process(make_pipeline_row({"batch_id": "run-1"}), make_context())
+
+    assert transform.declared_input_fields == frozenset()
+    assert seen == [fixed_url]
+    assert result.status == "success"
+    assert result.row is not None
+    assert result.row["batch_id"] == "run-1"
+    assert result.row["fetch_url_final"] == fixed_url
+
+
+def test_blob_fetch_fixed_url_invariant_probe_is_offline_and_restores_configured_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    options = _config(url="https://example.invalid/data.csv", schema={"mode": "observed"})
+    options.pop("url_field")
+    transform = BlobFetch(options)
+    rows = transform.forward_invariant_probe_rows(make_pipeline_row({"batch_id": "run-1"}))
+
+    def _probe_ip_only(host: str, *_args: Any, **_kwargs: Any) -> list[tuple[Any, ...]]:
+        assert host == "93.184.216.34", "probe must not resolve the configured hostname"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, 0))]
+
+    monkeypatch.setattr("socket.getaddrinfo", _probe_ip_only)
+    result = transform.execute_forward_invariant_probe(rows, make_context())
+
+    assert result.status == "success"
+    assert transform._url == "https://example.invalid/data.csv"
+
+
+@pytest.mark.parametrize(
+    ("url", "include_url_field"),
+    [(None, False), ("https://example.test/data.csv", True)],
+)
+def test_blob_fetch_requires_exactly_one_url_source(url: str | None, include_url_field: bool) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    options = _config()
+    if not include_url_field:
+        options.pop("url_field")
+    if url is not None:
+        options["url"] = url
+
+    with pytest.raises(PluginConfigError, match=r"url.*url_field"):
+        BlobFetch(options)
+
+
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "http://127.0.0.1/private", "https://example.test:0/"])
+def test_blob_fetch_rejects_unsafe_fixed_url_before_dns(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    def _dns_forbidden(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("configuration must not resolve DNS")
+
+    monkeypatch.setattr("socket.getaddrinfo", _dns_forbidden)
+    options = _config(url=url, schema={"mode": "observed"})
+    options.pop("url_field")
+
+    with pytest.raises(PluginConfigError, match="url"):
+        BlobFetch(options)
 
 
 def test_blob_fetch_stores_body_and_emits_blob_reference(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -194,9 +285,9 @@ def test_blob_fetch_redacts_url_in_error_reason(monkeypatch: pytest.MonkeyPatch)
     assert "password" not in persisted_reason
     assert "ERROR_SECRET" not in persisted_reason
     assert "fragment-secret" not in persisted_reason
-    persisted_url = result.reason["url"]
-    assert isinstance(persisted_url, str)
-    assert urllib.parse.parse_qs(urllib.parse.urlsplit(persisted_url).query)["token"][0].startswith("<fingerprint:")
+    # The URL is row data: no part of it is persisted in the reason (C3).
+    assert "url" not in result.reason
+    assert "example.test" not in persisted_reason
 
 
 def test_blob_fetch_blocks_ssrf_rejected_urls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -204,7 +295,7 @@ def test_blob_fetch_blocks_ssrf_rejected_urls(monkeypatch: pytest.MonkeyPatch) -
     from elspeth.plugins.transforms.blob_fetch import BlobFetch
 
     def _blocked(url: str, allowed_ranges=()) -> SSRFSafeRequest:
-        raise SSRFBlockedError(f"blocked: {url}")
+        raise SSRFBlockedError(f"blocked: {url}", kind="blocked_range")
 
     monkeypatch.setattr(blob_fetch_module, "validate_url_for_ssrf", _blocked)
 
@@ -217,6 +308,55 @@ def test_blob_fetch_blocks_ssrf_rejected_urls(monkeypatch: pytest.MonkeyPatch) -
     assert result.reason is not None
     assert result.reason["reason"] == "validation_failed"
     assert result.reason["error_type"] == "SSRFBlockedError"
+
+
+def test_blob_fetch_replay_uses_archived_pin_without_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.transforms.blob_fetch as blob_fetch_module
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    url = "https://example.test/file.pdf"
+    captured: list[SSRFSafeRequest] = []
+
+    class _ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_ssrf_request(self, **_kwargs: Any) -> ReplaySSRFRequest:
+            safe = _safe_request_for(url, resolved_ip="93.184.216.34")
+            return ReplaySSRFRequest(
+                safe.original_url,
+                safe.resolved_ip,
+                safe.host_header,
+                safe.port,
+                safe.path,
+                safe.scheme,
+                safe.bare_hostname,
+            )
+
+    def _dns_forbidden(*_args: Any, **_kwargs: Any) -> SSRFSafeRequest:
+        raise AssertionError("DNS validation called during replay")
+
+    monkeypatch.setattr(blob_fetch_module, "validate_url_for_ssrf", _dns_forbidden)
+    transform = BlobFetch(_config())
+    response = httpx.Response(
+        200,
+        content=b"%PDF-1.7",
+        headers={"content-type": "application/pdf"},
+        request=httpx.Request("GET", "https://93.184.216.34/file.pdf"),
+    )
+
+    def _fetch(safe: SSRFSafeRequest, _ctx: Any) -> tuple[httpx.Response, str, Call]:
+        captured.append(safe)
+        return response, url, _call()
+
+    monkeypatch.setattr(transform, "_fetch_url", _fetch)
+    ctx = make_context()
+    ctx.call_mode_session = _ReplaySession()
+    ctx.run_mode = RunMode.REPLAY
+    ctx.replay_from = "source-run"
+    result = transform.process(make_pipeline_row({"url": url}), ctx)
+
+    assert result.status == "error"
+    assert captured[0].resolved_ip == "93.184.216.34"
 
 
 def test_blob_fetch_rejects_unapproved_content_type(monkeypatch: pytest.MonkeyPatch) -> None:

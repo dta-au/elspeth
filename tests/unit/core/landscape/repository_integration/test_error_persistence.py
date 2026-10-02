@@ -6,15 +6,13 @@ persisted to the landscape database and queryable. This confirms the
 SDA-029 implementation for validation error audit trail.
 """
 
-from datetime import UTC
-
 import pytest
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select
 from tests.fixtures.factories import make_context
+from tests.fixtures.landscape import claim_test_work_item, ingest_quarantine_row_for_test, leader_coordination_token
 
-from elspeth.contracts.enums import NodeType
-from elspeth.contracts.results import SourceRow
+from elspeth.contracts.enums import NodeType, RoutingMode
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import sanitize_for_canonical
 from elspeth.core.landscape.database import LandscapeDB
@@ -26,7 +24,6 @@ from elspeth.core.landscape.schema import (
     transform_errors_table,
     validation_errors_table,
 )
-from elspeth.engine.tokens import TokenManager
 
 # Shared schema config for tests
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -47,7 +44,7 @@ class TestValidationErrorPersistence:
 
         # Register source node to satisfy FK constraint
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -61,6 +58,7 @@ class TestValidationErrorPersistence:
         ctx = make_context(
             run_id=run_id,
             landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, run_id),
             node_id="source_node",
         )
 
@@ -97,7 +95,7 @@ class TestValidationErrorPersistence:
 
         # Register source node to satisfy FK constraint
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -110,6 +108,7 @@ class TestValidationErrorPersistence:
         ctx = make_context(
             run_id=run_id,
             landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, run_id),
             node_id="source_node",
         )
 
@@ -146,7 +145,7 @@ class TestTransformErrorPersistence:
 
         # Create source node and row/token to satisfy FK constraints
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -155,34 +154,19 @@ class TestTransformErrorPersistence:
             node_id="source_test",
             sequence=0,
         )
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        factory.data_flow.create_row_with_token(
+            token_id="token-123",
+            coordination_token=leader_coordination_token(factory, run_id),
             source_node_id="source_test",
             row_index=1,
             data={"id": "test"},
             source_row_index=1,
             ingest_sequence=1,
         )
-        # Manually create token with specified ID to match test expectations
-        from datetime import datetime
-
-        from elspeth.core.landscape.schema import tokens_table
-
-        with landscape_db.write_connection() as conn:
-            conn.execute(
-                tokens_table.insert().values(
-                    token_id="token-123",
-                    row_id=row.row_id,
-                    run_id=run_id,
-                    step_in_pipeline=0,
-                    created_at=datetime.now(UTC),
-                )
-            )
-            conn.commit()
 
         # Register transform node to satisfy FK constraint
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="price_calculator",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -196,7 +180,14 @@ class TestTransformErrorPersistence:
         ctx = make_context(
             run_id=run_id,
             landscape=factory.plugin_audit_writer(),
-            node_id="transform_node",
+            coordination_token=leader_coordination_token(factory, run_id),
+            node_id="price_calculator",
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run_id).membership,
+                token_id="token-123",
+                node_id="price_calculator",
+            ),
         )
 
         # Act: Record a transform error
@@ -233,7 +224,7 @@ class TestTransformErrorPersistence:
 
         # Create source node and row/token to satisfy FK constraints
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -242,34 +233,19 @@ class TestTransformErrorPersistence:
             node_id="source_test",
             sequence=0,
         )
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        factory.data_flow.create_row_with_token(
+            token_id="token-456",
+            coordination_token=leader_coordination_token(factory, run_id),
             source_node_id="source_test",
             row_index=1,
             data={"id": "test"},
             source_row_index=1,
             ingest_sequence=1,
         )
-        # Manually create token with specified ID to match test expectations
-        from datetime import datetime
-
-        from elspeth.core.landscape.schema import tokens_table
-
-        with landscape_db.write_connection() as conn:
-            conn.execute(
-                tokens_table.insert().values(
-                    token_id="token-456",
-                    row_id=row.row_id,
-                    run_id=run_id,
-                    step_in_pipeline=0,
-                    created_at=datetime.now(UTC),
-                )
-            )
-            conn.commit()
 
         # Register transform node to satisfy FK constraint
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="validator",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -282,7 +258,14 @@ class TestTransformErrorPersistence:
         ctx = make_context(
             run_id=run_id,
             landscape=factory.plugin_audit_writer(),
-            node_id="transform_node",
+            coordination_token=leader_coordination_token(factory, run_id),
+            node_id="validator",
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run_id).membership,
+                token_id="token-456",
+                node_id="validator",
+            ),
         )
 
         # Act: Record with discard destination
@@ -318,7 +301,7 @@ class TestErrorEventExplainQuery:
         run_id = run.run_id
 
         source_node = factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -329,8 +312,8 @@ class TestErrorEventExplainQuery:
 
         # Create a row that will have the same hash as the error
         row_data = {"id": "row-42", "value": "not_a_number"}
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run_id),
             source_node_id=source_node.node_id,
             row_index=0,
             data=row_data,
@@ -338,12 +321,11 @@ class TestErrorEventExplainQuery:
             ingest_sequence=0,
         )
 
-        token = factory.data_flow.create_token(row_id=row.row_id)
-
         # Record validation error using same data (for matching hash)
         ctx = make_context(
             run_id=run_id,
             landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, run_id),
             node_id=source_node.node_id,
         )
 
@@ -378,7 +360,7 @@ class TestErrorEventExplainQuery:
         run_id = run.run_id
 
         source_node = factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="json_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -390,6 +372,7 @@ class TestErrorEventExplainQuery:
         ctx = make_context(
             run_id=run_id,
             landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, run_id),
             node_id=source_node.node_id,
         )
         error_token = ctx.record_validation_error(
@@ -399,21 +382,14 @@ class TestErrorEventExplainQuery:
             destination="quarantine_sink",
         )
 
-        token_manager = TokenManager(factory.data_flow, step_resolver=lambda _node_id: 0)
-        quarantine_token = token_manager.create_quarantine_token(
+        quarantine_token = ingest_quarantine_row_for_test(
+            factory,
             run_id=run_id,
             source_node_id=source_node.node_id,
-            row_index=0,
-            source_row=SourceRow.quarantined(
-                row=42,
-                error="Expected object row, got int",
-                destination="quarantine_sink",
-                source_row_index=0,
-            ),
+            row=42,
+            error="Expected object row, got int",
             validation_error_id=error_token.error_id,
-            source_row_index=0,
-            ingest_sequence=0,
-        )
+        ).token
 
         lineage = explain(
             query=factory.query,
@@ -435,7 +411,7 @@ class TestErrorEventExplainQuery:
         run_id = run.run_id
 
         source_node = factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="json_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -448,6 +424,7 @@ class TestErrorEventExplainQuery:
         ctx = make_context(
             run_id=run_id,
             landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, run_id),
             node_id=source_node.node_id,
         )
         error_token = ctx.record_validation_error(
@@ -457,21 +434,14 @@ class TestErrorEventExplainQuery:
             destination="quarantine_sink",
         )
 
-        token_manager = TokenManager(factory.data_flow, step_resolver=lambda _node_id: 0)
-        quarantine_token = token_manager.create_quarantine_token(
+        quarantine_token = ingest_quarantine_row_for_test(
+            factory,
             run_id=run_id,
             source_node_id=source_node.node_id,
-            row_index=0,
-            source_row=SourceRow.quarantined(
-                row=sanitize_for_canonical(raw_row),
-                error="Row contains NaN",
-                destination="quarantine_sink",
-                source_row_index=0,
-            ),
+            row=sanitize_for_canonical(raw_row),
+            error="Row contains NaN",
             validation_error_id=error_token.error_id,
-            source_row_index=0,
-            ingest_sequence=0,
-        )
+        ).token
 
         lineage = explain(
             query=factory.query,
@@ -488,7 +458,7 @@ class TestErrorEventExplainQuery:
         factory = RecorderFactory(landscape_db)
         run = factory.run_lifecycle.begin_run(config={"test": True}, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="json_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -497,13 +467,32 @@ class TestErrorEventExplainQuery:
             schema_config=DYNAMIC_SCHEMA,
         )
         error_id = factory.data_flow.record_validation_error(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id=source_node.node_id,
             row_data={"raw": "invalid"},
             error="invalid source row",
             schema_mode="observed",
             destination="quarantine_sink",
         )
+
+        # The graph exists before the injected fault (the DAG builder records
+        # it at run start), so the rollback proof covers only the ingest.
+        quarantine_sink = factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, run.run_id),
+            plugin_name="quarantine_sink",
+            node_type=NodeType.SINK,
+            plugin_version="1.0.0",
+            config={},
+            sequence=1,
+            schema_config=DYNAMIC_SCHEMA,
+        )
+        quarantine_edge_id = factory.data_flow.register_edge(
+            source_node.node_id,
+            quarantine_sink.node_id,
+            "__quarantine__",
+            RoutingMode.DIVERT,
+            coordination_token=leader_coordination_token(factory, run.run_id),
+        ).edge_id
 
         def fail_validation_error_link(
             _conn: object,
@@ -518,21 +507,15 @@ class TestErrorEventExplainQuery:
 
         sqlalchemy_event.listen(landscape_db.engine, "before_cursor_execute", fail_validation_error_link)
         try:
-            manager = TokenManager(factory.data_flow, step_resolver=lambda _node_id: 0)
             with pytest.raises(RuntimeError, match="injected validation-error linkage failure"):
-                manager.create_quarantine_token(
+                ingest_quarantine_row_for_test(
+                    factory,
                     run_id=run.run_id,
                     source_node_id=source_node.node_id,
-                    row_index=0,
-                    source_row=SourceRow.quarantined(
-                        row={"raw": "invalid"},
-                        error="invalid source row",
-                        destination="quarantine_sink",
-                        source_row_index=0,
-                    ),
+                    row={"raw": "invalid"},
+                    error="invalid source row",
                     validation_error_id=error_id,
-                    source_row_index=0,
-                    ingest_sequence=0,
+                    quarantine_edge_id=quarantine_edge_id,
                 )
         finally:
             sqlalchemy_event.remove(landscape_db.engine, "before_cursor_execute", fail_validation_error_link)
@@ -559,7 +542,7 @@ class TestErrorEventExplainQuery:
         run_id = run.run_id
 
         source_node = factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -569,7 +552,7 @@ class TestErrorEventExplainQuery:
         )
 
         transform_node = factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="divide_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -580,21 +563,27 @@ class TestErrorEventExplainQuery:
 
         # Create row and token
         row_data = {"id": "row-99", "divisor": 0}
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run_id),
             source_node_id=source_node.node_id,
             row_index=0,
             data=row_data,
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Record transform error
         ctx = make_context(
             run_id=run_id,
             landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, run_id),
             node_id=transform_node.node_id,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run_id).membership,
+                token_id=token.token_id,
+                node_id=transform_node.node_id,
+            ),
         )
 
         error_token = ctx.record_transform_error(
@@ -630,7 +619,7 @@ class TestErrorEventExplainQuery:
         run_id = run.run_id
 
         source_node = factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -639,15 +628,14 @@ class TestErrorEventExplainQuery:
             schema_config=DYNAMIC_SCHEMA,
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run_id),
             source_node_id=source_node.node_id,
             row_index=0,
             data={"id": "clean-row", "value": 42},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Act: Query lineage
         lineage = explain(
@@ -673,7 +661,7 @@ class TestErrorEventExplainQuery:
         run_id = run.run_id
 
         source_node = factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -683,7 +671,7 @@ class TestErrorEventExplainQuery:
         )
 
         transform1 = factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="transform1",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -693,7 +681,7 @@ class TestErrorEventExplainQuery:
         )
 
         transform2 = factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="transform2",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -703,20 +691,26 @@ class TestErrorEventExplainQuery:
         )
 
         row_data = {"id": "multi-error", "value": "bad"}
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run_id),
             source_node_id=source_node.node_id,
             row_index=0,
             data=row_data,
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         ctx = make_context(
             run_id=run_id,
             landscape=factory.plugin_audit_writer(),
-            node_id="test",
+            coordination_token=leader_coordination_token(factory, run_id),
+            node_id=transform1.node_id,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run_id).membership,
+                token_id=token.token_id,
+                node_id=transform1.node_id,
+            ),
         )
 
         # Record two transform errors for same token

@@ -8,6 +8,7 @@ from enum import StrEnum
 
 from sqlalchemy import (
     DDL,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -34,7 +35,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.compiler import SQLCompiler
 
-from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import CollectorGroupFailureReason, FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.types import NODE_ID_MAX_LENGTH
 from elspeth.core.schema_identity import create_schema_identity_table
@@ -173,6 +174,50 @@ def _compile_postgres_optional_lower_hex16(element: _OptionalLowerHex16Check, _c
     return f"{name} IS NULL OR {name} ~ '^[0-9a-f]{{16}}$'"
 
 
+class _OptionalLowerHex32Check(ColumnElement[bool]):
+    """Dialect-exact optional 32-character ``SchemaContract.version_hash`` value."""
+
+    inherit_cache = True
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__()
+        self.column_name = column_name
+
+
+@compiles(_OptionalLowerHex32Check, "sqlite")
+def _compile_sqlite_optional_lower_hex32(element: _OptionalLowerHex32Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR (length({name})=32 AND {name} NOT GLOB '*[^0-9a-f]*')"
+
+
+@compiles(_OptionalLowerHex32Check, "postgresql")
+def _compile_postgres_optional_lower_hex32(element: _OptionalLowerHex32Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR {name} ~ '^[0-9a-f]{{32}}$'"
+
+
+class _OptionalSha256Ref16Check(ColumnElement[bool]):
+    """Dialect-exact optional ``sha256:<16 hex>`` plugin source fingerprint."""
+
+    inherit_cache = True
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__()
+        self.column_name = column_name
+
+
+@compiles(_OptionalSha256Ref16Check, "sqlite")
+def _compile_sqlite_optional_sha256_ref16(element: _OptionalSha256Ref16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR (length({name})=23 AND substr({name}, 1, 7) = 'sha256:' AND substr({name}, 8) NOT GLOB '*[^0-9a-f]*')"
+
+
+@compiles(_OptionalSha256Ref16Check, "postgresql")
+def _compile_postgres_optional_sha256_ref16(element: _OptionalSha256Ref16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR {name} ~ '^sha256:[0-9a-f]{{16}}$'"
+
+
 def _sql_string_literal(value: str) -> str:
     """Render one deterministic SQL string literal for generated CHECK clauses."""
     return "'" + value.replace("'", "''") + "'"
@@ -218,7 +263,7 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #   7 → ADR-019 Stage 2/3: token_outcomes stores the two-axis terminal model
 #        (`outcome`, `path`, `completed`) instead of the old single-axis outcome + is_terminal.
 #   8 → Phase 5b interpretation-review audit anchor:
-#        calls.resolved_prompt_template_hash records the runtime-side hash used
+#        calls.approved_prompt_artifact_hash records the runtime-side hash used
 #        to join Landscape LLM calls back to session interpretation_events.
 #   9 → Phase 4 hello-world tutorial audit-story fields:
 #        runs.llm_call_count, runs.seeded_from_cache, and runs.cache_key.
@@ -375,7 +420,66 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        (ix_scheduler_events_run_token_time is replaced by
 #        ix_scheduler_events_run_token_seq). Pre-1.0 delete-and-recreate
 #        boundary; no migration, rollback_permitted: false.
-SQLITE_SCHEMA_EPOCH = 38
+#   39 → immutable web run-start permit binding and recoverable pre-effect
+#        admission state. Pre-1.0 delete-and-recreate boundary; no migration.
+#   40 → VANguard residual schema batch (elspeth-255ae1a544,
+#        elspeth-ff89d2bea0): nullable prompt_tokens, completion_tokens,
+#        cached_prompt_tokens and reasoning_tokens on calls preserve reported
+#        usage, including measured zero, without inventing usage when unknown.
+#        Run policy evidence gains the assessed quota-policy identities and
+#        canonical secret-wiring hash bound to the durable admission decision.
+#        These items missed the epoch-38 window; their named trigger is this
+#        prepared residual batch after ACA epoch 39, not a future incidental
+#        bump. Deploy together with Sessions epoch 55 in ONE service-stop
+#        window. Definitions and admission checks prepare that window; they
+#        do not perform a deployed cutover or assert complete token accounting.
+#        Pre-1.0 delete-and-recreate boundary; no migration,
+#        rollback_permitted: false. Preserve/export evidence before cutover.
+#  41 → Approved prompt artifact anchor replaces the fallback-template digest.
+#        Covers system prompt and ordered effective queries; delete/recreate.
+#  42 → Admission evidence v2 persists per-principal token quota usage and limits.
+#        Its decoder rejects stored v1 run_web_plugin_policy evidence, so even
+#        an unchanged table layout requires a pre-1.0 delete/recreate boundary.
+#        Deploy with Sessions epoch 59; never relabel old evidence as v2.
+#  43 → Every digest column carries a shape CHECK. SQLite ignores the declared
+#        VARCHAR width, so String(64) alone admitted any text: 64-hex, the
+#        16-hex error fingerprints, the 32-hex SchemaContract.version_hash
+#        values and the ``sha256:<16 hex>`` plugin source fingerprint now each
+#        have their own rule. Deploy with Sessions epoch 63; delete/recreate.
+#  44 → Calls gain source-call lineage and durable verification decisions;
+#        operations gain a fenced per-node/type occurrence index for repeatable
+#        source/preflight call matching.
+#        Populated epoch-43 stores require delete/recreate under pre-1.0 policy.
+#  45 → One immutable collector-group failure verdict per group, including
+#        groups with no arrived members. The run result counts these separately
+#        from failed rows. Its failure_reason is the closed
+#        CollectorGroupFailureReason vocabulary under a CHECK, and each failed
+#        member's CollectorGroupFailure hold names its group_id (folded into
+#        45 by operator ruling 2026-09-25, no bump; a store created before the
+#        fold lacks ck_collector_group_failures_failure_reason and startup
+#        validation refuses it). Populated epoch-44 stores require
+#        delete/recreate.
+#  46 → Valid source rows retain their exact source contract for sparse-stream
+#        replay and verify. The scheduler_events event_type CHECK admits
+#        ``resume_requeue_failed``: resume returns a FAILED item whose token
+#        has no completed outcome to READY (folded into 46 by lane ruling
+#        2026-09-26, no bump; a store created before the fold carries the
+#        narrower CHECK and startup shape validation refuses it). Populated
+#        epoch-45 stores require delete/recreate.
+#  47 → Verification verdicts page through a run/time/call index, while
+#        corrupt run bindings are found from indexed call parents. Populated
+#        epoch-46 stores require delete/recreate.
+#  48 → A source-quarantined row is handed to its sink through a durable
+#        PENDING_SINK work item written in its ingest transaction (the fifth
+#        pending_sink_bundle_clause arm), resume re-drives only scheduler work
+#        and never re-derives a row, and the run_coordination_events
+#        event_type CHECK admits ``resume_refused`` (resume refuses a run whose
+#        tokens are neither decided nor covered by scheduler work). A store
+#        written before this epoch can hold a quarantined token with no work
+#        item that the new resume refuses as corruption, so only a bump — not
+#        a fold — keeps such a store from opening. Populated epoch-47 stores
+#        require delete/recreate.
+SQLITE_SCHEMA_EPOCH = 49
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -434,6 +538,8 @@ runs_table = Table(
     Column("completed_at", DateTime(timezone=True)),
     Column("config_hash", String(64), nullable=False),
     Column("settings_json", Text, nullable=False),
+    Column("run_mode", String(16), nullable=False, server_default="live"),
+    Column("replay_from_run_id", String(64), ForeignKey("runs.run_id"), nullable=True),
     Column("reproducibility_grade", String(32)),
     Column("canonical_version", String(64), nullable=False),
     # Source schema for resume type restoration
@@ -471,11 +577,12 @@ runs_table = Table(
     # under prime-order; source ∈ {"live", "bundled"} distinguishes
     # online-probed snapshots from the bundled litellm fallback.  Both
     # NOT NULL — see ``read_openrouter_catalog_snapshot_id`` for the
-    # reader the orchestrator uses to populate them.  Per CLAUDE.md
-    # Tier-1 doctrine no ``server_default`` is set: a synthetic
-    # placeholder in the audit trail would be indistinguishable from a
-    # real hash to any downstream reader, violating the fabrication
-    # test.  Production goes through :meth:`RunLifecycleRepository.begin_run`
+    # reader the orchestrator uses to populate them.  Under Tier-1 rules
+    # (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    # Model) no ``server_default`` is set: a synthetic placeholder in the
+    # audit trail would be indistinguishable from a real hash to any
+    # downstream reader, and a fabricated value is not evidence.
+    # Production goes through :meth:`RunLifecycleRepository.begin_run`
     # which validates both fields; direct ``runs_table.insert()`` from
     # test fixtures must supply them explicitly.
     Column("openrouter_catalog_sha256", String(64), nullable=False),
@@ -484,8 +591,30 @@ runs_table = Table(
         "openrouter_catalog_source IN ('live', 'bundled')",
         name="ck_runs_openrouter_catalog_source",
     ),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_runs_config_hash_hex"),
+    CheckConstraint("run_mode IN ('live', 'replay', 'verify')", name="ck_runs_mode"),
+    CheckConstraint(
+        "(run_mode = 'live' AND replay_from_run_id IS NULL) OR (run_mode <> 'live' AND replay_from_run_id IS NOT NULL AND replay_from_run_id <> run_id)",
+        name="ck_runs_mode_source",
+    ),
+    CheckConstraint(_LowerHex64Check("openrouter_catalog_sha256"), name="ck_runs_openrouter_catalog_sha256_hex"),
 )
 Index("uq_runs_export_witness", runs_table.c.run_id, runs_table.c.status, runs_table.c.completed_at, unique=True)
+
+run_start_admissions_table = Table(
+    "run_start_admissions",
+    metadata,
+    Column("run_id", String(64), ForeignKey("runs.run_id"), primary_key=True),
+    Column("permit_id", String, nullable=False, unique=True),
+    Column("permit_epoch", Integer, nullable=False),
+    Column("subject_hash", String(64), nullable=False),
+    Column("state", String(16), nullable=False),
+    CheckConstraint("permit_epoch > 0", name="ck_run_start_admissions_epoch"),
+    CheckConstraint("length(trim(permit_id)) > 0", name="ck_run_start_admissions_permit").ddl_if(dialect="sqlite"),
+    CheckConstraint("length(btrim(permit_id)) > 0", name="ck_run_start_admissions_permit").ddl_if(dialect="postgresql"),
+    CheckConstraint(_LowerHex64Check("subject_hash"), name="ck_run_start_admissions_hash"),
+    CheckConstraint("state IN ('prepared', 'executing')", name="ck_run_start_admissions_state"),
+)
 
 run_attributions_table = Table(
     "run_attributions",
@@ -516,7 +645,24 @@ run_web_plugin_policy_table = Table(
     Column("plugin_code_identities_json", Text, nullable=False),
     Column("binding_generation_fingerprint", String(64), nullable=False),
     Column("decision_codes_json", Text, nullable=False),
+    Column("admission_decision_json", Text, nullable=True),
+    Column("admission_decision_hash", String(64), nullable=True),
+    CheckConstraint(
+        "(admission_decision_json IS NULL AND admission_decision_hash IS NULL) OR "
+        "(admission_decision_json IS NOT NULL AND admission_decision_hash IS NOT NULL)",
+        name="ck_run_web_plugin_policy_admission_pair",
+    ),
     CheckConstraint("schema_version >= 1", name="ck_run_web_plugin_policy_schema_version"),
+    CheckConstraint(_LowerHex64Check("policy_hash"), name="ck_run_web_plugin_policy_policy_hash_hex"),
+    CheckConstraint(_LowerHex64Check("snapshot_hash"), name="ck_run_web_plugin_policy_snapshot_hash_hex"),
+    CheckConstraint(
+        _LowerHex64Check("binding_generation_fingerprint"),
+        name="ck_run_web_plugin_policy_binding_generation_fingerprint_hex",
+    ),
+    CheckConstraint(
+        _OptionalLowerHex64Check("admission_decision_hash"),
+        name="ck_run_web_plugin_policy_admission_decision_hash_hex",
+    ),
 )
 
 run_sources_table = Table(
@@ -542,6 +688,8 @@ run_sources_table = Table(
         _enum_in_check("lifecycle_state", RunSourceLifecycleState),
         name="ck_run_sources_lifecycle_state",
     ),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_run_sources_config_hash_hex"),
+    CheckConstraint(_OptionalLowerHex32Check("schema_contract_hash"), name="ck_run_sources_schema_contract_hash_hex"),
     ForeignKeyConstraint(["source_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
 )
 Index("ix_run_sources_run", run_sources_table.c.run_id)
@@ -561,7 +709,6 @@ nodes_table = Table(
     Column("determinism", String(32), nullable=False),  # deterministic, seeded, nondeterministic (from Determinism enum)
     Column("config_hash", String(64), nullable=False),
     Column("config_json", Text, nullable=False),
-    Column("schema_hash", String(64)),
     Column("sequence_in_pipeline", Integer),
     Column("registered_at", DateTime(timezone=True), nullable=False),
     # Schema configuration for audit trail (WP-11.99)
@@ -570,12 +717,18 @@ nodes_table = Table(
     # Schema contracts for audit trail (Phase 5: Unified Schema Contracts)
     # Input contract: what the node requires (field names and types)
     Column("input_contract_json", Text),
-    # Output contract: what the node guarantees (field names and types)
+    # Output contract. A source records its inferred-and-locked contract on its
+    # first valid row; a transform records its DECLARED output contract (declared
+    # types, fixed before row 1) whose field set evolves as observed pass-through
+    # fields fold in (ADR-050).
     Column("output_contract_json", Text),
     Column("output_contract_hash", String(32)),
     # Composite PK: same node config can exist in multiple runs
     # This allows running the same pipeline multiple times against the same database
     PrimaryKeyConstraint("node_id", "run_id"),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_nodes_config_hash_hex"),
+    CheckConstraint(_OptionalLowerHex32Check("output_contract_hash"), name="ck_nodes_output_contract_hash_hex"),
+    CheckConstraint(_OptionalSha256Ref16Check("source_file_hash"), name="ck_nodes_source_file_hash_ref"),
 )
 
 # === Edges ===
@@ -600,7 +753,7 @@ edges_table = Table(
 
 # === Source Rows ===
 #
-# Audit-DB invariants for the rows table (filigree elspeth-56c3cda89b,
+# Audit-DB invariants for the rows table (archived issue elspeth-56c3cda89b,
 # ADR-bundle systems-thinker Finding 5, "Tragedy of the Commons"). The shared
 # resource is the audit database's invariant surface; the actors are 25+
 # downstream consumers (audit-readiness panel, ``elspeth explain``, MCP
@@ -630,19 +783,15 @@ edges_table = Table(
 #    ``data_flow_repository.create_row`` raises ``AuditIntegrityError`` when
 #    these values are not explicitly provided ("Do not fabricate
 #    source_row_index or ingest_sequence from row_index"), but the
-#    prohibition lives in an exception string at one write boundary. The
-#    cache-replay write path (``write_repository.record_synthesised_run``)
-#    uses the row-index fallback only for single-source runs; multi-source
-#    synthesised rows must provide explicit source_node_index,
-#    source_row_index, ingest_sequence, and source_data_hash before the
-#    writer inserts them. Tracked under filigree elspeth-92afea0d23
+#    prohibition lives in an exception string at one write boundary.
+#    Tracked under archived issue elspeth-92afea0d23
 #    (elspeth-lints rule with the same enforcement status as
 #    ``trust_tier.tier_model``).
 #
 # B. Scheduler lease-ownership transitions (G29). ``token_work_items``
 #    carries the current lease state but not its transition history; a
 #    lease-expiry event during multi-worker execution leaves no per-worker
-#    audit attribution. Tracked under filigree elspeth-9030f34c32
+#    audit attribution. Tracked under archived issue elspeth-9030f34c32
 #    (``scheduler_events`` table).
 
 rows_table = Table(
@@ -656,10 +805,12 @@ rows_table = Table(
     Column("ingest_sequence", Integer, nullable=False),
     Column("source_data_hash", String(64), nullable=False),
     Column("source_data_ref", String(256)),
+    Column("source_contract_json", Text),
     Column("created_at", DateTime(timezone=True), nullable=False),
     UniqueConstraint("row_id", "run_id"),
     UniqueConstraint("run_id", "source_node_id", "source_row_index"),
     UniqueConstraint("run_id", "ingest_sequence"),
+    CheckConstraint(_LowerHex64Check("source_data_hash"), name="ck_rows_source_data_hash_hex"),
     # Composite FK to nodes (node_id, run_id)
     ForeignKeyConstraint(["source_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
 )
@@ -724,6 +875,7 @@ token_outcomes_table = Table(
     Column("error_hash", String(64)),
     # Optional extended context
     Column("context_json", Text),
+    CheckConstraint(_OptionalLowerHex16Check("error_hash"), name="ck_token_outcomes_error_hash_hex"),
     # Composite FK: batch outcomes must point at a batch from the same run.
     ForeignKeyConstraint(["batch_id", "run_id"], ["batches.batch_id", "batches.run_id"]),
 )
@@ -807,7 +959,7 @@ token_work_items_table = Table(
     # ``recover_expired_leases`` sweep's OR-NULL predicate (elspeth-28aaa36a62)
     # treats ``lease_owner=NULL`` as a recoverable wedge, so the CHECK closes
     # the structural gap by preventing the wedge from being written in the
-    # first place (filigree elspeth-9990c81e14, embedded-database-reviewer).
+    # first place (archived issue elspeth-9990c81e14, embedded-database-reviewer).
     # The literal MUST match ``TokenWorkStatus.LEASED.value`` exactly — the
     # enum is a ``StrEnum`` whose ``.value`` is lowercase ``"leased"`` and
     # every write site persists ``.value`` (e.g. ``scheduler_repository.py``
@@ -825,6 +977,7 @@ token_work_items_table = Table(
     ForeignKeyConstraint(["row_id", "run_id"], ["rows.row_id", "rows.run_id"]),
     ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
     ForeignKeyConstraint(["coalesce_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    CheckConstraint(_OptionalLowerHex16Check("pending_error_hash"), name="ck_token_work_items_pending_error_hash_hex"),
 )
 Index("ix_token_work_items_ready", token_work_items_table.c.run_id, token_work_items_table.c.status, token_work_items_table.c.available_at)
 Index(
@@ -838,7 +991,7 @@ Index(
 # index. Bounded by run-LEASED rows today, but the RC6 multi-worker target
 # runs the sweep per-worker-per-iteration: O(workers²) per drain wave. The
 # wider index puts ``lease_owner`` into the seek key so the sweep is index-
-# only (filigree elspeth-9990c81e14, embedded-database-reviewer MED).
+# only (archived issue elspeth-9990c81e14, embedded-database-reviewer MED).
 Index(
     "ix_token_work_items_recovery",
     token_work_items_table.c.run_id,
@@ -873,8 +1026,14 @@ def pending_sink_bundle_clause() -> ColumnElement[bool]:
     ``PENDING_SINK`` is not merely a status: the dedicated redrive path must
     be able to rebuild a legal sink-bound ``RowResult`` without replaying its
     producer.  The opaque row payload and sink identity must therefore be
-    present, the persisted outcome/path pair must be one of the four
+    present, the persisted outcome/path pair must be one of the five
     sink-bound terminal pairs, and pair-specific evidence must be complete.
+    Source quarantine is the fifth: a row the source rejected is handed to its
+    quarantine sink through the same durable bundle as every other sink-bound
+    token, carrying the audited quarantine error hash and bounded message.
+    ``(FAILURE, QUARANTINED_AT_SOURCE)`` is also the sinkless discard pair;
+    a discarded token records its outcome directly and never parks, so a
+    parked item on this pair is always a source-quarantine handoff.
 
     Keep this predicate at the schema boundary so claim selection and its CAS
     UPDATE use the exact same SQL on SQLite and PostgreSQL.  Payload *shape*
@@ -914,7 +1073,63 @@ def pending_sink_bundle_clause() -> ColumnElement[bool]:
                 token_work_items_table.c.join_group_id != "",
                 no_error_evidence,
             ),
+            and_(
+                token_work_items_table.c.pending_outcome == TerminalOutcome.FAILURE.value,
+                token_work_items_table.c.pending_path == TerminalPath.QUARANTINED_AT_SOURCE.value,
+                token_work_items_table.c.pending_error_hash.is_not(None),
+                token_work_items_table.c.pending_error_hash != "",
+                token_work_items_table.c.pending_error_message.is_not(None),
+                token_work_items_table.c.join_group_id.is_(None),
+            ),
         ),
+    )
+
+
+def work_item_token_decided_clause() -> ColumnElement[bool]:
+    """EXISTS: the work item's token carries a completed terminal outcome in its run.
+
+    Correlated to ``token_work_items`` (a SELECT over it or an UPDATE of it).
+    """
+    return (
+        select(token_outcomes_table.c.outcome_id)
+        .where(token_outcomes_table.c.run_id == token_work_items_table.c.run_id)
+        .where(token_outcomes_table.c.token_id == token_work_items_table.c.token_id)
+        .where(token_outcomes_table.c.completed == 1)
+        .exists()
+    )
+
+
+def token_decided_clause() -> ColumnElement[bool]:
+    """EXISTS: the token carries a completed terminal outcome in its run.
+
+    Correlated to ``tokens``. The partial unique index
+    ``ix_token_outcomes_terminal_unique`` caps completed outcomes at one per
+    token, so NOT EXISTS of this clause is exactly "the token has no recorded
+    terminal outcome" — the fact a success stamp must never coexist with.
+    """
+    return (
+        select(token_outcomes_table.c.outcome_id)
+        .where(token_outcomes_table.c.run_id == tokens_table.c.run_id)
+        .where(token_outcomes_table.c.token_id == tokens_table.c.token_id)
+        .where(token_outcomes_table.c.completed == 1)
+        .exists()
+    )
+
+
+def undecided_failed_work_clause() -> ColumnElement[bool]:
+    """Predicate selecting FAILED work items whose token has no completed outcome.
+
+    FAILED is a disposition, not a fate. A routed failure records the token's
+    outcome before ``mark_failed``; a FAILED item whose token has none is a
+    claim that died on an exception mid-row (the drain's exception arm marks
+    it FAILED and the worker exits), so the row is undecided. Resume returns
+    exactly these items to READY for re-drive
+    (``requeue_undecided_failed_work``); ``complete_run``'s undecided-token
+    arm (``token_decided_clause``) refuses a success stamp over their tokens.
+    """
+    return and_(
+        token_work_items_table.c.status == TokenWorkStatus.FAILED.value,
+        ~work_item_token_decided_clause(),
     )
 
 
@@ -925,11 +1140,10 @@ def blocked_barrier_hold_clause() -> ColumnElement[bool]:
     ``barrier_key`` (coalesce_name for coalesce, str(node_id) for
     aggregation), while ADR-028 queue-holds carry only a ``queue_key``. The
     ``barrier_key IS NOT NULL`` filter is what keeps queue-holds out of
-    barrier sweeps (restore, resume work-set exclusion, quiescence counting).
+    barrier sweeps (restore, quiescence counting).
 
     Single source of truth for the dual-use predicate — shared by
     ``TokenSchedulerRepository.list_blocked_barrier_items`` and
-    ``RecoveryManager._get_buffered_journal_token_ids`` /
     ``count_blocked_barrier_items``. The literal ``'blocked'`` MUST match
     ``TokenWorkStatus.BLOCKED.value`` (a lowercase ``StrEnum``), consistent
     with the status literals in this module's CHECK constraints.
@@ -1084,11 +1298,13 @@ run_coordination_events_table = Table(
     Column("context_json", Text, nullable=False, server_default=text("'{}'")),
     # All 10 event types from the design DDL (§A.2), including the slice-4
     # producers worker_stalled and heartbeat_degraded — pinned into the
-    # epoch-21 CHECK now so slice 4 needs no schema change.
+    # epoch-21 CHECK now so slice 4 needs no schema change — plus epoch 48's
+    # resume_refused: the resuming leader's value-free record of a run whose
+    # tokens resume cannot account for (SchedulerLeaseRepository.verify_resume_coverage).
     CheckConstraint(
         "event_type IN ('worker_register', 'worker_depart', 'worker_evict', 'worker_stalled', "
         "'leader_acquire', 'leader_release', 'leadership_lost', "
-        "'fence_refusal', 'heartbeat_degraded', 'finalize')",
+        "'fence_refusal', 'heartbeat_degraded', 'finalize', 'resume_refused')",
         name="ck_run_coordination_events_event_type",
     ),
     # Mandatory: without the table kwarg, SQLAlchemy emits a bare INTEGER
@@ -1184,6 +1400,24 @@ Index(
     group_records_table.c.run_id,
     group_records_table.c.opener_token_id,
     unique=True,
+)
+
+collector_group_failures_table = Table(
+    "collector_group_failures",
+    metadata,
+    Column("run_id", String(64), primary_key=True),
+    Column("group_id", String(64), primary_key=True),
+    Column("collector_node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
+    # Closed vocabulary (CollectorGroupFailureReason): an engine-authored code
+    # the counting readers render as a failure category, never row data.
+    Column("failure_reason", String(64), nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(["run_id", "group_id"], ["group_records.run_id", "group_records.group_id"]),
+    ForeignKeyConstraint(["collector_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    CheckConstraint(
+        _enum_in_check("failure_reason", CollectorGroupFailureReason),
+        name="ck_collector_group_failures_failure_reason",
+    ),
 )
 
 group_losses_table = Table(
@@ -1335,6 +1569,8 @@ node_states_table = Table(
     ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
     # Composite FK to nodes (node_id, run_id)
     ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    CheckConstraint(_LowerHex64Check("input_hash"), name="ck_node_states_input_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("output_hash"), name="ck_node_states_output_hash_hex"),
 )
 Index(
     "uq_node_states_coalesce_member_identity",
@@ -1463,6 +1699,8 @@ sink_effect_streams_table = Table(
     UniqueConstraint("stream_id", "run_id"),
     CheckConstraint("role IN ('primary','failsink')", name="ck_sink_effect_streams_role"),
     CheckConstraint("next_sequence >= 0", name="ck_sink_effect_streams_next_sequence"),
+    CheckConstraint(_LowerHex64Check("requested_target_hash"), name="ck_sink_effect_streams_requested_target_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("head_descriptor_hash"), name="ck_sink_effect_streams_head_descriptor_hash_hex"),
     ForeignKeyConstraint(["run_id"], ["runs.run_id"]),
     ForeignKeyConstraint(["sink_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
 )
@@ -1523,6 +1761,8 @@ audit_export_snapshots_table = Table(
     CheckConstraint(_LowerHex64Check("last_chunk_seal_hash"), name="ck_audit_export_snapshots_last_chunk_seal_hash_hex"),
     CheckConstraint(_LowerHex64Check("final_hash"), name="ck_audit_export_snapshots_final_hash_hex"),
     CheckConstraint(_LowerHex64Check("signed_manifest_hash"), name="ck_audit_export_snapshots_signed_manifest_hash_hex"),
+    CheckConstraint(_LowerHex64Check("registry_key_hash"), name="ck_audit_export_snapshots_registry_key_hash_hex"),
+    CheckConstraint(_LowerHex64Check("public_export_config_hash"), name="ck_audit_export_snapshots_public_export_config_hash_hex"),
     CheckConstraint(
         _Sha256ContentRefCheck("signed_manifest_ref", "signed_manifest_hash"),
         name="ck_audit_export_snapshots_signed_manifest_ref",
@@ -1721,6 +1961,14 @@ sink_effects_table = Table(
         name="ck_sink_effects_reconcile_kind",
     ),
     ForeignKeyConstraint(["run_id"], ["runs.run_id"]),
+    CheckConstraint(_LowerHex64Check("config_hash"), name="ck_sink_effects_config_hash_hex"),
+    CheckConstraint(_LowerHex64Check("membership_or_manifest_hash"), name="ck_sink_effects_membership_or_manifest_hash_hex"),
+    CheckConstraint(_LowerHex64Check("group_payload_hash"), name="ck_sink_effects_group_payload_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("plan_hash"), name="ck_sink_effects_plan_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("expected_descriptor_hash"), name="ck_sink_effects_expected_descriptor_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("precondition_hash"), name="ck_sink_effects_precondition_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("result_descriptor_hash"), name="ck_sink_effects_result_descriptor_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("reconcile_evidence_hash"), name="ck_sink_effects_reconcile_evidence_hash_hex"),
     ForeignKeyConstraint(["sink_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
     ForeignKeyConstraint(["primary_effect_id"], ["sink_effects.effect_id"]),
     ForeignKeyConstraint(["stream_id", "run_id"], ["sink_effect_streams.stream_id", "sink_effect_streams.run_id"]),
@@ -1788,6 +2036,11 @@ sink_effect_members_table = Table(
     ForeignKeyConstraint(["row_id", "run_id"], ["rows.row_id", "rows.run_id"]),
     ForeignKeyConstraint(["sink_node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
     ForeignKeyConstraint(["primary_effect_id", "run_id"], ["sink_effects.effect_id", "sink_effects.run_id"]),
+    CheckConstraint(_LowerHex64Check("lineage_hash"), name="ck_sink_effect_members_lineage_hash_hex"),
+    CheckConstraint(_LowerHex64Check("payload_hash"), name="ck_sink_effect_members_payload_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("descriptor_hash"), name="ck_sink_effect_members_descriptor_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("evidence_hash"), name="ck_sink_effect_members_evidence_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("reason_hash"), name="ck_sink_effect_members_reason_hash_hex"),
 )
 Index(
     "uq_sink_effect_member_binding",
@@ -1833,6 +2086,8 @@ sink_effect_attempts_table = Table(
     CheckConstraint("generation >= 0", name="ck_sink_effect_attempts_generation"),
     CheckConstraint("action IN ('inspect','commit','reconcile')", name="ck_sink_effect_attempts_action"),
     CheckConstraint("state IN ('intent','returned','response_lost','error')", name="ck_sink_effect_attempts_state"),
+    CheckConstraint(_LowerHex64Check("request_hash"), name="ck_sink_effect_attempts_request_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("evidence_hash"), name="ck_sink_effect_attempts_evidence_hash_hex"),
     ForeignKeyConstraint(["effect_id"], ["sink_effects.effect_id"]),
     ForeignKeyConstraint(["effect_id", "member_ordinal"], ["sink_effect_members.effect_id", "sink_effect_members.ordinal"]),
 )
@@ -2034,6 +2289,7 @@ operations_table = Table(
     Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False, index=True),
     Column("node_id", String(NODE_ID_COLUMN_LENGTH), nullable=False),
     Column("operation_type", String(32), nullable=False),  # 'source_load' | 'sink_write' | 'runtime_preflight'
+    Column("occurrence_index", Integer, nullable=True),  # Transactional per-run/node/type order; NULL for legacy/raw rows
     Column("sink_effect_id", String(64), ForeignKey("sink_effects.effect_id"), nullable=True),
     Column("started_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True)),
@@ -2050,8 +2306,20 @@ operations_table = Table(
         "sink_effect_id IS NULL OR operation_type = 'sink_write'",
         name="ck_operations_sink_effect_type",
     ),
+    CheckConstraint(_OptionalLowerHex64Check("input_data_hash"), name="ck_operations_input_data_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("output_data_hash"), name="ck_operations_output_data_hash_hex"),
 )
 Index("uq_operations_sink_effect_id", operations_table.c.sink_effect_id, unique=True)
+Index(
+    "uq_operations_occurrence",
+    operations_table.c.run_id,
+    operations_table.c.node_id,
+    operations_table.c.operation_type,
+    operations_table.c.occurrence_index,
+    unique=True,
+    sqlite_where=operations_table.c.occurrence_index.isnot(None),
+    postgresql_where=operations_table.c.occurrence_index.isnot(None),
+)
 
 # === External Calls ===
 # Calls can be parented by either a node_state (transform processing) or an
@@ -2070,26 +2338,35 @@ calls_table = Table(
     Column("request_ref", String(256)),
     Column("response_hash", String(64)),
     Column("response_ref", String(256)),
+    Column("source_call_id", String(64), ForeignKey("calls.call_id"), nullable=True),
     # Cross-DB hash anchor for interpretation events (Option A — Phase 5b).
     # Populated by the LLM-transform plugin at execution time when the runtime
-    # node config contains a ``resolved_prompt_template_hash`` sibling field
+    # node config contains an ``approved_prompt_artifact_hash`` sibling field
     # (written by ``resolve_interpretation_event`` at compose time and committed
     # into ``composition_states.nodes``). If the sibling field is absent (the
     # LLM transform is NOT downstream of an interpretation event), this column
     # is NULL.
     #
     # When non-NULL, this hash MUST equal the corresponding
-    # ``interpretation_events.resolved_prompt_template_hash`` in the session
-    # audit DB for the same resolved prompt string. An inequality indicates
+    # ``interpretation_events.approved_prompt_artifact_hash`` in the session
+    # audit DB for the same approved prompt artifact. An inequality indicates
     # tampering or a composition-to-execution coherence failure. Checked by the
     # audit-tooling layer; a mismatch is a Tier-1 crash-on-anomaly.
     #
-    # Hash scheme: SHA-256 over rfc8785 canonical JSON of the resolved
-    # prompt-template string, using ``CANONICAL_VERSION = "sha256-rfc8785-v1"``
-    # (contracts/hashing.py:CANONICAL_VERSION). Identical scheme used by both
-    # the session service (write at resolve time) and the runtime plugin (write
-    # at execution time), so the hashes are comparable byte-for-byte.
-    Column("resolved_prompt_template_hash", String(64), nullable=True),
+    # Hash domain: elspeth.approved-prompt-artifact.v1 in core/prompt_artifact.py.
+    # Includes the system prompt and ordered effective query names/templates.
+    # Actual per-query template_hash and rendered request evidence are separate.
+    Column("approved_prompt_artifact_hash", String(64), nullable=True),
+    # Missing provider usage is unknown, never zero. Provider-specific totals
+    # and Anthropic cache measures remain in the retained response payload.
+    Column("prompt_tokens", BigInteger, nullable=True),
+    Column("completion_tokens", BigInteger, nullable=True),
+    Column("cached_prompt_tokens", BigInteger, nullable=True),
+    Column("reasoning_tokens", BigInteger, nullable=True),
+    CheckConstraint("prompt_tokens >= 0", name="calls_prompt_tokens_nonnegative"),
+    CheckConstraint("completion_tokens >= 0", name="calls_completion_tokens_nonnegative"),
+    CheckConstraint("cached_prompt_tokens >= 0", name="calls_cached_prompt_tokens_nonnegative"),
+    CheckConstraint("reasoning_tokens >= 0", name="calls_reasoning_tokens_nonnegative"),
     Column("error_json", Text),
     Column("latency_ms", Float),
     Column("created_at", DateTime(timezone=True), nullable=False),
@@ -2098,6 +2375,31 @@ calls_table = Table(
         "(state_id IS NOT NULL AND operation_id IS NULL) OR (state_id IS NULL AND operation_id IS NOT NULL)",
         name="calls_has_parent",
     ),
+    CheckConstraint(_LowerHex64Check("request_hash"), name="ck_calls_request_hash_hex"),
+    CheckConstraint(_OptionalLowerHex64Check("response_hash"), name="ck_calls_response_hash_hex"),
+    # The cross-store link to the session ``interpretation_events`` row of the
+    # same name; both sides carry the identical shape rule.
+    CheckConstraint(_OptionalLowerHex64Check("approved_prompt_artifact_hash"), name="ck_calls_approved_prompt_artifact_hash_hex"),
+)
+
+call_verifications_table = Table(
+    "call_verifications",
+    metadata,
+    Column("current_call_id", String(64), ForeignKey("calls.call_id"), primary_key=True),
+    Column("current_run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("source_run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("source_call_id", String(64), ForeignKey("calls.call_id"), nullable=True),
+    Column("is_match", Boolean, nullable=True),
+    Column("differences_json", Text, nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint("current_run_id <> source_run_id", name="ck_call_verifications_distinct_runs"),
+    CheckConstraint("is_match IS NOT TRUE OR source_call_id IS NOT NULL", name="ck_call_verifications_match_has_source"),
+)
+Index(
+    "ix_call_verifications_run",
+    call_verifications_table.c.current_run_id,
+    call_verifications_table.c.recorded_at,
+    call_verifications_table.c.current_call_id,
 )
 
 # Partial unique indexes for call_index uniqueness within each parent type.
@@ -2161,6 +2463,7 @@ artifacts_table = Table(
         "publication_evidence_kind IN ('returned','reconciled','inherited','virtual','legacy_returned')",
         name="ck_artifacts_publication_evidence_kind",
     ),
+    CheckConstraint(_LowerHex64Check("content_hash"), name="ck_artifacts_content_hash_hex"),
 )
 Index(
     "uq_artifacts_run_idempotency_key",
@@ -2190,6 +2493,7 @@ routing_events_table = Table(
     # Composite FKs: routed state and edge must belong to the same run.
     ForeignKeyConstraint(["state_id", "run_id"], ["node_states.state_id", "node_states.run_id"]),
     ForeignKeyConstraint(["edge_id", "run_id"], ["edges.edge_id", "edges.run_id"]),
+    CheckConstraint(_OptionalLowerHex64Check("reason_hash"), name="ck_routing_events_reason_hash_hex"),
 )
 
 # === Batches (Aggregation) ===
@@ -2340,16 +2644,17 @@ Index("ix_tokens_run_id", tokens_table.c.run_id)
 Index("ix_token_parents_parent", token_parents_table.c.parent_token_id)
 Index("ix_node_states_token", node_states_table.c.token_id)
 Index("ix_node_states_node", node_states_table.c.node_id)
+Index("ix_node_states_run", node_states_table.c.run_id)
 Index("ix_calls_state", calls_table.c.state_id)
 Index("ix_calls_operation", calls_table.c.operation_id)  # For operation call lookups
 # Phase 5b — supports the cross-DB anchor lookup: "given a session-side
-# interpretation_events.resolved_prompt_template_hash, find the matching
+# interpretation_events.approved_prompt_artifact_hash, find the matching
 # Landscape calls row". The index is sparse on NULL (SQLite excludes NULL
 # keys from B-tree indexes by default), so the storage cost is proportional
 # to the number of LLM-transform calls downstream of an interpretation event.
 Index(
-    "ix_calls_resolved_prompt_template_hash",
-    calls_table.c.resolved_prompt_template_hash,
+    "ix_calls_approved_prompt_artifact_hash",
+    calls_table.c.approved_prompt_artifact_hash,
 )
 Index("ix_operations_node_run", operations_table.c.node_id, operations_table.c.run_id)
 Index("ix_artifacts_run", artifacts_table.c.run_id)
@@ -2387,6 +2692,7 @@ validation_errors_table = Table(
         ["rows.row_id", "rows.run_id"],
         ondelete="RESTRICT",
     ),
+    CheckConstraint(_LowerHex64Check("row_hash"), name="ck_validation_errors_row_hash_hex"),
 )
 
 Index("ix_validation_errors_run", validation_errors_table.c.run_id)
@@ -2419,6 +2725,7 @@ transform_errors_table = Table(
         ["nodes.node_id", "nodes.run_id"],
         ondelete="RESTRICT",
     ),
+    CheckConstraint(_LowerHex64Check("row_hash"), name="ck_transform_errors_row_hash_hex"),
 )
 
 Index("ix_transform_errors_run", transform_errors_table.c.run_id)
@@ -2451,6 +2758,7 @@ checkpoints_table = Table(
     # the dropped per-barrier buffer blob columns; buffered tokens live in
     # token_work_items journal BLOCKED rows.
     Column("barrier_scalars_json", Text, nullable=True),
+    CheckConstraint(_LowerHex64Check("upstream_topology_hash"), name="ck_checkpoints_upstream_topology_hash_hex"),
 )
 
 Index("ix_checkpoints_run", checkpoints_table.c.run_id)
@@ -2484,6 +2792,7 @@ secret_resolutions_table = Table(
     Column("secret_name", String(256), nullable=True),  # Secret name in vault
     Column("fingerprint", String(64), nullable=False),  # HMAC fingerprint of secret value
     Column("resolution_latency_ms", Float, nullable=True),  # Time to fetch from vault
+    CheckConstraint(_LowerHex64Check("fingerprint"), name="ck_secret_resolutions_fingerprint_hex"),
 )
 
 Index("ix_secret_resolutions_run", secret_resolutions_table.c.run_id)
@@ -2527,7 +2836,7 @@ auth_events_table = Table(
         "'review_requested', 'review_request_cancelled', 'review_attested', "
         "'library_published', 'library_accepted', 'library_rejected', "
         "'library_deprecated', 'library_recalled', "
-        "'quota_set', 'quota_exceeded'"
+        "'quota_set', 'quota_exceeded', 'pending_identities_purged'"
         ")",
         name="ck_auth_events_event_type",
     ),

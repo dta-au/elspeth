@@ -23,6 +23,7 @@ from elspeth.contracts.errors import PluginContractViolation, SinkTransactionalI
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import node_states_table, operations_table, runs_table
 from elspeth.engine.executors.sink import SinkExecutor
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
@@ -118,18 +119,17 @@ class _RejectingFailsink(PartitioningObservableSink):
     declared_required_fields = frozenset({"must_exist"})
 
 
-def _effect_tokens(factory, *, run_id: str, source_id: str, rows: list[dict[str, object]]) -> list[TokenInfo]:  # type: ignore[no-untyped-def]
+def _effect_tokens(factory: RecorderFactory, *, run_id: str, source_id: str, rows: list[dict[str, object]]) -> list[TokenInfo]:
     tokens: list[TokenInfo] = []
     for index, row_data in enumerate(rows):
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        row, durable = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run_id),
             source_node_id=source_id,
             row_index=index,
             data=row_data,
             source_row_index=index,
             ingest_sequence=index,
         )
-        durable = factory.data_flow.create_token(row.row_id)
         tokens.append(
             TokenInfo(
                 row_id=row.row_id,
@@ -152,7 +152,8 @@ def _run_failing_failsink(db: LandscapeDB) -> tuple[str, str]:
     source_id = register_test_node(factory.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
     primary_id = register_test_node(factory.data_flow, run.run_id, "primary", node_type=NodeType.SINK, plugin_name="partitioning")
     failsink_id = register_test_node(factory.data_flow, run.run_id, "failsink", node_type=NodeType.SINK, plugin_name="rejecting")
-    edge = factory.data_flow.register_edge(run.run_id, primary_id, failsink_id, "__failsink__", RoutingMode.DIVERT)
+    authority = leader_coordination_token(factory, run.run_id)
+    edge = factory.data_flow.register_edge(primary_id, failsink_id, "__failsink__", RoutingMode.DIVERT, coordination_token=authority)
     accepted, diverted = _effect_tokens(
         factory,
         run_id=run.run_id,
@@ -163,7 +164,14 @@ def _run_failing_failsink(db: LandscapeDB) -> tuple[str, str]:
     primary.node_id = primary_id
     failsink = _RejectingFailsink(DuplicateObservableTarget(), name="failsink", divert_rows=False)
     failsink.node_id = failsink_id
-    ctx = PluginContext(run_id=run.run_id, config={}, landscape=factory.plugin_audit_writer(), node_id=primary_id)
+    ctx = PluginContext(
+        run_id=run.run_id,
+        config={},
+        landscape=factory.plugin_audit_writer(),
+        node_id=primary_id,
+        coordination_token=authority,
+        member_token=authority.membership,
+    )
 
     with pytest.raises(SinkTransactionalInvariantError, match="must_exist"):
         SinkExecutor(
@@ -172,7 +180,7 @@ def _run_failing_failsink(db: LandscapeDB) -> tuple[str, str]:
             SpanFactory(),
             run.run_id,
             factory=factory,
-            worker_id="worker-a",
+            worker_id=authority.worker_id,
             coordination_token=leader_coordination_token(factory, run.run_id),
         ).write(
             primary,  # type: ignore[arg-type]

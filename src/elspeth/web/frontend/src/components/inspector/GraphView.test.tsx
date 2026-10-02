@@ -5,12 +5,12 @@ import userEvent from "@testing-library/user-event";
 import { GraphView } from "./GraphView";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
-import { EMPTY_GUIDED_REVIEWED_COMPONENTS } from "@/stores/guidedReviewedComponents";
-import type { TurnPayload } from "@/types/guided";
 import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec } from "@/types/index";
+import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { projectValidationWorkspaceStatus } from "@/components/workspace/workspaceStatus";
 
@@ -156,7 +156,7 @@ vi.mock("@xyflow/react", () => ({
       data-size={size}
     />
   ),
-  Controls: ({ showInteractive, fitViewOptions }: any) => (
+  Controls: ({ showInteractive, fitViewOptions, children }: any) => (
     <div
       data-testid="react-flow-controls"
       data-show-interactive={String(showInteractive)}
@@ -164,7 +164,12 @@ vi.mock("@xyflow/react", () => ({
       // <ReactFlow>'s, so the two must be asserted separately
       // (elspeth-a8074a3a7b).
       data-fit-view-options={fitViewOptions ? JSON.stringify(fitViewOptions) : ""}
-    />
+    >
+      {children}
+    </div>
+  ),
+  ControlButton: ({ children, ...props }: any) => (
+    <button type="button" {...props}>{children}</button>
   ),
   MiniMap: ({ nodeColor, nodeStrokeColor, bgColor, nodeStrokeWidth, style }: any) => (
     <div
@@ -207,9 +212,7 @@ vi.mock("@dagrejs/dagre", () => ({
         setNode() {}
         setEdge() {}
         node(_id: string) { return { x: 0, y: 0 }; }
-        // GuidedGraphPane's ReadOnlyPipelineGraph sizes its viewBox from
-        // graph.graph().width/height (elspeth-9f0873426a); the committed
-        // canvas above never calls it, so the shared stub must still answer.
+        // Keep the graph dimensions available to the layout harness.
         graph() { return { width: 480, height: 200 }; }
       },
     },
@@ -287,12 +290,9 @@ function makeProposal(
 describe("GraphView", () => {
   beforeEach(() => {
     useSessionStore.setState({
+      activeSessionId: null,
       compositionState: null,
       compositionProposals: [],
-      // Guided projection inputs (elspeth-9f0873426a): a test that seeds a
-      // pending guided turn or reviewed ledger must not leak it forward.
-      guidedNextTurn: null,
-      guidedReviewedComponents: EMPTY_GUIDED_REVIEWED_COMPONENTS,
     });
     // selectedNodeId is store state, not a per-render prop: a test that opens
     // the NodeConfigPanel leaks its selection into every later test in file
@@ -300,6 +300,7 @@ describe("GraphView", () => {
     useSessionStore.setState({ selectedNodeId: null } as never);
     useExecutionStore.setState({ validationResult: null } as never);
     resetStore(usePreferencesStore);
+    resetStore(useInterpretationEventsStore);
     // OptionRows (rendered inside the node config panel) now reads the
     // catalog store's schema cache; reset it so no test's seeded schema
     // leaks into a later one.
@@ -317,9 +318,126 @@ describe("GraphView", () => {
     // The badge renders node.node_type
     expect(screen.getByText("transform")).toBeInTheDocument();
     // The node ID as display name
-    expect(screen.getByText("classify")).toBeInTheDocument();
+    expect(within(screen.getByTestId("node-classify")).getByText("classify")).toBeInTheDocument();
     // The plugin name
-    expect(screen.getByText("llm_transform")).toBeInTheDocument();
+    expect(within(screen.getByTestId("node-classify")).getByText("llm_transform")).toBeInTheDocument();
+  });
+
+  it.each([
+    { options: { model: "anthropic/claude-sonnet-4" }, label: "model anthropic/claude-sonnet-4" },
+    { options: { profile: "sonnet", resolved_model: "private-deployment" }, label: "profile sonnet" },
+    { options: {}, label: "configured LLM" },
+  ])("shows $label inside the LLM transform box and accessible description", ({ options, label }) => {
+    useSessionStore.setState({
+      compositionState: makeState({
+        nodes: [makeNode({ id: "classify", plugin: "llm", options })],
+      }),
+    });
+    render(<GraphView />);
+    const node = screen.getByTestId("node-classify");
+    expect(within(node).getByText(`llm · ${label}`)).toHaveAttribute("title", `llm · ${label}`);
+    expect(screen.getByRole("button", { name: new RegExp(`transform: classify.*${label}`) })).toBeInTheDocument();
+    expect(node).not.toHaveTextContent("private-deployment");
+  });
+
+  it("counts nodes and shows success and failure outputs with LLM selection in the Graph tab", async () => {
+    useSessionStore.setState({
+      compositionState: makeState({
+        sources: {
+          source: {
+            plugin: "csv", options: {}, on_success: "rows", on_validation_failure: "discard",
+          },
+        },
+        nodes: [makeNode({
+          id: "classify", input: "rows", plugin: "llm", options: { profile: "sonnet" },
+          on_error: "quarantine", on_success: "results",
+        })],
+        outputs: [{ name: "results", plugin: "csv", options: {}, on_write_failure: "discard" }],
+      }),
+    });
+
+    render(<GraphView />);
+    const summary = screen.getByText("Wiring (3)");
+    const policies = summary.closest("details");
+    expect(policies).not.toHaveAttribute("open");
+    await userEvent.setup().click(summary);
+    expect(policies).toHaveAttribute("open");
+    const table = within(policies as HTMLElement).getByRole("table");
+    expect(within(table).getByRole("columnheader", { name: "Component" })).toBeInTheDocument();
+    expect(within(table).getByRole("columnheader", { name: "On success" })).toBeInTheDocument();
+    expect(within(table).getByRole("columnheader", { name: "On failure" })).toBeInTheDocument();
+    expect(within(table).getByText("llm")).toHaveClass("graph-output-detail");
+    expect(within(table).getByText("profile sonnet")).toHaveClass("graph-output-detail");
+    expect(within(table).getByRole("row", { name: /Source: source/ })).toHaveTextContent(
+      "Send to classifyRow fails validationDiscard row (audit recorded)",
+    );
+    expect(within(table).getByRole("row", { name: /Transform: classify/ })).toHaveTextContent(
+      "profile sonnetSend to resultsRow processing failsSend to quarantine (not connected)",
+    );
+    expect(within(table).getByRole("row", { name: /Sink: results/ })).toHaveTextContent(
+      "Row writtenRow write failsDiscard row (audit recorded)",
+    );
+  });
+
+  it("keeps Wiring collapsed in Workflow without duplicating the Approvals tab", async () => {
+    const user = userEvent.setup();
+    const approved: InterpretationEvent = {
+      id: "approval-1", session_id: "session-1", composition_state_id: "state-1",
+      affected_node_id: "classify", tool_call_id: "tool-1", user_term: "category",
+      kind: "vague_term", llm_draft: "initial definitions",
+      accepted_value: "billing, outage, or other", choice: "amended",
+      created_at: "2026-09-20T07:23:00Z", resolved_at: "2026-09-20T07:24:00Z",
+      actor: "user:owner:1", interpretation_source: "user_approved",
+      model_identifier: "model", model_version: "1", provider: "provider",
+      composer_skill_hash: "hash", arguments_hash: "hash", hash_domain_version: "v2",
+      runtime_model_identifier_at_resolve: null, runtime_model_version_at_resolve: null,
+      approved_prompt_artifact_hash: null,
+    };
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode()] }) });
+    useInterpretationEventsStore.setState({
+      resolvedBySession: {
+        "session-1": [
+          approved,
+          {
+            ...approved, id: "prompt-approval", kind: "llm_prompt_template",
+            user_term: "llm_prompt_template:classify",
+            accepted_value: "System prompt:\nClassify carefully.\n\nPrompt template:\nClassify each complaint",
+          },
+          {
+            ...approved, id: "legacy-prompt-approval", kind: "llm_prompt_template",
+            user_term: "llm_prompt_template:summarize", affected_node_id: "summarize",
+            accepted_value: "Summarize each complaint",
+          },
+          { ...approved, id: "opted-out", choice: "opted_out" },
+        ],
+        "other-session": [{ ...approved, id: "other-session" }],
+      },
+    });
+
+    render(<GraphView />);
+    const wiring = screen.getByText("Wiring (1)").closest("details") as HTMLDetailsElement;
+    expect(screen.queryByText(/^Approvals/)).not.toBeInTheDocument();
+    expect(screen.queryByText(approved.accepted_value!)).not.toBeInTheDocument();
+    expect(wiring.open).toBe(false);
+    await user.click(screen.getByText("Wiring (1)"));
+    expect(wiring.open).toBe(true);
+    await user.click(screen.getByText("Wiring (1)"));
+    expect(wiring.open).toBe(false);
+  });
+
+  it("keeps the graph and the Wiring table when an approval is malformed (L9)", () => {
+    const malformed = {
+      id: "approval-bad", session_id: "session-1", composition_state_id: "state-1",
+      affected_node_id: "classify", tool_call_id: "tool-1", user_term: "category",
+      kind: "vague_term", llm_draft: "initial definitions",
+      accepted_value: null, choice: "amended",
+      created_at: "2026-09-20T07:23:00Z", resolved_at: "2026-09-20T07:24:00Z",
+    } as unknown as InterpretationEvent;
+    useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode()] }) });
+    useInterpretationEventsStore.setState({ resolvedBySession: { "session-1": [malformed] } });
+    render(<GraphView />);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText("Wiring (1)")).toBeInTheDocument();
   });
 
   it("renders a pending proposal pill when proposal affects graph", () => {
@@ -928,6 +1046,37 @@ describe("GraphView", () => {
       expect(screen.getByTestId("edge-inferred-conn-transform1-transform2-success-success")).toBeInTheDocument();
     });
 
+    it("shows one route per connection when explicit success edges have descriptive labels", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "csv", options: {}, on_success: "content_rows" },
+          },
+          nodes: [makeNode({
+            id: "split_lines",
+            plugin: "line_explode",
+            input: "content_rows",
+            on_success: "lines_out",
+          })],
+          outputs: [{ name: "lines_out", plugin: "text", options: {} }],
+          edges: [
+            makeEdge({ from_node: "source", to_node: "split_lines", label: "csv rows" }),
+            makeEdge({ from_node: "split_lines", to_node: "lines_out", label: "one line per record" }),
+          ],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+      const connections = screen.getByRole("list", { name: "Pipeline branch connections" });
+
+      expect(container.querySelectorAll('[data-edge-source="source"][data-edge-target="split_lines"]')).toHaveLength(1);
+      expect(container.querySelectorAll('[data-edge-source="split_lines"][data-edge-target="lines_out"]')).toHaveLength(1);
+      expect(within(connections).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+        "source to split_lines: csv rows (success)",
+        "split_lines to lines_out: one line per record (success)",
+      ]);
+    });
+
     it("infers transform→sink edges via direct sink references", () => {
       // When on_success points directly to a sink name (not a connection point)
       useSessionStore.setState({
@@ -1391,6 +1540,56 @@ describe("GraphView", () => {
       ]);
       expect(connectionTexts("results to failed_writes:")).toEqual([
         "results to failed_writes: error (error)",
+      ]);
+    });
+
+    it("keeps named error edges without adding generic error lines to the same sinks", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          nodes: [
+            makeNode({ id: "lookup_category", on_error: "join_failures" }),
+            makeNode({ id: "generate_text", on_error: "llm_failures" }),
+          ],
+          edges: [
+            makeEdge({ from_node: "lookup_category", to_node: "join_failures", edge_type: "on_error", label: "category lookup failures" }),
+            makeEdge({ from_node: "generate_text", to_node: "llm_failures", edge_type: "on_error", label: "chaos LLM failures" }),
+          ],
+          outputs: [
+            { name: "join_failures", plugin: "json", options: {} },
+            { name: "llm_failures", plugin: "json", options: {} },
+          ],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+      expect(edgeElements(container, "lookup_category", "join_failures").map((edge) => edge.textContent)).toEqual(["category lookup failures"]);
+      expect(edgeElements(container, "generate_text", "llm_failures").map((edge) => edge.textContent)).toEqual(["chaos LLM failures"]);
+      expect(connectionTexts("lookup_category to join_failures:")).toEqual([
+        "lookup_category to join_failures: category lookup failures (error)",
+      ]);
+      expect(connectionTexts("generate_text to llm_failures:")).toEqual([
+        "generate_text to llm_failures: chaos LLM failures (error)",
+      ]);
+    });
+
+    it("keeps a named error edge to a transform without adding a generic line", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          nodes: [
+            makeNode({ id: "generate_text", on_error: "recovery_in" }),
+            makeNode({ id: "recover", input: "recovery_in" }),
+          ],
+          edges: [makeEdge({
+            from_node: "generate_text", to_node: "recover",
+            edge_type: "on_error", label: "chaos LLM failures",
+          })],
+        }),
+      });
+
+      const { container } = render(<GraphView />);
+      expect(edgeElements(container, "generate_text", "recover").map((edge) => edge.textContent)).toEqual(["chaos LLM failures"]);
+      expect(connectionTexts("generate_text to recover:")).toEqual([
+        "generate_text to recover: chaos LLM failures (error)",
       ]);
     });
 
@@ -3206,6 +3405,22 @@ describe("GraphView", () => {
     // to 2.0x on every click and then disabled the zoom-in button
     // (elspeth-a8074a3a7b). The Controls prop is a SEPARATE surface and needs
     // its own assertion.
+    // GraphModal renders this same component with no handler, so the control
+    // that OPENS the modal must not appear inside it.
+    it("adds a Fullscreen control to the canvas controls only when given a handler", async () => {
+      const onFullscreen = vi.fn();
+      const { unmount } = render(<GraphView onFullscreen={onFullscreen} />);
+      const control = within(screen.getByTestId("react-flow-controls")).getByRole("button", { name: "Fullscreen" });
+      expect(control).toHaveAttribute("title", "Fullscreen");
+      expect(control.querySelector('[data-icon="maximise"]')).not.toBeNull();
+      await userEvent.click(control);
+      expect(onFullscreen).toHaveBeenCalledTimes(1);
+      unmount();
+
+      render(<GraphView />);
+      expect(screen.queryByRole("button", { name: "Fullscreen" })).not.toBeInTheDocument();
+    });
+
     it("gives the Controls fit-view button its own copy of the options", () => {
       render(<GraphView />);
       const controls = screen.getByTestId("react-flow-controls");
@@ -3775,132 +3990,4 @@ describe("GraphView", () => {
     });
   });
 
-  // Guided builds keep the committed composition empty until Confirm wiring,
-  // so for four steps this pane had nothing to draw while the proposal card
-  // squeezed a six-node DAG into the chat column (design review IA-1/V-1).
-  // The pane now draws from the guided turn payloads via
-  // guidedGraphProjection; these pin the per-step behaviour and the
-  // precedence rule against the committed graph.
-  describe("guided pre-commit projection (elspeth-9f0873426a)", () => {
-    const SOURCE_ID = "00000000-0000-4000-8000-000000000902";
-    const OUTPUT_ID = "00000000-0000-4000-8000-000000000904";
-    const proposalTurn: TurnPayload = {
-      type: "propose_pipeline",
-      step_index: 2,
-      turn_token: "c".repeat(64),
-      payload: {
-        proposal_id: "00000000-0000-4000-8000-000000000901",
-        draft_hash: "d".repeat(64),
-        supersedes_draft_hash: null,
-        summary: "guided.proposal.summary.full_graph.v1",
-        rationale: "guided.proposal.rationale.review_required.v1",
-        component_counts: { sources: 1, nodes: 0, edges: 2, outputs: 1 },
-        blockers: [],
-        graph: {
-          sources: [
-            { stable_id: SOURCE_ID, label: "source-1", plugin: { kind: "source", id: "csv" } },
-          ],
-          edges: [
-            {
-              stable_id: "00000000-0000-4000-8000-000000000905",
-              from_endpoint: { kind: "source", stable_id: SOURCE_ID },
-              to_endpoint: { kind: "output", stable_id: OUTPUT_ID },
-              flow: { kind: "source_success", branch: null },
-            },
-            {
-              stable_id: "00000000-0000-4000-8000-000000000906",
-              from_endpoint: { kind: "source", stable_id: SOURCE_ID },
-              to_endpoint: { kind: "discard" },
-              flow: { kind: "source_validation_failure" },
-            },
-          ],
-        },
-        nodes: [],
-        outputs: [
-          { stable_id: OUTPUT_ID, label: "output-1", plugin: { kind: "sink", id: "json" } },
-        ],
-        edit_targets: [],
-      },
-    };
-    const reviewedSource = {
-      stable_id: SOURCE_ID,
-      name: "source-1",
-      plugin: "csv",
-      status: "reviewed" as const,
-    };
-
-    it("draws the pending proposal from its payload while the composition is empty", () => {
-      useSessionStore.setState({ guidedNextTurn: proposalTurn });
-      const { container } = render(<GraphView />);
-
-      expect(
-        screen.getByRole("img", {
-          name: "Pipeline proposal graph with 3 components and 2 routes",
-        }),
-      ).toBeInTheDocument();
-      expect(container.querySelector(`[data-node-id="${SOURCE_ID}"]`)).not.toBeNull();
-      expect(container.querySelector(`[data-node-id="${OUTPUT_ID}"]`)).not.toBeNull();
-      expect(container.querySelector('[data-node-kind="discard"]')).not.toBeNull();
-      expect(
-        screen.getByText(
-          "Proposed pipeline, not yet committed. Confirm the wiring to commit it.",
-        ),
-      ).toBeInTheDocument();
-      expect(screen.queryByText("No pipeline to visualise.")).toBeNull();
-      expect(screen.queryByTestId("react-flow")).toBeNull();
-    });
-
-    it("draws the reviewed source alone, with no route, before any proposal exists", () => {
-      useSessionStore.setState({
-        guidedReviewedComponents: { sources: [reviewedSource], outputs: [] },
-      });
-      const { container } = render(<GraphView />);
-
-      expect(
-        screen.getByRole("img", {
-          name: "Reviewed components graph with 1 component and no routes yet",
-        }),
-      ).toBeInTheDocument();
-      expect(container.querySelectorAll("[data-node-id]")).toHaveLength(1);
-      expect(container.querySelectorAll("[data-edge-id]")).toHaveLength(0);
-      expect(
-        screen.getByText(
-          "Reviewed so far: 1 source. Routes appear once a pipeline is proposed.",
-        ),
-      ).toBeInTheDocument();
-    });
-
-    it("keeps the empty state for a guided session with nothing reviewed yet", () => {
-      useSessionStore.setState({
-        guidedNextTurn: {
-          type: "single_select",
-          step_index: 0,
-          turn_token: "a".repeat(64),
-          payload: { question: "Choose a source", options: [], allow_custom: false },
-        },
-      });
-      render(<GraphView />);
-
-      expect(screen.getByText("No pipeline to visualise.")).toBeInTheDocument();
-      expect(screen.queryByRole("img")).toBeNull();
-    });
-
-    it("draws a pending proposal over a committed composition, but lets the committed graph beat the ledger", () => {
-      useSessionStore.setState({
-        compositionState: makeState({
-          nodes: [makeNode({ id: "classify", node_type: "transform", plugin: "llm_transform" })],
-        }),
-        guidedReviewedComponents: { sources: [reviewedSource], outputs: [] },
-      });
-      const { unmount } = render(<GraphView />);
-      expect(screen.getByTestId("react-flow")).toBeInTheDocument();
-      expect(screen.queryByRole("img", { name: /reviewed components graph/i })).toBeNull();
-      unmount();
-
-      useSessionStore.setState({ guidedNextTurn: proposalTurn });
-      render(<GraphView />);
-      expect(screen.getByRole("img", { name: /pipeline proposal graph/i })).toBeInTheDocument();
-      expect(screen.queryByTestId("react-flow")).toBeNull();
-    });
-  });
 });

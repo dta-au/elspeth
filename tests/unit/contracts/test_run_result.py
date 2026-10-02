@@ -44,6 +44,7 @@ class TestRunResultValidation:
             "rows_forked",
             "rows_coalesced",
             "rows_coalesce_failed",
+            "collector_groups_failed",
             "rows_expanded",
             "rows_buffered",
             "rows_diverted",
@@ -76,6 +77,7 @@ class TestRunResultValidation:
             "rows_forked",
             "rows_coalesced",
             "rows_coalesce_failed",
+            "collector_groups_failed",
             "rows_expanded",
             "rows_buffered",
             "rows_diverted",
@@ -351,7 +353,8 @@ class TestRunResultStatusInvariant:
 
     def test_completed_rejects_quarantine(self) -> None:
         """Quarantine is a clean terminal outcome but still warrants the
-        COMPLETED_WITH_FAILURES label per CLAUDE.md Tier-3 manifesto — the
+        COMPLETED_WITH_FAILURES label under the Tier-3 rules in
+        docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model — the
         operator should see "failures" on a run that quarantined any row.
         """
         with pytest.raises(ValueError, match=r"COMPLETED.*requires no quarantined rows"):
@@ -441,6 +444,7 @@ class TestRunStatusRowsRoutedSplitPredicate:
         rows_routed_failure: int = 0,
         rows_quarantined: int = 0,
         rows_coalesce_failed: int = 0,
+        collector_groups_failed: int = 0,
     ) -> RunResult:
         return RunResult(
             run_id="rsp-1",
@@ -452,6 +456,7 @@ class TestRunStatusRowsRoutedSplitPredicate:
             rows_routed_failure=rows_routed_failure,
             rows_quarantined=rows_quarantined,
             rows_coalesce_failed=rows_coalesce_failed,
+            collector_groups_failed=collector_groups_failed,
         )
 
     def test_gate_routed_only_classifies_as_completed(self) -> None:
@@ -700,9 +705,27 @@ class TestRunStatusRowsRoutedSplitPredicate:
         )
         assert result.status == RunStatus.COMPLETED_WITH_FAILURES
 
+    def test_collector_group_failure_has_its_own_count_and_failure_status(self) -> None:
+        kwargs = {
+            "rows_processed": 0,
+            "rows_succeeded": 0,
+            "rows_failed": 0,
+            "rows_routed_success": 0,
+            "rows_routed_failure": 0,
+            "rows_quarantined": 0,
+            "rows_coalesce_failed": 0,
+            "collector_groups_failed": 1,
+        }
+        assert derive_terminal_run_status(**kwargs) is RunStatus.FAILED
+        failed = self._build(status=RunStatus.FAILED, collector_groups_failed=1)
+        assert failed.rows_failed == 0
+        assert failed.to_dict()["collector_groups_failed"] == 1
+        assert derive_terminal_run_status(**(kwargs | {"rows_processed": 1, "rows_succeeded": 1})) is RunStatus.COMPLETED_WITH_FAILURES
+
     def test_on_error_routed_with_quarantine_and_coalesce_failures_classifies_as_completed_with_failures(self) -> None:
         """Post-quarantine-promotion: quarantine is a clean terminal outcome
-        per CLAUDE.md Tier-3 manifesto. With ``rows_quarantined=2`` the
+        under the Tier-3 rules in docs/guides/data-trust-and-error-handling.md
+        §The Three-Tier Trust Model. With ``rows_quarantined=2`` the
         pipeline made a clean determination on two rows, satisfying the
         ``terminal_clean_indicator``. The remaining 4 uncaught
         ``rows_failed`` (6 - 2 quarantined = 4) and 2 ``rows_coalesce_failed``
@@ -731,8 +754,9 @@ class TestRunStatusRowsRoutedSplitPredicate:
 
     # ------------------------------------------------------------------
     # Quarantine-promotion regression coverage (run-status policy
-    # revision: quarantine is a clean terminal outcome per CLAUDE.md
-    # Tier-3 manifesto, not a failure). Three canonical shapes:
+    # revision: quarantine is a clean Tier-3 terminal outcome, not a failure —
+    # docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    # Model). Three canonical shapes:
     #   1) all rows quarantined cleanly -> COMPLETED_WITH_FAILURES
     #      (was FAILED; bug the policy revision fixed).
     #   2) mixed quarantine + uncaught failures, zero succeeded ->
@@ -744,7 +768,9 @@ class TestRunStatusRowsRoutedSplitPredicate:
 
     def test_all_rows_quarantined_classifies_as_completed_with_failures(self) -> None:
         """Canonical bug: a pipeline that cleanly quarantines every row was
-        classified FAILED. Per CLAUDE.md Tier-3 data manifesto quarantine is
+        classified FAILED. Under the Tier-3 rules in
+        docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model, quarantine is
         a deliberate clean terminal outcome ("row 42 was quarantined because
         field X was NULL" is legitimate audit evidence, not a framework
         failure). The pipeline made a clean determination on every row, so

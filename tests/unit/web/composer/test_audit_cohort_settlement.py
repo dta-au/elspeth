@@ -39,8 +39,9 @@ from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult, PlannerDeclined
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.protocol import ComposerConvergenceError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.coordination.contracts import SessionOperationKind
@@ -66,7 +67,9 @@ _PLUGIN_SNAPSHOT = PluginAvailabilitySnapshot.for_trained_operator(_CATALOG)
 def _text_response(content: str) -> Any:
     from types import SimpleNamespace
 
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))])
+    return _admit_composer_llm_completion(
+        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))])
+    )
 
 
 def _metadata_tool_response(call_id: str, name: str) -> Any:
@@ -76,7 +79,9 @@ def _metadata_tool_response(call_id: str, name: str) -> Any:
         id=call_id,
         function=SimpleNamespace(name="set_metadata", arguments=json.dumps({"patch": {"name": name}})),
     )
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+    return _admit_composer_llm_completion(
+        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
+    )
 
 
 def _discovery_invocation(call_id: str) -> ComposerToolInvocation:
@@ -339,12 +344,8 @@ def _plan() -> PipelinePlanResult:
     proposal = PipelineProposal.create(
         pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
     return PipelinePlanResult(
         proposal=proposal,
@@ -376,11 +377,11 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
     user_message_id = await _seed_user_message(sessions_service, result_session_id)
     injector = _InsertInjector(sessions_service, fail_at)
     injector.install(monkeypatch)
-    preflight = AsyncMock(spec=service._cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
+    preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
 
     async def _stage() -> Any:
         async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
-            return await service._stage_pipeline_plan(  # type: ignore[attr-defined]
+            return await service._planning_application._stage_pipeline_plan(
                 session_operation_context=compose_context,
                 plan=_plan(),
                 state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
@@ -393,10 +394,11 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
                 planner_llm_calls=(),
                 planner_attempts=(),
                 planner_invocations=_PLANNER_COHORT,
+                planner_withheld_replies=(),
                 plugin_snapshot=None,
             )
 
-    with patch.object(service, "_cached_runtime_preflight", preflight):
+    with patch.object(service._preflight, "cached_runtime_preflight", preflight):
         if fail_at is None:
             result = await _stage()
             assert result.message
@@ -418,12 +420,12 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
 async def _plan_and_stage_empty(service: ComposerServiceImpl, session_id: str, recorder: BufferingRecorder) -> Any:
     driver = cast(Any, service)
     sessions_service = cast(Any, service._sessions_service)
-    plugin_snapshot, policy_catalog = driver._plugin_policy_context(None)
+    plugin_snapshot, policy_catalog = driver._policy_context.build(None)
     # P4-D6 family A2b: the planner-evidence cohort is a fenced session write,
     # so the staging turn runs under a real acquired COMPOSE operation exactly
     # as the compose route does.
     async with sessions_service._call_context(UUID(session_id), SessionOperationKind.COMPOSE) as compose_context:
-        return await driver._plan_and_stage_empty_pipeline(
+        return await driver._planning_application._plan_and_stage_empty_pipeline(
             message="build me a pipeline",
             messages=[],
             state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
@@ -461,7 +463,7 @@ async def test_planner_decline_path_cohort_is_all_or_nothing_at_every_write_inde
             planner_recorder.record(invocation)
         raise PlannerDeclined("declined", decline_text="I cannot build that from the available components.")
 
-    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", _declining_planner)
+    monkeypatch.setattr("elspeth.web.composer.planning_application.plan_pipeline", _declining_planner)
 
     if fail_at is None:
         result = await _plan_and_stage_empty(service, result_session_id, recorder)
@@ -593,11 +595,11 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
     user_message_id = await _seed_user_message(sessions_service, result_session_id)
     gate = _GatedInsert(sessions_service)
     gate.install(monkeypatch)
-    preflight = AsyncMock(spec=service._cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
+    preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
 
     async def _stage() -> Any:
         async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
-            return await service._stage_pipeline_plan(  # type: ignore[attr-defined]
+            return await service._planning_application._stage_pipeline_plan(
                 session_operation_context=compose_context,
                 plan=_plan(),
                 state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
@@ -610,10 +612,11 @@ async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_n
                 planner_llm_calls=(),
                 planner_attempts=(),
                 planner_invocations=_PLANNER_COHORT,
+                planner_withheld_replies=(),
                 plugin_snapshot=None,
             )
 
-    with patch.object(service, "_cached_runtime_preflight", preflight):
+    with patch.object(service._preflight, "cached_runtime_preflight", preflight):
         task = asyncio.create_task(_stage())
         await asyncio.wait_for(gate.entered.wait(), timeout=2.0)
         task.cancel()

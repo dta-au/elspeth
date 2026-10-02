@@ -5,7 +5,9 @@ import { resolve } from "node:path";
 
 import { chromium } from "@playwright/test";
 import {
-  driveStagedGuidedTutorial,
+  driveFreeformTutorial,
+  finishTutorialAndVerifyGraduation,
+  isAuditRequest,
   isComposeRequest,
   isRunRequest,
 } from "./staging-tutorial-driver.mjs";
@@ -13,14 +15,6 @@ import {
 const TOKEN_KEY = "auth_token";
 const DEFAULT_RUNS = 20;
 const DEFAULT_BUILD_TIMEOUT_MS = 420_000;
-// The tutorial seeds an uploaded sample; the guided source binds it via the
-// upload fast-path (blob:<ref>, server_storage_bound) rather than authoring an
-// LLM-invented source, so it stages NO invented_source review on the source
-// node (parity with the normal guided seeded-upload flow — see
-// _source_from_latest_uploaded_blob_for_step_1_chat and chat_solver
-// server_storage_bound). The invented_source expectation therefore no longer
-// holds; the bound-source invariant is asserted positively below
-// (elspeth-52f42d09a2).
 const BASE_EXPECTED_TUTORIAL_KINDS = ["llm_prompt_template", "pipeline_decision"];
 const RAW_HTML_CLEANUP_TERM = "drop_raw_html_fields";
 const PROMPT_SHIELD_RECOMMENDATION_TERM = "prompt_injection_shield_recommendation";
@@ -200,7 +194,6 @@ const username = requiredEnv("STAGING_USERNAME");
 const password = requiredEnv("STAGING_PASSWORD");
 const runs = intEnv("TUTORIAL_RUNS", DEFAULT_RUNS);
 const buildTimeoutMs = intEnv("TUTORIAL_BUILD_TIMEOUT_MS", DEFAULT_BUILD_TIMEOUT_MS);
-const promptOverride = process.env.TUTORIAL_PROMPT_OVERRIDE ?? "";
 const expectedVagueTerm = process.env.TUTORIAL_EXPECT_VAGUE_TERM ?? "";
 const diagnosticQuestion = process.env.TUTORIAL_DIAGNOSTIC_QUESTION ?? "";
 const artifactsDir = resolve("test-results", "staging-tutorial-harness");
@@ -258,7 +251,7 @@ async function login() {
 async function resetTutorial(token) {
   await apiFetch(token, "/api/composer-preferences", {
     method: "PATCH",
-    body: { default_mode: "guided", tutorial_completed_at: null },
+    body: { tutorial_completed_at: null },
   });
   await apiFetch(token, "/api/tutorial/orphans", { method: "DELETE" });
 }
@@ -295,14 +288,6 @@ async function fetchSessionEvidence(token, sessionId) {
   const blockingToolValidationDiagnostics = latestBlockingToolValidationDiagnostics(messages);
   const hasExpectedTutorialAssumptions =
     expectedKinds.every((kind) => reviewKinds.includes(kind)) &&
-    // Bound-source invariant (elspeth-52f42d09a2): the seeded upload binds the
-    // source via the fast-path, so the tutorial must NOT stage an
-    // invented_source review on the source node. Its presence would mean the
-    // source regressed to the LLM-invented path (or the seeded blob failed to
-    // bind), which the pre-9f425de3d contract wrongly required.
-    !reviewEvents.some(
-      (event) => event.kind === "invented_source" && event.affected_node_id === "source",
-    ) &&
     (!expectedVagueTerm ||
       reviewEvents.some(
         (event) => event.kind === "vague_term" && event.user_term === expectedVagueTerm,
@@ -363,6 +348,8 @@ async function runOne(browser, token, index) {
 
   const apiFailures = [];
   const consoleErrors = [];
+  const httpConflicts = [];
+  const conflictReads = [];
   let rejectBlockingFailure = null;
   let blockingFailureSettled = false;
   const blockingFailurePromise = new Promise((_, reject) => {
@@ -376,8 +363,8 @@ async function runOne(browser, token, index) {
     body: null,
     elapsed_ms: null,
   });
-  const steps = { compose: makeStep(), run: makeStep() };
-  const stepStartedAt = { compose: null, run: null };
+  const steps = { compose: makeStep(), run: makeStep(), audit: makeStep() };
+  const stepStartedAt = { compose: null, run: null, audit: null };
   const context = await browser.newContext({
     baseURL,
     storageState: {
@@ -405,6 +392,9 @@ async function runOne(browser, token, index) {
     } else if (isRunRequest(url, method)) {
       steps.run.fired = true;
       stepStartedAt.run = Date.now();
+    } else if (isAuditRequest(url, method)) {
+      steps.audit.fired = true;
+      stepStartedAt.audit = Date.now();
     }
   });
   page.on("requestfailed", (request) => {
@@ -415,17 +405,31 @@ async function runOne(browser, token, index) {
       steps.compose.body ??= errorText;
     } else if (isRunRequest(url, method)) {
       steps.run.body ??= errorText;
+    } else if (isAuditRequest(url, method)) {
+      steps.audit.body ??= errorText;
     }
   });
   page.on("response", (response) => {
     const method = response.request().method();
     const url = response.url();
+    if (response.status() === 409) {
+      const conflict = { method, url, body: null };
+      httpConflicts.push(conflict);
+      conflictReads.push(
+        readResponseBody(response)
+          .then((body) => {
+            conflict.body = body;
+          })
+          .catch(() => undefined),
+      );
+    }
     const isSessionCreate = method === "POST" && url === `${baseURL}/api/sessions`;
     const compose = isComposeRequest(url, method);
     const run = isRunRequest(url, method);
-    if (compose || run) {
-      const target = compose ? steps.compose : steps.run;
-      const startedAt = compose ? stepStartedAt.compose : stepStartedAt.run;
+    const audit = isAuditRequest(url, method);
+    if (compose || run || audit) {
+      const target = compose ? steps.compose : run ? steps.run : steps.audit;
+      const startedAt = compose ? stepStartedAt.compose : run ? stepStartedAt.run : stepStartedAt.audit;
       target.responded = true;
       target.status = response.status();
       target.elapsed_ms = startedAt === null ? null : Date.now() - startedAt;
@@ -500,25 +504,13 @@ async function runOne(browser, token, index) {
         sessionId = session.id;
       }
     }
-    if (promptOverride.trim()) {
-      const legacyPrompt = page.locator("#tutorial-prompt");
-      if ((await legacyPrompt.count().catch(() => 0)) > 0) {
-        await legacyPrompt.fill(promptOverride);
-      } else {
-        console.warn(
-          "[tutorial-harness] TUTORIAL_PROMPT_OVERRIDE ignored; staged tutorial uses locked per-stage prompts",
-        );
-      }
-    }
-
     await Promise.race([
-      page.getByLabel(/guided composer/i).waitFor({ state: "visible", timeout: 60_000 }),
+      page.getByRole("heading", { name: "Build with the Composer." }).waitFor({ state: "visible", timeout: 60_000 }),
       blockingFailurePromise,
     ]);
     await Promise.race([
-      driveStagedGuidedTutorial(page, {
+      driveFreeformTutorial(page, {
         timeoutMs: buildTimeoutMs,
-        decisionScreenshotPath: resolve(artifactsDir, `run-${index}-guided-decision-summary.png`),
       }),
       blockingFailurePromise,
     ]);
@@ -531,26 +523,24 @@ async function runOne(browser, token, index) {
     await page.getByRole("button", { name: "Continue", exact: true }).click();
     await page.getByText(/This is the audit story/i).waitFor({ timeout: 60_000 });
     await page.getByRole("button", { name: "Continue", exact: true }).click();
-    await page
-      .getByRole("heading", { name: "You're ready to use the composer." })
-      .waitFor({ timeout: 60_000 });
+    const completion = await Promise.race([
+      finishTutorialAndVerifyGraduation(
+        page,
+        sessionId,
+        () => apiFetch(token, "/api/composer-preferences"),
+      ),
+      blockingFailurePromise,
+    ]);
     graduated = true;
-    await page
-      .getByRole("button", { name: "Take me to the composer" })
-      .click({ timeout: 30_000 })
-      .catch(() => undefined);
-
-    const bodyText = await page.locator("body").innerText();
-    const landed = graduated;
-    if (!landed) {
-      await mkdir(artifactsDir, { recursive: true });
-      screenshot = resolve(artifactsDir, `run-${index}-failure.png`);
-      await page.screenshot({ path: screenshot, fullPage: true });
-    }
+    const landed = completion.landed_session_id === sessionId;
 
     const evidence = sessionId === null ? null : await fetchSessionEvidence(token, sessionId);
+    await Promise.all(conflictReads);
     const ok =
       landed &&
+      [steps.compose, steps.run, steps.audit].every(
+        (step) => step.fired && step.responded && step.status >= 200 && step.status < 300,
+      ) &&
       evidence?.state_exists === true &&
       evidence?.tutorial_assumption_contract_ok === true &&
       apiFailures.length === 0 &&
@@ -568,13 +558,14 @@ async function runOne(browser, token, index) {
       session_id: sessionId,
       landed,
       graduated,
+      completion,
       steps,
       api_failures: apiFailures,
       console_errors: consoleErrors,
+      http_conflicts: httpConflicts,
       screenshot,
       evidence,
       diagnostic,
-      body_excerpt: landed ? null : bodyText.replace(/\s+/g, " ").slice(0, 800),
     };
   } catch (error) {
     await mkdir(artifactsDir, { recursive: true });
@@ -589,6 +580,7 @@ async function runOne(browser, token, index) {
       steps,
       api_failures: apiFailures,
       console_errors: consoleErrors,
+      http_conflicts: httpConflicts,
       screenshot,
       error: error instanceof Error ? error.message : String(error),
     };
@@ -619,7 +611,6 @@ async function main() {
   const summary = {
     base_url: baseURL,
     username,
-    prompt_override: promptOverride || null,
     expected_vague_term: expectedVagueTerm || null,
     diagnostic_question: diagnosticQuestion || null,
     runs,

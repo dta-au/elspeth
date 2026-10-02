@@ -14,6 +14,7 @@ from typing import Any, cast
 
 import yaml
 
+from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.state import (
     CompositionState,
@@ -88,7 +89,7 @@ _INTENTIONALLY_DROPPED_SECTIONS: dict[str, str] = {
 # sections plus the explicitly invalid singular source and metadata surfaces.
 # ``CompositionState`` carries sources, nodes, edges and outputs and has no
 # field any of these could land in (its dataclass fields are nodes/edges/
-# outputs/metadata/version/guided_session/sources), so importing them would mean
+# outputs/metadata/version/sources), so importing them would mean
 # inventing state the composer cannot round-trip — which is how they came to be
 # dropped in the first place.
 #
@@ -282,25 +283,44 @@ def _optional_mapping(value: Any, path: str) -> Mapping[str, Any]:
     source="operator-supplied YAML option values before JSON persistence",
     source_param="value",
     suppresses=("R5",),
-    invariant="raises RuntimeYamlImportError for non-string mapping keys at every nested mapping or sequence depth",
-    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_reject_non_string_mapping_keys_rejects_nested_non_string_keys",
-    test_fingerprint="ae8670eee6a8bf082898aa8f3a9844fd6affea3c11f8124d3098cc84ae672013",
+    invariant=(
+        "raises RuntimeYamlImportError for non-string mapping keys and for any value other than str, int, "
+        "finite float, bool, None, a non-string non-bytes sequence or a mapping, at every nested depth"
+    ),
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_reject_non_string_mapping_keys_rejects_non_json_keys_and_values",
+    test_fingerprint="b84a5347dde33aa8ea4f9808c1a87070a8b56f2497489b2b83cea4ce47b65bfd",
 )
 def _reject_non_string_mapping_keys(value: object, path: str) -> None:
-    """Reject keys that JSON persistence would stringify ambiguously."""
+    """Admit only JSON values: str-keyed mappings, sequences and JSON scalars.
+
+    SafeLoader also builds ``date``/``datetime`` (unquoted timestamps),
+    ``bytes`` (``!!binary``), ``set`` (``!!set``) and non-finite floats
+    (``.nan``/``.inf``). None of them survives JSON persistence faithfully:
+    the first four fail at the composition-state INSERT and a NaN persists as
+    non-standard JSON that reads back as null. Messages name the dotted path
+    and the type only, never the value.
+    """
     if isinstance(value, Mapping):
         for key, item in value.items():
             if not isinstance(key, str):
                 raise RuntimeYamlImportError(f"{path} contains non-string mapping key {key!r}")
             _reject_non_string_mapping_keys(item, f"{path}.{key}")
         return
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, (bytes, bytearray)):
+        raise RuntimeYamlImportError(f"{path} must be a JSON value, got {type(value).__name__}")
+    if isinstance(value, Sequence) and not isinstance(value, str):
         for index, item in enumerate(value):
             _reject_non_string_mapping_keys(item, f"{path}[{index}]")
+        return
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float) and isfinite(value):
+        return
+    raise RuntimeYamlImportError(f"{path} must be a JSON value, got {type(value).__name__}")
 
 
 def _json_mapping(value: Any, path: str) -> Mapping[str, Any]:
-    """Copy a mapping after proving every nested key is JSON-safe."""
+    """Copy a mapping after proving every nested key and value is a JSON value."""
     mapping = dict(_optional_mapping(value, path))
     _reject_non_string_mapping_keys(mapping, path)
     return mapping
@@ -718,6 +738,12 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
         expected_output_count = entry.get("expected_output_count")
         if expected_output_count is not None and (not isinstance(expected_output_count, int) or isinstance(expected_output_count, bool)):
             raise RuntimeYamlImportError(f"{path}.expected_output_count must be an integer when provided")
+        output_mode = _optional_str(entry, "output_mode")
+        if node_type == "aggregation" and (output_mode is None or output_mode in OutputMode):
+            mode = OutputMode.TRANSFORM if output_mode is None else OutputMode(output_mode)
+            count_error = mode.expected_output_count_error(expected_output_count)
+            if count_error is not None:
+                raise RuntimeYamlImportError(f"{path}.expected_output_count: {count_error}")
         nodes.append(
             NodeSpec(
                 id=_require_str(entry, "name", path),
@@ -734,7 +760,7 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
                 policy=None,
                 merge=None,
                 trigger=_json_mapping(entry.get("trigger"), f"{path}.trigger") if entry.get("trigger") is not None else None,
-                output_mode=_optional_str(entry, "output_mode"),
+                output_mode=output_mode,
                 expected_output_count=expected_output_count,
             )
         )

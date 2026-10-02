@@ -43,6 +43,7 @@ from elspeth.engine.journal_restore import (
 )
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.tokens import TokenManager
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 # Reference instant for journal-restore tests (tz-aware, like barrier_blocked_at).
 _JOURNAL_T0 = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
@@ -520,7 +521,14 @@ class TestCoalesceFacadeValidateBeforeMutate:
         # In-place mutation of the restored loss record must succeed; under
         # require_all the second loss makes the merge impossible, so the key
         # fails with BOTH losses recorded in the audit metadata.
-        outcome = executor.notify_branch_lost("merge", "fg-journal-test", "c", "error_routed")
+        setup = make_recorder_with_run(run_id="run_1")
+        outcome = executor.notify_branch_lost(
+            "merge",
+            "fg-journal-test",
+            "c",
+            "error_routed",
+            coordination_token=leader_coordination_token(setup.factory, setup.run_id),
+        )
 
         assert outcome is not None
         assert outcome.held is False

@@ -103,9 +103,10 @@ token-anchor (finding F2), so it no longer appears above.
 crashed run has already written `node_states` rows for those tokens at
 attempt 0, so the resumed flush re-opened attempt 0 and failed with a
 UNIQUE constraint violation on `(token_id, step_index, attempt)`. The
-incomplete-token resume path had already learned this lesson:
-`resume_incomplete_token` sets `resume_attempt_offset=spec.max_attempt + 1`
-(`processor.py:2323`). The fix existed; it was applied to one barrier path
+incomplete-token resume path of the time had already learned this lesson:
+`resume_incomplete_token` set `resume_attempt_offset=spec.max_attempt + 1`
+(that path was deleted 2026-09-28 with source-row replay; the pending-sink
+re-drive derives the same offset from `node_states`). The fix existed; it was applied to one barrier path
 and not the other. That is the twin-drift failure mode this document exists
 to prevent, and item 5 of the checklist is its generalisation. F1 fixed
 the bug by construction (ADR-029 D5): the `restore_from_journal`
@@ -126,10 +127,12 @@ algorithm now lives in `contracts/union_merge.py`
 `merge_union_fields` (build-time, `core/dag/coalesce_merge.py`) and
 `merge_union_contracts` (runtime) — so build-time and runtime coalesce
 merges cannot diverge. The batch-merge surviving on `SchemaContract`
-(renamed `merge_for_batch`; used by the sink executor to combine
-sibling-token contracts within a batch) is **intentionally** separate —
-it implements different sibling-token semantics, not a leftover
-duplicate.
+(`merge_for_batch`; used by the sink executor and display headers to
+describe sibling-token contracts within a batch) is **intentionally**
+separate — since ADR-050 it is the J1 description join
+(`contracts/union_merge.py::join_batch_contracts`), which never raises on
+a type difference, whereas a coalesce merge and a node's own output
+record (`merge_for_node_evolution`) raise.
 
 ## Forward note
 

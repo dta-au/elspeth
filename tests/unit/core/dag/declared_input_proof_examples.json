@@ -1,0 +1,549 @@
+{
+  "examples/ab_llm_experiment/settings.yaml": {
+    "aggregation:prompt_experiment": [
+      "prompt_variant",
+      "score"
+    ],
+    "transform:assess_a": [],
+    "transform:assess_b": [],
+    "transform:tag_a": [],
+    "transform:tag_b": []
+  },
+  "examples/ab_llm_experiment/settings_arm_loss.yaml": {
+    "aggregation:prompt_experiment": [
+      "prompt_variant",
+      "score"
+    ],
+    "transform:assess_a": [],
+    "transform:assess_b": [],
+    "transform:tag_a": [],
+    "transform:tag_b": [],
+    "transform:weigh_exposure": []
+  },
+  "examples/ab_llm_experiment/settings_models.yaml": {
+    "aggregation:model_experiment": [
+      "model_variant",
+      "score"
+    ],
+    "transform:assess_a": [],
+    "transform:assess_b": [],
+    "transform:tag_a": [],
+    "transform:tag_b": []
+  },
+  "examples/audit_export/settings.yaml": {},
+  "examples/azure_blob_sentiment/settings.yaml": {
+    "transform:azure_content_safety_1": [],
+    "transform:azure_prompt_shield_2": [],
+    "transform:keyword_filter_0": [],
+    "transform:llm_3": [
+      "text"
+    ]
+  },
+  "examples/azure_search_rag/settings.yaml": {
+    "transform:rag_0": [
+      "question"
+    ]
+  },
+  "examples/batch_aggregation/settings.yaml": {
+    "aggregation:batch_totals": [
+      "amount",
+      "category"
+    ]
+  },
+  "examples/batch_error_routing/settings.yaml": {
+    "aggregation:batch_totals": [
+      "amount"
+    ]
+  },
+  "examples/batch_error_routing/settings_declared.yaml": {
+    "aggregation:batch_totals": [
+      "amount_cents"
+    ],
+    "transform:amount_in_cents": []
+  },
+  "examples/batch_error_routing/settings_discard.yaml": {
+    "aggregation:batch_totals": [
+      "amount"
+    ]
+  },
+  "examples/batch_rank_passthrough/settings.yaml": {
+    "aggregation:rank_per_prompt": []
+  },
+  "examples/batch_rank_passthrough/settings_transform.yaml": {
+    "aggregation:rank_per_prompt": []
+  },
+  "examples/blob_transforms/settings_expand_csv_blobs.yaml": {
+    "transform:expand_csv_blob": [
+      "blob_ref"
+    ]
+  },
+  "examples/blob_transforms/settings_expand_inline_csv.yaml": {
+    "transform:expand_inline_csv": [
+      "csv_text"
+    ]
+  },
+  "examples/blob_transforms/settings_expand_inline_json.yaml": {
+    "transform:expand_inline_json": [
+      "json_text"
+    ]
+  },
+  "examples/blob_transforms/settings_expand_json_blobs.yaml": {
+    "transform:expand_json_blob": [
+      "blob_content_type",
+      "blob_ref"
+    ]
+  },
+  "examples/blob_transforms/settings_expand_text_blobs.yaml": {
+    "transform:expand_text_blob": [
+      "blob_ref"
+    ]
+  },
+  "examples/blob_transforms/settings_fetch_tutorial_html.yaml": {
+    "transform:fetch_tutorial_html": [
+      "url"
+    ]
+  },
+  "examples/boolean_routing/settings.yaml": {},
+  "examples/chaosllm_endurance/settings.yaml": {
+    "transform:llm_0": []
+  },
+  "examples/chaosllm_sentiment/settings.yaml": {
+    "transform:llm_0": [
+      "text"
+    ]
+  },
+  "examples/chaosweb/settings.yaml": {
+    "transform:scraper": [
+      "url"
+    ]
+  },
+  "examples/checkpoint_resume/settings.yaml": {
+    "transform:process": []
+  },
+  "examples/chroma_rag/settings.yaml": {
+    "transform:rag_0": [
+      "question"
+    ]
+  },
+  "examples/chroma_rag_qa/settings.yaml": {
+    "transform:llm_0": [
+      "question",
+      "sci__rag_context"
+    ],
+    "transform:rag_0": [
+      "question"
+    ]
+  },
+  "examples/concurrent_scheduler/settings.yaml": {
+    "aggregation:rendezvous": [
+      "amount"
+    ]
+  },
+  "examples/database_sink/settings.yaml": {},
+  "examples/deaggregation/settings.yaml": {
+    "aggregation:replicate_batch": []
+  },
+  "examples/deep_routing/settings.yaml": {
+    "transform:content_screen": [],
+    "transform:normalize": [
+      "amount",
+      "applicant",
+      "credit_score",
+      "id",
+      "loan_type",
+      "notes",
+      "term_months"
+    ],
+    "transform:trim_notes": []
+  },
+  "examples/document_review_panel/settings.yaml": {
+    "aggregation:corpus_summary": [
+      "mean"
+    ],
+    "collector:doc_verdict": [
+      "panel_gap"
+    ],
+    "transform:disagreement": [],
+    "transform:explode_pages": [],
+    "transform:flatten_page": [],
+    "transform:need_evidence": [],
+    "transform:review_a": [],
+    "transform:review_b": []
+  },
+  "examples/document_review_panel/settings_incomplete.yaml": {
+    "aggregation:corpus_summary": [
+      "mean"
+    ],
+    "collector:doc_verdict": [
+      "panel_gap"
+    ],
+    "transform:disagreement": [],
+    "transform:explode_pages": [],
+    "transform:flatten_page": [],
+    "transform:need_evidence": [],
+    "transform:review_a": [],
+    "transform:review_b": []
+  },
+  "examples/document_review_panel/settings_run_as_row.yaml": {
+    "collector:corpus_verdict": [
+      "review_score"
+    ],
+    "transform:assess_document": [],
+    "transform:explode_documents": [],
+    "transform:need_assurance": []
+  },
+  "examples/error_routing/settings.yaml": {
+    "transform:content_filter": [],
+    "transform:truncate_notes": []
+  },
+  "examples/explicit_routing/settings.yaml": {
+    "transform:enrich": []
+  },
+  "examples/fixed_web_search/settings_abn_page.yaml": {
+    "transform:search_page": [
+      "search_text"
+    ]
+  },
+  "examples/fixed_web_search/settings_fixture.yaml": {
+    "transform:search_page": [
+      "search_text"
+    ]
+  },
+  "examples/fixed_web_search/settings_fixture_detail.yaml": {
+    "transform:count_candidates": [],
+    "transform:detail_page": [
+      "detail_url"
+    ],
+    "transform:expand_candidates": [
+      "candidates"
+    ],
+    "transform:expand_detail_record": [
+      "detail_records"
+    ],
+    "transform:prepare_detail_url": [
+      "candidate",
+      "candidate_count",
+      "id",
+      "item_index",
+      "search_fingerprint",
+      "search_text"
+    ],
+    "transform:project_detail_fields": [
+      "candidate_count",
+      "candidate_index",
+      "candidate_name",
+      "detail",
+      "detail_fingerprint",
+      "detail_url",
+      "fetch_url_final",
+      "search_fingerprint",
+      "search_text",
+      "source_id"
+    ],
+    "transform:search_page": [
+      "search_text"
+    ]
+  },
+  "examples/fixed_web_search/settings_fixture_form.yaml": {
+    "transform:search_page": [
+      "search_form"
+    ]
+  },
+  "examples/fixed_web_search/settings_fixture_multipart.yaml": {
+    "transform:search_page": [
+      "fixture_id",
+      "search_parts"
+    ]
+  },
+  "examples/fixed_web_search/settings_fixture_pagination.yaml": {
+    "transform:search_pages": [
+      "search_text"
+    ]
+  },
+  "examples/fixed_web_search/settings_fixture_registry.yaml": {
+    "transform:search_page": [
+      "search_text"
+    ]
+  },
+  "examples/fork_coalesce/settings.yaml": {
+    "transform:preprocess": []
+  },
+  "examples/fork_coalesce/settings_per_branch.yaml": {
+    "transform:map_branch_b": [
+      "id",
+      "price",
+      "product"
+    ],
+    "transform:truncate_branch_a": []
+  },
+  "examples/fork_coalesce/settings_union_fail.yaml": {
+    "transform:truncate_branch_a": [],
+    "transform:truncate_branch_b": []
+  },
+  "examples/fork_coalesce/settings_union_first_wins.yaml": {
+    "transform:truncate_branch_a": [],
+    "transform:truncate_branch_b": []
+  },
+  "examples/fork_coalesce/settings_union_last_wins.yaml": {
+    "transform:truncate_branch_a": [],
+    "transform:truncate_branch_b": []
+  },
+  "examples/join_refused/settings.yaml": {
+    "transform:explode": [
+      "items"
+    ],
+    "transform:llm_0": [
+      "text"
+    ]
+  },
+  "examples/join_refused/settings_mismatched.yaml": {
+    "transform:explode": [
+      "items"
+    ],
+    "transform:llm_0": [
+      "text"
+    ]
+  },
+  "examples/json_explode/settings.yaml": {
+    "transform:json_explode_0": [
+      "items"
+    ]
+  },
+  "examples/landscape_journal/settings.yaml": {
+    "transform:passthrough_0": []
+  },
+  "examples/large_scale_test/settings.yaml": {},
+  "examples/llm_source/settings.yaml": {},
+  "examples/multi_flow/settings.yaml": {
+    "transform:normalize_signups": [],
+    "transform:normalize_tickets": []
+  },
+  "examples/multi_query_assessment/settings.yaml": {
+    "transform:llm_0": []
+  },
+  "examples/multi_source_queue/settings.yaml": {
+    "transform:normalize_rows": []
+  },
+  "examples/multi_worker/settings.yaml": {
+    "transform:explode": [
+      "items"
+    ],
+    "transform:llm_0": [
+      "text"
+    ]
+  },
+  "examples/multi_worker_showcase/settings.yaml": {
+    "transform:explode": [
+      "items"
+    ],
+    "transform:llm_0": [
+      "text"
+    ]
+  },
+  "examples/openrouter_multi_query_assessment/settings.yaml": {
+    "transform:llm_0": []
+  },
+  "examples/openrouter_multi_query_assessment/settings_journal.yaml": {
+    "transform:assessment_multi_query": []
+  },
+  "examples/openrouter_multi_query_assessment/settings_overflow.yaml": {
+    "transform:assessment_multi_query": []
+  },
+  "examples/openrouter_multi_query_assessment/settings_stress.yaml": {
+    "transform:assessment_multi_query": []
+  },
+  "examples/openrouter_sentiment/settings.yaml": {
+    "transform:llm_0": [
+      "text"
+    ]
+  },
+  "examples/openrouter_sentiment/settings_pooled.yaml": {
+    "transform:sentiment_enrichment": [
+      "text"
+    ]
+  },
+  "examples/pdf_rasterize/settings.yaml": {
+    "transform:rasterize": [
+      "blob_ref"
+    ]
+  },
+  "examples/rate_limited_llm/settings.yaml": {
+    "transform:sentiment": [
+      "text"
+    ]
+  },
+  "examples/reference_join/settings.yaml": {
+    "transform:coerce_numbers": [
+      "unit_price"
+    ],
+    "transform:enrich_products": [],
+    "transform:line_totals": []
+  },
+  "examples/reference_join/settings_missing_product.yaml": {
+    "transform:enrich_products": []
+  },
+  "examples/reference_join/settings_nested.yaml": {
+    "transform:enrich_products": []
+  },
+  "examples/reference_join_fork_llm/settings.yaml": {
+    "transform:draft_reply": [
+      "message",
+      "product_description",
+      "warranty_months"
+    ],
+    "transform:enrich": [
+      "product"
+    ],
+    "transform:triage": [
+      "message",
+      "product_category",
+      "product_description",
+      "support_tier",
+      "warranty_months"
+    ]
+  },
+  "examples/replay_verify/settings.yaml": {
+    "transform:fetch_page": [
+      "url"
+    ]
+  },
+  "examples/report_assemble/settings.yaml": {
+    "aggregation:pages": [
+      "line"
+    ]
+  },
+  "examples/retention_purge/settings.yaml": {
+    "transform:process": []
+  },
+  "examples/row_union_ab_experiment/settings.yaml": {
+    "aggregation:prompt_experiment": [
+      "prompt_variant",
+      "score"
+    ],
+    "transform:tag_control": [],
+    "transform:tag_treatment": []
+  },
+  "examples/row_union_ab_experiment/settings_identity_branches.yaml": {
+    "transform:stamp_replica": []
+  },
+  "examples/row_union_ab_experiment/settings_paired_preference.yaml": {
+    "aggregation:paired_preference": [
+      "id",
+      "prompt_variant",
+      "score"
+    ],
+    "transform:tag_control": [],
+    "transform:tag_treatment": []
+  },
+  "examples/row_union_ab_experiment/settings_screened.yaml": {
+    "aggregation:prompt_experiment": [
+      "prompt_variant",
+      "score"
+    ],
+    "transform:tag_control": [],
+    "transform:tag_treatment": []
+  },
+  "examples/row_union_ab_experiment/settings_screened_at_settlement.yaml": {
+    "aggregation:prompt_experiment": [
+      "prompt_variant",
+      "score"
+    ],
+    "transform:tag_control": [],
+    "transform:tag_treatment": []
+  },
+  "examples/schema_contracts_demo/settings.yaml": {
+    "transform:passthrough_0": []
+  },
+  "examples/schema_contracts_llm_assessment/settings.yaml": {
+    "transform:llm_0": []
+  },
+  "examples/scope_collector/settings.yaml": {
+    "collector:page_stitcher": [
+      "reading"
+    ],
+    "transform:explode_pages": [],
+    "transform:read_value": []
+  },
+  "examples/scope_collector/settings_best_effort.yaml": {
+    "collector:page_stitcher": [
+      "reading"
+    ],
+    "transform:explode_pages": [],
+    "transform:read_value": []
+  },
+  "examples/statistical_batch_plugins/settings_classifier_metrics.yaml": {
+    "aggregation:classification_summary": [
+      "actual_label",
+      "predicted_label"
+    ]
+  },
+  "examples/statistical_batch_plugins/settings_data_quality_report.yaml": {
+    "aggregation:data_quality_report": [
+      "label",
+      "score_text",
+      "source"
+    ]
+  },
+  "examples/statistical_batch_plugins/settings_distribution_profile.yaml": {
+    "aggregation:latency_profile": [
+      "latency_ms",
+      "variant"
+    ]
+  },
+  "examples/statistical_batch_plugins/settings_drift_compare.yaml": {
+    "aggregation:score_drift": [
+      "cohort",
+      "score"
+    ]
+  },
+  "examples/statistical_batch_plugins/settings_effect_size.yaml": {
+    "aggregation:prompt_effect_size": [
+      "prompt_variant",
+      "score"
+    ]
+  },
+  "examples/statistical_batch_plugins/settings_experiment_compare.yaml": {
+    "aggregation:prompt_experiment": [
+      "prompt_variant",
+      "score"
+    ]
+  },
+  "examples/statistical_batch_plugins/settings_outlier_annotator.yaml": {
+    "aggregation:latency_outliers": [
+      "latency_ms"
+    ]
+  },
+  "examples/statistical_batch_plugins/settings_paired_preference.yaml": {
+    "aggregation:paired_prompt_preference": [
+      "case_id",
+      "preference_score",
+      "variant"
+    ]
+  },
+  "examples/statistical_batch_plugins/settings_threshold_summary.yaml": {
+    "aggregation:quality_thresholds": [
+      "quality_score"
+    ]
+  },
+  "examples/statistical_batch_plugins/settings_top_k.yaml": {
+    "aggregation:label_top_k": [
+      "model",
+      "predicted_label"
+    ]
+  },
+  "examples/template_lookups/settings.yaml": {
+    "transform:llm_0": [
+      "body",
+      "category_id",
+      "priority_id",
+      "subject",
+      "ticket_id"
+    ]
+  },
+  "examples/threshold_gate/settings.yaml": {},
+  "examples/threshold_gate_container/settings.yaml": {},
+  "examples/transform_pipeline/settings.yaml": {
+    "transform:compute_fields": [],
+    "transform:normalize_types": []
+  }
+}

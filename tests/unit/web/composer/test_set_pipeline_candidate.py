@@ -41,11 +41,15 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools import sessions as sessions_tools
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT,
     SOURCE_AUTHORING_KEY,
+    prompt_review_anchor_hash_from_options,
+    prompt_review_draft_from_options,
 )
 from elspeth.web.plugin_policy.models import (
     PluginAvailability,
@@ -61,6 +65,8 @@ from elspeth.web.plugin_policy.validation import (
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composer_fences import fenced_tool_context
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
 
@@ -172,7 +178,7 @@ def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path
     result = candidate.result
 
     assert candidate.acceptable is False
-    assert result.data["error_code"] == "plugin_options_invalid"
+    assert result.validation.errors[0].error_code == "plugin_options_invalid"
     assert [entry.component for entry in result.validation.errors] == ["rejected_mutation"]
     assert [entry.error_code for entry in result.validation.errors] == ["plugin_options_invalid"]
 
@@ -309,7 +315,7 @@ def test_no_source_internal_defense_uses_prior_source_shape_for_repair_guidance(
         _trained_context(),
     )
 
-    error = candidate.result.data["error"]
+    error = candidate.result.validation.errors[0].message
     assert expected_container in error
     assert ("blob_id" in error) is expects_blob_advice
     assert ("inline_blob" in error) is expects_blob_advice
@@ -493,6 +499,32 @@ def _linear_args(tmp_path: Path) -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize("named_sources", [False, True])
+def test_uploaded_observed_guarantee_rejection_has_repair_guidance(tmp_path: Path, named_sources: bool) -> None:
+    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
+    from elspeth.web.composer.tools.generation import build_validation_guidance
+
+    args = _linear_args(tmp_path)
+    args["source"]["options"]["schema"]["guaranteed_fields"] = ["case_study"]
+    if named_sources:
+        args["sources"] = {"source": args.pop("source")}
+    state = _empty_state()
+    result = build_set_pipeline_candidate(args, state, _trained_context(data_dir=tmp_path)).result
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.validation.errors[0].error_code == "source_data_contract_required"
+    guidance = build_validation_guidance(entry.error_code for entry in result.validation.errors)
+    assert guidance is not None
+    fix = guidance["codes"]["source_data_contract_required"]["suggested_fix"]
+    assert "guaranteed_fields" in fix
+    assert "request_interpretation_review" in fix
+    assert "flexible" in fix and "fields" in fix
+    feedback = _allowlisted_candidate_feedback(result)
+    assert feedback["validation"]["errors"][0]["error_code"] == "source_data_contract_required"
+    assert feedback["validation"]["errors"][0]["suggested_fix"] == fix
+
+
 def _reviewed_source_harness(tmp_path: Path) -> tuple[Any, str, str, Any]:
     engine = create_session_engine(
         "sqlite:///:memory:",
@@ -500,6 +532,8 @@ def _reviewed_source_harness(tmp_path: Path) -> tuple[Any, str, str, Any]:
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="review-owner")
     first_session = str(uuid4())
     second_session = str(uuid4())
     now = datetime.now(UTC)
@@ -905,8 +939,8 @@ def test_reviewed_source_rehydrates_trusted_options_and_runs_b_before_plugin_val
     )
 
     assert candidate.acceptable is False
-    assert candidate.result.data["error_code"] == "interpretation_requirements_invalid"
-    assert "sk-sensitive-reviewed-source" not in candidate.result.data["error"]
+    assert candidate.result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+    assert "sk-sensitive-reviewed-source" not in candidate.result.validation.errors[0].message
 
 
 @pytest.mark.parametrize("mutation", ["name", "plugin", "options", "failure_policy"])
@@ -1048,8 +1082,7 @@ def _short_form_shield_review() -> dict[str, Any]:
 def test_authored_short_form_llm_review_is_canonicalized_not_a_keyerror(tmp_path: Path) -> None:
     """A skill-shaped short-form node review must not crash candidate construction.
 
-    Regression for the guided first-run tutorial: the step-3 planner authors a
-    web_scrape -> llm -> field_mapper pipeline and, following the composer skill,
+    The planner authors a web_scrape -> llm -> field_mapper pipeline and
     stages a ``prompt_injection_shield_recommendation`` review on the LLM node as
     ``{kind, user_term, draft}``. The candidate builder validated that node
     through ``CompositionState.validate`` -> ``prompt_shield_recommendation_warning_pairs``
@@ -1073,162 +1106,6 @@ def test_authored_short_form_llm_review_is_canonicalized_not_a_keyerror(tmp_path
     assert candidate.result.updated_state.validate() is not None
 
 
-def test_guided_tutorial_shape_short_form_review_builds_a_valid_candidate(tmp_path: Path) -> None:
-    """Tutorial-shaped live path: guided finalizer + reviewed blob source + short-form review.
-
-    Reconstructs the guided first-run tutorial's step-3 re-plan exactly as it
-    crashed live: a blob-backed reviewed csv source, a json sink, and a
-    planner-authored ``web_scrape -> llm -> field_mapper`` pipeline whose LLM node
-    carries the skill's short-form ``prompt_injection_shield_recommendation``
-    review. ``bind_guided_reviewed_components`` restores the reviewed
-    source/output, and ``build_set_pipeline_candidate`` (through the reviewed
-    source authority) must resolve the ``blob:`` path AND canonicalise the short
-    form into a valid candidate — where a raw ``KeyError('id')`` used to escape.
-    """
-    from elspeth.web.composer.guided.planning import (
-        bind_guided_reviewed_components,
-        guided_private_reviewed_facts,
-    )
-    from elspeth.web.composer.guided.protocol import GuidedStep
-    from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
-    from elspeth.web.composer.guided.state_machine import GuidedSession
-
-    engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
-    blob = blobs[0]
-    source_options = {
-        "schema": {"fields": ["url: str"], "mode": "flexible"},
-        "path": f"blob:{blob.id}",
-        "delimiter": ",",
-        "encoding": "utf-8",
-    }
-    output_options = {
-        "schema": {"mode": "observed"},
-        "path": "outputs/output.json",
-        "collision_policy": "auto_increment",
-        "mode": "write",
-    }
-    source_id = str(uuid4())
-    output_id = str(uuid4())
-    guided = GuidedSession(
-        step=GuidedStep.STEP_3_TRANSFORMS,
-        source_order=(source_id,),
-        reviewed_sources={
-            source_id: SourceResolved(
-                name="source",
-                plugin="csv",
-                options=source_options,
-                observed_columns=("url",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-        output_order=(output_id,),
-        reviewed_outputs={
-            output_id: SinkOutputResolved(
-                name="output",
-                plugin="json",
-                options=output_options,
-                required_fields=("url",),
-                schema_mode="observed",
-                on_write_failure="discard",
-            )
-        },
-    )
-    planner_pipeline = {
-        "sources": {
-            "source": {
-                "plugin": "csv",
-                "options": deepcopy(source_options),
-                "on_success": "raw_rows",
-                "on_validation_failure": "discard",
-            }
-        },
-        "nodes": [
-            {
-                "id": "scrape",
-                "node_type": "transform",
-                "plugin": "web_scrape",
-                "input": "raw_rows",
-                "on_success": "scraped",
-                "on_error": "discard",
-                "options": {
-                    "schema": {"mode": "observed"},
-                    "url_field": "url",
-                    "content_field": "page_content",
-                    "fingerprint_field": "page_fingerprint",
-                    "http": {"abuse_contact": "ops@example.gov.au", "scraping_reason": "Tutorial demo"},
-                },
-            },
-            {
-                "id": "summarise",
-                "node_type": "transform",
-                "plugin": "llm",
-                "input": "scraped",
-                "on_success": "summarised",
-                "on_error": "discard",
-                "options": {
-                    "schema": {"mode": "observed"},
-                    "provider": "openrouter",
-                    "model": "anthropic/claude-sonnet-4.6",
-                    "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
-                    "prompt_template": "Summarise {{ row.page_content }}",
-                    "required_input_fields": ["page_content"],
-                    "interpretation_requirements": [_short_form_shield_review()],
-                },
-            },
-            {
-                "id": "shape",
-                "node_type": "transform",
-                "plugin": "field_mapper",
-                "input": "summarised",
-                "on_success": "output",
-                "on_error": "discard",
-                "options": {"schema": {"mode": "observed"}, "mapping": {"page_content": "summary"}},
-            },
-        ],
-        "edges": [],
-        "outputs": [
-            {"sink_name": "output", "plugin": "json", "options": deepcopy(output_options), "on_write_failure": "discard"},
-        ],
-        "metadata": {"name": "tutorial"},
-    }
-
-    finalized = bind_guided_reviewed_components(planner_pipeline, guided)
-    facts = guided_private_reviewed_facts(guided)
-    authority = resolve_reviewed_source_authority(
-        engine=engine,
-        session_id=session_id,
-        user_id="review-owner",
-        reviewed_facts=facts,
-        expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
-    )
-
-    candidate = build_set_pipeline_candidate(
-        dict(finalized),
-        _empty_state(),
-        _trained_context(
-            data_dir=tmp_path,
-            session_engine=engine,
-            session_id=session_id,
-            user_id="review-owner",
-            reviewed_source_authority=authority,
-        ),
-    )
-
-    assert candidate.acceptable is True, candidate.result.to_dict()
-    # The reviewed blob path resolved to the private storage path...
-    assert candidate.result.updated_state.sources["source"].options["path"] == blob.storage_path
-    # ...and the short-form llm review canonicalised into a pending full-form row.
-    llm_node = next(node for node in candidate.result.updated_state.nodes if node.plugin == "llm")
-    shield = next(
-        item
-        for item in deep_thaw(llm_node.options["interpretation_requirements"])
-        if item["user_term"] == "prompt_injection_shield_recommendation"
-    )
-    assert shield["id"] == "prompt_injection_shield_recommendation:summarise"
-    assert shield["status"] == "pending"
-
-
 @pytest.mark.parametrize(
     "row",
     [
@@ -1242,15 +1119,13 @@ def test_guided_tutorial_shape_short_form_review_builds_a_valid_candidate(tmp_pa
 def test_uncanonicalizable_node_review_row_is_a_repairable_rejection(tmp_path: Path, row: Any) -> None:
     """A review row the canonicalizer cannot complete must reject, not crash.
 
-    Regression for the guided A/B + tutorial planner failures (sessions
-    deebaaa6 / f7ba27ca / 470631e8, 2026-07-22): the guided step skills carry
-    no ``interpretation_requirements`` exemplar, so the staged planner authors
-    rows the ``canonicalize_authored_node_review_requirements`` boundary cannot
+    A planner may author rows the
+    ``canonicalize_authored_node_review_requirements`` boundary cannot
     complete — a row without a usable ``user_term`` gets no synthesized ``id``,
     and ``CompositionState.validate``'s always-on prompt-shield walk then
     raised ``KeyError('id')`` out of ``build_set_pipeline_candidate``
     (surfacing as planner_code=CANDIDATE_CONSTRUCTION_ERROR, a terminal
-    planner death). The 04f0696ab contract — "a row missing user_term/kind
+    planner death). The contract — "a row missing user_term/kind
     surfaces as a recoverable validation failure, never a crash" — must
     actually hold: the builder rejects with a closed, explainable error_code
     the planner repair loop can act on.
@@ -1265,129 +1140,6 @@ def test_uncanonicalizable_node_review_row_is_a_repairable_rejection(tmp_path: P
     assert lead.error_code == "interpretation_requirements_invalid"
     # The rejection names the offending node so the planner edits the right row.
     assert "classify" in lead.message
-
-
-def test_guided_shape_malformed_review_row_is_repairable_not_a_keyerror(tmp_path: Path) -> None:
-    """Guided-staged seam: bind + canonicalize + build must reject, not KeyError.
-
-    Mirrors ``test_guided_tutorial_shape_short_form_review_builds_a_valid_candidate``
-    but with the review row the live guided planners actually die on: a
-    ``pipeline_decision`` entry with no ``user_term``. The staged surface
-    (``bind_guided_reviewed_components`` finalizer) must surface the same
-    repairable rejection as the freeform surface, never an unguarded
-    ``KeyError('id')``.
-    """
-    from elspeth.web.composer.guided.planning import (
-        bind_guided_reviewed_components,
-        guided_private_reviewed_facts,
-    )
-    from elspeth.web.composer.guided.protocol import GuidedStep
-    from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
-    from elspeth.web.composer.guided.state_machine import GuidedSession
-
-    engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
-    blob = blobs[0]
-    source_options = {
-        "schema": {"fields": ["url: str"], "mode": "flexible"},
-        "path": f"blob:{blob.id}",
-        "delimiter": ",",
-        "encoding": "utf-8",
-    }
-    output_options = {
-        "schema": {"mode": "observed"},
-        "path": "outputs/output.json",
-        "collision_policy": "auto_increment",
-        "mode": "write",
-    }
-    source_id = str(uuid4())
-    output_id = str(uuid4())
-    guided = GuidedSession(
-        step=GuidedStep.STEP_3_TRANSFORMS,
-        source_order=(source_id,),
-        reviewed_sources={
-            source_id: SourceResolved(
-                name="source",
-                plugin="csv",
-                options=source_options,
-                observed_columns=("url",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-        output_order=(output_id,),
-        reviewed_outputs={
-            output_id: SinkOutputResolved(
-                name="output",
-                plugin="json",
-                options=output_options,
-                required_fields=("url",),
-                schema_mode="observed",
-                on_write_failure="discard",
-            )
-        },
-    )
-    planner_pipeline = {
-        "sources": {
-            "source": {
-                "plugin": "csv",
-                "options": deepcopy(source_options),
-                "on_success": "raw_rows",
-                "on_validation_failure": "discard",
-            }
-        },
-        "nodes": [
-            {
-                "id": "summarise",
-                "node_type": "transform",
-                "plugin": "llm",
-                "input": "raw_rows",
-                "on_success": "output",
-                "on_error": "discard",
-                "options": {
-                    "schema": {"mode": "observed"},
-                    "provider": "openrouter",
-                    "model": "anthropic/claude-sonnet-4.6",
-                    "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
-                    "prompt_template": "Summarise {{ row.url }}",
-                    # The live crash shape: no user_term, nothing to synthesize
-                    # an id from.
-                    "interpretation_requirements": [{"kind": "pipeline_decision", "draft": "Recommend a prompt-injection shield."}],
-                },
-            },
-        ],
-        "edges": [],
-        "outputs": [
-            {"sink_name": "output", "plugin": "json", "options": deepcopy(output_options), "on_write_failure": "discard"},
-        ],
-        "metadata": {"name": "guided-malformed-review"},
-    }
-
-    finalized = bind_guided_reviewed_components(planner_pipeline, guided)
-    facts = guided_private_reviewed_facts(guided)
-    authority = resolve_reviewed_source_authority(
-        engine=engine,
-        session_id=session_id,
-        user_id="review-owner",
-        reviewed_facts=facts,
-        expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
-    )
-
-    candidate = build_set_pipeline_candidate(
-        dict(finalized),
-        _empty_state(),
-        _trained_context(
-            data_dir=tmp_path,
-            session_engine=engine,
-            session_id=session_id,
-            user_id="review-owner",
-            reviewed_source_authority=authority,
-        ),
-    )
-
-    assert candidate.acceptable is False
-    lead = candidate.result.validation.errors[0]
-    assert lead.error_code == "interpretation_requirements_invalid"
-    assert "summarise" in lead.message
 
 
 def test_candidate_uses_final_request_scoped_profile_validation(tmp_path: Path) -> None:
@@ -1685,6 +1437,7 @@ def _structured_llm_args(tmp_path: Path) -> dict[str, Any]:
                 "deployment_name": "candidate-test",
                 "endpoint": "https://candidate-test.openai.azure.com",
                 "api_key": {"secret_ref": "AZURE_OPENAI_API_KEY"},
+                "system_prompt": "You classify text by colour. Reply in the requested structure only.",
                 "prompt_template": "Classify {{ row.text }}",
                 "required_input_fields": ["text"],
                 # Multi-query execution must use the pooled path so capacity
@@ -1731,6 +1484,7 @@ def _secret_bearing_structured_fork_coalesce_args(tmp_path: Path) -> dict[str, A
             "deployment_name": "candidate-test",
             "endpoint": "https://candidate-test.openai.azure.com",
             "api_key": {"secret_ref": "AZURE_OPENAI_API_KEY"},
+            "system_prompt": "You classify text by colour. Reply in the requested structure only.",
             "prompt_template": "Classify {{ row.text }}",
             "required_input_fields": ["text"],
             "pool_size": 2,
@@ -1773,7 +1527,6 @@ def _secret_bearing_structured_fork_coalesce_args(tmp_path: Path) -> dict[str, A
                     "colour_score": "colour_score",
                 },
                 "select_only": True,
-                "strict": True,
             },
         },
     )
@@ -1810,7 +1563,17 @@ _EXPECTED_STATE_HASHES = {
     "fork_coalesce": "21fef020c5ef5d8c9d9b5319446795a57c257ef366d6ddb1c63cfee24d5a4315",
     "gate": "c0380bca12a88112057ce36547ab39547eb691c03a8751e27f2371593b5abb9e",
     "aggregation": "427cde0492596be8a65cf854e3183de0c868f31fb7a24884d4bd86963fbb22cd",
-    "structured_llm": "c324e56c54db6abba0c1eac06fd720ef3cbbd84502b389c0285b32371ecbf31f",
+    # Re-pinned 2026-09-14: the multi-query llm node's staged prompt review now
+    # drafts the rendered prompt SURFACE (per-query templates, system prompt,
+    # node-level in-use status) instead of the node-level prompt_template alone
+    # (session 94f6f00c). Control: swapping that one draft back to the
+    # prompt_template text reproduces the previous pin exactly.
+    # Re-pinned 2026-09-21: the fixture's llm node gained a system_prompt
+    # (Stage-1 llm_system_prompt_missing makes both prompt roles mandatory),
+    # which changes the node options and the staged review draft with them.
+    # Control: the same fixture without the system_prompt, on the tree without
+    # the rule, reproduces the previous pin 55dd9ee6… exactly.
+    "structured_llm": "41792a2289fccefe64c8e91a8709d3504ea67ba6acce4d0690ae1c056d6ff145",
     "multi_output": "a8e0698429a06efa22423ebc37033b585f1b6cdc225eb2501b4d69ee6b67ad8a",
 }
 
@@ -2069,7 +1832,8 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             _trained_context(data_dir=tmp_path),
             "Node 'classify': set_pipeline options.interpretation_requirements[0] includes resolver-owned status "
             "'resolved'. Composer tool input may stage pending review requirements only. Omit resolver-owned fields "
-            "and retry set_pipeline with exactly kind, user_term, and draft. Then call request_interpretation_review "
+            "and retry set_pipeline with exactly kind, user_term, and draft, with optional display_title "
+            "(a non-empty string of at most 200 characters). Then call request_interpretation_review "
             "for an authorable staged site; backend-owned review kinds are surfaced automatically. The user resolves "
             "the card and ELSPETH writes resolved review metadata.",
             "interpretation_requirements_invalid",
@@ -2091,8 +1855,6 @@ def test_current_executor_semantic_failures_are_atomic(tmp_path: Path, case_inde
     assert result.affected_nodes == ()
     assert result.validation.is_valid is False
     assert result.validation.errors[0].component == "rejected_mutation"
-    assert result.data["error"] == expected_error
-    assert result.data.get("error_code") == expected_error_code
     assert result.validation.errors[0].message == expected_error
     assert result.validation.errors[0].error_code == expected_error_code
     assert result.to_dict()["version"] == state.version
@@ -2112,6 +1874,17 @@ def test_candidate_matches_executor_semantic_failures_without_side_effects(tmp_p
     assert candidate.prepared_inline_blob is None
     assert candidate.result == executor_result
     assert state.to_dict() == before
+
+
+def test_set_pipeline_defaults_omitted_source_validation_routing_to_discard(tmp_path: Path) -> None:
+    """Composer's source wrapper supplies the option raw CSV config requires."""
+    args = _linear_args(tmp_path)
+    del args["source"]["on_validation_failure"]
+
+    result = _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    assert result.success is True
+    assert result.updated_state.sources["source"].on_validation_failure == "discard"
 
 
 def test_current_executor_can_return_success_with_invalid_graph_candidate(tmp_path: Path) -> None:
@@ -2147,14 +1920,18 @@ def test_current_executor_reopens_stale_authoritative_review(tmp_path: Path) -> 
     original_options = deep_thaw(original_node.options)
     requirements = original_options[INTERPRETATION_REQUIREMENTS_KEY]
     prompt_requirement = next(item for item in requirements if item["kind"] == "llm_prompt_template")
-    prompt = original_options["prompt_template"]
+    # The node is multi-query, so the operator approved the rendered prompt
+    # surface and the review is anchored to that surface's hash.
+    accepted_surface = prompt_review_draft_from_options(original_options)
+    surface_anchor = prompt_review_anchor_hash_from_options(original_options)
+    assert accepted_surface is not None and surface_anchor is not None
     resolved = {
         **prompt_requirement,
         "status": "resolved",
         "event_id": "authoritative-prompt-review",
-        "accepted_value": prompt,
+        "accepted_value": accepted_surface,
         "accepted_artifact_hash": None,
-        "resolved_prompt_template_hash": stable_hash(prompt),
+        "resolved_prompt_template_hash": surface_anchor,
     }
     previous = replace(
         first.updated_state,
@@ -2168,7 +1945,13 @@ def test_current_executor_reopens_stale_authoritative_review(tmp_path: Path) -> 
     assert result.success and result.validation.is_valid
     reconciled = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY]
     current = next(item for item in reconciled if item["kind"] == "llm_prompt_template")
-    assert current["draft"] == "Reclassify {{ row.text }}"
+    # This node is multi-query (its one query carries its own template), so the
+    # review drafts the rendered prompt SURFACE, not the node-level text. The
+    # approval above carried the surface anchor, and the changed prompt moves
+    # that anchor, so the review is reopened rather than inherited.
+    assert current["draft"] == prompt_review_draft_from_options(result.updated_state.nodes[0].options)
+    assert "Query 'colour':" in current["draft"]
+    assert "Node-level prompt_template: not used" in current["draft"]
     assert current["status"] == "pending"
     assert current["event_id"] is None
     assert current["accepted_value"] is None
@@ -2245,6 +2028,8 @@ def _session_with_user_message() -> tuple[Any, str, str]:
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="candidate-user")
     session_id = str(uuid4())
     message_id = str(uuid4())
     now = datetime.now(UTC)
@@ -2326,8 +2111,8 @@ def test_inline_blob_canonical_b_failure_precedes_blob_persistence(tmp_path: Pat
     blob_files = tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file())
     assert result.success is False
     assert result.updated_state is state
-    assert result.data["error_code"] == "interpretation_requirements_invalid"
-    assert "sk-sensitive-inline-review" not in result.data["error"]
+    assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+    assert "sk-sensitive-inline-review" not in result.validation.errors[0].message
     assert blob_rows == 0
     assert blob_files == ()
 
@@ -2402,11 +2187,48 @@ def test_inline_blob_replacement_preserves_trusted_existing_source_requirement_i
         tool_arguments_hash="b" * 64,
     )
 
-    result = _execute_set_pipeline(args, state, context)
+    with fenced_operation_context(engine, session_id) as operation:
+        result = _execute_set_pipeline(
+            args,
+            state,
+            replace(context, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)),
+        )
 
     assert result.success, result.to_dict()
     requirements = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY]
     assert requirements[0]["id"] == trusted_id
+
+
+@pytest.mark.parametrize("release_before_create", [False, True])
+def test_explicit_tool_context_keeps_real_authority_loss_observable(tmp_path: Path, release_before_create: bool) -> None:
+    """A scoped producer succeeds only while its actual database fence is live."""
+    from elspeth.web.composer.tools import _execute_create_blob
+
+    engine, session_id, message_id = _session_with_user_message()
+    policy_context = _trained_context()
+    arguments = {"filename": "ada.csv", "mime_type": "text/csv", "content": "name,score\nada,42\n"}
+    with fenced_tool_context(
+        catalog=policy_context.catalog,
+        plugin_snapshot=policy_context.plugin_snapshot,
+        session_engine=engine,
+        session_id=session_id,
+        data_dir=str(tmp_path),
+        user_message_id=message_id,
+        user_message_content="Use this CSV: name,score\nada,42\n",
+    ) as context:
+        assert context.session_operation_context is not None
+        assert context.session_operation_authority is not None
+        if release_before_create:
+            context.session_operation_authority.release(context.session_operation_context)
+            with pytest.raises(SessionOperationFenceLost):
+                _execute_create_blob(arguments, _empty_state(), context)
+        else:
+            result = _execute_create_blob(arguments, _empty_state(), context)
+            assert result.success is True
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == (0 if release_before_create else 1)
+    files = tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file())
+    assert len(files) == (0 if release_before_create else 1)
 
 
 @pytest.mark.asyncio
@@ -2474,7 +2296,14 @@ async def test_current_executor_inline_blob_effects_are_single_settlement(tmp_pa
     )
 
     async def _dispatch() -> Any:
-        return _execute_set_pipeline(args, state, context)
+        with fenced_operation_context(engine, session_id) as operation:
+            return _execute_set_pipeline(
+                args,
+                state,
+                replace(
+                    context, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)
+                ),
+            )
 
     outcome = await dispatch_with_audit(
         recorder=recorder,
@@ -2635,6 +2464,7 @@ def _ab_multi_query_args(tmp_path: Path) -> dict[str, Any]:
                     "profile": "sonnet",
                     "schema": {"mode": "observed"},
                     "required_input_fields": ["color_name", "hex"],
+                    "system_prompt": "You assess colours for designers. Reply with JSON only.",
                     "prompt_template": "Assess the colour {{ row.input_1 }} ({{ row.input_2 }}).",
                     "queries": {
                         "tone": {
@@ -2685,14 +2515,14 @@ def test_profile_lowered_llm_multi_query_candidate_is_acceptable(tmp_path: Path)
 
     candidate = build_set_pipeline_candidate(_ab_multi_query_args(tmp_path), state, context)
 
-    rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+    rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
     assert candidate.acceptable is True, f"canonical A/B shape rejected: {rejection}"
     assert candidate.result.success is True
 
 
 def test_bare_relative_sink_path_canonicalizes_to_outputs_pool(tmp_path: Path) -> None:
     """A bare relative sink path — the natural authoring form ("write it to
-    colours.json") — must canonicalize to outputs/<path> exactly as the guided
+    colours.json") — must canonicalize to outputs/<path> exactly as the
     sink form does (elspeth-859e2702dd L3), instead of parking an unrepairable
     S2 rejection: live sessions a5a5f599 (3 sonnet repairs + the opus hatch,
     all rejected on the identical bare filename)."""
@@ -2704,7 +2534,7 @@ def test_bare_relative_sink_path_canonicalizes_to_outputs_pool(tmp_path: Path) -
 
     candidate = build_set_pipeline_candidate(args, state, context)
 
-    rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+    rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
     assert candidate.acceptable is True, f"bare relative sink path rejected: {rejection}"
     committed = candidate.result.updated_state.outputs[0].options["path"]
     assert committed == "outputs/colour_ab.json"
@@ -2719,7 +2549,7 @@ def test_parent_traversal_sink_path_still_rejected(tmp_path: Path) -> None:
     candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
     assert candidate.acceptable is False
-    assert ".." in ((candidate.result.data or {}).get("error") or "")
+    assert ".." in (candidate.result.validation.errors[0].message or "")
 
 
 @pytest.mark.parametrize("path", [".", "./"])
@@ -2733,8 +2563,8 @@ def test_current_directory_sink_path_returns_validation_failure(tmp_path: Path, 
 
     assert candidate.acceptable is False
     assert candidate.result.success is False
-    assert (candidate.result.data or {}).get("error_code") == "plugin_options_invalid"
-    assert "current directory" in ((candidate.result.data or {}).get("error") or "")
+    assert candidate.result.validation.errors[0].error_code == "plugin_options_invalid"
+    assert "current directory" in (candidate.result.validation.errors[0].message or "")
 
 
 def _scrape_cleanup_args(tmp_path: Path) -> dict[str, Any]:
@@ -3155,9 +2985,6 @@ def test_multi_component_rejection_keeps_the_first_failure_first(tmp_path: Path)
     assert "bogus_source_option" in messages[0] or "Invalid options for source" in messages[0]
     assert messages[1].startswith("Node 'copy':")
     assert messages[2].startswith("Output 'main':")
-    # The leading rejection's own envelope is untouched, so a single-defect
-    # candidate and a multi-defect candidate agree on the `error` payload.
-    assert candidate.result.data["error"] == messages[0]
 
 
 def test_one_defective_component_is_reported_exactly_once(tmp_path: Path) -> None:
@@ -3173,7 +3000,7 @@ def test_one_defective_component_is_reported_exactly_once(tmp_path: Path) -> Non
     assert entries[0].message.startswith("Node 'copy':")
     # Exactly one rejection means the envelope is byte-identical to the
     # pre-collection single-rejection shape: no withheld counter rides along.
-    assert "components_withheld" not in candidate.result.data
+    assert candidate.result.data is None
 
 
 def test_component_rejections_are_bounded_and_report_what_they_withheld(tmp_path: Path) -> None:

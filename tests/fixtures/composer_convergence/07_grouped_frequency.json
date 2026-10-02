@@ -1,0 +1,116 @@
+{
+  "id": "07_grouped_frequency",
+  "title": "Group-aware whole-batch top-k summaries",
+  "inputs": [
+    {
+      "filename": "frequency.csv",
+      "media_type": "text/csv",
+      "content": "id,region,category\nf1,east,red\nf2,east,red\nf3,east,blue\nf4,west,green\nf5,west,green\nf6,west,red\n"
+    }
+  ],
+  "turns": [
+    "Summarize all six frequency.csv records as one batch with batch_top_k, counting category separately by region and keeping the two most common categories. Write frequency.jsonl with the native top-k summary fields and their numeric types, including counts and rates. Do not split into smaller windows: trigger one flush at six rows. Validate and preview."
+  ],
+  "expected_plugins": {
+    "source": [
+      "csv"
+    ],
+    "transform": [
+      "batch_top_k"
+    ],
+    "sink": [
+      "json"
+    ]
+  },
+  "required_node_kinds": [
+    "aggregation"
+  ],
+  "outputs": [
+    {
+      "filename": "frequency.jsonl",
+      "format": "jsonl",
+      "columns": [
+        "field",
+        "group_by",
+        "group_value",
+        "batch_size",
+        "count",
+        "distinct_count",
+        "missing_count",
+        "non_finite_count",
+        "k",
+        "top_values"
+      ],
+      "rows": [
+        {
+          "field": "category",
+          "group_by": "region",
+          "group_value": "east",
+          "batch_size": 3,
+          "count": 3,
+          "distinct_count": 2,
+          "missing_count": 0,
+          "non_finite_count": 0,
+          "k": 2,
+          "top_values": [
+            {
+              "value": "red",
+              "count": 2,
+              "rate": 0.6666666666666666
+            },
+            {
+              "value": "blue",
+              "count": 1,
+              "rate": 0.3333333333333333
+            }
+          ]
+        },
+        {
+          "field": "category",
+          "group_by": "region",
+          "group_value": "west",
+          "batch_size": 3,
+          "count": 3,
+          "distinct_count": 2,
+          "missing_count": 0,
+          "non_finite_count": 0,
+          "k": 2,
+          "top_values": [
+            {
+              "value": "green",
+              "count": 2,
+              "rate": 0.6666666666666666
+            },
+            {
+              "value": "red",
+              "count": 1,
+              "rate": 0.3333333333333333
+            }
+          ]
+        }
+      ],
+      "float_tolerance": 1e-12
+    }
+  ],
+  "audit": {
+    "source_rows": 6,
+    "success_output_rows": 2,
+    "routed_error_rows": 0,
+    "discarded_rows": 0,
+    "shape": "aggregation",
+    "succeeded_tokens": 2,
+    "structural_tokens": 6
+  },
+  "review_policy": {
+    "allowed_types": [
+      "vague_term",
+      "invented_source",
+      "llm_prompt_template",
+      "pipeline_decision",
+      "llm_model_choice",
+      "source_data_contract"
+    ],
+    "constraints": "Inspect each presented draft against every explicit requirement in turns. Accept only matching meanings; never approve a changed output, dropped row, weaker type or unrelated requirement. Source data must match supplied input bytes; any model choice must retain the approved sonnet profile."
+  },
+  "max_user_turns": 5
+}

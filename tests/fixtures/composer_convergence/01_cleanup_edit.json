@@ -1,0 +1,77 @@
+{
+  "id": "01_cleanup_edit",
+  "title": "Rename, project and amend truncation",
+  "inputs": [
+    {
+      "filename": "customers.csv",
+      "media_type": "text/csv",
+      "content": "id,customer_name,note,private_tag\nc1,Ada,abcdef,red\nc2,Bo,xy,green\nc3,Cy,123456789,blue\n"
+    }
+  ],
+  "turns": [
+    "Use customers.csv to build a CSV cleanup pipeline. Use field_mapper to rename customer_name to name and retain only id, name and note in that order. Use truncate to limit note to five characters with no suffix. Preserve every row and write cleaned.csv. Validate and preview it.",
+    "Change the note limit to three characters. Keep the rename, column selection, input rows and output filename. Validate and preview the amended pipeline."
+  ],
+  "expected_plugins": {
+    "source": [
+      "csv"
+    ],
+    "transform": [
+      "field_mapper",
+      "truncate"
+    ],
+    "sink": [
+      "csv"
+    ]
+  },
+  "required_node_kinds": [],
+  "outputs": [
+    {
+      "filename": "cleaned.csv",
+      "format": "csv",
+      "columns": [
+        "id",
+        "name",
+        "note"
+      ],
+      "rows": [
+        {
+          "id": "c1",
+          "name": "Ada",
+          "note": "abc"
+        },
+        {
+          "id": "c2",
+          "name": "Bo",
+          "note": "xy"
+        },
+        {
+          "id": "c3",
+          "name": "Cy",
+          "note": "123"
+        }
+      ]
+    }
+  ],
+  "audit": {
+    "source_rows": 3,
+    "success_output_rows": 3,
+    "routed_error_rows": 0,
+    "discarded_rows": 0,
+    "shape": "linear",
+    "succeeded_tokens": 3,
+    "structural_tokens": 0
+  },
+  "review_policy": {
+    "allowed_types": [
+      "vague_term",
+      "invented_source",
+      "llm_prompt_template",
+      "pipeline_decision",
+      "llm_model_choice",
+      "source_data_contract"
+    ],
+    "constraints": "Inspect each presented draft against every explicit requirement in turns. Accept only matching meanings; never approve a changed output, dropped row, weaker type or unrelated requirement. Source data must match supplied input bytes; any model choice must retain the approved sonnet profile."
+  },
+  "max_user_turns": 5
+}

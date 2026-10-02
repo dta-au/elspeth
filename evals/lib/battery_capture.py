@@ -10,6 +10,7 @@ NAME or the assistant stamp alone.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -124,6 +125,8 @@ class ToolRow:
     composition_state_id: str | None
     envelope: dict[str, Any] | None
     parent_assistant_id: str | None
+    # Primary persist_compose_turn links only a newly inserted per-call state and serializes tool_calls:null.
+    primary_state_evidence: bool
 
 
 def _read_json(path: Path, *, required: bool) -> Any:
@@ -239,7 +242,7 @@ def assistant_turns(capture: Capture) -> list[AssistantTurn]:
                 args = {"_unparseable": True}
             calls.append(
                 ToolCall(
-                    id=str(tc.get("id")),
+                    id=tc["id"] if isinstance(tc.get("id"), str) else "",
                     name=str(fn.get("name")),
                     arguments=args if isinstance(args, dict) else {},
                     outcome=tc.get("outcome"),
@@ -252,7 +255,7 @@ def assistant_turns(capture: Capture) -> list[AssistantTurn]:
 def tool_rows(capture: Capture) -> list[ToolRow]:
     rows: list[ToolRow] = []
     for m in capture.messages:
-        if m.get("role") != "tool" or not m.get("tool_call_id"):
+        if m.get("role") != "tool" or not isinstance(m.get("tool_call_id"), str) or not m["tool_call_id"]:
             continue
         content: dict[str, Any] | None
         try:
@@ -261,10 +264,27 @@ def tool_rows(capture: Capture) -> list[ToolRow]:
         except ValueError:
             content = None
         env = None
-        if m.get("tool_calls"):
-            first = m["tool_calls"][0]
-            env = first if isinstance(first, dict) else None
-        rows.append(ToolRow(_seq(m), str(m["tool_call_id"]), content, m.get("composition_state_id"), env, m.get("parent_assistant_id")))
+        envelopes = m.get("tool_calls")
+        if envelopes is not None:
+            env = (
+                envelopes[0]
+                if isinstance(envelopes, list) and len(envelopes) == 1 and isinstance(envelopes[0], dict)
+                else {"_kind": "invalid"}
+            )
+        rows.append(
+            ToolRow(
+                _seq(m),
+                str(m["tool_call_id"]),
+                content,
+                m.get("composition_state_id"),
+                env,
+                m.get("parent_assistant_id"),
+                "tool_calls" in m
+                and m["tool_calls"] is None
+                and isinstance(m.get("composition_state_id"), str)
+                and bool(m["composition_state_id"]),
+            )
+        )
     return rows
 
 
@@ -273,14 +293,30 @@ _CANCELLED = ComposerToolStatus.CANCELLED.value
 
 
 def tool_outcomes(capture: Capture) -> dict[str, str]:
-    """Durable-pair projection: applied | rejected | failed | cancelled | completed."""
+    """Durable-pair projection; duplicate call IDs are unknown, never last-writer wins."""
     out: dict[str, str] = {}
-    for row in tool_rows(capture):
+    rows = tool_rows(capture)
+    counts = Counter(row.tool_call_id for row in rows)
+    for row in rows:
+        if counts[row.tool_call_id] != 1:
+            out[row.tool_call_id] = "unknown"
+            continue
+        content = row.content
+        if isinstance(content, dict):
+            if content.get("error_class"):
+                out[row.tool_call_id] = "cancelled" if content.get("_redaction_status") == _CANCELLED else "failed"
+                continue
+            if content.get("success") is False:
+                out[row.tool_call_id] = "rejected"
+                continue
         env = row.envelope
-        if env is None and row.composition_state_id is not None:
+        if row.primary_state_evidence:
             out[row.tool_call_id] = "applied"
             continue
         if env is not None:
+            if env.get("_kind") != "audit":
+                out[row.tool_call_id] = "unknown"
+                continue
             # The per-call delta lives under "invocation": the writer stores
             # {"_kind": "audit", "invocation": {...}} (see decode_tools.
             # _first_audit_invocation, which already unwraps it the same way).
@@ -294,9 +330,6 @@ def tool_outcomes(capture: Capture) -> dict[str, str]:
             # ``int`` and a JSON ``true`` must not be admitted as version 1.
             # Keep the two classifiers in lockstep — they diverged on exactly
             # this line within one merge range (lens-B F1, 2026-08-29).
-            if type(vb) is int and type(va) is int and va > vb:
-                out[row.tool_call_id] = "applied"
-                continue
             status = delta.get("status")
             if status == _CANCELLED:
                 out[row.tool_call_id] = "cancelled"
@@ -304,13 +337,8 @@ def tool_outcomes(capture: Capture) -> dict[str, str]:
             if status in _FAILED_STATUSES:
                 out[row.tool_call_id] = "failed"
                 continue
-        content = row.content
-        if isinstance(content, dict):
-            if content.get("error_class"):
-                out[row.tool_call_id] = "cancelled" if content.get("_redaction_status") == _CANCELLED else "failed"
-                continue
-            if content.get("success") is False:
-                out[row.tool_call_id] = "rejected"
+            if status == ComposerToolStatus.SUCCESS.value and type(vb) is int and type(va) is int and 0 <= vb < va:
+                out[row.tool_call_id] = "applied"
                 continue
         out[row.tool_call_id] = "completed"
     return out

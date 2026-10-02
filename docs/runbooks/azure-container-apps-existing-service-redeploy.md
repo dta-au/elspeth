@@ -11,10 +11,30 @@ the release-specific replica > 1 acceptance program use
 Every platform literal below is measured in the
 [platform facts](../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md).
 
-> **Status.** Skeleton prepared by Phase 6b before the first live run; steps
-> marked **LIVE** are completed from the 6b-7 acceptance. Until the sanitized
-> receipt at `docs/operator/evidence/azure-container-apps/0.8.0.json` exists,
-> this is not a support claim.
+> **Status.** The implemented ACA slice received desktop acceptance:
+> `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
+> acceptance is claimed. This is an executable operator procedure; steps marked
+> **LIVE** require measurements during execution. A future acceptance receipt at
+> `docs/operator/evidence/azure-container-apps/0.8.1.json` is no longer a tracker
+> closure or documentation-promotion condition.
+
+The supported configuration retains `Single` revision mode, `sticky` session
+affinity and 2–4 replicas with one web process per replica. External PostgreSQL
+provides single-use tickets and durable run-event replay on authorized peer
+reconnect, renewable Composer request leases with saved progress and current
+inflight accounting, and shared budgets for auth, writes and Composer/execution
+work. An interrupted provider request is not automatically resumed. Automatic
+run handoff covers durable admission, permit-bound PREPARED initialization and
+eligible checkpoint resume, using fresh web and Landscape authority. Unsafe
+effects, incomplete sources and identity/compatibility failures remain
+`recovery_required`; see the [handoff contract](../reference/deployment-platforms.md#durable-run-handoff).
+Integrated verification is recorded in the
+[ACA plan](../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
+Evidence remains limited to
+local PostgreSQL mechanism and integration evidence, with no cloud receipt or
+no-affinity deployment qualification. The legacy v2 P4b receipt remains
+conservative `cannot_pass`; it does not measure the new runtime capabilities.
+Receipt evolution is deferred.
 
 ## Safety contract
 
@@ -42,9 +62,15 @@ for a Scenario A install. Otherwise keep the candidate and repair forward.
 
 ## Prerequisites
 
+An installation made with the shared-identity bundle must first complete the
+credential isolation migration below. An image-only update cannot change
+vault access, Job identities or the web container's `AZURE_CLIENT_ID`.
+
 - Azure CLI with the `containerapp` extension, `jq`, `curl`, Docker Buildx,
-  `cosign`, and an authenticated `az login` context with `Contributor` on the
+  and an authenticated `az login` context with `Contributor` on the
   resource group and `AcrPush` (or an existing copy) on the registry.
+  Install `cosign` only for a signed release. An unsigned RC is supported;
+  verify its digest, source label and CLI smoke below.
 - A clean source checkout; Python imports bound to it with `PYTHONPATH`.
 - The current app is stable: one active revision at 100 % with all replicas
   `Running`.
@@ -59,25 +85,30 @@ export AZURE_CORE_OUTPUT=json
 : "${RESOURCE_GROUP:?set the resource group}"
 : "${CONTAINER_APP:?set the container app name}"
 : "${DEPLOY_REF:?set the exact branch, tag, or commit to deploy}"
+: "${GHCR_DIGEST:?set the published digest for that image source commit}"
 : "${ELSPETH_BASE_URL:?set the exact public HTTPS origin without a trailing slash}"
 
 CANDIDATE_SHA=$(git rev-parse "${DEPLOY_REF}^{commit}")
-test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+DEPLOYMENT_CONFIG_SHA=$(git rev-parse HEAD)
 test -z "$(git status --porcelain)"
+: "${WORKLOAD_PARAMETERS:?absolute path to the concrete workload ARM JSON retained from cold install}"
+OPERATOR_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/elspeth/azure-container-apps/${RESOURCE_GROUP}"
+mkdir -p "$OPERATOR_DIR"
+chmod 700 "$OPERATOR_DIR"
 az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 ```
 
 ## 1. Capture the live deployment
 
 ```bash
-az containerapp show --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" >live-app.json
-PREVIOUS_REVISION=$(jq -r '.properties.latestReadyRevisionName' live-app.json)
-PREVIOUS_IMAGE=$(jq -r '.properties.template.containers[] | select(.name=="elspeth-web") | .image' live-app.json)
-ACR_LOGIN_SERVER=$(jq -r '.properties.configuration.registries[0].server' live-app.json)
+az containerapp show --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" >"$OPERATOR_DIR/live-app.json"
+PREVIOUS_REVISION=$(jq -r '.properties.latestReadyRevisionName' "$OPERATOR_DIR/live-app.json")
+PREVIOUS_IMAGE=$(jq -r '.properties.template.containers[] | select(.name=="elspeth-web") | .image' "$OPERATOR_DIR/live-app.json")
+ACR_LOGIN_SERVER=$(jq -r '.properties.configuration.registries[0].server' "$OPERATOR_DIR/live-app.json")
 jq '{mode: .properties.configuration.activeRevisionsMode,
      affinity: .properties.configuration.ingress.stickySessions.affinity,
      scale: .properties.template.scale,
-     grace: .properties.template.terminationGracePeriodSeconds}' live-app.json
+     grace: .properties.template.terminationGracePeriodSeconds}' "$OPERATOR_DIR/live-app.json"
 az containerapp revision list --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
   --query "[?properties.active].{name:name,traffic:properties.trafficWeight,state:properties.runningState}"
 ```
@@ -85,42 +116,127 @@ az containerapp revision list --name "$CONTAINER_APP" --resource-group "$RESOURC
 Require `activeRevisionsMode == "Single"`, exactly one active revision at
 100 %, and a `@sha256:` image reference. Stop on anything else.
 
+### One-time credential isolation migration
+
+Treat this as an infrastructure/configuration change with its own reviewed
+what-if, before the ordinary image-only procedure. Retain the current
+parameters and inspect live role assignments, including inherited grants;
+Incremental deployment does not remove old secrets or role assignments.
+
+1. Deploy the updated `environment.bicep` using the installation's retained
+   environment inputs in Incremental mode. Preserve the existing runtime
+   resources. Capture its outputs, including `schemaOwnerKeyVaultName`,
+   `schemaOwnerKeyVaultUri`, `schemaOwnerIdentityResourceId` and
+   `identityClientId`. Grant the operator Secrets Officer on both vaults as
+   shown in the cold-install runbook.
+2. Rotate the schema-owner PostgreSQL password through the operator's private
+   database/secret workflow. Store new versioned owner URLs only in the new
+   schema-owner vault. Delete the old owner URL secrets (all their versions)
+   from the runtime vault and remove any other owner-password secret stored
+   there. Do not rerun `bootstrap-roles.sql`: its cold-only role creation is
+   unsuitable for an existing database. Rotation invalidates credentials
+   previously readable by runtime replicas; terminate existing sessions for
+   that owner role during the maintenance window to revoke established access.
+3. Create a candidate copy of the retained workload parameters. Set
+   `schemaOwnerIdentityResourceId` and `identityClientId` from the new outputs
+   and replace only the two schema-owner URL references with their new pinned
+   versions. Preserve runtime URL and application-key versions. Validate the
+   candidate and review the full workload what-if. The expected migration
+   changes include the schema-init Job identity, its owner-secret references,
+   removal of identity from `provision-storage`, and web `AZURE_CLIENT_ID`.
+4. Deploy the candidate workload with `deployWebApp=false` in Incremental
+   mode; run `doctor-runtime`. Then deploy that same file with
+   `deployWebApp=true` and prove rollout and public behaviour using steps 6–7.
+   Do not run `doctor-schema-init` on an already initialized installation.
+5. Remove any old grant that lets the runtime identity read the owner vault
+   or owner credentials, including inherited assignments if present. Confirm
+   only the schema-init Job attaches the schema-owner identity and the root
+   provisioner has no identity. From the runtime identity, verify that owner
+   vault secret reads are denied; from the web container, exercise an Azure
+   plugin using managed identity. Recheck the live runtime vault contains no
+   schema-owner credentials and retain the migrated workload parameters.
+
+Keep the service in maintenance until credential rotation, old-secret removal
+and access checks are complete. Do not restore the old shared-access
+configuration during image rollback. After migration, resume the image-only
+procedure below; its requirement to preserve identities and secret versions
+applies to the migrated configuration.
+
 ## 2. Verify and publish the exact source
 
+`CANDIDATE_SHA` is the image source; `DEPLOYMENT_CONFIG_SHA` is the checkout
+containing the deployment templates. They may differ when deploying an
+existing RC with corrected Bicep. Use the cold-install registry checks for
+ACR role assignment mode, ARM audience authentication and network access.
+
 ```bash
-GHCR_DIGEST=$(docker buildx imagetools inspect "ghcr.io/dta-au/elspeth:sha-${CANDIDATE_SHA}" \
-  --format '{{.Manifest.Digest}}')
+test "$(docker buildx imagetools inspect "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" \
+  --format '{{.Manifest.Digest}}')" = "$GHCR_DIGEST"
+docker pull --platform linux/amd64 "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}"
+test "$(docker image inspect "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$CANDIDATE_SHA"
+docker run --rm --platform linux/amd64 "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" --version
+docker run --rm --platform linux/amd64 "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" health --json
 az acr login --name "${ACR_LOGIN_SERVER%%.*}"
 docker buildx imagetools create --tag "${ACR_LOGIN_SERVER}/elspeth:sha-${CANDIDATE_SHA}" \
   "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}"
 ACR_DIGEST=$(az acr manifest show-metadata "${ACR_LOGIN_SERVER}/elspeth:sha-${CANDIDATE_SHA}" \
   --query digest --output tsv)
 test "$ACR_DIGEST" = "$GHCR_DIGEST"
-cosign verify "${ACR_LOGIN_SERVER}/elspeth@${ACR_DIGEST}" \
-  --certificate-identity-regexp '^https://github.com/dta-au/elspeth/' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
 CANDIDATE_IMAGE="${ACR_LOGIN_SERVER}/elspeth@${ACR_DIGEST}"
 ```
 
-## 3. Review the change with what-if
+For a signed release, additionally verify its signature before deployment:
 
 ```bash
-az deployment group what-if --resource-group "$RESOURCE_GROUP" \
-  --template-file deploy/azure-container-apps/workload.bicep \
-  --parameters deploy/azure-container-apps/workload.production.bicepparam \
-  --parameters image="$CANDIDATE_IMAGE" revisionSuffix="${CANDIDATE_SHA:0:12}"
+cosign verify "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}" \
+  --certificate-identity-regexp '^https://github.com/dta-au/elspeth/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null
 ```
 
-The only expected change is the container image and the revision suffix.
+Skip that signature command for an unsigned RC. Copying an OCI image index
+does not automatically copy separate Cosign signature artifacts; an ACR
+signature check is meaningful only when that reference was separately signed.
+
+## 3. Review the change with what-if
+
+Use the operator-local ARM JSON retained from installation, never the tracked
+`workload.production.bicepparam` compilation example. If that file is missing,
+recover the concrete parameter set from the last successful workload deployment
+(`az deployment group show --query properties.parameters`) into a new local ARM
+parameter envelope before continuing. Compare it to the captured app and Jobs;
+do not regenerate secret IDs from the latest Key Vault versions during redeploy.
+The local source parameter file remains the rollback reference. Prepare a new
+candidate file with only the image and release identity changed:
+
+```bash
+NEXT_WORKLOAD_PARAMETERS="$OPERATOR_DIR/workload-${CANDIDATE_SHA}.parameters.json"
+test "$WORKLOAD_PARAMETERS" != "$NEXT_WORKLOAD_PARAMETERS"
+test ! -e "$NEXT_WORKLOAD_PARAMETERS"
+jq --arg image "$CANDIDATE_IMAGE" --arg sha "$CANDIDATE_SHA" '
+  .parameters.image.value = $image |
+  .parameters.candidateSourceSha.value = $sha |
+  .parameters.revisionSuffix.value = ("r" + $sha[0:12])
+' "$WORKLOAD_PARAMETERS" >"$NEXT_WORKLOAD_PARAMETERS"
+jq -e -f deploy/azure-container-apps/scripts/validate-workload-parameters.jq "$NEXT_WORKLOAD_PARAMETERS" >/dev/null
+jq -e --arg name "$CONTAINER_APP" '.parameters.containerAppName.value == $name' "$NEXT_WORKLOAD_PARAMETERS" >/dev/null
+az deployment group what-if --resource-group "$RESOURCE_GROUP" \
+  --template-file deploy/azure-container-apps/workload.bicep \
+  --parameters "@$NEXT_WORKLOAD_PARAMETERS"
+```
+
+The expected changes are the container image, revision suffix and candidate
+SHA in `ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE` and
+`ELSPETH_ACCEPTANCE_CANDIDATE_SHA` on the app and doctor Jobs.
 Any change to secrets, volumes, probes, scale or ingress is a stop.
 
 ## 4. Run the doctor Job with the candidate digest
 
 ```bash
-az containerapp job update --name doctor-runtime --resource-group "$RESOURCE_GROUP" --image "$CANDIDATE_IMAGE"
-EXECUTION=$(az containerapp job start --name doctor-runtime --resource-group "$RESOURCE_GROUP" --query name --output tsv)
-az containerapp job execution show --name doctor-runtime --resource-group "$RESOURCE_GROUP" \
-  --job-execution-name "$EXECUTION" --query properties.status --output tsv
+az deployment group create --name "elspeth-jobs-${CANDIDATE_SHA:0:12}" --resource-group "$RESOURCE_GROUP" \
+  --template-file deploy/azure-container-apps/workload.bicep \
+  --parameters "@$NEXT_WORKLOAD_PARAMETERS" --parameters deployWebApp=false --mode Incremental
+bash deploy/azure-container-apps/scripts/run-job.sh "$RESOURCE_GROUP" doctor-runtime
 ```
 
 The Job runs `elspeth doctor deployment --json`; require `Succeeded`. A
@@ -131,8 +247,9 @@ first; do not proceed to step 5.
 
 ```bash
 az containerapp update --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
-  --image "$CANDIDATE_IMAGE" --revision-suffix "${CANDIDATE_SHA:0:12}" \
-  --set-env-vars "ELSPETH_ACCEPTANCE_CANDIDATE_SHA=${CANDIDATE_SHA}"
+  --image "$CANDIDATE_IMAGE" --revision-suffix "r${CANDIDATE_SHA:0:12}" \
+  --set-env-vars "ELSPETH_ACCEPTANCE_CANDIDATE_SHA=${CANDIDATE_SHA}" \
+    "ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE=${CANDIDATE_SHA}"
 ```
 
 ## 6. Prove the rollout
@@ -141,13 +258,18 @@ az containerapp update --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP
 az containerapp revision list --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
   --query "[?properties.active].{name:name,traffic:properties.trafficWeight,state:properties.runningState,image:properties.template.containers[0].image}"
 az containerapp replica list --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
-  --revision "${CONTAINER_APP}--${CANDIDATE_SHA:0:12}" --query '[].{name:name,state:properties.runningState}'
+  --revision "${CONTAINER_APP}--r${CANDIDATE_SHA:0:12}" --query '[].{name:name,state:properties.runningState}'
 ```
 
 Require exactly one active revision at 100 % whose image is
 `CANDIDATE_IMAGE`, `N` replicas `Running`, and the previous revision
 inactive. The platform's own readiness wait is the rollout primitive; the
 checks above are the proof.
+
+After successful verification, retain `NEXT_WORKLOAD_PARAMETERS` as the
+`WORKLOAD_PARAMETERS` input for the next redeploy. A configuration change uses
+the same reviewed concrete parameters with `deployWebApp=true`; the direct
+`az containerapp update` above is the image-only path.
 
 ## 7. Prove public behaviour and identity
 
@@ -162,10 +284,24 @@ curl --silent --fail-with-body "$ELSPETH_BASE_URL/api/system/status" \
 
 Require HTTP 200 on both probes, an `X-Elspeth-Instance` header (6b-3) and
 `deployment_target: azure-container-apps`. Then run the authenticated flow
-appropriate to the change.
+appropriate to the change: verify `/api/auth/me`, perform a real Composer
+request as a user with a workload role, execute a small pipeline through the
+configured LLM profile, and inspect its output/audit history. Check
+`composer_available`, `composer_missing_keys` and `tutorial_ready` in system
+status; health alone does not prove LLM or login setup.
 
 > **LIVE:** the console-log query by revision name that shows no new
 > unhandled startup or runtime failure.
+
+An epoch-crossing candidate needs the database owner to drain the old
+revision, export the stopped Sessions store's identity/grant/edge cohort,
+archive and recreate both stores, and rerun the schema Job from the
+[cold-install runbook](azure-container-apps-cold-install.md). Then apply the
+candidate revision and complete the
+[identity workflow cutover handoff](identity-workflow-cutover.md): bootstrap,
+re-admit, check authenticated behavior, and send the notice before ordinary
+traffic resumes. This image-only path assumes already-current schemas and
+cannot turn a `STALE` doctor result into an initialized store.
 
 ## Rollback
 
@@ -179,7 +315,7 @@ az containerapp revision activate --name "$CONTAINER_APP" --resource-group "$RES
 az containerapp ingress traffic set --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
   --revision-weight "${PREVIOUS_REVISION}=100"
 az containerapp revision deactivate --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
-  --revision "${CONTAINER_APP}--${CANDIDATE_SHA:0:12}"
+  --revision "${CONTAINER_APP}--r${CANDIDATE_SHA:0:12}"
 ```
 
 Then repeat step 6 and step 7 against the previous revision.

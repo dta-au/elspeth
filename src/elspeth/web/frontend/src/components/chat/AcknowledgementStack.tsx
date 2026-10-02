@@ -1,9 +1,8 @@
 // ============================================================================
-// AcknowledgementStack.tsx — pinned, top-of-chat stack of LLM-authored
+// AcknowledgementStack.tsx — decision-panel rows for LLM-authored
 // decisions awaiting acknowledgement.
 //
-// Unifies BOTH guided and freeform modes onto one surface (the surfaces can
-// no longer drift).  Driven by the existing `pendingBySession[sessionId]`
+// Driven by the existing `pendingBySession[sessionId]`
 // projection; renders nothing when empty so the conversation is unobstructed
 // ("clear it to proceed").
 //
@@ -11,14 +10,13 @@
 //   * Cards ordered by pipeline step then created_at (stable).
 //   * ONE foot-of-stack session opt-out link (reuses the store's optOut
 //     action + the shared error mapping + the verbatim ConfirmDialog copy).
-//   * role="status" live region announces the count (announce-don't-steal —
-//     the persistent stack must NOT yank focus from someone typing).
+//   * The parent decision panel owns the persistent arrival live region.
 //
 // Behaviour (resolve / amend / 8 KB cap / error mapping) is reused verbatim
 // via `useInterpretationResolver` inside each AcknowledgementCard.
 // ============================================================================
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type JSX, useEffect, useMemo, useRef, useState } from "react";
 import type { CompositionState } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { Button } from "@/components/ui";
@@ -40,8 +38,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 /**
  * The single predicate that defines a "pending acknowledgement": a user-approved
  * interpretation still awaiting the operator's decision.  Shared by the stack
- * (which cards to render), the announcer (the count it reads aloud), and the
- * guided advancement gate so the three can never drift — an announced N that
+ * (which cards to render) and the announcer (the count it reads aloud) so an announced N that
  * disagreed with the rendered card count would be a fresh defect.
  */
 export function isPendingAcknowledgement(event: InterpretationEvent): boolean {
@@ -51,59 +48,10 @@ export function isPendingAcknowledgement(event: InterpretationEvent): boolean {
   );
 }
 
-/** Compose the live-region announce text for a given pending count ("" when 0). */
-function announceTextFor(count: number): string {
-  if (count === 0) return "";
-  return count === 1
-    ? "1 decision to acknowledge"
-    : `${count} decisions to acknowledge`;
-}
-
-export interface AcknowledgementLiveRegionProps {
-  sessionId: string;
-}
-
-/**
- * Persistent, ALWAYS-mounted `role="status"` live region for the acknowledgement
- * stack's count.
- *
- * The stack itself returns null when empty, so a live region rendered inside it
- * would be inserted into the DOM *with its content already present* on the 0→1
- * transition — the WAI-ARIA / MDN-documented unreliable pattern (a polite live
- * region must pre-exist its content for the change to be announced).  This
- * companion region is mounted by ChatPanel regardless of pending count and only
- * the text mutates, so "announce on appearance" (0→1) and "announce on count
- * change" (N→M) are both reliable content mutations inside a stable node.
- */
-export function AcknowledgementLiveRegion({
-  sessionId,
-}: AcknowledgementLiveRegionProps): JSX.Element {
-  const pendingBySession = useInterpretationEventsStore(
-    (s) => s.pendingBySession,
-  );
-  const count = useMemo(
-    () =>
-      Object.values(pendingBySession[sessionId] ?? {}).filter(
-        isPendingAcknowledgement,
-      ).length,
-    [pendingBySession, sessionId],
-  );
-
-  return (
-    <div
-      role="status"
-      className="visually-hidden"
-      data-testid="acknowledgement-live-region"
-    >
-      {announceTextFor(count)}
-    </div>
-  );
-}
-
 export interface AcknowledgementStackProps {
   sessionId: string;
-  /** Tutorial passive mode: hide the inline amend escape hatch + opt-out. */
-  isTutorial?: boolean;
+  /** Restore focus to a stable parent control after the final decision. */
+  onFocusFallback?: () => void;
   /**
    * Fired after a successful per-card resolve (with the resolved event) or a
    * session opt-out (event = null).  The parent uses the event for its own
@@ -155,8 +103,8 @@ export function usePendingAcknowledgements(
 
 export function AcknowledgementStack({
   sessionId,
-  isTutorial = false,
   onResolved,
+  onFocusFallback,
 }: AcknowledgementStackProps): JSX.Element | null {
   const compositionState = useSessionStore((s) => s.compositionState);
   const optOut = useInterpretationEventsStore((s) => s.optOut);
@@ -200,8 +148,7 @@ export function AcknowledgementStack({
     } else if (section != null) {
       section.focus();
     }
-    // Clear regardless: a single resolve should restore focus exactly once
-    // (last-card → no target → body is the accepted terminal case).
+    // A single resolve restores focus exactly once.
     setFocusTargetId(null);
   }, [pending, focusTargetId]);
 
@@ -211,6 +158,7 @@ export function AcknowledgementStack({
     try {
       await optOut(sessionId);
       onResolved?.(null, null);
+      onFocusFallback?.();
     } catch (err) {
       setOptOutError(describeError(err));
     } finally {
@@ -229,55 +177,46 @@ export function AcknowledgementStack({
   return (
     <section
       className="ack-stack"
-      aria-label="Decisions to acknowledge"
+      aria-label="Interpretation approvals"
       data-testid="acknowledgement-stack"
     >
-      {/*
-        The count's role="status" live region is NOT rendered here: the stack
-        returns null when empty, so a region mounted inside it would be inserted
-        WITH its content on the 0→1 transition (the documented-unreliable
-        announce pattern).  ChatPanel mounts <AcknowledgementLiveRegion>
-        persistently instead, so appearance + count changes are reliable
-        content mutations inside a pre-existing node.
-
-        Announce-don't-steal still holds: focus is moved only on a per-card
-        resolve (to the next card), never on mount/appearance.
-      */}
+      {/* DecisionPanel owns announcements; arrival never moves focus. */}
       <p className="ack-stack-header">{headerText}</p>
 
-      {pending.map((event, index) => (
-        <AcknowledgementCard
-          key={event.id}
-          event={event}
-          sessionId={sessionId}
-          stepLabel={humaniseStepLabel(compositionState, event.affected_node_id)}
-          stepTitle={humaniseStepTitle(compositionState, event.affected_node_id)}
-          // Live state for the card's resolved-prompt rendering
-          // (elspeth-990f5ea562): refreshed on every sibling resolve, so an
-          // open prompt card re-renders with fresh substitutions.
-          compositionState={compositionState}
-          showAmend={!isTutorial && supportsAmendment(event.kind)}
-          acceptButtonRef={(el) => {
-            if (el != null) acceptRefs.current.set(event.id, el);
-            else acceptRefs.current.delete(event.id);
-          }}
-          sectionRef={(el) => {
-            if (el != null) sectionRefs.current.set(event.id, el);
-            else sectionRefs.current.delete(event.id);
-          }}
-          onResolved={(newState) => {
-            // Restore focus to the next remaining card (if any) once this one
-            // unmounts.  `pending` is the live ordered list at resolve time,
-            // so the next card is simply the following entry.
-            const next = pending[index + 1];
-            setFocusTargetId(next?.id ?? null);
-            onResolved?.(newState, event);
-          }}
-        />
-      ))}
+      <ul className="ack-stack-rows">
+        {pending.map((event, index) => (
+          <li key={event.id}>
+            <AcknowledgementCard
+              event={event}
+              sessionId={sessionId}
+              stepLabel={humaniseStepLabel(compositionState, event.affected_node_id)}
+              stepTitle={humaniseStepTitle(compositionState, event.affected_node_id)}
+              // Live state for the card's resolved-prompt rendering
+              // (elspeth-990f5ea562): refreshed on every sibling resolve, so an
+              // open prompt card re-renders with fresh substitutions.
+              compositionState={compositionState}
+              showAmend={supportsAmendment(event.kind)}
+              acceptButtonRef={(el) => {
+                if (el != null) acceptRefs.current.set(event.id, el);
+                else acceptRefs.current.delete(event.id);
+              }}
+              sectionRef={(el) => {
+                if (el != null) sectionRefs.current.set(event.id, el);
+                else sectionRefs.current.delete(event.id);
+              }}
+              onResolved={(newState) => {
+                // Wrap to an earlier unresolved row when resolving the last row.
+                const next = pending[index + 1] ?? pending.find((item) => item.id !== event.id);
+                setFocusTargetId(next?.id ?? null);
+                onResolved?.(newState, event);
+                if (next === undefined) onFocusFallback?.();
+              }}
+            />
+          </li>
+        ))}
+      </ul>
 
-      {!isTutorial && (
-        <div className="ack-stack-opt-out">
+      <div className="ack-stack-opt-out">
           {optOutError !== null && (
             <div role="alert" className="ack-stack-error">
               <strong className="ack-stack-error-heading">
@@ -294,8 +233,7 @@ export function AcknowledgementStack({
           >
             Stop reviewing interpretations this session
           </Button>
-        </div>
-      )}
+      </div>
 
       {showOptOutConfirm && (
         <ConfirmDialog
@@ -314,20 +252,4 @@ export function AcknowledgementStack({
       )}
     </section>
   );
-}
-
-/**
- * True when the session has at least one pending user_approved interpretation
- * — the predicate the ChatPanel guided branch uses to block wizard
- * advancement while acknowledgements remain (D12).  Relocated here from the
- * retired GuidedInterpretationReviews module.
- */
-export function useHasPendingGuidedInterpretations(sessionId: string): boolean {
-  const pendingBySession = useInterpretationEventsStore(
-    (s) => s.pendingBySession,
-  );
-  return useMemo(() => {
-    const events = Object.values(pendingBySession[sessionId] ?? {});
-    return events.some(isPendingAcknowledgement);
-  }, [pendingBySession, sessionId]);
 }

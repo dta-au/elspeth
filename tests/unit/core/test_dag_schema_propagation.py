@@ -11,12 +11,16 @@ contracts from upstream transforms, so audit records reflect actual data contrac
 (P1-2026-02-05: pass-through nodes drop computed schema contracts)
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.config import (
     AggregationSettings,
     CoalesceSettings,
@@ -32,6 +36,23 @@ from elspeth.core.dag.wiring import WiredTransform
 class MockTransformWithSchemaConfig:
     """Mock transform with computed _output_schema_config attribute."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     name = "mock_transform_with_schema"
     input_schema = None
     output_schema = None
@@ -46,6 +67,8 @@ class MockTransformWithSchemaConfig:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         # Computed schema config with guaranteed and audit fields
@@ -59,6 +82,23 @@ class MockTransformWithSchemaConfig:
 
 class MockTransformWithoutSchemaConfig:
     """Mock transform without _output_schema_config attribute."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
 
     name = "mock_transform_no_schema"
     input_schema = None
@@ -74,6 +114,8 @@ class MockTransformWithoutSchemaConfig:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
     _output_schema_config: SchemaConfig | None = None
 
 
@@ -84,6 +126,7 @@ class MockSource:
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed", "guaranteed_fields": ["source_field"]}}
     _on_validation_failure = "discard"
     on_success = "output"
@@ -105,6 +148,11 @@ class MockFixedSource(MockSource):
 class MockSink:
     """Mock sink plugin."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     name = "mock_sink"
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
@@ -117,6 +165,11 @@ class MockSink:
 
 class MockSinkWithSchema:
     """Mock sink plugin with schema config."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
 
     name = "mock_sink_schema"
     input_schema = None
@@ -452,6 +505,27 @@ class TestGuaranteedFieldsWithSchemaConfig:
 class MockAggregationTransform:
     """Mock transform for aggregation with _output_schema_config."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        # BatchTransformProtocol presence requirement: this fake requires no field.
+        return frozenset()
+
     name = "mock_agg_transform"
     input_schema = None
     output_schema = None
@@ -466,6 +540,8 @@ class MockAggregationTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         self._output_schema_config = SchemaConfig(
@@ -1021,6 +1097,23 @@ class TestPassThroughNodesUseTypedSchema:
 class _ConfigurableTransform:
     """Mock transform with per-instance guaranteed_fields for schema tests."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     input_schema = None
     output_schema = None
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
@@ -1034,6 +1127,8 @@ class _ConfigurableTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, guaranteed_fields: tuple[str, ...] | None) -> None:
         self.name = name
@@ -1130,19 +1225,29 @@ class TestCoalesceMaterializedSchemaFromBuilder:
             coalesce_settings=[coalesce],
         )
 
-    def test_mixed_none_and_explicit_materializes_abstain(self) -> None:
-        """Branch with None guaranteed_fields abstains — doesn't kill materialized intersection."""
+    @pytest.mark.parametrize(
+        ("policy", "expected"),
+        [
+            # Every branch arrives: branch_a's guarantees hold on every merged row.
+            pytest.param("require_all", ("x", "y"), id="require_all"),
+            # A merged row can be branch_b alone, which vouches for nothing, so
+            # the coalesce materializes an abstention (None), not branch_a's
+            # set (R2 fix round 1).
+            pytest.param("best_effort", None, id="best_effort"),
+        ],
+    )
+    def test_mixed_none_and_explicit_materializes(self, policy: str, expected: tuple[str, ...] | None) -> None:
+        """A branch with None guaranteed_fields is skipped only under require_all."""
         graph = self._build_fork_coalesce_with_branch_transforms(
             transform_a_guaranteed=("x", "y"),
             transform_b_guaranteed=None,
+            policy=policy,
         )
         coalesce_nodes = [n for n in graph.get_nodes() if n.node_type == NodeType.COALESCE]
         assert len(coalesce_nodes) == 1
         coal_schema = coalesce_nodes[0].output_schema_config
         assert coal_schema is not None
-        # branch_b abstains, branch_a's guarantees survive
-        assert coal_schema.guaranteed_fields is not None
-        assert set(coal_schema.guaranteed_fields) == {"x", "y"}
+        assert coal_schema.guaranteed_fields == expected
 
     def test_empty_intersection_materializes_empty_tuple_not_none(self) -> None:
         """Branches with disjoint fields → guaranteed_fields is (), not None.

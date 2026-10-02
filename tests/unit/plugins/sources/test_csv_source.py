@@ -20,6 +20,7 @@ def _make_csv_context_with_audit_recorder() -> tuple[PluginContext, RecorderSetu
     setup = make_recorder_with_run(source_node_id="source_csv", source_plugin_name="csv")
     ctx = PluginContext(
         run_id=setup.run_id,
+        coordination_token=setup.coordination_token,
         node_id=setup.source_node_id,
         config={},
         landscape=setup.factory.plugin_audit_writer(),
@@ -161,7 +162,8 @@ class TestCSVSource:
     def test_has_plugin_version(self) -> None:
         """CSVSource has explicit plugin_version for audit trail.
 
-        Per CLAUDE.md auditability standard: every decision must be traceable
+        Per the auditability principle (ARCHITECTURE.md §Design Principles):
+        every decision must be traceable
         to source data, configuration, AND code version. The plugin_version
         attribute is recorded in the Landscape audit trail's nodes table.
         """
@@ -1229,6 +1231,7 @@ class TestCSVSourceSkipRowsAudit:
         setup = make_recorder_with_run(source_plugin_name="csv")
         ctx = PluginContext(
             run_id=setup.run_id,
+            coordination_token=setup.coordination_token,
             node_id=setup.source_node_id,
             config={},
             landscape=setup.factory.plugin_audit_writer(),
@@ -1688,3 +1691,89 @@ class TestDeclaredFieldReachability:
                     "on_validation_failure": "discard",
                 }
             )
+
+
+class TestCSVSourceInferenceWidthCap:
+    """Observed/flexible CSV inference holds at most 1024 columns.
+
+    Width is a file-level property, so the source refuses at header read,
+    before any row is yielded, with a message that names the cap and the
+    way through (``mode: fixed`` declaring every column).
+    """
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        return make_source_context(plugin_name="csv")
+
+    @staticmethod
+    def _write_wide_csv(tmp_path: Path, width: int, *, short_first_row: bool = False) -> Path:
+        csv_file = tmp_path / f"wide{width}.csv"
+        lines = [",".join(f"c{i}" for i in range(width))]
+        if short_first_row:
+            lines.append("short,row")
+        lines.append(",".join(str(i) for i in range(width)))
+        csv_file.write_text("\n".join(lines) + "\n")
+        return csv_file
+
+    def test_observed_1024_columns_load(self, tmp_path: Path, ctx: PluginContext) -> None:
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        source = CSVSource(
+            {
+                "path": str(self._write_wide_csv(tmp_path, 1024)),
+                "schema": DYNAMIC_SCHEMA,
+                "on_validation_failure": QUARANTINE_SINK,
+            }
+        )
+        rows = list(source.load(ctx))
+
+        assert len(rows) == 1
+        assert rows[0].is_quarantined is False
+        assert len(rows[0].row) == 1024
+
+    @pytest.mark.parametrize(
+        "schema",
+        [DYNAMIC_SCHEMA, {"mode": "flexible", "fields": ["c0: str"]}],
+        ids=["observed", "flexible"],
+    )
+    def test_1025_columns_refused_at_header_read_before_any_row(
+        self, tmp_path: Path, ctx: PluginContext, schema: dict[str, object]
+    ) -> None:
+        from elspeth.contracts.contract_builder import ContractFieldLimitExceeded
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        source = CSVSource(
+            {
+                "path": str(self._write_wide_csv(tmp_path, 1025, short_first_row=True)),
+                "schema": schema,
+                "on_validation_failure": QUARANTINE_SINK,
+            }
+        )
+        rows = source.load(ctx)
+
+        with pytest.raises(ContractFieldLimitExceeded) as exc_info:
+            next(rows)
+
+        message = str(exc_info.value)
+        assert message == (
+            "CSV header has 1025 fields; observed and flexible schemas infer at most 1024. "
+            "Declare the schema with mode: fixed and list every one of the 1025 fields "
+            "(a fixed schema rejects undeclared fields), or remove fields before ingest."
+        )
+        assert "c1024" not in message
+
+    def test_fixed_schema_declaring_every_column_loads_1025_columns(self, tmp_path: Path, ctx: PluginContext) -> None:
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        source = CSVSource(
+            {
+                "path": str(self._write_wide_csv(tmp_path, 1025)),
+                "schema": {"mode": "fixed", "fields": [f"c{i}: str" for i in range(1025)]},
+                "on_validation_failure": QUARANTINE_SINK,
+            }
+        )
+        rows = list(source.load(ctx))
+
+        assert len(rows) == 1
+        assert rows[0].is_quarantined is False
+        assert len(rows[0].row) == 1025

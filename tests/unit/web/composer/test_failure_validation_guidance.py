@@ -168,8 +168,7 @@ class TestValidationGuidanceBuilder:
         explain TOOL applies it. It must not be applied here: the mapping is
         keyed BY error_code, so one entry serves every error sharing that
         code, and a spliced per-entry message span would make N colliding
-        entries whose text depended on visit order. It also keeps these bytes
-        identical to the guided surface's.
+        entries whose text depended on visit order.
 
         Custody is NOT the reason — the field is ``_SafeResponseEnvelope`` in
         the redaction manifest and collapses to ``<redacted-response-mapping>``

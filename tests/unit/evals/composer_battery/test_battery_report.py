@@ -141,7 +141,9 @@ def test_pooled_uses_sum_over_sum_and_excludes_beside_n(tmp_path: Path) -> None:
         "flag": False,
         "reasons": [],
     }  # a measurement exclusion never degrades
-    assert rep["findings"] and rep["findings"][0].startswith("measurement exclusions (surface/no_calls) in 20% of runs")
+    assert rep["findings"] and rep["findings"][0].startswith(
+        "measurement exclusions (surface/no_calls/approval_unobservable) in 20% of runs"
+    )
 
 
 def test_by_case_by_repeat_and_ledger(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts import Artifact, NodeStateCompleted, NodeStateStatus, NodeType, TerminalOutcome, TerminalPath, TokenOutcome
+from elspeth.contracts.audit import CallVerification
 from elspeth.core.landscape import LandscapeDB
 from elspeth.tui.screens.explain_screen import (
     ExplainScreen,
@@ -94,6 +95,9 @@ class FakeExecution:
 
     def get_artifacts(self, run_id: str) -> list[Artifact]:
         return self.artifacts
+
+    def get_verification_decisions_for_run(self, run_id: str) -> list[CallVerification]:
+        return []
 
 
 @dataclass(slots=True)

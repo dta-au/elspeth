@@ -32,13 +32,25 @@ from elspeth.web.sessions.models import (
 _SQLITE_INTERNAL_TABLES: frozenset[str] = frozenset({"sqlite_sequence"})
 _SESSION_METADATA_CREATE_LOCK = Lock()
 
-_COORDINATION_HARD_CUT_EPOCH = 53
+# Coupled cut: sparse proposal display, structured stored validation errors,
+# timestamp-leading quota scan indexes, and durable fork failure diagnostics.
+# Epoch 68 admits compose_checkpoint and ordinary_proposal_checkpoint reasons
+# in persisted proposal.rebased events. Earlier readers reject these closed
+# vocabulary additions, so this semantic JSON cut requires store recreation.
+# Epoch 69 adds immutable freeform message ingress receipts and their same-session
+# bindings. Existing session stores cannot satisfy the new admission contract.
+# Epoch 70 replaces the persisted tutorial Build stage's old label with build.
+# Epoch 71 is freeform-only, removes the Composer mode preference, and adds
+# ordinary fork/revert receipts. Existing stores are recreated.
+_COORDINATION_HARD_CUT_EPOCH = 71
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
     "session_read_admissions": "ix_session_read_admissions_expires_at",
     "run_start_permits": "ix_run_start_permits_retention_expires_at",
     "websocket_tickets": "ix_websocket_tickets_expires_at",
+    "composer_inflight_requests": "ix_composer_inflight_requests_expires_at",
+    "composer_progress_snapshots": "ix_composer_progress_snapshots_expires_at",
     "rate_limit_buckets": "ix_rate_limit_buckets_expires_at",
     "rate_limit_events": "ix_rate_limit_events_expires_at",
     "sessions_cleanup_claims": "ix_sessions_cleanup_claims_lease_expires_at",
@@ -69,18 +81,12 @@ _COORDINATION_HARD_CUT_TABLES: frozenset[str] = frozenset({*_COORDINATION_HARD_C
 #   lineage walk. Whole-session archival remains the bounded lifecycle
 #   purge path and is implemented by deleting the owning ``sessions`` row,
 #   allowing schema-owned cascades to remove session-scoped children.
-# * ``trg_guided_operations_terminal_immutable`` — a reservation may renew or
-#   settle while in progress, but a completed/failed replay result cannot be
-#   changed after the terminal transition.
-# * ``trg_guided_operation_events_no_update`` / ``no_delete`` — lease,
-#   takeover, and settlement evidence is append-only; only the owning-session
-#   lifecycle cascade may remove it.
-# * ``trg_guided_operation_admission_blocks_no_update`` / ``no_delete`` — a
-#   negative admission decision is append-only; only the owning-session
-#   lifecycle cascade may remove it.
-# * the admission coexistence triggers reject either insertion order, plus an
-#   operation identity update, so a block and operation can never share one
-#   session-scoped operation id.
+# * ``trg_message_ingress_receipts_no_update`` / ``no_delete`` — accepted
+#   freeform request IDs remain bound to one user row and original requested
+#   state. Whole-session deletion can cascade them with the owning session.
+# * ``trg_session_operation_receipts_terminal_immutable`` protects terminal
+#   fork/revert replay descriptors; receipt events are append-only except for
+#   whole-session lifecycle cascades.
 #
 # The validator catches the case where schema bootstrap succeeded but the
 # trigger DDL failed silently (e.g., if the DDL event listener was removed
@@ -95,14 +101,11 @@ _REQUIRED_AUDIT_TRIGGERS: frozenset[str] = frozenset(
         "trg_composer_completion_events_no_delete",
         "trg_chat_messages_immutable_content",
         "trg_chat_messages_no_delete",
-        "trg_guided_operations_terminal_immutable",
-        "trg_guided_operation_events_no_update",
-        "trg_guided_operation_events_no_delete",
-        "trg_guided_operation_admission_blocks_no_update",
-        "trg_guided_operation_admission_blocks_no_delete",
-        "trg_guided_operation_admission_blocks_reject_existing_operation",
-        "trg_guided_operations_reject_admission_block_insert",
-        "trg_guided_operations_reject_admission_block_update",
+        "trg_message_ingress_receipts_no_update",
+        "trg_message_ingress_receipts_no_delete",
+        "trg_session_operation_receipts_terminal_immutable",
+        "trg_session_operation_receipt_events_no_update",
+        "trg_session_operation_receipt_events_no_delete",
     }
 )
 
@@ -387,19 +390,16 @@ class SessionSchemaAuthority:
                       'trg_chat_messages_immutable_content',
                       'trg_chat_messages_no_delete'
                     ))
-                    OR (relation.relname = 'guided_operation_events' AND trigger.tgname IN (
-                      'trg_guided_operation_events_no_update',
-                      'trg_guided_operation_events_no_delete'
+                    OR (relation.relname = 'message_ingress_receipts' AND trigger.tgname IN (
+                      'trg_message_ingress_receipts_no_update',
+                      'trg_message_ingress_receipts_no_delete'
                     ))
-                    OR (relation.relname = 'guided_operation_admission_blocks' AND trigger.tgname IN (
-                      'trg_guided_operation_admission_blocks_no_update',
-                      'trg_guided_operation_admission_blocks_no_delete',
-                      'trg_guided_operation_admission_blocks_reject_existing_operation'
+                    OR (relation.relname = 'session_operation_receipts' AND trigger.tgname IN (
+                      'trg_session_operation_receipts_terminal_immutable'
                     ))
-                    OR (relation.relname = 'guided_operations' AND trigger.tgname IN (
-                      'trg_guided_operations_terminal_immutable',
-                      'trg_guided_operations_reject_admission_block_insert',
-                      'trg_guided_operations_reject_admission_block_update'
+                    OR (relation.relname = 'session_operation_receipt_events' AND trigger.tgname IN (
+                      'trg_session_operation_receipt_events_no_update',
+                      'trg_session_operation_receipt_events_no_delete'
                     ))
                   )
                 """

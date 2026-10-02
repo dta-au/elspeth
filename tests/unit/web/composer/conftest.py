@@ -93,9 +93,14 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import tools as tools_module
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import (
     MANIFEST,
+    CreateBlobArgumentsModel,
+    GetBlobContentDataModel,
+    GetBlobContentResponseModel,
     SetPipelineArgumentsModel,
     SetSourceFromBlobArgumentsModel,
     SetSourceFromBlobsArgumentsModel,
@@ -120,8 +125,9 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.composer_lease import install_fenced_compose_adapter
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _dict_strategy(thing: type) -> st.SearchStrategy[dict[Any, Any]]:
@@ -185,23 +191,37 @@ _OPTIONS_STRATEGY: st.SearchStrategy[dict[str, Any]] = st.dictionaries(
 
 
 def _set_source_from_blob_strategy() -> st.SearchStrategy[SetSourceFromBlobArgumentsModel]:
-    return st.builds(
-        SetSourceFromBlobArgumentsModel,
-        blob_id=st.text(),
-        on_success=st.text(),
-        plugin=st.one_of(st.none(), st.text()),
-        on_validation_failure=st.one_of(st.none(), st.text()),
-        options=_OPTIONS_STRATEGY,
-    )
+    return st.fixed_dictionaries(
+        {"blob_id": st.text(), "on_success": st.text(), "options": _OPTIONS_STRATEGY},
+        optional={"plugin": st.text(), "on_validation_failure": st.text(), "source_name": st.text()},
+    ).map(SetSourceFromBlobArgumentsModel.model_validate)
 
 
 def _set_source_from_blobs_strategy() -> st.SearchStrategy[SetSourceFromBlobsArgumentsModel]:
-    return st.builds(
-        SetSourceFromBlobsArgumentsModel,
-        blob_ids=st.lists(st.text(), min_size=1, max_size=5),
-        on_success=st.text(),
-        on_validation_failure=st.one_of(st.none(), st.text()),
-        options=_OPTIONS_STRATEGY,
+    return st.fixed_dictionaries(
+        {"blob_ids": st.lists(st.text(), min_size=1, max_size=5), "on_success": st.text(), "options": _OPTIONS_STRATEGY},
+        optional={"on_validation_failure": st.text(), "source_name": st.text()},
+    ).map(SetSourceFromBlobsArgumentsModel.model_validate)
+
+
+def _create_blob_strategy() -> st.SearchStrategy[CreateBlobArgumentsModel]:
+    return st.fixed_dictionaries(
+        {
+            "filename": st.text(),
+            "mime_type": st.sampled_from(CreateBlobArgumentsModel.model_json_schema()["properties"]["mime_type"]["enum"]),
+            "content": st.text(),
+        },
+        optional={"description": st.text()},
+    ).map(CreateBlobArgumentsModel.model_validate)
+
+
+def _get_blob_content_response_strategy() -> st.SearchStrategy[GetBlobContentResponseModel]:
+    # Success requires data; failure can omit it. Other envelope fields retain
+    # their inferred strategies, including nested sensitive repair arguments.
+    data = st.from_type(GetBlobContentDataModel)
+    return st.one_of(
+        st.builds(GetBlobContentResponseModel, success=st.just(True), data=data),
+        st.builds(GetBlobContentResponseModel, success=st.just(False), data=st.one_of(st.none(), data)),
     )
 
 
@@ -340,6 +360,8 @@ def _repair_tool_call_strategy() -> st.SearchStrategy[_RepairToolCallShadowModel
 
 st.register_type_strategy(SetSourceFromBlobArgumentsModel, _set_source_from_blob_strategy())
 st.register_type_strategy(SetSourceFromBlobsArgumentsModel, _set_source_from_blobs_strategy())
+st.register_type_strategy(CreateBlobArgumentsModel, _create_blob_strategy())
+st.register_type_strategy(GetBlobContentResponseModel, _get_blob_content_response_strategy())
 st.register_type_strategy(_SetPipelineSourceModel, _set_pipeline_source_strategy())
 st.register_type_strategy(_SetPipelineNamedSourceModel, _set_pipeline_named_source_strategy())
 st.register_type_strategy(_PipelineNodeModel, _pipeline_node_strategy())
@@ -543,10 +565,10 @@ class _FakeComposeLLM:
         self._responses = list(responses)
         self.execute_tool_invocations = 0
 
-    async def __call__(self, _messages: Any, _tools: Any) -> _FakeLLMResponse:
+    async def __call__(self, _messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
         if not self._responses:
-            return _fake_llm_response(content="Done.")
-        return self._responses.pop(0)
+            return _admit_composer_llm_completion(_fake_llm_response(content="Done."))
+        return _admit_composer_llm_completion(self._responses.pop(0))
 
 
 def _fake_llm_response(
@@ -650,10 +672,10 @@ def _make_settings(data_dir: Path, **overrides: Any) -> WebSettings:
 def _composer_available_for_phase3(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep Phase 3 compose-loop harness tests independent of local API keys."""
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.fixture
@@ -662,6 +684,9 @@ def result_session_id(composer_service_with_real_sessions: ComposerServiceImpl) 
 
     sessions_service = composer_service_with_real_sessions._sessions_service
     assert sessions_service is not None
+    with sessions_service._engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="phase3-test-user")
+        grant_test_pipeline_user(conn, identity_id="phase3-test-user")
     session = sessions_service.session_operation_authority.create_session_with_initial_fence(
         user_id="phase3-test-user",
         auth_provider_type="local",
@@ -691,7 +716,7 @@ def build_test_sessions_service(
     )
     if engine is None:
         initialize_session_schema(resolved_engine)
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         resolved_engine,
         data_dir=data_dir,
         telemetry=build_sessions_telemetry(),

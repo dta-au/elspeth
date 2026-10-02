@@ -5,9 +5,13 @@ Single place that wires up loaders, database operations, and repository instance
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from collections.abc import Collection, Mapping
+from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.sink_effects import SinkEffectRole
 from elspeth.core.landscape._database_ops import DatabaseOps, ReadOnlyDatabaseOps
 from elspeth.core.landscape.auth_audit_repository import AuthAuditRepository
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -48,6 +52,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from elspeth.contracts import Run, SecretResolution
+    from elspeth.contracts.audit import CallVerification
     from elspeth.contracts.identity import LineageFrame
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.landscape.run_lifecycle_repository import (
@@ -82,6 +87,9 @@ class RunLifecycleReadRepository:
 
     def get_run_source_lifecycle_records(self, run_id: str) -> dict[str, RunSourceLifecycleRecord]:
         return self._repo.get_run_source_lifecycle_records(run_id)
+
+    def get_run_source_config_hashes(self, run_id: str) -> dict[str, str]:
+        return self._repo.get_run_source_config_hashes(run_id)
 
     def get_source_field_resolution(self, run_id: str) -> dict[str, str] | None:
         return self._repo.get_source_field_resolution(run_id)
@@ -175,6 +183,12 @@ class ExecutionReadRepository:
 
     def get_operation_calls(self, operation_id: str) -> list[Any]:
         return self._repo.get_operation_calls(operation_id)
+
+    def get_verification_decisions_for_run(self, current_run_id: str) -> list[CallVerification]:
+        return self._repo.get_verification_decisions_for_run(current_run_id)
+
+    def get_verification_decisions_for_calls(self, current_run_id: str, current_call_ids: Collection[str]) -> list[CallVerification]:
+        return self._repo.get_verification_decisions_for_calls(current_run_id, current_call_ids)
 
     def get_operations_for_run(self, run_id: str) -> list[Any]:
         return self._repo.get_operations_for_run(run_id)
@@ -412,6 +426,15 @@ class RecorderFactory:
     def __init__(self, db: LandscapeDB, *, payload_store: PayloadStore | None = None) -> None:
         self._db = db
         self._payload_store = payload_store
+        # Validated source-run snapshot passed from run admission to the
+        # executor. It is per-factory and never a persisted audit authority.
+        self.audited_sources: Mapping[str, object] | None = None
+        # Replay adapters are recreated for every sink effect. Keep validated
+        # source dispositions at the factory's run lifetime, not on an adapter.
+        self._replay_sink_dispositions: OrderedDict[
+            str, Mapping[tuple[str, SinkEffectRole], Mapping[tuple[int, str, str], tuple[str, str | None, str | None]]]
+        ] = OrderedDict()
+        self._replay_sink_dispositions_lock = Lock()
 
         # Database operations helper for reduced boilerplate
         ops = DatabaseOps(db)
@@ -441,7 +464,7 @@ class RecorderFactory:
 
         # Composed repository for run lifecycle
         self._run_lifecycle = RunLifecycleRepository(db, ops, run_loader)
-        self._auth_audit = AuthAuditRepository(ops)
+        self._auth_audit = AuthAuditRepository(db)
 
         # Composed repository for execution recording
         self._execution = ExecutionRepository(

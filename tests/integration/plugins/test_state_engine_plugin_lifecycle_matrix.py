@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import socket
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +24,7 @@ from sqlalchemy import Column, Integer, MetaData, Table, Text, create_engine, fu
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig, RuntimeRateLimitConfig
+from elspeth.contracts.sink_effects import MemberSinkEffectCapability
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
@@ -49,6 +50,7 @@ from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 from elspeth.plugins.infrastructure.runtime_factory import PluginBundle, instantiate_plugins_from_config
 from elspeth.plugins.sinks.database_sink import database_effect_ledger_table
 from tests.fixtures.pdf_documents import minimal_pdf
+from tests.fixtures.power_automate import READ_URL, WRITE_URL, DurablePowerAutomateFlow, pipeline_settings
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 PLUGIN_MATRIX = REPOSITORY_ROOT / "tests/golden/state_engine/plugin_lifecycle_matrix.json"
@@ -68,6 +70,21 @@ def _reviewed_local_subjects() -> tuple[str, ...]:
 
 LOCAL_LIFECYCLE_CASES = tuple(LocalLifecycleCase(plugin_key) for plugin_key in _reviewed_local_subjects())
 RESUMABLE_LOCAL_LIFECYCLE_CASES = tuple(case for case in LOCAL_LIFECYCLE_CASES if case.plugin_key != "source:null")
+
+
+@pytest.fixture
+def lifecycle_flow(
+    case: LocalLifecycleCase,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[DurablePowerAutomateFlow | None]:
+    if case.plugin_key not in {"source:power_automate", "sink:power_automate"}:
+        yield None
+        return
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "power-automate-lifecycle-key")
+    flow = DurablePowerAutomateFlow(tmp_path / "flow-target.db", pages=[_rows_for(case.plugin_key)])
+    with flow.transport():
+        yield flow
 
 
 def _plugin_types() -> dict[str, type[BaseSource] | type[BaseTransform] | type[BaseSink]]:
@@ -157,6 +174,8 @@ def _rows_for(plugin_key: str) -> list[dict[str, object]]:
         "transform:web_scrape": [{"page_url": "filled-by-harness"}],
         "sink:document": [{"announcement_text": "hello"}],
         "sink:text": [{"line_text": "hello"}],
+        "sink:power_automate": [{"record_id": "A", "result": "ok"}],
+        "source:power_automate": [{"record_id": "A", "result": "ok"}],
     }
     return rows.get(plugin_key, [{"id": 1, "value": "matrix"}])
 
@@ -188,6 +207,12 @@ def _materialize_pipeline(
     store = FilesystemPayloadStore(tmp_path / "payloads")
     rows = _rows_for(case.plugin_key)
     server: multiprocessing.Process | None = None
+
+    if plugin_name == "power_automate":
+        flow_settings = pipeline_settings(tmp_path)
+        section = cast("dict[str, dict[str, Any]]", flow_settings["sources" if kind == "source" else "sinks"])
+        options = dict(section["records" if kind == "source" else "publish"]["options"])
+        options["auth"] = {"method": "sas_url", "trigger_url_secret": READ_URL if kind == "source" else WRITE_URL}
 
     if case.plugin_key == "source:csv":
         source_path = tmp_path / "input.csv"
@@ -392,6 +417,7 @@ def _build_runtime(
         settings=settings,
         graph=graph,
         sink_effect_modes=bundle.sink_effect_modes,
+        sink_effect_bindings=bundle.sink_effect_bindings,
     )
     return settings, bundle, graph, config, store, server
 
@@ -406,7 +432,7 @@ def _stop_server(server: multiprocessing.Process | None) -> None:
 
 def test_local_lifecycle_cases_cover_the_exact_reviewed_subject_set() -> None:
     assert tuple(case.plugin_key for case in LOCAL_LIFECYCLE_CASES) == _reviewed_local_subjects()
-    assert len(LOCAL_LIFECYCLE_CASES) == 38
+    assert len(LOCAL_LIFECYCLE_CASES) == 41
     assert {case.profile_case for case in LOCAL_LIFECYCLE_CASES} == {SQLITE_SINGLE_LEADER}
 
 
@@ -415,6 +441,7 @@ def test_local_first_party_plugin_crosses_the_production_lifecycle(
     case: LocalLifecycleCase,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lifecycle_flow: DurablePowerAutomateFlow | None,
 ) -> None:
     settings, bundle, graph, config, store, server = _build_runtime(case, tmp_path)
     subject = _subject_instance(case, bundle)
@@ -453,6 +480,13 @@ def test_local_first_party_plugin_crosses_the_production_lifecycle(
         assert subject._on_start_called is True
         assert subject._on_complete_called is True
         assert teardown == ["complete", "close"]
+        if lifecycle_flow is not None:
+            if case.plugin_key == "source:power_automate":
+                assert [request["operation"] for request in lifecycle_flow.requests()] == ["read"]
+                assert lifecycle_flow.actions() == []
+            else:
+                assert [request["operation"] for request in lifecycle_flow.requests()] == ["status", "write"]
+                assert [action["data"] for action in lifecycle_flow.actions()] == _rows_for(case.plugin_key)
 
         with db.engine.connect() as connection:
             node_state_count = connection.scalar(
@@ -491,6 +525,7 @@ def test_partial_start_failure_never_cleans_the_unstarted_subject(
     case: LocalLifecycleCase,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lifecycle_flow: DurablePowerAutomateFlow | None,
 ) -> None:
     settings, bundle, graph, config, store, server = _build_runtime(case, tmp_path)
     subject = _subject_instance(case, bundle)
@@ -525,6 +560,9 @@ def test_partial_start_failure_never_cleans_the_unstarted_subject(
         assert subject._on_start_called is False
         assert subject._on_complete_called is False
         assert close_calls == []
+        if lifecycle_flow is not None:
+            assert lifecycle_flow.requests() == []
+            assert lifecycle_flow.actions() == []
         with db.engine.connect() as connection:
             assert connection.scalar(select(runs_table.c.status)) == RunStatus.FAILED.value
     finally:
@@ -538,6 +576,7 @@ def test_later_start_failure_cleans_the_already_started_subject_in_order(
     case: LocalLifecycleCase,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lifecycle_flow: DurablePowerAutomateFlow | None,
 ) -> None:
     settings, bundle, graph, config, store, server = _build_runtime(case, tmp_path)
     subject = _subject_instance(case, bundle)
@@ -596,6 +635,9 @@ def test_later_start_failure_cleans_the_already_started_subject_in_order(
         assert later._on_start_called is False
         assert later._on_complete_called is False
         assert teardown == [("complete", subject), ("close", subject)]
+        if lifecycle_flow is not None:
+            assert lifecycle_flow.requests() == []
+            assert lifecycle_flow.actions() == []
     finally:
         rate_limits.close()
         db.close()
@@ -607,6 +649,7 @@ def test_exceptional_operation_still_completes_and_closes_the_started_subject(
     case: LocalLifecycleCase,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lifecycle_flow: DurablePowerAutomateFlow | None,
 ) -> None:
     settings, bundle, graph, config, store, server = _build_runtime(case, tmp_path)
     subject = _subject_instance(case, bundle)
@@ -630,6 +673,8 @@ def test_exceptional_operation_still_completes_and_closes_the_started_subject(
 
     kind, _name = case.plugin_key.split(":", maxsplit=1)
     operation = {"source": "load", "transform": "process", "sink": "commit_effect"}[kind]
+    if isinstance(subject, MemberSinkEffectCapability):
+        operation = "commit_member_effect"
     monkeypatch.setattr(subject_type, operation, fail_operation)
     monkeypatch.setattr(subject_type, "on_complete", observed_complete)
     monkeypatch.setattr(subject_type, "close", observed_close)
@@ -652,6 +697,8 @@ def test_exceptional_operation_still_completes_and_closes_the_started_subject(
         assert subject._on_start_called is True
         assert subject._on_complete_called is True
         assert teardown == ["complete", "close"]
+        if lifecycle_flow is not None:
+            assert lifecycle_flow.actions() == []
     finally:
         rate_limits.close()
         db.close()
@@ -700,6 +747,7 @@ def test_public_resume_reconciles_the_subject_pipeline_after_a_finalized_effect_
     case: LocalLifecycleCase,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lifecycle_flow: DurablePowerAutomateFlow | None,
 ) -> None:
     settings, _bundle, graph, config, store, server = _build_runtime(case, tmp_path)
     checkpoint_config = RuntimeCheckpointConfig.from_settings(settings.checkpoint)
@@ -743,6 +791,9 @@ def test_public_resume_reconciles_the_subject_pipeline_after_a_finalized_effect_
                 "finalized",
             )
         assert checkpoints.get_latest_checkpoint(run_id) is not None
+        if lifecycle_flow is not None:
+            expected_operations = ["read"] if case.plugin_key == "source:power_automate" else ["status", "write"]
+            assert [request["operation"] for request in lifecycle_flow.requests()] == expected_operations
     finally:
         rate_limits.close()
         db.close()
@@ -784,6 +835,10 @@ def test_public_resume_reconciles_the_subject_pipeline_after_a_finalized_effect_
             )
             assert connection.scalar(select(func.count()).select_from(artifacts_table).where(artifacts_table.c.run_id == run_id)) == 1
         assert reopened_checkpoints.get_latest_checkpoint(run_id) is None
+        if lifecycle_flow is not None:
+            assert [request["operation"] for request in lifecycle_flow.requests()] == expected_operations
+            expected_actions = [] if case.plugin_key == "source:power_automate" else _rows_for(case.plugin_key)
+            assert [action["data"] for action in lifecycle_flow.actions()] == expected_actions
     finally:
         resumed_rate_limits.close()
         reopened.close()

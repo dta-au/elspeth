@@ -49,9 +49,3 @@ class TestCapacityErrorException:
 
         assert error.status_code == 429
         assert str(error) == "Rate limited"
-
-    def test_capacity_error_retryable_flag(self) -> None:
-        """CapacityError should always be retryable."""
-        error = CapacityError(503, "Service unavailable")
-
-        assert error.retryable is True

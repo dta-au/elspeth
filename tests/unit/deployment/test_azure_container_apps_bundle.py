@@ -18,13 +18,18 @@ import functools
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import yaml
+from pydantic import ValidationError
+
+from elspeth.web.config import WebSettings, settings_from_env
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = REPO_ROOT / "deploy" / "azure-container-apps"
@@ -40,6 +45,7 @@ VERSIONED_SECRET_URL_RE = re.compile(r"^https://[a-z0-9-]+\.vault\.azure\.net/se
 
 EXPECTED_FILES = {
     "README.md",
+    "application.example.json",
     "main.bicep",
     "environment.bicep",
     "workload.bicep",
@@ -54,6 +60,12 @@ EXPECTED_FILES = {
     "kql/replica-lifecycle.kql",
     "kql/fence-conflict-409.kql",
     "scripts/acceptance.sh",
+    "scripts/resolve-workload-parameters.sh",
+    "scripts/validate-workload-parameters.jq",
+    "scripts/run-job.sh",
+    "scripts/bootstrap-roles.sql",
+    "scripts/bootstrap-acceptance-roles.sql",
+    "scripts/bootstrap-acceptance.sh",
 }
 
 TEMPLATES = ("main", "environment", "workload")
@@ -219,6 +231,8 @@ class _Evaluator:
         for name, definition in template.get("parameters", {}).items():
             if name not in self.parameters and "defaultValue" in definition:
                 self.parameters[name] = self.value(definition["defaultValue"])
+            elif name not in self.parameters and definition.get("nullable") is True:
+                self.parameters[name] = None
         self._variables: dict[str, Any] = {}
 
     def value(self, node: Any, scope: dict[str, Any] | None = None) -> Any:
@@ -257,6 +271,8 @@ class _Evaluator:
         if name == "lambda":
             names = [self._eval(arg, scope) for arg in args[:-1]]
             return _Lambda([str(item) for item in names], args[-1])
+        if name == "if":
+            return self._eval(args[1] if self._eval(args[0], scope) else args[2], scope)
         values = [self._eval(arg, scope) for arg in args]
         return self._call(name, values, scope)
 
@@ -287,6 +303,14 @@ class _Evaluator:
                 return args[0] is None or len(args[0]) == 0
             case "equals":
                 return args[0] == args[1]
+            case "not":
+                return not args[0]
+            case "coalesce":
+                return next(arg for arg in args if arg is not None)
+            case "copyIndex":
+                return scope["copy_index"]
+            case "length":
+                return len(args[0])
             case "if":
                 return args[1] if args[0] else args[2]
             case "format":
@@ -349,8 +373,12 @@ def _resources(template: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _module_parameters(template_name: str, parameter_file: str, deployment_name: str) -> dict[str, Any]:
     """The resolved parameter values a module deployment passes to its AVM template."""
+    return _module_parameters_with_values(template_name, _parameters(parameter_file), deployment_name)
+
+
+def _module_parameters_with_values(template_name: str, parameters: dict[str, Any], deployment_name: str) -> dict[str, Any]:
     template = _template(template_name)
-    evaluator = _Evaluator(template, _parameters(parameter_file))
+    evaluator = _Evaluator(template, parameters)
     for resource in _resources(template):
         if resource["type"] != "Microsoft.Resources/deployments":
             continue
@@ -373,6 +401,219 @@ def _module_resource(template_name: str, parameter_file: str, deployment_name: s
 
 def _env_map(env: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {entry["name"]: entry for entry in env}
+
+
+def test_schema_owner_vault_is_inaccessible_to_runtime_identity() -> None:
+    vault = _module_parameters("environment", "environment.example", "elspeth-schema-owner-key-vault")
+    (grant,) = vault["roleAssignments"]
+    assert "schemaOwnerIdentity" in str(grant["principalId"])
+    assert grant["roleDefinitionIdOrName"] == "Key Vault Secrets User"
+    assert vault["enableRbacAuthorization"] is True
+    assert vault["publicNetworkAccess"] == "Disabled"
+    runtime_vault = _module_parameters("environment", "environment.example", "elspeth-key-vault")
+    assert vault["name"] != runtime_vault["name"]
+    runtime_grants = {str(entry["principalId"]) for entry in runtime_vault["roleAssignments"]}
+    assert str(grant["principalId"]) in runtime_grants
+    assert len(runtime_grants) == 2
+    assert repr(vault["privateEndpoints"]) == repr(runtime_vault["privateEndpoints"])
+    evaluator = _Evaluator(_template("environment"), _parameters("environment.example"))
+    assert str(grant["principalId"]) == str(evaluator.value("[reference('schemaOwnerIdentity').outputs.principalId.value]"))
+    for output, module in (("schemaOwnerKeyVaultUri", "schemaOwnerKeyVault"), ("keyVaultUri", "keyVault")):
+        assert module in str(evaluator.value(_template("environment")["outputs"][output]["value"]))
+    values = _parameters("workload.production")
+    assert values["identityResourceId"] != values["schemaOwnerIdentityResourceId"]
+    schema = _module_parameters("workload", "workload.production", "doctor-schema-init-job")
+    assert schema["managedIdentities"] == {"userAssignedResourceIds": [values["schemaOwnerIdentityResourceId"]]}
+    assert all(secret["identity"] == values["schemaOwnerIdentityResourceId"] for secret in schema["secrets"])
+    assert schema["registries"][0]["identity"] == values["schemaOwnerIdentityResourceId"]
+    app = _module_parameters("workload", "workload.production", "elspeth-web-app")
+    assert app["managedIdentities"] == {"userAssignedResourceIds": [values["identityResourceId"]]}
+    owner_host = values["sessionDbUrlSchemaOwnerSecretUrl"].split("/")[2]
+    assert owner_host == values["landscapeUrlSchemaOwnerSecretUrl"].split("/")[2]
+    assert all(secret["keyVaultUrl"].split("/")[2] != owner_host for secret in app["secrets"])
+    provision = _module_parameters("workload", "workload.production", "provision-storage-job")
+    assert "managedIdentities" not in provision
+    provision_template = _module_resource("workload", "workload.production", "provision-storage-job")["properties"]["template"]
+    provision_evaluator = _Evaluator(provision_template, provision)
+    (provision_resource,) = [resource for resource in _resources(provision_template) if resource["type"] == "Microsoft.App/jobs"]
+    assert provision_evaluator.value(provision_resource["identity"]) is None
+
+
+def _workload_regression_parameters(role: str = "") -> dict[str, Any]:
+    """Independent deployment inputs so reverting the template still reaches the behavioral oracle."""
+    secret = "https://runtime.vault.azure.net/secrets/"
+    version = "/" + "a" * 32
+    return {
+        "environmentResourceId": "/environment",
+        "identityResourceId": "/identities/runtime",
+        "schemaOwnerIdentityResourceId": "/identities/schema-owner",
+        "identityClientId": "7b016658-f98e-4ce6-9336-e5c4d8ca7d37",
+        "candidateSourceSha": "a" * 40,
+        "image": "registry.azurecr.io/elspeth@sha256:" + "b" * 64,
+        "provisionStorageImage": "mcr.microsoft.com/azurelinux/base/core@sha256:" + "c" * 64,
+        "revisionSuffix": "candidate" + role,
+        "composerTransportIdleCeilingSeconds": 210,
+        "composerMaxCompositionTurns": 50,
+        "composerMaxDiscoveryTurns": 20,
+        "composerTimeoutSeconds": 180,
+        "composerRateLimitPerMinute": 10,
+        "authProvider": "local",
+        "runtimeRoleLabel": role,
+        "acceptanceRuntimeSecretUrls": {
+            label: {
+                "sessionDbUrl": secret + "session-runtime-" + label + version,
+                "landscapeUrl": secret + "landscape-runtime-" + label + version,
+            }
+            for label in ("a", "b")
+        },
+        **{
+            name: secret + name.lower() + version
+            for name in (
+                "sessionDbUrlRuntimeSecretUrl",
+                "landscapeUrlRuntimeSecretUrl",
+                "sessionDbUrlSchemaOwnerSecretUrl",
+                "landscapeUrlSchemaOwnerSecretUrl",
+                "secretKeySecretUrl",
+                "shareableLinkSigningKeySecretUrl",
+                "fingerprintKeySecretUrl",
+                "operatorMetricsBearerTokenSecretUrl",
+            )
+        },
+    }
+
+
+def _settings_for_compiled_container(module: dict[str, Any]) -> WebSettings:
+    """Resolve only declared secret references with ephemeral synthetic values."""
+    declared_secrets = {entry["name"] for entry in module["secrets"]}
+    environment = {}
+    for entry in module["containers"][0]["env"]:
+        name = entry["name"]
+        assert name not in environment, f"Duplicate environment variable: {name}"
+        if "secretRef" in entry:
+            assert entry["secretRef"] in declared_secrets
+            if name in {"ELSPETH_WEB__SESSION_DB_URL", "ELSPETH_WEB__LANDSCAPE_URL"}:
+                value = "postgresql://synthetic@database.example.test/" + entry["secretRef"].replace("-", "_")
+            else:
+                value = secrets.token_hex(32)
+        else:
+            value = entry["value"]
+        environment[name] = value
+    # Ambient development settings must never make an incomplete deployment pass.
+    with patch.dict(os.environ, environment, clear=True):
+        return settings_from_env()
+
+
+@pytest.mark.parametrize("deployment_name", ["elspeth-web-app", "doctor-schema-init-job", "doctor-runtime-job"])
+def test_compiled_workloads_load_required_composer_settings(deployment_name: str) -> None:
+    module = _module_parameters_with_values("workload", _workload_regression_parameters(), deployment_name)
+    settings = _settings_for_compiled_container(module)
+    assert settings.composer_max_composition_turns == 50
+    assert settings.composer_max_discovery_turns == 20
+    assert settings.composer_timeout_seconds == 180
+    assert settings.composer_rate_limit_per_minute == 10
+
+
+@pytest.mark.parametrize("parameter_file", ["workload.production", "workload.acceptance"])
+def test_example_web_and_doctor_environments_load_without_ambient_config(parameter_file: str) -> None:
+    parameters = _parameters(parameter_file)
+    app = _module_parameters("workload", parameter_file, "elspeth-web-app")
+    settings = _settings_for_compiled_container(app)
+    assert settings.auth_provider == parameters["authProvider"]
+    assert settings.registration_mode == parameters["registrationMode"]
+    if parameter_file == "workload.production":
+        assert settings.registration_mode == "closed"
+        assert settings.auth_provider != "local"
+        assert settings.sso_client_secret is not None
+        assert settings.sso_transaction_secret is not None
+        assert settings.composer_endpoint_base_url == parameters["composerEndpointBaseUrl"]
+        assert settings.composer_advisor_endpoint_base_url == parameters["composerAdvisorEndpointBaseUrl"]
+    suffix = "-" + parameters["runtimeRoleLabel"] if parameters["runtimeRoleLabel"] else ""
+    for name in ("doctor-schema-init-job", f"doctor-runtime{suffix}-job"):
+        doctor = _module_parameters("workload", parameter_file, name)
+        doctor_settings = _settings_for_compiled_container(doctor)
+        assert doctor_settings.composer_timeout_seconds == parameters["composerTimeoutSeconds"]
+        assert doctor_settings.composer_endpoint_base_url is None
+        assert doctor_settings.composer_advisor_endpoint_base_url is None
+        environment = _env_map(doctor["containers"][0]["env"])
+        assert "ELSPETH_WEB__AUTH_PROVIDER" not in environment
+        assert "ELSPETH_WEB__SSO_CLIENT_SECRET" not in environment
+        assert "ELSPETH_WEB__SSO_TRANSACTION_SECRET" not in environment
+        if name == "doctor-schema-init-job":
+            assert not ({entry["name"] for entry in doctor["secrets"]} & {"sso-client-secret", "sso-transaction-secret"})
+
+
+@pytest.mark.parametrize("role", ["", "Advisor"])
+@pytest.mark.parametrize("supplied", ["both", "url", "key"])
+def test_compiled_composer_endpoint_credentials_are_paired(role: str, supplied: str) -> None:
+    parameters = _workload_regression_parameters()
+    if supplied in {"both", "url"}:
+        parameters[f"composer{role}EndpointBaseUrl"] = "https://models.example.com/v1"
+    if supplied in {"both", "key"}:
+        parameters[f"composer{role}EndpointApiKeySecretUrl"] = "https://runtime.vault.azure.net/secrets/composer-key/" + "a" * 32
+    module = _module_parameters_with_values("workload", parameters, "elspeth-web-app")
+    if supplied != "both":
+        with pytest.raises(ValidationError, match="must be configured together"):
+            _settings_for_compiled_container(module)
+    else:
+        settings = _settings_for_compiled_container(module)
+        if role:
+            assert settings.composer_advisor_endpoint_base_url == "https://models.example.com/v1"
+            assert settings.composer_advisor_endpoint_api_key is not None
+        else:
+            assert settings.composer_endpoint_base_url == "https://models.example.com/v1"
+            assert settings.composer_endpoint_api_key is not None
+
+
+def test_native_azure_application_example_loads_from_compiled_environment() -> None:
+    parameters = _workload_regression_parameters()
+    parameters.update(json.loads((BUNDLE / "application.example.json").read_text()))
+    app = _module_parameters_with_values("workload", parameters, "elspeth-web-app")
+    settings = _settings_for_compiled_container(app)
+    assert settings.auth_provider == "entra"
+    assert settings.registration_mode == "closed"
+    assert settings.composer_model.startswith("azure/")
+    assert settings.composer_advisor_model.startswith("azure/")
+    assert settings.composer_endpoint_base_url is None
+    assert settings.composer_advisor_endpoint_base_url is None
+    assert settings.default_llm_profile == "standard"
+    assert settings.llm_profiles["standard"].provider == "azure"
+    assert settings.llm_profiles["standard"].credential_ref == "AZURE_API_KEY"
+    environment = _env_map(app["containers"][0]["env"])
+    assert environment["AZURE_API_KEY"]["secretRef"] == "azure-api-key"
+
+
+def test_required_startup_parameters_are_explicit_and_positive() -> None:
+    parameters = _template("workload")["parameters"]
+    for name in ("composerMaxCompositionTurns", "composerMaxDiscoveryTurns", "composerTimeoutSeconds", "composerRateLimitPerMinute"):
+        assert parameters[name]["type"] == "int"
+        assert parameters[name]["minValue"] == 1
+        assert "defaultValue" not in parameters[name]
+    assert "defaultValue" not in parameters["authProvider"]
+
+
+@pytest.mark.parametrize("role", ["", "a"])
+def test_web_selects_attached_user_assigned_identity(role: str) -> None:
+    parameters = _workload_regression_parameters(role)
+    app = _module_parameters_with_values("workload", parameters, "elspeth-web-app")
+    env = _env_map(app["containers"][0]["env"])
+    assert "AZURE_CLIENT_ID" in env
+    assert env["AZURE_CLIENT_ID"]["value"] == parameters["identityClientId"]
+    assert "defaultValue" not in _template("workload")["parameters"]["identityClientId"]
+
+
+def test_acceptance_redeploy_retains_both_roles_secret_bindings() -> None:
+    snapshots = []
+    for role in ("", "a", "b", ""):
+        app = _module_parameters_with_values("workload", _workload_regression_parameters(role), "elspeth-web-app")
+        secrets = {entry["name"]: entry["keyVaultUrl"] for entry in app["secrets"]}
+        snapshots.append(secrets)
+        env = _env_map(app["containers"][0]["env"])
+        for setting, name in (("SESSION_DB_URL", "session-db-url"), ("LANDSCAPE_URL", "landscape-url")):
+            suffix = f"-{role}" if role else ""
+            assert env[f"ELSPETH_WEB__{setting}"]["secretRef"] == f"{name}{suffix}"
+            if role:
+                assert f"runtime-{role}/" in secrets[f"{name}{suffix}"]
+    assert snapshots[0] == snapshots[1] == snapshots[2] == snapshots[3]
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +670,11 @@ def test_every_template_compiles_and_every_parameter_file_builds() -> None:
         values = _parameters(parameter_file)
         declared = set(_template(template)["parameters"])
         assert set(values) <= declared, (parameter_file, set(values) - declared)
-        required = {name for name, definition in _template(template)["parameters"].items() if "defaultValue" not in definition}
+        required = {
+            name
+            for name, definition in _template(template)["parameters"].items()
+            if "defaultValue" not in definition and definition.get("nullable") is not True
+        }
         assert required <= set(values), (parameter_file, required - set(values))
 
 
@@ -530,20 +775,28 @@ def test_container_app_binds_the_runtime_contract_from_compiled_arm(parameter_fi
     assert app["managedIdentities"] == {"userAssignedResourceIds": [values["identityResourceId"]]}
 
     secrets = {entry["name"]: entry for entry in app["secrets"]}
+    suffix = f"-{values['runtimeRoleLabel']}" if values["runtimeRoleLabel"] else ""
+    database_names = {"session-db-url", "landscape-url"}
+    if suffix:
+        database_names |= {"session-db-url-a", "landscape-url-a", "session-db-url-b", "landscape-url-b"}
     assert set(secrets) == {
         "secret-key",
         "shareable-link-signing-key",
         "fingerprint-key",
         "operator-metrics-bearer-token",
-        "session-db-url",
-        "landscape-url",
-    }
+    } | database_names | {entry["name"] for entry in values.get("extraSecrets", [])} | (
+        {"composer-endpoint-api-key"} if values["composerEndpointApiKeySecretUrl"] else set()
+    ) | ({"composer-advisor-endpoint-api-key"} if values.get("composerAdvisorEndpointApiKeySecretUrl") else set())
     for entry in secrets.values():
         assert set(entry) == {"name", "keyVaultUrl", "identity"}, entry
         assert entry["identity"] == values["identityResourceId"]
         assert VERSIONED_SECRET_URL_RE.match(entry["keyVaultUrl"]), entry
     assert secrets["session-db-url"]["keyVaultUrl"] == values["sessionDbUrlRuntimeSecretUrl"]
     assert secrets["landscape-url"]["keyVaultUrl"] == values["landscapeUrlRuntimeSecretUrl"]
+    if suffix:
+        retained = values["acceptanceRuntimeSecretUrls"][values["runtimeRoleLabel"]]
+        assert secrets[f"session-db-url{suffix}"]["keyVaultUrl"] == retained["sessionDbUrl"]
+        assert secrets[f"landscape-url{suffix}"]["keyVaultUrl"] == retained["landscapeUrl"]
 
     assert app["volumes"] == [
         {
@@ -576,8 +829,8 @@ def test_container_app_binds_the_runtime_contract_from_compiled_arm(parameter_fi
     }.items():
         assert env[name] == {"name": name, "value": expected}, name
     for name, secret in {
-        "ELSPETH_WEB__SESSION_DB_URL": "session-db-url",
-        "ELSPETH_WEB__LANDSCAPE_URL": "landscape-url",
+        "ELSPETH_WEB__SESSION_DB_URL": f"session-db-url{suffix}",
+        "ELSPETH_WEB__LANDSCAPE_URL": f"landscape-url{suffix}",
         "ELSPETH_WEB__SECRET_KEY": "secret-key",
         "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": "shareable-link-signing-key",
         "ELSPETH_FINGERPRINT_KEY": "fingerprint-key",
@@ -609,7 +862,7 @@ def test_avm_container_app_wires_session_affinity_from_the_parameter() -> None:
 
 
 @pytest.mark.parametrize("parameter_file", ["workload.production", "workload.acceptance"])
-def test_jobs_share_the_mount_identity_and_digest(parameter_file: str) -> None:
+def test_jobs_share_the_mount_and_digest_with_separate_identities(parameter_file: str) -> None:
     values = _parameters(parameter_file)
     suffix = f"-{values['runtimeRoleLabel']}" if values["runtimeRoleLabel"] else ""
 
@@ -621,11 +874,13 @@ def test_jobs_share_the_mount_identity_and_digest(parameter_file: str) -> None:
         assert job["triggerType"] == "Manual"
         assert job["manualTriggerConfig"] == {"parallelism": 1, "replicaCompletionCount": 1}
         assert job["replicaRetryLimit"] == 0
-        assert job["managedIdentities"] == {"userAssignedResourceIds": [values["identityResourceId"]]}
         assert job["volumes"][0]["storageType"] == "NfsAzureFile"
         assert job["containers"][0]["volumeMounts"] == [{"volumeName": "elspeth-state", "mountPath": "/mnt/elspeth"}]
 
     assert provision["name"] == "provision-storage"
+    assert "managedIdentities" not in provision
+    assert runtime["managedIdentities"] == {"userAssignedResourceIds": [values["identityResourceId"]]}
+    assert schema_init["managedIdentities"] == {"userAssignedResourceIds": [values["schemaOwnerIdentityResourceId"]]}
     (provision_container,) = provision["containers"]
     assert provision_container["image"] == values["provisionStorageImage"]
     script = provision_container["command"][-1]
@@ -648,12 +903,16 @@ def test_jobs_share_the_mount_identity_and_digest(parameter_file: str) -> None:
     runtime_secrets = {entry["name"]: entry["keyVaultUrl"] for entry in runtime["secrets"]}
     assert runtime_secrets["session-db-url"] == values["sessionDbUrlRuntimeSecretUrl"]
     assert runtime_secrets["landscape-url"] == values["landscapeUrlRuntimeSecretUrl"]
+    if suffix:
+        retained = values["acceptanceRuntimeSecretUrls"][values["runtimeRoleLabel"]]
+        assert runtime_secrets[f"session-db-url{suffix}"] == retained["sessionDbUrl"]
+        assert runtime_secrets[f"landscape-url{suffix}"] == retained["landscapeUrl"]
 
-    for job in (schema_init, runtime):
+    for job, secret_suffix in ((schema_init, ""), (runtime, suffix)):
         env = _env_map(job["containers"][0]["env"])
         assert env["ELSPETH_WEB__DEPLOYMENT_TARGET"]["value"] == "azure-container-apps"
         assert env["ELSPETH_WEB__DEPLOYMENT_STATE_MODE"]["value"] == "external-postgresql"
-        assert env["ELSPETH_WEB__SESSION_DB_URL"] == {"name": "ELSPETH_WEB__SESSION_DB_URL", "secretRef": "session-db-url"}
+        assert env["ELSPETH_WEB__SESSION_DB_URL"] == {"name": "ELSPETH_WEB__SESSION_DB_URL", "secretRef": f"session-db-url{secret_suffix}"}
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +961,7 @@ def test_environment_states_the_storage_contract_once() -> None:
     (storage,) = environment["storages"]
     assert storage["kind"] == "NFS"
     assert storage["accessMode"] == "ReadWrite"
-    assert storage["name"] == "elspeth-nfs"
+    assert storage["name"] == "elspeth"
     assert "elspeth-file-storage" in str(storage["storageAccountName"]) or "fileStorage" in str(storage["storageAccountName"])
     assert environment["appLogsConfiguration"]["destination"] == "log-analytics"
     assert "logAnalytics" in str(environment["appLogsConfiguration"]["logAnalyticsWorkspaceResourceId"])
@@ -768,6 +1027,62 @@ def test_environment_binds_identity_network_and_key_vault_shapes() -> None:
     }
 
 
+def test_expanded_avm_nfs_export_matches_the_created_physical_share() -> None:
+    """Follow the pinned module's child deployment to the actual ARM mount."""
+    files = _module_parameters("environment", "environment.example", "elspeth-file-storage")
+    environment = _module_resource("environment", "environment.example", "elspeth-environment")
+    template = environment["properties"]["template"]
+    parameters = _module_parameters("environment", "environment.example", "elspeth-environment")
+    # The deployed storage-account output is its input name. Resolve this
+    # runtime reference, then evaluate the nested AVM storage module unchanged.
+    parameters["storages"][0]["storageAccountName"] = files["name"]
+    evaluator = _Evaluator(template, parameters)
+    (deployment,) = [r for r in _resources(template) if r["type"] == "Microsoft.Resources/deployments" and "Storage" in r["name"]]
+    assert evaluator.value(deployment["copy"]["count"]) == 1
+    child_parameters = {
+        name: evaluator.value(value, {"copy_index": 0})["value"]
+        for name, value in deployment["properties"]["parameters"].items()
+        if name != "enableTelemetry"
+    }
+    child = deployment["properties"]["template"]
+    child_evaluator = _Evaluator(child, child_parameters)
+    (storage,) = [r for r in _resources(child) if r["type"] == "Microsoft.App/managedEnvironments/storages"]
+    mount = child_evaluator.value(storage["properties"]["nfsAzureFile"])
+    (share,) = files["fileServices"]["shares"]
+    assert mount["server"] == f"{files['name']}.file.core.windows.net"
+    assert mount["shareName"] == f"/{files['name']}/{share['name']}"
+
+
+@pytest.mark.parametrize("deploy_web_app", [False, True])
+def test_jobs_exist_without_deploying_the_app(deploy_web_app: bool) -> None:
+    template = _template("workload")
+    parameters = {**_parameters("workload.production"), "deployWebApp": deploy_web_app}
+    evaluator = _Evaluator(template, parameters)
+    deployed = {evaluator.value(resource["name"]) for resource in _resources(template) if evaluator.value(resource.get("condition", True))}
+    assert {"provision-storage-job", "doctor-schema-init-job", "doctor-runtime-job"} <= deployed
+    assert ("elspeth-web-app" in deployed) == deploy_web_app
+    if not deploy_web_app:
+        assert evaluator.value(template["outputs"]["containerAppResourceId"]["value"]) == ""
+        assert evaluator.value(template["outputs"]["containerAppFqdn"]["value"]) == ""
+
+
+def test_managed_identity_acceptance_job_runs_candidate_with_identity_only() -> None:
+    job = _module_parameters("workload", "workload.acceptance", "verify-blob-managed-identity-job")
+    assert "secrets" not in job
+    (container,) = job["containers"]
+    assert container["image"] == _parameters("workload.acceptance")["image"]
+    assert container["command"] == ["python", "-m", "elspeth.web.azure_blob_acceptance_job"]
+    environment = _env_map(container["env"])
+    assert environment["AZURE_TOKEN_CREDENTIALS"]["value"] == "ManagedIdentityCredential"
+    assert set(environment) == {
+        "AZURE_TOKEN_CREDENTIALS",
+        "AZURE_CLIENT_ID",
+        "ELSPETH_ACCEPTANCE_BLOB_ACCOUNT_URL",
+        "ELSPETH_ACCEPTANCE_BLOB_CONTAINER",
+        "ELSPETH_ACCEPTANCE_CANDIDATE_SHA",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Driver, queries, and the image publication contract in CI
 # ---------------------------------------------------------------------------
@@ -787,8 +1102,8 @@ def test_acceptance_driver_routes_every_platform_call_through_protected_capture(
         assert f"{helper}() {{" in script, helper
     for stage in ("stage_environment", "stage_image", "stage_jobs", "stage_workload", "stage_probes", "stage_evidence", "stage_cleanup"):
         assert f"{stage}()" in script, stage
-    assert "facade_not_landed_6b5" in script
-    assert 'test "$acr_digest" = "$CANDIDATE_IMAGE_DIGEST"' in script
+    # Digest preservation is exercised by test_driver.py's
+    # test_digest_mismatch_stops_before_jobs, without pinning shell-local names.
     assert "docker buildx imagetools create" in script
     assert "sha256sum" in script
 

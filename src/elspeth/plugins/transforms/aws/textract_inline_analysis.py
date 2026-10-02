@@ -21,7 +21,7 @@ from typing import Any, ClassVar, Self, cast
 import structlog
 from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
-from elspeth.contracts import Determinism
+from elspeth.contracts import Determinism, RunMode
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.binary_documents import (
     BINARY_DOCUMENT_MAX_BYTES,
@@ -32,16 +32,19 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
 from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory
+from elspeth.contracts.events import TelemetryEvent
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust
+from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_client import (
     SDK_TOTAL_MAX_ATTEMPTS,
     TextractInlineClient,
@@ -57,6 +60,7 @@ from elspeth.plugins.transforms.aws.textract_config_shared import (
     TextractExtractFields,
     TextractQueryConfig,
     require_non_whitespace,
+    textract_created_output_fields,
     validate_textract_credential_fields,
 )
 from elspeth.plugins.transforms.aws.textract_regions import TEXTRACT_INVARIANT_PROBE_REGION, TEXTRACT_REGIONS
@@ -256,7 +260,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c5977c9db0ea2125"
+    source_file_hash: str | None = "sha256:229d85c78907213d"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -341,6 +345,13 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         )
 
         self.declared_output_fields = frozenset(cfg.all_output_field_names())
+        self._created_output_fields = textract_created_output_fields(
+            text_field=cfg.text_field,
+            page_count_field=cfg.page_count_field,
+            metadata_field=cfg.metadata_field,
+            result_field=cfg.result_field,
+            facet_fields=tuple(self._facet_fields.values()),
+        )
         self._reject_input_options_naming_created_fields({"blob_ref_field": cfg.blob_ref_field})
         self.input_schema, self.output_schema = self._create_schemas(
             cfg.schema_config,
@@ -352,7 +363,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._recorder: PluginAuditWriter | None = None
         self._run_id = ""
         self._node_id = ""
-        self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
+        self._telemetry_emit: Callable[[TelemetryEvent], None] = _warn_telemetry_before_start
         self._limiter: Any = None
         self._payload_store: PayloadStore | None = None
         self._sdk_client: TextractSyncSDKClient | None = None
@@ -360,6 +371,10 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._row_clients_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._batch_initialized = False
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The configured output targets, typed as ``NormalizedTextractResult`` fixes them (ADR-050)."""
+        return self._created_output_fields
 
     def on_start(self, ctx: LifecycleContext) -> None:
         super().on_start(ctx)
@@ -376,7 +391,19 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._payload_store = ctx.payload_store
         if ctx.shutdown_event is not None:
             self._shutdown = ctx.shutdown_event
-        if self._sdk_client is None:
+        if self._sdk_client is None and ctx.run_mode is RunMode.REPLAY:
+            self._sdk_client = ReplayOnlySDK()
+        elif self._sdk_client is None and ctx.run_mode is RunMode.VERIFY:
+            self._sdk_client = DeferredAWSClient(
+                lambda: build_textract_sync_sdk_client(
+                    region=self._region,
+                    aws_access_key_id=self._aws_access_key_id,
+                    aws_secret_access_key=self._aws_secret_access_key,
+                    aws_session_token=self._aws_session_token,
+                    read_timeout=self._request_timeout_seconds,
+                )
+            )
+        elif self._sdk_client is None:
             self._sdk_client = build_textract_sync_sdk_client(
                 region=self._region,
                 aws_access_key_id=self._aws_access_key_id,
@@ -420,13 +447,15 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._limiter = None
         self._payload_store = None
 
-    def _get_row_client(self, state_id: str, *, token_id: str | None) -> TextractInlineClient:
+    def _get_row_client(self, state_id: str, *, ctx: TransformContext, token_id: str | None) -> TextractInlineClient:
         with self._row_clients_lock:
             if state_id in self._row_clients:
                 return self._row_clients[state_id]
             if self._recorder is None or self._sdk_client is None or not self._run_id:
                 raise FrameworkBugError("Amazon Textract inline transform used before on_start")
             client = TextractInlineClient(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 execution=self._recorder,
                 state_id=state_id,
                 run_id=self._run_id,
@@ -436,6 +465,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 max_response_bytes=self._max_result_bytes,
                 limiter=self._limiter,
                 token_id=token_id,
+                call_mode_session=ctx.call_mode_session,
             )
             self._row_clients[state_id] = client
             return client
@@ -446,7 +476,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         if ctx.token is None:
             raise FrameworkBugError("Amazon Textract inline batch processing requires token identity")
         try:
-            return self._process_single_with_state(row, ctx.state_id, token_id=ctx.token.token_id)
+            return self._process_single_with_state(row, ctx.state_id, token_id=ctx.token.token_id, ctx=ctx)
         finally:
             # The row client is created lazily at the SDK call, so a row that
             # was rejected before reaching it never registered one.
@@ -512,7 +542,9 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             )
         return payload_ref, content
 
-    def _process_single_with_state(self, row: PipelineRow, state_id: str, *, token_id: str | None) -> TransformResult:
+    def _process_single_with_state(
+        self, row: PipelineRow, state_id: str, *, ctx: TransformContext, token_id: str | None
+    ) -> TransformResult:
         if not self._run_id or not self._node_id or token_id is None:
             raise FrameworkBugError("Amazon Textract inline processing requires run, node, and token identity")
         if self._shutdown.is_set():
@@ -522,7 +554,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             return document
         payload_ref, content = document
 
-        client = self._get_row_client(state_id, token_id=token_id)
+        client = self._get_row_client(state_id, token_id=token_id, ctx=ctx)
         try:
             analysis = client.analyze_document(
                 document_bytes=content,
@@ -675,6 +707,10 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                     raise PayloadNotFoundError(content_hash)
                 return _PROBE_DOCUMENT_BYTES
 
+            def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+                content = self.retrieve(content_hash)
+                return content if len(content) <= max_bytes else None
+
             def exists(self, content_hash: str) -> bool:
                 return content_hash == _PROBE_DOCUMENT_SHA256
 
@@ -702,7 +738,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             self._shutdown = threading.Event()
             state_id = ctx.state_id or "textract-inline-invariant-probe-state"
             token_id = ctx.token.token_id if ctx.token is not None else "textract-inline-invariant-probe-token"
-            return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id)
+            return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id, ctx=ctx)
         finally:
             self._recorder = prior_recorder
             self._run_id = prior_run_id

@@ -31,7 +31,7 @@
       },
       {
         "default": null,
-        "description": "Explicit normalized column names for headerless tabular input.",
+        "description": "Column names for headerless tabular input, in order, carried as written.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Columns",
@@ -42,13 +42,23 @@
       },
       {
         "default": null,
-        "description": "Optional mapping from observed source field names to normalized pipeline field names.",
+        "description": "Optional mapping from normalized source names (or headerless columns as written) to the names rows carry downstream.",
         "kind": "json-object",
         "label": "Field Mapping",
         "name": "field_mapping",
         "nullable": true,
         "required": false,
         "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "For a single-source pipeline, materialize at most 64 MiB of immutable rows before processing so a failed run can resume unread rows.",
+        "kind": "checkbox",
+        "label": "Snapshot For Resume",
+        "name": "snapshot_for_resume",
+        "nullable": false,
+        "required": false,
+        "tier": "advanced"
       },
       {
         "default": ",",

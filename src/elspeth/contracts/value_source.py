@@ -114,9 +114,10 @@ def get_catalog_missing_dep_hint(catalog_id: str) -> str | None:
     message.
 
     Uses ``in``/direct-access (not ``.get()``) to match the project's
-    forbidden-defensive-programming idiom — see CLAUDE.md "Defensive
-    Programming: Forbidden". Absence is a legitimate signal here ("no
-    hint registered"), not a bug to hide.
+    forbidden-defensive-programming idiom — see
+    docs/guides/data-trust-and-error-handling.md §The Defensive Programming
+    Prohibition. Absence is a legitimate signal here ("no hint registered"),
+    not a bug to hide.
     """
     if catalog_id not in _CATALOG_DEP_HINTS:
         return None

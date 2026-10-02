@@ -247,6 +247,50 @@ describe("SecretsPanel", () => {
     expect(valueInput).not.toHaveAttribute("aria-describedby");
   });
 
+  describe("server-only mode (userSecretsEnabled=false)", () => {
+    it("renders the add form and delete control when enabled (positive control)", () => {
+      render(<SecretsPanel onClose={onClose} />);
+      expect(screen.getByLabelText("Name")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Save secret" })).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "Delete secret OPENAI_API_KEY" }),
+      ).toBeInTheDocument();
+      expect(screen.queryByTestId("secrets-server-only")).not.toBeInTheDocument();
+    });
+
+    it("offers no way to add or delete a key, and says why", () => {
+      render(<SecretsPanel onClose={onClose} userSecretsEnabled={false} />);
+
+      expect(screen.queryByLabelText("Name")).not.toBeInTheDocument();
+      expect(screen.queryByLabelText("Value")).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Save secret" }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: /^Delete secret/ }),
+      ).not.toBeInTheDocument();
+      const notice = screen.getByTestId("secrets-server-only");
+      expect(notice).toHaveTextContent(
+        "Secrets are configured by an administrator on this deployment. Personal keys cannot be added here.",
+      );
+      // A notice that leads the body, in the user's words: no mode name.
+      expect(notice).toHaveClass("secrets-notice");
+      expect(notice).not.toHaveTextContent(/server-only/);
+      expect(notice.parentElement?.firstElementChild).toBe(notice);
+      // The inventory itself stays visible: read-only, not hidden.
+      expect(screen.getByText("SERVER_KEY")).toBeInTheDocument();
+    });
+
+    it("moves initial focus to the close control when there is no name field", async () => {
+      render(<SecretsPanel onClose={onClose} userSecretsEnabled={false} />);
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: "Close secrets panel" }),
+        ).toHaveFocus(),
+      );
+    });
+  });
+
   describe("submit failure recovery", () => {
     it("preserves the name and re-enables the form after createSecret throws", async () => {
       const user = userEvent.setup();

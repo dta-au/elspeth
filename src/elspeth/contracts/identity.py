@@ -252,7 +252,8 @@ class TokenInfo:
     resume_attempt_offset: int = 0  # Added to every node_states.attempt written while
     # re-driving THIS token on resume, so its records coexist with the append-only run-1
     # records under UniqueConstraint(token_id, node_id, attempt). Value is the prior run's
-    # highest recorded attempt + 1 (processor.resume_incomplete_token), so 0 is NOT a
+    # highest recorded attempt + 1 (the resume re-drive of a pending-sink item or a
+    # journal-restored barrier hold), so 0 is NOT a
     # reliable "run-1" marker: a token never stepped before the interrupt (max_attempt = -1)
     # is re-driven on resume with offset 0. The authoritative resume discriminator is
     # `resume_checkpoint_id is not None` — the field explain() filters on.
@@ -283,7 +284,8 @@ class TokenInfo:
             if type(frame) is not LineageFrame:
                 raise TypeError(f"TokenInfo.lineage_path entries must be LineageFrame, got {type(frame).__name__}: {frame!r}")
         # One-way resume invariant: a positive resume_attempt_offset only ever originates
-        # from a resume re-drive (processor.resume_incomplete_token), which always stamps
+        # from a resume re-drive (scheduler_drain's pending-sink re-drive, the barrier
+        # journal restore), which always stamps
         # the checkpoint id. The implication is one-directional — offset 0 is ambiguous
         # (run-1 OR a never-stepped resume token), so we do NOT require the converse.
         require_int(self.resume_attempt_offset, "TokenInfo.resume_attempt_offset", min_value=0)

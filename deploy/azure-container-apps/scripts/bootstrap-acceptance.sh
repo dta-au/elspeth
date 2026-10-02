@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# Create the fresh acceptance's SQL roles, KV versions and resolved parameters.
+# Runs only when explicitly invoked by the operator's acceptance controller.
+set -Eeuo pipefail
+umask 077
+test "$#" -eq 3 || { echo 'usage: bootstrap-acceptance.sh INVENTORY_JSON SECRET_DIR OUTPUT_DIR' >&2; exit 2; }
+: "${MAIN_PARAMETERS:?concrete environment ARM parameter JSON required}"
+: "${PGSSLROOTCERT:?operator PostgreSQL trust bundle path required}"
+: "${BOOTSTRAP_PRINCIPAL_ID:?object id of the operator writing Key Vault secrets}"
+: "${BOOTSTRAP_PRINCIPAL_TYPE:?User or ServicePrincipal}"
+: "${CANDIDATE_IMAGE:?verified digest-pinned candidate image required}"
+: "${CANDIDATE_SHA:?full candidate source SHA required}"
+: "${PROVISION_STORAGE_IMAGE:?verified digest-pinned root provisioner required}"
+: "${APPLICATION_PARAMETERS:?operator application parameter JSON required}"
+: "${ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS:?explicit transport ceiling required}"
+case "$BOOTSTRAP_PRINCIPAL_TYPE" in User|ServicePrincipal) ;; *) echo 'invalid bootstrap principal type' >&2; exit 2 ;; esac
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+inventory=$1
+secret_dir=$2
+output_dir=$3
+mkdir -p "$output_dir"
+chmod 700 "$output_dir"
+for name in workload.parameters.json workload-a.parameters.json workload-b.parameters.json; do
+  test ! -e "$output_dir/$name" || { echo 'bootstrap output exists; do not rerun cold bootstrap' >&2; exit 2; }
+done
+private_dir=$(mktemp -d "$output_dir/bootstrap-private.XXXXXX")
+trap 'rm -rf -- "$private_dir"' EXIT
+
+# Bounded subprocess output stays private and is never replayed into receipts.
+capture() {
+  local output=$1
+  shift
+  local code=0
+  (ulimit -f 4096; timeout --signal=TERM --kill-after=5s 900 "$@" >"$output" 2>"$private_dir/stderr") || code=$?
+  if (( code != 0 )); then
+    cp -- "$private_dir/stderr" "$output_dir/bootstrap-error.log"
+    echo 'acceptance bootstrap command failed; bootstrap has not completed' >&2
+    return "$code"
+  fi
+}
+
+wait_for_keyvault_rbac() {
+  local probe_vault=$1
+  local probe_name=$2
+  local probe_file=$3
+  local wait_seconds=${KEY_VAULT_RBAC_WAIT_SECONDS:-600}
+  [[ "$wait_seconds" =~ ^[1-9][0-9]*$ ]] && (( wait_seconds <= 600 )) || {
+    echo 'invalid Key Vault RBAC wait budget' >&2; return 2;
+  }
+  local deadline=$((SECONDS + wait_seconds)) remaining command_timeout delay code
+  while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    command_timeout=$((remaining < 30 ? remaining : 30))
+    code=0
+    (ulimit -f 4096; timeout --signal=TERM --kill-after=5s "$command_timeout" \
+      az keyvault secret set --vault-name "$probe_vault" --name "$probe_name" \
+      --file "$probe_file" --encoding utf-8 --query id --output tsv --only-show-errors \
+      >"$private_dir/$probe_name.version" 2>"$private_dir/stderr") || code=$?
+    if (( code == 0 )); then return 0; fi
+    # Only this explicit data-plane RBAC refusal is eligible for propagation
+    # retry after the just-created assignment. Probe the required WRITE action
+    # using the first real secret; a pre-existing Reader grant is insufficient.
+    # Firewall/network/other errors
+    # retain their failure code and do not repeat any SQL or secret writes.
+    if [[ $(<"$private_dir/stderr") != *ForbiddenByRbac* ]]; then
+      cp -- "$private_dir/stderr" "$output_dir/bootstrap-error.log"
+      echo 'key_vault_access_probe_failed' >&2
+      return "$code"
+    fi
+    remaining=$((deadline - SECONDS))
+    if (( remaining > 0 )); then
+      delay=$((remaining < 10 ? remaining : 10))
+      sleep "$delay"
+    fi
+  done
+  cp -- "$private_dir/stderr" "$output_dir/bootstrap-error.log"
+  echo 'key_vault_rbac_propagation_timeout' >&2
+  return 124
+}
+
+for name in elspeth-schema-owner-password elspeth-runtime-password elspeth-runtime-a-password elspeth-runtime-b-password \
+  elspeth-secret-key elspeth-shareable-link-signing-key elspeth-fingerprint-key elspeth-operator-metrics-bearer-token; do
+  test -s "$secret_dir/$name" || { echo 'required operator secret file missing or empty' >&2; exit 2; }
+done
+export PGHOST PGUSER PGPASSWORD PGDATABASE=postgres PGSSLMODE=verify-full PGCONNECT_TIMEOUT=30
+PGHOST=$(jq -er '.postgresFqdn.value' "$inventory")
+PGUSER=$(jq -er '.parameters.postgresAdministratorLogin.value | select(length > 0)' "$MAIN_PARAMETERS")
+PGPASSWORD=$(jq -er '.parameters.postgresAdministratorPassword.value | select(length > 0)' "$MAIN_PARAMETERS")
+vault=$(jq -er '.keyVaultName.value' "$inventory")
+schema_vault=$(jq -er '.schemaOwnerKeyVaultName.value' "$inventory")
+# Construct the owner URL before the write-authority probe; SQL role creation
+# remains after both vaults have accepted their first real secret.
+jq -nj --rawfile password "$secret_dir/elspeth-schema-owner-password" --arg host "$PGHOST" '
+  "postgresql+psycopg://elspeth_schema_owner:" + ($password | sub("\\n+$"; "") | @uri) + "@" + $host +
+  ":5432/elspeth_sessions?sslmode=verify-full&sslrootcert=system"
+  ' >"$private_dir/elspeth-session-db-url-schema-owner"
+for bootstrap_vault in "$schema_vault" "$vault"; do
+  capture "$private_dir/vault-id" az keyvault show --name "$bootstrap_vault" --query id --output tsv --only-show-errors
+  vault_id=$(cat "$private_dir/vault-id")
+  capture "$private_dir/role.json" az role assignment create --assignee-object-id "$BOOTSTRAP_PRINCIPAL_ID" \
+    --assignee-principal-type "$BOOTSTRAP_PRINCIPAL_TYPE" --role 'Key Vault Secrets Officer' --scope "$vault_id" --only-show-errors
+  if [[ "$bootstrap_vault" == "$schema_vault" ]]; then
+    wait_for_keyvault_rbac "$bootstrap_vault" elspeth-session-db-url-schema-owner "$private_dir/elspeth-session-db-url-schema-owner"
+  else
+    wait_for_keyvault_rbac "$bootstrap_vault" elspeth-secret-key "$secret_dir/elspeth-secret-key"
+  fi
+done
+
+# Do not create non-idempotent SQL roles until Key Vault access has propagated.
+export ELSPETH_SCHEMA_OWNER_PASSWORD ELSPETH_RUNTIME_PASSWORD ELSPETH_RUNTIME_A_PASSWORD ELSPETH_RUNTIME_B_PASSWORD
+ELSPETH_SCHEMA_OWNER_PASSWORD=$(cat "$secret_dir/elspeth-schema-owner-password")
+ELSPETH_RUNTIME_PASSWORD=$(cat "$secret_dir/elspeth-runtime-password")
+ELSPETH_RUNTIME_A_PASSWORD=$(cat "$secret_dir/elspeth-runtime-a-password")
+ELSPETH_RUNTIME_B_PASSWORD=$(cat "$secret_dir/elspeth-runtime-b-password")
+capture "$private_dir/bootstrap-sql.log" psql --no-psqlrc --set=ON_ERROR_STOP=1 --file "$script_dir/bootstrap-acceptance-roles.sql"
+unset PGPASSWORD ELSPETH_SCHEMA_OWNER_PASSWORD ELSPETH_RUNTIME_PASSWORD ELSPETH_RUNTIME_A_PASSWORD ELSPETH_RUNTIME_B_PASSWORD
+
+# Build database URLs from raw password files using URL encoding. No value is
+# passed to a child process through argv; psql read the same password bytes.
+for role in schema-owner runtime runtime-a runtime-b; do
+  for database in session-db landscape; do
+    if [[ "$database" == session-db ]]; then database_name=elspeth_sessions; else database_name=elspeth_landscape; fi
+    jq -nj --rawfile password "$secret_dir/elspeth-${role}-password" \
+      --arg role "elspeth_${role//-/_}" --arg host "$PGHOST" --arg database "$database_name" '
+      "postgresql+psycopg://" + $role + ":" + ($password | sub("\\n+$"; "") | @uri) + "@" + $host + ":5432/" +
+      $database + "?sslmode=verify-full&sslrootcert=system"
+      ' >"$private_dir/elspeth-${database}-url-${role}"
+  done
+done
+for name in elspeth-secret-key elspeth-shareable-link-signing-key elspeth-fingerprint-key elspeth-operator-metrics-bearer-token; do
+  cp -- "$secret_dir/$name" "$private_dir/$name"
+done
+for endpoint_secret in "${COMPOSER_ENDPOINT_SECRET_NAME:-}" "${COMPOSER_ADVISOR_ENDPOINT_SECRET_NAME:-}"; do
+  if [[ -z "$endpoint_secret" ]]; then continue; fi
+  [[ "$endpoint_secret" =~ ^[a-zA-Z0-9-]+$ ]]
+  test -s "$secret_dir/$endpoint_secret"
+  cp -- "$secret_dir/$endpoint_secret" "$private_dir/$endpoint_secret"
+done
+for value_file in "$private_dir"/elspeth-*-url-* "$private_dir"/elspeth-secret-key \
+  "$private_dir"/elspeth-shareable-link-signing-key "$private_dir"/elspeth-fingerprint-key \
+  "$private_dir"/elspeth-operator-metrics-bearer-token; do
+  name=${value_file##*/}
+  # Version receipts share the private directory but are never secret values.
+  if [[ "$name" == *.version ]]; then continue; fi
+  # The permission proof already wrote this exact value and captured its version.
+  if [[ "$name" == elspeth-secret-key || "$name" == elspeth-session-db-url-schema-owner ]]; then continue; fi
+  secret_vault=$vault
+  if [[ "$name" == *-schema-owner ]]; then secret_vault=$schema_vault; fi
+  capture "$private_dir/$name.version" az keyvault secret set --vault-name "$secret_vault" --name "$name" \
+    --file "$value_file" --encoding utf-8 --query id --output tsv --only-show-errors
+done
+for endpoint_secret in "${COMPOSER_ENDPOINT_SECRET_NAME:-}" "${COMPOSER_ADVISOR_ENDPOINT_SECRET_NAME:-}"; do
+  if [[ -z "$endpoint_secret" ]]; then continue; fi
+  capture "$private_dir/$endpoint_secret.version" az keyvault secret set --vault-name "$vault" --name "$endpoint_secret" \
+    --file "$private_dir/$endpoint_secret" --encoding utf-8 --query id --output tsv --only-show-errors
+done
+capture "$private_dir/resolve.log" env SECRET_VERSION_DIR="$private_dir" \
+  bash "$script_dir/resolve-workload-parameters.sh" "$inventory" "$output_dir/workload.parameters.json"
+document=$(jq --slurpfile inventory "$inventory" '
+  .parameters.verifyBlobManagedIdentity.value = true |
+  .parameters.blobAccountUrl.value = ("https://" + $inventory[0].blobStorageAccountName.value + ".blob.core.windows.net") |
+  .parameters.blobContainerName.value = $inventory[0].payloadContainerName.value |
+  .parameters.identityClientId.value = $inventory[0].identityClientId.value
+  ' "$output_dir/workload.parameters.json")
+printf '%s\n' "$document" >"$output_dir/workload.parameters.json"
+acceptance_urls=$(jq -n \
+  --rawfile session_a "$private_dir/elspeth-session-db-url-runtime-a.version" \
+  --rawfile landscape_a "$private_dir/elspeth-landscape-url-runtime-a.version" \
+  --rawfile session_b "$private_dir/elspeth-session-db-url-runtime-b.version" \
+  --rawfile landscape_b "$private_dir/elspeth-landscape-url-runtime-b.version" '
+  {a: {sessionDbUrl: ($session_a | rtrimstr("\n")), landscapeUrl: ($landscape_a | rtrimstr("\n"))},
+   b: {sessionDbUrl: ($session_b | rtrimstr("\n")), landscapeUrl: ($landscape_b | rtrimstr("\n"))}}')
+document=$(jq --argjson retained "$acceptance_urls" '.parameters.acceptanceRuntimeSecretUrls.value = $retained' \
+  "$output_dir/workload.parameters.json")
+printf '%s\n' "$document" >"$output_dir/workload.parameters.json"
+for role in a b; do
+  jq --arg role "$role" '
+    .parameters.runtimeRoleLabel.value = $role |
+    .parameters.activeRevisionsMode.value = "Multiple" |
+    .parameters.stickySessionsAffinity.value = "none" |
+    .parameters.minReplicas.value = 1 | .parameters.maxReplicas.value = 1
+    ' "$output_dir/workload.parameters.json" >"$output_dir/workload-${role}.parameters.json"
+done
+
+# The host-side observers need SQL connections too. Keep this credentials
+# envelope local and mode 0600; it is never a receipt or command-line argument.
+jq -n --slurpfile main "$MAIN_PARAMETERS" --arg host "$PGHOST" --arg cert "$PGSSLROOTCERT" \
+  --rawfile role_a "$private_dir/elspeth-session-db-url-runtime-a" \
+  --rawfile role_b "$private_dir/elspeth-session-db-url-runtime-b" '
+  ("?sslmode=verify-full&sslrootcert=" + ($cert | @uri)) as $tls |
+  ("postgresql+psycopg://" + ($main[0].parameters.postgresAdministratorLogin.value | @uri) + ":" +
+   ($main[0].parameters.postgresAdministratorPassword.value | @uri) + "@" + $host + ":5432/") as $admin |
+  {
+    ELSPETH_ACCEPTANCE_PG_ADMIN_URL: ($admin + "elspeth_sessions" + $tls),
+    ELSPETH_ACCEPTANCE_PG_RUNTIME_A_URL: (($role_a | split("?")[0]) + $tls),
+    ELSPETH_ACCEPTANCE_PG_RUNTIME_B_URL: (($role_b | split("?")[0]) + $tls),
+    ELSPETH_ACCEPTANCE_SESSION_DB_URL: ($admin + "elspeth_sessions" + $tls),
+    ELSPETH_ACCEPTANCE_LANDSCAPE_URL: ($admin + "elspeth_landscape" + $tls),
+    ELSPETH_TEST_POSTGRES_URL: ($admin + "postgres" + $tls)
+  }
+  ' >"$output_dir/acceptance-env.json"

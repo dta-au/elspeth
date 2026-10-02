@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,12 +23,15 @@ from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import llm_response_parsing as llm_response_parsing_module
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record, token_usage_from_response
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerServiceError
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
-from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
+from tests.unit.web.composer._helpers import (
+    _composer_service_with_session,
+    _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
+)
 
 
 @dataclass
@@ -432,20 +436,27 @@ def test_llm_call_record_redacts_raw_provider_error_detail() -> None:
 
 @pytest.fixture(autouse=True)
 def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.mark.asyncio
 async def test_text_only_success_records_llm_call_metadata() -> None:
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(
+        catalog=_mock_catalog(), settings=_make_settings(composer_pricing_model="openai/gpt-4o-2024-08-06")
+    )
     state = _empty_state()
     llm_response = _make_llm_response(content="Done.")
+    requests: list[dict[str, Any]] = []
 
-    with patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=llm_response) as mock_acomp:
-        result = await service.compose("Build a CSV pipeline", [], state)
+    async def complete(**kwargs: Any) -> _FakeLLMResponse:
+        requests.append(deepcopy(kwargs))
+        return llm_response
+
+    with patch("litellm.acompletion", new_callable=AsyncMock, side_effect=complete) as mock_acomp:
+        result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
 
     # New contract (post elspeth-861b0c58f5): model prose preserved verbatim,
     # system suffix appended; the synthetic [ELSPETH-SYSTEM] marker is the
@@ -453,30 +464,34 @@ async def test_text_only_success_records_llm_call_metadata() -> None:
     assert result.message.startswith("Done.")
     assert "[ELSPETH-SYSTEM]" in result.message
     assert result.raw_assistant_content == "Done."
-    assert len(result.llm_calls) == 1
-    call = result.llm_calls[0]
-    request_kwargs = mock_acomp.call_args.kwargs
-    assert call.status is ComposerLLMCallStatus.SUCCESS
-    assert call.model_requested == "openrouter/openai/gpt-5.5"
-    assert call.model_returned == "provider/model-returned"
-    assert call.prompt_tokens == 11
-    assert call.completion_tokens == 7
-    assert call.total_tokens == 18
-    assert call.provider_cost is None
-    assert call.provider_cost_source == "not_available"
-    assert call.provider_request_id == "chatcmpl-123"
-    assert call.messages_hash == stable_hash(request_kwargs["messages"])
-    assert call.tools_spec_hash == stable_hash(request_kwargs["tools"])
+    # Empty build-related prose gets one neutral repair turn. Both physical
+    # calls must retain their own request hashes and provider metadata.
+    assert mock_acomp.call_count == len(result.llm_calls) == 2
+    assert result.repair_turns_used == 1
+    assert result.llm_calls[0].messages_hash != result.llm_calls[1].messages_hash
+    for call, request_kwargs in zip(result.llm_calls, requests, strict=True):
+        assert call.status is ComposerLLMCallStatus.SUCCESS
+        assert call.model_requested == "openrouter/openai/gpt-5.5"
+        assert call.model_returned == "provider/model-returned"
+        assert call.prompt_tokens == 11
+        assert call.completion_tokens == 7
+        assert call.total_tokens == 18
+        assert call.pricing_model == "openai/gpt-4o-2024-08-06"
+        assert call.provider_cost == pytest.approx(0.0000975)
+        assert call.provider_cost_source == "litellm.cost_per_token"
+        assert call.provider_request_id == "chatcmpl-123"
+        assert call.messages_hash == stable_hash(request_kwargs["messages"])
+        assert call.tools_spec_hash == stable_hash(request_kwargs["tools"])
 
 
 @pytest.mark.asyncio
 async def test_success_records_provider_cost_from_usage_metadata() -> None:
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     state = _empty_state()
     llm_response = _make_llm_response(content="Done.", cost=0.0037)
 
-    with patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=llm_response):
-        result = await service.compose("Build a CSV pipeline", [], state)
+    with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response):
+        result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
 
     call = result.llm_calls[0]
     assert call.provider_cost == 0.0037
@@ -485,7 +500,7 @@ async def test_success_records_provider_cost_from_usage_metadata() -> None:
 
 @pytest.mark.asyncio
 async def test_success_records_provider_reasoning_metadata() -> None:
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     state = _empty_state()
     reasoning_details = [{"type": "reasoning.text", "text": "selected set_pipeline"}]
     thinking_blocks = [{"type": "thinking", "thinking": "checked required output options"}]
@@ -498,8 +513,8 @@ async def test_success_records_provider_reasoning_metadata() -> None:
         thinking_blocks=thinking_blocks,
     )
 
-    with patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=llm_response):
-        result = await service.compose("Build a CSV pipeline", [], state)
+    with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response):
+        result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
 
     call = result.llm_calls[0]
     payload = call.to_dict()
@@ -511,12 +526,12 @@ async def test_success_records_provider_reasoning_metadata() -> None:
 
 @pytest.mark.asyncio
 async def test_malformed_provider_cost_is_recorded_as_unavailable() -> None:
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     state = _empty_state()
     llm_response = _make_llm_response(content="Done.", cost="not-a-number")
 
-    with patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=llm_response):
-        result = await service.compose("Build a CSV pipeline", [], state)
+    with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response):
+        result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
 
     call = result.llm_calls[0]
     assert call.provider_cost is None
@@ -525,15 +540,15 @@ async def test_malformed_provider_cost_is_recorded_as_unavailable() -> None:
 
 @pytest.mark.asyncio
 async def test_unset_sampling_is_omitted_and_reflected_in_audit() -> None:
-    service = ComposerServiceImpl.for_trained_operator(
+    service, session_id = _composer_service_with_session(
         catalog=_mock_catalog(),
         settings=_make_settings(composer_model="anthropic/claude-3-5-sonnet-20241022"),
     )
     state = _empty_state()
     llm_response = _make_llm_response(content="Done.")
 
-    with patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=llm_response) as mock_acomp:
-        result = await service.compose("Build a CSV pipeline", [], state)
+    with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response) as mock_acomp:
+        result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
 
     request_kwargs = mock_acomp.call_args.kwargs
     assert "temperature" not in request_kwargs
@@ -544,7 +559,7 @@ async def test_unset_sampling_is_omitted_and_reflected_in_audit() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_call_then_final_response_records_both_llm_calls() -> None:
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     state = _empty_state()
     tool_turn = _make_llm_response(
         tool_calls=[
@@ -566,11 +581,11 @@ async def test_tool_call_then_final_response_records_both_llm_calls() -> None:
     )
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, side_effect=[tool_turn, final_turn]),
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=[tool_turn, final_turn]),
         patch("elspeth.web.composer.tool_batch.execute_tool", return_value=tool_result),
-        patch.object(service, "_cached_runtime_preflight", new_callable=AsyncMock, return_value=_passing_preflight()),
+        patch.object(service._preflight, "cached_runtime_preflight", new_callable=AsyncMock, return_value=_passing_preflight()),
     ):
-        result = await service.compose("Set a name", [], state)
+        result = await service.compose("Set a name", [], state, session_id=session_id)
 
     assert result.message == "Pipeline updated."
     assert [call.provider_request_id for call in result.llm_calls] == ["chatcmpl-tool", "chatcmpl-final"]
@@ -580,17 +595,17 @@ async def test_tool_call_then_final_response_records_both_llm_calls() -> None:
 
 @pytest.mark.asyncio
 async def test_deadline_timeout_records_llm_call_on_convergence_error() -> None:
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     state = _empty_state()
 
     async def timeout_llm(*_args: Any, **_kwargs: Any) -> _FakeLLMResponse:
         raise TimeoutError
 
     with (
-        patch.object(service, "_call_llm", side_effect=timeout_llm),
+        patch("litellm.acompletion", side_effect=timeout_llm),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
-        await service.compose("Hello", [], state)
+        await service.compose("Hello", [], state, session_id=session_id)
 
     assert exc_info.value.budget_exhausted == "timeout"
     assert len(exc_info.value.llm_calls) == 1
@@ -601,14 +616,14 @@ async def test_deadline_timeout_records_llm_call_on_convergence_error() -> None:
 async def test_bad_request_records_redacted_llm_call_on_service_error() -> None:
     from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     bad_request = LiteLLMBadRequestError(message="bad request leaked detail", model="bad", llm_provider="test")
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, side_effect=bad_request),
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=bad_request),
         pytest.raises(ComposerServiceError) as exc_info,
     ):
-        await service.compose("Hello", [], _empty_state())
+        await service.compose("Hello", [], _empty_state(), session_id=session_id)
 
     assert str(exc_info.value) == "LLM request rejected (BadRequestError)"
     llm_calls = _captured_llm_calls(exc_info.value)
@@ -621,17 +636,17 @@ async def test_bad_request_records_redacted_llm_call_on_service_error() -> None:
 
 @pytest.mark.asyncio
 async def test_unclassified_provider_exception_records_api_error_call() -> None:
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
 
     with (
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=ValueError("unexpected codec failure"),
         ),
         pytest.raises(ValueError, match="unexpected codec failure") as exc_info,
     ):
-        await service.compose("Hello", [], _empty_state())
+        await service.compose("Hello", [], _empty_state(), session_id=session_id)
 
     llm_calls = _captured_llm_calls(exc_info.value)
     assert len(llm_calls) == 1
@@ -643,14 +658,14 @@ async def test_unclassified_provider_exception_records_api_error_call() -> None:
 
 @pytest.mark.asyncio
 async def test_empty_choices_records_malformed_response() -> None:
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     empty_response = _FakeLLMResponse(choices=[], usage=SimpleNamespace(prompt_tokens=3, completion_tokens=None, total_tokens=3))
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=empty_response),
+        patch("litellm.acompletion", new_callable=AsyncMock, return_value=empty_response),
         pytest.raises(ComposerServiceError) as exc_info,
     ):
-        await service.compose("Hello", [], _empty_state())
+        await service.compose("Hello", [], _empty_state(), session_id=session_id)
 
     llm_calls = _captured_llm_calls(exc_info.value)
     assert len(llm_calls) == 1
@@ -699,17 +714,17 @@ async def test_malformed_nonempty_response_records_malformed_not_success(case: s
     the caller crashed dereferencing message/content/tool_calls after durable
     audit evidence had already recorded the call as successful.
     """
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     malformed = _FakeLLMResponse(
         choices=[choice],
         usage=SimpleNamespace(prompt_tokens=3, completion_tokens=None, total_tokens=3),
     )
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=malformed),
+        patch("litellm.acompletion", new_callable=AsyncMock, return_value=malformed),
         pytest.raises(ComposerServiceError) as exc_info,
     ):
-        await service.compose("Hello", [], _empty_state())
+        await service.compose("Hello", [], _empty_state(), session_id=session_id)
 
     llm_calls = _captured_llm_calls(exc_info.value)
     assert len(llm_calls) == 1
@@ -720,14 +735,14 @@ async def test_malformed_nonempty_response_records_malformed_not_success(case: s
 
 @pytest.mark.asyncio
 async def test_cancelled_model_call_records_cancelled_status() -> None:
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     cancelled = asyncio.CancelledError()
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, side_effect=cancelled),
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=cancelled),
         pytest.raises(asyncio.CancelledError) as exc_info,
     ):
-        await service.compose("Hello", [], _empty_state())
+        await service.compose("Hello", [], _empty_state(), session_id=session_id)
 
     llm_calls = _captured_llm_calls(exc_info.value)
     assert len(llm_calls) == 1
@@ -738,7 +753,7 @@ def test_pydantic_extra_unset_slot_reads_as_no_extras_without_raising() -> None:
     """A declared-but-unset ``__pydantic_extra__`` slot is third-party state a
     partially constructed provider object can legitimately carry: the boundary
     answers None ("no extras"), it never propagates the AttributeError."""
-    from elspeth.web.composer.llm_response_parsing import _pydantic_extra_fields
+    from elspeth.core.llm_pricing import _pydantic_extra_fields
 
     class _UnsetSlot:
         __slots__ = ("__pydantic_extra__",)

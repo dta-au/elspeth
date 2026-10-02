@@ -121,3 +121,138 @@ def test_illegal_collector_reports_the_node_kind_not_the_plugins_config_error():
     with pytest.raises(ValueError, match=r"Collector 'digest' uses transform 'llm' which has is_batch_aware=False") as excinfo:
         instantiate_plugins_from_config(_settings_with_illegal_llm_collector(), preflight_mode=True)
     assert "provider" not in str(excinfo.value)  # the llm constructor never ran
+
+
+# elspeth-5887fb7928 AC-R4 — two placements that used to pass ``validate`` and
+# abort every row or group at run time. Both verdicts come from the plugin
+# CLASS, before construction, so the options below — which the plugin's own
+# constructor would reject (batch_stats has no value_field; report_assemble
+# has no text_field) — never get the chance to report a config error instead.
+_UNCONSTRUCTIBLE_OPTIONS = {"schema": {"mode": "observed"}}
+
+
+def test_batch_plugin_under_transforms_reports_the_placement_not_the_plugins_config_error():
+    settings = load_settings_from_config_dict(
+        {
+            **_BASE_DOC,
+            "transforms": [
+                {
+                    "name": "stats",
+                    "plugin": "batch_stats",
+                    "input": "rows",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": _UNCONSTRUCTIBLE_OPTIONS,
+                }
+            ],
+        }
+    )
+    with pytest.raises(ValueError, match=r"Transform 'stats' uses transform 'batch_stats' which is batch-aware") as excinfo:
+        instantiate_plugins_from_config(settings, preflight_mode=True)
+    assert "value_field" not in str(excinfo.value)  # the batch_stats constructor never ran
+
+
+def test_flush_window_plugin_as_collector_reports_the_placement_not_the_plugins_config_error():
+    settings = load_settings_from_config_dict(
+        {
+            **_BASE_DOC,
+            "collectors": [
+                {"name": "digest", "plugin": "report_assemble", "input": "pages", "on_success": "out", "options": _UNCONSTRUCTIBLE_OPTIONS}
+            ],
+            "scopes": [{"name": "document", "opener": "explode", "closer": "digest", "policy": "require_all"}],
+        }
+    )
+    with pytest.raises(
+        ValueError, match=r"Collector 'digest' uses transform 'report_assemble' which requires an aggregation flush window"
+    ) as excinfo:
+        instantiate_plugins_from_config(settings, preflight_mode=True)
+    assert "text_field" not in str(excinfo.value)  # the report_assemble constructor never ran
+
+
+def test_only_report_assemble_declares_the_aggregation_window_requirement():
+    """The declaration is opt-in: every other registered batch plugin stays a legal collector."""
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    transforms = get_shared_plugin_manager().get_transforms()
+    assert {cls.name for cls in transforms if cls.requires_aggregation_batch_context} == {"report_assemble"}
+    # Positive control: the registry is populated and batch plugins are in it.
+    assert len({cls.name for cls in transforms if cls.is_batch_aware}) >= 13
+
+
+def test_every_registered_batch_plugin_states_whether_passthrough_can_carry_it():
+    """flush_emits_one_row_per_buffered_row is ONE authority, stated in each batch plugin's own class body.
+
+    Exactly one shipped batch plugin emits one row per buffered row:
+    batch_rank, which emits every buffered row (an unranked one with a null
+    rank). Every other one reduces the batch, replicates rows, or
+    (batch_outlier_annotator) skips rows whose value is null or non-finite, so
+    passthrough admits none of them.
+    """
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    batch_plugins = [cls for cls in get_shared_plugin_manager().get_transforms() if cls.is_batch_aware]
+    assert len(batch_plugins) >= 13  # positive control: the registry is populated
+    undeclared = sorted(cls.name for cls in batch_plugins if "flush_emits_one_row_per_buffered_row" not in cls.__dict__)
+    assert undeclared == []
+    assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == ["batch_rank"]
+
+
+def test_the_passthrough_declaration_census_sees_a_declaring_plugin(monkeypatch):
+    """Positive control for the census above: a plugin that declares True is reported."""
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    batch_stats_cls = get_shared_plugin_manager().get_transform_by_name("batch_stats")
+    monkeypatch.setattr(batch_stats_cls, "flush_emits_one_row_per_buffered_row", True)
+    batch_plugins = [cls for cls in get_shared_plugin_manager().get_transforms() if cls.is_batch_aware]
+    assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == ["batch_rank", "batch_stats"]
+
+
+def test_a_passthrough_aggregation_reports_the_output_mode_not_the_plugins_config_error():
+    settings = load_settings_from_config_dict(
+        {
+            **_BASE_DOC,
+            "aggregations": [
+                {
+                    "name": "stats",
+                    "plugin": "batch_stats",
+                    "input": "rows",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "trigger": {"count": 3},
+                    "output_mode": "passthrough",
+                    "options": _UNCONSTRUCTIBLE_OPTIONS,
+                }
+            ],
+        }
+    )
+    with pytest.raises(ValueError, match=r"Aggregation 'stats' uses transform 'batch_stats' with output_mode: passthrough") as excinfo:
+        instantiate_plugins_from_config(settings, preflight_mode=True)
+    assert "value_field" not in str(excinfo.value)  # the batch_stats constructor never ran
+    # The refusal states what is true of any undeclared plugin — it does not
+    # DECLARE the capability — and names the declaration a custom 1:1 plugin
+    # author sets (P5 review r1 F3).
+    assert "does not declare that its flush emits exactly one row per buffered row" in str(excinfo.value)
+    assert "declares flush_emits_one_row_per_buffered_row = True on its class" in str(excinfo.value)
+
+
+def test_a_passthrough_aggregation_of_the_declaring_batch_rank_is_admitted():
+    """Control for the refusal above: batch_rank declares the capability, so the same aggregation builds."""
+    settings = load_settings_from_config_dict(
+        {
+            **_BASE_DOC,
+            "aggregations": [
+                {
+                    "name": "rank",
+                    "plugin": "batch_rank",
+                    "input": "rows",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "trigger": {"count": 3},
+                    "output_mode": "passthrough",
+                    "options": {"schema": {"mode": "observed"}, "value_field": "score"},
+                }
+            ],
+        }
+    )
+    plugins = instantiate_plugins_from_config(settings, preflight_mode=True)
+    assert [aggregation.name for aggregation, _settings in plugins.aggregations.values()] == ["batch_rank"]

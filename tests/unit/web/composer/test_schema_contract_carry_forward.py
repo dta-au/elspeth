@@ -240,15 +240,20 @@ def test_real_csv_contract_carries_optional_types_defaults_and_required_fields()
         "delimiter",
         "encoding",
         "skip_rows",
+        "snapshot_for_resume",
     }
     assert properties["delimiter"]["type"] == "string"
     assert properties["delimiter"]["default"] == ","
     assert properties["skip_rows"]["default"] == 0
+    assert properties["snapshot_for_resume"] == {"type": "boolean", "default": False}
     assert entry["json_schema"]["required"] == ["schema", "path", "on_validation_failure"]
     knob_fields = {cast(str, field["name"]): field for field in cast(list[dict[str, object]], entry["knob_schema"]["fields"])}
     assert knob_fields["schema"]["required"] is True
     assert knob_fields["delimiter"]["required"] is False
     assert knob_fields["delimiter"]["default"] == ","
+    assert knob_fields["snapshot_for_resume"]["kind"] == "checkbox"
+    assert knob_fields["snapshot_for_resume"]["required"] is False
+    assert knob_fields["snapshot_for_resume"]["default"] is False
     assert "description" not in canonical_json(entry)
 
 

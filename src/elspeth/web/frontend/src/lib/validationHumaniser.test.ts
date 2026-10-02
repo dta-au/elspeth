@@ -1,125 +1,76 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  clientWireBlockerMessages,
   formatFindingBody,
   humaniseValidationMessage,
+  humaniseExecutionError,
+  humaniseValidationWarning,
+  humaniseValidationSuggestion,
   makePhraseFor,
 } from "./validationHumaniser";
 import {
   COLLECTOR_PHRASE,
   UNKNOWN_COMPONENT_PHRASE,
-} from "@/components/chat/guided/pipelineGloss";
+} from "@/components/chat/pipelineGloss";
 import { makeComposition } from "@/test/composerFixtures";
 import type { NodeSpec } from "@/types/index";
 
 // ── humaniseValidationMessage ───────────────────────────────────────────────
 
 describe("humaniseValidationMessage", () => {
-  const identityPhraseFor = (id: string | null): string => id ?? "(null)";
+  const phraseFor = (id: string | null): string => id === "actual" ? "Actual step" : UNKNOWN_COMPONENT_PHRASE;
 
-  it("passes an unrecognised message through untouched", () => {
-    const finding = humaniseValidationMessage("Some other error", identityPhraseFor);
-    expect(finding).toEqual({ headline: "Some other error", raw: null, namedSteps: [] });
-  });
-
-  it("humanises a two-sided contract violation with both producer and consumer phrases", () => {
-    const finding = humaniseValidationMessage(
-      "Schema contract violation: 'rater' -> 'out'. Consumer requires: [score]",
-      identityPhraseFor,
-    );
-    expect(finding.headline).toBe(
-      "Two steps aren't connected correctly: the \"rater\" step's output doesn't match what \"out\" expects.",
-    );
-    expect(finding.raw).toContain("Schema contract violation");
-  });
-
-  it("humanises a one-sided contract violation (no consumer capture) without a second phrase", () => {
-    const finding = humaniseValidationMessage(
-      "Semantic contract violation: 'rater'. Declares output fields that don't match downstream.",
-      identityPhraseFor,
-    );
-    expect(finding.headline).toBe(
-      "A step isn't connected correctly: \"rater\" doesn't match what the next step expects.",
-    );
-  });
-
-  it("humanises the backend transform contract shape without leaking its node id", () => {
-    // Rule C's own headline since elspeth-920bd88299 — it no longer shares
-    // "Transform contract violation" (nor an error_code) with the Rule D
-    // collision check, so this fixture exercises the second pattern.
-    const message =
-      "Transform output guarantee violation: node 'select_output_fields' (field_mapper) declares output " +
-      "fields [batch_size, customer_tier] (required) but with select_only: true the mapping can only " +
-      "guarantee [customer_tier]. Declared required output fields not guaranteed by this transform: " +
-      "[batch_size]. Those names are mapping TARGETS, and `schema` is this node's INPUT contract, so a " +
-      "target is usually absent from `schema.fields` altogether.";
-
-    const finding = humaniseValidationMessage(
-      message,
-      (id) => (id === "select_output_fields" ? "choose the output fields" : "unknown step"),
-    );
-
-    expect(finding.headline).toBe(
-      "A step isn't connected correctly: \"choose the output fields\" doesn't match what the next step expects.",
-    );
-    expect(finding.headline).not.toContain("select_output_fields");
+  it("uses code and the single component, retaining contradictory prose as detail", () => {
+    const message = "Schema contract violation: edge 'invented' → 'other'";
+    const finding = humaniseValidationMessage({ message, error_code: "schema_contract_violation", component: "actual" }, phraseFor);
+    expect(finding.headline).toBe('A step has incompatible data: "Actual step".');
+    expect(finding.namedSteps).toEqual(["Actual step"]);
     expect(finding.raw).toBe(message);
+    expect(finding.headline).not.toContain("invented");
   });
 
-  it("humanises the transform output collision shape (Rule D keeps the original headline)", () => {
-    const message =
-      "Transform contract violation: node 'rewrite' (llm) declares output fields [headline] but " +
-      "[headline] already arrive(s) on its input row. The engine rejects a transform that would " +
-      "overwrite an existing input field, so this pipeline fails on the first row.";
-
-    const finding = humaniseValidationMessage(
-      message,
-      (id) => (id === "rewrite" ? "rewrite the headline" : "unknown step"),
-    );
-
-    expect(finding.headline).toBe(
-      "A step isn't connected correctly: \"rewrite the headline\" doesn't match what the next step expects.",
-    );
-    expect(finding.raw).toBe(message);
+  it.each([null, "", "unknown_code"])("does not classify prose with code %s", (error_code) => {
+    const message = "Schema contract violation: edge 'invented' → 'other'";
+    expect(humaniseValidationMessage({ message, error_code, component: "actual" }, phraseFor)).toEqual({ headline: message, raw: null, namedSteps: [] });
   });
 
-  it("humanises the edge-contract preflight dump format", () => {
-    const finding = humaniseValidationMessage(
-      "Edge contract violation between producer node 'rater' (schema 'A') and consumer node 'out' (schema 'B'):\nMissing: score",
-      identityPhraseFor,
-    );
-    expect(finding.headline).toContain("aren't connected correctly");
+  it("uses a generic contract headline without an identified component", () => {
+    expect(humaniseValidationMessage({message: "arbitrary detail", error_code: "schema_contract_violation", component: null}, phraseFor).headline).toBe("The pipeline has incompatible data between steps.");
   });
 
-  it("humanises an interpretation-review-pending dump via stepLabelFor", () => {
-    const finding = humaniseValidationMessage(
-      "pipeline_decision review pending for transform 'rater': drop_raw_html_fields",
-      identityPhraseFor,
-      () => "Summarise",
-    );
+  it("uses the structured review code even when prose has another identifier", () => {
+    const finding = humaniseValidationMessage({message: "review pending for transform 'invented'", error_code: "interpretation_review_pending", component: "actual"}, phraseFor, (id) => id === "actual" ? "Summarise" : null);
     expect(finding.headline).toBe("The Summarise step is waiting for your review.");
-    expect(finding.raw).toContain("pipeline_decision");
   });
 
-  it("falls back to a generic review-pending headline when stepLabelFor cannot resolve the id", () => {
-    const finding = humaniseValidationMessage(
-      "pipeline_decision review pending for transform 'ghost': drop_raw_html_fields",
-      identityPhraseFor,
-      () => null,
-    );
-    expect(finding.headline).toBe("A step is waiting for your review.");
+  it("renders a generic review headline without a resolvable component", () => {
+    expect(humaniseValidationMessage({message: "detail", error_code: "interpretation_review_pending", component: null}, phraseFor).headline).toBe("A step is waiting for your review.");
+  });
+});
+
+describe("validation adapters", () => {
+  const message = "Schema contract violation: edge 'wrong' → 'also_wrong'";
+  const phraseFor = (id: string | null): string => id === "owned" ? "Owned step" : UNKNOWN_COMPONENT_PHRASE;
+
+  it("preserves warning prose without inventing an error code", () => {
+    expect(humaniseValidationWarning({ message, component_id: "owned", component_type: "transform", suggestion: null })).toEqual({ headline: message, raw: null, namedSteps: [] });
   });
 
-  it("does not special-case review-pending dumps when no stepLabelFor is supplied", () => {
-    // No stepLabelFor → falls through to the generic contract-violation /
-    // passthrough path rather than crashing.
-    const finding = humaniseValidationMessage(
-      "pipeline_decision review pending for transform 'rater': drop_raw_html_fields",
-      identityPhraseFor,
-    );
-    expect(finding.raw).toBeNull();
-    expect(finding.headline).toContain("review pending");
+  it("adapts the actual execution error fields", () => {
+    const finding = humaniseExecutionError({message, component_id: "owned", component_type: "transform", suggestion: null, error_code: "schema_contract_violation"}, phraseFor);
+    expect(finding.namedSteps).toEqual(["Owned step"]);
+    expect(finding.raw).toBe(message);
+  });
+
+  it("does not invent identity when an execution error has no code", () => {
+    expect(humaniseExecutionError({message, component_id: "owned", component_type: "transform", suggestion: null}, phraseFor).headline).toBe(message);
+  });
+
+  it("adapts a suggestion without interpreting its severity or prose", () => {
+    const finding = humaniseValidationSuggestion({message, component: "owned", severity: "info", error_code: "schema_contract_violation"}, phraseFor);
+    expect(finding.namedSteps).toEqual(["Owned step"]);
+    expect(finding.raw).toBe(message);
+    expect(humaniseValidationSuggestion({message, component: "owned", severity: "info"}, phraseFor).headline).toBe(message);
   });
 });
 
@@ -217,8 +168,8 @@ describe("makePhraseFor", () => {
 
   it("guesses a phrase for a role+format-bearing generated id absent from the composition", () => {
     const phraseFor = makePhraseFor(null);
-    expect(phraseFor("sink_guided_output_csv_abcd1234")).toBe("write a CSV");
-    expect(phraseFor("transform_guided_xform_0_abcd1234")).toBe("process each row");
+    expect(phraseFor("sink_generated_output_csv_abcd1234")).toBe("write a CSV");
+    expect(phraseFor("transform_generated_xform_0_abcd1234")).toBe("process each row");
   });
 
   // ── elspeth-66f50ba810: fuzzy known-component match must win over the ────
@@ -317,7 +268,7 @@ describe("makePhraseFor", () => {
 
   it("prioritises an authoritative row_union type over generated id-role heuristics", () => {
     const phraseFor = makePhraseFor(null);
-    expect(phraseFor("output_guided_row_union_a1b2", "row_union")).toBe(
+    expect(phraseFor("output_generated_row_union_a1b2", "row_union")).toBe(
       "wait for every branch, then preserve every branch row",
     );
   });
@@ -325,7 +276,7 @@ describe("makePhraseFor", () => {
   it("prioritises an authoritative collector type over generated id-role heuristics", () => {
     const phraseFor = makePhraseFor(null);
 
-    expect(phraseFor("output_guided_collector_a1b2", "collector")).toBe(
+    expect(phraseFor("output_generated_collector_a1b2", "collector")).toBe(
       COLLECTOR_PHRASE,
     );
   });
@@ -419,75 +370,8 @@ describe("makePhraseFor — compiled-id strip", () => {
 
   it("leaves short-hash generated ids to the existing fuzzy/role ladder (12-hex suffix required)", () => {
     const phraseFor = makePhraseFor(null);
-    // 8-hex suffixes (the guided generated-id shape pinned above) must not
-    // enter the strip; the role/format guess still answers.
-    expect(phraseFor("transform_guided_xform_0_abcd1234")).toBe("process each row");
-    expect(phraseFor("sink_guided_output_csv_abcd1234")).toBe("write a CSV");
-  });
-});
-
-// ── the session-2e0c8ea3 banner shape (elspeth-9f21f3c57d) ──────────────────
-
-describe("humaniseValidationMessage — compiled-id edge dump names the real steps", () => {
-  it("renders both composer step names for the exact session-2e0c8ea3 banner shape", () => {
-    const state = makeComposition(1, {
-      sources: {},
-      nodes: [
-        {
-          id: "fan_out",
-          node_type: "gate",
-          plugin: null,
-          input: "source",
-          on_success: null,
-          on_error: null,
-          options: {},
-          condition: "row.kind == 'colour'",
-        },
-        {
-          id: "recommend_pairing",
-          node_type: "transform",
-          plugin: "llm",
-          input: "fan_out",
-          on_success: null,
-          on_error: null,
-          options: {},
-          description: "Ask the LLM for a complementary colour pairing for this colour.",
-        },
-      ],
-      outputs: [],
-    });
-    const phraseFor = makePhraseFor(state);
-    const finding = humaniseValidationMessage(
-      "Schema contract violation: edge 'config_gate_fan_out_5176d9a61403' → 'transform_recommend_pairing_5176d9a61403'\n" +
-        "  Consumer (llm) requires fields: ['colour']\n" +
-        "  Producer (gate) guarantees: ['kind']\n" +
-        "  Missing fields: ['colour']",
-      phraseFor,
-    );
-    expect(finding.headline).toBe(
-      'Two steps aren\'t connected correctly: the "Fan Out" step\'s output ' +
-        'doesn\'t match what "Ask the LLM for a complementary colour pairing for this colour" expects.',
-    );
-    expect(finding.headline).not.toContain("this step");
-    expect(finding.headline).not.toContain("rate each row");
-    expect(finding.namedSteps).toEqual([
-      "Fan Out",
-      "Ask the LLM for a complementary colour pairing for this colour",
-    ]);
-  });
-
-  it("still degrades to the generic phrases when neither compiled id is mappable", () => {
-    const phraseFor = makePhraseFor(makeComposition(1, { sources: {}, nodes: [], outputs: [] }));
-    const finding = humaniseValidationMessage(
-      "Schema contract violation: edge 'config_gate_ghost_aaaabbbbcccc' → 'coalesce_phantom_aaaabbbbcccc'\n" +
-        "  Missing fields: ['x']",
-      phraseFor,
-    );
-    expect(finding.headline).toBe(
-      'Two steps aren\'t connected correctly: the "this step" step\'s output ' +
-        'doesn\'t match what "this step" expects.',
-    );
-    expect(finding.namedSteps).toEqual([]);
+    expect(phraseFor("transform_generated_xform_0_abcd1234")).toBe("process each row");
+    expect(phraseFor("sink_generated_output_csv_abcd1234")).toBe("write a CSV");
   });
 });
 
@@ -595,21 +479,5 @@ describe("formatFindingBody", () => {
       phraseFor,
     );
     expect(calls).toEqual([["csv_refunds_a1b2", "source"]]);
-  });
-});
-
-describe("clientWireBlockerMessages", () => {
-  it("drops the guided deferred-commit placeholder status", () => {
-    expect(clientWireBlockerMessages(["guided_composition_invalid"])).toEqual([]);
-  });
-
-  it("keeps real validation messages while dropping the placeholder", () => {
-    expect(
-      clientWireBlockerMessages(["guided_composition_invalid", "No source configured."]),
-    ).toEqual(["No source configured."]);
-  });
-
-  it("passes ordinary error lists through untouched", () => {
-    expect(clientWireBlockerMessages(["No sinks configured."])).toEqual(["No sinks configured."]);
   });
 });

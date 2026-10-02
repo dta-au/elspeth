@@ -41,11 +41,13 @@ EXPECTED_BUILTIN_IDENTITIES = frozenset(
         "source:json",
         "source:llm",
         "source:null",
+        "source:power_automate",
         "source:text",
         "transform:aws_bedrock_content_safety",
         "transform:aws_bedrock_prompt_shield",
         "transform:aws_textract_document_analysis",
         "transform:aws_textract_inline_analysis",
+        "transform:azure_ai_search",
         "transform:azure_content_safety",
         "transform:azure_document_intelligence",
         "transform:azure_prompt_shield",
@@ -57,6 +59,7 @@ EXPECTED_BUILTIN_IDENTITIES = frozenset(
         "transform:batch_experiment_compare",
         "transform:batch_outlier_annotator",
         "transform:batch_paired_preference",
+        "transform:batch_rank",
         "transform:batch_replicate",
         "transform:batch_stats",
         "transform:batch_threshold_summary",
@@ -87,6 +90,7 @@ EXPECTED_BUILTIN_IDENTITIES = frozenset(
         "sink:dataverse",
         "sink:document",
         "sink:json",
+        "sink:power_automate",
         "sink:text",
     }
 )
@@ -104,12 +108,14 @@ OPERATOR_PROFILED_IDENTITIES = frozenset(
         "transform:aws_bedrock_prompt_shield",
         "transform:aws_bedrock_content_safety",
         "transform:aws_textract_document_analysis",
+        "transform:azure_ai_search",
     }
 )
 RAW_TRAINED_OPERATOR_PROFILED_IDENTITIES = frozenset(
     {
         "source:aws_s3",
         "transform:aws_textract_document_analysis",
+        "transform:azure_ai_search",
     }
 )
 WEB_PROFILE_EXAMPLE_IDENTITIES = OPERATOR_PROFILED_IDENTITIES - RAW_TRAINED_OPERATOR_PROFILED_IDENTITIES
@@ -121,6 +127,21 @@ REFERENCE_FIELDS = (
 )
 REFERENCES = discover_builtin_references()
 REFERENCES_BY_IDENTITY = {f"{reference.kind}:{reference.plugin_cls.name}": reference for reference in REFERENCES}
+
+
+def test_llm_live_assistance_separates_upstream_requirements_from_generated_outputs() -> None:
+    assistance = REFERENCES_BY_IDENTITY["transform:llm"].plugin_cls.get_agent_assistance()
+    assert assistance is not None
+    hints = "\n".join(assistance.composer_hints)
+    assert "options.schema declares INPUT" not in hints
+    assert "schema.fields may declare output types (ADR-050)" in hints
+    assert "required_input_fields names upstream columns" in hints
+    assert "output_fields" in hints and "unprefixed" in hints
+    example = next(example for example in assistance.examples if "colour" in example.title)
+    after = deep_thaw(example.after)
+    assert after["required_input_fields"] == ["colour"]
+    assert after["schema"]["fields"] == ["colour: str"]
+    assert set(after["queries"]) == {"good_colour_pair", "approximate_hex"}
 
 
 def _identity(reference: BuiltinReference) -> str:
@@ -214,11 +235,11 @@ def _operator_profile_registry() -> OperatorProfileRegistry:
 
 
 def test_registry_contains_the_exact_accepted_builtin_inventory() -> None:
-    assert len(REFERENCES) == 55
+    assert len(REFERENCES) == 59
     assert Counter(reference.kind for reference in REFERENCES) == {
-        "source": 9,
-        "transform": 37,
-        "sink": 9,
+        "source": 10,
+        "transform": 39,
+        "sink": 10,
     }
     assert {_identity(reference) for reference in REFERENCES} == EXPECTED_BUILTIN_IDENTITIES
 
@@ -257,7 +278,7 @@ def test_operator_profiled_exception_set_is_fixed_and_exhaustive() -> None:
             profiled_examples.add(_identity(reference))
 
     assert profiled_examples == WEB_PROFILE_EXAMPLE_IDENTITIES
-    assert len(DIRECT_CONFIG_REFERENCES) == 51
+    assert len(DIRECT_CONFIG_REFERENCES) == 55
 
 
 @pytest.mark.parametrize("reference", DIRECT_CONFIG_REFERENCES, ids=_identity)

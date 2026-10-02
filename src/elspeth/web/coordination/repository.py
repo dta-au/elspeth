@@ -7,9 +7,11 @@ connections.
 
 from __future__ import annotations
 
+import json
 import secrets
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final
@@ -25,10 +27,9 @@ from elspeth.contracts.blobs import (
     BLOB_STATUSES,
     STORAGE_MIME_TYPES,
     BlobActiveRunError,
+    BlobAtomicDeletionObligation,
     BlobCreationObligation,
     BlobDeletionPlan,
-    BlobGuidedOperationFenceLostError,
-    BlobGuidedOperationWriteFence,
     BlobInProgressForkError,
     BlobPendingProposalError,
     BlobRecord,
@@ -40,22 +41,39 @@ from elspeth.contracts.blobs import (
     names_same_blob,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
+from elspeth.contracts.chargeable_admission import (
+    AdmissionRefusalReason,
+    ChargeableAdmissionDecision,
+    ChargeableAdmissionPolicy,
+    ChargeableOperation,
+)
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
     InterpretationEventRecord,
     InterpretationKind,
     InterpretationSource,
+    InterpretationSurfaceOrigin,
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
-from elspeth.web.composer.redaction import assert_guided_custody_persistable
 from elspeth.web.coordination import mutation_connection_registry as _mutation_connection_registry
+from elspeth.web.coordination.approval_authority import (
+    ApprovalGateInputs,
+    ApprovalSupersession,
+    RepositoryApprovalAuthority,
+    evaluate_approval_gate,
+    refuse_unrecorded_approval_supersession,
+    supersede_open_approvals,
+)
+from elspeth.web.coordination.chargeable_admission_authority import RepositoryChargeableAdmissionAuthority
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
     ArchiveManifestRelation,
     FenceLossReason,
+    RecoveryRequiredReason,
+    RunSagaState,
     SessionOperationContext,
     SessionOperationFence,
     SessionOperationFenceLost,
@@ -66,6 +84,8 @@ from elspeth.web.coordination.mutation_connection_registry import (
     _resolve_mutation_connection,
     _unregister_mutation_connection,
 )
+from elspeth.web.coordination.quota_authority import QuotaExceeded, RepositoryQuotaAuthority, refuse_unrecorded_quota_exceeded
+from elspeth.web.coordination.run_start_permit_authority import RepositoryRunStartPermitAuthority
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock, transaction_session_lock
 from elspeth.web.sessions.models import (
@@ -80,36 +100,38 @@ from elspeth.web.sessions.models import (
     composition_proposals_table,
     composition_rejection_events_table,
     composition_states_table,
-    guided_operations_table,
     interpretation_events_table,
     library_entries_table,
     proposal_blob_effect_receipts_table,
     proposal_events_table,
+    quota_provider_attempts_table,
     review_attestations_table,
     review_requests_table,
     run_events_table,
+    run_execution_inputs_table,
     runs_table,
     session_operation_fences_table,
+    session_operation_receipts_table,
     session_read_admissions_table,
     sessions_table,
+    token_usage_ledger_table,
     web_instances_table,
 )
 from elspeth.web.sessions.proposal_blob_effects import BlobSnapshotPayload, blob_record_snapshot_payload, proposal_blob_arguments_hash
 from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
 from elspeth.web.sessions.protocol import (
-    GUIDED_OPERATION_KIND_VALUES,
     LEGAL_RUN_TRANSITIONS,
     OPERATOR_COMPLETION_RUN_STATUS_VALUES,
     SESSION_RUN_EVENT_TYPE_VALUES,
     SESSION_RUN_STATUS_VALUES,
     SESSION_TERMINAL_RUN_STATUS_VALUES,
     CompositionStateRecord,
-    GuidedOperationFence,
-    GuidedOperationKind,
     IllegalRunTransitionError,
+    OperationReceiptFence,
     RunAlreadyActiveError,
     RunEventRecord,
     RunRecord,
+    RunStartPermitRecord,
     SessionArchiveDisposition,
     SessionCompositionStateCreation,
     SessionForkAuthority,
@@ -119,8 +141,7 @@ from elspeth.web.sessions.protocol import (
     SessionForkChildStateCreation,
     SessionForkCreationTransaction,
     SessionForkParentAuthority,
-    SessionForkParentGuidedMutations,
-    SessionGuidedOperationInProgressError,
+    SessionForkParentReceiptMutations,
     SessionNotFoundError,
     SessionOperationBlobMutations,
     SessionOperationCompositionMutations,
@@ -133,9 +154,12 @@ from elspeth.web.sessions.protocol import (
     SessionPendingInterpretationSiteSnapshot,
     SessionPendingInterpretationSnapshot,
     SessionPendingInterpretationValidator,
+    SessionReceiptInProgressError,
     SessionRecord,
     SessionRunEventType,
     SessionRunStatus,
+    decode_stored_composition_validation_errors,
+    serialize_composition_validation_errors,
 )
 from elspeth.web.sessions.state_envelope import envelope_state_column, unwrap_state_column
 
@@ -144,6 +168,7 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
     from elspeth.contracts.auth import AuthProviderType
+    from elspeth.web.execution.envelope import RunExecutionInput
 
 _MAX_SESSION_ID_COLLISION_ATTEMPTS = 8
 _MUTATION_CONNECTION_REGISTRY = _mutation_connection_registry._MUTATION_CONNECTION_REGISTRY
@@ -310,7 +335,6 @@ _BLOB_DELETION_RECOVERY_OPERATION_KINDS = frozenset(
 # plan is a write: a shareable BLOB_READ admission (no fence row) must never
 # hold it, so the writer set is the recovery set minus the read kind.
 _BLOB_RECOVERY_WRITE_OPERATION_KINDS = _BLOB_DELETION_RECOVERY_OPERATION_KINDS - {SessionOperationKind.BLOB_READ}
-_GUIDED_INLINE_CUSTODY_OPERATION_KINDS = frozenset({"guided_plan", "guided_respond"})
 
 _ACTIVE_RUN_COMPOSITION_COLUMNS = (
     runs_table.c.id.label("run_id"),
@@ -344,7 +368,7 @@ def _active_run_state_record(active_run: Any) -> CompositionStateRecord:
         outputs=unwrap_state_column(active_run.outputs),
         metadata_=unwrap_state_column(active_run.metadata_),
         is_valid=bool(active_run.is_valid),
-        validation_errors=active_run.validation_errors,
+        validation_errors=decode_stored_composition_validation_errors(active_run.validation_errors),
         created_at=active_run.created_at,
         derived_from_state_id=(UUID(str(active_run.derived_from_state_id)) if active_run.derived_from_state_id is not None else None),
         composer_meta=unwrap_state_column(active_run.composer_meta),
@@ -431,7 +455,7 @@ def _ensure_utc(value: object) -> datetime:
     """Normalise one exact datetime row value to UTC; anything else is a malformed row."""
     if not isinstance(value, datetime):
         raise AuditIntegrityError("expected a datetime row value")
-    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _composition_state_column(value: Any) -> Any:
@@ -483,7 +507,14 @@ def _validate_archive_manifest_identity(
 class _RepositoryMutationState:
     """Shared private state for one short-lived fenced transaction."""
 
-    __slots__ = ("_connection_token", "_database_now", "_operation_context", "_session_id")
+    __slots__ = (
+        "_approval_supersession_recorder",
+        "_connection_token",
+        "_database_now",
+        "_operation_context",
+        "_quota_exceeded_recorder",
+        "_session_id",
+    )
 
     def __init__(
         self,
@@ -492,11 +523,15 @@ class _RepositoryMutationState:
         session_id: str,
         database_now: datetime,
         operation_context: SessionOperationContext | None = None,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+        approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
     ) -> None:
         self._connection_token = _register_mutation_connection(connection)
         self._session_id = session_id
         self._database_now = database_now
         self._operation_context = operation_context
+        self._quota_exceeded_recorder = quota_exceeded_recorder
+        self._approval_supersession_recorder = approval_supersession_recorder
 
     def _require_active(self) -> None:
         _resolve_mutation_connection(self._connection_token)
@@ -554,6 +589,17 @@ class _RepositorySessionMutations:
 
     def __init__(self, state: _RepositoryMutationState) -> None:
         self.__state = state
+
+    def assess_chargeable_operation(
+        self, *, policy: ChargeableAdmissionPolicy, operation: ChargeableOperation
+    ) -> ChargeableAdmissionDecision:
+        state = self.__state
+        state._require_active()
+        context = state._operation_context
+        expected = SessionOperationKind.EXECUTE if operation is ChargeableOperation.RUN else SessionOperationKind.COMPOSE
+        if type(operation) is not ChargeableOperation or context is None or context.operation_kind is not expected:
+            raise AuditIntegrityError("Chargeable admission operation does not match session custody")
+        return RepositoryChargeableAdmissionAuthority.assess(state._connection_token, session_id=state._session_id, policy=policy)
 
     def record_plugin_crash_breadcrumb(self) -> None:
         """Bump the bound session timestamp under exact COMPOSE authority."""
@@ -674,33 +720,30 @@ class _RepositorySessionMutations:
             raise TypeError("archived_at must be an exact datetime")
         archived_at = _ensure_utc(archived_at)
         session_id = state._session_id
-        active_guided_kind = connection.execute(
-            select(guided_operations_table.c.kind)
+        active_receipt_kind = connection.execute(
+            select(session_operation_receipts_table.c.kind)
             .where(
-                guided_operations_table.c.session_id == session_id,
-                guided_operations_table.c.status == "in_progress",
+                session_operation_receipts_table.c.session_id == session_id,
+                session_operation_receipts_table.c.status == "in_progress",
             )
-            .order_by(guided_operations_table.c.operation_id)
+            .order_by(session_operation_receipts_table.c.operation_id)
             .limit(1)
         ).scalar_one_or_none()
-        if active_guided_kind is not None:
-            if active_guided_kind not in GUIDED_OPERATION_KIND_VALUES:
-                raise AuditIntegrityError("Tier 1: active guided operation has an invalid kind")
-            raise SessionGuidedOperationInProgressError(
-                session_id=UUID(session_id),
-                kind=cast(GuidedOperationKind, active_guided_kind),
-            )
+        if active_receipt_kind is not None:
+            if active_receipt_kind not in {"session_fork", "state_revert"}:
+                raise AuditIntegrityError("Tier 1: active ordinary operation receipt has an invalid kind")
+            raise SessionReceiptInProgressError(session_id=UUID(session_id), kind=active_receipt_kind)
         incoming_active_fork = connection.execute(
-            select(guided_operations_table.c.operation_id)
+            select(session_operation_receipts_table.c.operation_id)
             .where(
-                guided_operations_table.c.kind == "session_fork",
-                guided_operations_table.c.status == "in_progress",
-                guided_operations_table.c.result_session_id == session_id,
+                session_operation_receipts_table.c.kind == "session_fork",
+                session_operation_receipts_table.c.status == "in_progress",
+                session_operation_receipts_table.c.result_session_id == session_id,
             )
             .limit(1)
         ).first()
         if incoming_active_fork is not None:
-            raise SessionGuidedOperationInProgressError(
+            raise SessionReceiptInProgressError(
                 session_id=UUID(session_id),
                 kind="session_fork",
             )
@@ -710,20 +753,20 @@ class _RepositorySessionMutations:
                 select(composer_completion_events_table.c.id).where(composer_completion_events_table.c.session_id == session_id).limit(1)
             ).first()
             or connection.execute(
-                select(guided_operations_table.c.operation_id)
+                select(session_operation_receipts_table.c.operation_id)
                 .where(
-                    guided_operations_table.c.session_id == session_id,
-                    guided_operations_table.c.kind == "session_fork",
-                    guided_operations_table.c.status.in_(("completed", "failed")),
+                    session_operation_receipts_table.c.session_id == session_id,
+                    session_operation_receipts_table.c.kind == "session_fork",
+                    session_operation_receipts_table.c.status.in_(("completed", "failed")),
                 )
                 .limit(1)
             ).first()
             or connection.execute(
-                select(guided_operations_table.c.operation_id)
+                select(session_operation_receipts_table.c.operation_id)
                 .where(
-                    guided_operations_table.c.kind == "session_fork",
-                    guided_operations_table.c.status == "completed",
-                    guided_operations_table.c.result_session_id == session_id,
+                    session_operation_receipts_table.c.kind == "session_fork",
+                    session_operation_receipts_table.c.status == "completed",
+                    session_operation_receipts_table.c.result_session_id == session_id,
                 )
                 .limit(1)
             ).first()
@@ -745,6 +788,14 @@ class _RepositorySessionMutations:
             # from, so the join column differs from the four above.
             or connection.execute(
                 select(library_entries_table.c.entry_id).where(library_entries_table.c.published_from_session_id == session_id).limit(1)
+            ).first()
+            # Usage must survive archival so deleting a session cannot reset
+            # its owner's daily quota. Soft archival still hides the session.
+            or connection.execute(
+                select(token_usage_ledger_table.c.entry_id).where(token_usage_ledger_table.c.session_id == session_id).limit(1)
+            ).first()
+            or connection.execute(
+                select(quota_provider_attempts_table.c.attempt_id).where(quota_provider_attempts_table.c.session_id == session_id).limit(1)
             ).first()
         )
         if not durable_history_exists:
@@ -804,11 +855,6 @@ class _RepositoryCompositionStateMutations:
             ).scalar_one()
         )
         data = creation.data
-        # An active guided pair that cannot bind would re-raise on every read of
-        # this row; refuse it here, under the operation fence, before it becomes
-        # the tip. Every composition-state INSERT in this repository runs the
-        # same admission, matching ``SessionServiceImpl._insert_composition_state``.
-        assert_guided_custody_persistable(deep_thaw(data.sources), deep_thaw(data.composer_meta))
         connection.execute(
             insert(composition_states_table).values(
                 id=str(creation.id),
@@ -821,7 +867,7 @@ class _RepositoryCompositionStateMutations:
                 outputs=_composition_state_column(data.outputs),
                 metadata_=_composition_state_column(data.metadata_),
                 is_valid=data.is_valid,
-                validation_errors=deep_thaw(data.validation_errors),
+                validation_errors=serialize_composition_validation_errors(data.validation_errors),
                 composer_meta=_composition_state_column(data.composer_meta),
                 derived_from_state_id=(str(derived_from_state_id) if derived_from_state_id is not None else None),
                 provenance=creation.provenance,
@@ -857,6 +903,12 @@ class _RepositoryCompositionStateMutations:
             session_id=state._session_id,
             build_state_record=lambda: record,
             now=state._database_now,
+        )
+        supersede_open_approvals(
+            connection,
+            session_id=state._session_id,
+            now=state._database_now,
+            record=state._approval_supersession_recorder,
         )
         return record
 
@@ -909,7 +961,7 @@ class _RepositoryInterpretationMutations:
             outputs=cls._state_column(row.outputs),
             metadata_=cls._state_column(row.metadata_),
             is_valid=row.is_valid,
-            validation_errors=row.validation_errors,
+            validation_errors=decode_stored_composition_validation_errors(row.validation_errors),
             created_at=_ensure_utc(row.created_at),
             derived_from_state_id=(UUID(row.derived_from_state_id) if row.derived_from_state_id is not None else None),
             composer_meta=cls._state_column(row.composer_meta),
@@ -938,9 +990,10 @@ class _RepositoryInterpretationMutations:
             arguments_hash=row.arguments_hash,
             hash_domain_version=row.hash_domain_version,
             interpretation_source=InterpretationSource(row.interpretation_source),
+            surface_origin=InterpretationSurfaceOrigin(row.surface_origin) if row.surface_origin is not None else None,
             runtime_model_identifier_at_resolve=row.runtime_model_identifier_at_resolve,
             runtime_model_version_at_resolve=row.runtime_model_version_at_resolve,
-            resolved_prompt_template_hash=row.resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=row.approved_prompt_artifact_hash,
         )
 
     def create_or_reconcile_pending(
@@ -1045,6 +1098,9 @@ class _RepositoryInterpretationMutations:
             opt_out_marker_exists=marker_exists,
             superseded_events=tuple(self._event_record(row) for row in superseded_rows),
         )
+        inline_blob_snapshot = validator.inline_blob_snapshot
+        if inline_blob_snapshot is not None:
+            inline_blob_snapshot.assert_current_rows(connection, session_id=UUID(state._session_id))
         decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, validator)
         if type(decision) is not SessionPendingInterpretationDecision:
             raise TypeError("pending interpretation planner must return an exact decision")
@@ -1106,7 +1162,7 @@ class _RepositoryInterpretationMutations:
                 or decision.resolved_at is not None
                 or decision.arguments_hash is not None
                 or decision.hash_domain_version is not None
-                or decision.resolved_prompt_template_hash is not None
+                or decision.approved_prompt_artifact_hash is not None
                 or decision.ensure_opt_out_marker
                 or appended_state is not None
             ):
@@ -1123,10 +1179,10 @@ class _RepositoryInterpretationMutations:
                 or appended_state is None
             ):
                 raise SessionDerivedCustodyError
-            if command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-                if not is_lower_sha256_hex(decision.resolved_prompt_template_hash):
+            if command.kind in {InterpretationKind.LLM_PROMPT_TEMPLATE, InterpretationKind.VAGUE_TERM}:
+                if not is_lower_sha256_hex(decision.approved_prompt_artifact_hash):
                     raise SessionDerivedCustodyError
-            elif decision.resolved_prompt_template_hash is not None:
+            elif decision.approved_prompt_artifact_hash is not None:
                 raise SessionDerivedCustodyError
             if (
                 appended_state.derived_from_state_id != snapshot.live_state.id
@@ -1165,7 +1221,8 @@ class _RepositoryInterpretationMutations:
                     interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT.value,
                     runtime_model_identifier_at_resolve=None,
                     runtime_model_version_at_resolve=None,
-                    resolved_prompt_template_hash=None,
+                    approved_prompt_artifact_hash=None,
+                    surface_origin=None,
                 )
             )
         connection.execute(
@@ -1192,7 +1249,8 @@ class _RepositoryInterpretationMutations:
                 interpretation_source=decision.interpretation_source.value,
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
-                resolved_prompt_template_hash=decision.resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=decision.approved_prompt_artifact_hash,
+                surface_origin=command.surface_origin.value,
             )
         )
         if appended_state is not None:
@@ -1213,11 +1271,8 @@ class _RepositoryInterpretationMutations:
             )
             data = appended_state.data
             # This append is a genuine session HEAD (version MAX+1, derived_from
-            # set), so it owes the same two obligations as every other head
-            # writer: refuse an unbindable active guided pair before it becomes
-            # the tip, and retire in THIS transaction the pending reviews whose
-            # site the new head extinguished.
-            assert_guided_custody_persistable(deep_thaw(data.sources), deep_thaw(data.composer_meta))
+            # set), so retire pending reviews whose site the new head extinguished
+            # in this transaction.
             connection.execute(
                 insert(composition_states_table).values(
                     id=str(appended_state.id),
@@ -1230,7 +1285,7 @@ class _RepositoryInterpretationMutations:
                     outputs=_composition_state_column(data.outputs),
                     metadata_=_composition_state_column(data.metadata_),
                     is_valid=data.is_valid,
-                    validation_errors=deep_thaw(data.validation_errors),
+                    validation_errors=serialize_composition_validation_errors(data.validation_errors),
                     composer_meta=_composition_state_column(data.composer_meta),
                     derived_from_state_id=str(appended_state.derived_from_state_id),
                     provenance=appended_state.provenance,
@@ -1260,6 +1315,12 @@ class _RepositoryInterpretationMutations:
                 session_id=state._session_id,
                 build_state_record=lambda: appended_record,
                 now=state._database_now,
+            )
+            supersede_open_approvals(
+                connection,
+                session_id=state._session_id,
+                now=state._database_now,
+                record=state._approval_supersession_recorder,
             )
         row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(command.event_id))).one()
         return self._event_record(row)
@@ -1312,7 +1373,8 @@ class _RepositoryInterpretationMutations:
                 interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT.value,
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
-                resolved_prompt_template_hash=None,
+                approved_prompt_artifact_hash=None,
+                surface_origin=None,
             )
         )
         result = connection.execute(
@@ -1370,7 +1432,8 @@ class _RepositoryInterpretationMutations:
                 interpretation_source=InterpretationSource.AUTO_INTERPRETED_NO_SURFACES.value,
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
-                resolved_prompt_template_hash=None,
+                approved_prompt_artifact_hash=None,
+                surface_origin=None,
             )
         )
         row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(event_id))).one()
@@ -1388,7 +1451,7 @@ class _RepositoryInterpretationMutations:
         hash_domain_version: str,
         runtime_model_identifier: str | None,
         runtime_model_version: str | None,
-        resolved_prompt_template_hash: str | None,
+        approved_prompt_artifact_hash: str | None,
     ) -> None:
         """Settle one pending interpretation event under exact COMPOSE custody (P4-D6 family A2b).
 
@@ -1417,7 +1480,7 @@ class _RepositoryInterpretationMutations:
                 hash_domain_version=hash_domain_version,
                 runtime_model_identifier_at_resolve=runtime_model_identifier,
                 runtime_model_version_at_resolve=runtime_model_version,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             )
         )
         if result.rowcount != 1:
@@ -1439,6 +1502,32 @@ class _RepositoryRunMutations:
             raise AuditIntegrityError("run mutation is not authorized for this operation kind")
         return context
 
+    def check_approval_binding(self, *, state_id: UUID, approval: ApprovalGateInputs) -> AdmissionRefusalReason | None:
+        """Preflight the exact state under the same EXECUTE fence as run creation.
+
+        The durable permit repeats this check after pending-run creation and
+        on recovery, so a decision changed between transactions cannot admit
+        the worker.
+        """
+        state = self.__state
+        state._require_active()
+        self._require_execute()
+        state._validate_uuid(state_id, field_name="state_id")
+        if not isinstance(approval, ApprovalGateInputs):
+            raise TypeError("approval must be ApprovalGateInputs")
+        conn = _resolve_mutation_connection(state._connection_token)
+        owned_state = conn.execute(
+            select(composition_states_table.c.id)
+            .where(composition_states_table.c.id == str(state_id), composition_states_table.c.session_id == state._session_id)
+            .with_for_update()
+        ).one_or_none()
+        if owned_state is None:
+            raise SessionDerivedCustodyError
+        approved = RepositoryApprovalAuthority.approved_bindings(
+            state._connection_token, session_id=state._session_id, state_id=str(state_id)
+        )
+        return evaluate_approval_gate(approved=approved, compiled=approval.binding)
+
     def create_pending_run(
         self,
         *,
@@ -1446,6 +1535,7 @@ class _RepositoryRunMutations:
         state_id: UUID,
         pipeline_yaml: str | None,
         started_at: datetime,
+        execution_input: RunExecutionInput | None = None,
     ) -> RunRecord:
         """Create the one pending run owned by this exact EXECUTE lease."""
         state = self.__state
@@ -1496,6 +1586,15 @@ class _RepositoryRunMutations:
             )
         except IntegrityError as exc:
             raise RunAlreadyActiveError(state._session_id) from exc
+        if execution_input is not None:
+            envelope_values = asdict(execution_input)
+            envelope_values["envelope"] = json.loads(envelope_values.pop("envelope_json"))
+            connection.execute(
+                insert(run_execution_inputs_table).values(run_id=str(run_id), created_at=state._database_now, **envelope_values)
+            )
+            RepositoryRunStartPermitAuthority.create_pending(state._connection_token, run_id=str(run_id))
+            self.rebind_run_ownership(run_id=run_id)
+            connection.execute(update(runs_table).where(runs_table.c.id == str(run_id)).values(saga_state="start_intent"))
         return RunRecord(
             id=run_id,
             session_id=UUID(state._session_id),
@@ -1512,7 +1611,135 @@ class _RepositoryRunMutations:
             error=None,
             landscape_run_id=None,
             pipeline_yaml=pipeline_yaml,
+            saga_state=RunSagaState.START_INTENT if execution_input is not None else RunSagaState.DRAFT,
         )
+
+    def assess_start_admission(
+        self, *, run_id: UUID, policy: ChargeableAdmissionPolicy, approval: ApprovalGateInputs | None = None
+    ) -> RunStartPermitRecord:
+        state = self.__state
+        state._require_active()
+        context = self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        permit = RepositoryRunStartPermitAuthority.assess(
+            state._connection_token, run_id=str(run_id), context=context, now=state._database_now, policy=policy, approval=approval
+        )
+        self._record_admission_refusal(run_id, permit)
+        return permit
+
+    def issue_start_permit(
+        self, *, run_id: UUID, policy: ChargeableAdmissionPolicy, approval: ApprovalGateInputs | None = None
+    ) -> RunStartPermitRecord:
+        state = self.__state
+        state._require_active()
+        context = self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        permit = RepositoryRunStartPermitAuthority.issue(
+            state._connection_token, run_id=str(run_id), context=context, now=state._database_now, policy=policy, approval=approval
+        )
+        self._record_admission_refusal(run_id, permit)
+        return permit
+
+    def _record_admission_refusal(self, run_id: UUID, permit: RunStartPermitRecord) -> None:
+        refusal = permit.execution_refusal or permit.admission_decision
+        if refusal is not None and not refusal.allowed:
+            reason = refusal.refusal_reason
+            assert reason is not None
+            self.append_terminal_run_event_once(
+                run_id=run_id,
+                timestamp=self.__state._database_now,
+                event_type="failed",
+                data={"status": "failed", "detail": f"Run admission refused: {reason.value}", "node_id": None},
+            )
+
+    def observe_start_permit_for_cleanup(self, *, run_id: UUID) -> RunStartPermitRecord:
+        state = self.__state
+        state._require_active()
+        context = self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        return RepositoryRunStartPermitAuthority.observe_for_cleanup(state._connection_token, run_id=str(run_id), context=context)
+
+    def complete_admission_refusal(self, *, run_id: UUID) -> None:
+        state = self.__state
+        state._require_active()
+        self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        row = state._require_run(run_id)
+        if row.status != "failed" or row.saga_state not in {"admission_refusal_pending", "terminal"}:
+            raise AuditIntegrityError("Run is not awaiting admission refusal reconciliation")
+        _resolve_mutation_connection(state._connection_token).execute(
+            update(runs_table).where(runs_table.c.id == str(run_id)).values(saga_state="terminal")
+        )
+
+    def rebind_run_ownership(self, *, run_id: UUID) -> RunSagaState:
+        state = self.__state
+        state._require_active()
+        context = self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        conn = _resolve_mutation_connection(state._connection_token)
+        run = conn.execute(select(runs_table).where(runs_table.c.id == str(run_id)).with_for_update()).one()
+        if run.session_id != state._session_id:
+            raise SessionDerivedCustodyError
+        fence = conn.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == state._session_id)
+        ).one()
+        if conn.dialect.name == "postgresql" and run.owner_instance_id is not None and run.owner_instance_id != fence.owner_instance_id:
+            previous_member = conn.execute(
+                select(web_instances_table.c.lease_expires_at)
+                .where(
+                    web_instances_table.c.instance_id == run.owner_instance_id,
+                )
+                .with_for_update()
+            ).one_or_none()
+            if previous_member is None or _ensure_utc(previous_member.lease_expires_at) > state._database_now:
+                raise SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+        _RepositoryBlobMutations(state)._adopt_pending_run_outputs(run_id=run_id)
+        conn.execute(
+            update(runs_table)
+            .where(runs_table.c.id == str(run_id))
+            .values(
+                owner_instance_id=fence.owner_instance_id,
+                owner_epoch=context.fence.operation_epoch,
+                owner_lease_expires_at=fence.lease_expires_at,
+            )
+        )
+        return RunSagaState(run.saga_state)
+
+    def mark_recovery_outputs_finalized(self, *, run_id: UUID) -> None:
+        state = self.__state
+        state._require_active()
+        self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        result = _resolve_mutation_connection(state._connection_token).execute(
+            update(runs_table)
+            .where(
+                runs_table.c.id == str(run_id),
+                runs_table.c.session_id == state._session_id,
+                runs_table.c.status.in_(tuple(SESSION_TERMINAL_RUN_STATUS_VALUES)),
+            )
+            .values(saga_state="terminal")
+        )
+        if result.rowcount != 1:
+            raise SessionDerivedCustodyError
+
+    def mark_recovery_required(self, *, run_id: UUID, reason: RecoveryRequiredReason) -> None:
+        state = self.__state
+        state._require_active()
+        self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        if type(reason) is not RecoveryRequiredReason:
+            raise TypeError("reason must be an exact RecoveryRequiredReason")
+        result = _resolve_mutation_connection(state._connection_token).execute(
+            update(runs_table)
+            .where(
+                runs_table.c.id == str(run_id),
+                runs_table.c.session_id == state._session_id,
+                runs_table.c.status.in_(("pending", "running")),
+            )
+            .values(saga_state="recovery_required", recovery_required_reason=reason.value)
+        )
+        if result.rowcount != 1:
+            raise SessionDerivedCustodyError
 
     def transition_run_status(
         self,
@@ -1547,6 +1774,8 @@ class _RepositoryRunMutations:
         if status == "failed" and not error:
             raise ValueError("failed status requires error")
         values: dict[str, Any] = {"status": status}
+        if status == "running":
+            values["saga_state"] = "running"
         if status in SESSION_TERMINAL_RUN_STATUS_VALUES:
             values["finished_at"] = state._database_now
         optional_values = {
@@ -1596,6 +1825,37 @@ class _RepositoryRunMutations:
             event_type=cast(SessionRunEventType, row.event_type),
             data=cast(Mapping[str, Any], row.data),
         )
+
+    def append_terminal_run_event_once(
+        self,
+        *,
+        run_id: UUID,
+        timestamp: datetime,
+        event_type: SessionRunEventType,
+        data: Mapping[str, Any],
+    ) -> RunEventRecord:
+        state = self.__state
+        state._require_active()
+        self._require_execute()
+        state._validate_uuid(run_id, field_name="run_id")
+        state._require_run(run_id)
+        if event_type not in {"completed", "failed", "cancelled"}:
+            raise ValueError("terminal event type required")
+        row = (
+            _resolve_mutation_connection(state._connection_token)
+            .execute(
+                select(run_events_table).where(
+                    run_events_table.c.run_id == str(run_id),
+                    run_events_table.c.event_type.in_(("completed", "failed", "cancelled")),
+                )
+            )
+            .one_or_none()
+        )
+        if row is not None:
+            if row.event_type != event_type:
+                raise AuditIntegrityError("Run terminal event contradicts the authoritative result")
+            return self._event_record(row)
+        return self.append_run_event(run_id=run_id, timestamp=timestamp, event_type=event_type, data=data)
 
     def append_run_event(
         self,
@@ -1704,35 +1964,6 @@ class _RepositoryBlobMutations:
 
     def _require_execute(self) -> SessionOperationContext:
         return self._require_operation_kinds(frozenset({SessionOperationKind.EXECUTE}))
-
-    def _require_guided_operation_write_fence(
-        self,
-        fence: BlobGuidedOperationWriteFence | None,
-    ) -> None:
-        if fence is None:
-            return
-        if type(fence) is not BlobGuidedOperationWriteFence:
-            raise TypeError("guided_operation_write_fence must be an exact BlobGuidedOperationWriteFence")
-        state = self.__state
-        if str(fence.session_id) != state._session_id:
-            raise AuditIntegrityError("guided operation blob write fence targets a different session")
-        row = (
-            _resolve_mutation_connection(state._connection_token)
-            .execute(
-                select(guided_operations_table.c.session_id).where(
-                    guided_operations_table.c.session_id == state._session_id,
-                    guided_operations_table.c.operation_id == fence.operation_id,
-                    guided_operations_table.c.kind.in_(_GUIDED_INLINE_CUSTODY_OPERATION_KINDS),
-                    guided_operations_table.c.status == "in_progress",
-                    guided_operations_table.c.lease_token == fence.lease_token,
-                    guided_operations_table.c.attempt == fence.attempt,
-                    guided_operations_table.c.lease_expires_at > state._database_now,
-                )
-            )
-            .one_or_none()
-        )
-        if row is None:
-            raise BlobGuidedOperationFenceLostError(fence.operation_id, attempt=fence.attempt)
 
     @staticmethod
     def _validate_link_direction(value: object) -> BlobRunLinkDirection:
@@ -2025,6 +2256,13 @@ class _RepositoryBlobMutations:
             from elspeth.contracts.blobs import BlobQuotaExceededError
 
             raise BlobQuotaExceededError(state._session_id, current_bytes=current_total, limit_bytes=max_storage_per_session)
+        RepositoryQuotaAuthority.admit_storage_bytes(
+            state._connection_token,
+            session_id=state._session_id,
+            additional_bytes=replacement.size_bytes - actual.size_bytes,
+            operation="blob_replacement",
+            record=state._quota_exceeded_recorder,
+        )
 
         owner_instance_id = connection.execute(
             select(session_operation_fences_table.c.owner_instance_id)
@@ -2177,6 +2415,13 @@ class _RepositoryBlobMutations:
             from elspeth.contracts.blobs import BlobQuotaExceededError
 
             raise BlobQuotaExceededError(state._session_id, current_bytes=current_total, limit_bytes=max_storage_per_session)
+        RepositoryQuotaAuthority.admit_storage_bytes(
+            state._connection_token,
+            session_id=state._session_id,
+            additional_bytes=exact.replacement_blob.size_bytes - actual.size_bytes,
+            operation="blob_replacement",
+            record=state._quota_exceeded_recorder,
+        )
         advanced = connection.execute(
             update(blob_replacement_cleanups_table)
             .where(and_(*self._blob_replacement_plan_predicates(exact)))
@@ -2358,6 +2603,13 @@ class _RepositoryBlobMutations:
                     current_bytes=current_total,
                     limit_bytes=max_storage_per_session,
                 )
+            RepositoryQuotaAuthority.admit_storage_bytes(
+                state._connection_token,
+                session_id=state._session_id,
+                additional_bytes=size_bytes - row.size_bytes,
+                operation="run_output_finalize",
+                record=state._quota_exceeded_recorder,
+            )
         result = connection.execute(
             update(blobs_table)
             .where(
@@ -2387,7 +2639,6 @@ class _RepositoryBlobMutations:
         record: BlobRecord,
         max_storage_per_session: int,
         idempotent: bool,
-        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
     ) -> bool:
         """Reserve one pending row inside the exact fenced session UoW."""
         state = self.__state
@@ -2403,7 +2654,6 @@ class _RepositoryBlobMutations:
         if type(idempotent) is not bool:
             raise TypeError("idempotent must be an exact bool")
         operation_context = self._require_operation_kinds(_BLOB_CREATION_OPERATION_KINDS)
-        self._require_guided_operation_write_fence(guided_operation_write_fence)
         connection = _resolve_mutation_connection(state._connection_token)
         existing = connection.execute(select(blobs_table).where(blobs_table.c.id == str(record.id)).with_for_update()).one_or_none()
         if existing is not None:
@@ -2472,6 +2722,13 @@ class _RepositoryBlobMutations:
                 current_bytes=current_total,
                 limit_bytes=max_storage_per_session,
             )
+        RepositoryQuotaAuthority.admit_storage_bytes(
+            state._connection_token,
+            session_id=state._session_id,
+            additional_bytes=record.size_bytes,
+            operation="blob_create",
+            record=state._quota_exceeded_recorder,
+        )
         connection.execute(
             insert(blobs_table).values(
                 id=str(record.id),
@@ -2534,12 +2791,10 @@ class _RepositoryBlobMutations:
         self,
         *,
         blob_id: UUID,
-        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
     ) -> BlobRecord:
         state = self.__state
         state._require_active()
         operation_context = self._require_operation_kinds(_BLOB_CREATION_OPERATION_KINDS)
-        self._require_guided_operation_write_fence(guided_operation_write_fence)
         row = state._require_blob(blob_id)
         if row.status == "ready":
             if row.custody_operation_id is not None or row.custody_operation_epoch is not None or row.custody_operation_kind is not None:
@@ -2577,12 +2832,10 @@ class _RepositoryBlobMutations:
         self,
         *,
         blob_id: UUID,
-        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
     ) -> bool:
         state = self.__state
         state._require_active()
         operation_context = self._require_operation_kinds(_BLOB_CREATION_OPERATION_KINDS)
-        self._require_guided_operation_write_fence(guided_operation_write_fence)
         result = _resolve_mutation_connection(state._connection_token).execute(
             delete(blobs_table).where(
                 blobs_table.c.id == str(blob_id),
@@ -2626,6 +2879,12 @@ class _RepositoryBlobMutations:
                 operation_kind = SessionOperationKind(cast(str, row.custody_operation_kind))
             except ValueError as exc:
                 raise AuditIntegrityError("pending blob reservation has invalid operation-kind custody") from exc
+            if operation_kind is SessionOperationKind.EXECUTE:
+                # Pipeline outputs retain their run's ownership until that
+                # EXECUTE operation finalizes them. A later COMPOSE create
+                # must neither collect their bytes nor reinterpret them as
+                # abandoned standalone uploads.
+                continue
             if operation_kind not in _BLOB_CREATION_OPERATION_KINDS:
                 raise AuditIntegrityError("pending blob reservation has invalid operation-kind custody")
             obligations.append(
@@ -2699,7 +2958,7 @@ class _RepositoryBlobMutations:
             raise AuditIntegrityError("blob deletion ledger identity was rebound outside session custody")
         blob = self._blob_record(blob_row) if blob_row is not None else None
         try:
-            return BlobDeletionPlan(
+            plan = BlobDeletionPlan(
                 blob_id=UUID(cleanup.blob_id),
                 session_id=UUID(cleanup.session_id),
                 storage_path=cleanup.storage_path,
@@ -2718,6 +2977,12 @@ class _RepositoryBlobMutations:
             )
         except (TypeError, ValueError) as exc:
             raise AuditIntegrityError("blob deletion ledger contains malformed durable evidence") from exc
+        if plan.phase == "purge_pending":
+            if blob is not None:
+                raise AuditIntegrityError("purge-pending deletion still has live blob metadata")
+        elif blob is None or blob_record_snapshot_hash(blob) != plan.blob_snapshot_hash:
+            raise AuditIntegrityError("uncommitted blob deletion requires exact live metadata before recovery")
+        return plan
 
     def _read_blob_deletion_locked(self, *, blob_id: UUID) -> BlobDeletionPlan | None:
         state = self.__state
@@ -2750,18 +3015,18 @@ class _RepositoryBlobMutations:
     def _in_progress_session_fork_operation_id(self) -> str | None:
         state = self.__state
         connection = _resolve_mutation_connection(state._connection_token)
-        guided_operation_id = connection.execute(
-            select(guided_operations_table.c.operation_id)
+        receipt_operation_id = connection.execute(
+            select(session_operation_receipts_table.c.operation_id)
             .where(
-                guided_operations_table.c.session_id == state._session_id,
-                guided_operations_table.c.kind == SessionOperationKind.SESSION_FORK.value,
-                guided_operations_table.c.status == "in_progress",
+                session_operation_receipts_table.c.session_id == state._session_id,
+                session_operation_receipts_table.c.kind == SessionOperationKind.SESSION_FORK.value,
+                session_operation_receipts_table.c.status == "in_progress",
             )
-            .order_by(guided_operations_table.c.operation_id)
+            .order_by(session_operation_receipts_table.c.operation_id)
             .limit(1)
         ).scalar_one_or_none()
-        if guided_operation_id is not None:
-            return str(guided_operation_id)
+        if receipt_operation_id is not None:
+            return str(receipt_operation_id)
         operation_id = connection.execute(
             select(session_operation_fences_table.c.operation_id)
             .where(
@@ -2972,6 +3237,98 @@ class _RepositoryBlobMutations:
         self._require_operation_kinds(_BLOB_DELETION_RECOVERY_OPERATION_KINDS)
         return self._read_blob_deletion_locked(blob_id=blob_id)
 
+    def read_atomic_blob_deletion(self, *, blob_id: UUID) -> BlobAtomicDeletionObligation | None:
+        """Admit only the current atomic producer's all-NULL evidence schema."""
+        state = self.__state
+        state._require_active()
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
+        state._validate_uuid(blob_id, field_name="blob_id")
+        connection = _resolve_mutation_connection(state._connection_token)
+        cleanup = connection.execute(
+            select(blob_deletion_cleanups_table)
+            .where(
+                blob_deletion_cleanups_table.c.blob_id == str(blob_id),
+                blob_deletion_cleanups_table.c.session_id == state._session_id,
+            )
+            .with_for_update()
+        ).one_or_none()
+        if cleanup is None:
+            return None
+        if any(
+            value is not None
+            for value in (
+                cleanup.operation_id,
+                cleanup.operation_epoch,
+                cleanup.operation_kind,
+                cleanup.phase,
+                cleanup.blob_snapshot_hash,
+                cleanup.expected_file_present,
+                cleanup.expected_file_size,
+                cleanup.expected_file_hash,
+            )
+        ):
+            # Qualified evidence must validate completely; a partially populated
+            # row is neither producer's schema and cannot acquire atomic authority.
+            self._blob_deletion_plan(cleanup)
+            return None
+        if connection.execute(select(blobs_table.c.id).where(blobs_table.c.id == str(blob_id)).with_for_update()).first() is not None:
+            raise AuditIntegrityError("atomic blob deletion obligation still has live blob metadata")
+        try:
+            return BlobAtomicDeletionObligation(
+                blob_id=UUID(cleanup.blob_id),
+                session_id=UUID(cleanup.session_id),
+                storage_path=cleanup.storage_path,
+                tombstone_path=cleanup.tombstone_path,
+                created_at=_ensure_utc(cleanup.created_at),
+                updated_at=_ensure_utc(cleanup.updated_at),
+            )
+        except (TypeError, ValueError) as exc:
+            raise AuditIntegrityError("atomic blob deletion obligation contains malformed durable evidence") from exc
+
+    def retire_atomic_blob_deletion(self, *, obligation: BlobAtomicDeletionObligation) -> bool:
+        """Retire exact atomic evidence through the successor's live authority."""
+        state = self.__state
+        state._require_active()
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
+        if type(obligation) is not BlobAtomicDeletionObligation:
+            raise TypeError("obligation must be an exact BlobAtomicDeletionObligation")
+        if str(obligation.session_id) != state._session_id:
+            raise AuditIntegrityError("atomic blob deletion obligation has mismatched session custody")
+        exact = self.read_atomic_blob_deletion(blob_id=obligation.blob_id)
+        if exact is None:
+            # Distinguish completed retirement from replacement by a phased plan.
+            if self._read_blob_deletion_locked(blob_id=obligation.blob_id) is not None:
+                raise AuditIntegrityError("atomic blob deletion obligation was replaced by qualified evidence")
+            live_blob = (
+                _resolve_mutation_connection(state._connection_token)
+                .execute(select(blobs_table.c.id).where(blobs_table.c.id == str(obligation.blob_id)).with_for_update())
+                .first()
+            )
+            if live_blob is not None:
+                raise AuditIntegrityError("retired atomic blob deletion identity has live metadata")
+            return False
+        if exact != obligation:
+            raise AuditIntegrityError("atomic blob deletion obligation no longer matches exact evidence")
+        result = _resolve_mutation_connection(state._connection_token).execute(
+            delete(blob_deletion_cleanups_table).where(
+                blob_deletion_cleanups_table.c.blob_id == str(obligation.blob_id),
+                blob_deletion_cleanups_table.c.session_id == state._session_id,
+                blob_deletion_cleanups_table.c.storage_path == obligation.storage_path,
+                blob_deletion_cleanups_table.c.tombstone_path == obligation.tombstone_path,
+                blob_deletion_cleanups_table.c.created_at == obligation.created_at,
+                blob_deletion_cleanups_table.c.updated_at == obligation.updated_at,
+                blob_deletion_cleanups_table.c.operation_id.is_(None),
+                blob_deletion_cleanups_table.c.operation_epoch.is_(None),
+                blob_deletion_cleanups_table.c.operation_kind.is_(None),
+                blob_deletion_cleanups_table.c.phase.is_(None),
+                blob_deletion_cleanups_table.c.blob_snapshot_hash.is_(None),
+                blob_deletion_cleanups_table.c.expected_file_present.is_(None),
+                blob_deletion_cleanups_table.c.expected_file_size.is_(None),
+                blob_deletion_cleanups_table.c.expected_file_hash.is_(None),
+            )
+        )
+        return result.rowcount == 1
+
     def list_blob_deletions(self) -> tuple[BlobDeletionPlan, ...]:
         """List ordinary durable deletion obligations for current recovery."""
         state = self.__state
@@ -3178,6 +3535,40 @@ class _RepositoryBlobMutations:
         )
         return tuple(self._blob_record(state._require_blob(UUID(blob_id))) for blob_id in blob_ids)
 
+    def _adopt_pending_run_outputs(self, *, run_id: UUID) -> None:
+        """Move linked pending outputs with their run under the fresh EXECUTE fence."""
+        state = self.__state
+        state._require_active()
+        context = self._require_execute()
+        run = state._require_run(run_id)
+        conn = _resolve_mutation_connection(state._connection_token)
+        rows = conn.execute(
+            select(blobs_table)
+            .join(blob_run_links_table, blob_run_links_table.c.blob_id == blobs_table.c.id)
+            .where(
+                blob_run_links_table.c.run_id == str(run_id),
+                blob_run_links_table.c.direction == "output",
+                blobs_table.c.session_id == state._session_id,
+                blobs_table.c.status == "pending",
+            )
+            .with_for_update()
+        ).all()
+        previous_operation_ids = {row.custody_operation_id for row in rows}
+        if len(previous_operation_ids) > 1:
+            raise AuditIntegrityError("Pending outputs disagree about their previous EXECUTE owner")
+        for row in rows:
+            if run.owner_epoch is None or row.custody_operation_epoch != run.owner_epoch or row.custody_operation_kind != "execute":
+                raise AuditIntegrityError("Pending output custody does not match its run owner")
+            conn.execute(
+                update(blobs_table)
+                .where(blobs_table.c.id == row.id)
+                .values(
+                    custody_operation_id=context.fence.operation_id,
+                    custody_operation_epoch=context.fence.operation_epoch,
+                    custody_operation_kind=context.operation_kind.value,
+                )
+            )
+
     def list_pending_run_output_blobs(self, *, run_id: UUID) -> tuple[BlobRecord, ...]:
         state = self.__state
         state._require_active()
@@ -3234,10 +3625,11 @@ class _RepositoryBlobMutations:
         )
         if row is None:
             raise SessionDerivedCustodyError
-        if row.status != "pending":
+        record = self._blob_record(row)
+        if record.status != "pending":
             raise BlobStateError(
                 str(blob_id),
-                message=f"Cannot finalize blob {blob_id} — status is '{row.status}', expected 'pending'",
+                message=f"Cannot finalize blob {blob_id} — status is '{record.status}', expected 'pending'",
             )
         if (
             row.custody_operation_id != operation_context.fence.operation_id
@@ -3287,6 +3679,13 @@ class _RepositoryBlobMutations:
                 current_bytes=current_total,
                 limit_bytes=max_storage_per_session,
             )
+        RepositoryQuotaAuthority.admit_storage_bytes(
+            state._connection_token,
+            session_id=state._session_id,
+            additional_bytes=size_bytes - state._require_blob(blob_id).size_bytes,
+            operation="run_output_finalize",
+            record=state._quota_exceeded_recorder,
+        )
         result = connection.execute(
             update(blobs_table)
             .where(
@@ -3380,8 +3779,26 @@ class _RepositoryBlobMutations:
                     "resolved_at": resolved_at,
                 }
             )
+        connection = _resolve_mutation_connection(state._connection_token)
+        existing = connection.execute(
+            select(blob_inline_resolutions_table).where(
+                blob_inline_resolutions_table.c.run_id == str(run_id),
+                blob_inline_resolutions_table.c.attempt == attempt,
+            )
+        ).all()
+        if existing:
+            recorded_manifest = sorted(
+                (row.field_path, row.blob_id, row.content_hash, row.byte_length, row.mime_type, row.encoding) for row in existing
+            )
+            requested_manifest = sorted(
+                (item.field_path, str(item.blob_id), item.content_hash, item.byte_length, item.mime_type, item.encoding)
+                for item in resolutions
+            )
+            if recorded_manifest != requested_manifest:
+                raise AuditIntegrityError("Run inline resolution retry does not match its immutable manifest")
+            return
         if rows:
-            _resolve_mutation_connection(state._connection_token).execute(insert(blob_inline_resolutions_table), rows)
+            connection.execute(insert(blob_inline_resolutions_table), rows)
 
 
 @final
@@ -3405,12 +3822,16 @@ class _RepositoryMutationTransaction:
         session_id: str,
         database_now: datetime,
         operation_context: SessionOperationContext | None = None,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+        approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
     ) -> None:
         state = _RepositoryMutationState(
             connection,
             session_id=session_id,
             database_now=database_now,
             operation_context=operation_context,
+            quota_exceeded_recorder=quota_exceeded_recorder,
+            approval_supersession_recorder=approval_supersession_recorder,
         )
         try:
             self.__state = state
@@ -3524,10 +3945,6 @@ class _ForkChildSessionMutations:
         if type(creation) is not SessionForkChildStateCreation:
             raise TypeError("fork child state creation must be exact")
         state = creation.data
-        # The child's first state is copied custody: an active guided pair that
-        # cannot bind in the child would re-raise on every read of the forked
-        # row, so it is refused here rather than at the child's first read.
-        assert_guided_custody_persistable(deep_thaw(state.sources), deep_thaw(state.composer_meta))
         connection = self._require_exact_child_context()
         next_version = connection.execute(
             select(func.coalesce(func.max(composition_states_table.c.version), 0) + 1).where(
@@ -3547,7 +3964,7 @@ class _ForkChildSessionMutations:
                 outputs=self._state_column(state.outputs),
                 metadata_=self._state_column(state.metadata_),
                 is_valid=state.is_valid,
-                validation_errors=deep_thaw(state.validation_errors),
+                validation_errors=serialize_composition_validation_errors(state.validation_errors),
                 composer_meta=self._state_column(state.composer_meta),
                 derived_from_state_id=None,
                 provenance="session_fork",
@@ -3593,16 +4010,16 @@ class _ForkChildSessionMutations:
 
 
 @final
-class _ForkParentGuidedMutations:
-    """Exact guided-parent binding over the fork transaction's lifetime token."""
+class _ForkParentReceiptMutations:
+    """Exact parent receipt binding over the fork transaction's lifetime token."""
 
     __slots__ = (
         "__child_session_id",
         "__connection_token",
         "__database_now",
-        "__guided_operation",
         "__parent_authority",
         "__parent_session_id",
+        "__receipt",
     )
 
     def __init__(
@@ -3610,24 +4027,24 @@ class _ForkParentGuidedMutations:
         connection_token: str,
         *,
         fork_authority: SessionForkAuthority,
-        guided_operation: dict[str, object],
+        receipt: dict[str, object],
         database_now: datetime,
     ) -> None:
         self.__connection_token = connection_token
         self.__parent_authority = fork_authority.parent
         self.__parent_session_id = fork_authority.parent.parent_context.fence.session_id
         self.__child_session_id = fork_authority.child_context.fence.session_id
-        self.__guided_operation = guided_operation
+        self.__receipt = receipt
         self.__database_now = database_now
 
-    def _require_exact_guided_authority(self) -> tuple[Connection, GuidedOperationFence, dict[str, object]]:
+    def _require_exact_receipt_authority(self) -> tuple[Connection, OperationReceiptFence, dict[str, object]]:
         connection = _resolve_fork_mutation_connection(
             self.__connection_token,
             parent_session_id=self.__parent_session_id,
             child_session_id=self.__child_session_id,
         )
-        fence = self.__parent_authority.guided_fence
-        row = self.__guided_operation
+        fence = self.__parent_authority.receipt_fence
+        row = self.__receipt
         if (
             str(fence.session_id) != self.__parent_session_id
             or row["session_id"] != self.__parent_session_id
@@ -3638,13 +4055,13 @@ class _ForkParentGuidedMutations:
             or row["status"] != "in_progress"
             or _ensure_utc(row["lease_expires_at"]) <= self.__database_now
         ):
-            raise AuditIntegrityError("fork parent guided authority is no longer exact")
+            raise AuditIntegrityError("fork parent receipt authority is no longer exact")
 
         live_row = (
             connection.execute(
-                select(guided_operations_table).where(
-                    guided_operations_table.c.session_id == self.__parent_session_id,
-                    guided_operations_table.c.operation_id == fence.operation_id,
+                select(session_operation_receipts_table).where(
+                    session_operation_receipts_table.c.session_id == self.__parent_session_id,
+                    session_operation_receipts_table.c.operation_id == fence.operation_id,
                 )
             )
             .mappings()
@@ -3660,8 +4077,6 @@ class _ForkParentGuidedMutations:
             "lease_expires_at",
             "attempt",
             "originating_message_id",
-            "proposal_id",
-            "result_kind",
             "result_state_id",
             "result_session_id",
             "response_hash",
@@ -3679,15 +4094,15 @@ class _ForkParentGuidedMutations:
             )
             for field in exact_fields
         ):
-            raise AuditIntegrityError("fork parent live guided authority differs from cached authority")
+            raise AuditIntegrityError("fork parent live receipt authority differs from cached authority")
         return connection, fence, row
 
     @staticmethod
-    def _null_safe_guided_predicate(field: str, value: Any) -> ColumnElement[bool]:
-        column = guided_operations_table.c[field]
+    def _null_safe_receipt_predicate(field: str, value: Any) -> ColumnElement[bool]:
+        column = session_operation_receipts_table.c[field]
         return column.is_(None) if value is None else column == value
 
-    def bind_guided_fork(
+    def bind_fork_receipt(
         self,
         *,
         originating_message_id: UUID,
@@ -3696,13 +4111,13 @@ class _ForkParentGuidedMutations:
         if type(originating_message_id) is not UUID:
             raise TypeError("originating_message_id must be an exact UUID")
         message_id = str(originating_message_id)
-        connection, fence, row = self._require_exact_guided_authority()
+        connection, fence, row = self._require_exact_receipt_authority()
         current_message_id = row["originating_message_id"]
         current_child_id = row["result_session_id"]
         if current_message_id not in {None, message_id}:
-            raise AuditIntegrityError("Guided fork is bound to a different originating message")
+            raise AuditIntegrityError("Fork receipt is bound to a different originating message")
         if current_child_id not in {None, self.__child_session_id}:
-            raise AuditIntegrityError("Guided fork is bound to a different child session")
+            raise AuditIntegrityError("Fork receipt is bound to a different child session")
         exact_fields = (
             "kind",
             "status",
@@ -3711,8 +4126,6 @@ class _ForkParentGuidedMutations:
             "lease_expires_at",
             "attempt",
             "originating_message_id",
-            "proposal_id",
-            "result_kind",
             "result_state_id",
             "result_session_id",
             "response_hash",
@@ -3722,23 +4135,22 @@ class _ForkParentGuidedMutations:
             "settled_at",
         )
         changed = connection.execute(
-            update(guided_operations_table)
+            update(session_operation_receipts_table)
             .where(
-                guided_operations_table.c.session_id == self.__parent_session_id,
-                guided_operations_table.c.operation_id == fence.operation_id,
-                *(self._null_safe_guided_predicate(field, row[field]) for field in exact_fields),
-                guided_operations_table.c.lease_expires_at > self.__database_now,
+                session_operation_receipts_table.c.session_id == self.__parent_session_id,
+                session_operation_receipts_table.c.operation_id == fence.operation_id,
+                *(self._null_safe_receipt_predicate(field, row[field]) for field in exact_fields),
+                session_operation_receipts_table.c.lease_expires_at > self.__database_now,
             )
             .values(
                 originating_message_id=message_id,
-                proposal_id=row["proposal_id"],
                 result_state_id=row["result_state_id"],
                 result_session_id=self.__child_session_id,
                 updated_at=self.__database_now,
             )
         ).rowcount
         if changed != 1:
-            raise AuditIntegrityError("Guided fork binding lost its exact authority")
+            raise AuditIntegrityError("Fork receipt binding lost its exact authority")
         row.update(
             {
                 "originating_message_id": message_id,
@@ -3758,9 +4170,9 @@ class _ForkCreationTransaction:
         "__child_session_id",
         "__connection_token",
         "__database_now",
-        "__guided_operation",
-        "__parent_guided_mutations",
+        "__parent_receipt_mutations",
         "__parent_session_id",
+        "__receipt",
     )
 
     def __init__(
@@ -3768,20 +4180,20 @@ class _ForkCreationTransaction:
         connection: Connection,
         *,
         fork_authority: SessionForkAuthority,
-        guided_operation: RowMapping,
+        receipt: RowMapping,
         database_now: datetime,
         child_created: bool,
     ) -> None:
         if type(fork_authority) is not SessionForkAuthority:
             raise TypeError("fork_authority must be an exact SessionForkAuthority")
-        guided_row = dict(guided_operation)
+        receipt_row = dict(receipt)
         parent_session_id = fork_authority.parent.parent_context.fence.session_id
         child_session_id = fork_authority.child_context.fence.session_id
         self.__connection_token = _register_authorized_fork_mutation_connection(connection, fork_authority)
         try:
             self.__parent_session_id = parent_session_id
             self.__child_session_id = child_session_id
-            self.__guided_operation = guided_row
+            self.__receipt = receipt_row
             self.__database_now = database_now
             self.__child_created = child_created
             self.__child_mutations = _ForkChildSessionMutations(
@@ -3790,10 +4202,10 @@ class _ForkCreationTransaction:
                 child_context=fork_authority.child_context,
                 database_now=database_now,
             )
-            self.__parent_guided_mutations = _ForkParentGuidedMutations(
+            self.__parent_receipt_mutations = _ForkParentReceiptMutations(
                 self.__connection_token,
                 fork_authority=fork_authority,
-                guided_operation=guided_row,
+                receipt=receipt_row,
                 database_now=database_now,
             )
         except BaseException:
@@ -3813,9 +4225,9 @@ class _ForkCreationTransaction:
         return self.__child_mutations
 
     @property
-    def parent_guided_mutations(self) -> SessionForkParentGuidedMutations:
+    def parent_receipt_mutations(self) -> SessionForkParentReceiptMutations:
         self._require_active()
-        return self.__parent_guided_mutations
+        return self.__parent_receipt_mutations
 
     @staticmethod
     def _require_uuid(value: UUID, *, field_name: str) -> str:
@@ -3823,14 +4235,14 @@ class _ForkCreationTransaction:
             raise TypeError(f"{field_name} must be an exact UUID")
         return str(value)
 
-    def require_parent_guided_operation(
+    def require_parent_fork_receipt(
         self,
-        fence: GuidedOperationFence,
+        fence: OperationReceiptFence,
     ) -> tuple[Mapping[str, Any], datetime]:
         self._require_active()
-        if type(fence) is not GuidedOperationFence:
-            raise TypeError("fork guided fence must be exact")
-        row = self.__guided_operation
+        if type(fence) is not OperationReceiptFence:
+            raise TypeError("fork receipt fence must be exact")
+        row = self.__receipt
         if (
             str(fence.session_id) != self.__parent_session_id
             or fence.operation_id != row["operation_id"]
@@ -3839,7 +4251,7 @@ class _ForkCreationTransaction:
             or row["status"] != "in_progress"
             or _ensure_utc(row["lease_expires_at"]) <= self.__database_now
         ):
-            raise AuditIntegrityError("fork creation guided authority is no longer exact")
+            raise AuditIntegrityError("fork creation receipt authority is no longer exact")
         return dict(row), self.__database_now
 
     def read_parent_session(self) -> Any | None:
@@ -3906,7 +4318,7 @@ class _ForkCreationTransaction:
         set: a ``pending`` or ``failed`` parent blob is outside every plan, so
         a reference to it in the source state can never be rebased onto a child
         copy — precisely the custody
-        ``sessions/service.py::_refuse_unrewritable_fork_custody`` refuses
+        ``sessions/fork_custody.py::_refuse_unrewritable_fork_custody`` refuses
         before the child is staged. Scoping this to ``ready`` would make the
         refusal blind to exactly the rows it exists to catch.
         """
@@ -3963,7 +4375,7 @@ class _ForkCreationTransaction:
         ``sessions/service.py::_effective_pipeline_proposal_base`` could not
         run on the fork path and the anchor was held at the immutable creation
         base — which refuses a parent whose pending proposal has been rebased,
-        the ordinary outcome of a guided local replan (elspeth-ed67eb9d0d).
+        the ordinary outcome of a local replan.
         Scoped and shaped exactly like its ``proposal.created`` sibling.
         """
         self._require_active()
@@ -3996,55 +4408,6 @@ class _ForkCreationTransaction:
             )
             .scalar_one()
         )
-
-    def read_parent_guided_root_authority(
-        self,
-        message_id: UUID,
-    ) -> tuple[Any | None, tuple[Any, ...], Any | None]:
-        """Read the parent rows one guided root-intent derivation needs.
-
-        The operation filter admits ``guided_convert`` as well as
-        ``guided_start``: a converted session's root intent is claimed by a
-        ``guided_convert`` row, and scoping this accessor to starts left the
-        fork path deriving root authority from ZERO operations for such a
-        parent. The rows are returned unjudged so
-        ``sessions/service.py::_verified_guided_root_authority`` — the single
-        derivation both the ordinary-connection and the fork-transaction path
-        run — decides kind, profile and hash.
-        """
-        self._require_active()
-        message_id_str = self._require_uuid(message_id, field_name="message_id")
-        connection = _resolve_mutation_connection(self.__connection_token)
-        message = connection.execute(
-            select(
-                chat_messages_table.c.role,
-                chat_messages_table.c.content,
-                chat_messages_table.c.writer_principal,
-            ).where(
-                chat_messages_table.c.session_id == self.__parent_session_id,
-                chat_messages_table.c.id == message_id_str,
-            )
-        ).one_or_none()
-        operations = tuple(
-            connection.execute(
-                select(guided_operations_table).where(
-                    guided_operations_table.c.session_id == self.__parent_session_id,
-                    guided_operations_table.c.kind.in_(("guided_start", "guided_convert")),
-                    guided_operations_table.c.status == "completed",
-                    guided_operations_table.c.originating_message_id == message_id_str,
-                    guided_operations_table.c.result_kind == "composition_state",
-                )
-            ).all()
-        )
-        state = None
-        if len(operations) == 1 and operations[0].result_state_id is not None:
-            state = connection.execute(
-                select(composition_states_table).where(
-                    composition_states_table.c.session_id == self.__parent_session_id,
-                    composition_states_table.c.id == operations[0].result_state_id,
-                )
-            ).one_or_none()
-        return message, operations, state
 
     def read_child_snapshot(
         self,
@@ -4144,8 +4507,16 @@ class _SessionOperationAuthorityRepository:
     _locked_pair_transaction, _require_active_locked_fork_pair, __active_locked_fork_pair_count = __build_locked_fork_pair_controls()
     del __build_locked_fork_pair_controls
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+        approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
+    ) -> None:
         self._engine = engine
+        self._quota_exceeded_recorder = quota_exceeded_recorder
+        self._approval_supersession_recorder = approval_supersession_recorder
 
     def _locked_transaction(self, session_id: str) -> AbstractContextManager[Connection]:
         """The dialect's same-session locked transaction (process + transaction lock).
@@ -4644,13 +5015,13 @@ class _SessionOperationAuthorityRepository:
             parent_context,
             database_now=database_now,
         )
-        guided = self._require_fork_guided_row(
+        receipt = self._require_fork_receipt_row(
             conn,
             parent_authority=authority.parent,
             database_now=database_now,
         )
-        if self._canonical_bound_child_id(guided["result_session_id"]) != child_id:
-            raise AuditIntegrityError("fork child lease is not the guided operation's exact bound child")
+        if self._canonical_bound_child_id(receipt["result_session_id"]) != child_id:
+            raise AuditIntegrityError("fork child lease is not the receipt's exact bound child")
         child = conn.execute(select(sessions_table).where(sessions_table.c.id == child_id).with_for_update()).mappings().one_or_none()
         if child is None:
             raise SessionOperationFenceLost(FenceLossReason.MISSING)
@@ -4793,6 +5164,8 @@ class _SessionOperationAuthorityRepository:
                 session_id=fence.session_id,
                 database_now=database_now,
                 operation_context=context,
+                quota_exceeded_recorder=self._quota_exceeded_recorder,
+                approval_supersession_recorder=self._approval_supersession_recorder,
             )
             try:
                 return mutation(transaction)
@@ -4800,34 +5173,34 @@ class _SessionOperationAuthorityRepository:
                 transaction._close()
 
     @staticmethod
-    def _require_fork_guided_row(
+    def _require_fork_receipt_row(
         conn: Connection,
         *,
         parent_authority: SessionForkParentAuthority,
         database_now: datetime | None = None,
     ) -> RowMapping:
         parent_session_id = parent_authority.parent_context.fence.session_id
-        guided = parent_authority.guided_fence
+        receipt = parent_authority.receipt_fence
         row = (
             conn.execute(
-                select(guided_operations_table).where(
-                    guided_operations_table.c.session_id == parent_session_id,
-                    guided_operations_table.c.operation_id == guided.operation_id,
+                select(session_operation_receipts_table).where(
+                    session_operation_receipts_table.c.session_id == parent_session_id,
+                    session_operation_receipts_table.c.operation_id == receipt.operation_id,
                 )
             )
             .mappings()
             .one_or_none()
         )
         if row is None:
-            raise AuditIntegrityError("fork creation guided operation is missing")
+            raise AuditIntegrityError("fork creation receipt is missing")
         if row["kind"] != "session_fork" or row["status"] != "in_progress":
-            raise AuditIntegrityError("fork creation guided operation is not an in-progress session fork")
+            raise AuditIntegrityError("fork creation receipt is not an in-progress session fork")
         if (
-            row["lease_token"] != guided.lease_token
-            or row["attempt"] != guided.attempt
+            row["lease_token"] != receipt.lease_token
+            or row["attempt"] != receipt.attempt
             or (database_now is not None and _ensure_utc(row["lease_expires_at"]) <= database_now)
         ):
-            raise AuditIntegrityError("fork creation guided operation fence is not exact and live")
+            raise AuditIntegrityError("fork creation receipt fence is not exact and live")
         return row
 
     @staticmethod
@@ -4835,13 +5208,13 @@ class _SessionOperationAuthorityRepository:
         if value is None:
             return None
         if type(value) is not str:
-            raise AuditIntegrityError("fork creation guided operation has a malformed child binding")
+            raise AuditIntegrityError("fork creation receipt has a malformed child binding")
         try:
             parsed = UUID(value)
         except ValueError as exc:
-            raise AuditIntegrityError("fork creation guided operation has a malformed child binding") from exc
+            raise AuditIntegrityError("fork creation receipt has a malformed child binding") from exc
         if str(parsed) != value:
-            raise AuditIntegrityError("fork creation guided operation has a noncanonical child binding")
+            raise AuditIntegrityError("fork creation receipt has a noncanonical child binding")
         return value
 
     @classmethod
@@ -4857,7 +5230,7 @@ class _SessionOperationAuthorityRepository:
         transaction: _ForkCreationTransaction,
         database_now: datetime,
     ) -> None:
-        guided = cls._require_fork_guided_row(
+        receipt = cls._require_fork_receipt_row(
             conn,
             parent_authority=parent_authority,
             database_now=database_now,
@@ -4890,8 +5263,8 @@ class _SessionOperationAuthorityRepository:
             previously_bound_child_id == child_session_id and not transaction._child_created
         )
         if (
-            guided["result_session_id"] != child_session_id
-            or guided["originating_message_id"] != expected_message_id
+            receipt["result_session_id"] != child_session_id
+            or receipt["originating_message_id"] != expected_message_id
             or not valid_child
             or not valid_fence
             or not valid_transition
@@ -5041,7 +5414,7 @@ class _SessionOperationAuthorityRepository:
         child: SessionForkChildCreation,
         mutation: Callable[[SessionForkCreationTransaction, SessionForkAuthority], T],
     ) -> T:
-        """Run guided fork staging under canonical parent/hidden-child locks."""
+        """Run receipt-backed fork staging under canonical parent/hidden-child locks."""
         self._validate_fork_parent_authority(parent_authority)
         if type(child) is not SessionForkChildCreation:
             raise TypeError("child must be an exact SessionForkChildCreation")
@@ -5053,7 +5426,7 @@ class _SessionOperationAuthorityRepository:
         candidate_id = str(_new_session_id())
         for _attempt in range(_MAX_SESSION_ID_COLLISION_ATTEMPTS):
             with self._engine.connect() as probe:
-                probe_row = self._require_fork_guided_row(
+                probe_row = self._require_fork_receipt_row(
                     probe,
                     parent_authority=parent_authority,
                 )
@@ -5061,7 +5434,7 @@ class _SessionOperationAuthorityRepository:
             locked_child_id = bound_child_id or candidate_id
             retry_child_id: str | None = None
             with self._locked_pair_transaction(parent_id, locked_child_id) as conn:
-                current_row = self._require_fork_guided_row(
+                current_row = self._require_fork_receipt_row(
                     conn,
                     parent_authority=parent_authority,
                 )
@@ -5075,7 +5448,7 @@ class _SessionOperationAuthorityRepository:
                         parent_context,
                         database_now=database_now,
                     )
-                    current_row = self._require_fork_guided_row(
+                    current_row = self._require_fork_receipt_row(
                         conn,
                         parent_authority=parent_authority,
                         database_now=database_now,
@@ -5110,7 +5483,7 @@ class _SessionOperationAuthorityRepository:
                     transaction = _ForkCreationTransaction(
                         conn,
                         fork_authority=fork_authority,
-                        guided_operation=current_row,
+                        receipt=current_row,
                         database_now=database_now,
                         child_created=child_created,
                     )
@@ -5269,10 +5642,20 @@ class _SessionOperationAuthorityRepository:
 class PostgresSessionOperationRepository(_SessionOperationAuthorityRepository):
     """Distributed authority using PostgreSQL row locks and database time."""
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+        approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
+    ) -> None:
         if engine.dialect.name != "postgresql":
             raise ValueError("PostgresSessionOperationRepository requires PostgreSQL")
-        super().__init__(engine)
+        super().__init__(
+            engine,
+            quota_exceeded_recorder=quota_exceeded_recorder,
+            approval_supersession_recorder=approval_supersession_recorder,
+        )
 
     @contextmanager
     def _locked_transaction(self, session_id: str) -> Iterator[Connection]:

@@ -3,7 +3,8 @@
 These are strict contracts - all enum fields use proper enum types.
 Model loader layer handles string→enum conversion for DB reads.
 
-Per Data Manifesto: The audit database is OUR data. If we read
+Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+§The Three-Tier Trust Model): the audit database is OUR data. If we read
 garbage from it, something catastrophic happened - crash immediately.
 """
 
@@ -31,6 +32,7 @@ from elspeth.contracts.enums import (
     NodeType,
     ReproducibilityGrade,
     RoutingMode,
+    RunMode,
     RunStatus,
     TerminalOutcome,
     TerminalPath,
@@ -77,10 +79,10 @@ type ArtifactPublicationEvidenceKind = Literal["returned", "reconciled", "inheri
 OPERATION_TYPE_VALUES: tuple[OperationType, ...] = ("source_load", "sink_write", "runtime_preflight")
 
 
-def validate_resolved_prompt_template_hash(call_type: CallType, resolved_prompt_template_hash: str | None) -> None:
+def validate_approved_prompt_artifact_hash(call_type: CallType, approved_prompt_artifact_hash: str | None) -> None:
     """Validate the cross-DB prompt-hash anchor invariant (Tier 1).
 
-    ``resolved_prompt_template_hash`` is defined only for LLM calls and, when
+    ``approved_prompt_artifact_hash`` is defined only for LLM calls and, when
     present, must be a 64-character lowercase hex digest. Raises ``ValueError``
     on violation; ``None`` is always valid.
 
@@ -90,12 +92,12 @@ def validate_resolved_prompt_template_hash(call_type: CallType, resolved_prompt_
     surfaces as a post-commit ``ValueError`` when the ``Call`` is constructed,
     violating the Tier-1 guarantee that the audit trail is always pristine.
     """
-    if resolved_prompt_template_hash is None:
+    if approved_prompt_artifact_hash is None:
         return
     if call_type is not CallType.LLM:
-        raise ValueError(f"Call.resolved_prompt_template_hash is defined only for CallType.LLM calls, got call_type={call_type!r}")
-    if not isinstance(resolved_prompt_template_hash, str) or not _SHA256_HEX_PATTERN.fullmatch(resolved_prompt_template_hash):
-        raise ValueError("Call.resolved_prompt_template_hash must be a 64-character lowercase hex digest")
+        raise ValueError(f"Call.approved_prompt_artifact_hash is defined only for CallType.LLM calls, got call_type={call_type!r}")
+    if not isinstance(approved_prompt_artifact_hash, str) or not _SHA256_HEX_PATTERN.fullmatch(approved_prompt_artifact_hash):
+        raise ValueError("Call.approved_prompt_artifact_hash must be a 64-character lowercase hex digest")
 
 
 def _validate_enum(value: object, enum_type: type, field_name: str, *, optional: bool = False) -> None:
@@ -140,6 +142,8 @@ class Run:
     settings_json: str
     canonical_version: str
     status: RunStatus  # Strict: enum only
+    run_mode: RunMode = RunMode.LIVE
+    replay_from_run_id: str | None = None
     completed_at: datetime | None = None
     reproducibility_grade: ReproducibilityGrade | None = None
     export_status: ExportStatus | None = None  # Strict: enum only
@@ -155,6 +159,9 @@ class Run:
         """Validate enum fields - Tier 1 crash on invalid types."""
         require_int(self.llm_call_count, "llm_call_count", optional=True, min_value=0)
         _validate_enum(self.status, RunStatus, "status")
+        _validate_enum(self.run_mode, RunMode, "run_mode")
+        if (self.run_mode is RunMode.LIVE) != (self.replay_from_run_id is None):
+            raise ValueError("live runs have no replay source; replay/verify runs require one")
         _validate_enum(self.reproducibility_grade, ReproducibilityGrade, "reproducibility_grade", optional=True)
         _validate_enum(self.export_status, ExportStatus, "export_status", optional=True)
         if type(self.seeded_from_cache) is not bool:
@@ -182,7 +189,6 @@ class Node:
     config_json: str
     registered_at: datetime
     source_file_hash: str | None = None
-    schema_hash: str | None = None
     sequence_in_pipeline: int | None = None
     # Schema configuration for audit trail (WP-11.99)
     schema_mode: str | None = None  # "observed", "fixed", "flexible", "parse"
@@ -238,6 +244,7 @@ class Row:
     source_row_index: int
     ingest_sequence: int
     source_data_ref: str | None = None  # None when payload stored inline
+    source_contract_json: str | None = None  # Exact contract at source-row ingestion
 
     def __post_init__(self) -> None:
         """Validate int fields - Tier 1 crash on invalid types."""
@@ -544,24 +551,34 @@ class Call:
     request_ref: str | None = None
     response_hash: str | None = None
     response_ref: str | None = None
+    source_call_id: str | None = None
     error_json: str | None = None
     latency_ms: float | None = None
     # Cross-DB hash anchor for LLM transforms downstream of an interpretation
     # event (Phase 5b Task 9 / Option A). Populated at execution time by the
-    # LLM plugin when it reads ``options.resolved_prompt_template_hash`` from
+    # LLM plugin when it reads ``options.approved_prompt_artifact_hash`` from
     # the node config (written there by ``resolve_interpretation_event`` at
     # compose time). ``None`` for non-LLM calls and for LLM transforms that
     # never went through an interpretation surface. Must equal the matching
-    # ``interpretation_events.resolved_prompt_template_hash`` in the session
+    # ``interpretation_events.approved_prompt_artifact_hash`` in the session
     # audit DB when non-None; inequality = Tier-1 audit anomaly.
-    resolved_prompt_template_hash: str | None = None
+    approved_prompt_artifact_hash: str | None = None
+    # None means unreported, including failed calls. It is not zero usage.
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    cached_prompt_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
     def __post_init__(self) -> None:
         """Validate enum fields and structural invariants — Tier 1 crash on invalid types."""
         require_int(self.call_index, "call_index", min_value=0)
         _validate_enum(self.call_type, CallType, "call_type")
         _validate_enum(self.status, CallStatus, "status")
-        validate_resolved_prompt_template_hash(self.call_type, self.resolved_prompt_template_hash)
+        validate_approved_prompt_artifact_hash(self.call_type, self.approved_prompt_artifact_hash)
+        require_int(self.prompt_tokens, "prompt_tokens", optional=True, min_value=0)
+        require_int(self.completion_tokens, "completion_tokens", optional=True, min_value=0)
+        require_int(self.cached_prompt_tokens, "cached_prompt_tokens", optional=True, min_value=0)
+        require_int(self.reasoning_tokens, "reasoning_tokens", optional=True, min_value=0)
         # XOR: exactly one of state_id or operation_id must be set
         has_state = self.state_id is not None
         has_operation = self.operation_id is not None
@@ -569,6 +586,19 @@ class Call:
             raise ValueError(
                 f"Call requires exactly one of state_id or operation_id. Got state_id={self.state_id!r}, operation_id={self.operation_id!r}"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class CallVerification:
+    """Durable comparison of a current call with a source-run call."""
+
+    current_call_id: str
+    current_run_id: str
+    source_run_id: str
+    source_call_id: str | None
+    is_match: bool | None
+    differences_json: str
+    recorded_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -1182,8 +1212,9 @@ class Checkpoint:
     def __post_init__(self) -> None:
         """Validate required fields - Tier 1 crash on invalid data.
 
-        Per Data Manifesto: Audit data is OUR data. If we receive None
-        for required hash fields, that's a bug in our code - crash immediately.
+        Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model: audit data is OUR data. If we receive None for required hash
+        fields, that's a bug in our code - crash immediately.
         """
         require_int(self.sequence_number, "sequence_number", min_value=0)
         require_int(self.format_version, "format_version", optional=True, min_value=0)
@@ -1622,6 +1653,7 @@ class Operation:
     operation_type: OperationType
     started_at: datetime
     status: Literal["open", "completed", "failed", "pending"]
+    occurrence_index: int | None = None
     sink_effect_id: str | None = None
     completed_at: datetime | None = None
     input_data_ref: str | None = None
@@ -1645,6 +1677,7 @@ class Operation:
         """
         if self.operation_type not in self._ALLOWED_OPERATION_TYPES:
             raise ValueError(f"operation_type must be one of {sorted(self._ALLOWED_OPERATION_TYPES)}, got {self.operation_type!r}")
+        require_int(self.occurrence_index, "occurrence_index", optional=True, min_value=0)
 
         if self.status not in self._ALLOWED_STATUSES:
             raise ValueError(f"status must be one of {sorted(self._ALLOWED_STATUSES)}, got {self.status!r}")
@@ -1682,6 +1715,7 @@ class Operation:
             "run_id": self.run_id,
             "node_id": self.node_id,
             "operation_type": self.operation_type,
+            "occurrence_index": self.occurrence_index,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "status": self.status,
@@ -1733,8 +1767,9 @@ class SecretResolution:
     def __post_init__(self) -> None:
         """Validate Tier 1 invariants for secret provenance records.
 
-        Per Data Manifesto: The audit database is OUR data. If we read
-        garbage from it, something catastrophic happened - crash immediately.
+        Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model: the audit database is OUR data. If we read garbage from it,
+        something catastrophic happened - crash immediately.
 
         Invariants:
         - resolution_id, run_id, env_var_name, source, fingerprint must be non-empty strings

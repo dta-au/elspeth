@@ -240,6 +240,16 @@
   min-height: var(--size-control-compact);
 }
 
+/* The Fullscreen control carries a STROKED ui-icon, while @xyflow styles every
+   controls svg as a filled 12px glyph (`fill: currentColor`). Filled, the four
+   open corner brackets close into triangles; keep them as strokes and size
+   the mark to sit with the vendor's zoom and fit glyphs. */
+:root .react-flow__controls-button .ui-icon {
+  max-width: 14px;
+  max-height: 14px;
+  fill: none;
+}
+
 /* Both floating panels (Controls, MiniMap) inset from the canvas edge at
    @xyflow's raw 15px; put them on the spacing scale instead. Every rule in
    this group is :root-prefixed because the vendor rules are bare classes —
@@ -281,8 +291,11 @@
 
 .graph-view-shell {
   position: relative;
+  display: flex;
+  flex-direction: column;
   width: 100%;
   height: 100%;
+  min-height: 0;
 }
 
 /* Empty canvas (elspeth-1f4b60a492): composes the shared .empty-state
@@ -312,43 +325,79 @@
   margin: 0;
 }
 
-/* Guided pre-commit drawing (elspeth-9f0873426a, IA-1/V-1): GuidedGraphPane
-   replaces the empty state above while a guided build has something reviewed
-   or proposed but nothing committed. Same panel box as the canvas (fills the
-   tabpanel, scrolls its own overflow) with a one-line caption over the
-   read-only SVG. The SVG scales with its viewBox, so left unbounded in the
-   wide pane a three-node drawing would blow up to poster size: the canvas is
-   capped at reading width and centred — roughly twice the width the
-   proposal card used to give it, so the labels V-1 measured at 8px read at
-   body size without the nodes turning into billboards. */
-.graph-view-guided {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-sm);
-  box-sizing: border-box;
-  height: 100%;
-  padding: var(--space-md);
-  overflow: auto;
-}
-
-.graph-view-guided__caption {
-  margin: 0;
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-sm);
-}
-
-.graph-view-guided .guided-readonly-graph {
-  width: min(100%, 44rem);
-  margin-inline: auto;
-}
-
 .graph-view-canvas {
   /* Positioned so the React Flow Controls/MiniMap panels — rendered as
      SIBLINGS of the role="img" diagram (elspeth-37f6f13132) — anchor to the
      canvas box rather than an arbitrary ancestor. */
   position: relative;
   width: 100%;
-  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.graph-detail-table {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--color-border-strong);
+  background: var(--color-surface-paper);
+  color: var(--color-text);
+  font-size: var(--font-size-sm);
+}
+
+.graph-detail-table summary {
+  padding: var(--space-sm) var(--space-md);
+  cursor: pointer;
+  font-weight: var(--font-weight-semibold);
+}
+
+.graph-detail-table-scroll {
+  --scroll-owner: wiring;
+
+  max-height: 12rem;
+  overflow: auto;
+}
+
+.graph-detail-table-scroll:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: -2px;
+}
+
+.graph-detail-table table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.graph-detail-table th,
+.graph-detail-table td {
+  padding: var(--space-xs) var(--space-md);
+  border-top: 1px solid var(--color-border);
+  vertical-align: top;
+}
+
+.graph-approvals-value {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.graph-approvals-date {
+  white-space: nowrap;
+}
+
+.graph-output-detail {
+  display: inline;
+  margin-inline: var(--space-xs);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: normal;
+}
+
+.graph-detail-table code {
+  background-color: var(--color-surface-elevated);
+  padding: var(--space-2xs) var(--space-xs);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  overflow-wrap: anywhere;
 }
 
 /* The role="img" scope: contains ONLY the React Flow diagram. The live
@@ -673,8 +722,32 @@
   gap: var(--space-xs);
 }
 
-/* Advanced settings / Raw options (JSON) disclosures — same idiom as
-   .guided-schema-advanced and .wire-stage__raw: a top rule separates the
+/* A prompt role an llm step is missing (session 60ab6a67). Warning, not
+   error: the row states a requirement; the blocking rejection itself is
+   reported by validation in the decision panel. Colour is never the only
+   signal — the sentence says "Not set". */
+/* The two prompt roles lead every llm step's box as their own block; the rule
+   below separates them from the generic option rows that follow. */
+.option-rows-prompt-roles {
+  padding-bottom: var(--space-xs);
+  border-bottom: 1px solid var(--color-border);
+}
+
+/* A multi-query step shows one user prompt per query; the query's own name
+   captions each one on its own line above the prompt text. */
+.option-rows-query-name {
+  display: block;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+}
+
+.option-rows-prompt-missing {
+  color: var(--color-warning);
+  font-style: italic;
+}
+
+/* Advanced settings / Raw options (JSON) disclosures: a top rule separates the
    disclosure from the essential rows above it, and the summary picks up the
    pointer cursor plus the file's secondary-text register instead of
    inheriting raw UA <summary> chrome. */

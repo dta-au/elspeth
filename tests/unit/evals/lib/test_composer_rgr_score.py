@@ -13,6 +13,8 @@ no I/O.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -87,6 +89,54 @@ def _assistant_tool_call(name: str) -> dict[str, Any]:
 
 
 class TestBaselineRedSignals:
+    @pytest.mark.parametrize("state", [[], "unavailable", 42, False])
+    @pytest.mark.parametrize("must_be_valid", [True, False])
+    def test_nonobject_state_is_red(self, state: Any, must_be_valid: bool) -> None:
+        result = score(_scenario(red={"must_be_valid": must_be_valid}), [_msg("assistant", "Done.")], state)
+        assert result["verdict"] == "RED"
+        assert result["red_reasons"] == ["final composition state is not an object"]
+        assert result["stats"]["is_valid"] is None
+
+    @pytest.mark.parametrize("validity", [None, "false", "true", 1, 0, [], {}])
+    @pytest.mark.parametrize("must_be_valid", [True, False])
+    def test_nonboolean_validity_is_red(self, validity: Any, must_be_valid: bool) -> None:
+        result = score(
+            _scenario(red={"must_be_valid": must_be_valid, "allow_is_valid_false_when_error_codes": ["allowed"]}),
+            [_msg("assistant", "Done.")],
+            _state_valid(is_valid=validity, validation_errors=[{"message": "pending", "error_code": "allowed", "component": None}]),
+        )
+        assert result["verdict"] == "RED"
+        assert result["red_reasons"] == ["final composition state has missing or non-boolean is_valid"]
+        assert result["stats"]["is_valid"] is None
+
+    def test_missing_validity_is_red(self) -> None:
+        state = _state_valid()
+        del state["is_valid"]
+        result = score(_scenario(), [_msg("assistant", "Done.")], state)
+        assert result["verdict"] == "RED"
+        assert result["red_reasons"] == ["final composition state has missing or non-boolean is_valid"]
+        assert result["stats"]["is_valid"] is None
+
+    @pytest.mark.parametrize(
+        ("criterion", "needle", "reason_prefix"),
+        [
+            ("build_failure_sentinels", "Cannot Complete", "build-failure sentinel(s) present in final message"),
+            ("passivity_phrases", "Should I", "forbidden passivity phrases in final message"),
+            ("credential_misnarration_phrases", "Missing Credentials", "credential misnarration phrases in final message"),
+        ],
+    )
+    @pytest.mark.parametrize("body_case", ["lower", "upper", "unchanged", "absent"])
+    def test_content_criteria_ignore_case(self, criterion: str, needle: str, reason_prefix: str, body_case: str) -> None:
+        bodies = {"lower": needle.lower(), "upper": needle.upper(), "unchanged": needle, "absent": "All done."}
+        result = score(
+            scenario=_scenario(red={criterion: [needle]}),
+            messages=[_msg("assistant", bodies[body_case])],
+            state=_state_valid(),
+        )
+
+        assert result["verdict"] == ("GREEN" if body_case == "absent" else "RED")
+        assert result["red_reasons"] == ([] if body_case == "absent" else [f"{reason_prefix}: {[needle]}"])
+
     def test_green_when_all_clean(self) -> None:
         result = score(
             scenario=_scenario(),
@@ -154,6 +204,7 @@ class TestBaselineRedSignals:
 
     def test_green_when_relaxed_validity_has_only_allowed_error_codes(self) -> None:
         result = score(
+            state_origin="mocked_harness",
             scenario=_scenario(
                 red={
                     "must_be_valid": False,
@@ -176,21 +227,7 @@ class TestBaselineRedSignals:
         assert result["verdict"] == "GREEN", result["red_reasons"]
 
     def test_red_when_relaxed_validity_cannot_read_codes_off_a_stringified_state(self) -> None:
-        """The allowance is undecidable on the HTTP state shape, and the reason must say so.
-
-        ``CompositionStateResponse.validation_errors`` is ``list[str] | None``
-        (``src/elspeth/web/sessions/schemas.py``), so a state that came through
-        the HTTP boundary carries bare messages and
-        ``_extract_error_codes_from_entries`` ignores them BY DESIGN. That is the
-        branch this pins, and it had no test before: both sibling relaxation
-        tests supply dict entries, which only the mocked-LLM harness produces.
-
-        Failing closed is correct — an unreadable state must not buy a GREEN.
-        What would be wrong is the WORDING: reporting "no codes were present"
-        states a fact about the pipeline that the scorer cannot know, when the
-        run may well have raised coded errors that the boundary stringified.
-        The reason must attribute the blindness to the observation.
-        """
+        """Historical message-only observations cannot prove a coded allowance."""
         result = score(
             scenario=_scenario(
                 red={
@@ -215,6 +252,7 @@ class TestBaselineRedSignals:
 
     def test_red_when_relaxed_validity_has_disallowed_error_code(self) -> None:
         result = score(
+            state_origin="mocked_harness",
             scenario=_scenario(
                 red={
                     "must_be_valid": False,
@@ -236,6 +274,85 @@ class TestBaselineRedSignals:
 
         assert result["verdict"] == "RED"
         assert any("invalid_output_path" in r for r in result["red_reasons"])
+
+
+class TestHttpValidationErrorAuthority:
+    @pytest.mark.parametrize(
+        ("case", "expected"),
+        [("null", "GREEN"), ("empty", "GREEN"), ("coded", "GREEN"), ("unexpected", "RED"), ("uncoded", "RED"), ("guided_invalid", "RED")],
+    )
+    def test_actual_http_producer_state(self, case, expected):
+        from tests.fixtures.web.composer.generate_composition_state_validation_errors import composition_state_validation_error_cases
+
+        payload = composition_state_validation_error_cases()["states"][case]
+        result = score(
+            scenario=_scenario(
+                red={"must_be_valid": False, "allow_is_valid_false_when_error_codes": ["interpretation_review_pending"]},
+                green={"must_be_valid": False},
+            ),
+            messages=[_msg("assistant", "Ready for review")],
+            state=payload,
+        )
+        assert result["verdict"] == expected, result["red_reasons"]
+        if case == "uncoded":
+            assert any("what the state made observable" in reason for reason in result["red_reasons"])
+        if case == "unexpected":
+            assert any("invalid_output_path" in reason for reason in result["red_reasons"])
+
+    def test_frontend_fixture_is_current_actual_http_output(self):
+        from tests.fixtures.web.composer.generate_composition_state_validation_errors import composition_state_validation_error_cases
+
+        fixture = Path(__file__).resolve().parents[3] / "fixtures/web/composer/composition_state_validation_errors.json"
+        produced = composition_state_validation_error_cases()
+        assert json.loads(fixture.read_text()) == produced
+        assert produced["states"]["null"]["validation_errors"] is None
+        assert produced["states"]["empty"]["validation_errors"] == []
+        assert produced["versions"] == list(produced["states"].values())
+        assert produced["states"]["guided_invalid"]["validation_errors"] == [
+            {"message": "guided_composition_invalid", "error_code": "guided_composition_invalid", "component": None}
+        ]
+
+    @pytest.mark.parametrize(
+        "errors",
+        [
+            [{"message": "pending", "error_code": "interpretation_review_pending"}],
+            [{"message": "pending", "error_code": "interpretation_review_pending", "component": None, "extra": 1}],
+            [{"message": False, "error_code": "interpretation_review_pending", "component": None}],
+            [{"message": "pending", "error_code": "interpretation_review_pending", "component": 7}],
+            [
+                {"message": "pending", "error_code": "interpretation_review_pending", "component": None},
+                {"message": "unobserved", "error_code": None, "component": None},
+            ],
+            [
+                {"message": "pending", "error_code": "interpretation_review_pending", "component": None},
+                "interpretation_review_pending: old text",
+            ],
+        ],
+    )
+    def test_malformed_or_partly_uncoded_http_errors_cannot_buy_allowance(self, errors):
+        result = score(
+            scenario=_scenario(
+                red={"must_be_valid": False, "allow_is_valid_false_when_error_codes": ["interpretation_review_pending"]},
+                green={"must_be_valid": False},
+            ),
+            messages=[_msg("assistant", "Ready for review")],
+            state=_state_valid(is_valid=False, validation_errors=errors),
+        )
+        assert result["verdict"] == "RED"
+        assert any("what the state made observable" in reason for reason in result["red_reasons"])
+
+    @pytest.mark.parametrize("field", ["errors", "runtime_preflight"])
+    def test_http_does_not_borrow_mock_harness_error_sources(self, field):
+        errors = [{"error_code": "interpretation_review_pending", "message": "pending"}]
+        result = score(
+            scenario=_scenario(
+                red={"must_be_valid": False, "allow_is_valid_false_when_error_codes": ["interpretation_review_pending"]},
+                green={"must_be_valid": False},
+            ),
+            messages=[_msg("assistant", "Ready for review")],
+            state=_state_valid(is_valid=False, validation_errors=None, **{field: errors if field == "errors" else {"errors": errors}}),
+        )
+        assert result["verdict"] == "RED"
 
 
 class TestBaselineAmberSignals:

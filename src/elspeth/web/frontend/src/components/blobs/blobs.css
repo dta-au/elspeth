@@ -201,6 +201,13 @@
   color: var(--color-text-secondary);
 }
 
+.blob-manager-identity-total {
+  margin-inline: var(--space-sm);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  text-align: right;
+}
+
 .blob-manager-upload-btn {
   font-size: var(--font-size-xs);
   padding: var(--space-2xs) var(--space-sm);
@@ -234,10 +241,6 @@
   font-weight: 600;
   color: var(--color-text-muted);
   text-transform: uppercase;
-  /* Relative tracking (elspeth-5859905d1f): an absolute 0.5px does not scale
-     with font-size, so the band drifted off the uppercase micro-label idiom
-     the moment type size moved. 0.04em is the value already shared by
-     .guided-current-decision-eyebrow and .bubble-system--stage. */
   letter-spacing: 0.04em;
   background-color: var(--color-surface-elevated);
   border-bottom: 1px solid var(--color-border);

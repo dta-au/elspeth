@@ -160,6 +160,7 @@ def _llm(
         input_stream,
         on_success,
         options={
+            "system_prompt": "You judge each submitted prompt. Reply with a one-line verdict.",
             "prompt_template": " ".join(f"{{{{ row.{field} }}}}" for field in prompt_fields),
             "required_input_fields": list(declared_fields),
             "response_field": response_field,
@@ -194,12 +195,15 @@ def _safety(
     fields: tuple[str, ...] = ("llm_response",),
     plugin: str = "azure_content_safety",
 ) -> NodeSpec:
+    options: dict[str, object] = {"detect_only": detect_only, "fields": list(fields)}
+    if plugin == "azure_content_safety":
+        options["thresholds"] = {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4}
     return _node(
         node_id,
         plugin,
         input_stream,
         on_success,
-        options={"detect_only": detect_only, "fields": list(fields)},
+        options=options,
     )
 
 
@@ -218,6 +222,23 @@ def _mapper(
         on_success,
         options={"mapping": mapping, "select_only": select_only},
     )
+
+
+def test_power_automate_source_to_llm_keeps_ordinary_shield_requirement() -> None:
+    from elspeth.web.interpretation_state import prompt_shield_recommendation_warning_pairs
+
+    unshielded = _state(_llm())
+    source_name, source = next(iter(unshielded.sources.items()))
+    unshielded = replace(unshielded, sources={source_name: replace(source, plugin="power_automate")})
+    findings = control_coverage_findings(unshielded, PluginCapability.PROMPT_SHIELD)
+    assert any(finding.reason == "input_not_dominated" for finding in findings)
+    assert prompt_shield_recommendation_warning_pairs(unshielded)
+
+    shielded = _state(_shield("shield", "raw", "llm_in"), _llm(), source_target="raw")
+    source_name, source = next(iter(shielded.sources.items()))
+    shielded = replace(shielded, sources={source_name: replace(source, plugin="power_automate")})
+    assert control_coverage_findings(shielded, PluginCapability.PROMPT_SHIELD) == ()
+    assert prompt_shield_recommendation_warning_pairs(shielded) == ()
 
 
 @pytest.mark.parametrize(
@@ -286,7 +307,31 @@ def test_prompt_shield_input_coverage_requires_llm_field_scope(
     assert (control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()) is covered
 
 
-def test_prompt_shield_input_coverage_uses_actual_template_fields() -> None:
+def test_prompt_shield_input_coverage_protects_every_declared_field_the_template_can_see() -> None:
+    """ADR-051: the protected set is the declaration, not what the template text happens to read.
+
+    The template reads only ``benign_label``, but the node declares
+    ``untrusted_prompt`` too, so at render the template's row holds it and a
+    template form the analysis cannot see (``row | dictsort``) would send it.
+    A shield scanning only ``benign_label`` must not be credited.
+    """
+    state = _state(
+        _shield("shield", "raw", "llm_in", fields=("benign_label",)),
+        _llm(
+            prompt_fields=("benign_label",),
+            declared_prompt_fields=("benign_label", "untrusted_prompt"),
+        ),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [("judge", "input_not_dominated")]
+    assert findings[0].protected_fields == ("benign_label", "untrusted_prompt")
+
+
+def test_prompt_shield_input_coverage_ignores_a_template_read_outside_the_declaration() -> None:
+    """A read outside the declaration cannot reach the provider: at render it fails the row (ADR-051)."""
     state = _state(
         _shield("shield", "raw", "llm_in", fields=("benign_label",)),
         _llm(
@@ -296,7 +341,27 @@ def test_prompt_shield_input_coverage_uses_actual_template_fields() -> None:
         source_target="raw",
     )
 
-    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [pytest.param([], id="opt-out-whole-row"), pytest.param(None, id="omitted"), pytest.param(["", "prompt"], id="malformed")],
+)
+def test_prompt_shield_input_coverage_is_unprovable_without_an_explicit_declaration(declared: list[str] | None) -> None:
+    """``[]`` is the whole row and an omitted or malformed declaration proves nothing: only ``fields: all`` covers them."""
+    options: dict[str, object] = {"prompt_template": "{{ row.prompt }}", "response_field": "llm_response"}
+    if declared is not None:
+        options["required_input_fields"] = declared
+    llm = _node("judge", "llm", "llm_in", "main", options=options)
+
+    scoped = _state(_shield("shield", "raw", "llm_in", fields=("prompt",)), llm, source_target="raw")
+    assert [(finding.component_id, finding.reason) for finding in control_coverage_findings(scoped, PluginCapability.PROMPT_SHIELD)] == [
+        ("judge", "input_fields_unprovable")
+    ]
+
+    everything = _state(_all_fields_shield("shield", "raw", "llm_in"), llm, source_target="raw")
+    assert control_coverage_findings(everything, PluginCapability.PROMPT_SHIELD) == ()
 
 
 def _value_transform(
@@ -438,7 +503,7 @@ def test_prompt_shield_input_coverage_fails_closed_for_dotted_mapper_source(
         "main",
         options={
             "prompt_template": prompt_template,
-            "required_input_fields": [],
+            "required_input_fields": [next(iter(mapping.values()))],
             "response_field": "llm_response",
         },
     )
@@ -479,7 +544,7 @@ def test_prompt_shield_input_coverage_tracks_dotted_literal_passthrough(
         "main",
         options={
             "prompt_template": '{{ row["meta.prompt"] }}',
-            "required_input_fields": [],
+            "required_input_fields": ["meta.prompt"],
             "response_field": "llm_response",
         },
     )
@@ -1548,10 +1613,11 @@ def _multi_query_llm(
     *,
     prompt_template: str,
     queries: dict[str, object],
+    required_input_fields: list[str],
     input_stream: str = "llm_in",
     on_success: str = "main",
 ) -> NodeSpec:
-    """A multi-query LLM whose shared template may be dead (all queries override)."""
+    """A multi-query LLM node; its declaration, not its templates, decides what the queries can see (ADR-051)."""
     return _node(
         "judge",
         "llm",
@@ -1559,28 +1625,26 @@ def _multi_query_llm(
         on_success,
         options={
             "prompt_template": prompt_template,
-            "required_input_fields": [],
+            "required_input_fields": required_input_fields,
             "response_field": "llm_response",
             "queries": queries,
         },
     )
 
 
-def test_dead_shared_template_does_not_poison_prompt_field_provability() -> None:
-    """A node template every query overrides never renders, so it must not decide provability.
+def test_template_text_does_not_decide_multi_query_provability() -> None:
+    """A dynamic shared template cannot widen what a query sees: its ``source_row`` holds the declaration only.
 
-    ``queries.*.template`` is a per-query override (``None`` = fall back to the
-    node-level ``prompt_template`` — multi_query.py), and config validation
-    deliberately skips a shared template no query falls back to
-    (``LLMConfig._validate_template_variable_bindings``). Coverage must apply
-    the same liveness rule: with every override static, the protected set is
-    provably {prompt} and a shield scanning exactly that field is credited.
+    Required-control coverage reads the declaration plus each query's
+    ``input_fields`` values, so a shield scanning exactly that set is credited
+    whatever the template text does.
     """
     state = _state(
         _shield("shield", "raw", "llm_in", fields=("prompt",)),
         _multi_query_llm(
-            prompt_template="Classify: {{ row[lookup.field_name] }}",
-            queries={"q.a": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"}},
+            prompt_template="Classify: {{ row.source_row[lookup.field_name] }}",
+            queries={"q.a": {"input_fields": {"prompt": "prompt"}}},
+            required_input_fields=["prompt"],
         ),
         source_target="raw",
     )
@@ -1588,18 +1652,17 @@ def test_dead_shared_template_does_not_poison_prompt_field_provability() -> None
     assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
 
 
-def test_dead_shared_template_missing_shield_is_an_auto_wirable_topology_failure() -> None:
-    """With the dead template ignored, a missing shield is the wirable diagnosis.
+def test_a_declared_multi_query_node_without_a_shield_is_an_auto_wirable_topology_failure() -> None:
+    """A provable declaration makes a missing shield the wirable diagnosis.
 
     Required-control auto-wiring acts only on ``input_not_dominated``
-    (required_controls._AUTO_WIRE_ACTIONABLE_REASONS); reporting the dead
-    template's dynamic access as ``input_fields_unprovable`` left the required
-    shield unwired and failed the gate later.
+    (required_controls._AUTO_WIRE_ACTIONABLE_REASONS).
     """
     state = _state(
         _multi_query_llm(
-            prompt_template="Classify: {{ row[lookup.field_name] }}",
+            prompt_template="Classify: {{ row.source_row[lookup.field_name] }}",
             queries={"q.a": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"}},
+            required_input_fields=["prompt"],
         )
     )
 
@@ -1611,14 +1674,15 @@ def test_dead_shared_template_missing_shield_is_an_auto_wirable_topology_failure
     assert findings[0].protected_fields == ("prompt",)
 
 
-def test_query_fallback_keeps_node_template_in_provability() -> None:
-    """A query WITHOUT an override still pulls the shared template into the set."""
+def test_the_multi_query_protected_set_is_the_declaration_and_every_query_input() -> None:
+    """Every declared field and every query's ``input_fields`` value can reach a prompt."""
     llm = _multi_query_llm(
-        prompt_template="{{ row.shared_context }}",
+        prompt_template="{{ row.source_row.shared_context }}",
         queries={
             "q.a": {"input_fields": {"prompt": "prompt"}},
             "q.b": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"},
         },
+        required_input_fields=["shared_context"],
     )
 
     partial = _state(_shield("shield", "raw", "llm_in", fields=("prompt",)), llm, source_target="raw")
@@ -1636,13 +1700,14 @@ def test_query_fallback_keeps_node_template_in_provability() -> None:
     assert control_coverage_findings(covered, PluginCapability.PROMPT_SHIELD) == ()
 
 
-def test_dynamic_shared_template_with_a_falling_back_query_stays_unprovable() -> None:
-    """Liveness is per-query: one fallback keeps the dynamic template authoritative."""
+def test_an_opted_out_multi_query_node_stays_unprovable() -> None:
+    """``[]`` gives every query's ``source_row`` the whole row: no field-scoped control can be credited."""
     state = _state(
         _shield("shield", "raw", "llm_in", fields=("prompt",)),
         _multi_query_llm(
-            prompt_template="Classify: {{ row[lookup.field_name] }}",
+            prompt_template="Classify: {{ row.source_row[lookup.field_name] }}",
             queries={"q.a": {"input_fields": {"prompt": "prompt"}}},
+            required_input_fields=[],
         ),
         source_target="raw",
     )
@@ -1704,7 +1769,13 @@ def test_all_fields_control_is_credited_for_output_coverage_too() -> None:
     """The ``all`` shortcut is role-agnostic: it dominates any protected set."""
     state = _authorable_state(
         _llm(on_success="safe_in"),
-        _node("safety", "azure_content_safety", "safe_in", "main", options={"detect_only": False, "fields": "all"}),
+        _node(
+            "safety",
+            "azure_content_safety",
+            "safe_in",
+            "main",
+            options={"detect_only": False, "fields": "all", "thresholds": {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4}},
+        ),
     )
 
     assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
@@ -1762,7 +1833,15 @@ def _self_publishing_state(node_type: str, *, guarded: bool) -> CompositionState
 
     nodes = [_llm(on_success=producer_target), node]
     if guarded:
-        nodes.append(_node("safety", "azure_content_safety", node_id, "main", options={"detect_only": False, "fields": "all"}))
+        nodes.append(
+            _node(
+                "safety",
+                "azure_content_safety",
+                node_id,
+                "main",
+                options={"detect_only": False, "fields": "all", "thresholds": {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4}},
+            )
+        )
     return _state(*nodes)
 
 

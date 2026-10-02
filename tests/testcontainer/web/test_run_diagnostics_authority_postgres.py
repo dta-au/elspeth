@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -11,8 +12,12 @@ from uuid import UUID, uuid4
 import pytest
 import structlog
 from sqlalchemy import Engine, event, func, select
+from tests.fixtures.identities import ensure_test_identity
 
 import elspeth.web.coordination.run_diagnostics_authority as run_diagnostics_authority_module
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.web.composer.audit import llm_call_audit_envelope
+from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table
@@ -27,6 +32,22 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 pytestmark = pytest.mark.testcontainer
+
+
+def _llm_call_envelope() -> dict[str, object]:
+    """A real ``llm_call_audit`` envelope: the Task I1 ledger adapter reads every call field the writer emits."""
+    return llm_call_audit_envelope(
+        build_llm_call_record(
+            model_requested="test/model",
+            messages=[{"role": "user", "content": "prompt"}],
+            tools=None,
+            status=ComposerLLMCallStatus.SUCCESS,
+            started_at=datetime(2026, 9, 13, tzinfo=UTC),
+            started_ns=time.monotonic_ns(),
+            temperature=None,
+            seed=None,
+        )
+    )
 
 
 @pytest.fixture()
@@ -55,8 +76,11 @@ def deployment(
         archive_engine.dispose()
 
 
-async def _create_pending_run(service: SessionServiceImpl) -> RunRecord:
-    session = await service.create_session(str(uuid4()), "Pipeline", "local")
+async def _create_pending_run(service: SessionServiceImpl, engine: Engine) -> RunRecord:
+    owner_id = str(uuid4())
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=owner_id)
+    session = await service.create_session(owner_id, "Pipeline", "local")
     compose_context = await service._run_sync(
         lambda: service.session_operation_authority.acquire(
             session_id=session.id,
@@ -104,7 +128,7 @@ def _message_count(engine: Engine, session_id: UUID) -> int:
 @pytest.mark.asyncio
 async def test_archive_winning_advisory_lock_forces_diagnostics_recheck_and_refusal(deployment) -> None:
     diagnostics_engine, archive_engine, diagnostics, archive = deployment
-    run = await _create_pending_run(diagnostics)
+    run = await _create_pending_run(diagnostics, diagnostics_engine)
     authority = RunDiagnosticsAuditAuthority(
         run_id=run.id,
         session_id=run.session_id,
@@ -134,7 +158,7 @@ async def test_archive_winning_advisory_lock_forces_diagnostics_recheck_and_refu
             diagnostics.add_run_diagnostics_audit_message(
                 authority,
                 "must not survive archive",
-                tool_calls=[{"_kind": "llm_call_audit", "run_id": str(run.id)}],
+                tool_calls=[{**_llm_call_envelope(), "run_id": str(run.id)}],
             )
         )
         assert await asyncio.to_thread(diagnostics_attempted_lock.wait, 10), "diagnostics never attempted the session lock"
@@ -154,7 +178,7 @@ async def test_archive_winning_advisory_lock_forces_diagnostics_recheck_and_refu
 @pytest.mark.asyncio
 async def test_diagnostics_winning_advisory_lock_commits_before_archive(deployment) -> None:
     diagnostics_engine, archive_engine, diagnostics, archive = deployment
-    run = await _create_pending_run(diagnostics)
+    run = await _create_pending_run(diagnostics, diagnostics_engine)
     authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=run.session_id, state_id=run.state_id)
     diagnostics_has_lock = threading.Event()
     allow_diagnostics_commit = threading.Event()
@@ -182,7 +206,7 @@ async def test_diagnostics_winning_advisory_lock_commits_before_archive(deployme
             diagnostics.add_run_diagnostics_audit_message(
                 authority,
                 "commits before archive",
-                tool_calls=[{"_kind": "llm_call_audit", "run_id": str(run.id)}],
+                tool_calls=[{**_llm_call_envelope(), "run_id": str(run.id)}],
             )
         )
         assert await asyncio.to_thread(diagnostics_has_lock.wait, 10), "diagnostics never reached its locked insert"
@@ -205,7 +229,7 @@ async def test_diagnostics_winning_advisory_lock_commits_before_archive(deployme
 @pytest.mark.asyncio
 async def test_lock_order_also_orders_diagnostics_timestamps(deployment, monkeypatch: pytest.MonkeyPatch) -> None:
     diagnostics_engine, _peer_engine, diagnostics, peer = deployment
-    run = await _create_pending_run(diagnostics)
+    run = await _create_pending_run(diagnostics, diagnostics_engine)
     authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=run.session_id, state_id=run.state_id)
     earlier = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
     later = earlier + timedelta(seconds=1)

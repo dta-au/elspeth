@@ -21,6 +21,7 @@ from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.config import WebSettings
 from elspeth.web.execution._validation_model import (
     GraphedRuntime,
     InstantiatedRuntime,
@@ -30,6 +31,7 @@ from elspeth.web.execution._validation_model import (
     PhaseReport,
     _blocked_readiness,
 )
+from elspeth.web.execution.export_marking import operator_marked_config_dict
 from elspeth.web.execution.schemas import (
     CHECK_GATE_FAN_OUT_ADVISORY,
     CHECK_IDENTITY_NODE_ADVISORY,
@@ -177,6 +179,7 @@ def _settings_failure(
 def load_runtime_settings(
     materialized: MaterializedYaml,
     *,
+    operator_settings: WebSettings | None,
     secret_service: WebSecretResolver | None,
     user_id: str | None,
     load_yaml: _YamlLoader,
@@ -188,9 +191,13 @@ def load_runtime_settings(
     pipeline_yaml = materialized.pipeline_yaml
     authored = materialized.authored
     try:
+        config_dict = _load_yaml_mapping(load_yaml, pipeline_yaml)
+        if "run_mode" in config_dict and (type(config_dict["run_mode"]) is not str or config_dict["run_mode"] != "live"):
+            raise ValueError("Web execution does not support nonlive run invocation")
+        if "replay_from" in config_dict and config_dict["replay_from"] is not None:
+            raise ValueError("Web execution does not support nonlive run invocation")
         settings_config: dict[str, object] | None = None
         if secret_service is not None and user_id is not None and authored.all_secret_refs:
-            config_dict = _load_yaml_mapping(load_yaml, pipeline_yaml)
             resolved_dict, _resolutions = resolve_secret_refs(
                 config_dict,
                 secret_service,
@@ -199,8 +206,13 @@ def load_runtime_settings(
             )
             settings_config = resolved_dict
         elif secret_service is None and "secret_ref" in pipeline_yaml:
-            config_dict = _load_yaml_mapping(load_yaml, pipeline_yaml)
             settings_config = redact_secret_refs_for_validation(config_dict)
+
+        if operator_settings is not None:
+            authored_config = settings_config if settings_config is not None else config_dict
+            marked_config = operator_marked_config_dict(authored_config, operator_settings)
+            if marked_config is not authored_config or settings_config is not None:
+                settings_config = marked_config
 
         if settings_config is None:
             runtime_settings = load_settings_yaml(pipeline_yaml, expand_env_vars=False)
@@ -371,8 +383,8 @@ def validate_graph_structure(
     Edge compatibility is checked inside the graph BUILD, so a type-mismatch
     edge failure raises here — phase 3's dedicated handler requires a built
     graph and can never see it. This phase owns the same rich edge-contract
-    diagnostics; the graph does not exist when the BUILD raises, so
-    patch-target resolution degrades to the DAG node id by design — but a
+    diagnostics; a BUILD failure carries the authored endpoint names so
+    patch-target resolution still works before the graph returns. A
     failure from ``graph.validate()`` fires AFTER a successful build, and the
     real graph is then threaded through so diagnostics resolve composer ids
     (elspeth-9f21f3c57d).
@@ -387,7 +399,7 @@ def validate_graph_structure(
         )
     except EdgeContractError as exc:
         consumer_target = edge_patch_target_for_node_id(
-            exc.to_node_id,
+            exc.to_config_name if exc.to_config_name is not None else exc.to_node_id,
             state=policy_state,
             graph=graph,
             component_type=exc.component_type,

@@ -338,6 +338,40 @@ def test_build_invoke_tool_round_trip():
     assert plan.body["conversation"][2] == {"speaker": "tool", "text": "4", "operation_ref": "c1"}
 
 
+@pytest.mark.parametrize("content", ["", "model prose", "  "])
+def test_build_invoke_assistant_text_with_operations_omits_only_exact_empty_text(content):
+    request = CanonicalRequest(
+        model_target={"target": "backend-a"},
+        model_alias="gpt-4o",
+        messages=(
+            CanonicalMessage(
+                role="assistant",
+                content=content,
+                tool_calls=(
+                    CanonicalToolCall(call_id="c1", name="lookup", arguments_json='{"q": 1}'),
+                    CanonicalToolCall(call_id="c2", name="calculate", arguments_json='{"n": 2}'),
+                ),
+            ),
+        ),
+        temperature=None,
+        seed=None,
+        max_tokens=None,
+    )
+
+    plan = ReferenceV1InvokeAdapter().build_invoke(request)
+
+    expected_entry = {
+        "speaker": "assistant",
+        "operations": [
+            {"ref": "c1", "operation": "lookup", "payload": {"q": 1}},
+            {"ref": "c2", "operation": "calculate", "payload": {"n": 2}},
+        ],
+    }
+    if content:
+        expected_entry["text"] = content
+    assert plan.body["conversation"] == [expected_entry]
+
+
 # --- parse_success(): halt -> finish_reason -----------------------------------
 
 
@@ -393,6 +427,18 @@ def test_parse_success_screened_without_result_yields_empty_string():
     response = adapter.parse_success({"halt": "screened"})
     assert response.finish_reason == FinishReason.CONTENT_FILTER
     assert response.text == ""
+
+
+def test_parse_success_operations_preserves_text_when_present():
+    adapter = ReferenceV1InvokeAdapter()
+    response = adapter.parse_success(
+        {
+            "halt": "operations",
+            "result": {"text": "I will check", "invocations": [{"ref": "c1", "operation": "lookup", "payload": {}}]},
+        }
+    )
+    assert response.text == "I will check"
+    assert response.tool_calls == (CanonicalToolCall(call_id="c1", name="lookup", arguments_json="{}"),)
 
 
 def test_parse_success_unknown_halt_raises_value_error():
@@ -501,6 +547,13 @@ def test_classify_error_too_long():
     adapter = ReferenceV1InvokeAdapter()
     classification = adapter.classify_error(UpstreamFailure(status=400, body={"fault": {"kind": "too_long"}}))
     assert classification.code == "context_length_exceeded"
+    assert classification.retryable is False
+
+
+def test_classify_error_unknown_upstream_400_is_request_rejection():
+    adapter = ReferenceV1InvokeAdapter()
+    classification = adapter.classify_error(UpstreamFailure(status=400, body={"fault": {"kind": "validation"}}))
+    assert classification.code == "upstream_request_rejected"
     assert classification.retryable is False
 
 

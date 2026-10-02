@@ -1,6 +1,6 @@
 """Contract-level surface for the row_union barrier primitive.
 
-The v1 contract (filigree elspeth-a5b86149d4, product decision 2026-07-16)
+The v1 contract (archived issue elspeth-a5b86149d4, product decision 2026-07-16)
 defines row_union as a correlated same-row_id N->N UNION ALL barrier over
 declared fork branches. These tests pin the contract vocabulary: the node
 type, the name NewType, and the typed failure payload.

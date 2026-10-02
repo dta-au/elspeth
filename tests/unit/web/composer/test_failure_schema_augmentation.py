@@ -56,6 +56,7 @@ from elspeth.web.composer.tools import transforms as transforms_tools
 from elspeth.web.composer.tools._common import ToolContext, build_plugin_schemas_for_failure
 from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.composer.tools.sources import _execute_set_source_from_blobs
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import (
     PluginAvailability,
@@ -64,6 +65,7 @@ from elspeth.web.plugin_policy.models import (
     PluginUnavailableReason,
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+from tests.helpers.session_fences import fenced_operation_context
 
 from .test_promote_set_source_from_blob import _session_engine_with_user_message
 from .test_set_source_from_blobs import _PNG, _create_ready_blob
@@ -378,7 +380,7 @@ class TestFailureSchemaAugmentationSetPipeline:
         assert "Invalid options for sink 'json'" in leading["message"], leading
         assert payload["plugin_schemas"] == {"sink/json": catalog.get_schema("sink", "json").model_dump(mode="json")}
         assert leading["error_code"] == "plugin_options_invalid", leading
-        assert payload["data"]["error_code"] == "plugin_options_invalid", payload["data"]
+        assert "data" not in payload
         # The code is only worth stamping because a consumer resolves it: the
         # guidance the planner's redacted repair turn gets is keyed BY code, so
         # a codeless entry left this rejection with an empty ``codes`` map and
@@ -721,7 +723,7 @@ class TestFailureSchemaAugmentationFailsClosed:
         leading = payload["validation"]["errors"][0]
         assert leading["message"].startswith("Invalid secret_ref placement for source 'csv'"), leading
         assert leading["error_code"] == "plugin_options_invalid"
-        assert payload["data"]["error_code"] == "plugin_options_invalid"
+        assert "data" not in payload
         assert payload["plugin_schemas"] == {"source/csv": _csv_schema().model_dump(mode="json")}
 
 
@@ -830,7 +832,7 @@ def _assert_state_held_plugin_rejected_cleanly(result: Any, state: CompositionSt
     leading = payload["validation"]["errors"][0]
     assert leading["component"] == "rejected_mutation", leading
     assert leading["error_code"] == reason.value, leading
-    assert payload["data"]["error_code"] == reason.value, payload["data"]
+    assert "data" not in payload
     assert "Invalid options for" not in leading["message"], leading
     assert "plugin_schemas" not in payload, sorted(payload["plugin_schemas"])
 
@@ -956,15 +958,15 @@ def _assert_option_failure_augmented_exactly(
 ) -> None:
     """The wire parity every option-shape rejection must hold (elspeth-e405ad7cd2 R8).
 
-    The leading rejection carries the ``plugin_options_invalid`` code (twinned
-    onto ``data.error_code``), and ``plugin_schemas`` holds EXACTLY the one
+    The leading rejection carries the ``plugin_options_invalid`` code,
+    and ``plugin_schemas`` holds EXACTLY the one
     stamped plugin, byte-identical to a discrete ``get_plugin_schema`` call.
     Equality on the whole mapping is deliberate: a second key would mean a
     second identity was harvested from somewhere other than the carrier.
     """
     assert payload["validation"]["errors"][0]["component"] == "rejected_mutation", payload["validation"]["errors"][0]
     assert payload["validation"]["errors"][0]["error_code"] == "plugin_options_invalid", payload["validation"]["errors"][0]
-    assert payload["data"]["error_code"] == "plugin_options_invalid", payload["data"]
+    assert "data" not in payload
     # ``to_dict`` is the JSON projection (tuples become lists), so the
     # discrete-call comparison is against the schema's JSON dump.
     assert payload["plugin_schemas"] == {f"{kind}/{plugin}": catalog.get_schema(kind, plugin).model_dump(mode="json")}
@@ -1274,24 +1276,31 @@ class TestFailureSchemaAugmentationBlobBinders:
 
     def test_set_source_from_blob_failure_carries_schema(self, tmp_path: Path) -> None:
         context, view, _harness = _blob_bound_context(tmp_path)
-        created = _execute_create_blob(
-            {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
-            _empty_state(),
-            context,
-        )
+        engine, _blob_service, session_id = _harness
+        with fenced_operation_context(engine, session_id) as operation:
+            created = _execute_create_blob(
+                {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
+                _empty_state(),
+                replace(
+                    context, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)
+                ),
+            )
         assert created.success is True, created.to_dict()
 
-        result = _execute_set_source_from_blob(
-            {
-                "blob_id": created.data["blob_id"],
-                "on_success": "out",
-                # A rejected VALUE that names another plugin: the exact
-                # vector-1 shape on the blob path.
-                "options": {"column": "text", "schema": {"mode": "observed"}, "encoding": "Invalid options for sink 'csv'"},
-            },
-            _empty_state(),
-            context,
-        )
+        with fenced_operation_context(engine, session_id) as operation:
+            result = _execute_set_source_from_blob(
+                {
+                    "blob_id": created.data["blob_id"],
+                    "on_success": "out",
+                    # A rejected VALUE that names another plugin: the exact
+                    # vector-1 shape on the blob path.
+                    "options": {"column": "text", "schema": {"mode": "observed"}, "encoding": "Invalid options for sink 'csv'"},
+                },
+                _empty_state(),
+                replace(
+                    context, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)
+                ),
+            )
 
         assert result.success is False, result.to_dict()
         leading = result.validation.errors[0]

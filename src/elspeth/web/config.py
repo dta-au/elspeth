@@ -19,9 +19,10 @@ from pydantic import BaseModel, ConfigDict, Field, SecretBytes, SecretStr, Valid
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
-from elspeth.core.config import PayloadStoreSettings
+from elspeth.core.config import PayloadStoreSettings, RateLimitSettings
 from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
 from elspeth.core.url_validation import validate_credential_safe_https_url
+from elspeth.plugins.infrastructure.power_automate import normalize_allowed_origin
 from elspeth.plugins.transforms.aws.guardrail_profiles import (
     BEDROCK_GUARDRAIL_PLUGIN_IDS,
     BedrockGuardrailProfileSettings,
@@ -33,8 +34,14 @@ from elspeth.web.auth.urls import (
     DiscoveredEndpoints,
     validate_discovered_endpoints,
 )
+from elspeth.web.compartments import COMPARTMENT_ID_PATTERN, is_compartment_id
 from elspeth.web.composer.reasoning import ReasoningEffort
-from elspeth.web.plugin_policy.profiles import AWSS3SourceProfileSettings, AWSTextractProfileSettings
+from elspeth.web.composer.strict_transport import StrictToolsSetting
+from elspeth.web.plugin_policy.profiles import (
+    AWSS3SourceProfileSettings,
+    AWSTextractProfileSettings,
+    AzureSearchProfileSettings,
+)
 from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
 from elspeth.web.validation import (
     SERVER_SECRET_RESERVED_PREFIX,
@@ -217,10 +224,9 @@ class WebSettings(BaseModel):
     # authentication. Generate with ``openssl rand -base64 32``.
     operator_metrics_bearer_token: SecretStr | None = None
     registration_mode: Literal["open", "email_verified", "closed"] = "open"
-    # Short-term dev deployments only: names the ONE local-auth user granted
-    # the in-app user-management surface (/api/auth/admin/users). Unset (the
-    # default) removes the surface entirely; production deployments use the
-    # IdP (Entra/OIDC) and must leave this unset.
+    # Optional credential-management grant for one local development account,
+    # independent of identity roles. Local-auth administrators also have this
+    # capability through their live admin role. IdP deployments leave it unset.
     dev_admin_user: str | None = None
     cors_origins: tuple[str, ...] = ("http://localhost:5173",)
     data_dir: Path = Field(default=Path("data"), validate_default=True)
@@ -250,6 +256,9 @@ class WebSettings(BaseModel):
         default=None
     )
     composer_model: str = "gpt-5.5"
+    composer_pricing_model: str | None = Field(
+        default=None, min_length=1, description="LiteLLM catalog identity for missing-cost calculation; defaults to the routing model."
+    )
     # Reasoning-effort hints for the composer plane (elspeth-dc459d438e).
     # All composer roles run reasoning-capable models; these knobs bound the
     # thinking budget per call class instead of letting the model pick an
@@ -298,6 +307,14 @@ class WebSettings(BaseModel):
     composer_seed: int | None = None
     # Tests/offline development can disable the real provider boot probe.
     composer_boot_probe_enabled: bool = True
+    composer_strict_tools: StrictToolsSetting = Field(
+        default="preferred",
+        description=(
+            "Which composer routes send OpenAI strict tool contracts. 'preferred' sends them only on OpenRouter "
+            "hosts; 'forward_to_endpoint' also sends them to custom endpoints, hosted OpenAI and Azure; 'off' "
+            "restores the pre-strict tool bytes on every route."
+        ),
+    )
     # JSON log rendering (elspeth-cd98ea9d82 Tier 3): CloudWatch Logs
     # Insights auto-parses JSON, so `filter request_id = "..."` becomes a
     # working field query. Off by default — local journald stays the
@@ -336,6 +353,16 @@ class WebSettings(BaseModel):
     )
     composer_runtime_preflight_timeout_seconds: float = Field(default=5.0, gt=0)
     composer_rate_limit_per_minute: int = Field(..., ge=1)
+    audit_readiness_rate_limit_per_minute: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "Per-user per-minute budget for audit-readiness snapshots. "
+            "Snapshots run canonical pipeline validation, so this separate "
+            "bucket protects shared worker capacity without consuming the "
+            "LLM-backed composer-call budget."
+        ),
+    )
     write_rate_limit_per_minute: int = Field(
         default=60,
         ge=1,
@@ -352,10 +379,19 @@ class WebSettings(BaseModel):
     composer_expose_provider_errors: bool = False
     e2e_state_seed_enabled: bool = False
     composer_advisor_model: str = "anthropic/claude-sonnet-4-6"
+    composer_advisor_pricing_model: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Advisor LiteLLM catalog identity for missing-cost calculation; defaults to its routing model.",
+    )
+    composer_allow_same_advisor_model: bool = Field(
+        default=False,
+        description="Allow Composer and Advisor to use the same model, accepting correlated review blind spots.",
+    )
     # Independent endpoint affordance for the ADVISOR role — see
     # composer_endpoint_base_url. Deliberately separate settings: the
-    # two-model independence rule (_validate_advisor_distinct_from_primary)
-    # keeps the advisor's failure modes independent of the primary composer,
+    # default two-model rule (_validate_advisor_distinct_from_primary)
+    # promotes independence from the primary composer's failure modes,
     # and an operator may legitimately run the advisor direct against its
     # provider while the primary composer goes through a gateway (or vice
     # versa). Neither role defaults to the other's endpoint.
@@ -444,7 +480,20 @@ class WebSettings(BaseModel):
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "AZURE_API_KEY",
+        # Bedrock: the Amazon Bedrock API key (bearer token), then the static
+        # IAM credential triple. All optional — the AWS default credential
+        # chain (task role) needs none of them.
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
     )
+    # Locked-down server-only mode: when False, user-scoped secrets are
+    # disabled end to end — the API refuses create/delete, stored user rows
+    # are neither listed nor resolved, and only ``server_secret_allowlist``
+    # names can be wired. Fail-closed for deployments where every credential
+    # must be operator-provisioned.
+    user_secrets_enabled: bool = True
     # Server-authored secret→destination allowlist (elspeth-f3c1aafd25).
     # Secret WIRING is deny-by-default: with no rules, wire_secret_ref and
     # every other marker entry path is refused at validation. Each rule
@@ -455,6 +504,7 @@ class WebSettings(BaseModel):
     # Universal web plugin policy.  These user-facing Pydantic values are
     # converted immediately to RuntimeWebPluginConfig before consumption.
     plugin_allowlist: tuple[str, ...] = ()
+    power_automate_allowed_origins: tuple[str, ...] = ()
     plugin_preferences: Mapping[PluginCapability, tuple[str, ...]] = Field(default_factory=dict)
     plugin_control_modes: Mapping[PluginCapability, ControlMode] = Field(
         default_factory=lambda: {
@@ -468,8 +518,18 @@ class WebSettings(BaseModel):
     bedrock_guardrail_default_profiles: Mapping[str, str] = Field(default_factory=dict)
     aws_s3_source_profiles: tuple[AWSS3SourceProfileSettings, ...] = ()
     aws_textract_profiles: tuple[AWSTextractProfileSettings, ...] = ()
+    azure_search_profiles: tuple[AzureSearchProfileSettings, ...] = ()
     orphan_run_max_age_seconds: int = Field(default=3600, ge=60)
     orphan_run_check_interval_seconds: int = Field(default=300, ge=30)
+    # External-call rate limits for web-executed runs: the same block a CLI
+    # pipeline sets as ``rate_limit:`` in settings.yaml. A composition cannot
+    # carry run-execution settings, so without this every web run was pinned to
+    # the engine default (60 calls/minute per service) with no operator
+    # override. Operator-owned, never author-settable. Limiters are keyed by
+    # provider type (``openrouter``, ``azure_openai``, ``bedrock``,
+    # ``gateway``), so one ``services`` entry covers every LLM profile that
+    # shares that provider.
+    execution_rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
 
     # Execution infrastructure — defaults derive from data_dir when not explicitly set
     landscape_url: str | None = None
@@ -534,20 +594,33 @@ class WebSettings(BaseModel):
     # Every activation writes a quota_policies row from these, so an
     # activated identity can never hold unbounded spend on the container's
     # shared LLM credential. Required for an IdP deployment; None is only
-    # coherent for local auth.
-    quota_default_tokens_per_day: int | None = Field(default=None, gt=0)
-    quota_default_storage_bytes: int | None = Field(default=None, gt=0)
+    # coherent for local auth, and only with the WHOLE quota system off:
+    # see ``quotas_enabled`` and its validator.
+    quota_default_tokens_per_day: int | None = Field(default=None, gt=0, le=2**63 - 1)
+    quota_default_storage_bytes: int | None = Field(default=None, gt=0, le=2**63 - 1)
     # Optional container ceiling rows, distinct from the per-identity level.
-    quota_container_tokens_per_day: int | None = Field(default=None, gt=0)
-    quota_container_storage_bytes: int | None = Field(default=None, gt=0)
+    quota_container_tokens_per_day: int | None = Field(default=None, gt=0, le=2**63 - 1)
+    quota_container_storage_bytes: int | None = Field(default=None, gt=0, le=2**63 - 1)
     # The marking stamped into exports, library rows and audit metadata, so
     # the same artifact appearing in two containers is detectable later.
     compartment_id: str | None = None
     # R9 dormancy window, and how long a never-activated pending row is kept
     # before a lazy purge drops it. Both have defaults because both are
     # policy, not deployment facts.
+    #
+    # ``identity_dormancy_days`` IS READ AT EVERY LOGIN: the app factory and
+    # the SSO wiring hand it to ``ensure_identity``, which re-pends an active
+    # identity whose previous login is older than the window (R9), exempting
+    # the last active human administrator (D34). Lower it and the next login
+    # by anyone past the new window re-pends them; raise it and nothing
+    # already re-pended comes back on its own.
     identity_dormancy_days: int = Field(default=90, gt=0)
     identity_pending_retention_days: int = Field(default=90, gt=0)
+    # Workflow-governance mode for the later approval, review, and library
+    # authorities. Readiness already checks the unsafe local-registration
+    # combination and missing compartment, so an operator receives a named
+    # /api/ready failure instead of a load error.
+    workflow_governance: Literal["off", "on"] = "off"
 
     # JWKS cache tuning (OIDC / Entra). Defaults match the provider
     # defaults; operators may lower or raise them. Raising the failure
@@ -662,6 +735,13 @@ class WebSettings(BaseModel):
             raise ValueError("must not be blank (omit the field or set to a non-empty value)")
         return v
 
+    @field_validator("compartment_id")
+    @classmethod
+    def _validate_compartment_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_compartment_id(value):
+            raise ValueError(f"compartment_id must match {COMPARTMENT_ID_PATTERN}")
+        return value
+
     @field_validator("deployment_aws_region")
     @classmethod
     def _validate_deployment_aws_region(cls, value: str | None) -> str | None:
@@ -713,6 +793,13 @@ class WebSettings(BaseModel):
         if _is_loopback_or_private_origin(safe_url) and not (parsed.scheme == "http" and _is_loopback_origin(safe_url)):
             raise ValueError("public_base_url must target a public origin unless using HTTP loopback for local development")
         return safe_url
+
+    @field_validator("composer_pricing_model", "composer_advisor_pricing_model")
+    @classmethod
+    def _validate_pricing_model(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("pricing model must be nonblank")
+        return value
 
     @field_validator("composer_endpoint_base_url")
     @classmethod
@@ -864,6 +951,16 @@ class WebSettings(BaseModel):
             raise ValueError(f"server_secret_allowlist entries must not start with {SERVER_SECRET_RESERVED_PREFIX}: {sorted(reserved)}")
         return validated
 
+    @field_validator("power_automate_allowed_origins")
+    @classmethod
+    def _validate_power_automate_allowed_origins(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(normalize_allowed_origin(value) for value in values)
+        if any(_is_loopback_or_private_origin(value) for value in normalized):
+            raise ValueError("power_automate_allowed_origins requires public HTTPS443 origins")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("power_automate_allowed_origins contains duplicate origins")
+        return tuple(sorted(normalized))
+
     @field_validator("llm_profiles")
     @classmethod
     def _validate_llm_profile_aliases(cls, value: Mapping[str, LLMProfileSettings]) -> Mapping[str, LLMProfileSettings]:
@@ -927,6 +1024,17 @@ class WebSettings(BaseModel):
         aliases = [profile.alias for profile in profiles]
         if len(aliases) != len(set(aliases)):
             raise ValueError("AWS Textract profile aliases must be unique")
+        return profiles
+
+    @field_validator("azure_search_profiles")
+    @classmethod
+    def _validate_azure_search_profiles(
+        cls,
+        profiles: tuple[AzureSearchProfileSettings, ...],
+    ) -> tuple[AzureSearchProfileSettings, ...]:
+        aliases = [profile.alias for profile in profiles]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("Azure Search profile aliases must be unique")
         return profiles
 
     @field_validator("operator_telemetry_service_name")
@@ -1148,7 +1256,7 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_advisor_distinct_from_primary(self) -> WebSettings:
-        """The advisor must be a different model from the primary composer.
+        """Require different models unless the operator explicitly allows sharing.
 
         Independence of failure modes: a model checking its own work shares
         its blind spots. Exact-string distinctness on the canonical model id
@@ -1156,6 +1264,8 @@ class WebSettings(BaseModel):
         do not mask a same-model pairing). The advisor is mandatory — there is
         no enable flag — so this runs for every boot.
         """
+        if self.composer_allow_same_advisor_model:
+            return self
 
         def _canonical(model_id: str) -> str:
             return model_id.rsplit("/", 1)[-1].strip()
@@ -1164,7 +1274,46 @@ class WebSettings(BaseModel):
             raise ValueError(
                 "composer_advisor_model must differ from composer_model "
                 f"(both resolve to {_canonical(self.composer_model)!r}); the advisor "
-                "is the independent reviewer and cannot be the primary composer"
+                "is the independent reviewer. Set composer_allow_same_advisor_model=true "
+                "to explicitly accept a same-model pairing"
+            )
+        return self
+
+    @property
+    def quotas_enabled(self) -> bool:
+        """Whether this deployment runs the quota system at all.
+
+        There is no separate switch: configuring ANY quota setting turns it
+        on. ``_validate_quota_defaults_when_enabled`` then guarantees both
+        per-identity defaults exist, so "on" always means a person's first
+        cap can be written.
+        """
+        return any(
+            value is not None
+            for value in (
+                self.quota_default_tokens_per_day,
+                self.quota_default_storage_bytes,
+                self.quota_container_tokens_per_day,
+                self.quota_container_storage_bytes,
+            )
+        )
+
+    @model_validator(mode="after")
+    def _validate_quota_defaults_when_enabled(self) -> WebSettings:
+        """Quotas on means BOTH per-identity defaults are configured.
+
+        A ``quota_policies`` row stores a value for tokens AND storage. An
+        administrator sets one dimension at a time, so the other value of a
+        person's first cap comes from these defaults. With one default, or
+        with only a container ceiling, the system looks enabled and every
+        first cap is refused for a reason no administrator can fix from the
+        panel. Refuse to start instead.
+        """
+        if self.quotas_enabled and (self.quota_default_tokens_per_day is None or self.quota_default_storage_bytes is None):
+            raise ValueError(
+                "the quota system is enabled (a quota_* setting is configured), so both quota_default_tokens_per_day "
+                "and quota_default_storage_bytes must be set: a person's first cap stores a value for both, and the "
+                "one an administrator does not type comes from these defaults"
             )
         return self
 
@@ -1317,14 +1466,16 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
         "sso_endpoint_origins",
         "sso_admin_subjects",
         "plugin_allowlist",
+        "power_automate_allowed_origins",
         "bedrock_guardrail_profiles",
         "aws_s3_source_profiles",
         "aws_textract_profiles",
+        "azure_search_profiles",
         "secret_wiring_allowlist",
     }
 )
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
-    {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles"}
+    {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles", "execution_rate_limit"}
 )
 
 
@@ -1459,6 +1610,7 @@ def settings_from_env() -> WebSettings:
     except ValidationError as error:
         policy_fields = {
             "plugin_allowlist",
+            "power_automate_allowed_origins",
             "plugin_preferences",
             "plugin_control_modes",
             "llm_profiles",
@@ -1467,6 +1619,7 @@ def settings_from_env() -> WebSettings:
             "bedrock_guardrail_default_profiles",
             "aws_s3_source_profiles",
             "aws_textract_profiles",
+            "azure_search_profiles",
         }
         safe_paths = {
             str(item) for detail in error.errors(include_input=False) for item in detail.get("loc", ()) if isinstance(item, (str, int))

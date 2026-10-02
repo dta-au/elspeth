@@ -29,8 +29,10 @@ tooling (the ``trust_tier.tier_model`` elspeth-lints rule, and the companion
 The decorator itself enforces only what is checkable at decoration time:
 
 1. ``tier`` must be ``3``. Tier-1 and Tier-2 invariants must crash on
-   anomaly per the project's data manifesto; a suppression decorator at
-   those tiers is a category error. Passing ``tier=1`` or ``tier=2`` raises
+   anomaly under the three-tier trust model
+   (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model);
+   a suppression decorator at those tiers is a category error. Passing
+   ``tier=1`` or ``tier=2`` raises
    :class:`TypeError` at module import.
 2. ``source_param`` must name an actual parameter of the wrapped function.
    The signature is inspected via :func:`inspect.signature` at decoration

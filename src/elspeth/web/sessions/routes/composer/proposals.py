@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from dataclasses import replace
+from typing import Annotated
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.compartments import compartment_ingress_record
+from elspeth.web.composer.protocol import ComposerRuntimePreflightError
 from elspeth.web.composer.required_controls import (
     merge_required_control_affected_components,
     wire_required_controls_state,
@@ -16,7 +20,6 @@ from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.protocol import ProposalStateConflictError, StaleComposeStateError
 
 from .._helpers import (
-    _DATA_ERROR_KEY,
     UUID,
     AcceptProposalRequest,
     Any,
@@ -35,7 +38,7 @@ from .._helpers import (
     UserIdentity,
     _composition_proposal_response,
     _get_session_compose_lock_registry,
-    _initial_composition_state_with_guided_session,
+    _initial_composition_state,
     _log_last_resort_diagnostic,
     _proposal_event_response,
     _state_data_from_composer_state,
@@ -45,12 +48,14 @@ from .._helpers import (
     cast,
     deep_thaw,
     execute_tool,
-    get_current_user,
+    merge_composer_meta_updates,
+    require_pipeline_user,
     run_sync_in_worker,
     slog,
 )
 from .pipeline_settlement import (
     _await_with_deferred_cancellation,
+    _proposal_chat_ingress_inputs,
     _proposal_user_message_content,
     settle_pipeline_proposal_under_compose_lock,
 )
@@ -162,10 +167,7 @@ def _missing_proposal_composer_context(
     )
     missing = [name for name, value in context_fields if value is None]
     if proposal.composer_provider == "server":
-        # provider="server" was the deleted guided synthesis gate's provenance
-        # (elspeth-b4a286d517). No code path can stage it any more, so a row
-        # carrying it is INVALID provenance, not merely legacy-incomplete —
-        # refuse it even when every provenance field is present.
+        # A server-authored graph is never valid composer provenance.
         missing.append("composer_provider (provider='server' is never valid provenance)")
     if user_message_content is None:
         missing.insert(0, "user_message_content")
@@ -195,6 +197,44 @@ def _ensure_inline_blob_proposal_context(
     )
 
 
+def _accept_runtime_preflight_failure(proposal: CompositionProposalRecord) -> HTTPException:
+    """Name a settle-time runtime-preflight failure without committing anything.
+
+    ``_state_data_from_composer_state(preflight_exception_policy="raise")``
+    has already recorded the exception telemetry. This is a server failure,
+    not a proposal lifecycle conflict. The same exception class is a
+    structured 500 on the compose and message routes. The wrapped exception's
+    text stays server-side.
+    """
+    return HTTPException(
+        status_code=500,
+        detail={
+            "detail": (
+                "Runtime preflight could not complete, so the proposal was not applied and was left pending. Try accepting it again."
+            ),
+            "error_type": "runtime_preflight_failed",
+            "tool_name": proposal.tool_name,
+        },
+    )
+
+
+async def _await_accept_state_data[T](
+    awaitable: Awaitable[T],
+    *,
+    proposal: CompositionProposalRecord,
+) -> tuple[T, bool]:
+    """Await accept-time state preparation, naming a runtime-preflight failure.
+
+    The raised ``HTTPException`` reaches the route's precommit handler, which
+    closes the lease before re-raising, exactly as the other pre-commit
+    refusals do.
+    """
+    try:
+        return await _await_with_deferred_cancellation(awaitable)
+    except ComposerRuntimePreflightError as preflight_error:
+        raise _accept_runtime_preflight_failure(proposal) from preflight_error
+
+
 @router.get(
     "/{session_id}/proposals",
     response_model=list[CompositionProposalResponse],
@@ -202,7 +242,7 @@ def _ensure_inline_blob_proposal_context(
 async def list_composition_proposals(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     status: ProposalLifecycleStatus | None = Query(None),  # noqa: B008
 ) -> list[CompositionProposalResponse]:
     session = await _verify_session_ownership(session_id, user, request)
@@ -218,7 +258,7 @@ async def list_composition_proposals(
 async def list_proposal_events(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> list[ProposalEventResponse]:
     session = await _verify_session_ownership(session_id, user, request)
     service: SessionServiceProtocol = request.app.state.session_service
@@ -234,8 +274,8 @@ async def accept_composition_proposal(
     session_id: UUID,
     proposal_id: UUID,
     request: Request,
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     body: AcceptProposalRequest | None = None,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
 ) -> CompositionProposalResponse:
     session = await _verify_session_ownership(session_id, user, request)
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
@@ -252,7 +292,6 @@ async def accept_composition_proposal(
             proposal_authority = await service.get_authoritative_composition_proposal(
                 session_id=session.id,
                 proposal_id=proposal_id,
-                reviewed_facts=None,
             )
         except KeyError:
             primary = HTTPException(status_code=404, detail="Proposal not found")
@@ -280,6 +319,10 @@ async def accept_composition_proposal(
                     draft_hash=body.draft_hash,
                     session_operation_context=lease.context,
                 )
+            except ComposerRuntimePreflightError as preflight_error:
+                preflight_failure = _accept_runtime_preflight_failure(proposal)
+                await _close_proposal_lease_before_commit(lease, primary=preflight_failure)
+                raise preflight_failure from preflight_error
             except BaseException as primary:
                 await _close_proposal_lease_before_commit(lease, primary=primary)
                 raise
@@ -327,13 +370,28 @@ async def accept_composition_proposal(
             ):
                 raise HTTPException(
                     status_code=409,
-                    detail="The session state changed after this proposal was created. Ask ELSPETH to rebase the proposal.",
+                    detail={
+                        "error_type": "proposal_base_state_changed",
+                        "detail": "The session state changed after this proposal was created. Ask ELSPETH to rebase the proposal.",
+                    },
                 )
-            current_state = (
-                _state_from_record(current_record) if current_record is not None else _initial_composition_state_with_guided_session()
-            )
+            current_state = _state_from_record(current_record) if current_record is not None else _initial_composition_state()
             arguments = cast(dict[str, Any], deep_thaw(proposal.arguments_json))
             user_message_content = await _proposal_user_message_content(service, proposal)
+            chat_ingress_inputs = await _proposal_chat_ingress_inputs(
+                service, proposal, own_compartment_id=request.app.state.settings.compartment_id
+            )
+            proposal_composer_meta = merge_composer_meta_updates(
+                current_record.composer_meta if current_record is not None else None,
+                {
+                    "ingress": compartment_ingress_record(
+                        user_message_content, own_compartment_id=request.app.state.settings.compartment_id
+                    ),
+                    "chat_ingress_inputs": chat_ingress_inputs,
+                }
+                if user_message_content is not None
+                else {},
+            )
             _ensure_inline_blob_proposal_context(
                 proposal,
                 arguments,
@@ -348,7 +406,7 @@ async def accept_composition_proposal(
             if blob_effect_applied:
                 accepted_state = None
                 if current_record is None:
-                    (accepted_state, _validation), was_cancelled = await _await_with_deferred_cancellation(
+                    (accepted_state, _validation), was_cancelled = await _await_accept_state_data(
                         _state_data_from_composer_state(
                             current_state,
                             settings=request.app.state.settings,
@@ -362,7 +420,9 @@ async def accept_composition_proposal(
                             preflight_exception_policy="raise",
                             initial_version=current_state.version,
                             telemetry_source="compose",
-                        )
+                            composer_meta=proposal_composer_meta,
+                        ),
+                        proposal=proposal,
                     )
                     cancellation_deferred = cancellation_deferred or was_cancelled
                 committed, was_cancelled = await _await_with_deferred_cancellation(
@@ -397,6 +457,8 @@ async def accept_composition_proposal(
                     data_dir=str(request.app.state.settings.data_dir),
                     session_engine=request.app.state.session_engine,
                     session_id=str(session.id),
+                    session_operation_context=lease.context,
+                    session_operation_authority=service.session_operation_authority,
                     secret_service=request.app.state.scoped_secret_resolver,
                     user_id=str(user.user_id),
                     user_message_id=str(proposal.user_message_id) if proposal.user_message_id is not None else None,
@@ -457,25 +519,11 @@ async def accept_composition_proposal(
                 # frontend without revealing the validation errors that were
                 # the actual blocker).
                 if not result.success:
-                    # ``result`` is our own ``execute_tool`` output. Every
-                    # ``success=False`` ToolResult is built by one of the two
-                    # failure factories in ``web/composer/tools/_common.py``
-                    # (``_failure_result`` and the credential-repair factory),
-                    # both of which set ``data`` to a Mapping carrying
-                    # ``_DATA_ERROR_KEY``. That is a first-party contract — read
-                    # it directly and let a contract violation (a future tool
-                    # building ``success=False`` without the error key) crash
-                    # loudly rather than degrade to a generic message.
-                    # ``ToolResult.data`` is the closed ``ToolResultData`` union
-                    # (Mapping | Sequence | BaseModel | None), so the carrier half
-                    # of that contract is asserted before the read rather than
-                    # assumed by indexing (ADR-032). The key half stays a bare
-                    # subscript: a missing ``_DATA_ERROR_KEY`` is the loud KeyError
-                    # the comment above asks for.
-                    failure_data = result.data
-                    if not isinstance(failure_data, Mapping):
-                        raise TypeError(f"a success=False ToolResult must carry a Mapping data payload, got {type(failure_data).__name__}")
-                    error_summary = failure_data[_DATA_ERROR_KEY] or "Composer proposal failed validation."
+                    # Helper rejections lead with their own detail. Standing-state
+                    # errors on a general failure do not identify this rejection.
+                    error_summary = "Composer proposal failed validation."
+                    if result.validation.errors and result.validation.errors[0].component == "rejected_mutation":
+                        error_summary = result.validation.errors[0].message or error_summary
                     validation_errors_payload = (
                         [{"component": entry.component, "message": entry.message} for entry in result.validation.errors]
                         if result.validation is not None
@@ -545,7 +593,7 @@ async def accept_composition_proposal(
                         detail="Accepted proposal did not change composition state.",
                     )
                 if current_record is None:
-                    (accepted_state, _validation), was_cancelled = await _await_with_deferred_cancellation(
+                    (accepted_state, _validation), was_cancelled = await _await_accept_state_data(
                         _state_data_from_composer_state(
                             current_state,
                             settings=request.app.state.settings,
@@ -559,11 +607,13 @@ async def accept_composition_proposal(
                             preflight_exception_policy="raise",
                             initial_version=current_state.version,
                             telemetry_source="compose",
-                        )
+                            composer_meta=proposal_composer_meta,
+                        ),
+                        proposal=proposal,
                     )
                     cancellation_deferred = cancellation_deferred or was_cancelled
             else:
-                (accepted_state, _validation), was_cancelled = await _await_with_deferred_cancellation(
+                (accepted_state, _validation), was_cancelled = await _await_accept_state_data(
                     _state_data_from_composer_state(
                         result.updated_state,
                         settings=request.app.state.settings,
@@ -577,7 +627,9 @@ async def accept_composition_proposal(
                         preflight_exception_policy="raise",
                         initial_version=current_state.version,
                         telemetry_source="compose",
-                    )
+                        composer_meta=proposal_composer_meta,
+                    ),
+                    proposal=proposal,
                 )
                 cancellation_deferred = cancellation_deferred or was_cancelled
 
@@ -632,7 +684,7 @@ async def reject_composition_proposal(
     proposal_id: UUID,
     body: RejectProposalRequest,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> CompositionProposalResponse:
     session = await _verify_session_ownership(session_id, user, request)
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
@@ -649,7 +701,6 @@ async def reject_composition_proposal(
             authority = await service.get_authoritative_composition_proposal(
                 session_id=session.id,
                 proposal_id=proposal_id,
-                reviewed_facts=None,
             )
         except KeyError as primary:
             await _close_proposal_lease_before_commit(lease, primary=primary)
@@ -659,11 +710,13 @@ async def reject_composition_proposal(
             raise
         if authority.pipeline is None:
             try:
-                proposal = await service.reject_composition_proposal(
-                    session_id=session.id,
-                    proposal_id=proposal_id,
-                    actor=f"user:{user.user_id}",
-                    session_operation_context=lease.context,
+                proposal, was_cancelled = await _await_with_deferred_cancellation(
+                    service.reject_composition_proposal(
+                        session_id=session.id,
+                        proposal_id=proposal_id,
+                        actor=f"user:{user.user_id}",
+                        session_operation_context=lease.context,
+                    )
                 )
             except ValueError as primary:
                 await _close_proposal_lease_before_commit(lease, primary=primary)
@@ -677,27 +730,21 @@ async def reject_composition_proposal(
                 lease,
                 session_id=session.id,
             )
-            if cleanup_cancelled:
+            if was_cancelled or cleanup_cancelled:
                 raise asyncio.CancelledError
             return response
 
-        if authority.pipeline.proposal.surface.value in {"guided_staged", "tutorial_profile"}:
-            request_error = HTTPException(
-                status_code=409,
-                detail="This pipeline proposal must be rejected through its guided workflow.",
-            )
-            await _close_proposal_lease_before_commit(lease, primary=request_error)
-            raise request_error
         try:
-            proposal = await service.reject_pipeline_composition_proposal(
-                session_id=session.id,
-                proposal_id=proposal_id,
-                draft_hash=authority.pipeline.proposal.draft_hash,
-                reviewed_facts=None,
-                reason="operator_rejected",
-                dispatch=None,
-                actor=f"user:{user.user_id}",
-                session_operation_context=lease.context,
+            proposal, was_cancelled = await _await_with_deferred_cancellation(
+                service.reject_pipeline_composition_proposal(
+                    session_id=session.id,
+                    proposal_id=proposal_id,
+                    draft_hash=authority.pipeline.proposal.draft_hash,
+                    reason="operator_rejected",
+                    dispatch=None,
+                    actor=f"user:{user.user_id}",
+                    session_operation_context=lease.context,
+                )
             )
         except ValueError as primary:
             await _close_proposal_lease_before_commit(lease, primary=primary)
@@ -712,6 +759,6 @@ async def reject_composition_proposal(
             session_id=session.id,
             event="composer_pipeline_proposal_reject_postcommit_cleanup_failed",
         )
-        if cleanup_cancelled:
+        if was_cancelled or cleanup_cancelled:
             raise asyncio.CancelledError
         return response

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run
+from tests.fixtures.landscape import RecorderSetup, claim_test_work_item, leader_coordination_token, make_recorder_with_run
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.audit import TokenRef
@@ -37,7 +37,7 @@ def _forge_cross_run_parent(*, setup: RecorderSetup, child_token_id: str, parent
 def _register_source_run(setup: RecorderSetup, *, run_id: str, source_node_id: str) -> str:
     setup.run_lifecycle.begin_run(run_id=run_id, config={}, canonical_version="v1")
     source = setup.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(setup.factory, run_id),
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -57,30 +57,31 @@ def _create_row_token(
     run_id: str | None = None,
     source_node_id: str | None = None,
 ):
-    row = setup.data_flow.create_row(
-        run_id=run_id or setup.run_id,
+    row, token = setup.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(setup.factory, run_id or setup.run_id),
+        token_id=token_id,
         source_node_id=source_node_id or setup.source_node_id,
         row_index=row_index,
         data=data or {"row_index": row_index},
         source_row_index=row_index,
         ingest_sequence=row_index,
     )
-    token = setup.data_flow.create_token(row.row_id, token_id=token_id)
     return row, token
 
 
 def _record_success(setup: RecorderSetup, *, run_id: str, token_id: str, sink: str) -> None:
-    setup.data_flow.record_token_outcome(
+    setup.data_flow.record_token_outcome_leader(
         TokenRef(token_id=token_id, run_id=run_id),
         TerminalOutcome.SUCCESS,
         TerminalPath.DEFAULT_FLOW,
         sink_name=sink,
+        coordination_token=leader_coordination_token(setup.factory, run_id),
     )
 
 
 def _record_buffered(setup: RecorderSetup, *, run_id: str, token_id: str, batch_id: str) -> None:
     aggregation_node = setup.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(setup.factory, run_id),
         plugin_name="aggregation",
         node_type=NodeType.AGGREGATION,
         plugin_version="1.0",
@@ -88,12 +89,15 @@ def _record_buffered(setup: RecorderSetup, *, run_id: str, token_id: str, batch_
         node_id=f"aggregation-{batch_id}",
         schema_config=DYNAMIC_SCHEMA,
     )
-    setup.execution.create_batch(run_id, aggregation_node.node_id, batch_id=batch_id)
-    setup.data_flow.record_token_outcome(
+    setup.execution.create_batch(
+        aggregation_node.node_id, batch_id=batch_id, coordination_token=leader_coordination_token(setup.factory, run_id)
+    )
+    setup.data_flow.record_token_outcome_leader(
         TokenRef(token_id=token_id, run_id=run_id),
         None,
         TerminalPath.BUFFERED,
         batch_id=batch_id,
+        coordination_token=leader_coordination_token(setup.factory, run_id),
     )
 
 
@@ -122,7 +126,7 @@ def test_row_id_resolution_ignores_persisted_non_terminal_buffered_outcome() -> 
 def test_row_id_resolution_requires_sink_when_persisted_terminals_are_ambiguous() -> None:
     setup = make_recorder_with_run(run_id="run-lineage-sink-required", source_node_id="source-lineage-sink-required")
     row, first = _create_row_token(setup, row_index=0, token_id="token-sink-a")
-    second = setup.data_flow.create_token(row.row_id, token_id="token-sink-b")
+    second = setup.data_flow.create_token(row.row_id, token_id="token-sink-b", coordination_token=setup.coordination_token)
     _record_success(setup, run_id=setup.run_id, token_id=first.token_id, sink="left")
     _record_success(setup, run_id=setup.run_id, token_id=second.token_id, sink="right")
 
@@ -139,7 +143,7 @@ def test_row_id_resolution_requires_sink_when_persisted_terminals_are_ambiguous(
 def test_row_id_resolution_rejects_same_sink_ambiguity_from_persisted_outcomes() -> None:
     setup = make_recorder_with_run(run_id="run-lineage-same-sink", source_node_id="source-lineage-same-sink")
     row, first = _create_row_token(setup, row_index=0, token_id="token-same-sink-a")
-    second = setup.data_flow.create_token(row.row_id, token_id="token-same-sink-b")
+    second = setup.data_flow.create_token(row.row_id, token_id="token-same-sink-b", coordination_token=setup.coordination_token)
     _record_success(setup, run_id=setup.run_id, token_id=first.token_id, sink="shared")
     _record_success(setup, run_id=setup.run_id, token_id=second.token_id, sink="shared")
 
@@ -155,6 +159,13 @@ def test_explain_includes_parent_token_from_persisted_fork_relationship() -> Non
         row.row_id,
         ["left", "right"],
         step_in_pipeline=1,
+        member_token=setup.coordination_token.membership,
+        work_item=claim_test_work_item(
+            setup.factory,
+            member_token=setup.coordination_token.membership,
+            token_id=parent.token_id,
+            node_id=setup.source_node_id,
+        ),
     )
     child = children[0]
 
@@ -167,8 +178,8 @@ def test_explain_includes_parent_token_from_persisted_fork_relationship() -> Non
 
 def test_explain_rejects_persisted_group_id_without_parent_relationship() -> None:
     setup = make_recorder_with_run(run_id="run-lineage-orphan-group", source_node_id="source-lineage-orphan-group")
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    row, _ = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"case": "orphan-group"},
@@ -178,6 +189,7 @@ def test_explain_rejects_persisted_group_id_without_parent_relationship() -> Non
     token = setup.data_flow.create_token(
         row.row_id,
         token_id="token-orphan-group",
+        coordination_token=setup.coordination_token,
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-without-parent", member_key="left"),),
     )
 
@@ -188,7 +200,7 @@ def test_explain_rejects_persisted_group_id_without_parent_relationship() -> Non
 def test_explain_rejects_parent_relationship_without_group_id_from_corruption() -> None:
     setup = make_recorder_with_run(run_id="run-lineage-parent-no-group", source_node_id="source-lineage-parent-no-group")
     row, parent = _create_row_token(setup, row_index=0, token_id="token-parent-no-group-parent")
-    child = setup.data_flow.create_token(row.row_id, token_id="token-parent-no-group-child")
+    child = setup.data_flow.create_token(row.row_id, token_id="token-parent-no-group-child", coordination_token=setup.coordination_token)
 
     # Corruption boundary: production fork/coalesce/expand APIs write both the group
     # marker and token_parents row atomically, so this one-sided parent relationship
@@ -212,8 +224,8 @@ def test_explain_rejects_cross_run_parent_relationship_from_corruption() -> None
     other_source_id = _register_source_run(
         setup, run_id="run-lineage-cross-parent-other", source_node_id="source-lineage-cross-parent-other"
     )
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    row, _ = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"case": "cross-run-child"},
@@ -223,6 +235,7 @@ def test_explain_rejects_cross_run_parent_relationship_from_corruption() -> None
     child = setup.data_flow.create_token(
         row.row_id,
         token_id="token-cross-run-child",
+        coordination_token=setup.coordination_token,
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-cross-run", member_key="left"),),
     )
     _other_row, other_parent = _create_row_token(

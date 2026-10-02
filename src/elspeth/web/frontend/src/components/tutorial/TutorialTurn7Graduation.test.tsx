@@ -10,7 +10,6 @@ import { TutorialTurn7Graduation } from "./TutorialTurn7Graduation";
 vi.mock("@/api/client", () => ({
   createSession: vi.fn(),
   fetchUserComposerPreferences: vi.fn(),
-  startGuided: vi.fn(),
   updateUserComposerPreferences: vi.fn(),
 }));
 
@@ -21,7 +20,6 @@ describe("TutorialTurn7Graduation", () => {
     vi.clearAllMocks();
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "freeform",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
     });
@@ -33,7 +31,7 @@ describe("TutorialTurn7Graduation", () => {
       renameSession: vi.fn().mockResolvedValue(undefined),
       loadSessions: vi.fn().mockResolvedValue(undefined),
       selectSession: vi.fn().mockImplementation(async (id: string) => {
-        useSessionStore.setState({ activeSessionId: id });
+        useSessionStore.setState({ activeSessionId: id, compositionStateLoaded: true });
       }),
     } as never);
     vi.mocked(api.createSession).mockResolvedValue({
@@ -42,17 +40,9 @@ describe("TutorialTurn7Graduation", () => {
       created_at: "2026-05-19T12:30:00Z",
       updated_at: "2026-05-19T12:30:00Z",
     });
-    // Body-aware echo mirroring the backend: a default_mode-only PATCH does
-    // not touch tutorial_completed_at, and vice versa. saveTutorialMode (sent
-    // first by onFinish) must not flip tutorialCompleted to true off a
-    // default_mode write.
+    // Completion is saved in one request.
     vi.mocked(api.updateUserComposerPreferences).mockImplementation(
       async (body) => ({
-        default_mode:
-          body.default_mode ??
-          usePreferencesStore.getState().defaultMode ??
-          "guided",
-        banner_dismissed_at: null,
         freeform_intro_dismissed_at: null,
         tutorial_completed_at:
           body.tutorial_completed_at === undefined
@@ -90,13 +80,7 @@ describe("TutorialTurn7Graduation", () => {
     expect(screen.getByText("Read before you run.")).toBeInTheDocument();
     expect(screen.getByText("Ask ELSPETH.")).toBeInTheDocument();
     expect(screen.getByText("LLMs are confident even when they're wrong.")).toBeInTheDocument();
-    // Guided and freeform differ only in interaction style, not capability.
-    expect(
-      screen.getByText(/guided and freeform can build the same pipelines/i),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/interaction preference, not a capability limit/i),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/ask in the chat panel/i)).toBeInTheDocument();
 
     window.removeEventListener("tutorial_graduation_shown", eventListener);
   });
@@ -119,6 +103,7 @@ describe("TutorialTurn7Graduation", () => {
     await waitFor(() => {
       expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
         tutorial_completed_at: expect.any(String),
+        tutorial_completed_via: "complete",
       });
     });
     expect(usePreferencesStore.getState().tutorialCompleted).toBe(true);
@@ -131,7 +116,7 @@ describe("TutorialTurn7Graduation", () => {
     expect(api.createSession).not.toHaveBeenCalled();
   });
 
-  it("renames the tutorial session and saves Guided as the default before finishing", async () => {
+  it("renames the tutorial session and saves explicit completion intent", async () => {
     const user = userEvent.setup();
     render(
       <TutorialTurn7Graduation
@@ -151,14 +136,12 @@ describe("TutorialTurn7Graduation", () => {
       ),
     );
     expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-      default_mode: "guided",
-    });
-    expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
       tutorial_completed_at: expect.any(String),
+      tutorial_completed_via: "complete",
     });
   });
 
-  it("does not rename a skipped tutorial session but still saves Guided default", async () => {
+  it("does not rename a skipped tutorial session and saves completion", async () => {
     const user = userEvent.setup();
     render(
       <TutorialTurn7Graduation
@@ -173,7 +156,8 @@ describe("TutorialTurn7Graduation", () => {
     );
     await waitFor(() => {
       expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-        default_mode: "guided",
+        tutorial_completed_at: expect.any(String),
+        tutorial_completed_via: "skip",
       });
     });
     expect(useSessionStore.getState().renameSession).not.toHaveBeenCalled();
@@ -231,7 +215,7 @@ describe("TutorialTurn7Graduation", () => {
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 
-  it("shows a role alert when the composer cannot open the built pipeline after graduation is saved", async () => {
+  it("does not save graduation when the composer cannot open the built pipeline", async () => {
     const user = userEvent.setup();
     // selectSession resolves but leaves the session inactive (e.g. a 404 on
     // load cleared activeSessionId); graduation must surface the failure and
@@ -257,11 +241,37 @@ describe("TutorialTurn7Graduation", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "The composer could not open your pipeline.",
     );
-    expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-      tutorial_completed_at: expect.any(String),
-    });
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
     expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
     expect(useSessionStore.getState().activeSessionId).toBeNull();
+  });
+
+  it("refuses graduation when the session ID loaded but its state did not", async () => {
+    useSessionStore.setState({ selectSession: vi.fn().mockImplementation(async (id: string) => {
+      useSessionStore.setState({ activeSessionId: id, compositionStateLoaded: false });
+    }) });
+    const user = userEvent.setup();
+    render(<TutorialTurn7Graduation sessionId="sess-new" skipped={false} cancelled={false} />);
+    await user.click(screen.getByRole("button", { name: "Take me to the composer" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The tutorial session has not loaded");
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
+    expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
+  });
+
+  it("keeps a pending compose visible and allows retry without publishing completion", async () => {
+    useSessionStore.setState({ isComposing: true });
+    const user = userEvent.setup();
+    render(<TutorialTurn7Graduation sessionId="sess-new" skipped={false} cancelled={false} />);
+    await user.click(screen.getByRole("button", { name: "Take me to the composer" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("current Composer operation");
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
+    expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
+    expect(screen.getByRole("button", { name: "Take me to the composer" })).toBeEnabled();
+    useSessionStore.setState({ isComposing: false });
+    await user.click(screen.getByRole("button", { name: "Take me to the composer" }));
+    await waitFor(() => expect(usePreferencesStore.getState().tutorialCompleted).toBe(true));
+    expect(useSessionStore.getState().activeSessionId).toBe("sess-new");
+    expect(api.updateUserComposerPreferences).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -289,14 +299,10 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
     expect(
       screen.getByText(/nothing executes without your say-so/i),
     ).toBeInTheDocument();
-    // Shared bullets (no just-ran claims) render on both paths, including
-    // the guided/freeform capability-parity guidance riding "Ask ELSPETH.".
+    // Shared bullets (no just-ran claims) render on both paths.
     expect(screen.getByText("Ask ELSPETH.")).toBeInTheDocument();
     expect(
-      screen.getByText(/guided and freeform can build the same pipelines/i),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/interaction preference, not a capability limit/i),
+      screen.getByText(/same freeform conversation/i),
     ).toBeInTheDocument();
     expect(
       screen.getByText("LLMs are confident even when they're wrong."),
@@ -320,7 +326,10 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
     ).toBeNull();
   });
 
-  it("both variants point at the real 'Checks tab' — never a nonexistent 'Audit page' or the retired Audit drawer (elspeth-4f69b267dd)", () => {
+  // The copy must name a surface that EXISTS and that renders the record
+  // (elspeth-4f69b267dd). Ruling D2 (2026-09-20): that surface is the Graph
+  // tab's Approvals table — Checks shows only a count row.
+  it("both variants point at the pipeline's Approvals tab — never Checks, a nonexistent 'Audit page' or the retired Audit drawer", () => {
     const { unmount } = render(
       <TutorialTurn7Graduation
         sessionId="sess-new"
@@ -329,8 +338,9 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
       />,
     );
     expect(
-      screen.getByText(/your pipeline's Checks tab/),
+      screen.getByText(/on your pipeline's Approvals tab/),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/Checks tab/)).toBeNull();
     expect(screen.queryByText(/Audit page/)).toBeNull();
     expect(screen.queryByText(/Audit panel/)).toBeNull();
     unmount();
@@ -343,8 +353,9 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
       />,
     );
     expect(
-      screen.getByText(/each pipeline's Checks tab/),
+      screen.getByText(/on each pipeline's Approvals tab/),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/Checks tab/)).toBeNull();
     expect(screen.queryByText(/Audit page/)).toBeNull();
     expect(screen.queryByText(/Audit panel/)).toBeNull();
   });

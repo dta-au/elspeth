@@ -78,6 +78,7 @@ function ProgressAccountingDetails({
     [RUN_ACCOUNTING_LABELS.tokensPending, accounting.tokens.pending],
     [RUN_ACCOUNTING_LABELS.tokensAbandoned, accounting.tokens.abandoned],
     [RUN_ACCOUNTING_LABELS.rowsDiscarded, accounting.routing.discarded],
+    [RUN_ACCOUNTING_LABELS.collectorGroupsFailed, accounting.collector_groups_failed],
   ] as const;
   const integrityWarnings = [
     [
@@ -122,6 +123,7 @@ function ProgressAccountingDetails({
 
 export function ProgressView() {
   const { progress, wsDisconnected, activeRunId } = useWebSocket();
+  const wsStreamEnded = useExecutionStore((s) => s.wsStreamEnded);
   const cancel = useExecutionStore((s) => s.cancel);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const showAdvanced = useShowAdvanced();
@@ -157,13 +159,18 @@ export function ProgressView() {
         {statusAnnouncement}
       </div>
 
-      {/* WebSocket disconnect banner */}
+      {/* WebSocket disconnect banner. Two causes, two truthful messages: a
+          transient drop the socket is retrying, versus a stream the server
+          ended for good (1000/1011) after which the store's own status poll —
+          not a reconnect — is what retires the run. */}
       {wsDisconnected && !isTerminal && (
         <div
           role="status"
           className="progress-ws-banner"
         >
-          Live progress connection lost. Reconnecting...
+          {wsStreamEnded
+            ? "Live progress connection ended. Checking run status..."
+            : "Live progress connection lost. Reconnecting..."}
         </div>
       )}
 

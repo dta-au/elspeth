@@ -7,8 +7,14 @@
 // ============================================================================
 
 import type { AuditCharacteristicFlag } from "../components/catalog/auditCharacteristics";
-import type { FieldTier, VisibilityPredicate } from "./guided";
 import type { FailedTurn } from "./recovery";
+
+export type FieldTier = "essential" | "common" | "advanced";
+
+export interface VisibilityPredicate {
+  field: string;
+  equals: unknown;
+}
 
 // ── Auth ────────────────────────────────────────────────────────────────────
 
@@ -104,6 +110,11 @@ export interface ToolCall {
   outcome?: "applied" | "rejected" | "failed" | "cancelled" | "completed";
   /** Composition-state version this call created; only with outcome "applied". */
   applied_state_version?: number | null;
+  /** Public repair guidance authored by the server; excludes session data. */
+  rejection?: {
+    error_code: string;
+    guidance: string[];
+  };
 }
 
 /** A visible chat segment whose kind carries its rendering authority. */
@@ -122,8 +133,14 @@ export interface ChatMessage {
   segments?: ChatMessageSegment[];
   tool_calls: ToolCall[] | null;
   created_at: string;
+  /** Server receipt identity for an accepted user send; absent on older rows. */
+  client_request_id?: string | null;
   local_status?: "pending" | "failed";
   local_error?: string;
+  /** Original nullable state supplied with an optimistic send. */
+  local_requested_state_id?: string | null;
+  /** Accepted ingress receipt awaiting an authoritative transcript refresh. */
+  local_accepted_user_message_id?: string;
   /** Closed failure code from the ApiError that failed this local send
    *  (e.g. "policy_blocked", which is permanent by construction — retry
    *  affordances must not invite a retry for it). Set only when the error
@@ -242,6 +259,12 @@ export interface ValidationEntryDTO {
   error_code?: string | null;
 }
 
+export type CompositionValidationError = Readonly<{
+  message: string;
+  error_code: string | null;
+  component: string | null;
+}>;
+
 export interface CompositionState {
   id: string;
   session_id: string;
@@ -252,7 +275,7 @@ export interface CompositionState {
   outputs: OutputSpec[];
   metadata: PipelineMetadata;
   is_valid: boolean;
-  validation_errors: string[] | null;
+  validation_errors: CompositionValidationError[] | null;
   validation_warnings: ValidationEntryDTO[] | null;
   validation_suggestions: ValidationEntryDTO[] | null;
   derived_from_state_id: string | null;
@@ -291,10 +314,8 @@ export type ComposerDensityDefault = "high" | "medium" | "low";
 export type ProposalLifecycleStatus = "pending" | "committed" | "rejected";
 
 export interface PipelineProposalMetadata {
-  surface: "freeform" | "guided_full" | "guided_staged" | "tutorial_profile";
   draft_hash: string;
   base: Record<string, unknown>;
-  reviewed_anchor_hash: string;
   repair_count: number;
   skill_hash: string;
   audit_payload_hash: string;
@@ -361,9 +382,6 @@ export type ComposerProgressReason =
   | "convergence_composition_budget"
   | "convergence_discovery_budget"
   | "convergence_wall_clock_timeout"
-  // Per-turn tool-call cap. Python-only until 2026-08-17: the only surface that
-  // reached it was guided, and freeform hardcoded `provider_unavailable` over
-  // every planner outcome, so the gap was invisible (elspeth-ad5628ecda).
   | "tool_call_cap_exceeded"
   | "provider_auth_failed"
   | "provider_unavailable"
@@ -373,6 +391,8 @@ export type ComposerProgressReason =
   // retryable — deliberately not part of the provider_* family.
   | "planner_repair_exhausted"
   | "service_setup_failed"
+  | "admission_refused"
+  | "accounting_unavailable"
   // Required when phase === "cancelled" — distinguishes a client disconnect
   // from a future operator-initiated cancel without parsing the headline.
   | "client_cancelled"
@@ -438,15 +458,6 @@ export interface PluginSummary {
   audit_characteristics: AuditCharacteristicFlag[];
 }
 
-/** One lowered composer knob as the inspector needs it — the catalog side of
- *  the same lowered field the guided form reads as KnobField (types/guided.ts).
- *  `tier` is OPTIONAL: the catalog lowering sets it on every field
- *  (knob_schema.py _attach_tier), but the operator-profile policy views
- *  (web/plugin_policy/profiles.py) hand-build their projections and have
- *  shipped fields with no `tier` at all — the live `transform:llm` policy
- *  view was entirely untiered (elspeth-a6ea581e8a). A field the catalog
- *  knows but does not tier reads as "common" (see `optionTier` in
- *  components/chat/guided/optionTiers.ts): visible, never demoted. */
 export type CatalogKnobField = {
   name: string;
   tier?: FieldTier;
@@ -599,6 +610,9 @@ export interface ValidationReadinessBlocker {
   component_id: string | null;
   component_type: string | null;
   detail: string;
+  suggestion: string | null;
+  /** The advisor's own words, bounded and labelled, on `advisor_signoff_blocked` only; null elsewhere. */
+  note: string | null;
 }
 
 export interface ValidationReadiness {
@@ -746,6 +760,8 @@ export interface RunAccounting {
   sources: Record<string, RunAccountingSource>;
   tokens: RunAccountingTokens;
   routing: RunAccountingRouting;
+  /** Failed collector groups; counts groups, not rows or tokens. */
+  collector_groups_failed: number;
   integrity: RunAccountingIntegrity;
 }
 
@@ -801,6 +817,7 @@ export interface Run {
  * - "failed" -- terminal. Pipeline aborted due to an unrecoverable error.
  */
 export interface RunEvent {
+  event_sequence?: number;
   run_id: string;
   timestamp: string;
   event_type: "progress" | "error" | "completed" | "cancelled" | "failed";
@@ -1154,13 +1171,21 @@ export interface ApiError {
   status: number;
   detail: string;
   error_type?: string;
+  /** The server's current approval state when another approver won the decision race. */
+  current_state?: string;
+  /** Server-measured identity storage refusal, distinct from a file-size 413. */
+  storage_quota?: StorageQuotaRefusal;
+  /** Source names on a library publish refusal that needs profile-bound input. */
+  sources?: string[];
   /** Server correlation id (RequestIdMiddleware). Present on fail-closed
    *  audit-integrity 500s so the banner can name a support reference. */
   request_id?: string;
-  /** Closed guided-operation failure code (guided_operation_terminal_failure
-   *  envelopes). "policy_blocked" is permanent by construction — retry
-   *  affordances must not invite a retry for it. */
+  /** Exact accepted send receipt, distinct from the server request correlation id. */
+  client_request_id?: string;
+  user_message_id?: string;
   failure_code?: string;
+  /** Static provider or accounting guidance supplied by the Composer route. */
+  guidance?: string;
   component_id?: string;
   plugin_id?: string;
   /**
@@ -1204,6 +1229,12 @@ export interface ApiError {
   snapshot_fingerprint?: string;
 }
 
+export interface StorageQuotaRefusal {
+  cap: number | null;
+  ceiling: number | null;
+  usage: number;
+}
+
 /**
  * Shared message-bearing shape for structured execution errors. Semantic
  * contract entries use `component`; pipeline validation entries use the
@@ -1229,6 +1260,12 @@ export interface SystemStatus {
   frontend_build?: string | null;
   composer_available: boolean;
   composer_model: string;
+  /**
+   * The advisor model that gates completion
+   * (ELSPETH_WEB__COMPOSER_ADVISOR_MODEL). Required: the server always
+   * sends a non-empty string (WebSettings has no advisor-disabled state).
+   */
+  composer_advisor_model: string;
   composer_provider: string | null;
   composer_reason: string | null;
   composer_missing_keys: string[];
@@ -1243,6 +1280,13 @@ export interface SystemStatus {
    * server always sends it.
    */
   composer_timeout_seconds?: number;
+  /**
+   * False when the deployment runs in locked-down server-only mode
+   * (ELSPETH_WEB__USER_SECRETS_ENABLED=false): users cannot add their own
+   * keys and SecretsPanel renders read-only. Absent is treated as enabled
+   * for fixture tolerance; the server always sends it.
+   */
+  user_secrets_enabled?: boolean;
   /**
    * Operator-declared protective marking for the deployment
    * (ELSPETH_WEB__CLASSIFICATION_BANNER), rendered by ClassificationBanner
@@ -1434,14 +1478,14 @@ export interface InlineSourceSummary {
    * SHA-256 of the raw inline content (from session blob metadata).
    *
    * NON-NULLABLE BY CONTRACT. Every persisted blob carries a hash — that's
-   * a Tier-1 audit-trail invariant on our data (CLAUDE.md "Auditability
-   * Standard": hashes survive payload deletion, integrity is always
-   * verifiable). The inline-source projection MUST throw, not
+   * a Tier-1 audit-trail invariant on our data (ARCHITECTURE.md §Design
+   * Principles — auditability: hashes survive payload deletion, integrity
+   * is always verifiable). The inline-source projection MUST throw, not
    * coerce, when the wire returns a null or empty hash: silently
    * substituting an empty string into the rendered audit-info pane
-   * gives an auditor a value the system never asserted, which is exactly
-   * the fabrication CLAUDE.md forbids. The throw lives in
-   * `projectInlineSourceSummary` — keep it there.
+   * gives an auditor a value the system never asserted — absence is
+   * evidence, and a fabricated hash is indistinguishable from a real one.
+   * The throw lives in `projectInlineSourceSummary` — keep it there.
    */
   contentHash: string;
   /**

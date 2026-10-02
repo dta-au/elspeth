@@ -51,7 +51,8 @@ def find_aggregation_transform(
         Tuple of (transform, aggregation_node_id)
 
     Raises:
-        RuntimeError: If no batch-aware transform found for the aggregation
+        OrchestrationInvariantError: If no batch-aware transform is found for
+            the aggregation.
     """
     agg_transform: TransformProtocol | None = None
     agg_node_id = NodeID(agg_node_id_str)
@@ -83,25 +84,20 @@ def _process_flush_results(
     counters: ExecutionCounters,
     pending_tokens: PendingTokenMap,
 ) -> None:
-    """Accumulate completed results and route work items through remaining transforms.
+    """Accumulate completed results and advance the flush's continuations.
 
-    Extracted from check_aggregation_timeouts and flush_remaining_aggregation_buffers
-    which had identical post-flush continuation loops.
+    Shared by check_aggregation_timeouts and flush_remaining_aggregation_buffers.
+    The flush inserted every continuation READY in one transaction, so all of
+    them advance in ONE processor drain: a per-continuation drain would also
+    claim the siblings and then replay work items that had already moved on.
     """
     accumulate_row_outcomes(completed_results, counters, pending_tokens)
 
     for work_item in work_items:
         if work_item.current_node_id is None:
             raise OrchestrationInvariantError("Aggregation continuation work item missing current_node_id")
-        downstream_results = processor.process_token(
-            token=work_item.token,
-            ctx=ctx,
-            current_node_id=work_item.current_node_id,
-            coalesce_node_id=work_item.coalesce_node_id,
-            coalesce_name=work_item.coalesce_name,
-            row_union_name=work_item.row_union_name,
-        )
-        accumulate_row_outcomes(downstream_results, counters, pending_tokens)
+    downstream_results = processor.drain_released_continuations(work_items, ctx)
+    accumulate_row_outcomes(downstream_results, counters, pending_tokens)
 
 
 def check_aggregation_timeouts(
@@ -224,8 +220,9 @@ def flush_remaining_aggregation_buffers(
         quarantined, coalesced, forked, expanded, buffered rows and routed_destinations
 
     Raises:
-        RuntimeError: If no batch-aware transform found for an aggregation
-                     (indicates bug in graph construction or pipeline config)
+        OrchestrationInvariantError: If no batch-aware transform is found for
+            an aggregation (indicates a bug in graph construction or pipeline
+            configuration).
     """
     counters = ExecutionCounters()
 

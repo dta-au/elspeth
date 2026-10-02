@@ -2,30 +2,21 @@
 
 elspeth-54edda5699: row_union pops the FORK frame in memory only
 (``row_union_executor.py`` via ``pop_fork_frame``); ``token_lineage_frames``
-rows are mint frames and never rewritten. ``get_resume_workset`` therefore
-projects an ``IncompleteTokenSpec`` for a released-but-unfinished token whose
-``lineage_path`` has silently REGAINED the popped FORK frame — and
-``classify_resume_start`` would misroute it back through the whole fork branch
-(re-arriving at a barrier whose group already released).
+rows are mint frames and never rewritten, so any resume that rebuilt a token
+from its mint frames would regain the popped FORK frame and misroute the token
+back through the whole fork branch (re-arriving at a barrier whose group
+already released).
 
-Measured 2026-08-26: that projection is real but is NEVER dispatched on the
-orchestrator resume path, because ``run_resume_processing_loop`` drains the
-durable scheduler journal FIRST (``resume.py`` — journal rows carry the popped
-``lineage_path_json``, the byte-exact pre-crash path) and then DISCARDS the
-row-replay work outright (``unprocessed_rows = ()``); a mixed image where a
-recovered row lacks scheduler coverage fail-closes with AuditIntegrityError
-instead of silently re-driving. This module pins that healing mechanism:
+Resume rebuilds nothing from mint frames: it re-drives only the durable
+scheduler journal, whose rows carry the popped ``lineage_path_json`` — the
+byte-exact pre-crash path. This module pins that on a real process death:
 
-* the crashed image really carries the divergence (journal bytes = popped
-  path; workset spec bytes = mint path with the FORK frame back), and
+* the crashed image's journal rows for the released tokens carry the popped
+  path, and
 * resume completes every released token from the journal — nothing
   re-executes (no node_state above attempt 0), one terminal outcome per
   token, and the journal's post-union lineage bytes are unchanged across the
   crash boundary.
-
-Killing either half of the healer (the drain-first precedence or the
-coverage refusal) re-dispatches the mint-frame specs and fails the
-one-outcome-per-token assertion here.
 """
 
 from __future__ import annotations
@@ -258,17 +249,6 @@ def test_released_row_union_tokens_resume_from_the_journal_not_mint_frames(tmp_p
                 .values(leader_heartbeat_expires_at=datetime.now(UTC) - timedelta(seconds=1))
             )
 
-        # The workset PROJECTION regains the popped FORK frame (the ticket's
-        # divergence): every released token appears as an incomplete spec whose
-        # lineage_path was rebuilt from MINT frames. This is the hazard the
-        # journal-drain precedence must keep un-dispatched.
-        workset = RecoveryManager(killed_db, CheckpointManager(killed_db)).get_resume_workset(_RUN_ID)
-        specs = [spec for specs in workset.incomplete_by_row.values() for spec in specs]
-        assert {spec.token_id for spec in specs} == released_token_ids
-        assert all(len(spec.lineage_path) == 1 and spec.lineage_path[0].kind is FrameKind.FORK for spec in specs), (
-            "workset specs no longer regain the FORK frame — update this pin alongside the projection change"
-        )
-
     with spawn_database_process_at_seam(
         database_url=database_url,
         seam="fresh-process-recovery-completed",
@@ -288,8 +268,8 @@ def test_released_row_union_tokens_resume_from_the_journal_not_mint_frames(tmp_p
             .where(token_outcomes_table.c.completed == 1)
         ).all()
         # Exactly one terminal outcome per released token: the journal drain
-        # completed them; a re-dispatch of the mint-frame specs would have
-        # re-run the fork branches and doubled (or late-arrival-killed) these.
+        # completed them; re-running the fork branches would have doubled (or
+        # late-arrival-killed) these.
         assert sorted(row.token_id for row in outcome_rows) == sorted(released_token_ids)
         # Nothing re-executed: the resumed process wrote no bumped attempts.
         attempts = conn.execute(select(node_states_table.c.attempt).where(node_states_table.c.run_id == _RUN_ID)).scalars()

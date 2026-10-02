@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import PluginRetryableError
 from elspeth.contracts.probes import CollectionReadinessResult
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 
 
@@ -25,13 +27,13 @@ class RetrievalError(PluginRetryableError):
         super().__init__(message, retryable=retryable, status_code=status_code)
 
 
-@runtime_checkable
-class RetrievalProvider(Protocol):
-    """Search backend interface for RAG retrieval.
+class RetrievalSearcher(Protocol):
+    """What the retrieval core needs from a search backend.
 
     Implementations handle search execution, score normalization, and
     resource lifecycle. The protocol is deliberately minimal — no
-    provider-specific query objects leak into the transform.
+    provider-specific query objects leak into the transform. Readiness is
+    not part of it: each plugin chooses its own readiness path.
     """
 
     last_skipped_count: int
@@ -45,6 +47,8 @@ class RetrievalProvider(Protocol):
         *,
         state_id: str,
         token_id: str | None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> list[RetrievalChunk]:
         """Execute a search query and return ranked results.
 
@@ -64,14 +68,19 @@ class RetrievalProvider(Protocol):
         """
         ...
 
+    def close(self) -> None:
+        """Release provider resources (connections, clients)."""
+        ...
+
+
+@runtime_checkable
+class RetrievalProvider(RetrievalSearcher, Protocol):
+    """A searcher that also answers an on_start readiness check."""
+
     def check_readiness(self) -> CollectionReadinessResult:
         """Check that the target collection exists and has documents.
 
         Single-attempt, no retry. Called during on_start() — transient
         failures crash the pipeline startup.
         """
-        ...
-
-    def close(self) -> None:
-        """Release provider resources (connections, clients)."""
         ...

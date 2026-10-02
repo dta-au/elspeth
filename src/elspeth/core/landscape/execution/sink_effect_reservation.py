@@ -29,6 +29,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReservationRequest,
     SinkEffectState,
 )
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.model_loaders import SinkEffectLoader
@@ -590,21 +591,42 @@ class SinkEffectReservation:
             self._validate_export_snapshot(request, snapshot)
             identity = _export_identity(request, snapshot)
             existing_effects = conn.execute(
-                select(sink_effects_table.c.effect_id).where(
+                select(sink_effects_table).where(
                     sink_effects_table.c.run_id == request.run_id,
                     sink_effects_table.c.input_kind == SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT.value,
                 )
             ).fetchall()
             if any(effect.effect_id != identity.effect_id for effect in existing_effects):
                 raise ValueError("audit export target identity differs from the existing durable effect for this run")
+            self._validate_existing_stream_shape(request, existing_effects, identity.stream_id)
             stream = self._lock_stream(
                 conn,
                 request,
                 identity.stream_id,
-                create=request.replacing_target,
+                create=request.replacing_target and not existing_effects,
             )
             sequence = stream.next_sequence if stream is not None else None
             predecessor = stream.tail_effect_id if stream is not None else None
+            if existing_effects:
+                # A retry compares against the position allocated to the
+                # immutable winner, not the stream's next vacant position.
+                # The source-run lock serializes export reservation and the
+                # exact identity/stream checks above protect this reuse.
+                sequence = existing_effects[0].stream_sequence
+                predecessor = existing_effects[0].predecessor_effect_id
+                if stream is not None:
+                    assert sequence is not None
+                    if stream.next_sequence != sequence + 1 or stream.tail_effect_id != identity.effect_id:
+                        raise ValueError("audit export stream position disagrees with its durable effect winner")
+                    if sequence > 0:
+                        predecessor_sequence = conn.execute(
+                            select(sink_effects_table.c.stream_sequence).where(
+                                sink_effects_table.c.effect_id == predecessor,
+                                sink_effects_table.c.stream_id == stream.stream_id,
+                            )
+                        ).scalar_one_or_none()
+                        if predecessor_sequence != sequence - 1:
+                            raise ValueError("audit export stream predecessor disagrees with its durable effect winner")
             inserted, effect = self._insert_or_compare_effect(
                 conn,
                 request,
@@ -748,12 +770,17 @@ class SinkEffectReservation:
     def _effect_rows(conn: Connection, effect_ids: Sequence[str], *, lock: bool) -> tuple[Row[Any], ...]:
         if not effect_ids:
             return ()
-        statement = (
-            select(sink_effects_table).where(sink_effects_table.c.effect_id.in_(tuple(effect_ids))).order_by(sink_effects_table.c.effect_id)
-        )
+        # The requested tokens may carry bindings to any number of earlier
+        # effects, so the read runs in ascending chunks of the shared bind
+        # budget; ascending order keeps the effect_id lock order when locking.
+        statement = select(sink_effects_table).order_by(sink_effects_table.c.effect_id)
         if lock:
             statement = statement.with_for_update()
-        rows = tuple(conn.execute(statement).fetchall())
+        rows = tuple(
+            row
+            for chunk in bind_budget_chunks(sorted(effect_ids))
+            for row in conn.execute(statement.where(sink_effects_table.c.effect_id.in_(chunk))).fetchall()
+        )
         if len(rows) != len(effect_ids):
             raise ValueError("sink effect membership references a missing effect")
         return rows

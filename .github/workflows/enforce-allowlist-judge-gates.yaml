@@ -1,8 +1,10 @@
-# CI gates for the convergent panel findings on the cicd-judge-cli prototype.
+# Additional lint and quality diagnostics for the cicd-judge-cli prototype.
 #
-# Two gates run here, both load-bearing per the audit-trail thesis. C1 remains
-# implemented in elspeth-lints, but is intentionally not wired into this
-# workflow until every covered allowlist shape can acquire judge metadata:
+# This workflow is advisory by design. It is outside the standard enforcement
+# package and Git required checks; its absence from branch protection is not a
+# defect. C1 remains implemented in elspeth-lints, but is intentionally not
+# wired into this workflow until every covered allowlist shape can acquire
+# judge metadata:
 #
 #   C1 (check-judge-coverage, temporarily disabled): on PRs and protected-branch
 #     pushes touching any 'enforce_*' allowlist directory, every new
@@ -18,12 +20,12 @@
 #   C3 (check-override-rate): on every configured PR and push to
 #     main/master/RC*/release/* branches, the rolling-30d OVERRIDDEN_BY_OPERATOR
 #     rate is checked against the workflow-pinned --max-rate 0.10
-#     threshold. Insufficient-data windows pass with a notice; the gate
+#     threshold. Insufficient-data windows pass with a notice; the diagnostic
 #     produces stable signal only once the denominator grows past
-#     --min-samples (default 10). Converts the override-rate metric from
-#     informational to enforcing.
+#     --min-samples (default 10). Above-threshold data fails this advisory
+#     workflow without making it a repository merge gate.
 #
-#   VAL (check-judge-quality): on trusted pushes only, run the labelled
+#   check-judge-quality: on trusted pushes only, run the labelled
 #     judge-quality corpus through the live OpenRouter-backed judge and
 #     require exact verdict/decorator accuracy >= 0.90. This is a prompt/model
 #     REGRESSION TRIPWIRE, not a quality guarantee: the corpus is small (10-30
@@ -39,7 +41,9 @@
 # workflow only ever *verifies*: it must never invoke a signing verb
 # (sign-bundle / rekey / justify / sign-judge-signatures / migrate-judge-scope).
 # The judge-metadata HMAC key is operator-custody and must never be reachable
-# from PR-controlled code, so minting or rotating a signature runs ONLY in an
+# from workflow-controlled code, including release-branch pushes. Workflow
+# references are forbidden; Actions secrets and runner environments must also
+# exclude the key. Minting or rotating a signature runs ONLY in an
 # operator-controlled shell, never here. Agents stage a review bundle via the
 # elspeth-judge MCP server; an operator fires `elspeth-lints sign-bundle` /
 # `rekey` in a key-bearing shell (see docs/judge-signature-handoff.md). This
@@ -47,15 +51,11 @@
 # tests/unit/elspeth_lints/test_meta_ci_never_signs.py. (Re-enabling C1 is out
 # of scope for this change.)
 #
-# BRANCH PROTECTION: the aggregate ``judge-gates-success`` job at the bottom
-# is the single required status check for these gates (mirroring ci.yaml's
-# ``ci-success``). Branch protection MUST require ``Judge gates success`` from
-# GitHub Actions —
-# requiring the individual gate jobs is fragile (a renamed job silently drops
-# the requirement) and GitHub keys protection on one named check. The
-# aggregate fails if C3 is not ``success``; VAL may be ``skipped`` (it is
-# intentionally skipped on every PR so PR-controlled code can never read the
-# OpenRouter secret).
+# The aggregate ``judge-gates-success`` job at the bottom provides one summary
+# status for this additional workflow. Neither it nor the individual
+# diagnostics is a required Git check. The aggregate fails unless C3 succeeds;
+# check-judge-quality may be ``skipped`` because it is intentionally skipped on
+# every PR so PR-controlled code can never read the OpenRouter secret.
 #
 # Spec: notes/cicd-judge-cli-prototype-plan.md + the convergent-findings
 # remediation diff that introduced this workflow.
@@ -90,19 +90,18 @@ defaults:
   run:
     shell: bash
 
-# Public-repository guardrail mirrors ci.yaml: every PR stays on GitHub-hosted
-# runners, while trusted pushes use nyx. Both gates are I/O-light (no
-# compilation, no tests); a small hosted runner is sufficient for PR checks.
+# Code-executing jobs admit same-repository PRs and trusted pushes. Fork PRs
+# fail the aggregate without checking out or executing their repository code.
 jobs:
   check-judge-quality:
-    name: Judge-quality validation corpus (VAL)
+    name: Judge-quality validation corpus
     if: github.event_name != 'pull_request'
-    runs-on: ${{ fromJSON('["self-hosted","Linux","X64","nyx-ci","trusted"]') }}
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     # This job makes real OpenRouter calls; keep the corpus bounded and fail
     # quickly on transport/config drift.
     timeout-minutes: 20
     container:
-      image: python:3.13-bookworm
+      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-judge-quality
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -115,7 +114,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
-          version: "0.5"
+          version: "0.10.2"
           enable-cache: false
           prune-cache: true
 
@@ -154,11 +153,12 @@ jobs:
 
   check-override-rate:
     name: Override-rate drift gate (C3)
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     # Judge gates should fail fast if checkout/dependency/git plumbing hangs.
     timeout-minutes: 15
     container:
-      image: python:3.13-bookworm
+      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-override-rate
     steps:
@@ -171,7 +171,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
-          version: "0.5"
+          version: "0.10.2"
           enable-cache: false
           prune-cache: true
 
@@ -209,21 +209,28 @@ jobs:
           exit "$status"
 
   # ===========================================================================
-  # Aggregate success job - Required for branch protection
+  # Aggregate result for the advisory workflow
   # ===========================================================================
-  # Branch protection requires THIS job, not the individual gates. Without an
-  # aggregate, a red gate only blocks merge if that specific job name is listed
-  # as required — fragile against renames, and it leaves "are the gates even
-  # gating?" depending on unverifiable repo settings. This job makes the answer
-  # mechanical: it fails unless C3 succeeded and VAL succeeded-or-skipped.
+  # This job supplies one mechanical summary status: it fails unless C3
+  # succeeded and check-judge-quality succeeded or was skipped. It remains an
+  # additional diagnostic and is intentionally outside branch protection.
   judge-gates-success:
     name: Judge gates success
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs:
       - check-judge-quality
       - check-override-rate
     if: always()
     steps:
+      - name: Reject fork pull requests
+        env:
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          if [[ "$IS_FORK_PR" == "true" ]]; then
+            echo "Fork pull requests cannot run on the trusted local runners."
+            exit 1
+          fi
+
       - name: Check all judge gates passed
         run: |
           # C1 (new-entry judge-coverage) is temporarily removed: the judge
@@ -235,13 +242,13 @@ jobs:
             echo "C3 override-rate drift gate did not pass (result: ${{ needs.check-override-rate.result }})"
             exit 1
           fi
-          # VAL (judge-quality) is intentionally skipped on every PR: it needs the
+          # check-judge-quality is intentionally skipped on every PR: it needs the
           # OpenRouter secret, which must not be reachable from PR-controlled code.
           # 'skipped' is therefore acceptable here; any other non-success result
-          # (failure / cancelled / timed_out) blocks the merge.
-          val_result="${{ needs.check-judge-quality.result }}"
-          if [[ "$val_result" != "success" && "$val_result" != "skipped" ]]; then
-            echo "VAL judge-quality gate did not pass (result: $val_result)"
+          # (failure / cancelled / timed_out) fails this advisory workflow.
+          judge_quality_result="${{ needs.check-judge-quality.result }}"
+          if [[ "$judge_quality_result" != "success" && "$judge_quality_result" != "skipped" ]]; then
+            echo "judge-quality gate did not pass (result: $judge_quality_result)"
             exit 1
           fi
-          echo "All judge gates passed (VAL result: $val_result)."
+          echo "All judge gates passed (judge-quality result: $judge_quality_result)."

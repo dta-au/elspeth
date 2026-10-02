@@ -85,7 +85,7 @@ from elspeth.contracts.call_data import (
     LLMCallResponse,
     RawCallPayload,
 )
-from elspeth.contracts.checkpoint import CheckpointDraft, ResumeCheck, ResumedRow, ResumePoint
+from elspeth.contracts.checkpoint import CheckpointDraft, ResumeCheck, ResumePoint
 from elspeth.contracts.cli import ExecutionResult, ProgressEvent
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
 from elspeth.contracts.coalesce_metadata import ArrivalOrderEntry, CoalesceMetadata
@@ -161,6 +161,7 @@ from elspeth.contracts.engine import (
     CommittedCoalesceResidual,
     CommittedCollect,
     PendingOutcome,
+    RecordedAggregationFailure,
     RetryPolicy,
 )
 from elspeth.contracts.enums import (
@@ -229,6 +230,8 @@ from elspeth.contracts.errors import (
     violations_to_error_reason,
 )
 from elspeth.contracts.events import (
+    ChromaWriteStatistics,
+    DataverseLoadStatistics,
     ExternalCallCompleted,
     FieldResolutionApplied,
     GateEvaluated,
@@ -238,6 +241,7 @@ from elspeth.contracts.events import (
     PhaseError,
     PhaseStarted,
     PipelinePhase,
+    RAGRetrievalStatistics,
     ResourceCleanupFailed,
     RowCreated,
     RunCompletionStatus,
@@ -362,7 +366,6 @@ from elspeth.contracts.type_normalization import (
     UNSUPPORTED_CONTRACT_TYPE,
     classify_runtime_type,
     normalize_type_for_contract,
-    require_supported_contract_type,
 )
 from elspeth.contracts.types import (
     NODE_ID_MAX_LENGTH,
@@ -529,7 +532,6 @@ __all__ = [  # Grouped by category for readability
     "CheckpointDraft",
     "ResumeCheck",
     "ResumePoint",
-    "ResumedRow",
     # coalesce enums
     "CoalescePolicy",
     "MergeStrategy",
@@ -591,6 +593,7 @@ __all__ = [  # Grouped by category for readability
     "CommittedCoalesceResidual",
     "CommittedCollect",
     "PendingOutcome",
+    "RecordedAggregationFailure",
     "RetryPolicy",
     # payload_store
     "IntegrityError",
@@ -630,6 +633,9 @@ __all__ = [  # Grouped by category for readability
     "RunStarted",
     "RunSummary",
     "TelemetryEvent",
+    "ChromaWriteStatistics",
+    "DataverseLoadStatistics",
+    "RAGRetrievalStatistics",
     "TokenCompleted",
     "TransformCompleted",
     # cli
@@ -696,7 +702,6 @@ __all__ = [  # Grouped by category for readability
     "map_schema_mode",
     "classify_runtime_type",
     "normalize_type_for_contract",
-    "require_supported_contract_type",
     "UNSUPPORTED_CONTRACT_TYPE",
     "PipelineRow",
     "PipelineRunner",

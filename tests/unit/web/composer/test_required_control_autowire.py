@@ -65,6 +65,7 @@ def _bare_llm_candidate(**llm_option_overrides: Any) -> dict[str, Any]:
     """csv -> llm -> json with NO controls: both coverage findings fire."""
     options: dict[str, Any] = {
         "profile": "sonnet",
+        "system_prompt": "You assess support tickets. Reply with a brief assessment only.",
         "prompt_template": "Assess support ticket {{ row.ticket_id }}: {{ row.body }}. Reply briefly.",
         "required_input_fields": ["ticket_id", "body"],
         "response_field": "assessment",
@@ -285,7 +286,7 @@ class TestAutoWireSplicing:
 
         wired = wire_required_controls(bare, snapshot, view)
         candidate = build_set_pipeline_candidate(wired, _empty_state(), context)
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"auto-wired candidate rejected: {rejection}"
 
         result = view.validate_authored_state(candidate.result.updated_state)
@@ -322,7 +323,7 @@ class TestAutoWireSplicing:
         # disclosure over placeholder config.
         context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
         built = build_set_pipeline_candidate(candidate, _empty_state(), context)
-        assert built.acceptable is True, (built.result.data or {}).get("error")
+        assert built.acceptable is True, built.result.validation.errors[0].message
         result = view.validate_authored_state(built.result.updated_state)
         coverage = [finding for finding in result.findings if finding.stage == "required_control_coverage"]
         assert coverage, "the required-control coverage finding must be preserved"
@@ -478,7 +479,7 @@ class TestLLMSourceAutoWireSplicing:
         wired = wire_required_controls(bare, snapshot, view)
         candidate = build_set_pipeline_candidate(wired, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"wired candidate rejected: {rejection}"
         state = candidate.result.updated_state
         assert state.sources["source"].on_validation_failure == "discard"
@@ -830,7 +831,7 @@ class TestAutoWireIdempotence:
     def test_every_no_op_path_is_identity_preserving(self, tmp_path: Path) -> None:
         """Regression (fix round 2): the pass returned a NEW equal dict on
         no-op paths, breaking the finalizer identity contract pinned by
-        tests/integration/web/composer/guided/test_shared_planner_surfaces.py.
+        the planner's ordinary authoring path.
         Every refusal path must return the input object itself — including for
         read-only mapping inputs such as a frozen proposal pipeline."""
         from types import MappingProxyType
@@ -847,7 +848,7 @@ class TestAutoWireIdempotence:
 
         # REQUIRED posture through the service finalizer factory (the seam the
         # regression test exercises).
-        from elspeth.web.composer.service import _required_controls_candidate_finalizer
+        from elspeth.web.composer.planning_application import _required_controls_candidate_finalizer
 
         finalize = _required_controls_candidate_finalizer(policy_catalog=req_view, plugin_snapshot=req_snapshot)
         assert finalize(frozen) is frozen
@@ -889,12 +890,14 @@ class TestAutoWireRefusals:
         assert wire_required_controls(candidate, unselected, view) is candidate
 
     def test_unprovable_prompt_fields_leave_the_input_finding_alone(self, tmp_path: Path) -> None:
-        """A dynamic row access defeats field-scoped shielding: insert nothing on
-        the input edge (the scope repair is the author's), but the output edge is
-        independent and still gets its safety control."""
+        """The ``[]`` opt-out lets the template see the whole row (ADR-051), which
+        defeats field-scoped shielding: insert nothing on the input edge (the
+        scope repair is the author's), but the output edge is independent and
+        still gets its safety control."""
         view, snapshot = _guardrail_profile_view(tmp_path)
         candidate = _bare_llm_candidate(
             prompt_template="Assess {{ row[key] }} for ticket {{ row.ticket_id }}.",
+            required_input_fields=[],
         )
 
         wired = wire_required_controls(candidate, snapshot, view)
@@ -1007,7 +1010,7 @@ class TestServiceFinalizerFactory:
     """The exact finalizer callable all three plan_pipeline sites now pass."""
 
     def test_finalizer_wires_the_candidate(self, tmp_path: Path) -> None:
-        from elspeth.web.composer.service import _required_controls_candidate_finalizer
+        from elspeth.web.composer.planning_application import _required_controls_candidate_finalizer
 
         view, snapshot = _guardrail_profile_view(tmp_path)
         finalize = _required_controls_candidate_finalizer(policy_catalog=view, plugin_snapshot=snapshot)
@@ -1015,26 +1018,6 @@ class TestServiceFinalizerFactory:
         wired = finalize(_bare_llm_candidate())
 
         assert type(wired) is dict  # the planner's exact-dict finalizer contract
-        assert "prompt_shield_auto_1" in _nodes_by_id(dict(wired))
-
-    def test_inner_finalizer_runs_before_the_pass(self, tmp_path: Path) -> None:
-        """The guided reviewed-component binder composes BEFORE wiring, so the
-        pass always sees the bound candidate."""
-        from elspeth.web.composer.service import _required_controls_candidate_finalizer
-
-        view, snapshot = _guardrail_profile_view(tmp_path)
-        seen: list[dict[str, Any]] = []
-
-        def inner(candidate: Any) -> Any:
-            seen.append(copy.deepcopy(dict(candidate)))
-            return candidate
-
-        finalize = _required_controls_candidate_finalizer(policy_catalog=view, plugin_snapshot=snapshot, inner=inner)
-        bare = _bare_llm_candidate()
-
-        wired = finalize(bare)
-
-        assert seen == [bare], "inner must receive the pre-wire candidate"
         assert "prompt_shield_auto_1" in _nodes_by_id(dict(wired))
 
 
@@ -1063,8 +1046,8 @@ class TestDisclosureRegistry:
         candidate = build_set_pipeline_candidate(forged, _empty_state(), context)
 
         assert candidate.result.success is False
-        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in (candidate.result.data or {})["error"]
-        assert "server" in (candidate.result.data or {})["error"]
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in candidate.result.validation.errors[0].message
+        assert "server" in candidate.result.validation.errors[0].message
 
     def test_artifact_hash_binds_to_the_inserted_edge(self) -> None:
         def _control(node_id: str, *, input_stream: str) -> NodeSpec:

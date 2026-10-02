@@ -4,7 +4,7 @@ Create custom sources, transforms, and sinks for ELSPETH pipelines.
 
 > **Quick Links:**
 >
-> - [5-Minute Transform](#5-minute-transform) - Get started fast
+> - [Example transform](#example-transform) - Start with a small plugin
 > - [Plugin Types](#plugin-types-overview) - Choose the right type
 > - [Contract Tests](#contract-testing) - Verify your plugin works
 
@@ -13,7 +13,7 @@ Create custom sources, transforms, and sinks for ELSPETH pipelines.
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)
-- [5-Minute Transform](#5-minute-transform)
+- [Example Transform](#example-transform)
 - [Plugin Types Overview](#plugin-types-overview)
 - [Creating Transforms](#creating-a-transform-plugin)
 - [Creating Sources](#creating-a-source-plugin)
@@ -32,16 +32,19 @@ Create custom sources, transforms, and sinks for ELSPETH pipelines.
 - **ELSPETH concepts** - Read [Data Trust and Error Handling](docs/guides/data-trust-and-error-handling.md) for the Three-Tier Trust Model
 
 ```bash
-git clone https://github.com/dta-au/elspeth.git && cd elspeth
-uv venv && source .venv/bin/activate
-uv pip install -e ".[dev]"
+git clone https://github.com/dta-au/elspeth.git
+cd elspeth
+uv sync --frozen --all-extras
+source .venv/bin/activate
 ```
 
 ---
 
-## 5-Minute Transform
+## Example Transform
 
-The fastest path to a working plugin:
+This example sketches a row transform. Complete its contract tests and source
+hash before registering it in a branch; the hash values shown throughout this
+guide are placeholders, not gate-ready values.
 
 ```python
 # src/elspeth/plugins/transforms/double_value.py
@@ -68,7 +71,7 @@ class DoubleValueTransform(BaseTransform):
     name = "double_value"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0000000000000000"
+    source_file_hash: str | None = "sha256:0000000000000000"  # Replace before CI
     config_model = DoubleValueConfig
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -88,10 +91,24 @@ class DoubleValueTransform(BaseTransform):
         if self._field not in row:
             return TransformResult.error({"reason": "missing_field", "field": self._field})
 
-        try:
-            result = row[self._field] * 2
-        except TypeError as e:
-            return TransformResult.error({"reason": "invalid_input", "error": str(e)})
+        # Under an observed schema the value's type is row data. Check it: never
+        # coerce it, and never raise (a raise ends the run; a returned error
+        # routes this one row). `"12.5" * 2` is "12.512.5", not a TypeError, so
+        # catching TypeError around the operation would miss it. `type()`, not
+        # isinstance: bool is an int. Name the field and type, never the value.
+        value = row[self._field]
+        if type(value) not in (int, float):
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "error_type": "wrong_type",
+                    "field": self._field,
+                    "expected": "int or float",
+                    "actual_type": type(value).__name__,
+                },
+                retryable=False,
+            )
+        result = value * 2
 
         output = row.to_dict()
         output[self._field] = result
@@ -145,6 +162,21 @@ class TestDoubleValueContract(TransformContractPropertyTestBase):
         return {"id": 1, "value": 10.0}
 ```
 
+After formatting the new plugin file, compute and paste its actual source
+hash, then run the contract test and source-hash gate. The hash computation
+normalises the `source_file_hash` line itself, so replacing the placeholder
+does not change the computed value:
+
+```bash
+.venv/bin/python -c "from pathlib import Path; from scripts.cicd.plugin_hash import compute_source_file_hash as h; print(h(Path('src/elspeth/plugins/transforms/double_value.py')))"
+.venv/bin/python -m pytest tests/unit/contracts/transform_contracts/test_double_value_contract.py -n 0
+ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
+  .venv/bin/elspeth-lints check --rules plugin_contract.plugin_hashes --root src/elspeth
+```
+
+See the [whole-tree plugin gates](CONTRIBUTING.md#gate-plugin-inventories-source-hashes-scenario-corpus-manifest-fingerprint-baseline)
+for the required inventory updates when adding a built-in plugin.
+
 ---
 
 ## Plugin Types Overview
@@ -159,7 +191,7 @@ SOURCE (Sense) → TRANSFORM (Decide) → SINK (Act)
 |------|---------|------------|------------|---------|
 | **Source** | Load data from external systems | `BaseSource` | `load()` | `SourceContext` |
 | **Transform** | Process/classify rows | `BaseTransform` | `process()` | `TransformContext` |
-| **Sink** | Output data | `BaseSink` | `write()` | `SinkContext` |
+| **Sink** | Publish output through the recoverable effect protocol | `BaseSink` | `prepare_effect()`, `commit_effect()`, `reconcile_effect()` | `RestrictedSinkEffectContext` |
 
 ### The Trust Model: Who Can Coerce Data?
 
@@ -207,7 +239,7 @@ class MyTransform(BaseTransform):
     name = "my_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0000000000000000"
+    source_file_hash: str | None = "sha256:0000000000000000"  # Replace before CI
     config_model = MyTransformConfig
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -231,14 +263,24 @@ class MyTransform(BaseTransform):
                 "field": self._target_field,
             })
 
-        # Wrap operations on row values (their data can fail)
-        try:
-            result = row[self._target_field] * self._multiplier
-        except TypeError as e:
-            return TransformResult.error({
-                "reason": "invalid_input",
-                "error": str(e),
-            })
+        # A row value's type is row data under an observed schema: check it,
+        # never coerce it, never raise. Catching TypeError around the operation
+        # is not a check: `"12.5" * 2` succeeds and yields "12.512.5".
+        value = row[self._target_field]
+        if type(value) not in (int, float):
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "error_type": "wrong_type",
+                    "field": self._target_field,
+                    "expected": "int or float",
+                    "actual_type": type(value).__name__,
+                },
+                retryable=False,
+            )
+        # Wrap operations on row values that can still fail on a valid type
+        # (division by zero, a date that does not parse) and return an error.
+        result = value * self._multiplier
 
         output = row.to_dict()
         output[self._target_field] = result
@@ -346,7 +388,27 @@ class BatchStatsTransform(BaseTransform):
         if not rows:
             return TransformResult.error({"reason": "invalid_input", "error": "empty batch"})
 
-        total = float(sum(r["value"] for r in rows))
+        values: list[int | float] = []
+        for index, row in enumerate(rows):
+            value = row["value"]
+            # Row data: never coerced, never raised. `type()`, not isinstance:
+            # bool is an int. The reason names the row index, field and type,
+            # never the value.
+            if type(value) not in (int, float):
+                return TransformResult.error(
+                    {
+                        "reason": "invalid_input",
+                        "error_type": "wrong_type",
+                        "field": "value",
+                        "expected": "int or float",
+                        "actual_type": type(value).__name__,
+                        "error": f"must be int or float, got {type(value).__name__} in row {index}",
+                    },
+                    retryable=False,
+                )
+            values.append(value)
+
+        total = float(sum(values))
         return TransformResult.success(
             PipelineRow(
                 {"count": len(rows), "sum": total, "mean": total / len(rows)},
@@ -371,6 +433,41 @@ aggregations:
   expected_output_count: 1   # Assert N inputs → 1 output
 ```
 
+**Declare every column `process()` reads.** A real batch transform validates its
+config, calls `self._initialize_declared_input_fields(cfg)`, and folds each
+configured input column into `schema.required_fields` on the `SchemaConfig` it
+stores as `self._schema_config` (`batch_threshold_summary.py` is the pattern).
+Before `process()` runs, the engine checks every buffered row for those fields
+(`schema_required_input_fields()`); a row that omits one fails the whole batch
+through the aggregation's `on_error`, or fails the collector's group, with a
+reason naming the field and the batch row index. A column you read without
+declaring it reaches `row[...]` as a `KeyError` that ends the run.
+`tests/invariants/test_batch_transforms_read_only_declared_fields.py` holds every
+built-in batch transform to this. A column you read only when present
+(`if field in row`) is optional and is not declared.
+
+**Reject a wrongly-typed value by returning an error, never by raising.** Under
+an `observed` schema (or a field the schema leaves untyped) a value's type is
+row data, so a batch transform must check it, as the example does, and must
+not coerce it. One bad row fails the WHOLE batch: a sum or a statistic over the
+rows that happened to be good would describe a set nobody asked for. The
+aggregation's `on_error` then routes every buffered row, with its original
+values, to the named sink, or records them as discarded; at a collector the
+group fails. When the check sits in a helper that returns a value rather than a
+`TransformResult`, raise a plugin-owned exception from the helper and convert it
+once in `process()`: the built-in batch transforms raise `BatchRowTypeError`
+(`src/elspeth/plugins/transforms/_batch_row_types.py`; `batch_threshold_summary.py`
+is the pattern) and return `TransformResult.error(exc.as_reason(), retryable=False)`.
+A bare `raise TypeError(...)` is the defect this replaces: nothing in the engine
+converts it, so it ends the run with a traceback and no terminal outcomes.
+`tests/unit/plugins/test_process_path_type_error_gate.py` fails the build on an
+explicit `raise TypeError` that a plugin class's own `process` reaches through
+its methods, same-module bases and module functions. It does not follow helper
+objects the class composes or code in another module, so a green gate is not
+proof that a plugin cannot abort
+([CONTRIBUTING](CONTRIBUTING.md#gate-no-bare-typeerror-on-a-plugin-process-path)
+lists its blind spots).
+
 </details>
 
 <details>
@@ -389,7 +486,21 @@ class ExpandItemsTransform(BaseTransform):
     declared_output_fields = frozenset({"item", "item_index"})
 
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
-        items = row["items"]  # Trust: source validated this is a list
+        items = row["items"]
+        # A list-shaped field is typed `any` by the source, which validates
+        # nothing, so check it here. PipelineRow deep-freezes row data, so a
+        # list arrives as a tuple. Never coerce and never raise: iterating a
+        # str or a dict would fabricate rows, and a raise aborts the run.
+        if type(items) not in (list, tuple):
+            return TransformResult.error(
+                {
+                    "reason": "invalid_input",
+                    "field": "items",
+                    "error_type": "wrong_type",
+                    "error": f"must be a list, got {type(items).__name__}",
+                },
+                retryable=False,
+            )
 
         output_rows = []
         for i, item in enumerate(items):
@@ -449,7 +560,7 @@ class MySource(BaseSource):
     name = "my_source"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0000000000000000"
+    source_file_hash: str | None = "sha256:0000000000000000"  # Replace before CI
     config_model = MySourceConfig
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -572,96 +683,30 @@ omitting it raises `TypeError`.
 
 ## Creating a Sink Plugin
 
-Sinks output data and **must return audit information** including content hashes.
+Built-in sinks publish effects through a recoverable protocol. A new built-in
+sink must declare its effect protocol version and implement inspection,
+preparation, commit, and reconciliation with the typed contracts in
+[`contracts/sink_effects.py`](src/elspeth/contracts/sink_effects.py).
+The engine reserves and records effect identity before publication. A sink
+then prepares a plan, commits the effect, and can reconcile an uncertain
+outcome after interruption. The committed result includes artifact identity,
+content hash, and size for audit attribution.
 
-```python
-import hashlib
-from pathlib import Path
-from typing import Any
+Use [`CSVSink`](src/elspeth/plugins/sinks/csv_sink.py) as a maintained local-file
+example, including its staged file and directory-sync behaviour. Shared local
+file helpers are in
+[`_local_file_effects.py`](src/elspeth/plugins/sinks/_local_file_effects.py).
+Remote sinks have different reconciliation requirements; see
+[`AWSS3Sink`](src/elspeth/plugins/sinks/aws_s3_sink.py) and
+[`_remote_object_effects.py`](src/elspeth/plugins/sinks/_remote_object_effects.py).
 
-from pydantic import Field
-
-from elspeth.contracts import ArtifactDescriptor, Determinism
-from elspeth.contracts.diversion import SinkWriteResult
-from elspeth.plugins.infrastructure.base import BaseSink
-from elspeth.plugins.infrastructure.config_base import SinkPathConfig
-from elspeth.contracts.contexts import LifecycleContext, SinkContext
-from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-
-
-class MySinkConfig(SinkPathConfig):
-    append: bool = Field(default=False, description="Append to an existing file instead of overwriting it.")
-
-
-class MySink(BaseSink):
-    """Write data to a custom format."""
-
-    name = "my_sink"
-    determinism = Determinism.IO_WRITE
-    plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0000000000000000"
-    config_model = MySinkConfig
-    idempotent = False  # Appends are not idempotent
-
-    def __init__(self, config: dict[str, Any]) -> None:
-        super().__init__(config)
-        cfg = MySinkConfig.from_dict(config, plugin_name=self.name)
-        self._path = Path(cfg.path)
-        self._append = cfg.append
-
-        schema = create_schema_from_config(
-            cfg.schema_config, "MySinkSchema", allow_coercion=False
-        )
-        self.input_schema = schema
-        self.declared_required_fields = cfg.schema_config.get_effective_required_fields()
-
-        self._file = None
-        self._bytes_written = 0
-        self._hasher = hashlib.sha256()
-
-    def on_start(self, ctx: LifecycleContext) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(self._path, "a" if self._append else "w")
-        self._bytes_written = 0
-        self._hasher = hashlib.sha256()
-
-    def write(self, rows: list[dict[str, Any]], ctx: SinkContext) -> SinkWriteResult:
-        for row in rows:
-            line = ",".join(str(v) for v in row.values()) + "\n"
-            self._file.write(line)
-            self._hasher.update(line.encode())
-            self._bytes_written += len(line.encode())
-
-        # REQUIRED: Return artifact with content hash for audit
-        return SinkWriteResult(
-            artifact=ArtifactDescriptor.for_file(
-                path=str(self._path),
-                content_hash=self._hasher.hexdigest(),
-                size_bytes=self._bytes_written,
-            ),
-            diversions=self._get_diversions(),
-        )
-
-    def flush(self) -> None:
-        if self._file:
-            self._file.flush()
-
-    def close(self) -> None:
-        if self._file:
-            self._file.close()
-            self._file = None
-```
-
-### SinkWriteResult and ArtifactDescriptor Requirements
-
-`write()` returns `SinkWriteResult`. The `artifact` inside it gives the audit
-trail proof of work, and `diversions` carries any per-row write failures created
-with `BaseSink._divert_row()`.
-
-The artifact requires:
-
-- `content_hash` - SHA-256 hex digest of output content
-- `size_bytes` - Output size in bytes
+`BaseSink` also requires concrete `write()`, `flush()`, and `close()` methods.
+For a recoverable sink, `write()` must refuse direct publication; `flush()` and
+`close()` can be no-ops when effect commit owns all handles, as in `CSVSink`.
+Implementing only the older `write()` / `flush()` pattern does not provide
+recovery. Run
+[`test_sink_effect_contract.py`](tests/unit/contracts/test_sink_effect_contract.py)
+and the relevant sink effect tests before registering one.
 
 ---
 
@@ -799,13 +844,11 @@ class TestMyTransformContract(TransformContractPropertyTestBase):
 
 ### Sink Contracts
 
-| Contract | Test |
-|----------|------|
-| Has `name` attribute | `test_sink_has_name` |
-| Has `input_schema` attribute | `test_sink_has_input_schema` |
-| `write()` returns `SinkWriteResult` with an `ArtifactDescriptor` | `test_write_returns_artifact_descriptor` |
-| `content_hash` is valid SHA-256 | `test_content_hash_is_sha256_hex` |
-| Same data → same hash | `test_same_data_same_hash` |
+The general [sink protocol tests](tests/unit/contracts/sink_contracts/test_sink_protocol.py)
+cover class and artifact metadata. The
+[effect contract tests](tests/unit/contracts/test_sink_effect_contract.py)
+cover the publication boundary. A new sink also needs focused tests for
+commit, uncertain outcomes, reconciliation, and any remote-service behaviour.
 
 </details>
 
@@ -876,7 +919,8 @@ class MyTransform(BaseTransform):
 - [ ] Schema created with correct `allow_coercion`
 - [ ] Source valid rows call `SourceRow.valid(row, contract=contract, source_row_index=index)`
 - [ ] Transform successes return `PipelineRow` values, never raw dicts
-- [ ] Sink `write()` returns `SinkWriteResult(artifact=ArtifactDescriptor, diversions=...)`
+- [ ] Sink implements the typed effect protocol, including inspect, prepare,
+      commit, and reconcile, with tests for interrupted publication
 - [ ] Transform field declarations are set (`declared_input_fields`, `declared_output_fields`, `_output_schema_config`) when the plugin requires or adds fields
 - [ ] Sink required fields are set with `declared_required_fields`
 - [ ] Plugin file lives in a scanned discovery directory, or `PLUGIN_SCAN_CONFIG` was updated

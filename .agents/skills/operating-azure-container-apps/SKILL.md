@@ -26,10 +26,13 @@ procedures are `docs/runbooks/azure-container-apps-cold-install.md`,
 `docs/runbooks/azure-container-apps-existing-service-redeploy.md` and
 `docs/runbooks/azure-container-apps-deployment.md`.
 
-> **Status.** Skeleton prepared by Phase 6b before the first live run. Until
-> the sanitized receipt at
-> `docs/operator/evidence/azure-container-apps/0.8.0.json` exists, this skill
-> describes a program under acceptance, not a supported platform.
+> **Status.** The implemented ACA slice received desktop acceptance:
+> `elspeth-5ec3befc1a` closed on 2026-09-10. The supported configuration retains
+> Single/sticky routing, with PostgreSQL progress and shared budgets verified
+> through local mechanism/integration evidence. No live cloud
+> acceptance is claimed. A future receipt at
+> `docs/operator/evidence/azure-container-apps/0.8.1.json` must come from actual
+> operator execution; it is no longer a closure or documentation-promotion gate.
 
 ## Scope first
 
@@ -55,7 +58,7 @@ the selected worktree with an explicit `PYTHONPATH` covering `src` and
 
 1. **Discover, do not remember.** Resolve the subscription, resource group,
    environment, app, active revision, replica names, identity, registry,
-   Key Vault and workspace from live Azure state.
+   runtime and schema-owner Key Vaults and workspace from live Azure state.
 2. **One immutable identity, one digest.** The registry image is a
    digest-preserving copy of the GHCR image (`docker buildx imagetools
    create`); a second build never shares a digest. Deploy `@sha256:`, never a
@@ -80,8 +83,11 @@ the selected worktree with an explicit `PYTHONPATH` covering `src` and
    timeout is fixed; `ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS` is
    a required parameter with no default and is the minimum across every hop.
 9. **Never bake credentials into the image or the template.** Secrets are
-   versioned Key Vault references resolved by the user-assigned identity;
-   never print a value or a resolved reference.
+   versioned Key Vault references. Only `doctor-schema-init` attaches the
+   schema-owner identity and reads owner URLs from its dedicated vault. Web
+   and runtime Jobs attach the runtime identity; the web `AZURE_CLIENT_ID`
+   must match its client ID. The root provisioner has no identity. Never
+   print a value or a resolved reference.
 10. **Rollback is conditional.** Only when the compatibility record says
     `rollback_permitted: true`; a Scenario A install says `false`, so repair
     forward.
@@ -89,6 +95,12 @@ the selected worktree with an explicit `PYTHONPATH` covering `src` and
     changed surface; the full suite runs once when the body of work is done.
 
 ## Normal deploy workflow
+
+For an older shared-identity installation, complete the existing-service
+runbook's **One-time credential isolation migration** first: rotate the owner
+password, remove old owner secrets from the runtime vault, revoke old access
+and deploy the full workload configuration. New parameters and an image-only
+update cannot revoke credentials already exposed by the old vault.
 
 Load [the command cheat sheet](references/command-cheatsheet.md) and follow
 it in order.
@@ -112,22 +124,50 @@ testcontainer files for doctor, schema, startup and readiness. Run them with
 
 ### 3. Publish by digest
 
+For building the ACA image and publishing it to GHCR, use
+[Build and push the ACA container](references/build-and-push-ghcr.md), including
+its Docker configuration, Buildx builder and source-archive traps.
+
 - Resolve the GHCR digest for the exact commit.
 - Copy it into the registry with `docker buildx imagetools create` and assert
   `az acr manifest show-metadata` returns the same digest.
-- `cosign verify` the registry reference against the GHCR-signed identity.
+- Pull by digest, compare `org.opencontainers.image.revision` to the image
+  source SHA, and run `--version` and `health --json` in that image.
+- An unsigned RC is supported when selected by the user. CI signing is not a
+  prerequisite. For a signed release, `cosign verify` the signed GHCR
+  reference; an image-index copy does not copy separate signature artifacts.
+  Only verify an ACR signature when that ACR reference was actually signed.
+- The image source SHA may differ from the checkout containing deployment
+  configuration repairs. Preserve and report both; configuration-only fixes
+  do not force a rebuild of an existing RC.
 
 ### 4. Run the doctor Job with the candidate digest
 
-Point the `doctor-runtime` Job at the candidate digest, start it, and require
+Load the concrete operator-local `WORKLOAD_PARAMETERS` retained from cold
+install, create a new candidate file, validate it with
+`deploy/azure-container-apps/scripts/validate-workload-parameters.jq`, and run
+what-if. Never deploy the tracked placeholder example. Update Jobs using
+`deployWebApp=false` in Incremental mode and run `doctor-runtime` with
+`scripts/run-job.sh`, which waits on the exact execution it started. Require
 `Succeeded`. Classify a failure first: contract/config, Key Vault reference
 or version, PostgreSQL connectivity or TLS, schema state, NFS mount or
 ownership, identity role assignment (role assignments can take up to 24 h to
 reach a cached token), or a missing image.
 
+For a cold start the resolver also requires `APPLICATION_PARAMETERS` (flat
+Bicep parameter names to values) and `SECRET_VERSION_DIR` containing captured
+`<secret-name>.version` files. Use `application.example.json` as the editable
+operator input. Four mandatory Composer budgets must reach web and both
+doctors; `extraEnvironment` only reaches web. Choose nonlocal authentication,
+closed registration, quota defaults and the first administrator subject.
+Complete both Composer model roles, pipeline LLM profiles and versioned
+`extraSecrets` for every SSO/provider `secretRef`.
+
 ### 5. Roll the revision
 
-`az containerapp update --image <digest> --revision-suffix <sha12>`; then
+`az containerapp update --image <digest> --revision-suffix r<sha12>` with
+`ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE` and
+`ELSPETH_ACCEPTANCE_CANDIDATE_SHA` set to the full candidate SHA; then
 independently require one active revision at 100 % with the candidate image,
 `N` replicas `Running`, HTTP 200 on both probes, an `X-Elspeth-Instance`
 header and the expected `/api/system/status` facts.
@@ -138,6 +178,21 @@ At minimum the two probes, `/api/system/status`, an authenticated browser or
 API flow appropriate to the change, and a console-log query by revision name
 without a new unhandled startup or runtime failure (Log Analytics lags by
 minutes).
+For a first launch, verify first-admin login and grant an explicit workload
+role, then make a real Composer request and a small LLM pipeline run. An admin
+grant alone does not grant author/run access. The ACA doctor does not emit
+`session_tls`/`landscape_tls`; keep verified TLS URLs and use the cold-install
+runbook's separate connection check.
+
+For the disposable acceptance, `scripts/acceptance.sh all` includes the final
+`single-revision` stage after the labelled P1/P2/P4/P3 probes. It deploys
+`r<sha12>-single` with sticky affinity and exactly two replicas, then runs fresh
+P1 and P4a probes through cookie clients on the default ingress. The standalone
+stage requires retained parameter/observer files and an existing acceptance
+bearer token before deployment. Inspect `single-p1.receipt.json` and
+`single-p4.receipt.json` and their actual replica bindings; implementation and
+local tests do not establish completed live acceptance. See the acceptance
+runbook's final Single-revision pass for the exact inputs and artifacts.
 
 ## Diagnosis loop
 
@@ -166,6 +221,13 @@ Common interpretations:
 - `503 /api/ready` is a dependency/readiness failure, not a liveness failure.
 - A `504` after roughly four minutes is the ingress request timeout, not a
   platform failure of the deployment.
+- Fatal membership or orphan-sweeper failure must stop the actual host, drain
+  services, and let the platform replace the process. A cancelled lifespan
+  task with a still-serving Uvicorn main loop is a defect. Correlate process
+  exit and replica replacement with membership transitions, not health alone.
+- Membership generation and revision use the platform's
+  `CONTAINER_APP_REVISION`; image provenance uses the candidate SHA bound in
+  `ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE`. Never substitute the package version.
 
 ## Stop, resume, rollback, destroy
 

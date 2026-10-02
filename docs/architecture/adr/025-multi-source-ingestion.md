@@ -6,16 +6,61 @@
 **Tags:** sources, config, resume, schema-contract, no-legacy-code,
           rc6, multi-source-token-scheduler
 
+## Amendment (2026-09-28): resume never re-derives a source row
+
+Decisions 3 and 4 below governed the *source-row replay* arm of resume: rows
+recovered from the audit trail were re-validated through their source's
+restored schema (`ResumedRow`, `get_unprocessed_row_data_by_source`) and
+driven down the pipeline again under a per-source contract
+(`ResumeState.schema_contracts_by_source`). That arm is deleted.
+
+Every row a run ingests is handed to the durable scheduler in the same fenced
+transaction that records it — a valid row with a claimed READY work item, a
+source-quarantined row with a born-parked PENDING_SINK item. A fork, expand or
+collect product gets its item when the work that minted it completes (or its
+barrier releases); a crash between the mint and that completion leaves the
+producing item open, and re-driving it reconciles the committed products and
+emits their items, so resume's coverage check counts such a product as covered
+by its open producer. Each item's payload carries its own row and
+its contract (`serialize_row_payload`), so resume re-drives exactly the run's
+non-terminal scheduler work and never consults a source schema. The replay arm
+was reachable only when a row had no durable work item, which the fenced
+ingest makes impossible; its one real trigger was a source-quarantined row
+(before the quarantine handoff existed), where it re-validated a row the source
+had already rejected — trapping the run under a fixed schema, and publishing
+the rejected row as SUCCESS under an observed one.
+
+Consequently:
+
+- **Decision 3** keeps its plural-by-source intent for the audit trail
+  (`run_sources` stays the single per-source contract writer, Decision 5), but
+  `ResumeState` no longer carries a contract map: the non-empty chokepoint now
+  guards `ResumeState.source_names_by_source` (one entry per `run_sources`
+  record), with `EmptyResumeStateError` unchanged as the upstream refusal.
+- **Decision 4** is withdrawn: `ResumedRow` and the whole replay work set
+  (`get_resume_workset`, `get_unprocessed_rows`, `IncompleteTokenSpec`,
+  `reconstruct_token_row`, `RowProcessor.process_existing_row` /
+  `resume_incomplete_token`) are deleted. Mixed-contract soundness is carried
+  by the scheduler payload, which records each token's contract with its row.
+
+The original text below is preserved as the dated decision.
+
 ## Context
 
 Through RC5.2 the pipeline source surface was singular by contract and by
-code. The CLAUDE.md project overview still records the rule verbatim:
+code. The CLAUDE.md project overview recorded the rule at the time of
+this decision, condensed here:
 *"Source: Load data — exactly 1 per run."* `ElspethSettings` carried a
 single `source: SourceSettings`, `ExecutionGraph.from_plugin_instances`
 took one `source` keyword argument, and every downstream consumer
 (orchestrator, processor, audit trail, composer, redaction policy,
 runbooks, runtime contract) modelled the pipeline as exactly one
 producer feeding zero-or-more transforms feeding one-or-more sinks.
+
+**Current implementation note (2026-09-11):** that CLAUDE.md line no
+longer exists. It left the tracked tree when CLAUDE.md was untracked at
+commit `6d5a930c6` (2026-06-05), and the CLAUDE.md re-tracked at commit
+`90539384d` (2026-07-28) states no source-cardinality rule.
 
 The RC6 branch (`feat/multi-source-token-scheduler`) adds first-class
 multi-source ingestion: a pipeline may declare N named sources, fan-in
@@ -61,7 +106,7 @@ it. The structural state is unambiguous across four review lenses:
 ### Why this matters now
 
 The architecture review identified a broad issue cohort, represented by the
-Filigree records named below. The structural family splits into four clusters:
+legacy issue tracker records named below. The structural family splits into four clusters:
 
 1. **Dual-truth surface** — `config.source` / `config.sources`,
    singular / plural ResumeState fields, dual writers for source schema
@@ -119,7 +164,8 @@ by code**. The singular `source` surface is deleted, not deprecated.
    the same commit that lands the structural fix. A YAML that supplies
    `source:` instead of `sources:` is a configuration error, not a
    shim activation. ELSPETH has no users yet; no compatibility path
-   is preserved (CLAUDE.md: *No Legacy Code Policy*).
+   is preserved (CONTRIBUTING.md §Code Standards: *no legacy shims or
+   backwards compatibility*).
 
 2. **`build_execution_graph` takes plural sources only.** The
    `legacy_single_source_invocation` branch
@@ -156,11 +202,13 @@ by code**. The singular `source` surface is deleted, not deprecated.
    loud chokepoint downstream. (Closes G2 / elspeth-01942858c3.)
 
    *Doctrine note (2026-05-23): Tier-1 graceful refuse via a typed
-   upstream-interpretable exception is in-scope — the CLAUDE.md
-   doctrine forbids implicit fabrication (e.g., `.get(k, default)`
-   pitching the decision to an untrusted provider), not explicit
-   exception-raising for graceful upstream management. A future
-   refactor (filigree elspeth-4b61252164) may strengthen this to a
+   upstream-interpretable exception is in-scope — the defensive-
+   programming prohibition (see
+   docs/guides/data-trust-and-error-handling.md) forbids implicit
+   fabrication (e.g., `.get(k, default)` pitching the decision to an
+   untrusted provider), not explicit exception-raising for graceful
+   upstream management. A future refactor (legacy issue tracker
+   elspeth-4b61252164) may strengthen this to a
    discriminated-union return type so the empty case becomes
    literally unrepresentable at the type level rather than
    runtime-rejected.*
@@ -361,14 +409,15 @@ validator, and the `populate_legacy_source_view` shim. Document the
 singular surface as the "simple path" for tutorials and the plural
 surface as the "advanced path" for fan-in.
 
-**Rejected because:** The *No Legacy Code Policy* (CLAUDE.md) is
-unconditional and the project's compensating control is *we have no
-users yet*. A documented escape hatch is exactly the *"both old and
-new branches"* anti-pattern the policy forbids; the existence of two
-paths through `build_execution_graph` is the source of the dual-truth
-critique the reviewers raised. The composer-skill consequence is
-also asymmetric: teaching the LLM that the singular form *is also
-valid* leaks back into engine call sites that defensively accept
+**Rejected because:** The *No Legacy Code Policy* (CONTRIBUTING.md
+§Code Standards) is unconditional and the project's compensating
+control is *we have no users yet*. A documented escape hatch is
+exactly the *"both old and new branches"* anti-pattern the policy
+forbids; the existence of two paths through `build_execution_graph`
+is the source of the dual-truth critique the reviewers raised. The
+composer-skill consequence is also asymmetric: teaching the LLM that
+the singular form *is also valid* leaks back into engine call sites
+that defensively accept
 both, which reproduces the present state.
 
 ## Tickets this ADR covers / unblocks
@@ -458,7 +507,8 @@ true; each ticket is then a focused fix)
 ### Documentation / governance follow-ups (RC6 publish gate, not merge gate)
 
 - **G13 / elspeth-2409a7c7bf** — `CLAUDE.md "exactly 1 source per
-  run"` (correct for RC5.2 today; update on RC6 ship).
+  run"` (correct for RC5.2 when this ADR was written; update on RC6
+  ship).
 - **G14 / elspeth-e4cf92586c** — Single-source doc corpus stale
   (omnibus, 6 files enumerated in consolidation note).
 - **G15 / elspeth-bc91898548** — `docs/release/guarantees.md §7.1`
@@ -531,8 +581,11 @@ true; each ticket is then a focused fix)
   `web/audit_readiness/service._build_plugin_trust_row`) is
   independent of source count.
 - **ADR-024** (delivery governance for single-maintainer mode) —
-  preserved; this ADR is itself the governance artifact ADR-024
-  contemplates for a structural change of this size.
+  **Retired 2026-09-13**; the assurance posture moved to
+  `GOVERNANCE.md` § Maintainer Continuity. The point stands under
+  that posture: with no independent reviewer available, a recorded
+  ADR is the control for a structural change of this size, and this
+  ADR is that record.
 - **ADR-026** (durable token scheduler) — companion. ADR-025 records
   *what* the source surface looks like; ADR-026 records *how* tokens
   produced by that surface survive crash and resume.
@@ -569,9 +622,10 @@ true; each ticket is then a focused fix)
 
 ### Project policies
 
-- `CLAUDE.md` — *No Legacy Code Policy*, *Three-Tier Trust Model* (the
-  Tier-1 audit-integrity rule that the arbitrary `schema_contract`
-  pick violated).
+- `CONTRIBUTING.md` §Code Standards — *No Legacy Code Policy*.
+- `docs/guides/data-trust-and-error-handling.md` §The Three-Tier Trust
+  Model — the Tier-1 audit-integrity rule that the arbitrary
+  `schema_contract` pick violated.
 - `docs/reference/configuration.md` — pre-1.0 Landscape schema policy.
 - `CHANGELOG.md` — the 0.6.0 multi-source and scheduler release record.
 

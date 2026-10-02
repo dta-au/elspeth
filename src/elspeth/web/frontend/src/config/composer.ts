@@ -1,36 +1,6 @@
-// Client-side abort budget for composer requests — the freeform
-// POST /api/sessions/{id}/messages call and the guided step-chat call.
-//
-// INVARIANT: this ceiling sits ABOVE the backend compose wall clock
-// (ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS) plus grace, so the backend's
-// discriminated 422 (convergence_wall_clock_timeout) always arrives before
-// the client aborts. The client abort is a last-resort guard against a
-// truly dead connection, not a UX pacing mechanism — the composer progress
-// panel is what tells the user the turn is alive.
-//
-// The wall clock is deployment-configurable with NO fixed maximum (only
-// transport-ceiling headroom — see WebSettings._validate_composer_timeout_
-// transport_headroom), so a hard-coded constant can only satisfy the
-// invariant for the checked-in defaults. The SPA therefore derives the
-// ceiling at boot from GET /api/system/status (composer_timeout_seconds)
-// via applyServerComposerTimeout; the default below covers the window
-// before that fetch lands and deployments running the checked-in 270s.
-//
-// History: 295s (backend 270s + 25s grace) for big-bang compose; lowered
-// to 90s on 2026-07-03 on the premise that subphase-era turns "never
-// legitimately run that long". The 2026-07-10 web eval battery falsified
-// that premise 4/4: freeform multi-tool builds (11-22 tool calls) run
-// minutes while healthy, and the 90s abort killed every one of them —
-// then left the session wedged behind a zombie server turn
-// (elspeth-e08063c3a5). The server now also cancels the turn when the
-// client disconnects, so an abort at this ceiling (or Stop) actually
-// stops the work instead of orphaning it.
 export const COMPOSE_CLIENT_GRACE_MS = 25_000;
 export const DEFAULT_COMPOSE_TIMEOUT_MS = 270_000 + COMPOSE_CLIENT_GRACE_MS;
 
-// User-facing reasons for the two compose-gate closed states. Exported so
-// every Send affordance (ChatInput, side-rail Apply, the guided Explain button)
-// renders identical copy and the two states can never drift apart per surface.
 /** Transient boot window: the backend wall clock has not landed yet. */
 export const COMPOSE_CONNECTING_MESSAGE = "Connecting to the composer…";
 /** Stuck state: backend reachable but it reported no usable compose timeout. */
@@ -76,25 +46,6 @@ export function resetComposeTimeoutForTests(): void {
   composeTimeoutMs = DEFAULT_COMPOSE_TIMEOUT_MS;
 }
 
-/**
- * Run a compose request under the client abort ceiling — the single shared
- * primitive for BOTH freeform (useComposer) and guided (ChatPanel) sends, so
- * the two paths cannot drift the timer/guard logic apart again.
- *
- * INVARIANT: a compose-abort setTimeout is only ever scheduled from a
- * known-good ceiling. `ready` is sessionStore.composeTimeoutReady, the single
- * reactive source of truth (set true by App.checkHealth once the backend wall
- * clock lands). While NOT ready the runner is not invoked at all (no API
- * request, no controller, no timer) — the Send affordances are disabled until
- * readiness, so reaching here un-ready is the programmatic-caller (e.g.
- * SideRailValidationBanner) defense-in-depth path. Readiness is a parameter,
- * not a module read, so the primitive stays pure and the caller owns the one
- * source.
- *
- * The controllerRef is assigned BEFORE the runner awaits (so a concurrent
- * Stop can abort the in-flight fetch) and released with an identity check
- * after it settles (so a later send's controller is never clobbered).
- */
 export async function runComposeWithTimeout(
   controllerRef: { current: AbortController | null },
   ready: boolean,

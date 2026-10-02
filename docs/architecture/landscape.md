@@ -1,6 +1,6 @@
 # Landscape System Architecture
 
-Current as of 2026-09-08 for the 0.8.0 release line.
+Maintained subsystem reference for the 0.8.1 release line.
 
 Landscape is ELSPETH's audit database and lineage read model. It records run
 configuration, source rows, DAG nodes and edges, token lineage, node execution
@@ -12,32 +12,19 @@ The maintained system-level overview lives in
 [ARCHITECTURE.md](../../ARCHITECTURE.md). This document focuses on the
 Landscape subsystem.
 
-## Current Inventory
+## Schema authority
 
-Measured from this checkout on 2026-09-08:
+[`schema.py`](../../src/elspeth/core/landscape/schema.py) owns the SQLAlchemy
+metadata, constraints, indexes, and `SQLITE_SCHEMA_EPOCH`. The current release
+requires Landscape epoch 49 and Sessions epoch 71. Startup accepts an empty
+store or the exact current schema; it does not migrate or relabel earlier
+evidence. Epoch 49 adds the `pending_identities_purged` authentication event.
+The [schema reset runbook](../runbooks/staging-session-db-recreation.md) covers
+the paired cutover and preservation of the separate local authentication store.
 
-| Metric | Value |
-|--------|-------|
-| Python files in `src/elspeth/core/landscape/` | 65 |
-| Python lines in `src/elspeth/core/landscape/` | 37,417 |
-| SQLAlchemy Core tables | 46 |
-| MCP Landscape analysis tools | 32 |
-| Schema epoch | 38 |
-
-The inventory above is intentionally date-stamped. Re-run these checks before
-using the numbers in release material:
-
-```bash
-find src/elspeth/core/landscape -name '*.py' -type f | wc -l
-find src/elspeth/core/landscape -name '*.py' -type f -print0 | xargs -0 wc -l | tail -1
-python - <<'PY'
-from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, metadata
-from elspeth.mcp.server import _TOOLS
-print(SQLITE_SCHEMA_EPOCH)
-print(len(metadata.tables))
-print(len(_TOOLS))
-PY
-```
+Source-file and tool counts are transient inventories, not subsystem contracts.
+Use the live schema metadata and the [MCP guide](../guides/landscape-mcp-analysis.md)
+when inspecting the installed system.
 
 ## Trust Model
 
@@ -106,19 +93,21 @@ that refer to that file are historical snapshots.
 
 ## Table Groups
 
-The current schema defines 41 tables:
+The main table groups are below; the schema metadata is the complete inventory.
 
 | Group | Tables |
 |-------|--------|
-| Run metadata | `runs`, `run_attributions`, `auth_events`, `preflight_results`, `secret_resolutions`, `run_web_plugin_policy` |
+| Run metadata and admission | `runs`, `run_start_admissions`, `run_attributions`, `auth_events`, `preflight_results`, `secret_resolutions`, `run_web_plugin_policy` |
 | Schema identity | `elspeth_schema_identity` |
 | Multi-source ingestion (ADR-025) | `run_sources` |
 | Static graph | `nodes`, `edges` |
 | Data flow | `rows`, `tokens`, `token_parents`, `token_outcomes` |
 | Durable scheduler (ADR-026) | `token_work_items`, `scheduler_events` |
-| Run coordination (ADR-030) | `run_coordination`, `run_coordination_events`, `run_workers`, `coalesce_branch_losses` |
+| Run coordination (ADR-030) | `run_coordination`, `run_coordination_events`, `run_workers` |
+| Unified lineage and group accounting | `token_lineage_frames`, `group_records`, `group_losses`, `collector_group_failures` |
 | Execution and outputs | `node_states`, `operations`, `calls`, `routing_events`, `artifacts` |
-| Batching | `batches`, `batch_members`, `batch_outputs` |
+| Batching and aggregation | `batches`, `batch_members`, `batch_outputs`, `aggregation_results`, `aggregation_result_outputs`, `aggregation_result_members` |
+| Replay and verification | Source-call linkage on `calls`, `call_verifications` |
 | Errors | `validation_errors`, `transform_errors` |
 | Recovery | `checkpoints` |
 | Durable coalesce | `coalesce_effects`, `coalesce_effect_members` |
@@ -162,28 +151,20 @@ RESERVED -> PREPARED -> IN_FLIGHT -> FINALIZED
 
 After a lost response, the coordinator may publish again only when the adapter
 proves the exact plan was not applied. A proven application finalizes without
-another commit; an `UNKNOWN` result remains blocked. Epochs 26–28 introduced
-the effect ledger, durable coalesce receipts, and per-member failsink
-provenance. Epoch 29 adds run-scoped ancestry/error links, output-contract
-hashes, durable batch-expansion claims, and the transaction-owned sidecar
-journal outbox. Epoch 30 adds `token_work_items.row_union_name` so a recovered
-scheduler can attribute a blocked work item to its declared row_union barrier.
-Epoch 31 closes `token_work_items.status` over the public scheduler status enum.
-Epoch 33 adds a composite (run_id, token_id) index to `token_outcomes` so a
-run-scoped per-token read resolves through one index instead of choosing
-between two single-column candidates the planner cannot separate. Epoch 34
-adds the unified-lineage groundwork tables (`token_lineage_frames`,
-`group_records`, `group_losses`) and `token_work_items.lineage_path_json`.
-Epoch 35 flips lineage onto that groundwork: the tri-column
-`fork_group_id`/`expand_group_id`/`branch_name` discriminators are retired
-from `tokens`, `token_outcomes`, and `token_work_items` (plus
-`token_outcomes.expected_branches_json`), and `token_lineage_frames` /
-`lineage_path_json` become the sole lineage truth. `join_group_id` stays — it
-is a merge-event identity, not a lineage-path field.
+another commit; an `UNKNOWN` result remains blocked. Run-scoped ancestry and
+error links keep recovery evidence bound to the effect's original members.
+The sidecar journal outbox is written in the audit transaction, so journal
+publication can recover without inventing a new audit event.
 
-ELSPETH is pre-1.0. An older Landscape database is archived or exported as
-required and recreated at epoch 35; startup and read-only inspection do not
-transform a predecessor store in place.
+### Unified lineage and group accounting
+
+`token_lineage_frames` and scheduler `lineage_path_json` are the lineage
+authority. The retired `fork_group_id`, `expand_group_id`, and `branch_name`
+columns are not alternate readers. `join_group_id` identifies a merge event,
+not a lineage path. `group_records` and `group_losses` retain group lifecycle
+and losses; `collector_group_failures` records a failed collector verdict even
+when no member arrived. The [token lifecycle](token-lifecycle.md) explains how
+these records relate to terminal outcomes and recovery.
 
 ### Multi-source ingestion (ADR-025)
 
@@ -207,6 +188,47 @@ contracts are the single source of truth.
 | `recorded_at` | `DateTime(tz)` NOT NULL | When the row was persisted. |
 
 Indexes: `ix_run_sources_run`, `ix_run_sources_source_name`.
+
+### Sealed finite-source recovery
+
+With `snapshot_for_resume: true`, a single CSV/JSON source records a bounded,
+content-addressed snapshot of its complete validated emission stream before
+downstream processing. A completed `source_load` operation binds metadata to
+the snapshot payload. Resume requires that unique completed operation and
+validates the metadata hash, exact snapshot version, source identity, contracts,
+and retained bytes. It restores quarantined emissions with their original
+validation-error identities rather than recording a new classification.
+
+The source lifecycle must have completed before recovery; partial ingestion
+has no live-file fallback. Snapshot eligibility does not override checkpoint,
+graph, coordination, or external-effect admission. See the
+[resume runbook](../runbooks/resume-failed-run.md) for supported sources and limits.
+
+The [purge manager](../../src/elspeth/core/retention/purge.py) follows retained
+source-output dependencies, including the snapshot referenced by source-load
+metadata. Active/interrupted runs and retained outputs protect their required
+payloads. Corrupt dependency evidence refuses the affected purge; a failed
+child deletion keeps its discovery metadata available for retry. Reproducibility
+updates account for payloads already absent on an idempotent purge retry.
+
+### Replay, verification, and portable export
+
+Replay restores recorded source rows and external responses without live
+provider calls. Verify reads current sources and makes admitted external calls
+to compare their results with the source run. `calls` links replayed and
+verified calls to the original source call; `call_verifications` records
+comparison evidence. Missing or incompatible retained evidence cannot silently
+downgrade either mode to live execution. Both modes write a new audit run and
+suppress configured sink publication. See the
+[replay/verify contract](design-notes/replay-verify-runtime-contract.md).
+
+Audit-export reservations reuse the original durable effect and stream
+position on exact retry. Delivered JSON or CSV evidence can be checked without
+opening the original Landscape database using `elspeth audit-export verify`.
+The verifier captures bounded regular files into private storage and checks
+that snapshot's signatures, hashes, projections, and manifest. Its artifact
+digest identifies the verified bytes; it does not grant continued custody of
+the original path. See the [export guarantees](../release/guarantees.md).
 
 ### Durable scheduler (ADR-026)
 
@@ -232,7 +254,9 @@ durable row (`SCREAM` invariant in the drain loop).
 | `on_success_sink` | `String(128)` | Sink-bound continuation (preserved across resume). |
 | `pending_sink_name` | `String(128)` | Set when the row is in `PENDING_SINK`. |
 | `pending_outcome` / `pending_path` / `pending_error_hash` / `pending_error_message` | `String(32)` / `String(64)` / `String(64)` / `Text` | Pre-computed sink-outcome record so the transform does not re-run on lease expiry. |
-| `branch_name`, `fork_group_id`, `join_group_id`, `expand_group_id` | `String(128)` | Token lineage carried into the durable row. |
+| `join_group_id` | `String(128)` | Coalesce merge-event identity. |
+| `lineage_path_json` | `Text` NOT NULL | Unified lineage path carried into the durable row; the token's frames live in `token_lineage_frames`. |
+| `row_union_name`, `collector_name` | `String(128)` | Declared row-union or collector context retained across recovery. |
 | `coalesce_node_id`, `coalesce_name` | `String(NODE_ID_COLUMN_LENGTH)` / `String(128)` | Resume-target for coalesce cursors. |
 | `attempt` | `Integer` NOT NULL | Incremented when `recover_expired_leases` reaps a non-`PENDING_SINK` row; preserved for `PENDING_SINK`. |
 | `lease_owner` | `String(128)` | Registered `worker:<run_id>:<uuid>` identity holding the row in production; direct legacy repository harnesses may use an explicit opaque identity. Required non-empty when `status='LEASED'` (see check constraint). |
@@ -246,8 +270,6 @@ Constraints:
   attempt per token-node continuation.
 - `CheckConstraint ck_token_work_items_lease_owner_required_when_leased`
   — `status='LEASED'` implies `lease_owner IS NOT NULL` and non-empty.
-  Closes the wedge the recovery sweep's OR-NULL predicate tolerates;
-  closes filigree elspeth-9990c81e14.
 - Composite FKs to `tokens`, `rows`, `nodes` (twice — `node_id` and
   `coalesce_node_id`).
 
@@ -271,9 +293,8 @@ Indexes:
 `source_row_index`, and `ingest_sequence` as non-nullable columns. These
 fields are Tier-1 evidence and must not be fabricated by sources or by
 synthesized-run write paths; the `create_row` write boundary raises
-`AuditIntegrityError` when any are missing, with the institutional-memory
-message *"Do not fabricate source_row_index or ingest_sequence from
-row_index"*. See [Plugin Protocol — Source row identity](../contracts/plugin-protocol.md#source-row-identity--no-fabrication).
+`AuditIntegrityError` when any are missing. `row_index` is not a substitute
+for either source index or ingest sequence. See [Plugin Protocol — Source row identity](../contracts/plugin-protocol.md#source-row-identity--no-fabrication).
 
 | Identity column | Meaning |
 |----------------|---------|
@@ -351,7 +372,7 @@ Preferred read paths:
 - `LandscapeExporter` for complete export/reimport evidence.
 - `elspeth-mcp` for read-only MCP analysis against a Landscape database.
 
-The MCP Landscape server exposes 29 tools from `src/elspeth/mcp/server.py`,
+The MCP Landscape server exposes read-only tools from `src/elspeth/mcp/server.py`,
 including run listing, token explanation, operations, calls, collisions, schema
 description, outcome analysis, sink-effect recovery history, performance
 reports, diagnostics, and contract queries.

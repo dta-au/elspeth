@@ -134,7 +134,7 @@ class TestBlobSink:
         )
         content = _read_blob(azurite_blob_container, blob_path).decode("utf-8")
 
-        assert result.descriptor.path_or_uri == f"azure://{azurite_blob_container['container']}/{blob_path}"
+        assert result.descriptor.path_or_uri == f"azure://devstoreaccount1/{azurite_blob_container['container']}/{blob_path}"
         assert result.descriptor.size_bytes == len(content.encode("utf-8"))
         assert list(csv.DictReader(io.StringIO(content))) == [
             {"id": "1", "name": "Ada"},
@@ -176,7 +176,7 @@ class TestBlobSink:
 
         result = _publish_effect(sink, [{"id": 1, "name": "Ada"}], operation_id="jsonl-write")
 
-        assert result.descriptor.path_or_uri == f"azure://{azurite_blob_container['container']}/{blob_path}"
+        assert result.descriptor.path_or_uri == f"azure://devstoreaccount1/{azurite_blob_container['container']}/{blob_path}"
         assert _read_blob(azurite_blob_container, blob_path).decode("utf-8") == '{"id": 1, "name": "Ada"}'
 
     def test_blob_sink_reaffirms_identical_content_and_rejects_true_collision_without_overwrite(

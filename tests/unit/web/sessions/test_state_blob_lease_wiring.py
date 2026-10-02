@@ -70,8 +70,12 @@ def _assert_exact_route_lease(
 def test_state_import_owns_one_compose_lease_and_threads_its_context() -> None:
     tree = ast.parse(inspect.getsource(state_routes))
     endpoint = _function(tree, "import_state_yaml")
+    seed_calls = _calls(endpoint, "seed_state_from_runtime_yaml")
+    assert len(seed_calls) == 1
+    # Both a pasted import and a library fork enter this one lease owner.
+    seed_helper = _function(tree, "seed_state_from_runtime_yaml")
     _assert_exact_route_lease(
-        endpoint,
+        seed_helper,
         operation_kind="COMPOSE",
         helper_name="_state_with_imported_source_blobs",
     )

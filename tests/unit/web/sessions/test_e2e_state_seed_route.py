@@ -8,7 +8,7 @@ import structlog
 from fastapi import FastAPI
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSurfaceOrigin
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.progress import ComposerProgressRegistry
@@ -24,8 +24,9 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _make_app(
@@ -40,8 +41,10 @@ def _make_app(
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     telemetry = build_sessions_telemetry()
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=telemetry,
         log=structlog.get_logger("test.e2e_state_seed"),
@@ -65,6 +68,7 @@ def _make_app(
         shareable_link_signing_key=b"\x00" * 32,
         e2e_state_seed_enabled=e2e_state_seed_enabled,
     )
+    wire_test_pipeline_user_authority(app, identity_id=user_id, engine=engine)
     app.state.composer_service = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.execution_service = None
@@ -246,6 +250,8 @@ async def test_e2e_state_seed_route_surfaces_pending_review_cards(tmp_path: Path
         InterpretationKind.LLM_MODEL_CHOICE,
     ]
     assert {str(event.composition_state_id) for event in events} == {response.json()["id"]}
+    assert {event.surface_origin for event in events} == {InterpretationSurfaceOrigin.E2E_SEED}
+    assert {event.composer_skill_hash for event in events} == {None}
 
 
 @pytest.mark.asyncio

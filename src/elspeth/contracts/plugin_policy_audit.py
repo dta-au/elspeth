@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -18,6 +20,20 @@ _DECISION_CODE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z")
 def _require_sha256(name: str, value: str) -> None:
     if _SHA256.fullmatch(value) is None:
         raise ValueError(f"{name} must be a lowercase SHA-256 hex digest")
+
+
+def decode_admission_decision(value: str | None, expected_hash: str | None) -> ChargeableAdmissionDecision | None:
+    """Decode owned persisted evidence, rejecting missing or inconsistent bindings."""
+    if value is None:
+        if expected_hash is not None:
+            raise ValueError("Unassessed admission cannot have a decision hash")
+        return None
+    if type(value) is not str or type(expected_hash) is not str:
+        raise ValueError("Assessed admission requires JSON and its canonical hash")
+    decision = ChargeableAdmissionDecision.model_validate_json(value, strict=True)
+    if decision.canonical_hash != expected_hash:
+        raise ValueError("Admission decision hash does not match persisted evidence")
+    return decision
 
 
 def _require_plugin_id(value: str) -> None:
@@ -50,13 +66,37 @@ class WebPluginPolicyEvidence:
     plugin_code_identities: tuple[tuple[str, str, str], ...]
     binding_generation_fingerprint: str
     decision_codes: tuple[str, ...]
+    admission_decision: ChargeableAdmissionDecision | None = None
+    power_automate_allowed_origins: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.admission_decision is not None and not isinstance(self.admission_decision, ChargeableAdmissionDecision):
+            raise TypeError("admission_decision must be an owned ChargeableAdmissionDecision")
         if type(self.schema_version) is not int or self.schema_version < 1:
             raise ValueError("schema_version must be a positive integer")
         _require_sha256("policy_hash", self.policy_hash)
         _require_sha256("snapshot_hash", self.snapshot_hash)
         _require_sha256("binding_generation_fingerprint", self.binding_generation_fingerprint)
+
+        _require_canonical("power_automate_allowed_origins", self.power_automate_allowed_origins)
+        for origin in self.power_automate_allowed_origins:
+            parsed = urlsplit(origin)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+                or parsed.port is not None
+                or "*" in parsed.netloc
+            ):
+                raise ValueError("power_automate_allowed_origins must contain normalized HTTPS443 origins")
+            host = parsed.hostname
+            authority = f"[{host}]" if ":" in host else host
+            if origin != f"https://{authority}":
+                raise ValueError("power_automate_allowed_origins must contain normalized HTTPS443 origins")
 
         _require_canonical("authorized_plugin_ids", self.authorized_plugin_ids)
         _require_canonical("available_plugin_ids", self.available_plugin_ids)

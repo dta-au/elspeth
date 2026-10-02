@@ -16,8 +16,8 @@ from elspeth.contracts.type_normalization import (
     ALLOWED_CONTRACT_TYPES,
     CONTRACT_TYPE_MAP,
     UNSUPPORTED_CONTRACT_TYPE,
+    infer_field_type,
     normalize_type_for_contract,
-    require_supported_contract_type,
 )
 
 
@@ -175,10 +175,19 @@ class TestNormalizeTypeForContract:
 
         assert normalize_type_for_contract(CustomClass()) is UNSUPPORTED_CONTRACT_TYPE
 
-    def test_require_supported_contract_type_raises_typeerror(self) -> None:
-        """Fail-fast callers can still request a TypeError for unsupported types."""
-        with pytest.raises(TypeError, match=r"Unsupported type.*Decimal"):
-            require_supported_contract_type(Decimal("100.50"))
+    def test_infer_field_type_types_unsupported_value_as_object(self) -> None:
+        """A value with no contract type name is inferred as 'any', never refused."""
+        assert infer_field_type(Decimal("100.50")) == (object, False)
+        assert infer_field_type([1, 2]) == (object, False)
+        assert infer_field_type({"k": 1}) == (object, False)
+
+    def test_infer_field_type_types_null_as_nullable_object(self) -> None:
+        """One null says the field may be null, not that it is always NoneType."""
+        assert infer_field_type(None) == (object, True)
+
+    def test_infer_field_type_keeps_supported_scalar_types(self) -> None:
+        assert infer_field_type(3) == (int, False)
+        assert infer_field_type("x") == (str, False)
 
 
 class TestContractTypeMapConsistency:

@@ -1,0 +1,154 @@
+{
+  "knob_schema": {
+    "fields": [
+      {
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Unsigned HTTPS trigger URL for OAuth authentication; omit when auth supplies a signed callback URL.",
+        "kind": "text",
+        "label": "Trigger URL",
+        "name": "trigger_url",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Exact approved HTTPS origin for the flow, without a path or query; every request must stay on this origin.",
+        "kind": "text",
+        "label": "Allowed Origin",
+        "name": "allowed_origin",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "default": 90,
+        "description": "Absolute HTTP exchange deadline in seconds, including connection and bounded response reading; maximum 110 seconds.",
+        "kind": "number-float",
+        "label": "Timeout Seconds",
+        "name": "timeout_seconds",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 1048576,
+        "description": "Maximum UTF-8 byte size of a serialized read, status or write request before dispatch.",
+        "kind": "number-int",
+        "label": "Max Request Body Bytes",
+        "name": "max_request_body_bytes",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Flow authentication method and its required identity or secret-backed credential fields.",
+        "kind": "json-value",
+        "label": "Auth",
+        "name": "auth",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "description": "Destination sink for invalid row candidates, or discard to omit them with audit evidence.",
+        "kind": "text",
+        "label": "On Validation Failure",
+        "name": "on_validation_failure",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Rename normalized external row field names to pipeline field names before schema validation.",
+        "kind": "json-object",
+        "label": "Field Mapping",
+        "name": "field_mapping",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Finite JSON selection parameters interpreted by the read flow; credentials and secret markers are forbidden.",
+        "kind": "json-object",
+        "label": "Query",
+        "name": "query",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Optional existing snapshot ID to request; every returned page must retain the same snapshot ID.",
+        "kind": "text",
+        "label": "Snapshot ID",
+        "name": "snapshot_id",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "Retain admitted source rows for ordinary single-source resume; the retained snapshot is limited to 64 MiB.",
+        "kind": "checkbox",
+        "label": "Snapshot For Resume",
+        "name": "snapshot_for_resume",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 100,
+        "description": "Maximum row candidates requested per page, from 1 to 1000; oversized pages fail before yielding rows.",
+        "kind": "number-int",
+        "label": "Page Size",
+        "name": "page_size",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 1000,
+        "description": "Maximum pages permitted in the finite read; a continuation at the limit is refused.",
+        "kind": "number-int",
+        "label": "Max Pages",
+        "name": "max_pages",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 100000,
+        "description": "Maximum row candidates across all pages, including candidates rejected during row validation.",
+        "kind": "number-int",
+        "label": "Max Rows",
+        "name": "max_rows",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 4194304,
+        "description": "Maximum decoded byte size of one read response, enforced before JSON envelope admission.",
+        "kind": "number-int",
+        "label": "Max Response Body Bytes",
+        "name": "max_response_body_bytes",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      }
+    ]
+  },
+  "plugin_kind": "source",
+  "plugin_name": "power_automate"
+}

@@ -29,7 +29,7 @@ from elspeth.contracts.audit_export import (
 )
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
-from elspeth.contracts.errors import CoalesceCollisionError
+from elspeth.contracts.export_records import AuditExportConfigRecord, AuthEventCoverageExportRecord
 from elspeth.contracts.hashing import canonical_json as contract_canonical_json
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
@@ -98,7 +98,6 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     ConfigEvidence,
     ExpansionChildEnqueueRecoveryEvidence,
     GraphEvidence,
-    GraphNodeType,
     GraphNodeTypeCount,
     HarnessCaseSpec,
     OutputArtifactExpectation,
@@ -144,7 +143,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
 )
 from tests.fixtures.landscape import expire_lease, expire_worker
 
-EXPECTED_RUN_ERROR_TYPES: Mapping[str, type[BaseException]] = MappingProxyType({"CoalesceCollisionError": CoalesceCollisionError})
+CORPUS_EXPORT_COMPARTMENT_ID = "dag-corpus"
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,7 +384,7 @@ def build_scenario(
         node_count=len(graph.get_nodes()),
         edge_count=len(graph.get_edges()),
         node_type_counts=tuple(
-            GraphNodeTypeCount(node_type=cast(GraphNodeType, node_type), count=count)
+            GraphNodeTypeCount.model_validate({"node_type": node_type, "count": count})
             for node_type, count in sorted(node_type_counts.items())
         ),
         edge_labels=tuple(sorted(edge.label for edge in graph.get_edges())),
@@ -478,6 +477,11 @@ def _semantic_run_settings(raw_settings: object) -> dict[str, object]:
     for post_pin_section, empty_default in _post_pin_empty_defaults.items():
         if settings.get(post_pin_section) == empty_default:
             settings.pop(post_pin_section, None)
+    landscape = settings.get("landscape")
+    if isinstance(landscape, dict):
+        export = landscape.get("export")
+        if isinstance(export, dict) and export.get("authentication_policy") == "optional":
+            export.pop("authentication_policy")
     for section in ("sources", "sinks"):
         declarations = settings.get(section)
         if not isinstance(declarations, dict):
@@ -573,7 +577,6 @@ def _stable_audit_records(
                 "plugin_name": record["plugin_name"],
                 "plugin_version": record["plugin_version"],
                 "schema_fields": record.get("schema_fields"),
-                "schema_hash": record.get("schema_hash"),
                 "schema_mode": record.get("schema_mode"),
                 "sequence_in_pipeline": record.get("sequence_in_pipeline"),
                 "source_file_hash": record.get("source_file_hash"),
@@ -695,7 +698,7 @@ def _stable_audit_records(
                 "error_json": record.get("error_json"),
                 "request_hash": "$SINK_EFFECT_REQUEST" if sink_effect_call else record.get("request_hash"),
                 "request_ref": record.get("request_ref"),
-                "resolved_prompt_template_hash": record.get("resolved_prompt_template_hash"),
+                "approved_prompt_artifact_hash": record.get("approved_prompt_artifact_hash"),
                 "response_hash": "$SINK_EFFECT_RESPONSE" if sink_effect_call else record.get("response_hash"),
                 "response_ref": record.get("response_ref"),
                 "status": record["status"],
@@ -1864,6 +1867,8 @@ def _validate_durable_sink_effect_material(records: list[dict[str, Any]]) -> Non
 
 
 _DURABLE_EXPORT_PARITY_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("audit_export_config", (), ("public_config",)),
+    ("auth_event_coverage", (), ("policy", "selection_cutoff", "selection_basis", "selected_count", "reason")),
     (
         "run",
         ("run_id",),
@@ -1880,7 +1885,6 @@ _DURABLE_EXPORT_PARITY_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[str, ...]
             "determinism",
             "config_hash",
             "config",
-            "schema_hash",
             "schema_mode",
             "schema_fields",
             "sequence_in_pipeline",
@@ -1913,7 +1917,7 @@ _DURABLE_EXPORT_PARITY_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[str, ...]
             "status",
             "request_hash",
             "response_hash",
-            "resolved_prompt_template_hash",
+            "approved_prompt_artifact_hash",
             "request_ref",
             "response_ref",
             "error_json",
@@ -2156,10 +2160,12 @@ def _validate_portable_manifest(records: list[dict[str, Any]]) -> None:
         source_status=str(run["status"]),
         source_completed_at=expected_completed_at,
         export_format="json",
-        exporter_version="landscape-exporter-v1",
+        exporter_version="landscape-exporter-auth-v2",
         serialization_version=AUDIT_EXPORT_SERIALIZATION_VERSION,
         chunking_algorithm_version="record-framing-v1",
         include_raw_error_rows=False,
+        auth_events="omitted",
+        compartment_id="dag-corpus",
         per_chunk_byte_limit=AUDIT_EXPORT_MAX_CHUNK_BYTES,
         per_chunk_record_limit=AUDIT_EXPORT_MAX_CHUNK_RECORDS,
         signing_mode="unsigned",
@@ -2211,7 +2217,34 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
     def project(record_type: str, row: Mapping[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
         return {"record_type": record_type, **{field: row[field] for field in fields}}
 
-    records: list[dict[str, Any]] = []
+    # These export declarations describe the harness's explicit current
+    # unsigned/omitted-auth policy. They are independently constructed, never
+    # copied from the exporter under test, and checked by the parity schema.
+    export_config: AuditExportConfigRecord = {
+        "record_type": "audit_export_config",
+        "public_config": {
+            "auth_events": "omitted",
+            "chunking_algorithm_version": "record-framing-v1",
+            "export_format": "json",
+            "exporter_version": "landscape-exporter-auth-v2",
+            "compartment_id": "dag-corpus",
+            "include_raw_error_rows": False,
+            "per_chunk_byte_limit": AUDIT_EXPORT_MAX_CHUNK_BYTES,
+            "per_chunk_record_limit": AUDIT_EXPORT_MAX_CHUNK_RECORDS,
+            "serialization_version": AUDIT_EXPORT_SERIALIZATION_VERSION,
+            "signer_key_id": "UNSIGNED",
+            "signing_mode": "unsigned",
+        },
+    }
+    auth_coverage: AuthEventCoverageExportRecord = {
+        "record_type": "auth_event_coverage",
+        "policy": "omitted",
+        "selection_cutoff": None,
+        "selection_basis": None,
+        "selected_count": None,
+        "reason": "not_requested",
+    }
+    records: list[dict[str, Any]] = [dict(export_config), dict(auth_coverage)]
     with db.connection() as connection:
         run_fields = ("run_id", "status", "canonical_version", "config_hash", "settings_json", "reproducibility_grade")
         run_rows = fetch(runs_table, run_fields)
@@ -2240,7 +2273,6 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
             "determinism",
             "config_hash",
             "config_json",
-            "schema_hash",
             "schema_mode",
             "schema_fields_json",
             "sequence_in_pipeline",
@@ -2264,7 +2296,6 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
                     "determinism": row["determinism"],
                     "config_hash": row["config_hash"],
                     "config": decode_json(row["config_json"], label=f"node {row['node_id']}.config_json"),
-                    "schema_hash": row["schema_hash"],
                     "schema_mode": row["schema_mode"],
                     "schema_fields": (
                         None
@@ -2312,7 +2343,7 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
             "status",
             "request_hash",
             "response_hash",
-            "resolved_prompt_template_hash",
+            "approved_prompt_artifact_hash",
             "request_ref",
             "response_ref",
             "error_json",
@@ -2765,44 +2796,44 @@ def _audit_evidence(
     )
 
 
-def _run_expected_error_case(
+def _run_failed_case(
     scenario: ScenarioSpec,
     case: HarnessCaseSpec,
     tmp_path: Path,
 ) -> ScenarioRunEvidence:
+    """A run that RETURNS with status FAILED (every row failed; none succeeded
+    or was quarantined). A FAILED run is not export-terminal, so the audit
+    evidence is the durable projection plus the exporter's by-policy refusal.
+    An exception escaping the run is never an expected outcome here: it
+    propagates and fails the case."""
     expected = case.expected
-    if not isinstance(expected, RunExpectation) or expected.expected_error is None:
-        raise AssertionError("expected-error runner requires an exact run expectation with expected_error")
-    expected_type = EXPECTED_RUN_ERROR_TYPES[expected.expected_error.exception_type]
+    if not isinstance(expected, RunExpectation) or expected.status != "failed":
+        raise AssertionError("failed-run runner requires an exact run expectation with status=failed")
     rendered = render_settings(case, tmp_path)
     built = build_scenario(rendered)
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
     try:
         catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
         payload_store = FilesystemPayloadStore(tmp_path / "payloads")
-        try:
-            Orchestrator(db).run(
-                built.config,
-                graph=built.graph,
-                settings=built.rendered.settings,
-                payload_store=payload_store,
-                openrouter_catalog_sha256=catalog_sha256,
-                openrouter_catalog_source=catalog_source,
-            )
-        except expected_type as exc:
-            if type(exc) is not expected_type:
-                raise AssertionError(f"DAG corpus expected exact {expected_type.__name__}, got subclass {type(exc).__name__}") from exc
-        else:
-            raise AssertionError(f"DAG corpus expected exact {expected_type.__name__}, but production run returned")
+        result = Orchestrator(db).run(
+            built.config,
+            graph=built.graph,
+            settings=built.rendered.settings,
+            payload_store=payload_store,
+            openrouter_catalog_sha256=catalog_sha256,
+            openrouter_catalog_source=catalog_source,
+        )
+        if result.status is not RunStatus.FAILED:
+            raise AssertionError(f"DAG failed-run corpus expected a FAILED run result, got {result.status.value!r}")
 
         sink_outputs = _sink_outputs(rendered)
         repositories = RecorderFactory.read_only(db, payload_store=payload_store)
         runs = repositories.run_lifecycle.list_runs()
         if len(runs) != 1:
-            raise AssertionError(f"DAG expected-error corpus expected exactly one persisted run, got {len(runs)}")
+            raise AssertionError(f"DAG failed-run corpus expected exactly one persisted run, got {len(runs)}")
         failed_run = runs[0]
         if failed_run.status is not RunStatus.FAILED:
-            raise AssertionError(f"DAG expected-error corpus expected failed run, got {failed_run.status.value!r}")
+            raise AssertionError(f"DAG failed-run corpus expected failed run, got {failed_run.status.value!r}")
 
         counter_factory = RecorderFactory(db, payload_store=payload_store)
         _derived_status, counters = derive_terminal_status_from_audit(counter_factory, failed_run.run_id)
@@ -2812,12 +2843,12 @@ def _run_expected_error_case(
 
         export_reason = "Audit export requires an immutable export-terminal run"
         try:
-            list(LandscapeExporter(db).export_run(failed_run.run_id))
+            list(LandscapeExporter(db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(failed_run.run_id))
         except ValueError as export_exc:
             if type(export_exc) is not ValueError or str(export_exc) != export_reason:
                 raise
         else:
-            raise AssertionError("DAG expected-error corpus failed run unexpectedly allowed portable export")
+            raise AssertionError("DAG failed-run corpus failed run unexpectedly allowed portable export")
         audit = _audit_evidence(
             durable_records,
             portable_export_unavailable=PortableExportUnavailableByPolicy(
@@ -2843,7 +2874,6 @@ def _run_expected_error_case(
                 output_rows=sum(len(output.rows) for output in sink_outputs),
                 sink_outputs=sink_outputs,
                 durable_projection=durable_projection,
-                observed_error=expected.expected_error,
             ),
             audit=audit,
             recovery=RecoveryEvidence(
@@ -2860,8 +2890,8 @@ def _run_expected_error_case(
 
 
 def _run_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> ScenarioRunEvidence:
-    if isinstance(case.expected, RunExpectation) and case.expected.expected_error is not None:
-        return _run_expected_error_case(scenario, case, tmp_path)
+    if isinstance(case.expected, RunExpectation) and case.expected.status == "failed":
+        return _run_failed_case(scenario, case, tmp_path)
     rendered = render_settings(case, tmp_path)
     built = build_scenario(rendered)
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
@@ -2883,7 +2913,7 @@ def _run_case(scenario: ScenarioSpec, case: HarnessCaseSpec, tmp_path: Path) -> 
             durable_records,
             source="durable",
         )
-        records = list(LandscapeExporter(db).export_run(result.run_id))
+        records = list(LandscapeExporter(db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(result.run_id))
         _validate_portable_material_matches_durable(durable_records, records)
         _validate_portable_manifest(records)
         portable_projection = _stable_projection(records, source="portable")
@@ -3091,7 +3121,7 @@ def _exact_recovery_views(
     durable_records = _public_durable_records(db, run_id=run_id, payload_store=payload_store)
     _validate_durable_sink_effect_material(durable_records)
     durable_projection = _stable_projection(durable_records, source="durable recovery")
-    portable_records = list(LandscapeExporter(db).export_run(run_id))
+    portable_records = list(LandscapeExporter(db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(run_id))
     _validate_portable_material_matches_durable(durable_records, portable_records)
     _validate_portable_manifest(portable_records)
     portable_projection = _stable_projection(portable_records, source="portable recovery")
@@ -3481,7 +3511,7 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
                 run_id=run_id,
                 payload_store=reopened_store,
             )
-            portable_records_before = list(LandscapeExporter(reopened_db).export_run(run_id))
+            portable_records_before = list(LandscapeExporter(reopened_db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(run_id))
             durable_records_sha256_before = _canonical_sha256(durable_records_before)
             portable_export_sha256_before = _canonical_sha256(portable_records_before)
             output_tree_sha256_before = _output_tree_sha256(fresh_rendered)
@@ -3545,7 +3575,7 @@ def _eof_aggregation_recovery_case(scenario: ScenarioSpec, case: HarnessCaseSpec
                     run_id=run_id,
                     payload_store=second_store,
                 )
-                portable_records_after = list(LandscapeExporter(after_db).export_run(run_id))
+                portable_records_after = list(LandscapeExporter(after_db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(run_id))
                 after_audit = _audit_evidence(
                     portable_records_after,
                     portable_projection=_stable_projection(portable_records_after, source="post-refusal portable export"),
@@ -4870,7 +4900,7 @@ def _parallel_sink_finalization_recovery_case(
         durable_records = _public_durable_records(reopened_db, run_id=run_id, payload_store=reopened_store)
         _validate_durable_sink_effect_material(durable_records)
         durable_projection = _stable_projection(durable_records, source="durable")
-        portable_records = list(LandscapeExporter(reopened_db).export_run(run_id))
+        portable_records = list(LandscapeExporter(reopened_db, compartment_id=CORPUS_EXPORT_COMPARTMENT_ID).export_run(run_id))
         _validate_portable_material_matches_durable(durable_records, portable_records)
         _validate_portable_manifest(portable_records)
         portable_projection = _stable_projection(portable_records, source="portable")

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
+from elspeth.contracts.enums import OutputMode, RunMode
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.sink_effects import (
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
         TransformSettings,
     )
     from elspeth.core.dag.wiring import WiredTransform
+    from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateNonliveConstruction
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +90,7 @@ def instantiate_plugins_from_config(
     *,
     preflight_mode: bool = False,
     sink_effect_purpose: SinkEffectExecutionPurpose = SinkEffectExecutionPurpose.FRESH,
+    power_automate_nonlive: PowerAutomateNonliveConstruction | None = None,
 ) -> PluginBundle:
     """Instantiate all plugins from configuration.
 
@@ -103,20 +106,69 @@ def instantiate_plugins_from_config(
     from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 
     manager = get_shared_plugin_manager()
+    pa_sources = {name for name, entry in config.sources.items() if entry.plugin == "power_automate"}
+    pa_sinks = {name for name, entry in config.sinks.items() if entry.plugin == "power_automate"}
+    if pa_sources or pa_sinks or power_automate_nonlive is not None:
+        from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateNonliveConstruction
+
+        if config.run_mode is RunMode.LIVE:
+            if power_automate_nonlive is not None:
+                raise ValueError("live Power Automate construction cannot use an archived context")
+        else:
+            if type(power_automate_nonlive) is not PowerAutomateNonliveConstruction:
+                raise TypeError("nonlive Power Automate requires its nominal archived construction context")
+            if power_automate_nonlive.mode is not config.run_mode or power_automate_nonlive.source_run_id != config.replay_from:
+                raise ValueError("nonlive Power Automate construction differs from run identity")
+            if set(power_automate_nonlive.sources) != pa_sources or set(power_automate_nonlive.sinks) != pa_sinks:
+                raise ValueError("nonlive Power Automate construction differs from configured components")
+            for section, archived in ((config.sources, power_automate_nonlive.sources), (config.sinks, power_automate_nonlive.sinks)):
+                for name, archived_options in archived.items():
+                    if stable_hash(section[name].options) != archived_options.safe_options_hash:
+                        raise ValueError("nonlive Power Automate options differ from admitted archive")
 
     with plugin_preflight_mode(preflight_mode):
         source_settings_by_name = config.sources
 
         sources = {}
+        source_instance: SourceProtocol
         for source_name, source_config in source_settings_by_name.items():
             source_cls = manager.get_source_by_name(source_config.plugin)
-            source_instance = source_cls(dict(source_config.options))
+            if source_config.plugin == "power_automate":
+                from elspeth.contracts.source_read_verification import SourceReadVerificationPolicy
+                from elspeth.plugins.sources.power_automate import PowerAutomateSource
+
+                if source_cls is not PowerAutomateSource:
+                    raise TypeError("Power Automate construction requires the exact reviewed builtin source")
+                if power_automate_nonlive is not None:
+                    power_automate_source = PowerAutomateSource.from_archived_options(
+                        power_automate_nonlive.sources[source_name],
+                        credential=power_automate_nonlive.source_credentials.get(source_name),
+                    )
+                else:
+                    power_automate_source = PowerAutomateSource(dict(source_config.options))
+                power_automate_source.source_read_verification_policy = SourceReadVerificationPolicy.POWER_AUTOMATE_CANONICAL_JSON_V1
+                source_instance = power_automate_source
+            else:
+                source_instance = source_cls(dict(source_config.options))
             source_instance.on_success = source_config.on_success
             sources[source_name] = source_instance
 
         transforms: list[WiredTransform] = []
         for plugin_config in config.transforms:
             transform_cls = manager.get_transform_by_name(plugin_config.plugin)
+            # A batch-aware plugin's process() takes a list of rows. Under
+            # transforms: it would be handed one row and iterate its field
+            # names, aborting the run on every row. Decided on the CLASS,
+            # before construction, as the aggregation and collector arms below
+            # are (elspeth-98a0a9e732); the composer's Stage-1 placement rule
+            # (_batch_aware_placement_error) reads the same two declarations.
+            if transform_cls.is_batch_aware and not transform_cls.supports_row_mode_when_batch_aware:
+                raise ValueError(
+                    f"Transform '{plugin_config.name}' uses transform '{plugin_config.plugin}' which is "
+                    f"batch-aware: it processes a whole batch of rows at once and does not support row mode. "
+                    f"Declare it under aggregations: (with a trigger) or collectors: (as a scope closer), "
+                    f"not transforms:."
+                )
             transform = transform_cls(dict(plugin_config.options))
             transform.on_success = plugin_config.on_success
             transform.on_error = plugin_config.on_error
@@ -139,6 +191,19 @@ def instantiate_plugins_from_config(
                     f"Use a batch-aware transform like 'batch_stats' or 'batch_replicate', "
                     f"or set is_batch_aware=True on your custom transform."
                 )
+            # output_mode: passthrough continues each buffered token with its
+            # own output row, so it carries only a plugin whose flush emits
+            # exactly one row per buffered row. Any other plugin would end the
+            # run on its first flush. Decided on the class declaration, before
+            # construction; the composer's placement rule reads the same one.
+            if agg_config.output_mode is OutputMode.PASSTHROUGH and not transform_cls.flush_emits_one_row_per_buffered_row:
+                raise ValueError(
+                    f"Aggregation '{agg_config.name}' uses transform '{agg_config.plugin}' with output_mode: "
+                    f"passthrough, but '{agg_config.plugin}' does not declare that its flush emits exactly one row "
+                    f"per buffered row, which is what passthrough carries. Use output_mode: transform, so the rows "
+                    f"its flush emits become new downstream tokens. A custom batch plugin whose flush does emit one "
+                    f"row per buffered row declares flush_emits_one_row_per_buffered_row = True on its class."
+                )
             transform = transform_cls(dict(agg_config.options))
             transform.on_success = agg_config.on_success
             transform.on_error = agg_config.on_error
@@ -157,6 +222,18 @@ def instantiate_plugins_from_config(
                     f"which has is_batch_aware=False. Collectors reuse the batch-transform plugin "
                     f"contract and require batch-aware plugins."
                 )
+            # A collector flushes on end_of_group, so it has no aggregation
+            # flush window to put on ctx.aggregation_batch; a plugin that
+            # reads one would abort on every group (the composer mirror is the
+            # collector arm of _batch_aware_placement_error).
+            if transform_cls.requires_aggregation_batch_context:
+                raise ValueError(
+                    f"Collector '{collector_config.name}' uses transform '{collector_config.plugin}' which "
+                    f"requires an aggregation flush window (its trigger and row positions); a collector's "
+                    f"end_of_group flush does not have one. Close the scope with a batch-aware plugin that reads "
+                    f"no flush window; to keep this plugin, declare it under aggregations: (with a trigger) "
+                    f"downstream of the collector."
+                )
             transform = transform_cls(dict(collector_config.options))
             transform.on_success = collector_config.on_success
             collectors[collector_config.name] = (transform, collector_config)
@@ -164,6 +241,7 @@ def instantiate_plugins_from_config(
         from elspeth.plugins.infrastructure.base import BaseSink
 
         sinks = {}
+        sink: SinkProtocol
         sink_effect_bindings = {}
         delayed_export_sink = config.landscape.export.sink if config.landscape.export.enabled else None
         for sink_name, sink_config in config.sinks.items():
@@ -175,7 +253,20 @@ def instantiate_plugins_from_config(
                     if config_model is not None:
                         config_model.from_dict(options, plugin_name=sink_config.plugin)
                 continue
-            sink = sink_cls(dict(sink_config.options))
+            http_post_factory = None
+            if sink_config.plugin == "power_automate":
+                from elspeth.plugins.sinks.power_automate import PowerAutomateSink
+
+                if sink_cls is not PowerAutomateSink:
+                    raise TypeError("Power Automate construction requires the exact reviewed builtin sink")
+                if power_automate_nonlive is not None:
+                    sink = PowerAutomateSink.from_archived_options(power_automate_nonlive.sinks[sink_name])
+                else:
+                    power_automate_sink = PowerAutomateSink(dict(sink_config.options))
+                    http_post_factory = power_automate_sink.make_http_post_factory()
+                    sink = power_automate_sink
+            else:
+                sink = sink_cls(dict(sink_config.options))
             sinks[sink_name] = sink
             sinks[sink_name]._on_write_failure = sink_config.on_write_failure
             resolved_mode = (
@@ -192,6 +283,7 @@ def instantiate_plugins_from_config(
                 config_fingerprint=stable_hash(dict(sink_config.options)),
                 purpose=sink_effect_purpose,
                 effect_mode=resolved_mode,
+                http_post_factory=http_post_factory,
             )
 
         bundle = PluginBundle(

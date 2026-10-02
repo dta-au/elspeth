@@ -1,7 +1,8 @@
 // ELSPETH on Azure Container Apps — workload (resource-group scope).
 //
 // One container app plus the manual Jobs, all on the same digest, the same
-// NFS mount and the same user-assigned identity. Every secret is a versioned
+// NFS mount. Schema init has a separate identity; the provisioner has none.
+// Every secret is a versioned
 // Key Vault reference; nothing here carries a secret value.
 targetScope = 'resourceGroup'
 
@@ -11,8 +12,29 @@ param environmentResourceId string
 @description('Resource id of the user-assigned identity from environment.bicep.')
 param identityResourceId string
 
+@description('Client id of the runtime user-assigned identity; selects it in DefaultAzureCredential.')
+@minLength(36)
+@maxLength(36)
+param identityClientId string
+
+@description('Dedicated schema-init identity; only this identity can read the schema-owner vault.')
+param schemaOwnerIdentityResourceId string
+
 @description('Name of the NFS storage definition on the environment.')
-param nfsStorageName string = 'elspeth-nfs'
+param nfsStorageName string = 'elspeth'
+
+@description('False creates/updates only the manual Jobs. Cold install runs these Jobs successfully before deploying the app. Always use Incremental deployment mode.')
+param deployWebApp bool = true
+
+@description('Create the disposable acceptance Blob managed-identity proof Job.')
+param verifyBlobManagedIdentity bool = false
+param blobAccountUrl string = ''
+param blobContainerName string = ''
+
+@description('Full source commit SHA of the digest-pinned candidate; binds membership and telemetry to the published release.')
+@minLength(40)
+@maxLength(40)
+param candidateSourceSha string
 
 @description('Container app name.')
 param containerAppName string = 'elspeth-web'
@@ -60,9 +82,47 @@ param terminationGracePeriodSeconds int = 60
 @maxValue(240)
 param composerTransportIdleCeilingSeconds int
 
+@description('Maximum tool turns for a composition request.')
+@minValue(1)
+param composerMaxCompositionTurns int
+
+@description('Maximum tool turns for a discovery request.')
+@minValue(1)
+param composerMaxDiscoveryTurns int
+
+@description('Composer request budget; must leave the runtime-required headroom below the transport ceiling.')
+@minValue(1)
+param composerTimeoutSeconds int
+
+@description('Composer requests admitted per user per minute.')
+@minValue(1)
+param composerRateLimitPerMinute int
+
+@description('Explicit web authentication provider. Production shared NFS requires an external identity provider; local is reserved for disposable acceptance.')
+@allowed(['local', 'oidc', 'entra', 'vanguard', 'google'])
+param authProvider string
+
+@allowed(['open', 'email_verified', 'closed'])
+param registrationMode string = 'closed'
+
 @description('Label distinguishing the runtime role a revision runs as; empty in production, a or b in the acceptance (two revisions, two roles).')
-@maxLength(8)
+@allowed(['', 'a', 'b'])
 param runtimeRoleLabel string = ''
+
+@sealed()
+type databaseSecretUrls = {
+  sessionDbUrl: string
+  landscapeUrl: string
+}
+
+@sealed()
+type acceptanceSecretUrls = {
+  a: databaseSecretUrls
+  b: databaseSecretUrls
+}
+
+@description('Both acceptance roles, retained identically on every app deployment. Required when runtimeRoleLabel is a or b.')
+param acceptanceRuntimeSecretUrls acceptanceSecretUrls?
 
 @description('CPU for the web container (Consumption pairs: 0.5/1Gi, 1.0/2Gi, 2.0/4Gi).')
 param webCpu string = '1.0'
@@ -70,8 +130,17 @@ param webCpu string = '1.0'
 @description('Memory for the web container.')
 param webMemory string = '2Gi'
 
-@description('Extra environment entries ({name, value}) appended to the web container.')
+@description('Extra environment entries ({name, value} or {name, secretRef}) appended only to the web container. Secret references must be declared in extraSecrets or a built-in secret.')
 param extraEnvironment array = []
+
+@sealed()
+type runtimeExtraSecret = {
+  name: string
+  keyVaultUrl: string
+}
+
+@description('Additional versioned Key Vault references for web SSO/provider credentials, read by the runtime identity only.')
+param extraSecrets runtimeExtraSecret[] = []
 
 @description('Tags applied to every resource.')
 param tags object = {}
@@ -86,8 +155,23 @@ param shareableLinkSigningKeySecretUrl string
 param fingerprintKeySecretUrl string
 param operatorMetricsBearerTokenSecretUrl string
 
-@description('Optional composer endpoint API key secret URL; empty leaves the composer endpoint unset.')
+@description('Primary model identifier passed to the configured provider.')
+param composerModel string = 'gpt-5.5'
+
+@description('Advisor model identifier; select a model distinct from the primary.')
+param composerAdvisorModel string = 'anthropic/claude-sonnet-4-6'
+
+@description('Optional primary OpenAI-compatible endpoint URL; provide together with composerEndpointApiKeySecretUrl.')
+param composerEndpointBaseUrl string = ''
+
+@description('Optional primary endpoint API key versioned secret URL; provide together with composerEndpointBaseUrl.')
 param composerEndpointApiKeySecretUrl string = ''
+
+@description('Optional advisor OpenAI-compatible endpoint URL; provide together with composerAdvisorEndpointApiKeySecretUrl.')
+param composerAdvisorEndpointBaseUrl string = ''
+
+@description('Optional advisor endpoint API key versioned secret URL; provide together with composerAdvisorEndpointBaseUrl.')
+param composerAdvisorEndpointApiKeySecretUrl string = ''
 
 // ---------------------------------------------------------------------------
 // Derived values
@@ -103,12 +187,28 @@ var composerSecret = empty(composerEndpointApiKeySecretUrl) ? [] : [
     identity: identityResourceId
   }
 ]
-var composerEnv = empty(composerEndpointApiKeySecretUrl) ? [] : [
+var composerAdvisorSecret = empty(composerAdvisorEndpointApiKeySecretUrl) ? [] : [
+  {
+    name: 'composer-advisor-endpoint-api-key'
+    keyVaultUrl: composerAdvisorEndpointApiKeySecretUrl
+    identity: identityResourceId
+  }
+]
+var composerEnv = concat(empty(composerEndpointApiKeySecretUrl) ? [] : [
   {
     name: 'ELSPETH_WEB__COMPOSER_ENDPOINT_API_KEY'
     secretRef: 'composer-endpoint-api-key'
   }
-]
+], empty(composerEndpointBaseUrl) ? [] : [
+  { name: 'ELSPETH_WEB__COMPOSER_ENDPOINT_BASE_URL', value: composerEndpointBaseUrl }
+], empty(composerAdvisorEndpointApiKeySecretUrl) ? [] : [
+  { name: 'ELSPETH_WEB__COMPOSER_ADVISOR_ENDPOINT_API_KEY', secretRef: 'composer-advisor-endpoint-api-key' }
+], empty(composerAdvisorEndpointBaseUrl) ? [] : [
+  { name: 'ELSPETH_WEB__COMPOSER_ADVISOR_ENDPOINT_BASE_URL', value: composerAdvisorEndpointBaseUrl }
+], [
+  { name: 'ELSPETH_WEB__COMPOSER_MODEL', value: composerModel }
+  { name: 'ELSPETH_WEB__COMPOSER_ADVISOR_MODEL', value: composerAdvisorModel }
+])
 
 var applicationSecrets = [
   {
@@ -133,7 +233,7 @@ var applicationSecrets = [
   }
 ]
 
-var runtimeSecrets = concat(applicationSecrets, [
+var productionDatabaseSecrets = [
   {
     name: 'session-db-url'
     keyVaultUrl: sessionDbUrlRuntimeSecretUrl
@@ -144,24 +244,48 @@ var runtimeSecrets = concat(applicationSecrets, [
     keyVaultUrl: landscapeUrlRuntimeSecretUrl
     identity: identityResourceId
   }
-], composerSecret)
+]
 
-var schemaOwnerSecrets = concat(applicationSecrets, [
+var acceptanceDatabaseSecrets = acceptanceRuntimeSecretUrls == null ? [] : [
+  { name: 'session-db-url-a', keyVaultUrl: acceptanceRuntimeSecretUrls!.a.sessionDbUrl, identity: identityResourceId }
+  { name: 'landscape-url-a', keyVaultUrl: acceptanceRuntimeSecretUrls!.a.landscapeUrl, identity: identityResourceId }
+  { name: 'session-db-url-b', keyVaultUrl: acceptanceRuntimeSecretUrls!.b.sessionDbUrl, identity: identityResourceId }
+  { name: 'landscape-url-b', keyVaultUrl: acceptanceRuntimeSecretUrls!.b.landscapeUrl, identity: identityResourceId }
+]
+var runtimeSecrets = concat(applicationSecrets, productionDatabaseSecrets, acceptanceDatabaseSecrets, composerSecret, composerAdvisorSecret, map(extraSecrets, secret => {
+  name: secret.name
+  keyVaultUrl: secret.keyVaultUrl
+  identity: identityResourceId
+}))
+
+var schemaOwnerSecrets = concat(map(applicationSecrets, secret => {
+  name: secret.name
+  keyVaultUrl: secret.keyVaultUrl
+  identity: schemaOwnerIdentityResourceId
+}), [
   {
     name: 'session-db-url'
     keyVaultUrl: sessionDbUrlSchemaOwnerSecretUrl
-    identity: identityResourceId
+    identity: schemaOwnerIdentityResourceId
   }
   {
     name: 'landscape-url'
     keyVaultUrl: landscapeUrlSchemaOwnerSecretUrl
-    identity: identityResourceId
+    identity: schemaOwnerIdentityResourceId
   }
 ])
 
 // The provider-neutral external-PostgreSQL contract: azure-container-apps
 // resolves to external-postgresql and refuses sqlite-single at config time.
 var contractEnvironment = [
+  {
+    name: 'ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE'
+    value: candidateSourceSha
+  }
+  {
+    name: 'ELSPETH_ACCEPTANCE_CANDIDATE_SHA'
+    value: candidateSourceSha
+  }
   {
     name: 'ELSPETH_WEB__DEPLOYMENT_TARGET'
     value: 'azure-container-apps'
@@ -202,9 +326,13 @@ var contractEnvironment = [
     name: 'ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS'
     value: string(composerTransportIdleCeilingSeconds)
   }
+  { name: 'ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS', value: string(composerMaxCompositionTurns) }
+  { name: 'ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS', value: string(composerMaxDiscoveryTurns) }
+  { name: 'ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS', value: string(composerTimeoutSeconds) }
+  { name: 'ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE', value: string(composerRateLimitPerMinute) }
 ]
 
-var secretEnvironment = [
+var databaseSecretEnvironment = [
   {
     name: 'ELSPETH_WEB__SESSION_DB_URL'
     secretRef: 'session-db-url'
@@ -213,6 +341,9 @@ var secretEnvironment = [
     name: 'ELSPETH_WEB__LANDSCAPE_URL'
     secretRef: 'landscape-url'
   }
+]
+
+var applicationSecretEnvironment = [
   {
     name: 'ELSPETH_WEB__SECRET_KEY'
     secretRef: 'secret-key'
@@ -231,8 +362,17 @@ var secretEnvironment = [
   }
 ]
 
-var webEnvironment = concat(contractEnvironment, secretEnvironment, composerEnv, extraEnvironment)
-var doctorEnvironment = concat(contractEnvironment, secretEnvironment)
+var runtimeSecretEnvironment = concat([
+  { name: 'ELSPETH_WEB__SESSION_DB_URL', secretRef: 'session-db-url${jobSuffix}' }
+  { name: 'ELSPETH_WEB__LANDSCAPE_URL', secretRef: 'landscape-url${jobSuffix}' }
+], applicationSecretEnvironment)
+var runtimeIdentityEnvironment = [{ name: 'AZURE_CLIENT_ID', value: identityClientId }]
+var webEnvironment = concat(contractEnvironment, runtimeSecretEnvironment, runtimeIdentityEnvironment, composerEnv, [
+  { name: 'ELSPETH_WEB__AUTH_PROVIDER', value: authProvider }
+  { name: 'ELSPETH_WEB__REGISTRATION_MODE', value: registrationMode }
+], extraEnvironment)
+var doctorEnvironment = concat(contractEnvironment, databaseSecretEnvironment, applicationSecretEnvironment)
+var runtimeDoctorEnvironment = concat(contractEnvironment, runtimeSecretEnvironment, runtimeIdentityEnvironment)
 
 var stateVolumes = [
   {
@@ -304,7 +444,7 @@ var webProbes = [
 // ---------------------------------------------------------------------------
 // The web app
 // ---------------------------------------------------------------------------
-module containerApp 'br/public:avm/res/app/container-app:0.23.0' = {
+module containerApp 'br/public:avm/res/app/container-app:0.23.0' = if (deployWebApp) {
   name: '${containerAppName}-app'
   params: {
     name: containerAppName
@@ -358,7 +498,7 @@ module containerApp 'br/public:avm/res/app/container-app:0.23.0' = {
 }
 
 // ---------------------------------------------------------------------------
-// Jobs (Manual, no retry): same mount and identity as the app.
+// Jobs (Manual, no retry): same mount, least-privilege identities.
 // ---------------------------------------------------------------------------
 module provisionStorageJob 'br/public:avm/res/app/job:0.7.2' = {
   name: 'provision-storage-job'
@@ -375,7 +515,6 @@ module provisionStorageJob 'br/public:avm/res/app/job:0.7.2' = {
     }
     replicaRetryLimit: 0
     replicaTimeout: 600
-    managedIdentities: managedIdentities
     volumes: stateVolumes
     containers: [
       {
@@ -411,8 +550,8 @@ module doctorSchemaInitJob 'br/public:avm/res/app/job:0.7.2' = {
     }
     replicaRetryLimit: 0
     replicaTimeout: 1800
-    managedIdentities: managedIdentities
-    registries: registries
+    managedIdentities: { userAssignedResourceIds: [schemaOwnerIdentityResourceId] }
+    registries: [{ server: registryServer, identity: schemaOwnerIdentityResourceId }]
     secrets: schemaOwnerSecrets
     volumes: stateVolumes
     containers: [
@@ -464,7 +603,7 @@ module doctorRuntimeJob 'br/public:avm/res/app/job:0.7.2' = {
           'deployment'
           '--json'
         ]
-        env: doctorEnvironment
+        env: runtimeDoctorEnvironment
         resources: {
           cpu: json('0.5')
           memory: '1Gi'
@@ -475,7 +614,64 @@ module doctorRuntimeJob 'br/public:avm/res/app/job:0.7.2' = {
   }
 }
 
-output containerAppResourceId string = containerApp.outputs.resourceId
-output containerAppFqdn string = containerApp.outputs.fqdn
+module verifyBlobManagedIdentityJob 'br/public:avm/res/app/job:0.7.2' = if (verifyBlobManagedIdentity) {
+  name: 'verify-blob-managed-identity-job'
+  params: {
+    name: 'verify-blob-managed-identity'
+    location: resourceGroup().location
+    tags: tags
+    environmentResourceId: environmentResourceId
+    workloadProfileName: 'Consumption'
+    triggerType: 'Manual'
+    manualTriggerConfig: {
+      parallelism: 1
+      replicaCompletionCount: 1
+    }
+    replicaRetryLimit: 0
+    replicaTimeout: 600
+    managedIdentities: managedIdentities
+    registries: registries
+    containers: [
+      {
+        name: 'verify-blob-managed-identity'
+        image: image
+        command: [
+          'python'
+          '-m'
+          'elspeth.web.azure_blob_acceptance_job'
+        ]
+        env: [
+          {
+            name: 'ELSPETH_ACCEPTANCE_BLOB_ACCOUNT_URL'
+            value: blobAccountUrl
+          }
+          {
+            name: 'ELSPETH_ACCEPTANCE_BLOB_CONTAINER'
+            value: blobContainerName
+          }
+          {
+            name: 'AZURE_CLIENT_ID'
+            value: identityClientId
+          }
+          {
+            name: 'AZURE_TOKEN_CREDENTIALS'
+            value: 'ManagedIdentityCredential'
+          }
+          {
+            name: 'ELSPETH_ACCEPTANCE_CANDIDATE_SHA'
+            value: candidateSourceSha
+          }
+        ]
+        resources: {
+          cpu: json('0.5')
+          memory: '1Gi'
+        }
+      }
+    ]
+  }
+}
+
+output containerAppResourceId string = deployWebApp ? containerApp!.outputs.resourceId : ''
+output containerAppFqdn string = deployWebApp ? containerApp!.outputs.fqdn : ''
 output revisionName string = '${containerAppName}--${revisionSuffix}'
 output doctorRuntimeJobName string = 'doctor-runtime${jobSuffix}'

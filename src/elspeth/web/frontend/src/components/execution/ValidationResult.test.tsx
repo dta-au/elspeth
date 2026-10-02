@@ -6,7 +6,7 @@ import { ValidationResultBanner } from "./ValidationResult";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
-import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
+import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/pipelineGloss";
 import type { NodeSpec, ValidationResult } from "@/types/index";
 
 const READY_READINESS = {
@@ -199,6 +199,8 @@ describe("ValidationResultBanner", () => {
                 code: "advisor_signoff_blocked",
                 component_id: "pipeline",
                 component_type: "pipeline",
+                suggestion: null,
+                note: null,
                 detail:
                   "The evidence-scoped completion advisory review has not covered this pipeline version.",
               },
@@ -398,6 +400,7 @@ describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
             {
               component_id: "assess",
               component_type: "transform",
+              error_code: "schema_contract_violation",
               message:
                 "Schema contract violation: 'source' -> 'assess': required field 'case_study1' is not guaranteed by the producer",
               suggestion: null,
@@ -426,7 +429,7 @@ describe("ValidationResultBanner detail level (elspeth-27efd1e801)", () => {
     // never the raw id itself (elspeth-93f5621f18: this line used to assert
     // the opposite, pinning the bug this ticket fixes).
     expect(headline).not.toMatch(/\bassess\b/);
-    expect(headline).toMatch(/this step/i);
+    expect(headline).toMatch(/pipeline has incompatible data between steps/i);
   });
 
   it("never renders a bare component id when the banner has no nodes list (elspeth-93f5621f18)", () => {

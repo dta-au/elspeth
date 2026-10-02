@@ -24,11 +24,11 @@ from elspeth.contracts import (
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import TabularSourceDataConfig
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import ExternalHeaderError, FieldResolution, resolve_field_names
 
 
@@ -39,6 +39,13 @@ class CSVSourceConfig(TabularSourceDataConfig):
     - schema and on_validation_failure (from SourceDataConfig)
     - columns, field_mapping (field normalization is mandatory)
     """
+
+    snapshot_for_resume: bool = Field(
+        default=False,
+        strict=True,
+        description="For a single-source pipeline, materialize at most 64 MiB of immutable rows before processing so a failed run can resume unread rows.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
 
     delimiter: str = Field(
         default=",",
@@ -99,7 +106,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5e8324e0e8280e22"
+    source_file_hash: str | None = "sha256:5a67572be967d4aa"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by
@@ -155,6 +162,9 @@ class CSVSource(BaseSource):
         # Store normalization config for use in load()
         self._columns = cfg.columns
         self._field_mapping = cfg.field_mapping
+        # Headerless (explicit columns): field_mapping keys are the columns as written.
+        self._field_mapping_keys = "as_written" if cfg.columns is not None else "normalized"
+        self._normalizes_external_names = cfg.columns is None
 
         # Field resolution computed at load() time - includes version for audit
         self._field_resolution: FieldResolution | None = None
@@ -461,6 +471,13 @@ class CSVSource(BaseSource):
             field_resolution=self._field_resolution.resolution_mapping,
         )
         self._contract_builder = ContractBuilder(initial_contract)
+        # Width is a file-level property: every row of an over-wide file would
+        # exceed the inference cap, so refuse at header read, before any row
+        # (valid or quarantined) is yielded and then abandoned.
+        self._contract_builder.refuse_uninferable_width(
+            headers,
+            subject="CSV header" if raw_headers is not None else "CSV columns",
+        )
 
         # Track whether first valid row has been processed (for type inference)
         first_valid_row_processed = False
@@ -617,7 +634,7 @@ class CSVSource(BaseSource):
             except ValidationError as e:
                 # Input-free text: str(e) echoes the offending Tier-3 value
                 # into audit surfaces (elspeth-a300402c58).
-                error_text = safe_validation_error_text(e)
+                error_text = safe_validation_error_text(e, self._schema_class)
                 ctx.record_validation_error(
                     row=row,
                     error=error_text,
@@ -673,20 +690,27 @@ class CSVSource(BaseSource):
                     "schemas coerce declared fields at the Tier-3 boundary. Malformed rows can be quarantined."
                 ),
                 composer_hints=(
-                    "Default schema.mode to 'observed' unless the user explicitly asked to project to a smaller schema.",
-                    "Call inspect_source before declaring schema.mode: 'fixed' — fixed mode silently drops rows that don't match.",
+                    "Use schema.mode 'observed' when no explicit runtime field contract is required; if downstream transforms require uploaded columns, prefer 'flexible' with non-optional schema.fields.",
+                    "Use 'fixed' only for an explicitly required closed schema. To keep fewer columns, use a field_mapper downstream — a fixed source schema rejects extras rather than projecting them away.",
+                    "Call inspect_source before declaring schema.mode: 'fixed' — fixed mode rejects rows that don't match, including unexpected columns; on_validation_failure routes them to quarantine or discards them with audit.",
                     "Decide whether the CSV is headered: without columns CSVSource treats the first non-skipped row as headers; for headerless data set columns=[...] so the first data row stays data. Do not copy a header row into inline source data unless it is real headered CSV.",
                     "If you have been asked to generate CSV rows yourself (the invented_source path): always emit a header row as the first non-skipped line of the generated CSV, and always leave the `columns` option unset so CSVSource treats your first row as headers.",
-                    "CSV headers are normalized to lowercase identifiers at the source boundary (TicketID -> ticketid, 'User ID' -> user_id). Declare the normalized form, or keep an original name via field_mapping: {normalized: Original}; other declared names are rejected at config time.",
+                    "CSV headers are normalized to lowercase identifiers at the source boundary (TicketID -> ticketid, 'User ID' -> user_id, case_study_ -> case_study). Leading/trailing underscores are stripped.",
+                    "inspect_source returns raw observed_headers, runtime_headers and field_name_mapping; declare the runtime name, or preserve an identifier via field_mapping: {case_study: case_study_}. Other declared names are rejected at config time.",
                     "When generating CSV rows yourself, declare the NORMALIZED form of those generated column names in `schema.fields` (or `schema.guaranteed_fields`) — or generate already-lowercase headers. The header row, the `columns` decision, and the schema must all agree.",
                     "Never generate headerless CSV — the audit trail and downstream contracts need the header to be self-describing.",
-                    "columns tells CSVSource how to parse headerless rows, but downstream DAG validation still needs a schema guarantee. If transforms consume a CSV column, declare it in schema.guaranteed_fields or explicit schema fields.",
+                    "columns tells CSVSource how to parse headerless rows, but downstream DAG validation still needs a field contract.",
+                    "For uploaded/path-bound CSV, an inspected header is only a sample: you must not author schema.guaranteed_fields.",
+                    "Declare a flexible/fixed runtime contract with non-optional schema.fields, or retain observed mode and request_interpretation_review(kind='source_data_contract'), omit llm_draft, and let the user acknowledge the server-computed promise.",
+                    "This review requires the intended source and demanding consumers to be saved already; it cannot review a rejected candidate or a scaffold without those consumers.",
+                    "For a rejected full replacement, prefer an explicit runtime contract.",
+                    "Composer-authored content receives verified guarantees through source binding.",
                     "CSV source options do not have url_field; if a downstream web_scrape needs URLs, keep the URL column in the CSV schema and set url_field on the web_scrape node.",
                     "If you authored CSV rows or chose source values for this CSV, bind the exact artifact as a blob-backed source, stage invented_source on source.options.interpretation_requirements.",
-                    "Then call request_interpretation_review with affected_node_id='source' and llm_draft equal to the exact CSV text.",
+                    "Then call request_interpretation_review with affected_node_id='source' and omit llm_draft; the server uses the exact staged source draft, avoiding newline or escaping drift.",
                     "For source-level interpretation reviews, source is not a transform node; do not search nodes[] for source before calling the review tool.",
                     "Excel-exported CSVs are often cp1252 or have a UTF-16 BOM — verify encoding before pinning schema.",
-                    "Set on_validation_failure to a sink name for quarantine/review, or 'discard' to drop with audit. Default is 'discard'.",
+                    "Set on_validation_failure deliberately: a sink name quarantines invalid rows; 'discard' drops them with audit. Raw CSV config requires it; set_pipeline and set_source_from_blob default to discard when it is omitted.",
                 ),
             )
         return None
@@ -710,6 +734,7 @@ class CSVSource(BaseSource):
         if "mode" in schema and schema["mode"] == "fixed":
             return (
                 "You declared schema.mode: 'fixed'. Did you call inspect_source first? "
-                "Fixed mode drops every row whose columns don't exactly match the declared fields.",
+                "Fixed mode rejects nonconforming rows, including unexpected columns; "
+                "on_validation_failure selects quarantine or audited discard. It does not project columns away.",
             )
         return ()

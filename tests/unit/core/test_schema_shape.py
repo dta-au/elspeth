@@ -372,29 +372,29 @@ class _StaticInspector:
         self._indexes = indexes
         self.bind = bind
 
-    def get_columns(self, table_name: str) -> list[dict[str, Any]]:
-        assert table_name == "pg_demo"
-        return self._columns
+    def get_multi_columns(self, *, filter_names: list[str]) -> dict[tuple[None, str], list[dict[str, Any]]]:
+        assert filter_names == ["pg_demo"]
+        return {(None, "pg_demo"): self._columns}
 
-    def get_pk_constraint(self, table_name: str) -> dict[str, Any]:
-        assert table_name == "pg_demo"
-        return {"constrained_columns": self._primary_key}
+    def get_multi_pk_constraint(self, *, filter_names: list[str]) -> dict[tuple[None, str], dict[str, Any]]:
+        assert filter_names == ["pg_demo"]
+        return {(None, "pg_demo"): {"constrained_columns": self._primary_key}}
 
-    def get_foreign_keys(self, table_name: str) -> list[dict[str, Any]]:
-        assert table_name == "pg_demo"
-        return self._foreign_keys
+    def get_multi_foreign_keys(self, *, filter_names: list[str]) -> dict[tuple[None, str], list[dict[str, Any]]]:
+        assert filter_names == ["pg_demo"]
+        return {(None, "pg_demo"): self._foreign_keys}
 
-    def get_check_constraints(self, table_name: str) -> list[dict[str, Any]]:
-        assert table_name == "pg_demo"
-        return self._checks
+    def get_multi_check_constraints(self, *, filter_names: list[str]) -> dict[tuple[None, str], list[dict[str, Any]]]:
+        assert filter_names == ["pg_demo"]
+        return {(None, "pg_demo"): self._checks}
 
-    def get_unique_constraints(self, table_name: str) -> list[dict[str, Any]]:
-        assert table_name == "pg_demo"
-        return self._unique_constraints
+    def get_multi_unique_constraints(self, *, filter_names: list[str]) -> dict[tuple[None, str], list[dict[str, Any]]]:
+        assert filter_names == ["pg_demo"]
+        return {(None, "pg_demo"): self._unique_constraints}
 
-    def get_indexes(self, table_name: str) -> list[dict[str, Any]]:
-        assert table_name == "pg_demo"
-        return self._indexes
+    def get_multi_indexes(self, *, filter_names: list[str]) -> dict[tuple[None, str], list[dict[str, Any]]]:
+        assert filter_names == ["pg_demo"]
+        return {(None, "pg_demo"): self._indexes}
 
 
 def _postgres_equivalence_metadata() -> MetaData:

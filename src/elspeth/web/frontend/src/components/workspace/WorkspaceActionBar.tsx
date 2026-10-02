@@ -1,10 +1,11 @@
+import type { JSX } from "react";
 import { CompletionBar } from "@/components/composer/CompletionBar";
 
 export interface WorkspaceActionCapabilities {
   /* `completion` also carries Import YAML: the bar's import trigger rides
      inside CompletionBar, and everywhere this bar mounts the two
-     availability facts are the same one (!guidedBuildActive — the shared,
-     tutorial, and empty-landing views never render this bar).
+     availability facts are the same one (the shared, tutorial, and
+     empty-landing views never render this bar).
 
      The catalog capability left this bar entirely (2026-08-15 UX review):
      the More-actions popover it gated held a single item, so the Plugin

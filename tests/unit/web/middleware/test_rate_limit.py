@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from elspeth.web.middleware.rate_limit import (
     ComposerRateLimiter,
+    get_audit_readiness_rate_limiter,
     get_rate_limiter,
     get_write_rate_limiter,
 )
@@ -264,6 +265,20 @@ def test_write_rate_limiter_dependency_reads_distinct_app_state() -> None:
     assert write is not strict
 
 
+def test_audit_readiness_rate_limiter_dependency_reads_distinct_app_state() -> None:
+    """Expensive snapshots have a bucket independent of composer calls."""
+    app = FastAPI()
+    app.state.rate_limiter = ComposerRateLimiter(limit=1)
+    app.state.audit_readiness_rate_limiter = ComposerRateLimiter(limit=60)
+    request = Request({"type": "http", "app": app, "headers": []})
+
+    strict = asyncio.run(get_rate_limiter(request))
+    readiness = asyncio.run(get_audit_readiness_rate_limiter(request))
+
+    assert readiness is app.state.audit_readiness_rate_limiter
+    assert readiness is not strict
+
+
 def test_web_settings_write_rate_limit_defaults_to_60() -> None:
     from elspeth.web.config import WebSettings
 
@@ -275,3 +290,4 @@ def test_web_settings_write_rate_limit_defaults_to_60() -> None:
         shareable_link_signing_key=b"\x00" * 32,
     )
     assert settings.write_rate_limit_per_minute == 60
+    assert settings.audit_readiness_rate_limit_per_minute == 60

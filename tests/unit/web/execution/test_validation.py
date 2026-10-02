@@ -313,6 +313,7 @@ def test_required_content_safety_for_llm_source_fails_closed_with_source_attribu
     """Execution rejects an unrepairable source failure route before construction."""
     from elspeth.plugins.infrastructure.manager import PluginManager
     from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.plugin_policy.coverage import control_coverage_findings
 
     manager = PluginManager()
     manager.register_builtin_plugins()
@@ -348,7 +349,11 @@ def test_required_content_safety_for_llm_source_fails_closed_with_source_attribu
             replace(
                 _make_node(
                     plugin="azure_content_safety",
-                    options={"detect_only": False, "fields": ["briefing"]},
+                    options={
+                        "detect_only": False,
+                        "fields": ["briefing"],
+                        "thresholds": {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4},
+                    },
                 ),
                 on_success="primary",
             ),
@@ -358,6 +363,14 @@ def test_required_content_safety_for_llm_source_fails_closed_with_source_attribu
         metadata=PipelineMetadata(),
         version=1,
     )
+
+    # Prove the success path is protected so the rejection below isolates
+    # the source's unprotected validation-failure route.
+    discard_state = replace(
+        state,
+        sources={"source": replace(state.sources["source"], on_validation_failure="discard")},
+    )
+    assert control_coverage_findings(discard_state, PluginCapability.CONTENT_SAFETY) == ()
 
     with patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as constructor:
         result = validate_pipeline_for_trained_operator(
@@ -1075,6 +1088,7 @@ def test_validate_pipeline_public_signature_is_stable_through_boundary_decorator
         "catalog: 'CatalogService', secret_service: 'WebSecretResolver | None' = None, "
         "secret_wiring_policy: 'SecretWiringPolicy | None' = None, user_id: 'str | None' = None, "
         "blob_get_metadata: 'Callable[[UUID], BlobRecord | None] | None' = None, "
+        "blob_get_content: 'Callable[[UUID], tuple[BlobRecord, bytes]] | None' = None, "
         "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None) -> 'ValidationResult'"
     )
 
@@ -1289,6 +1303,43 @@ sinks:
     load_settings.assert_called_once()
 
 
+@pytest.mark.parametrize("authored_compartment", [None, "forged"])
+def test_web_validation_stamps_operator_export_before_settings_model_load(authored_compartment: str | None) -> None:
+    state = _make_state(outputs=(_make_output(),))
+    settings = _make_settings().model_copy(update={"compartment_id": "operator-a"})
+    yaml_generator = _FakeYamlGenerator(
+        "sources:\n  primary:\n    plugin: csv\n    on_success: primary\n    options: {}\nsinks:\n  primary:\n    plugin: csv\n    options: {}\n"
+    )
+    parsed_config = {
+        "sources": {"primary": {"plugin": "csv", "on_success": "primary", "options": {}}},
+        "sinks": {"primary": {"plugin": "csv", "options": {}}},
+        "landscape": {"export": {"enabled": True, "compartment_id": authored_compartment}},
+    }
+    catalog = create_catalog_service()
+
+    with (
+        patch("elspeth.web.execution.validation.load_bounded_pipeline_yaml", return_value=parsed_config),
+        patch(
+            "elspeth.web.execution.validation.load_settings_from_config_dict",
+            side_effect=ValueError("stop after operator marking"),
+        ) as load_settings,
+    ):
+        result = validation_module.validate_pipeline(
+            state,
+            settings,
+            yaml_generator,
+            plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(catalog),
+            profile_registry=None,
+            catalog=catalog,
+            session_id="test-session",
+        )
+
+    assert result.is_valid is False
+    assert "stop after operator marking" in result.errors[0].message
+    assert load_settings.call_args.args[0]["landscape"]["export"]["compartment_id"] == "operator-a"
+    assert parsed_config["landscape"]["export"]["compartment_id"] == authored_compartment
+
+
 def test_validation_pipeline_delegates_to_injected_impl_with_its_dependencies() -> None:
     """The pipeline threads its captured dependencies into the injected impl
     and converts a PhaseTermination escape into that termination's result —
@@ -1411,9 +1462,8 @@ class TestValidatePipelineEmptyComposition:
     stack trace leaking the internal model name to a user-facing UI. The
     short-circuit replaces that with a structured ``empty_pipeline`` error.
 
-    Surface that exercises this path: a guided session immediately after
-    ``exit_to_freeform`` (the wire response sets composition_state to a
-    version-bumped state with source=null nodes=[] outputs=[]).
+    This can be reached by a newly created session before the planner has
+    authored a source or sink.
     """
 
     def test_empty_pipeline_returns_structured_error(self) -> None:
@@ -1997,10 +2047,10 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         assert "CIDR" in result.errors[0].message
         mock_yaml_gen.generate_yaml.assert_not_called()
 
-    def test_web_scrape_failure_skips_later_managed_identity_and_llm_retry_checks(self) -> None:
-        # Regression: managed_identity_policy (declared #8) and llm_retry_budget_policy
-        # (declared #9) must NOT be reported as passed when web_scrape_network_policy
-        # (declared #2) fails earlier in the contract order. They previously executed
+    def test_web_scrape_failure_skips_later_llm_and_storage_policy_checks(self) -> None:
+        # Regression: llm_retry_budget_policy and the policy checks declared after it
+        # must NOT be reported as passed when web_scrape_network_policy (declared
+        # earlier) fails in the contract order. They previously executed
         # before web_scrape in code, so their pass records were already emitted and the
         # skipped-after-failure record was suppressed — the trail then showed a
         # later-declared gate passing under an earlier-declared failure.
@@ -2024,7 +2074,6 @@ class TestValidatePipelineWebFetchNetworkPolicy:
         assert result.is_valid is False
         assert _check(result, "web_scrape_network_policy").passed is False
         for later_check in (
-            "managed_identity_policy",
             "llm_retry_budget_policy",
             "llm_base_url_policy",
             "llm_tracing_policy",
@@ -2716,6 +2765,49 @@ class TestValidatePipelinePendingInterpretationPlaceholders:
         assert "llm_prompt_template:test_node" in result.errors[1].message
         mock_yaml_gen.generate_yaml.assert_not_called()
 
+    @staticmethod
+    def _multi_query_llm_state() -> CompositionState:
+        """A multi-query llm node whose llm_prompt_template review is RESOLVED with the prompt-surface anchor."""
+        from elspeth.web.interpretation_state import prompt_review_anchor_hash_from_options, prompt_review_draft_from_options
+
+        prompt_template = "Answer the question about the colour {{ row.colour }}."
+        options: dict[str, Any] = {
+            "prompt_template": prompt_template,
+            "queries": {
+                "good_pair": {"input_fields": {"colour": "colour"}, "template": "What colour pairs with {{ row.colour }}?"},
+                "hex_code": {"input_fields": {"colour": "colour"}, "template": "What is the hex code of {{ row.colour }}?"},
+            },
+        }
+        surface_anchor = prompt_review_anchor_hash_from_options(options)
+        surface_draft = prompt_review_draft_from_options(options)
+        assert surface_anchor is not None
+        assert surface_draft is not None
+        options[INTERPRETATION_REQUIREMENTS_KEY] = [
+            {
+                "id": "prompt_template_review:test_node",
+                "kind": "llm_prompt_template",
+                "user_term": "llm_prompt_template:test_node",
+                "status": "resolved",
+                "draft": surface_draft,
+                "event_id": "evt-prompt",
+                "accepted_value": surface_draft,
+                "accepted_artifact_hash": None,
+                "resolved_prompt_template_hash": surface_anchor,
+            }
+        ]
+        return _make_state(nodes=(_make_node(plugin="llm", options=options),))
+
+    def test_resolved_surface_anchored_multi_query_prompt_review_is_not_a_readiness_blocker(self) -> None:
+        mock_yaml_gen = MagicMock(spec=YamlGenerator)
+        mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
+
+        result = validate_pipeline_for_trained_operator(self._multi_query_llm_state(), _make_settings(), mock_yaml_gen)
+
+        assert [blocker for blocker in result.readiness.blockers if blocker.code == "interpretation_review_pending"] == []
+        assert all(error.error_code != "interpretation_review_pending" for error in result.errors)
+        # The interpretation-review phase passed: validation went on to generate YAML.
+        mock_yaml_gen.generate_yaml.assert_called_once()
+
     def test_pending_invented_source_review_returns_source_readiness(self) -> None:
         state = _make_state(
             source_options={
@@ -2892,14 +2984,14 @@ class TestValidatePipelinePendingInterpretationPlaceholders:
         assert captured_states[0].nodes[0].options["prompt_template"] == "Rate how pending interpretation this row is."
         assert state.nodes[0].options["prompt_template"] == "Rate how {{ interpretation: cool }} this row is."
 
-    def test_resolved_prompt_hash_keeps_placeholder_strict_even_in_authoring_preflight(self) -> None:
+    def test_approved_prompt_hash_keeps_placeholder_strict_even_in_authoring_preflight(self) -> None:
         state = _make_state(
             nodes=(
                 _make_node(
                     plugin="llm",
                     options={
                         "prompt_template": "Rate how {{ interpretation: cool }} this row is.",
-                        "resolved_prompt_template_hash": "sha256-rfc8785-v1:abc123",
+                        "approved_prompt_artifact_hash": "sha256-rfc8785-v1:abc123",
                     },
                 ),
             )
@@ -3112,58 +3204,136 @@ class TestValidatePipelineTransformProviderConfigPathAllowlist:
         assert path_check.passed is True
 
 
-class TestValidatePipelineTransformProviderConfigManagedIdentityPolicy:
-    """Web-authored RAG provider configs must not enable server managed identity."""
+def _azure_search_profile_policy_context() -> tuple[OperatorProfileRegistry, PluginAvailabilitySnapshot]:
+    """The registry and the snapshot the PRODUCTION builder makes for one managed-identity search profile."""
+    from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 
-    def test_azure_search_managed_identity_provider_config_blocked(self) -> None:
-        node = _make_node(
-            plugin="rag_retrieval",
-            options={
-                "provider": "azure_search",
-                "provider_config": {
-                    "endpoint": "https://tenant-b.search.windows.net",
-                    "index": "payroll",
-                    "use_managed_identity": True,
-                },
-            },
+    class _NoSecrets:
+        def has_server_ref(self, name: str) -> bool:
+            return False
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def server_generation(self, name: str) -> str | None:
+            return None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    settings = WebSettings.model_validate(
+        {
+            **_make_settings().model_dump(),
+            "plugin_allowlist": ["source:csv", "sink:csv", "transform:azure_ai_search"],
+            "azure_search_profiles": [
+                {
+                    "alias": "policies",
+                    "endpoint": "https://operator-private-marker.search.windows.net",
+                    "auth": "managed_identity",
+                    "indexes": ["approved-documents"],
+                }
+            ],
+        }
+    )
+    runtime_config = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_config)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime_config)
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=create_catalog_service(),
+        profiles=profiles,
+        principal_scope="local:alice",
+        secret_inventory=_NoSecrets(),
+        generation_key=b"azure-search-layer-proof-key",
+    )
+    assert PluginId("transform", "azure_ai_search") in snapshot.available
+    return profiles, snapshot
+
+
+_AZURE_SEARCH_AUTHORED: dict[str, Any] = {
+    "query_field": "question",
+    "output_prefix": "policy",
+    "schema": {"mode": "observed"},
+}
+
+
+class TestValidatePipelineAzureAISearchIsProfileOnly:
+    """The guarantee that replaces the managed-identity refusal, at the validation layer.
+
+    A web author reaches Azure AI Search only through an operator profile: no raw
+    endpoint, no raw managed identity, and nothing private beside a profile.
+    """
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            pytest.param(
+                {"endpoint": "https://tenant-b.search.windows.net", "index": "payroll", "use_managed_identity": True},
+                id="raw-managed-identity-no-profile",
+            ),
+            pytest.param(
+                {"endpoint": "https://tenant-b.search.windows.net", "index": "payroll", "api_key": "k"},
+                id="raw-api-key-no-profile",
+            ),
+            pytest.param(
+                {"profile": "policies", "index": "approved-documents", "endpoint": "https://evil.example.com"}, id="profile-plus-endpoint"
+            ),
+            pytest.param(
+                {"profile": "policies", "index": "approved-documents", "use_managed_identity": True}, id="profile-plus-managed-identity"
+            ),
+            pytest.param({"profile": "policies", "index": "approved-documents", "client_id": "abc"}, id="profile-plus-client-id"),
+            pytest.param({"profile": "policies", "index": "approved-documents", "api_key": "k"}, id="profile-plus-api-key"),
+            pytest.param(
+                {"profile": "policies", "index": "approved-documents", "api_version": "2020-06-30"}, id="profile-plus-api-version"
+            ),
+            pytest.param({"profile": "policies", "index": "hr-records"}, id="index-outside-the-pin"),
+            pytest.param({"profile": "someone-elses", "index": "approved-documents"}, id="unknown-profile"),
+        ],
+    )
+    def test_refused_before_anything_is_materialized(self, options: dict[str, Any]) -> None:
+        profiles, snapshot = _azure_search_profile_policy_context()
+        state = _make_state(
+            nodes=(_make_node(plugin="azure_ai_search", options={**_AZURE_SEARCH_AUTHORED, **options}),),
+            outputs=(_make_output(),),
         )
-        state = _make_state(source_options={}, nodes=(node,))
-        settings = _make_settings(data_dir="/tmp/test_data")
-        mock_yaml_gen = MagicMock(spec=YamlGenerator)
-        mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
-            mock_load.side_effect = ValueError("invalid settings")
+        yaml_generator = MagicMock(spec=YamlGenerator)
 
-            result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
+        result = validation_module.validate_pipeline(
+            state,
+            _make_settings(),
+            yaml_generator,
+            plugin_snapshot=snapshot,
+            profile_registry=profiles,
+            catalog=create_catalog_service(),
+            session_id="test-session",
+        )
 
         assert result.is_valid is False
-        assert any(c.name == "managed_identity_policy" and c.passed is False for c in result.checks)
-        assert any("managed identity" in e.message.lower() for e in result.errors)
-        assert result.readiness is not None
-        assert any(b.code == "managed_identity_policy" for b in result.readiness.blockers)
+        assert _check(result, "operator_profile_options").passed is False
+        yaml_generator.generate_yaml.assert_not_called()
+        rendered = " ".join(error.message for error in result.errors)
+        for private_value in ("tenant-b", "evil.example.com", "operator-private-marker"):
+            assert private_value not in rendered
 
-    def test_azure_search_api_key_provider_config_remains_allowed(self) -> None:
-        node = _make_node(
-            plugin="rag_retrieval",
-            options={
-                "provider": "azure_search",
-                "provider_config": {
-                    "endpoint": "https://tenant-a.search.windows.net",
-                    "index": "docs",
-                    "api_key": "test-key",
-                },
-            },
+    def test_a_profiled_node_passes_the_profile_check(self) -> None:
+        """Control: the refusals above are about the options, not the plugin being unreachable."""
+        profiles, snapshot = _azure_search_profile_policy_context()
+        state = _make_state(
+            nodes=(
+                _make_node(
+                    plugin="azure_ai_search", options={**_AZURE_SEARCH_AUTHORED, "profile": "policies", "index": "approved-documents"}
+                ),
+            ),
+            outputs=(_make_output(),),
         )
-        state = _make_state(source_options={}, nodes=(node,))
-        settings = _make_settings(data_dir="/tmp/test_data")
-        mock_yaml_gen = MagicMock(spec=YamlGenerator)
-        mock_yaml_gen.generate_yaml.return_value = "source:\n  plugin: csv_source\n  options: {}"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load:
-            mock_load.side_effect = ValueError("invalid settings")
-            result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
-        managed_identity_check = next(c for c in result.checks if c.name == "managed_identity_policy")
-        assert managed_identity_check.passed is True
+        result = validate_plugin_policy(state, snapshot=snapshot, profile_registry=profiles, catalog=create_catalog_service())
+
+        assert result.findings == ()
+        assert result.executable_state.nodes[0].options["use_managed_identity"] is True
 
 
 class TestValidatePipelineLlmRetryBudgetPolicy:
@@ -3694,7 +3864,7 @@ class TestValidatePipelineSuccess:
         result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
 
         assert result.is_valid is True
-        assert len(result.checks) == 24
+        assert len(result.checks) == 23
         assert all(c.passed for c in result.checks)
         assert [check.name for check in result.checks[:11]] == [
             "plugin_enablement",
@@ -3814,7 +3984,7 @@ class TestValidatePipelineExportNoResolverSecretRef:
         prompt_template = "Summarise: {{ row.text }}"
         model = "openai/gpt-4o-mini"
         # An LLM node with a prompt_template and a model carries resolved
-        # prompt-template and model-choice review requirements once the guided
+        # prompt-template and model-choice review requirements once the
         # composer has surfaced them — mirror that so interpretation_review
         # passes and validation reaches the plugin-instantiation step (where the
         # secret-marker bug lives).
@@ -3864,7 +4034,7 @@ class TestValidatePipelineExportNoResolverSecretRef:
                         "response_field": "summary",
                         "required_input_fields": ["text"],
                         # The credential is wired as a secret_ref marker, exactly
-                        # as the guided composer persists an LLM api_key.
+                        # as the composer persists an LLM api_key.
                         "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                         "schema": {"mode": "observed", "guaranteed_fields": ["summary"]},
                         INTERPRETATION_REQUIREMENTS_KEY: interpretation_requirements,
@@ -5380,8 +5550,8 @@ sinks:
         # Regression guard for the *bug class*, not just one case: the physical
         # emission order of the blocking checks must match
         # VALIDATION_BLOCKING_CHECK_NAMES. A check appended at the wrong physical
-        # spot (as managed_identity_policy/llm_retry_budget_policy once were —
-        # emitted before web_scrape_network_policy despite being declared after it)
+        # spot (as llm_retry_budget_policy once was — emitted before
+        # web_scrape_network_policy despite being declared after it)
         # leaves a later-declared gate's pass record ahead of an earlier-declared
         # gate, which corrupts the skipped-after-failure trail on any earlier
         # failure. The order-vs-constant test only checks the declared tuple; this
@@ -5408,15 +5578,14 @@ sinks:
         emitted = [check.name for check in result.checks if check.name in declared_index]
         emitted_indices = [declared_index[name] for name in emitted]
         assert emitted_indices == sorted(emitted_indices), f"blocking checks emitted out of declared order: {emitted}"
-        # And the relocation is concretely asserted: the two policy checks sit
-        # after blob_inline_refs (their declared #8/#9 home), not before web_scrape.
-        assert emitted.index("managed_identity_policy") > emitted.index("blob_inline_refs")
-        assert emitted.index("llm_retry_budget_policy") > emitted.index("managed_identity_policy")
+        # And the relocation is concretely asserted: the retry-budget check sits
+        # directly after blob_inline_refs (its declared home), not before web_scrape.
+        assert emitted.index("llm_retry_budget_policy") == emitted.index("blob_inline_refs") + 1
         assert emitted.index("web_fetch_resource_policy") == emitted.index("web_scrape_network_policy") + 1
         assert emitted.index("llm_tracing_policy") == emitted.index("llm_base_url_policy") + 1
         assert emitted.index("aws_s3_endpoint_url_policy") == emitted.index("llm_tracing_policy") + 1
         assert emitted.index("aws_s3_source_policy") == emitted.index("aws_s3_endpoint_url_policy") + 1
-        assert emitted.index("web_scrape_network_policy") < emitted.index("managed_identity_policy")
+        assert emitted.index("web_scrape_network_policy") < emitted.index("llm_retry_budget_policy")
 
     @patch("elspeth.web.execution.validation.load_settings_from_yaml_string")
     @patch("elspeth.web.execution.validation.instantiate_runtime_plugins")
@@ -6147,7 +6316,12 @@ class TestPluginPolicySuggestions:
             binding_generation_fingerprint="required-control-generation",
         )
         state = _make_state(
-            nodes=(_make_node(plugin="llm", options={"prompt_template": "Assess {{ row.ticket_id }}"}),),
+            nodes=(
+                _make_node(
+                    plugin="llm",
+                    options={"prompt_template": "Assess {{ row.ticket_id }}", "required_input_fields": ["ticket_id"]},
+                ),
+            ),
             outputs=(_make_output(),),
         )
 
@@ -6206,7 +6380,7 @@ class TestValidatePipelineStateShapeMaterialization:
     ``CompositionState.from_dict`` accepts persisted sessions whose node shapes
     Stage 1 would reject, and ``_validate_pipeline_impl`` runs no Stage-1 pass
     before materialization — so every rehydrate consumer (tutorial, sessions,
-    proposals, guided chat, execute) could reach ``generate_yaml`` with a state
+    proposals, execute) could reach ``generate_yaml`` with a state
     it refuses to lower. Those refusals are authoring defects and belong in the
     ledger; a genuine bug inside the generator must still surface as a 500.
     """

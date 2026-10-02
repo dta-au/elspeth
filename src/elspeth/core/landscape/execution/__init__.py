@@ -5,7 +5,7 @@ events, the external call audit trail, source/sink operation lifecycle,
 aggregation batches, and sink artifacts. The ``ExecutionRepository``
 facade in ``elspeth.core.landscape.execution_repository`` composes them
 and remains the compatibility surface for existing call sites
-(filigree elspeth-c227effc89).
+(archived issue elspeth-c227effc89).
 """
 
 from elspeth.core.landscape.execution.artifacts import ArtifactRepository

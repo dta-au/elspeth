@@ -7,7 +7,7 @@
 **Supersedes:** (partial, clause-level) — see "Supersession map" below
 **Tags:** framework, declaration-contract, audit-evidence, tier-1, registry, audit-integrity
 **Review date:** 2026-10-19 (six months from acceptance; ADR-010 §Consequences must be re-evaluated against observed 2B/2C experience by that date)
-**Filigree epic:** `elspeth-300abf520d` (Track 2 — Declaration-trust framework Phase 2B/2C). Re-filed 2026-08-06 from the pre-Jun-30 archived store, where it is `elspeth-a3ac5d88c6`; the "hard SLA 2026-07-18" carried by the original has lapsed and is not a live commitment.
+**legacy issue tracker epic:** `elspeth-300abf520d` (Track 2 — Declaration-trust framework Phase 2B/2C). Re-filed 2026-08-06 from the pre-Jun-30 archived store, where it is `elspeth-a3ac5d88c6`; the "hard SLA 2026-07-18" carried by the original has lapsed and is not a live commitment.
 
 ---
 
@@ -23,6 +23,25 @@
 > **Amendment A2 — 2026-04-20 (issue `elspeth-3f320398f1` / M4).**
 > The reversibility claim in §Consequences → §Neutral ("Reversibility: the framework is additive — removing it would require unpicking all decorator usages and re-introducing the hand-written `TIER_1_ERRORS` tuple. Non-trivial but not destructive.") is accurate at 2A's single-adopter state but becomes materially weaker as Phase 2B/2C adopters register. After six adopters land (four 2B transforms + two 2C boundaries), reversal requires a coordinated rollback of the six adopter modules, the dispatcher, the registry and its manifest (C2), the dispatch-site manifest (follow-up issue `elspeth-10dc0b747f`), and — if first-fire shadowing is fixed by then (issue `elspeth-60890a7388`) — the aggregate-violation machinery as well. Review date 2026-10-19 remains the formal reversibility checkpoint, but the practical window closes earlier: if reversal is being seriously considered it must happen before the first 2B adopter lands, not after. The original prose stands for audit-trail purposes; this banner is the authoritative reversibility reading as of the 2026-04-20 post-panel cleanup. Precedent: ADR-009 §Alternatives Considered #4.
 
+> **Amendment A5 — 2026-09-11 (recording the effect of [ADR-012](012-can-drop-rows-contract.md), accepted 2026-04-20).**
+> Three passages below still read as though ADR-009 §Clause 3's empty-emission
+> carve-out were the live posture: the §Supersession map row for **ADR-009
+> §Clause 3 (empty-emission carve-out + 90-day SLA)** ("Remains normative. The
+> Track 2 legacy issue tracker epic (ref above) anchors the SLA."); the §Consequences →
+> §Negative bullet ("The v0 empty-emission carve-out (ADR-009 §Clause 3) still
+> stands; ADR-010 does not tighten it. The 90-day SLA trigger (2026-07-18)
+> remains the safeguard for moving to `can_drop_rows` …"); and the §References
+> line naming the "ADR-009 §Clause 3 SLA hard trigger 2026-07-18". ADR-012
+> overtook all three on 2026-04-20: it added `can_drop_rows` to `BaseTransform`
+> and `TransformProtocol`, registered `CanDropRowsContract` on
+> `post_emission_check` and `batch_flush_check`, and retired the carve-out
+> mechanically in `verify_pass_through` (ADR-012 §Clause-3 retirement). The
+> tightening those three passages defer to has therefore happened, and
+> `can_drop_rows` is a landed declaration rather than a pending safeguard. The
+> original prose stands for audit-trail purposes; this banner is the
+> authoritative reading of those three passages. Precedent: ADR-009
+> §Alternatives Considered #4.
+
 ---
 
 ## Supersession map
@@ -37,7 +56,7 @@ This ADR amends (not replaces) the single-declaration pattern from 007/008/009:
 | ADR-008 §Explicit scope boundary | Normatively remains; ADR-010 provides the framework each future declaration adopts, but each new declaration still requires its own ADR. |
 | ADR-009 §Clause 1 (shared propagation primitives) | Remains normative. ADR-010 does NOT include `static_check` in the 2A protocol — the walker refactor is deferred entirely to Phase 2B. |
 | ADR-009 §Clause 2 (runtime cross-check batch path) | Remains normative. ADR-010's dispatcher preserves the single-token and batch-flush call sites. |
-| ADR-009 §Clause 3 (empty-emission carve-out + 90-day SLA) | Remains normative. The Track 2 filigree epic (ref above) anchors the SLA. |
+| ADR-009 §Clause 3 (empty-emission carve-out + 90-day SLA) | Remains normative. The Track 2 legacy issue tracker epic (ref above) anchors the SLA. |
 | ADR-009 §Clause 4 (invariant harness) | ADR-010 extends — harness iterates registered contracts and exercises every `negative_example`. |
 
 ## Context
@@ -163,8 +182,8 @@ Considered seriously in review. Rejected because: (a) the nominal `AuditEvidence
 - Decision record: commit `187e1fcee`
 - Predecessor ADRs: 007 (pass-through propagation), 008 (runtime cross-check), 009 (pathway fusion)
 - Successor ADRs (Phase 2B/2C): each declaration gets its own ADR per §Supersession map ADR-008 reference
-- CLAUDE.md §Three-Tier Trust Model, §Plugin Ownership, §Frozen Dataclass Immutability, §Defensive Programming Forbidden
-- Track 2 filigree epic: `elspeth-a3ac5d88c6`; ADR-009 §Clause 3 SLA hard trigger 2026-07-18
+- docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model, §Plugin Ownership: System Code, Not User Code, §The Defensive Programming Prohibition; and the frozen-dataclass immutability rule (`frozen=True` leaves container contents mutable through the attribute reference, so container fields are deep-frozen in `__post_init__`; scalar-only records need no guard)
+- Track 2 legacy issue tracker epic: `elspeth-a3ac5d88c6`; ADR-009 §Clause 3 SLA hard trigger 2026-07-18
 - H2 cluster landing (2026-04-20): `elspeth-425047a599` (H2), `elspeth-10dc0b747f` (N1), `elspeth-60890a7388` (N3), `elspeth-f52d7c5a47` (F2), `elspeth-5fc876138d` (F3), `elspeth-b513c01cff` (F4), `elspeth-121b268aec` (F5), `elspeth-5dae105959` (H1 amendment)
 - H2 implementation and amendment record: commit `009b6009c`
 - H2 decision anchor: comment #417 on `elspeth-425047a599` — ADR-010 §Semantics audit-complete decision record
@@ -198,13 +217,16 @@ DCV catch branch as every other adopter. A new ABC invariant —
 — is enforced at registration time so future adopters cannot reintroduce
 the legacy pattern. The dispatcher now has exactly one catch branch.
 
-**Rationale (verbatim for audit-trail posterity).**
+**Rationale (recorded for audit-trail posterity; the citation is repointed
+to the live doc — the wording is otherwise unchanged, and the mirrored copy
+in `engine/executors/declaration_dispatch.py` carries the same amendment).**
 
-> ELSPETH's CLAUDE.md "Auditability Standard" makes "I don't know what
-> happened" structurally impermissible for any output. Under fail-fast
-> first-fire semantics, the audit trail's silence on a second contract's
-> evaluation is indistinguishable from "checked and passed" — a Repudiation
-> surface (STRIDE) the auditor cannot resolve. Under audit-complete
+> ELSPETH's auditability principle (ARCHITECTURE.md §Design Principles)
+> makes "I don't know what happened" structurally impermissible for any
+> output. Under fail-fast first-fire semantics, the audit trail's silence
+> on a second contract's evaluation is indistinguishable from "checked
+> and passed" — a Repudiation surface (STRIDE) the auditor cannot
+> resolve. Under audit-complete
 > semantics, every applicable contract's method runs; every violation is
 > recorded; absence-of-violation in the audit trail means "checked and
 > passed," not "skipped because an earlier contract fired." The
@@ -377,7 +399,9 @@ val carries the whole of the enforcement.
 
 The failure is deliberately loud. Each registered contract's `violation_class`
 carries `@tier_1_error`, so a contradicted declaration aborts the run rather
-than letting it finish and produce evidence nobody can trust. Measured
+than letting it finish and produce evidence nobody can trust. A declaration's
+untrusted residual (see [ADR-013](013-declared-required-fields-contract.md)
+Amendment 2026-09-27) is row validation, not a val, and routes. Measured
 2026-09-10: `passes_through_input` → `PassThroughContractViolation` and
 `sink_required_fields` → `SinkRequiredFieldsViolation` are both in
 `TIER_1_ERRORS`, as is `AggregateDeclarationContractViolation`. The generic base

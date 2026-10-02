@@ -39,10 +39,12 @@ of disciplines that are deliberately out of scope for the analyzer entirely.
   {field: int}`, but cannot prove the source actually emits ints at
   runtime. (Source-plugin validation/coercion at the Tier-3 boundary;
   Landscape Tier-1 read guards that crash on type mismatch — see
-  `engine-patterns-reference` skill, "Offensive Programming" section.)
+  `engine-patterns-reference` skill §Offensive Programming Examples.)
 - *Whether a `None` represents real absence or fabricated default.* The
-  fabrication decision test in CLAUDE.md is value-dependent; statics see
-  only that a field is `int | None`, not what `None` means semantically.
+  fabrication decision test
+  (docs/guides/data-trust-and-error-handling.md §The Decision Test) is
+  value-dependent; statics see only that a field is `int | None`, not
+  what `None` means semantically.
   (Source-plugin discipline at construction time; auditor-facing queries
   surface the `None` for the consumer to interpret.)
 - *Whether `TYPE_CHECKING` imports actually stay confined to type
@@ -72,9 +74,11 @@ of disciplines that are deliberately out of scope for the analyzer entirely.
   recursively; attempted mutation raises `TypeError` from
   `MappingProxyType` and `tuple`.)
 - *Whether `MappingProxyType(self.x)` was constructed from a fresh dict
-  copy or wraps the caller's reference.* The forbidden anti-patterns in
-  CLAUDE.md's "Frozen Dataclass Immutability" section are
-  value-dependent. (No runtime check; pre-PR review and the
+  copy or wraps the caller's reference.* `frozen=True` leaves container
+  contents mutable through the attribute reference, so container fields
+  are deep-frozen in `__post_init__` (scalar-only records need no
+  guard); the aliasing anti-patterns this forbids are value-dependent.
+  (No runtime check; pre-PR review and the
   `immutability.freeze_guards` / `immutability.frozen_annotations`
   `elspeth-lints` rules catch these during development. This is a
   deliberate gap: catching them statically requires alias analysis.)
@@ -95,8 +99,9 @@ of disciplines that are deliberately out of scope for the analyzer entirely.
   decision.* The analyzer can see the class is shaped to carry an audit
   payload, but cannot prove `recorder.record(...)` was called. (Landscape
   schema validation on persist; the attributability test
-  `explain(recorder, run_id, token_id)` in CLAUDE.md is the runtime
-  contract.)
+  `explain(recorder, run_id, token_id)` in the
+  `engine-patterns-reference` skill §The Attributability Test is the
+  runtime contract.)
 - *Whether the audit primacy order was honoured at runtime
   (audit-fires-first then telemetry then log).* The analyzer cannot
   observe call order. (Pipeline integration tests; telemetry-emission
@@ -104,7 +109,8 @@ of disciplines that are deliberately out of scope for the analyzer entirely.
 - *Whether a Tier-1 read guard caught a corrupted row at runtime.* The
   analyzer enforces guard symmetry (read side mirrors write side); the
   runtime guard's actual behaviour on corrupt data is the runtime check
-  (see `engine-patterns-reference` skill, Tier-1 read-guard examples).
+  (see `engine-patterns-reference` skill §Offensive Programming
+  Examples, which covers Tier-1 read guards).
 
 ## Plugin Contract
 

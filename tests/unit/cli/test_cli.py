@@ -400,7 +400,7 @@ class TestExplainSecretLoading:
 
 
 class TestBuildResumeGraphs:
-    """Test _build_resume_graphs accepts connection-valued on_success.
+    """Test _build_resume_graph accepts connection-valued on_success.
 
     Regression test for 6v1d: resume mode must accept connection names (e.g.
     'source_out') not just sink names as source.on_success. The previous
@@ -408,8 +408,8 @@ class TestBuildResumeGraphs:
     """
 
     def test_connection_valued_on_success_accepted(self, plugin_manager) -> None:
-        """_build_resume_graphs succeeds when source.on_success is a connection name."""
-        from elspeth.cli import _build_resume_graphs
+        """_build_resume_graph succeeds when source.on_success is a connection name."""
+        from elspeth.cli import _build_resume_graph
         from elspeth.cli_helpers import instantiate_plugins_from_config
         from elspeth.core.config import (
             ElspethSettings,
@@ -433,11 +433,11 @@ class TestBuildResumeGraphs:
             transforms=[
                 TransformSettings(
                     name="processor",
-                    plugin="passthrough",
+                    plugin="value_transform",
                     input="source_out",
                     on_success="output",
                     on_error="discard",
-                    options={"schema": {"mode": "observed"}},
+                    options={"schema": {"mode": "observed"}, "operations": [{"target": "total", "expression": "1"}]},
                 ),
             ],
             sinks={
@@ -450,16 +450,16 @@ class TestBuildResumeGraphs:
         )
 
         plugins = instantiate_plugins_from_config(config)
-        validation_graph, execution_graph = _build_resume_graphs(config, plugins)
+        execution_graph = _build_resume_graph(config, plugins)
 
-        # Both graphs should build successfully
-        assert validation_graph.node_count > 0
         assert execution_graph.node_count > 0
-        assert execution_graph.get_sources() == validation_graph.get_sources()
+        execution_graph.validate()
+        transform_id = execution_graph.get_transform_name_id_map()["processor"]
+        assert execution_graph.get_node_info(transform_id).output_field_declarations["total"].field_type == "int"
 
     def test_sink_valued_on_success_still_accepted(self, plugin_manager) -> None:
-        """_build_resume_graphs still works when source.on_success is a sink name."""
-        from elspeth.cli import _build_resume_graphs
+        """_build_resume_graph still works when source.on_success is a sink name."""
+        from elspeth.cli import _build_resume_graph
         from elspeth.cli_helpers import instantiate_plugins_from_config
         from elspeth.core.config import ElspethSettings, SinkSettings, SourceSettings
 
@@ -485,11 +485,9 @@ class TestBuildResumeGraphs:
         )
 
         plugins = instantiate_plugins_from_config(config)
-        validation_graph, execution_graph = _build_resume_graphs(config, plugins)
+        execution_graph = _build_resume_graph(config, plugins)
 
-        assert validation_graph.node_count > 0
         assert execution_graph.node_count > 0
-        assert execution_graph.get_sources() == validation_graph.get_sources()
 
 
 class TestHealthCommand:
@@ -1120,12 +1118,12 @@ sinks:
         from unittest.mock import patch
 
         from elspeth.cli import app
-        from elspeth.contracts.checkpoint import ResumeCheck
+        from elspeth.contracts.checkpoint import ResumeCheck, ResumeRefusalCause
 
         settings_file, _db_path = self._make_settings_with_landscape_db(tmp_path)
 
         # Mock can_resume to return False with a reason
-        mock_check = ResumeCheck(can_resume=False, reason="Run already completed successfully")
+        mock_check = ResumeCheck(can_resume=False, reason="Run already completed successfully", cause=ResumeRefusalCause.RUN_TERMINAL)
 
         with patch("elspeth.core.checkpoint.RecoveryManager") as MockRecovery:
             MockRecovery.return_value.can_resume.return_value = mock_check
@@ -1219,7 +1217,7 @@ sinks:
         ):
             MockRecovery.return_value.can_resume.return_value = ResumeCheck(can_resume=True)
             MockRecovery.return_value.get_resume_point.return_value = mock_resume_point
-            MockRecovery.return_value.get_unprocessed_rows.return_value = []
+            MockRecovery.return_value.count_active_scheduler_work.return_value = 0
 
             result = runner.invoke(app, ["resume", run_id, "-s", str(settings_file), "--execute", "--format", "json"])
 
@@ -1261,7 +1259,7 @@ sinks:
         with patch("elspeth.core.checkpoint.RecoveryManager") as MockRecovery:
             MockRecovery.return_value.can_resume.return_value = mock_check
             MockRecovery.return_value.get_resume_point.return_value = mock_resume_point
-            MockRecovery.return_value.get_unprocessed_rows.return_value = ["row-1"]
+            MockRecovery.return_value.count_active_scheduler_work.return_value = 1
             result = runner.invoke(app, ["resume", "test-run-123", "-s", str(settings_file), "--execute"])
 
         assert result.exit_code == 1
@@ -1328,7 +1326,7 @@ payload_store:
         with patch("elspeth.core.checkpoint.RecoveryManager") as MockRecovery:
             MockRecovery.return_value.can_resume.return_value = mock_check
             MockRecovery.return_value.get_resume_point.return_value = mock_resume_point
-            MockRecovery.return_value.get_unprocessed_rows.return_value = ["row-1"]
+            MockRecovery.return_value.count_active_scheduler_work.return_value = 1
             result = runner.invoke(app, ["resume", "test-run-123", "-s", str(settings_file), "--execute"])
 
         assert result.exit_code == 1

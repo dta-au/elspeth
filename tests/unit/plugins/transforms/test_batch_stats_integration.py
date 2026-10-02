@@ -68,10 +68,20 @@ def test_batch_stats_returns_contract_in_transform_mode():
         f"Contract should include all output fields. Expected {expected_fields}, got {contract_field_names}"
     )
 
-    # Verify all fields are marked as inferred (OBSERVED mode pattern)
-    for field in result.row.contract.fields:
-        assert field.source == "inferred", f"Field {field.normalized_name} should be inferred"
-        assert field.python_type is object, f"Field {field.normalized_name} should have object type"
+    # Every created field carries the plugin's own declaration (ADR-050):
+    # the counts are ints, the mean and the sum floats (an int sum satisfies
+    # its float declaration, ruling C3), and the group_by value is row data
+    # (any, so nullable). Every one is a guaranteed output.
+    declared = {
+        field.normalized_name: (field.source, field.python_type, field.nullable, field.required) for field in result.row.contract.fields
+    }
+    assert declared == {
+        "count": ("declared", int, False, True),
+        "sum": ("declared", float, False, True),
+        "batch_size": ("declared", int, False, True),
+        "mean": ("declared", float, False, True),
+        "category": ("declared", object, True, True),
+    }
 
 
 def test_batch_stats_contract_empty_batch():

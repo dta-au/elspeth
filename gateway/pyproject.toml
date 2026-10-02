@@ -11,10 +11,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pytest-asyncio>=0.24", "respx>=0.22"]
+test = ["pytest>=8", "pytest-asyncio>=0.24", "python-multipart>=0.0.27", "respx>=0.22"]
+
+[dependency-groups]
+# Keep the exact build backend and its hashes in the standalone lock without
+# installing build tooling in the shipped runtime environment.
+container-build = ["hatchling==1.27.0"]
+# Required gate executables are locked independently for this standalone
+# project; CI must not resolve the tools while deciding the gateway verdict.
+audit = ["pip-audit==2.10.1", "pip-licenses==5.5.5"]
+
+[tool.uv]
+# Runtime and test environments opt into only the groups they need. The
+# container-build tool must never become part of the shipped runtime venv.
+default-groups = []
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/elspeth_llm_gateway"]

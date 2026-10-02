@@ -143,10 +143,10 @@ describe("parseResponse execution error envelopes", () => {
     });
   });
 
-  it("carries failure_code from a guided terminal-failure envelope (F13-D)", async () => {
+  it("carries failure_code from a session operation terminal-failure envelope", async () => {
     const error = await parseApiError(
       {
-        error_type: "guided_operation_terminal_failure",
+        error_type: "session_operation_terminal_failure",
         failure_code: "policy_blocked",
         detail:
           "This pipeline is blocked by a deployment policy and cannot be built as configured. " +
@@ -158,7 +158,7 @@ describe("parseResponse execution error envelopes", () => {
 
     expect(error).toMatchObject({
       status: 422,
-      error_type: "guided_operation_terminal_failure",
+      error_type: "session_operation_terminal_failure",
       failure_code: "policy_blocked",
     });
     expect(error.detail).toContain("blocked by a deployment policy");
@@ -180,5 +180,64 @@ describe("parseResponse execution error envelopes", () => {
 
     expect(error.errors).toEqual([valid]);
     expect(error.detail).toBe(valid.message);
+  });
+
+  it("surfaces FastAPI's global RequestValidationError array envelope (#37)", async () => {
+    // app.py's handle_validation_error returns {detail: [{type, loc, msg}],
+    // request_id} for every route bound to a pydantic request model -- an
+    // ARRAY `detail`, unlike every other route's string/object shape.
+    const response = {
+      ok: false,
+      status: 422,
+      statusText: "Unprocessable Entity",
+      json: async () => ({
+        detail: [
+          {
+            type: "string_too_long",
+            loc: ["body", "content"],
+            msg: "String should have at most 65536 characters",
+          },
+        ],
+        request_id: "req-1",
+      }),
+    } as Response;
+
+    let error: ApiError;
+    try {
+      await parseResponse(response);
+      throw new Error("parseResponse unexpectedly accepted an error response");
+    } catch (caught) {
+      error = caught as ApiError;
+    }
+
+    expect(error.detail).toBe(
+      "body -> content: String should have at most 65536 characters",
+    );
+    expect(error.detail).not.toBe("Unprocessable Entity");
+    expect(error.errors).toEqual([
+      { message: "body -> content: String should have at most 65536 characters" },
+    ]);
+    expect(error.request_id).toBe("req-1");
+  });
+
+  it("falls back to the first msg when an array entry lacks a loc", async () => {
+    const response = {
+      ok: false,
+      status: 422,
+      statusText: "Unprocessable Entity",
+      json: async () => ({
+        detail: [{ type: "value_error", msg: "Value error, bad input" }],
+      }),
+    } as Response;
+
+    let error: ApiError;
+    try {
+      await parseResponse(response);
+      throw new Error("parseResponse unexpectedly accepted an error response");
+    } catch (caught) {
+      error = caught as ApiError;
+    }
+
+    expect(error.detail).toBe("Value error, bad input");
   });
 });

@@ -3,9 +3,13 @@
 The composer-side run row exposes a single ``error`` text field on the runs
 table.  Bare structural facts (``rows_succeeded=0``) tell the operator *that*
 the run failed but not *why*.  This module reads the audit DB after the run
-finishes and aggregates the most common ``transform_errors`` rows so the
-run-level error string can name the dominant failure modes without forcing
-the operator to drill into the per-run diagnostics panel.
+finishes and aggregates the most common failure categories over the tokens
+that terminally failed on a transform error (one deciding ``transform_errors``
+row per failed token) or because their collector group FAILED as a whole (one
+entry per member token, under its group's recorded reason), so the run-level
+error string can name the dominant failure modes without forcing the operator
+to drill into the per-run diagnostics panel. Both come from the one counting
+authority, ``core/landscape/terminal_transform_failures.py``.
 
 Egress discipline (elspeth-30416e67cc).  Everything this module returns is
 inlined into three surfaces that live OUTSIDE the audit boundary:
@@ -34,8 +38,11 @@ This module therefore never lets free text out.  Only three things leave it:
   the node line in ``_operator_failure_diagnostic``);
 * an error *category* proved to be a member of the closed
   :data:`~elspeth.contracts.errors.TransformErrorCategory` vocabulary, or one
-  of two fixed sentinels when it is not; and
-* a row count.
+  of two fixed sentinels when it is not, or a collector group's
+  :class:`~elspeth.contracts.enums.CollectorGroupFailureReason` (an
+  engine-authored code the authority has already parsed into that enum);
+* which of the two arms the category came from; and
+* a count of terminally failed tokens.
 
 Per-row free text is not dropped from the system — it stays behind the
 authenticated, ownership-verified ``GET /api/runs/{run_id}/diagnostics``,
@@ -56,13 +63,13 @@ from __future__ import annotations
 import json
 from collections import Counter
 from dataclasses import dataclass
-from typing import get_args
+from typing import Literal, get_args
 
 from sqlalchemy import select
 
 from elspeth.contracts.errors import TransformErrorCategory
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.schema import transform_errors_table
+from elspeth.core.landscape.terminal_transform_failures import deciding_collector_group_failures, deciding_transform_errors
 
 # The closed category vocabulary, derived from the Literal itself so the two
 # can never drift.  Membership in this set is what makes an emitted category
@@ -90,16 +97,26 @@ NON_CANONICAL_CATEGORY = "non_canonical_error_details"
 _MAX_NODE_ID_CHARS = 64
 
 
+FailureKind = Literal["transform_error", "collector_group"]
+"""Which counting arm a summary comes from, so a collector reason code is never read as a transform category."""
+
+
 @dataclass(frozen=True, slots=True)
 class ClientSafeFailureSummary:
-    """One (failing node, error category) pair with the number of rows it hit.
+    """One (failing node, error category) pair with the number of tokens it failed.
 
     Deliberately carries **no** free-text field.  The client-path formatter
     accepts only this type, so the per-row ``error``/``message``/``repr`` text
     is not merely unrendered — it is not representable here, and there is no
     formatter overload that could route it to a client surface by accident.
+
+    ``kind`` names the arm: ``transform_error`` (``category`` is a
+    ``TransformErrorCategory`` or a sentinel) or ``collector_group``
+    (``transform_id`` is the collector node and ``category`` its group's
+    recorded ``CollectorGroupFailureReason``).
     """
 
+    kind: FailureKind
     transform_id: str
     category: str
     count: int
@@ -162,27 +179,38 @@ def load_top_failure_categories(
     message and sliced before collapsing, so a category spread across many
     distinct message texts lost to a category with one repeated text, and the
     reported counts were per-message rather than per-category.  A count here
-    means "rows in this run that failed at this node with this category".
+    means "tokens in this run whose terminal outcome is a failure decided by
+    a transform error at this node, with this category"
+    (:func:`~elspeth.core.landscape.terminal_transform_failures.deciding_transform_errors`),
+    or "tokens in this run whose collector group at this node FAILED, for this
+    recorded reason"
+    (:func:`~elspeth.core.landscape.terminal_transform_failures.deciding_collector_group_failures`).
+    The two arms are disjoint by terminal path, so no token counts twice.
+    It is not a count of ``transform_errors`` rows, which record ATTEMPTS: a
+    crash after the error write leaves the row behind, and the resumed attempt
+    may fail again (a second row for the same token) or succeed and deliver
+    the row (a row for a token that did not fail). A routed token (on_error
+    names a sink) failed and counts here; the category is the deciding
+    attempt's.
 
-    The scan is bounded by ``scan_cap`` to stay safe on runs with very large
-    error counts; accuracy on the long tail is not the goal — naming the
-    dominant failure modes for the operator is.
+    The transform scan is bounded by ``scan_cap`` failed tokens to stay safe
+    on runs with very large error counts; accuracy on the long tail is not the
+    goal — naming the dominant failure modes for the operator is. The collector
+    arm parses one small hold per failed member token and is not capped.
     """
     if limit < 1:
         raise ValueError("limit must be >= 1")
     if scan_cap < limit:
         raise ValueError("scan_cap must be >= limit")
 
-    counter: Counter[tuple[str, str]] = Counter()
+    counter: Counter[tuple[FailureKind, str, str]] = Counter()
     with db.read_only_connection() as conn:
-        stmt = (
-            select(
-                transform_errors_table.c.transform_id,
-                transform_errors_table.c.error_details_json,
-            )
-            .where(transform_errors_table.c.run_id == landscape_run_id)
-            .limit(scan_cap)
-        )
+        # One row per terminally failed token: the error that decided it, at
+        # the node that decided it. An earlier attempt's row (a resumed
+        # attempt failed again, or succeeded and delivered the row) is attempt
+        # evidence and never counts.
+        deciding = deciding_transform_errors((landscape_run_id,)).subquery()
+        stmt = select(deciding.c.transform_id, deciding.c.error_details_json).limit(scan_cap)
         for transform_id, error_details_json in conn.execute(stmt):
             # No NULL guard and no ``WHERE error_details_json IS NOT NULL``:
             # the column is nominally nullable (schema.py: ``Column(..., Text)``)
@@ -197,17 +225,26 @@ def load_top_failure_categories(
             # Aggregate on the FULL node id — bounding is a rendering concern,
             # and truncating here would collapse two distinct long ids into
             # one bucket.
-            counter[(transform_id, _client_safe_category(details))] += 1
+            counter[("transform_error", transform_id, _client_safe_category(details))] += 1
+        # One entry per token whose collector group FAILED, under the reason
+        # its group's verdict records: an engine-authored code from a closed
+        # vocabulary (a CHECK on the verdict row, and the authority refuses a
+        # hold that disagrees with it). The flush state's text is attempt
+        # evidence and is never read. A group no member reached adds nothing
+        # here; the structural collector_groups_failed count carries it.
+        for member in deciding_collector_group_failures(conn, (landscape_run_id,)):
+            counter[("collector_group", member.collector_node_id, member.failure_reason.value)] += 1
 
     return [
-        ClientSafeFailureSummary(transform_id=tid, category=category, count=count) for (tid, category), count in counter.most_common(limit)
+        ClientSafeFailureSummary(kind=kind, transform_id=node_id, category=category, count=count)
+        for (kind, node_id, category), count in counter.most_common(limit)
     ]
 
 
 def format_failure_categories(summaries: list[ClientSafeFailureSummary]) -> str:
     """Render summaries as a single multi-line string suitable for inlining.
 
-    Each summary renders on its own bullet with the row count, the failing
+    Each summary renders on its own bullet with the token count, the failing
     node, and the error category.  The node is shown unconditionally: it is
     half of what the operator needs to act, and hiding it on single-node runs
     (as the previous renderer did) saved a few characters at the cost of the

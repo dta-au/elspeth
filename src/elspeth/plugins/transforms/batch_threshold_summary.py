@@ -11,30 +11,36 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 
 type ThresholdOperator = Literal["<", "<=", ">", ">=", "==", "!="]
 type BatchThresholdSummaryRow = dict[str, object]
 
-_THRESHOLD_OUTPUT_FIELDS = frozenset(
-    {
-        "batch_size",
-        "match_count",
-        "match_rate",
-        "missing_count",
-        "non_finite_count",
-        "non_match_count",
-        "operator",
-        "threshold",
-        "threshold_name",
-        "valid_count",
-        "value_field",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050): the
+# labels are configured strings, ``threshold`` is ``ThresholdSpec.value`` (a
+# pydantic ``float`` field, which holds a float even when the config wrote an
+# int), the counts are ints and ``match_rate`` is the true division
+# ``match_count / valid_count`` (a batch with no valid value is an error
+# before any rate is computed).
+_THRESHOLD_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("match_count", "int"),
+    FieldDefinition("match_rate", "float"),
+    FieldDefinition("missing_count", "int"),
+    FieldDefinition("non_finite_count", "int"),
+    FieldDefinition("non_match_count", "int"),
+    FieldDefinition("operator", "str"),
+    FieldDefinition("threshold", "float"),
+    FieldDefinition("threshold_name", "str"),
+    FieldDefinition("valid_count", "int"),
+    FieldDefinition("value_field", "str"),
 )
+_THRESHOLD_OUTPUT_FIELDS = frozenset(field.name for field in _THRESHOLD_CREATED_FIELDS)
 _MAX_THRESHOLDS = 128
 
 
@@ -103,9 +109,11 @@ class BatchThresholdSummary(BaseTransform):
     name = "batch_threshold_summary"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0674b3782a36ee52"
+    source_file_hash: str | None = "sha256:7cb6f69881bb092a"
     config_model = BatchThresholdSummaryConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use to emit named threshold summary rows containing finite-value match counts and rates for each flushed window."
     )
@@ -144,8 +152,10 @@ class BatchThresholdSummary(BaseTransform):
                 issue_code=None,
                 summary="Counts how many finite numeric batch values match named thresholds.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_threshold_summary under aggregations with a trigger; it emits one summary row per threshold.",
-                    "value_field must be numeric; missing and non-finite values are skipped and counted.",
+                    "value_field must be numeric; missing and non-finite values are skipped and counted, "
+                    "and a non-numeric value fails the whole batch.",
                     "Each threshold needs a unique name, an operator from < <= > >= == !=, and a finite numeric value.",
                     "Output is threshold summary rows, not pass-through source data.",
                 ),
@@ -200,6 +210,10 @@ class BatchThresholdSummary(BaseTransform):
             audit_fields=None,
         )
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed table above: the same fields on every threshold row (ADR-050)."""
+        return _THRESHOLD_CREATED_FIELDS
+
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the threshold output path for the backward invariant."""
         return [
@@ -221,11 +235,15 @@ class BatchThresholdSummary(BaseTransform):
                 missing_indices.append(row_index)
                 continue
 
+            # A wrong TYPE fails the whole batch (elspeth-d5034647f0): no summary
+            # is published over survivors the operator never specified. Raised
+            # here and converted in `process`, because this helper returns values.
             if type(value) not in (int, float):
-                raise TypeError(
-                    f"Field '{self._value_field}' must be numeric (int or float), "
-                    f"got {type(value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                raise BatchRowTypeError(
+                    field=self._value_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(value).__name__,
                 )
 
             if type(value) is float and not math.isfinite(value):
@@ -303,22 +321,6 @@ class BatchThresholdSummary(BaseTransform):
             )
         return results
 
-    def _output_contract_for(self, results: list[BatchThresholdSummaryRow]) -> SchemaContract:
-        """Build one shared output contract for threshold summary rows."""
-        field_names = list(dict.fromkeys(key for result in results for key in result))
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,
-                required=False,
-                source="inferred",
-            )
-            for key in field_names
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
-
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext
     ) -> TransformResult:
@@ -326,7 +328,13 @@ class BatchThresholdSummary(BaseTransform):
         if not rows:
             return TransformResult.error({"reason": "empty_batch"}, retryable=False)
 
-        values, missing_indices, non_finite_indices = self._finite_values_for(rows)
+        try:
+            values, missing_indices, non_finite_indices = self._finite_values_for(rows)
+        except BatchRowTypeError as exc:
+            # The batch records that it failed and why (row, field, expected and
+            # found type; never the value). The aggregation applies its declared
+            # on_error to every buffered row; a collector fails the whole group.
+            return TransformResult.error(exc.as_reason(), retryable=False)
         if not values:
             return self._error_for_no_finite_values(
                 batch_size=len(rows),
@@ -340,7 +348,7 @@ class BatchThresholdSummary(BaseTransform):
             missing_count=len(missing_indices),
             non_finite_count=len(non_finite_indices),
         )
-        output_contract = self._output_contract_for(results)
+        output_contract = self._batch_output_contract(key for result in results for key in result)
         fields_added = [field.normalized_name for field in output_contract.fields]
         pipeline_rows = [PipelineRow(result, output_contract) for result in results]
 

@@ -15,6 +15,7 @@ from elspeth.web.secrets.user_store import RepositoryUserSecretAuthority, UserSe
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import user_secrets_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 
 @dataclass
@@ -51,6 +52,8 @@ class _CapturingAuthority:
 def engine():
     engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return engine
 
 

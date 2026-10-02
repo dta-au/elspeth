@@ -40,8 +40,6 @@ if TYPE_CHECKING:
 def validate_route_destinations(
     route_resolution_map: Mapping[tuple[NodeID, str], RouteDestination],
     available_sinks: set[str],
-    transform_id_map: Mapping[int, NodeID],
-    transforms: Sequence[RowPlugin],
     config_gate_id_map: Mapping[GateName, NodeID] | None = None,
     config_gates: Sequence[GateSettings] | None = None,
 ) -> None:
@@ -53,8 +51,6 @@ def validate_route_destinations(
     Args:
         route_resolution_map: Maps (gate_node_id, route_label) -> resolved destination
         available_sinks: Set of sink names from PipelineConfig
-        transform_id_map: Maps transform sequence -> node_id
-        transforms: List of transform plugins
         config_gate_id_map: Maps config gate name -> node_id
         config_gates: List of config gate settings
 
@@ -103,7 +99,6 @@ def validate_pipeline_route_targets(
     *,
     config: PipelineConfig,
     route_resolution_map: Mapping[tuple[NodeID, str], RouteDestination],
-    transform_id_map: Mapping[int, NodeID],
     config_gate_id_map: Mapping[GateName, NodeID],
     closer_names: frozenset[str] = frozenset(),
 ) -> None:
@@ -126,8 +121,6 @@ def validate_pipeline_route_targets(
     validate_route_destinations(
         route_resolution_map=route_resolution_map,
         available_sinks=available_sinks,
-        transform_id_map=transform_id_map,
-        transforms=config.transforms,
         config_gate_id_map=config_gate_id_map,
         config_gates=config.gates,
     )
@@ -237,10 +230,12 @@ def validate_aggregation_error_sinks(
 ) -> None:
     """Validate aggregation on_error destinations reference existing sinks.
 
-    AggregationSettings.on_error is required ("sink name or 'discard'"), but a
-    ghost sink was only discovered when the first batch actually failed —
-    mid-run, after rows were consumed. Mirror the transform/gate checks and
-    fail at pipeline initialization instead (elspeth-eb4127fb49).
+    The DAG builder is the first wall: it refuses an unknown aggregation
+    on_error sink while it wires the ``__error_<name>__`` DIVERT edge
+    (elspeth-d2e3f29d10). This is the second wall at pipeline initialization,
+    for a PipelineConfig whose aggregation settings reach the orchestrator
+    without that graph — mirroring the transform/gate checks
+    (elspeth-eb4127fb49).
     """
     for settings in aggregation_settings.values():
         on_error = settings.on_error

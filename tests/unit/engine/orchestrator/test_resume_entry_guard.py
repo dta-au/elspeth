@@ -34,10 +34,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 
 from elspeth.contracts import Checkpoint, RunStatus
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError
 from elspeth.core.checkpoint.recovery import NonResumableRunError, check_run_status_resumable
@@ -45,6 +47,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import runs_table
 from elspeth.engine.orchestrator.resume import ResumeCoordinator
 from elspeth.engine.spans import SpanFactory
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
 from tests.helpers.run_coordination import register_run_leader
@@ -61,7 +64,7 @@ def _insert_run(db: LandscapeDB, run_id: str, *, status: RunStatus | str) -> Non
             runs_table.insert().values(
                 run_id=run_id,
                 started_at=datetime.now(UTC),
-                config_hash="cfg",
+                config_hash=fake_sha256("cfg"),
                 settings_json="{}",
                 canonical_version="sha256-rfc8785-v1",
                 status=status,
@@ -188,6 +191,7 @@ class TestCheckRunStatusResumable:
         assert run_status is None
         assert check.can_resume is False
         assert check.reason == "Run missing not found"
+        assert check.cause is ResumeRefusalCause.RUN_NOT_FOUND
 
     @pytest.mark.parametrize(
         ("status", "reason"),
@@ -207,6 +211,7 @@ class TestCheckRunStatusResumable:
         run_status, check = check_run_status_resumable(db, "run-x")
         assert run_status is status
         assert check.can_resume is False
+        assert check.cause is ResumeRefusalCause.RUN_TERMINAL
         assert check.reason == reason
 
     def test_running_with_absent_seat_is_resumable_in_slice_4(self, db: LandscapeDB) -> None:
@@ -293,6 +298,7 @@ class TestResumeEntryGuard:
             )
 
         assert exc_info.value.run_id == "run-running"
+        assert exc_info.value.cause is ResumeRefusalCause.LEADER_LIVE
         assert "in progress" in exc_info.value.reason
         assert checkpoints.rebase_calls == [], "entry guard must fire BEFORE rebase_sequence (the first mutation)"
         assert _run_status_of(db, "run-running") == RunStatus.RUNNING.value
@@ -402,6 +408,7 @@ class TestResumeEntryGuard:
             )
 
         assert exc_info.value.run_id == "run-gone"
+        assert exc_info.value.cause is ResumeRefusalCause.RUN_NOT_FOUND
         assert checkpoints.rebase_calls == []
 
     @pytest.mark.parametrize(
@@ -434,6 +441,7 @@ class TestResumeEntryGuard:
 
         assert exc_info.value.run_id == run_id
         assert status.value in exc_info.value.reason
+        assert exc_info.value.cause is ResumeRefusalCause.RUN_TERMINAL
         assert "immutable" in exc_info.value.reason
         assert checkpoints.rebase_calls == [], "terminal refusal must fire BEFORE rebase_sequence (the first mutation)"
         assert _run_status_of(db, run_id) == status.value
@@ -471,6 +479,32 @@ class TestResumeCheckpointCurrencyGuard:
     the elspeth-2f23292372 status guard above.
     """
 
+    def test_post_search_refused_before_leadership_takeover(self, db: LandscapeDB) -> None:
+        from elspeth.contracts import NodeType, ResumeCheck
+        from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
+        from elspeth.core.dag import ExecutionGraph
+
+        graph = ExecutionGraph()
+        graph.add_node("search", node_type=NodeType.TRANSFORM, plugin_name="web_scrape", config={"method": "POST"})
+        topology_hash = CheckpointCompatibilityValidator().compute_full_topology_hash(graph)
+        run_id = "run-post-resume-refusal"
+        _insert_run(db, run_id, status=RunStatus.FAILED)
+        coordinator, checkpoints = _currency_coordinator(db, latest=_latest_checkpoint(run_id, topology_hash=topology_hash))
+
+        with (
+            patch("elspeth.engine.orchestrator.resume.check_implementation_compatibility", return_value=ResumeCheck(can_resume=True)),
+            pytest.raises(NonResumableRunError, match="pre-dispatch effect reservation") as exc_info,
+        ):
+            coordinator.resume(
+                _full_resume_point(run_id, topology_hash=topology_hash),
+                cast(Any, object()),
+                graph,
+                payload_store=MockPayloadStore(),
+            )
+
+        assert exc_info.value.cause is ResumeRefusalCause.UNCERTAIN_REMOTE_EFFECT
+        assert checkpoints.rebase_calls == []
+
     def test_missing_latest_checkpoint_refused_before_any_mutation(self, db: LandscapeDB) -> None:
         """A run with no checkpoint rows cannot validate a supplied resume point."""
         _insert_run(db, "run-no-cp", status=RunStatus.FAILED)
@@ -485,6 +519,7 @@ class TestResumeCheckpointCurrencyGuard:
             )
 
         assert exc_info.value.run_id == "run-no-cp"
+        assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_MISSING
         assert checkpoints.rebase_calls == [], "refusal must fire BEFORE rebase_sequence (the first mutation)"
 
     def test_stale_checkpoint_id_refused_before_any_mutation(self, db: LandscapeDB) -> None:
@@ -504,6 +539,7 @@ class TestResumeCheckpointCurrencyGuard:
             )
 
         assert "cp-old" in exc_info.value.reason
+        assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_NOT_LATEST
         assert "cp-latest" in exc_info.value.reason
         assert checkpoints.rebase_calls == []
 
@@ -520,13 +556,14 @@ class TestResumeCheckpointCurrencyGuard:
             latest=_latest_checkpoint("run-stale-seq", checkpoint_id="cp-1", sequence_number=9),
         )
 
-        with pytest.raises(NonResumableRunError, match=r"not the run's latest resume point"):
+        with pytest.raises(NonResumableRunError, match=r"not the run's latest resume point") as exc_info:
             coordinator.resume(
                 _full_resume_point("run-stale-seq", checkpoint_id="cp-1", sequence_number=7),
                 cast(Any, None),
                 cast(Any, None),
                 payload_store=MockPayloadStore(),
             )
+        assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_NOT_LATEST
 
         assert checkpoints.rebase_calls == []
 
@@ -559,6 +596,7 @@ class TestResumeCheckpointCurrencyGuard:
             )
 
         assert exc_info.value.run_id == "run-topo-drift"
+        assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_TOPOLOGY_CHANGED
         assert checkpoints.rebase_calls == []
 
     def test_stored_latest_topology_refused_even_when_hand_built_resume_point_claims_current_hash(self, db: LandscapeDB) -> None:
@@ -592,18 +630,11 @@ class TestResumeCheckpointCurrencyGuard:
             )
 
         assert exc_info.value.run_id == "run-stored-topo-drift"
+        assert exc_info.value.cause is ResumeRefusalCause.CHECKPOINT_TOPOLOGY_CHANGED
         assert checkpoints.rebase_calls == []
 
-    def test_current_checkpoint_and_matching_topology_admitted(self, db: LandscapeDB) -> None:
-        """Positive control: a current, topology-matching point passes the guard.
-
-        Admission is proven by ``rebase_sequence`` being reached (the first
-        mutation after the guard); the resume then fails downstream inside
-        ``reconstruct_resume_state`` on this fixture's bare runs row, which is
-        expected — the guard must refuse stale points without over-blocking
-        current ones.
-        """
-        from elspeth.contracts.errors import AuditIntegrityError
+    def test_current_checkpoint_without_implementation_baseline_refused(self, db: LandscapeDB) -> None:
+        """A matching topology cannot replace the registered implementation baseline."""
         from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
         from elspeth.engine.orchestrator import PipelineConfig
         from tests.fixtures.base_classes import as_sink, as_source
@@ -624,7 +655,7 @@ class TestResumeCheckpointCurrencyGuard:
             latest=_latest_checkpoint("run-current-cp", topology_hash=current_hash),
         )
 
-        with pytest.raises(AuditIntegrityError, match=r"no runtime VAL manifest stored"):
+        with pytest.raises(NonResumableRunError, match="implementation baseline") as exc_info:
             coordinator.resume(
                 _full_resume_point("run-current-cp", topology_hash=current_hash),
                 cast(Any, config),
@@ -632,4 +663,5 @@ class TestResumeCheckpointCurrencyGuard:
                 payload_store=MockPayloadStore(),
             )
 
-        assert checkpoints.rebase_calls == [7], "a current resume point must be admitted past the guard"
+        assert exc_info.value.cause is ResumeRefusalCause.PLUGIN_IMPLEMENTATION_CHANGED
+        assert checkpoints.rebase_calls == []

@@ -944,8 +944,8 @@ def test_undecodable_bytes_are_a_value_level_error() -> None:
     assert result.reason["encoding"] == "utf-8"
 
 
-def test_missing_data_key_lists_the_available_keys() -> None:
-    body = json.dumps({"payload": []}).encode()
+def test_missing_data_key_names_the_configured_key_not_the_documents_keys() -> None:
+    body = json.dumps({"SENTINEL_KEY": []}).encode()
 
     result = _run_blob(body, data_key="documents")
 
@@ -953,7 +953,10 @@ def test_missing_data_key_lists_the_available_keys() -> None:
     assert result.reason is not None
     assert result.reason["reason"] == "invalid_input"
     assert result.reason["error_type"] == "data_key_not_found"
-    assert result.reason["available_fields"] == ["payload"]
+    assert "'documents'" in result.reason["error"]
+    # The document's own keys are row data (not emitted as field names): never listed (C3).
+    assert "available_fields" not in result.reason
+    assert "SENTINEL_KEY" not in repr(result.reason)
 
 
 def test_data_key_pointing_at_a_non_array_is_a_value_level_error() -> None:
@@ -1012,7 +1015,8 @@ def test_malformed_blob_ref_is_a_value_level_error(tmp_path: Path) -> None:
     assert result.reason is not None
     assert result.reason["reason"] == "invalid_input"
     assert result.reason["error_type"] == "invalid_blob_ref"
-    assert result.reason["blob_ref"] == "not-a-sha256"
+    # An unvalidated ref is arbitrary row text: the reason names the field, never the value.
+    assert "not-a-sha256" not in repr(result.reason)
 
 
 def test_non_string_blob_ref_routes_as_a_row_error(tmp_path: Path) -> None:

@@ -161,6 +161,10 @@ class TestCleanupDoesNotMaskPendingException:
 
         events = [entry["event"] for entry in captured]
         assert "Plugin cleanup failed during exception propagation; original error preserved" in events
+        aggregate_log = next(
+            entry for entry in captured if entry["event"] == "Plugin cleanup failed during exception propagation; original error preserved"
+        )
+        assert aggregate_log["run_id"] == "test"
 
     def test_cleanup_failure_without_pending_exception_still_raises(self) -> None:
         """The success path must surface cleanup failures, not swallow them."""
@@ -199,6 +203,7 @@ class TestCleanupDoesNotMaskPendingException:
         assert "<redacted-plugin-error>" not in public_error
 
         hook_log = next(entry for entry in captured if entry["event"] == "Plugin cleanup hook failed")
+        assert hook_log["run_id"] == "test"
         assert hook_log["error"] == "sink close failure"
 
     def test_cleanup_failure_public_surfaces_scrub_plugin_error_text(self) -> None:
@@ -225,6 +230,7 @@ class TestCleanupDoesNotMaskPendingException:
         assert "<redacted-secret>" in public_error
 
         hook_log = next(entry for entry in captured if entry["event"] == "Plugin cleanup hook failed")
+        assert hook_log["run_id"] == "test"
         assert hook_log["hook"] == "sink.close"
         assert hook_log["plugin"] == "default"
         assert hook_log["error_type"] == "RuntimeError"

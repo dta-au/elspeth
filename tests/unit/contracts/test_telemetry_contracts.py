@@ -45,6 +45,7 @@ from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.telemetry import TelemetryManager
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.mock_audit import mock_item_audit_authority
 from tests.fixtures.pipeline import build_production_graph
 from tests.fixtures.plugins import CollectSink, ListSource, PassTransform
 from tests.fixtures.telemetry import MockTelemetryConfig, TelemetryTestExporter
@@ -179,6 +180,7 @@ class TestAuditedLLMClientTelemetryContract:
             emitted_events.append(event)
 
         client = AuditedLLMClient(
+            **mock_item_audit_authority("run_abc"),
             execution=execution,
             state_id="state_123",
             underlying_client=openai_client,
@@ -228,6 +230,7 @@ class TestAuditedLLMClientTelemetryContract:
             emitted_events.append(event)
 
         client = AuditedLLMClient(
+            **mock_item_audit_authority("run_abc"),
             execution=execution,
             state_id="state_123",
             underlying_client=openai_client,
@@ -284,6 +287,7 @@ class TestAuditedHTTPClientTelemetryContract:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_item_audit_authority("run_abc"),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com",
@@ -324,6 +328,7 @@ class TestAuditedHTTPClientTelemetryContract:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_item_audit_authority("run_abc"),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com",
@@ -361,6 +366,7 @@ class TestAuditedHTTPClientTelemetryContract:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_item_audit_authority("run_abc"),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com",
@@ -564,6 +570,7 @@ class TestPluginTelemetryThroughAuditedClients:
             exporter.export(event)
 
         client = AuditedLLMClient(
+            **mock_item_audit_authority("run-1"),
             execution=execution,
             state_id="state-1",
             run_id="run-1",
@@ -604,6 +611,7 @@ class TestPluginTelemetryThroughAuditedClients:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_item_audit_authority("run-1"),
                 execution=execution,
                 state_id="state-1",
                 run_id="run-1",
@@ -654,6 +662,7 @@ class TestTelemetryEmissionOrderContract:
             call_order.append("telemetry")
 
         client = AuditedLLMClient(
+            **mock_item_audit_authority("run-1"),
             execution=execution,
             state_id="state-1",
             run_id="run-1",
@@ -691,6 +700,7 @@ class TestTelemetryEmissionOrderContract:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_item_audit_authority("run-1"),
                 execution=execution,
                 state_id="state-1",
                 run_id="run-1",
@@ -722,6 +732,7 @@ class TestTelemetryEmissionOrderContract:
             emitted_events.append(event)
 
         client = AuditedLLMClient(
+            **mock_item_audit_authority("run-1"),
             execution=execution,
             state_id="state-1",
             run_id="run-1",
@@ -765,6 +776,7 @@ class TestTelemetryFailureIsolationContract:
             raise RuntimeError("Telemetry export failed!")
 
         client = AuditedLLMClient(
+            **mock_item_audit_authority("run-1"),
             execution=execution,
             state_id="state-1",
             run_id="run-1",
@@ -801,6 +813,7 @@ class TestTelemetryFailureIsolationContract:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_item_audit_authority("run-1"),
                 execution=execution,
                 state_id="state-1",
                 run_id="run-1",

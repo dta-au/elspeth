@@ -16,4 +16,4 @@ Use these maintained sources instead:
   token outcome requirements.
 - [ADR index](adr/README.md) for accepted architecture decisions.
 
-Active delivery requirements and acceptance criteria are tracked in Filigree.
+Active delivery requirements and acceptance criteria are tracked in GitHub Issues.

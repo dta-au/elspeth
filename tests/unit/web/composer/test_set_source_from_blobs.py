@@ -27,8 +27,9 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import fenced_operation_context
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 from .test_tools import _mock_catalog, _trained_tool_context
 
@@ -60,7 +61,9 @@ def harness(tmp_path):
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
-    DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
+    FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     blob_service = BlobServiceImpl(engine, tmp_path)
     session_id = str(uuid4())
     from datetime import UTC, datetime
@@ -111,6 +114,17 @@ def _run(harness, arguments: dict[str, Any], state: CompositionState | None = No
 
 
 class TestSetSourceFromBlobs:
+    @pytest.mark.parametrize("destination", ["discard", "missing-quarantine"])
+    def test_destination_error_is_structured_without_redundant_note(self, harness, destination: str) -> None:
+        blob_id = _create_ready_blob(harness, content=_PNG, filename="page.png", mime_type="image/png")
+        result = _run(harness, {"blob_ids": [blob_id], "on_success": "documents", "on_validation_failure": destination})
+
+        assert result.success, _first_error(result)
+        assert "note" not in result.data
+        assert result.data["source_blobs"][0]["blob_id"] == blob_id
+        codes = [entry.error_code for entry in result.validation.errors]
+        assert codes.count("quarantine_unknown_output") == (0 if destination == "discard" else 1)
+
     def test_binds_ready_blobs_in_order_with_authoritative_fields(self, harness) -> None:
         import hashlib
 
@@ -163,6 +177,7 @@ class TestSetSourceFromBlobs:
 
         other_session = str(uuid4())
         with engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="mallory")
             conn.execute(
                 insert(sessions_table).values(
                     id=other_session,

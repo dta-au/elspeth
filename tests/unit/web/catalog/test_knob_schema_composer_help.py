@@ -14,6 +14,7 @@ import json
 import types
 
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import BaseModel, Field
 
 from elspeth.contracts.schema import FIELD_TYPE_MAP, SchemaConfig
@@ -160,14 +161,7 @@ def test_schema_help_placeholder_is_accepted_by_the_parser() -> None:
 
 
 def test_schema_placeholder_is_attached_to_the_schema_knob() -> None:
-    """F5-5b landed atomically: the schema knob now carries the placeholder.
-
-    ``placeholder`` is inside the closed knob-field vocabularies in
-    ``web/composer/guided/protocol.py`` (``_validate_knob_schema``) and the
-    frontend guided decoder, so emitting it on ``schema`` — a field on 46 of 47
-    data plugins — is safe for every guided schema_form turn (construction,
-    durable load, and replay).
-    """
+    """The catalog's schema knob carries the Composer help placeholder."""
     extra = DataPluginConfig.model_fields["schema_config"].json_schema_extra
     assert isinstance(extra, dict)
     assert extra["composer_placeholder"] == COMPOSER_SCHEMA_PLACEHOLDER
@@ -327,3 +321,28 @@ class TestComposerExtrasAreReadNotSilentlySkipped:
         """Fail closed: an unreadable hidden flag must not degrade to 'not hidden'."""
         with pytest.raises(TypeError, match="composer_hidden"):
             _lower(_extras_model({"composer_hidden": "true"}))
+
+
+def test_schema_help_example_is_accepted_by_the_emitted_json_schema() -> None:
+    """Anti-rot twin: the gate must admit the shape the help text mandates.
+
+    ``test_schema_help_example_is_accepted_by_the_parser`` proves the PARSER
+    boundary, but a profile-bound node never reaches the parser first:
+    ``web.plugin_policy.validation`` runs ``Draft202012Validator`` over the
+    AUTHORED options against the emitted validation-mode JSON Schema before any
+    config is constructed.  While that schema described the parser's OUTPUT
+    (``FieldDefinition`` objects) rather than its INPUT, every composer-authored
+    node carrying explicit string ``schema.fields`` was refused as
+    ``profile_unavailable`` with ``failing=['schema/fields']`` — the gate
+    rejecting the one form its own ``composer_description`` instructs the model
+    to write.  The two boundaries must agree, so assert both here.
+    """
+    validator = Draft202012Validator(DataPluginConfig.model_json_schema())
+
+    for authored in (
+        json.loads(json.dumps(COMPOSER_SCHEMA_EXAMPLE)),
+        json.loads(COMPOSER_SCHEMA_PLACEHOLDER),
+        {"mode": "observed"},
+    ):
+        failing = sorted("/".join(str(part) for part in error.absolute_path) for error in validator.iter_errors({"schema": authored}))
+        assert failing == [], f"emitted JSON Schema rejects authored {authored!r}: {failing}"

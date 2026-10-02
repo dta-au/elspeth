@@ -9,7 +9,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Literal, cast
+from typing import Any, cast
 from uuid import UUID
 
 from pydantic import JsonValue
@@ -24,6 +24,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json as primitive_canonical_json
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
@@ -37,17 +38,15 @@ from elspeth.web.composer.authority_hashing import (
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
-    PlannerSurface,
     PresentBase,
     composition_content_hash,
     is_owned_composition_state_authority,
     owned_composition_state_execution_arguments,
     restore_owned_composition_state_authority,
 )
-from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments
+from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments, semantic_redacted_pipeline_arguments_hash
 from elspeth.web.composer.reviewed_source_authority import (
     resolve_owned_composition_source_authority,
-    resolve_reviewed_source_authority,
 )
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import RuntimePreflight, ToolContext, ToolResult
@@ -55,7 +54,7 @@ from elspeth.web.composer.tools._dispatch import execute_tool
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
-from elspeth.web.sessions.protocol import AuthoritativePipelineProposal
+from elspeth.web.sessions.protocol import AuthoritativePipelineProposal, SessionOperationAuthority
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
@@ -212,11 +211,15 @@ class PipelineDispatchAuditBinding:
             raise AuditIntegrityError("persisted pipeline dispatch payload is malformed") from exc
         if invocation.get("result_hash") != result_hash:
             raise AuditIntegrityError("persisted pipeline dispatch canonical hashes are malformed")
-        normalized_arguments = normalize_set_pipeline_redacted_arguments(restored_arguments)
-        if type(normalized_arguments) is not dict:
+        if type(restored_arguments) is not dict:
             raise AuditIntegrityError("persisted pipeline dispatch arguments are malformed")
+        # Restored arguments already occupy the canonical domain. Rehashing an
+        # unchanged reserved mapping would escape its canonical wrapper again.
+        normalized_arguments = normalize_set_pipeline_redacted_arguments(restored_arguments)
         semantic_arguments_hash = (
-            stored_authority_hash if normalized_arguments is restored_arguments else composer_authority_hash(normalized_arguments)
+            stored_authority_hash
+            if normalized_arguments is restored_arguments
+            else semantic_redacted_pipeline_arguments_hash(restored_arguments)
         )
         return cls(
             tool_call_id=tool_call_id,
@@ -269,6 +272,8 @@ class PipelineCommitMismatchError(PipelineCommitError):
 class PipelineCommitConfig:
     data_dir: str
     session_engine: Engine | None
+    session_operation_context: SessionOperationContext
+    session_operation_authority: SessionOperationAuthority
     secret_service: WebSecretResolver | None
     user_id: str | None
     user_message_content: str | None
@@ -280,6 +285,10 @@ class PipelineCommitConfig:
     secret_wiring_policy: SecretWiringPolicy | None = None
 
     def __post_init__(self) -> None:
+        if type(self.session_operation_context) is not SessionOperationContext:
+            raise TypeError("pipeline commit requires the actual session operation context")
+        if self.session_operation_authority is None:
+            raise TypeError("pipeline commit requires the service-owned session operation authority")
         if type(self.data_dir) is not str or not self.data_dir.strip():
             raise ValueError("data_dir must be a non-empty exact string")
         if self.user_id is not None and (type(self.user_id) is not str or not self.user_id.strip()):
@@ -355,7 +364,6 @@ def _bind_executor_content_hash(
 async def prepare_pipeline_proposal_commit(
     *,
     authority: AuthoritativePipelineProposal,
-    reviewed_facts: Mapping[str, Any],
     current_state: CompositionState,
     current_state_id: UUID | None,
     policy_catalog: PolicyCatalogView,
@@ -363,22 +371,14 @@ async def prepare_pipeline_proposal_commit(
     config: PipelineCommitConfig,
     recorder: BufferingRecorder,
     actor: str,
-    settlement_surface: Literal["generic", "guided"],
     recovery_dispatch: PipelineDispatchAuditBinding | None = None,
     recovery_executor_content_hash: str | None = None,
 ) -> PreparedPipelineCommit | RecoveredPipelineCommit:
     """Revalidate and audited-dispatch exact arguments; never settle state."""
     if type(authority) is not AuthoritativePipelineProposal:
         raise TypeError("authority must be an exact AuthoritativePipelineProposal")
-    if settlement_surface not in {"generic", "guided"}:
-        raise ValueError("settlement_surface is outside the closed vocabulary")
-    if settlement_surface == "generic" and authority.proposal.surface in {
-        PlannerSurface.GUIDED_STAGED,
-        PlannerSurface.TUTORIAL_PROFILE,
-    }:
-        raise PipelineCommitError("generic route cannot settle staged pipeline proposals", code="SURFACE_REQUIRES_GUIDED")
-    if settlement_surface == "guided" and authority.proposal.surface is PlannerSurface.FREEFORM:
-        raise PipelineCommitError("guided route cannot settle freeform pipeline proposals", code="SURFACE_REQUIRES_GENERIC")
+    if config.session_operation_context.fence.session_id != str(authority.row.session_id):
+        raise AuditIntegrityError("pipeline commit context does not match the proposal session")
     if authority.row.status != "pending":
         raise PipelineCommitError("pipeline proposal is not pending", code="NOT_PENDING")
     if policy_catalog.snapshot is not plugin_snapshot:
@@ -438,20 +438,15 @@ async def prepare_pipeline_proposal_commit(
             state=proposed_state,
         )
     else:
-        reviewed_source_authority = await bounded(
-            resolve_reviewed_source_authority,
-            engine=config.session_engine,
-            session_id=str(authority.row.session_id),
-            user_id=config.user_id,
-            reviewed_facts=reviewed_facts,
-            expected_reviewed_anchor_hash=authority.proposal.reviewed_anchor_hash,
-        )
+        reviewed_source_authority = None
     context = ToolContext(
         catalog=policy_catalog,
         plugin_snapshot=plugin_snapshot,
         data_dir=config.data_dir,
         require_data_dir_for_paths=True,
         session_engine=config.session_engine,
+        session_operation_context=config.session_operation_context,
+        session_operation_authority=config.session_operation_authority,
         session_id=str(authority.row.session_id),
         secret_service=config.secret_service,
         secret_wiring_policy=config.secret_wiring_policy,
@@ -517,6 +512,8 @@ async def prepare_pipeline_proposal_commit(
                 plugin_snapshot=plugin_snapshot,
                 data_dir=config.data_dir,
                 session_engine=config.session_engine,
+                session_operation_context=config.session_operation_context,
+                session_operation_authority=config.session_operation_authority,
                 session_id=str(authority.row.session_id),
                 secret_service=config.secret_service,
                 secret_wiring_policy=config.secret_wiring_policy,
@@ -544,8 +541,8 @@ async def prepare_pipeline_proposal_commit(
         do_dispatch=execute_exact,
         version_after_provider=lambda result: result.updated_state.version,
         arg_error_payload_factory=lambda exc: {
-            "error_class": "ToolArgumentError",
-            "error_code": exc.code or "argument_error",
+            "error_class": type(exc).__name__,
+            "error_code": exc.category.value,
         },
     )
     result = outcome.result

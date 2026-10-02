@@ -9,90 +9,98 @@ The actual resume logic (Orchestrator.resume()) is implemented separately.
 
 from __future__ import annotations
 
-import json
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.engine import Row
 
 from elspeth.contracts import (
     Checkpoint,
-    PayloadNotFoundError,
-    PayloadStore,
-    PipelineRow,
-    PluginSchema,
     ResumeCheck,
-    ResumedRow,
     ResumePoint,
     RunStatus,
     SchemaContract,
-    TerminalPath,
 )
 from elspeth.contracts.barrier_scalars import BarrierScalars
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError
-from elspeth.contracts.freeze import deep_freeze, freeze_fields
-from elspeth.contracts.identity import LineageFrame
-from elspeth.contracts.types import NodeID
-from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator, IncompatibleCheckpointError
+from elspeth.contracts.freeze import freeze_fields
+from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError, CheckpointManager
 from elspeth.core.checkpoint.serialization import checkpoint_loads
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
-from elspeth.core.landscape.scheduler import BarrierJournalRepository, SchedulerEventStore
+from elspeth.core.landscape.scheduler import BarrierJournalRepository, SchedulerEventStore, SchedulerReadModel
 from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.schema import (
     SOURCE_COMPLETE_LIFECYCLE_STATES,
     group_losses_table,
     group_records_table,
     node_states_table,
-    rows_table,
     run_sources_table,
     runs_table,
     token_lineage_frames_table,
     token_outcomes_table,
     token_work_items_table,
-    tokens_table,
 )
 
 if TYPE_CHECKING:
     from elspeth.core.dag import ExecutionGraph
 
-# SQLite's SQLITE_MAX_VARIABLE_NUMBER defaults to 999. We chunk IN clauses
-# at 500 to leave headroom for other query parameters in the same statement.
-_METADATA_CHUNK_SIZE = 500
 _CHECKPOINT_STATE_CACHE_MAX = 16
-_DELEGATION_PATHS = (TerminalPath.FORK_PARENT.value, TerminalPath.EXPAND_PARENT.value)
 _RESUMABLE_RUN_STATUSES = frozenset({RunStatus.FAILED, RunStatus.INTERRUPTED})
 # (checkpoint_id, barrier_scalars_json) — keyed by payload so a re-read of the
 # same checkpoint row with mutated JSON cannot serve a stale deserialization.
 _CheckpointStateCacheKey = tuple[str, str | None]
 
 
-def _reject_source_row_json_constant(constant: str) -> Any:
-    raise AuditIntegrityError(f"non-finite JSON constant {constant!r} - NaN/Infinity are not valid audit values")
-
-
 __all__ = [
     "GroupBindingView",
     "GroupSatisfiabilityResumeGate",
     "GroupUnsatisfiableResumeError",
-    "IncompleteTokenSpec",
     "NonResumableRunError",
     "RecoveryManager",
     "ResumeCheck",  # Re-exported from contracts for convenience
     "ResumePoint",  # Re-exported from contracts for convenience
-    "ResumeWorkSet",
     "SourceLifecycleResumeGate",
     "UnsatisfiableGroupMember",
     "check_group_satisfiability_resumable",
+    "check_http_effects_resumable",
     "check_run_status_resumable",
     "check_source_lifecycle_resumable",
     "group_binding_view_from_graph",
 ]
+
+
+def check_http_effects_resumable(graph: ExecutionGraph) -> ResumeCheck:
+    """Refuse automatic re-dispatch of a web search POST after interruption.
+
+    The HTTP call is recorded after network dispatch. A process can die after
+    the remote server accepts a POST but before its call reaches Landscape;
+    scheduler recovery cannot distinguish that state from an unsent request.
+    Until a pre-dispatch reservation and reconciliation record exist, even a
+    read-only POST search must be resumed by an operator, not automatically.
+    The same pure gate serves advisory and enforcing resume admission.
+    """
+    for node in graph.get_nodes():
+        if node.plugin_name != "web_scrape":
+            continue
+        method = node.config.get("method", "GET")
+        if method != "GET":
+            return ResumeCheck(
+                can_resume=False,
+                reason=(
+                    f"web_scrape method {method!r} has no pre-dispatch effect reservation; "
+                    "a prior request may have reached the remote service without an audit call"
+                ),
+                cause=ResumeRefusalCause.UNCERTAIN_REMOTE_EFFECT,
+            )
+    return ResumeCheck(can_resume=True)
 
 
 # TIER-2: Operator-interpretable refuse signal — the audit DB is intact and
@@ -103,7 +111,7 @@ __all__ = [
 # (contrast the run-immutability guard's AuditIntegrityError in
 # RunLifecycleRepository.update_run_status).
 class NonResumableRunError(Exception):
-    """Raised by ``ResumeCoordinator.resume()`` when run status precludes resume.
+    """Operational refusal of resume or export admission with its observed cause.
 
     ``RecoveryManager.can_resume()`` is ADVISORY — callers may skip it — so
     ``resume()`` re-checks the run status at entry via the same shared
@@ -115,9 +123,10 @@ class NonResumableRunError(Exception):
     without parsing the exception text.
     """
 
-    def __init__(self, run_id: str, reason: str) -> None:
+    def __init__(self, run_id: str, reason: str, *, cause: ResumeRefusalCause) -> None:
         self.run_id = run_id
         self.reason = reason
+        self.cause = cause
         super().__init__(f"Cannot resume run {run_id!r}: {reason}")
 
 
@@ -146,7 +155,7 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
     """
     run = _fetch_run(db, run_id)
     if run is None:
-        return None, ResumeCheck(can_resume=False, reason=f"Run {run_id} not found")
+        return None, ResumeCheck(can_resume=False, reason=f"Run {run_id} not found", cause=ResumeRefusalCause.RUN_NOT_FOUND)
 
     try:
         run_status = RunStatus(run.status)
@@ -154,7 +163,7 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
         raise CheckpointCorruptionError(f"Run {run_id} has invalid status {run.status!r}; audit trail is corrupt") from exc
 
     if run_status == RunStatus.COMPLETED:
-        return run_status, ResumeCheck(can_resume=False, reason="Run already completed successfully")
+        return run_status, ResumeCheck(can_resume=False, reason="Run already completed successfully", cause=ResumeRefusalCause.RUN_TERMINAL)
 
     if run_status == RunStatus.RUNNING:
         # §B.3 + §H test #2(c) (epoch 21, ADR-030, slice 4 flip):
@@ -177,12 +186,14 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
                 f"(seat expires {leader.leader_heartbeat_expires_at.isoformat()}) — "
                 "use `elspeth join` to attach as a follower"
             )
-            return run_status, ResumeCheck(can_resume=False, reason=reason)
+            return run_status, ResumeCheck(can_resume=False, reason=reason, cause=ResumeRefusalCause.LEADER_LIVE)
         # Seat is absent or expired: dead-leader takeover path → resumable.
         return run_status, ResumeCheck(can_resume=True)
 
     if run_status not in _RESUMABLE_RUN_STATUSES:
-        return run_status, ResumeCheck(can_resume=False, reason=f"Run status {run_status.value!r} is not resumable")
+        return run_status, ResumeCheck(
+            can_resume=False, reason=f"Run status {run_status.value!r} is not resumable", cause=ResumeRefusalCause.RUN_TERMINAL
+        )
 
     return run_status, ResumeCheck(can_resume=True)
 
@@ -225,8 +236,9 @@ def check_source_lifecycle_resumable(db: LandscapeDB, run_id: str) -> SourceLife
     the enforcing ``IncompleteSourceResumeError`` guard in
     ``ResumeCoordinator.resume()`` — the two must never drift
     (elspeth-1f5b83cd28; same parity contract as
-    :func:`check_run_status_resumable`, elspeth-2f23292372). Resume replays
-    only persisted row payloads through NullSource, so a source that never
+    :func:`check_run_status_resumable`, elspeth-2f23292372). Resume never
+    reopens a source (NullSource stands in): it re-drives only the durable
+    scheduler work of rows the run already ingested, so a source that never
     reached a complete lifecycle state (``SOURCE_COMPLETE_LIFECYCLE_STATES``)
     may have unread rows that no resume can recover.
     """
@@ -245,7 +257,7 @@ def check_source_lifecycle_resumable(db: LandscapeDB, run_id: str) -> SourceLife
         return SourceLifecycleResumeGate(
             lifecycle_by_source=lifecycle_by_source,
             incomplete_sources=incomplete_sources,
-            check=ResumeCheck(can_resume=False, reason=reason),
+            check=ResumeCheck(can_resume=False, reason=reason, cause=ResumeRefusalCause.SOURCE_NOT_EXHAUSTED),
         )
     return SourceLifecycleResumeGate(
         lifecycle_by_source=lifecycle_by_source,
@@ -435,10 +447,14 @@ def check_group_satisfiability_resumable(
             )
             .distinct()
         ).fetchall()
-        fork_member_pairs = [(str(row.group_id), str(row.member_key)) for row in fork_rows]
+        # One pass over the result: rescanning every (group, member) pair once per
+        # group made this check quadratic in the group count (#187).
+        fork_members_by_group: defaultdict[str, set[str]] = defaultdict(set)
+        for row in fork_rows:
+            fork_members_by_group[str(row.group_id)].add(str(row.member_key))
 
-        for group_id in sorted({pair_group_id for pair_group_id, _ in fork_member_pairs}):
-            seen = {member_key for pair_group_id, member_key in fork_member_pairs if pair_group_id == group_id}
+        for group_id in sorted(fork_members_by_group):
+            seen = fork_members_by_group[group_id]
             bound = {member for member in seen if member in bindings.fork_branch_closers}
             if not bound:
                 continue  # fully unbound fork: pure fan-out, no roster watching
@@ -522,7 +538,7 @@ def check_group_satisfiability_resumable(
         )
         return GroupSatisfiabilityResumeGate(
             unsatisfiable_members=tuple(unsatisfiable),
-            check=ResumeCheck(can_resume=False, reason=reason),
+            check=ResumeCheck(can_resume=False, reason=reason, cause=ResumeRefusalCause.GROUP_UNSATISFIABLE),
         )
     return GroupSatisfiabilityResumeGate(unsatisfiable_members=(), check=ResumeCheck(can_resume=True))
 
@@ -555,89 +571,14 @@ def group_binding_view_from_graph(graph: ExecutionGraph) -> GroupBindingView:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class IncompleteTokenSpec:
-    """A non-delegation child token that lacks a terminal outcome on a resumed run.
-
-    Identity fields read directly from persisted columns (Tier-1: no defaults,
-    no coercion). ``token_data_ref`` is NULL for fork children and set for
-    expand children and post-coalesce merged tokens.
-    """
-
-    token_id: str
-    row_id: str
-    join_group_id: str | None
-    lineage_path: tuple[LineageFrame, ...]
-    token_data_ref: str | None
-    step_in_pipeline: int | None
-    max_attempt: int
-
-    def __post_init__(self) -> None:
-        """Validate Tier-1 identity invariants at construction time."""
-        for field_name, identity_value in (
-            ("token_id", self.token_id),
-            ("row_id", self.row_id),
-        ):
-            if not isinstance(identity_value, str):
-                raise TypeError(f"IncompleteTokenSpec.{field_name} must be str, got {type(identity_value).__name__}: {identity_value!r}")
-            if not identity_value:
-                raise ValueError(f"IncompleteTokenSpec.{field_name} must not be empty")
-        for field_name, optional_identity_value in (
-            ("join_group_id", self.join_group_id),
-            ("token_data_ref", self.token_data_ref),
-        ):
-            if optional_identity_value is not None:
-                if not isinstance(optional_identity_value, str):
-                    raise TypeError(
-                        f"IncompleteTokenSpec.{field_name} must be str or None, "
-                        f"got {type(optional_identity_value).__name__}: {optional_identity_value!r}"
-                    )
-                if not optional_identity_value:
-                    raise ValueError(f"IncompleteTokenSpec.{field_name} must be None or non-empty string, got {optional_identity_value!r}")
-
-
-@dataclass(frozen=True, slots=True)
-class ResumeWorkSet:
-    """Rows and token continuations that resume must restore for a run."""
-
-    row_ids: tuple[str, ...]
-    incomplete_by_row: Mapping[str, tuple[IncompleteTokenSpec, ...]]
-    buffered_token_ids: frozenset[str]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "row_ids", tuple(self.row_ids))
-        object.__setattr__(
-            self,
-            "incomplete_by_row",
-            deep_freeze({row_id: tuple(specs) for row_id, specs in self.incomplete_by_row.items()}),
-        )
-        object.__setattr__(self, "buffered_token_ids", frozenset(self.buffered_token_ids))
-
-
-def _resume_token_predicates(run_id: str) -> tuple[Any, Any]:
-    """Shared delegation/terminal token predicates for resume work-set queries."""
-    delegation_tokens = (
-        select(token_outcomes_table.c.token_id)
-        .where(token_outcomes_table.c.run_id == run_id)
-        .where(token_outcomes_table.c.path.in_(_DELEGATION_PATHS))
-    ).scalar_subquery()
-    terminal_tokens = (
-        select(token_outcomes_table.c.token_id)
-        .where(token_outcomes_table.c.run_id == run_id)
-        .where(token_outcomes_table.c.completed == 1)
-        .where(~token_outcomes_table.c.path.in_(_DELEGATION_PATHS))
-    ).scalar_subquery()
-    return delegation_tokens, terminal_tokens
-
-
 class RecoveryManager:
     """Manages recovery of failed runs from checkpoints.
 
     Recovery protocol:
     1. Check if run can be resumed (failed status + checkpoint exists)
     2. Load checkpoint and barrier scalar metadata
-    3. Identify unprocessed rows (sequence > checkpoint.sequence)
-    4. Resume processing from checkpoint position
+    3. Resume re-drives the run's durable scheduler work (READY / LEASED /
+       BLOCKED / PENDING_SINK items); no source row is ever re-derived
 
     Usage:
         recovery = RecoveryManager(db, checkpoint_manager)
@@ -658,54 +599,6 @@ class RecoveryManager:
         self._db = db
         self._checkpoint_manager = checkpoint_manager
         self._checkpoint_state_cache: dict[_CheckpointStateCacheKey, BarrierScalars | None] = {}
-
-    @staticmethod
-    def _restore_row_data(
-        row_id: str,
-        source_data_ref: str,
-        payload_store: PayloadStore,
-        source_schema_class: type[PluginSchema],
-    ) -> dict[str, object]:
-        try:
-            payload_bytes = payload_store.retrieve(source_data_ref)
-        except PayloadNotFoundError as exc:
-            raise ValueError(f"Row {row_id} payload has been purged (hash={exc.content_hash}) - cannot resume") from exc
-
-        try:
-            degraded_data = json.loads(
-                payload_bytes.decode("utf-8"),
-                parse_constant=_reject_source_row_json_constant,
-            )
-        except (UnicodeDecodeError, json.JSONDecodeError, AuditIntegrityError) as exc:
-            raise AuditIntegrityError(
-                f"Corrupt payload for row {row_id} (ref={source_data_ref}) — "
-                f"cannot decode persisted row data (Tier 1 violation). "
-                f"Error: {exc}"
-            ) from exc
-
-        if type(degraded_data) is not dict:
-            raise AuditIntegrityError(
-                f"Corrupt payload for row {row_id} (ref={source_data_ref}) — "
-                f"expected dict, got {type(degraded_data).__name__} (Tier 1 violation)"
-            )
-
-        # Restore datetime, Decimal, and other types that canonical JSON
-        # degraded to strings. Resume requires schema validation; there is no
-        # degraded-type fallback.
-        validated = source_schema_class.model_validate(degraded_data)
-        row_data = validated.to_row()
-
-        # Defense in depth: detect schemas that silently discard every field.
-        if degraded_data and not row_data:
-            raise ValueError(
-                f"Resume failed for row {row_id}: Schema validation returned empty data "
-                f"but source had {len(degraded_data)} fields. "
-                f"Schema class '{source_schema_class.__name__}' appears to have no fields defined. "
-                f"Cannot resume - this would silently discard all row data. "
-                f"The source plugin's schema must declare fields matching the stored row structure."
-            )
-
-        return row_data
 
     def can_resume(self, run_id: str, graph: ExecutionGraph) -> ResumeCheck:
         """Check if a run can be resumed.
@@ -742,11 +635,7 @@ class RecoveryManager:
         if not status_check.can_resume:
             return status_check
 
-        try:
-            checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
-        except IncompatibleCheckpointError as e:
-            # Return ResumeCheck instead of propagating exception (API contract)
-            return ResumeCheck(can_resume=False, reason=str(e))
+        checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
         if checkpoint is None:
             # F1 Task 3.2: journal-flavoured refuse — the checkpoint row is the
             # run's resume BASELINE (scalars + topology anchor); buffered work
@@ -755,6 +644,7 @@ class RecoveryManager:
             return ResumeCheck(
                 can_resume=False,
                 reason="Run has no resume baseline (run predates run-start checkpointing or checkpointing was disabled)",
+                cause=ResumeRefusalCause.CHECKPOINT_MISSING,
             )
 
         # Validate topological compatibility
@@ -762,6 +652,10 @@ class RecoveryManager:
         topology_check = validator.validate(checkpoint, graph)
         if not topology_check.can_resume:
             return topology_check
+
+        effect_check = check_http_effects_resumable(graph)
+        if not effect_check.can_resume:
+            return effect_check
 
         # Source-lifecycle completeness (elspeth-1f5b83cd28): the same shared
         # gate resume() enforces via IncompleteSourceResumeError. A clean,
@@ -787,7 +681,7 @@ class RecoveryManager:
 
         return ResumeCheck(can_resume=True)
 
-    def get_resume_point(self, run_id: str, graph: ExecutionGraph) -> ResumePoint | None:
+    def get_resume_point(self, run_id: str, graph: ExecutionGraph) -> ResumePoint:
         """Get the resume point for a failed run.
 
         Returns all information needed to resume processing:
@@ -800,23 +694,28 @@ class RecoveryManager:
             graph: The current execution graph to validate against
 
         Returns:
-            ResumePoint if run can be resumed, None otherwise
+            ResumePoint if run can be resumed.
+
+        Raises:
+            NonResumableRunError: The observed admission check refused resume.
         """
         check = self.can_resume(run_id, graph)
         if not check.can_resume:
-            return None
+            assert check.reason is not None and check.cause is not None
+            raise NonResumableRunError(run_id, check.reason, cause=check.cause)
 
         # get_latest_checkpoint is a raw persistence read: it returns a
         # checkpoint or None and raises CheckpointCorruptionError on malformed
-        # data — it never raises IncompatibleCheckpointError (compatibility is
-        # the validator's job, below). No handler: corruption propagates.
+        # data. Compatibility is the validator's job, below.
+        # No handler: corruption propagates.
         checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
         if checkpoint is None:
-            return None
+            raise NonResumableRunError(run_id, "Run has no resume baseline", cause=ResumeRefusalCause.CHECKPOINT_MISSING)
 
         topology_check = CheckpointCompatibilityValidator().validate(checkpoint, graph)
         if not topology_check.can_resume:
-            return None
+            assert topology_check.reason is not None and topology_check.cause is not None
+            raise NonResumableRunError(run_id, topology_check.reason, cause=topology_check.cause)
 
         self.verify_contract_integrity(run_id)
         barrier_scalars = self._restore_barrier_scalars(checkpoint)
@@ -827,514 +726,14 @@ class RecoveryManager:
             barrier_scalars=barrier_scalars,
         )
 
-    def _get_latest_checkpoint_for_resume_workset(self, run_id: str) -> Checkpoint | None:
-        """Load latest checkpoint and enforce format compatibility for workset reads."""
-        checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
-        if checkpoint is None:
-            return None
+    def count_active_scheduler_work(self, run_id: str) -> int:
+        """Count the run's non-terminal scheduler work items (READY / LEASED / BLOCKED / PENDING_SINK).
 
-        format_check = CheckpointCompatibilityValidator().validate_format_version(checkpoint)
-        if not format_check.can_resume:
-            assert format_check.reason is not None
-            raise IncompatibleCheckpointError(format_check.reason)
-
-        return checkpoint
-
-    def get_unprocessed_row_data(
-        self,
-        run_id: str,
-        payload_store: PayloadStore,
-        *,
-        source_schema_class: type[PluginSchema],
-        row_ids: Sequence[str] | None = None,
-    ) -> list[ResumedRow]:
-        """Get row data for unprocessed rows with type fidelity preservation.
-
-        Retrieves actual row data (not just IDs) for rows that need
-        processing during resume. Returns ``ResumedRow`` instances
-        ordered by row_index for deterministic processing.
-
-        Used on the pre-RC6 single-source resume path where ``run_sources``
-        is empty; every persisted row still carries its originating
-        ``source_node_id`` (NOT NULL per schema), which is preserved on
-        the ResumedRow so downstream consumers can look up the row's
-        schema contract by source node identity (ADR-025 §3).
-
-        IMPORTANT: Type Fidelity Preservation (REQUIRED)
-        -------------------------------------------------
-        Payloads are stored via canonical_json(), which normalizes non-JSON types:
-        - datetime → ISO string ("2024-01-01T00:00:00+00:00")
-        - Decimal → string ("42.50")
-        - pandas/numpy scalars → primitives
-
-        On resume, json.loads() returns degraded types (all strings). To restore
-        type fidelity, this method REQUIRES source_schema_class to re-validate rows
-        through the source's Pydantic schema, which re-coerces strings back to typed values.
-
-        Without schema validation, transforms would receive wrong types (str instead of
-        datetime/Decimal), violating the Tier 2 pipeline data trust model from CLAUDE.md.
-
-        Args:
-            run_id: The run to get unprocessed rows for
-            payload_store: PayloadStore for retrieving row data
-            source_schema_class: Pydantic schema class for type restoration (REQUIRED).
-                Resume cannot guarantee type fidelity without schema validation.
-                The schema must have allow_coercion=True to handle string→typed conversions.
-
-        Returns:
-            List of ResumedRow records, ordered by row_index.
-            Empty list if run cannot be resumed or all rows were processed.
-
-        Raises:
-            AuditIntegrityError: If row not found in database, payload is corrupt,
-                or decoded payload is not a dict (Tier 1 violations).
-            ValueError: If payload has been purged or schema validation fails
-                (operational errors that prevent resume but aren't data corruption)
+        Public resume-inspection surface: resume re-drives exactly this work
+        (it never re-derives a source row), so the CLI resume preflight
+        reports it as what a resume will process.
         """
-        resolved_row_ids = list(row_ids) if row_ids is not None else self.get_unprocessed_rows(run_id)
-        if not resolved_row_ids:
-            return []
-
-        result: list[ResumedRow] = []
-
-        # Batch query: Fetch row metadata in chunks to respect SQLite bind limit.
-        # ADR-025 §4: source_node_id is now load-bearing on every row, not
-        # just multi-source pipelines. Pre-RC6 audit DBs without
-        # ``run_sources`` records still carry source_node_id on rows
-        # (NOT NULL per schema) and resume must propagate it so downstream
-        # consumers look up the per-row schema contract by source identity.
-        row_metadata: dict[str, tuple[int, NodeID, str | None]] = {}
-        with self._db.engine.connect() as conn:
-            for i in range(0, len(resolved_row_ids), _METADATA_CHUNK_SIZE):
-                chunk = resolved_row_ids[i : i + _METADATA_CHUNK_SIZE]
-                rows_result = conn.execute(
-                    select(
-                        rows_table.c.row_id,
-                        rows_table.c.row_index,
-                        rows_table.c.source_node_id,
-                        rows_table.c.source_data_ref,
-                    ).where(rows_table.c.row_id.in_(chunk))
-                ).fetchall()
-                for r in rows_result:
-                    row_metadata[r.row_id] = (r.row_index, NodeID(r.source_node_id), r.source_data_ref)
-
-        for row_id in resolved_row_ids:
-            if row_id not in row_metadata:
-                raise AuditIntegrityError(f"Row {row_id} not found in database — audit data corruption (Tier 1 violation)")
-
-            row_index, source_node_id, source_data_ref = row_metadata[row_id]
-
-            if source_data_ref is None:
-                raise ValueError(
-                    f"Row {row_id} has no source_data_ref — row was recorded without "
-                    f"payload storage, so recovery cannot reconstruct its data. "
-                    f"Re-run the pipeline from scratch instead of resuming."
-                )
-
-            row_data = self._restore_row_data(row_id, source_data_ref, payload_store, source_schema_class)
-
-            result.append(
-                ResumedRow(
-                    row_id=row_id,
-                    row_index=row_index,
-                    source_node_id=source_node_id,
-                    row_data=row_data,
-                )
-            )
-
-        return result
-
-    def get_unprocessed_row_data_by_source(
-        self,
-        run_id: str,
-        payload_store: PayloadStore,
-        *,
-        source_schema_classes: Mapping[NodeID, type[PluginSchema]],
-        row_ids: Sequence[str] | None = None,
-    ) -> list[ResumedRow]:
-        """Get unprocessed row data with source-scoped type restoration.
-
-        Multi-source resume cannot validate every persisted payload through a
-        single source schema. Rows carry ``source_node_id`` in Landscape, and
-        this method uses that node identity to select the schema class that
-        originally ingested the row. Returns ``ResumedRow`` instances
-        ordered by ``ingest_sequence`` (ADR-025 §4).
-        """
-        resolved_row_ids = list(row_ids) if row_ids is not None else self.get_unprocessed_rows(run_id)
-        if not resolved_row_ids:
-            return []
-
-        row_metadata: dict[str, tuple[int, int, NodeID, str | None]] = {}
-        with self._db.engine.connect() as conn:
-            for i in range(0, len(resolved_row_ids), _METADATA_CHUNK_SIZE):
-                chunk = resolved_row_ids[i : i + _METADATA_CHUNK_SIZE]
-                rows_result = conn.execute(
-                    select(
-                        rows_table.c.row_id,
-                        rows_table.c.row_index,
-                        rows_table.c.ingest_sequence,
-                        rows_table.c.source_node_id,
-                        rows_table.c.source_data_ref,
-                    ).where(rows_table.c.row_id.in_(chunk))
-                ).fetchall()
-                for r in rows_result:
-                    row_metadata[r.row_id] = (r.row_index, r.ingest_sequence, NodeID(r.source_node_id), r.source_data_ref)
-
-        # Per Three-Tier Trust Model: the audit DB is Tier 1; ``resolved_row_ids`` comes
-        # from ``get_unprocessed_rows()`` and ``row_metadata`` is built from the
-        # same DB in the lookup above. A ``row_id`` missing from ``row_metadata``
-        # is internal audit corruption. Let the KeyError raise from the sort
-        # key — no defensive ``else -1`` arm that would silently mis-order
-        # corrupt data before any explicit check could fire.
-        ordered_row_ids = sorted(
-            resolved_row_ids,
-            key=lambda row_id: row_metadata[row_id][1],
-        )
-        result: list[ResumedRow] = []
-        for row_id in ordered_row_ids:
-            row_index, _ingest_sequence, source_node_id, source_data_ref = row_metadata[row_id]
-            if source_node_id not in source_schema_classes:
-                raise AuditIntegrityError(
-                    f"Row {row_id} references source_node_id={source_node_id!r}, but resume has no schema class for that source. "
-                    "Per-source run_sources metadata is incomplete or corrupt."
-                )
-
-            if source_data_ref is None:
-                raise ValueError(
-                    f"Row {row_id} has no source_data_ref — row was recorded without "
-                    f"payload storage, so recovery cannot reconstruct its data. "
-                    f"Re-run the pipeline from scratch instead of resuming."
-                )
-
-            source_schema_class = source_schema_classes[source_node_id]
-            row_data = self._restore_row_data(row_id, source_data_ref, payload_store, source_schema_class)
-
-            result.append(
-                ResumedRow(
-                    row_id=row_id,
-                    row_index=row_index,
-                    source_node_id=source_node_id,
-                    row_data=row_data,
-                )
-            )
-
-        return result
-
-    def _get_incomplete_token_work(
-        self,
-        run_id: str,
-        buffered_token_ids: frozenset[str],
-        *,
-        delegation_tokens: Any | None = None,
-        terminal_tokens: Any | None = None,
-    ) -> tuple[dict[str, set[str]], dict[str, list[IncompleteTokenSpec]]]:
-        """Return all incomplete leaf token IDs plus unbuffered specs by row."""
-        if delegation_tokens is None or terminal_tokens is None:
-            delegation_tokens, terminal_tokens = _resume_token_predicates(run_id)
-
-        with self._db.engine.connect() as conn:
-            max_attempt_sq = (
-                select(func.max(node_states_table.c.attempt))
-                .where(node_states_table.c.token_id == tokens_table.c.token_id)
-                .where(node_states_table.c.run_id == run_id)
-                .correlate(tokens_table)
-                .scalar_subquery()
-            )
-            incomplete_query = (
-                select(
-                    tokens_table.c.token_id,
-                    tokens_table.c.row_id,
-                    tokens_table.c.join_group_id,
-                    tokens_table.c.token_data_ref,
-                    tokens_table.c.step_in_pipeline,
-                    max_attempt_sq.label("max_attempt"),
-                )
-                .where(tokens_table.c.run_id == run_id)
-                .where(~tokens_table.c.token_id.in_(delegation_tokens))
-                .where(~tokens_table.c.token_id.in_(terminal_tokens))
-                .order_by(tokens_table.c.step_in_pipeline, tokens_table.c.token_id)
-            )
-            incomplete_rows = conn.execute(incomplete_query).fetchall()
-
-            frames_by_token: dict[str, list[tuple[int, LineageFrame]]] = {}
-            frame_rows = conn.execute(
-                select(
-                    token_lineage_frames_table.c.token_id,
-                    token_lineage_frames_table.c.depth,
-                    token_lineage_frames_table.c.kind,
-                    token_lineage_frames_table.c.group_id,
-                    token_lineage_frames_table.c.member_key,
-                ).where(token_lineage_frames_table.c.run_id == run_id)
-            ).fetchall()
-            for frame_row in frame_rows:
-                frames_by_token.setdefault(frame_row.token_id, []).append(
-                    (
-                        int(frame_row.depth),
-                        LineageFrame(kind=FrameKind(frame_row.kind), group_id=frame_row.group_id, member_key=frame_row.member_key),
-                    )
-                )
-
-        row_to_incomplete_tokens: dict[str, set[str]] = {}
-        by_row: dict[str, list[IncompleteTokenSpec]] = {}
-        for row in incomplete_rows:
-            row_to_incomplete_tokens.setdefault(row.row_id, set()).add(row.token_id)
-            if row.token_id in buffered_token_ids:
-                continue
-            by_row.setdefault(row.row_id, []).append(
-                IncompleteTokenSpec(
-                    token_id=row.token_id,
-                    row_id=row.row_id,
-                    join_group_id=row.join_group_id,
-                    lineage_path=(
-                        tuple(frame for _depth, frame in sorted(frames_by_token[row.token_id])) if row.token_id in frames_by_token else ()
-                    ),
-                    token_data_ref=row.token_data_ref,
-                    step_in_pipeline=row.step_in_pipeline,
-                    max_attempt=-1 if row.max_attempt is None else int(row.max_attempt),
-                )
-            )
-        return row_to_incomplete_tokens, by_row
-
-    def get_resume_workset(self, run_id: str) -> ResumeWorkSet:
-        """Compute row replay IDs and incomplete token continuations once.
-
-        Uses token outcomes to determine which rows need processing:
-        - Rows with non-delegation terminal outcomes are done
-        - Rows whose tokens lack terminal outcomes need reprocessing
-        - Rows whose incomplete tokens are all buffered at barriers are
-          excluded (they are restored from journal BLOCKED rows at processor
-          construction, not reprocessed)
-
-        This correctly handles multi-sink scenarios where rows are routed to
-        different sinks in interleaved order. The previous row_index boundary
-        approach would skip rows routed to a failed sink if a later row
-        succeeded on a different sink.
-
-        Args:
-            run_id: The run to get resume work for
-
-        Returns:
-            A ``ResumeWorkSet`` carrying row IDs that need source-row replay,
-            incomplete non-delegation token continuations grouped by row_id,
-            and the barrier-buffered token IDs used to derive both.
-        """
-        # ADR-038: ABANDONED is an explicit declaration that no resume may
-        # ever decide the token.  The ordinary resume entry gates reject the
-        # finalized run before reaching this read, but this projection is also
-        # a public recovery surface and must not classify ABANDONED as pending
-        # work.  A completed outcome on the same token is the stronger audit
-        # contradiction: both images fail closed here before any replay set is
-        # returned.
-        abandoned = token_outcomes_table.alias("abandoned_outcomes")
-        decided = token_outcomes_table.alias("decided_outcomes")
-        with self._db.engine.connect() as conn:
-            abandoned_rows = conn.execute(
-                select(abandoned.c.token_id, func.count(decided.c.outcome_id).label("decided_count"))
-                .select_from(
-                    abandoned.outerjoin(
-                        decided,
-                        (decided.c.run_id == abandoned.c.run_id)
-                        & (decided.c.token_id == abandoned.c.token_id)
-                        & (decided.c.completed == 1),
-                    )
-                )
-                .where(abandoned.c.run_id == run_id)
-                .where(abandoned.c.path == TerminalPath.ABANDONED.value)
-                .group_by(abandoned.c.token_id)
-                .order_by(abandoned.c.token_id)
-            ).all()
-        if abandoned_rows:
-            contradictions = tuple(str(row.token_id) for row in abandoned_rows if int(row.decided_count) > 0)
-            if contradictions:
-                raise AuditIntegrityError(
-                    f"Resume work-set for run {run_id!r} found token(s) both terminally decided and marked "
-                    f"ABANDONED: {contradictions!r}; refusing an ADR-038 audit contradiction."
-                )
-            abandoned_ids = tuple(str(row.token_id) for row in abandoned_rows)
-            raise AuditIntegrityError(
-                f"Resume work-set for run {run_id!r} found ABANDONED token(s) {abandoned_ids!r}; "
-                "ABANDONED is non-resumable and cannot be returned as pending replay work."
-            )
-
-        checkpoint = self._get_latest_checkpoint_for_resume_workset(run_id)
-        if checkpoint is None:
-            return ResumeWorkSet(row_ids=(), incomplete_by_row={}, buffered_token_ids=frozenset())
-
-        # Buffered-token exclusion: tokens held at barriers are RESTORED from
-        # journal BLOCKED rows at processor construction (F1), not re-driven
-        # from source, so they must not trigger duplicate reprocessing. Row-level
-        # exclusion is unsafe when a row has mixed buffered and non-buffered
-        # incomplete tokens, hence the all-incomplete-tokens-buffered filter below.
-        buffered_token_ids = frozenset(self._get_buffered_journal_token_ids(run_id))
-
-        delegation_tokens, terminal_tokens = _resume_token_predicates(run_id)
-
-        with self._db.engine.connect() as conn:
-            # CORRECT SEMANTICS FOR FORK/AGGREGATION/COALESCE RECOVERY:
-            #
-            # A row is "complete" when ALL its "leaf" tokens have terminal outcomes.
-            # "Leaf" tokens = tokens that are NOT delegation markers.
-            #
-            # Delegation markers (excluded from completion check):
-            # - FORK_PARENT: Fork parent, children carry completion status
-            # - EXPAND_PARENT: Deaggregation parent, expanded children carry status
-            #
-            # Terminal outcomes (indicate row processing is done):
-            # - completed=1 marks rows with an outcome decision.
-            # - FORK_PARENT/EXPAND_PARENT paths are excluded because those
-            #   parent outcomes delegate completion to child tokens.
-            #
-            # A row is "incomplete" (needs reprocessing) if ANY of:
-            # 1. No tokens at all (never started processing)
-            # 2. Any non-delegation token lacks terminal outcome
-            # 3. Has tokens but NONE have terminal outcomes (delegation marker only)
-            #
-            # BUG FIX (P2-recovery-skips-forked-rows):
-            # Previous approach: "row has ANY terminal token → complete"
-            # Failed: If child A completed but child B crashed, row marked done.
-            # Fix: "ALL non-delegation tokens must have terminal outcomes"
-
-            # Subquery: Tokens that are delegation markers (FORK_PARENT or EXPAND_PARENT)
-            # These delegate completion to their children, so exclude from completion check
-            delegation_tokens = (
-                select(token_outcomes_table.c.token_id)
-                .where(token_outcomes_table.c.run_id == run_id)
-                .where(token_outcomes_table.c.path.in_(_DELEGATION_PATHS))
-            ).scalar_subquery()
-
-            # Subquery: Tokens with terminal outcomes
-            terminal_tokens = (
-                select(token_outcomes_table.c.token_id)
-                .where(token_outcomes_table.c.run_id == run_id)
-                .where(token_outcomes_table.c.completed == 1)
-                .where(~token_outcomes_table.c.path.in_(_DELEGATION_PATHS))
-            ).scalar_subquery()
-
-            # Subquery: Rows that have at least one terminal outcome
-            rows_with_terminal = (
-                select(tokens_table.c.row_id)
-                .distinct()
-                .where(tokens_table.c.run_id == run_id)
-                .where(tokens_table.c.token_id.in_(terminal_tokens))
-            ).scalar_subquery()
-
-            # Main query: Find incomplete rows
-            # Row is incomplete if:
-            # - Case 1: No tokens at all
-            # - Case 2: Has non-delegation token without terminal outcome
-            # - Case 3: Has tokens but none have terminal outcomes (delegation only)
-            #
-            # NOTE: PostgreSQL requires ORDER BY columns to be in SELECT when using DISTINCT.
-            # We select both row_id and ingest_sequence, then extract just row_id from results.
-            query = (
-                select(rows_table.c.row_id, rows_table.c.ingest_sequence)
-                .select_from(rows_table)
-                .outerjoin(
-                    tokens_table,
-                    rows_table.c.row_id == tokens_table.c.row_id,
-                )
-                .where(rows_table.c.run_id == run_id)
-                .where(
-                    # Case 1: No tokens at all
-                    (tokens_table.c.token_id.is_(None))
-                    |
-                    # Case 2: Non-delegation token without terminal outcome
-                    ((~tokens_table.c.token_id.in_(delegation_tokens)) & (~tokens_table.c.token_id.in_(terminal_tokens)))
-                    |
-                    # Case 3: Has tokens but no terminal outcomes (fork parent only)
-                    (~rows_table.c.row_id.in_(rows_with_terminal))
-                )
-                .order_by(rows_table.c.ingest_sequence)
-                .distinct()
-            )
-
-            unprocessed = [row.row_id for row in conn.execute(query).fetchall()]
-
-        row_to_incomplete_tokens, by_row = self._get_incomplete_token_work(
-            run_id,
-            buffered_token_ids,
-            delegation_tokens=delegation_tokens,
-            terminal_tokens=terminal_tokens,
-        )
-
-        # Exclude rows only when ALL their incomplete leaf tokens are buffered.
-        # This avoids silently dropping rows with mixed-state tokens where one
-        # token is buffered and another incomplete token still needs processing.
-        if buffered_token_ids and unprocessed:
-            filtered_rows: list[str] = []
-            for row_id in unprocessed:
-                row_incomplete = row_to_incomplete_tokens.get(row_id, set())
-                if row_incomplete and row_incomplete.issubset(buffered_token_ids):
-                    continue
-                filtered_rows.append(row_id)
-            unprocessed = filtered_rows
-
-        return ResumeWorkSet(
-            row_ids=tuple(unprocessed),
-            incomplete_by_row={row_id: tuple(specs) for row_id, specs in by_row.items()},
-            buffered_token_ids=buffered_token_ids,
-        )
-
-    def get_unprocessed_rows(self, run_id: str) -> list[str]:
-        """Get row IDs that were not processed before the run failed."""
-        return list(self.get_resume_workset(run_id).row_ids)
-
-    def get_incomplete_tokens_by_row(self, run_id: str) -> dict[str, list[IncompleteTokenSpec]]:
-        """Return incomplete non-delegation child tokens, grouped by row_id.
-
-        A token is incomplete when it is not a delegation marker and has no
-        completed terminal outcome. Tokens held at barriers (journal BLOCKED
-        rows with a barrier_key) are excluded because those are flushed from
-        executor state restored from the journal rather than re-driven from
-        source (F1).
-        """
-        buffered_token_ids = frozenset(self._get_buffered_journal_token_ids(run_id))
-        _row_to_incomplete_tokens, by_row = self._get_incomplete_token_work(run_id, buffered_token_ids)
-        return by_row
-
-    def reconstruct_token_row(
-        self,
-        spec: IncompleteTokenSpec,
-        run_id: str,
-        source_row: PipelineRow,
-        payload_store: PayloadStore,
-    ) -> PipelineRow:
-        """Build the PipelineRow to re-drive an incomplete token with."""
-        if spec.token_data_ref is None:
-            return source_row
-
-        try:
-            payload_bytes = payload_store.retrieve(spec.token_data_ref)
-        except PayloadNotFoundError as exc:
-            raise ValueError(
-                f"Incomplete token {spec.token_id} (run {run_id}) payload purged "
-                f"(token_data_ref={spec.token_data_ref!r}) — cannot resume; re-run instead."
-            ) from exc
-
-        try:
-            envelope = checkpoint_loads(payload_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise AuditIntegrityError(
-                f"Corrupt token payload for token {spec.token_id} (run {run_id}): invalid UTF-8 or checkpoint JSON"
-            ) from exc
-        if not isinstance(envelope, dict) or "data" not in envelope or "contract" not in envelope:
-            raise AuditIntegrityError(
-                f"token_data_ref payload for token {spec.token_id} (run {run_id}) is not a "
-                f"valid {{data, contract}} envelope — audit data corruption (Tier-1 violation). "
-                f"Got type={type(envelope).__name__!r}."
-            )
-
-        contract = SchemaContract.from_checkpoint(envelope["contract"])
-        return PipelineRow(envelope["data"], contract)
-
-    def _get_buffered_journal_token_ids(self, run_id: str) -> set[str]:
-        """Collect token IDs held at barriers in the scheduler journal.
-
-        F1: scheduler-journal BLOCKED barrier rows own buffered token payloads;
-        resume restores them into executor buffers at processor construction,
-        so they are excluded from the re-drive work set.
-        """
-        return set(BarrierJournalRepository(self._db.engine, events=SchedulerEventStore()).blocked_barrier_token_ids(run_id=run_id))
+        return SchedulerReadModel(self._db.engine).count_active_work(run_id=run_id)
 
     def count_blocked_barrier_items(self, run_id: str) -> int:
         """Count journal BLOCKED barrier holds for a run.
@@ -1342,7 +741,7 @@ class RecoveryManager:
         Public resume-inspection surface (F1): "what will be restored rather
         than re-driven" is the journal's BLOCKED rows with a non-NULL
         ``barrier_key``. Used by the resume coordinator's quiescence gate
-        (a run with zero unprocessed rows but blocked barrier work must NOT
+        (a run whose remaining work is blocked barrier holds must NOT
         early-complete) and by the CLI resume preflight display.
         """
         return BarrierJournalRepository(self._db.engine, events=SchedulerEventStore()).count_blocked_barrier_items(run_id=run_id)
@@ -1403,7 +802,9 @@ class RecoveryManager:
             CheckpointCorruptionError: If no ``run_sources`` rows exist, if any
                 stored contract is missing, malformed, or has mismatched hash,
                 or if the run itself doesn't exist.
-                Per CLAUDE.md Tier-1 trust model: "Bad data in the audit trail = crash immediately"
+                Per the Tier-1 trust model
+                (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model),
+                bad data in the audit trail crashes immediately.
         """
         factory = RecorderFactory(self._db)
 

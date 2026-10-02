@@ -63,7 +63,7 @@ def _fence_trial(index: int, **overrides: object) -> FenceConflictTrial:
         fence_epoch_before=index,
         fence_epoch_after=index + 1,
         fence_owner_after=winner,
-        guided_operation_rows=1,
+        message_ingress_receipt_rows=1,
         dispatch_spread_ms=1.5,
     )
     return dataclasses.replace(trial, **overrides)  # type: ignore[arg-type]
@@ -164,10 +164,10 @@ class TestFenceConflict:
         trials[2] = dataclasses.replace(trials[2], fence_owner_after=RB)  # trial 2's winner is RA
         assert "trial[2]:fence_owner_is_not_the_winner" in decide_fence_conflict(trials).reasons
 
-    def test_exactly_one_guided_operation_row(self) -> None:
+    def test_exactly_one_message_ingress_receipt_row(self) -> None:
         trials = [_fence_trial(index) for index in range(20)]
-        trials[9] = dataclasses.replace(trials[9], guided_operation_rows=2)
-        assert "trial[9]:guided_operation_rows:2!=1" in decide_fence_conflict(trials).reasons
+        trials[9] = dataclasses.replace(trials[9], message_ingress_receipt_rows=2)
+        assert "trial[9]:message_ingress_receipt_rows:2!=1" in decide_fence_conflict(trials).reasons
 
     def test_dispatch_window_is_enforced(self) -> None:
         trials = [_fence_trial(index) for index in range(20)]
@@ -366,6 +366,7 @@ class TestOwnerAffineProgress:
         assert result.probe == "P4b"
         assert result.outcome == "cannot_pass"
         assert result.mechanism == "owner_affine"
+        assert result.reasons == ("legacy_p4b_contract_does_not_measure_durable_progress",)
         assert result.evidence == {"mitigation": "single_revision_sticky_sessions"}
 
 
@@ -418,14 +419,14 @@ class _FakeObserver(EvidenceObserver):
     def fence_owner(self, session_id: str) -> str | None:
         return self.owner
 
-    def guided_operation_rows(self, session_id: str, *, since_epoch: int) -> int:
+    def message_ingress_receipt_rows(self, session_id: str, *, client_request_id: str) -> int:
         return 1
 
     def runs_row_ids(self, session_id: str) -> tuple[str, ...]:
-        return ("run-1",)
+        return ("run-1",) if self.owner is not None else ()
 
     def landscape_run_ids(self, session_id: str) -> tuple[str, ...]:
-        return ("landscape-1",)
+        return ("landscape-1",) if self.owner is not None else ()
 
     def membership_row(self, instance_id: str) -> MembershipRow | None:
         return None
@@ -467,16 +468,56 @@ def _driver(observer: _FakeObserver, replicas: _RecordedReplicas) -> ReplicaProb
 
 
 class TestDriver:
+    def test_run_start_waits_for_background_landscape_publication(self) -> None:
+        class DelayedObserver(_FakeObserver):
+            def __init__(self) -> None:
+                super().__init__()
+                self.reads_after_start = 0
+
+            def landscape_run_ids(self, session_id: str) -> tuple[str, ...]:
+                if self.owner is None:
+                    return ()
+                self.reads_after_start += 1
+                return ("landscape-1",) if self.reads_after_start == 2 else ()
+
+        observer = DelayedObserver()
+        driver = _driver(observer, _RecordedReplicas(observer))
+        trial = driver.run_start_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/execute", {}))
+        assert trial.landscape_run_ids == ("landscape-1",)
+        assert observer.reads_after_start == 2
+
+    def test_run_start_refuses_a_session_with_historical_runs_before_dispatch(self) -> None:
+        observer = _FakeObserver()
+        observer.owner = RA
+        driver = _driver(observer, _RecordedReplicas(observer))
+        with pytest.raises(AcceptanceCheckError, match="probe_session_not_fresh"):
+            driver.run_start_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/execute", {}))
+        assert observer.epoch == 3
+
+    @pytest.mark.parametrize("count", [0, -1, 1, 19, True, 20.0])
+    def test_decision_boundaries_refuse_insufficient_or_noninteger_counts(self, count: int) -> None:
+        with pytest.raises(AcceptanceInputError):
+            decide_run_start([], required_trials=count)
+        with pytest.raises(AcceptanceInputError):
+            decide_fence_conflict([], required_trials=count)
+
     def test_fence_conflict_trial_records_both_instances_and_the_fence_facts(self) -> None:
         observer = _FakeObserver()
         driver = _driver(observer, _RecordedReplicas(observer))
-        trial = driver.fence_conflict_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/guided/respond", {"text": "go"}))
+        trial = driver.fence_conflict_trial(
+            "session-1",
+            ProbeRequest(
+                "POST",
+                "/api/sessions/session-1/messages",
+                {"content": "Build a pipeline", "client_request_id": "00000000-0000-4000-8000-000000000001"},
+            ),
+        )
         statuses = sorted(response.status for response in trial.responses)
         assert statuses == [202, 409]
         assert {response.instance_id for response in trial.responses} == {RA, RB}
         assert trial.fence_epoch_after == trial.fence_epoch_before + 1
         assert trial.fence_owner_after == next(response.instance_id for response in trial.responses if response.status == 202)
-        assert trial.guided_operation_rows == 1
+        assert trial.message_ingress_receipt_rows == 1
         assert trial.dispatch_spread_ms >= 0
 
     def test_run_start_trial_reads_the_run_rows(self) -> None:
@@ -522,3 +563,22 @@ class TestDriver:
             transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"})),
         )
         assert client.request_json_with_instance("GET", "/api/health", expected_statuses={200}) == (200, None, {"status": "ok"})
+
+
+@pytest.mark.parametrize("invalid_pair", ["same_client", "wrong_order"])
+def test_pinned_clients_require_independent_ordered_origins(invalid_pair: str) -> None:
+    first_origin = "https://app---la.example.test"
+    second_origin = "https://app---lb.example.test"
+    credentials = AcceptanceCredentials(mode="bearer", bearer_token="test-token")
+    with (
+        AcceptanceHttpClient(origin=first_origin, credentials=credentials) as first,
+        AcceptanceHttpClient(origin=second_origin, credentials=credentials) as second,
+    ):
+        clients = (first, first) if invalid_pair == "same_client" else (second, first)
+        with pytest.raises(AcceptanceInputError, match="pinned clients must be distinct"):
+            ReplicaProbeDriver(
+                controller=_FakeController(ReplicaAddress("a", first_origin), ReplicaAddress("b", second_origin)),
+                observer=_FakeObserver(),
+                client_factory=lambda origin: first,
+                pinned_clients=clients,
+            )

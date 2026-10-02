@@ -30,7 +30,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, cast
 
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.identifiers import is_valid_field_name, validate_field_name, validate_field_names
@@ -101,6 +101,13 @@ def _dict_field_spec_invalid_identifier_message(name: str) -> str:
         f"(letters, digits, underscores only). "
         f"Use '{suggested}' instead."
     )
+
+
+# Who declared a transform output field's type (ADR-050, the D6 authorship
+# bit): the pipeline author's schema, or the plugin's own code. Recorded on a
+# DeclaredOutputTypeViolation so the disposition of a plugin breaking its own
+# declaration can tighten later without rework.
+OutputFieldDeclarer = Literal["operator", "plugin"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +481,32 @@ def _normalize_field_spec(spec: Any, *, index: int) -> str | Mapping[str, Any]:
     )
 
 
+def _coerce_field_definition(value: Any) -> Any:
+    """Accept an authored field spec, or pass an already-built definition through."""
+    if isinstance(value, FieldDefinition):
+        return value
+    return FieldDefinition.parse(value)
+
+
+# Both authoring surfaces write a field as the string "name: type" — YAML, and
+# the composer, whose COMPOSER_SCHEMA_EXAMPLE/COMPOSER_SCHEMA_DESCRIPTION
+# (plugins/infrastructure/config_base.py) mandate exactly that form.
+# ``FieldDefinition.parse`` accepts it; ``SchemaConfig.from_dict`` relies on
+# that.  Pydantic, left alone, emits the PARSED shape into the JSON Schema, so a
+# *validation-mode* schema describes the parser's OUTPUT rather than its INPUT.
+# ``web.plugin_policy.validation`` runs that schema over AUTHORED options with
+# Draft202012Validator BEFORE any parser sees them, so the documented string form
+# was refused at path ``schema/fields`` as ``profile_unavailable`` on every
+# profile-bound node — the gate rejecting the one shape its own help text
+# instructs authors to write.  Declaring the input type keeps the emitted schema
+# honest about what a caller may write.  Runtime acceptance is unchanged:
+# ``from_dict`` already parsed both forms.
+AuthoredFieldDefinition = Annotated[
+    FieldDefinition,
+    BeforeValidator(_coerce_field_definition, json_schema_input_type=str | FieldDefinition),
+]
+
+
 @dataclass(frozen=True, slots=True)
 class SchemaConfig:
     """Configuration for a plugin's data schema.
@@ -532,7 +565,7 @@ class SchemaConfig:
     """
 
     mode: Literal["fixed", "flexible", "observed"]
-    fields: tuple[FieldDefinition, ...] | None = None
+    fields: tuple[AuthoredFieldDefinition, ...] | None = None
     guaranteed_fields: tuple[str, ...] | None = None
     required_fields: tuple[str, ...] | None = None
     audit_fields: tuple[str, ...] | None = None
@@ -787,6 +820,19 @@ class SchemaConfig:
         """Whether extra fields beyond schema are allowed."""
         return self.is_observed or self.mode == "flexible"
 
+    def closed_field_names(self) -> frozenset[str] | None:
+        """Every name a row this schema admits can carry, or None when it admits undeclared fields.
+
+        An UPPER bound: the declared fields, optional ones included (unlike
+        ``get_effective_guaranteed_fields``, a lower bound), under an extras
+        firewall (``allows_extra_fields`` False). Read by the field-name
+        spelling rule's build-time resolution to tell a field a node drops
+        (``FieldNameResolution.past_node``).
+        """
+        if self.allows_extra_fields or self.fields is None:
+            return None
+        return frozenset(field_definition.name for field_definition in self.fields) | self.get_effective_guaranteed_fields()
+
     def get_effective_guaranteed_fields(self) -> frozenset[str]:
         """Get all fields this schema guarantees will exist.
 
@@ -846,11 +892,13 @@ def declare_missing_guaranteed_fields(
     transform's own emitted rows fail validation against its own contract
     (elspeth-97487736ca).
 
-    Appends a required, any-typed FieldDefinition for each guaranteed name
-    not already declared: a guarantee asserts the field WILL exist, which
-    is required-ness, but the caller does not know its type. Authored
-    declarations are never modified — a guaranteed name already declared
-    keeps its authored type and (possibly optional) requiredness.
+    Appends a required, any-typed, nullable FieldDefinition for each
+    guaranteed name not already declared: a guarantee asserts the field WILL
+    exist, which is required-ness, but the caller does not know its type.
+    ``any`` is nullable (ADR-050): no check ever reads the value of an ``any``
+    field, so ``nullable=False`` on one would be a claim nothing verifies.
+    Authored declarations are never modified — a guaranteed name already
+    declared keeps its authored type and (possibly optional) requiredness.
 
     Returns fields unchanged when the schema is observed-style
     (fields is None) or nothing is guaranteed.
@@ -861,7 +909,7 @@ def declare_missing_guaranteed_fields(
     missing = [name for name in guaranteed_fields if name not in declared]
     if not missing:
         return fields
-    return fields + tuple(FieldDefinition(name=name, field_type="any", required=True) for name in missing)
+    return fields + tuple(FieldDefinition(name=name, field_type="any", required=True, nullable=True) for name in missing)
 
 
 def raw_options_have_schema(options: Mapping[str, Any]) -> bool:

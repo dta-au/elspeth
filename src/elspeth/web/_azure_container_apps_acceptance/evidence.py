@@ -450,19 +450,32 @@ def project_resource_graph_count(payload: object) -> int:
 
 
 def resource_graph_cleanup_details(
-    *, resource_group: str, remaining_resources: int, key_vault_purged: bool, scheduled_purge_date: datetime | None
+    *,
+    resource_group: str,
+    remaining_resources: int,
+    runtime_key_vault_purged: bool,
+    runtime_scheduled_purge_date: datetime | None,
+    schema_owner_key_vault_purged: bool,
+    schema_owner_scheduled_purge_date: datetime | None,
 ) -> ResourceGraphCleanupDetails:
     if remaining_resources != 0:
         raise AcceptanceCheckError("resource_graph_cleanup")
-    if key_vault_purged == (scheduled_purge_date is not None):
+    if runtime_key_vault_purged == (runtime_scheduled_purge_date is not None):
+        raise AcceptanceInputError("a vault is purged or tombstoned with a scheduled purge date, never both or neither")
+    if schema_owner_key_vault_purged == (schema_owner_scheduled_purge_date is not None):
         raise AcceptanceInputError("a vault is purged or tombstoned with a scheduled purge date, never both or neither")
     return {
         "mechanism": "resource_graph_query",
         "resource_group_sha256": _sha256(resource_group.encode("utf-8")),
         "remaining_resources": 0,
-        "key_vault_purged": key_vault_purged,
-        "key_vault_tombstoned": not key_vault_purged,
-        "scheduled_purge_date": None if scheduled_purge_date is None else _utc_timestamp(scheduled_purge_date),
+        "runtime_key_vault_purged": runtime_key_vault_purged,
+        "runtime_key_vault_tombstoned": not runtime_key_vault_purged,
+        "runtime_scheduled_purge_date": None if runtime_scheduled_purge_date is None else _utc_timestamp(runtime_scheduled_purge_date),
+        "schema_owner_key_vault_purged": schema_owner_key_vault_purged,
+        "schema_owner_key_vault_tombstoned": not schema_owner_key_vault_purged,
+        "schema_owner_scheduled_purge_date": None
+        if schema_owner_scheduled_purge_date is None
+        else _utc_timestamp(schema_owner_scheduled_purge_date),
     }
 
 
@@ -859,11 +872,15 @@ def bundle_check(store_dir: Path, *, candidate_sha: str, scenario_id: str) -> Bu
             probe = PROBE_KINDS[row["kind"]]
             if details["outcome"] != "pass":
                 failed_probes.append(probe)
-            if row["kind"] == "replica-progress" and cast(Mapping[str, object], details["owner_affine"])["outcome"] != "cannot_pass":
+            if (
+                row["kind"] in {"replica-progress", "single-revision-progress"}
+                and cast(Mapping[str, object], details["owner_affine"])["outcome"] != "cannot_pass"
+            ):
                 failed_probes.append("P4b")
     verdict = testcontainer_run_gate(
         rows,
         provider=PROVIDER,
+        required_database="provisioned",
         candidate_sha=candidate_sha,
         read_receipt=lambda receipt_sha256: _read_protected_document(
             store_dir / f"{receipt_sha256}.json", check="testcontainer_run_receipt"

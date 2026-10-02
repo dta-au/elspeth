@@ -13,7 +13,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -23,12 +23,23 @@
         "tier": "common"
       },
       {
+        "default": null,
         "description": "Input row field containing the absolute HTTP(S) URL to fetch.",
         "kind": "text",
         "label": "URL Field",
         "name": "url_field",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Fixed absolute HTTP(S) URL for every row; exclusive with url_field.",
+        "kind": "text",
+        "label": "URL",
+        "name": "url",
+        "nullable": true,
+        "required": false,
         "tier": "common"
       },
       {

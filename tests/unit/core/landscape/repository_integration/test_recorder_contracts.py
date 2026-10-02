@@ -7,6 +7,8 @@ for storing and retrieving schema contracts in the audit trail.
 
 from __future__ import annotations
 
+from tests.fixtures.landscape import leader_coordination_token
+
 from elspeth.contracts import (
     ContractAuditRecord,
     FieldContract,
@@ -43,7 +45,7 @@ class TestUpdateNodeOutputContract:
 
         # Register source node without output_contract (dynamic source)
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source_1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
@@ -69,7 +71,9 @@ class TestUpdateNodeOutputContract:
         )
 
         # Update the node's output_contract
-        factory.data_flow.update_node_output_contract(run.run_id, "source_1", contract)
+        factory.data_flow.update_node_output_contract(
+            "source_1", contract, member_token=leader_coordination_token(factory, run.run_id).membership
+        )
 
         # Verify stored
         with db.connection() as conn:
@@ -116,7 +120,7 @@ class TestRegisterNodeWithContracts:
         )
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -168,7 +172,7 @@ class TestRegisterNodeWithContracts:
         )
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -227,7 +231,7 @@ class TestRegisterNodeWithContracts:
         )
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -262,7 +266,7 @@ class TestRegisterNodeWithContracts:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -322,7 +326,7 @@ class TestGetNodeContracts:
         )
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -352,7 +356,7 @@ class TestGetNodeContracts:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -388,7 +392,7 @@ class TestGetNodeContracts:
         )
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -420,7 +424,7 @@ class TestRecordValidationErrorWithContract:
 
         # Create source node for FK constraint
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -440,7 +444,7 @@ class TestRecordValidationErrorWithContract:
         )
 
         error_id = factory.data_flow.record_validation_error(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source_1",
             row_data={"amount": "not_a_number"},
             error="Type mismatch: expected int, got str",
@@ -479,7 +483,7 @@ class TestRecordValidationErrorWithContract:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -495,7 +499,7 @@ class TestRecordValidationErrorWithContract:
         )
 
         error_id = factory.data_flow.record_validation_error(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source_1",
             row_data={},
             error="Missing required field: Customer ID",
@@ -533,7 +537,7 @@ class TestRecordValidationErrorWithContract:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -544,7 +548,7 @@ class TestRecordValidationErrorWithContract:
         )
 
         error_id = factory.data_flow.record_validation_error(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source_1",
             row_data={"bad": "data"},
             error="Generic validation error",
@@ -596,7 +600,7 @@ class TestContractIntegrityVerification:
         )
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",

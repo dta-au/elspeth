@@ -47,6 +47,7 @@ from elspeth.engine.barrier_coordination import BarrierIntakeCoordinator, Barrie
 from elspeth.engine.clock import MockClock
 from elspeth.engine.executors.collector import CollectorOutcome
 from elspeth.engine.work_items import WorkItemFactory
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 from tests.helpers.tree_gate import iter_gate_sources
 from tests.unit.engine.test_barrier_coordination import (
     FakeNav,
@@ -201,6 +202,7 @@ def _make_collector_coordinator(
         get_max_node_state_attempts=lambda run_id, token_ids: {},
         row_id_for_token=lambda run_id, token_id: "row-1",
     )
+    setup = make_recorder_with_run(run_id="run-1", leader_worker_id="leader-1")
     return BarrierIntakeCoordinator(
         run_id="run-1",
         scheduler=scheduler,
@@ -215,7 +217,7 @@ def _make_collector_coordinator(
         aggregation_settings={_AGG_NODE: object()},
         coalesce_node_ids={},
         branch_to_coalesce={},
-        coordination_token=SimpleNamespace(worker_id="leader-1", epoch=1),
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         scheduler_lease_owner="leader-1",
         live_barrier_holds={},
         resume_checkpoint_id=None,
@@ -223,7 +225,7 @@ def _make_collector_coordinator(
         complete_coalesce_fire=lambda **kwargs: None,
         terminal_coalesce_row_result=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("not reached")),
         emit_token_completed=lambda token, *, outcome, path, sink_name=None: None,
-        mark_coalesce_consumed_terminal=lambda *, coalesce_name, consumed_tokens: None,
+        settle_failed_coalesce_group=lambda consumed_tokens, **kwargs: [],
         record_group_member_terminals=lambda *args, **kwargs: [],
         take_pending_group_losses=lambda: (),
         collector_executor=collector_executor,  # type: ignore[arg-type]

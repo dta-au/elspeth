@@ -61,11 +61,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from typing import Literal
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import insert, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationSnapshot,
@@ -86,8 +88,15 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.canonical import canonical_json
-from elspeth.core.landscape.database import Tier1Engine, begin_write, verify_sqlite_tier1_pragmas
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database import Tier1Engine, _maybe_serialize_shared_connection, begin_write, verify_sqlite_tier1_pragmas
+from elspeth.core.landscape.database_clock import read_landscape_decision_time
+from elspeth.core.landscape.lease_deadlines import (
+    DeadlineKey,
+    DeadlineKind,
+    forget_issued_deadline,
+    has_issued_deadline,
+    record_issued_deadline,
+)
 from elspeth.core.landscape.schema import (
     run_coordination_events_table,
     run_coordination_table,
@@ -106,9 +115,46 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+
+def _bound_heartbeat_statement_waits(conn: Connection) -> None:
+    """Bound heartbeat and forensic writes without limiting pipeline payloads.
+
+    SQLite already applies a five-second busy timeout. PostgreSQL defaults
+    to unbounded waits; transaction-local limits let a blocked beat report
+    degradation and let its owner join the thread during shutdown.
+    """
+    if conn.dialect.name == "postgresql":
+        # A lock timeout must precede the whole-statement limit, otherwise
+        # PostgreSQL reports generic cancellation instead of lock contention.
+        conn.exec_driver_sql("SET LOCAL lock_timeout = '4000ms'")
+        conn.exec_driver_sql("SET LOCAL statement_timeout = '5000ms'")
+
+
+@contextmanager
+def fenced_heartbeat_transaction(engine: Tier1Engine, *, member_token: WorkerMembershipToken, verb: str) -> Iterator[Connection]:
+    """Lock the seat before checking membership, then admit heartbeat writes.
+
+    Heartbeats update both liveness records. Their lock order must match
+    takeover and finalization; ordinary member writes need only their own
+    membership fence. The caller records a refusal after this transaction
+    rolls back, preserving the heartbeat's declared loss outcome.
+    """
+    if not isinstance(member_token, WorkerMembershipToken):
+        raise TypeError("worker heartbeat requires a WorkerMembershipToken")
+    with begin_write(engine) as conn:
+        _bound_heartbeat_statement_waits(conn)
+        locked_seat = conn.execute(
+            select(run_coordination_table.c.run_id).where(run_coordination_table.c.run_id == member_token.run_id).with_for_update()
+        ).one_or_none()
+        verify_membership_fence(conn, member_token=member_token, verb=verb)
+        if locked_seat is None:
+            raise AuditIntegrityError(f"Run {member_token.run_id!r} has registered membership but no coordination seat")
+        yield conn
+
+
 # Run statuses the takeover CAS flips back to 'running' (§B.4). The
-# dead-leader RUNNING takeover arm is skipped by this predicate by
-# construction; terminal-success statuses are refused by the
+# dead-leader RUNNING takeover arm also clears prior finalization metadata;
+# terminal-success statuses are refused by the
 # immutable-success backstop below before the seat CAS runs.
 _TAKEOVER_FLIPPABLE_RUN_STATUSES = (RunStatus.FAILED.value, RunStatus.INTERRUPTED.value)
 
@@ -322,6 +368,7 @@ def _record_best_effort_event(
     """
     try:
         with begin_write(engine) as conn:
+            _bound_heartbeat_statement_waits(conn)
             record_coordination_event(
                 conn,
                 run_id=run_id,
@@ -346,6 +393,32 @@ def _record_best_effort_event(
     return BestEffortEventOutcome.RECORDED
 
 
+def _leader_deadline_key(token: CoordinationToken) -> DeadlineKey:
+    return DeadlineKey(DeadlineKind.LEADER, (token.run_id, token.worker_id, str(token.leader_epoch)))
+
+
+def _worker_deadline_key(*, run_id: str, worker_id: str) -> DeadlineKey:
+    return DeadlineKey(DeadlineKind.WORKER, (run_id, worker_id))
+
+
+def _renew_leader_deadline_on(conn: Connection, *, token: CoordinationToken, window_seconds: float, verb: str) -> None:
+    """Renew the exact seat after its authority lock has already been acquired."""
+    database_now = read_landscape_decision_time(conn)
+    expires = database_now + timedelta(seconds=window_seconds)
+    renewed = conn.execute(
+        update(run_coordination_table)
+        .where(
+            run_coordination_table.c.run_id == token.run_id,
+            run_coordination_table.c.leader_worker_id == token.worker_id,
+            run_coordination_table.c.leader_epoch == token.leader_epoch,
+        )
+        .values(leader_heartbeat_expires_at=expires, updated_at=database_now)
+    )
+    if renewed.rowcount != 1:
+        raise RunLeadershipLostError(run_id=token.run_id, worker_id=token.worker_id, leader_epoch=token.leader_epoch, verb=verb)
+    record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
+
+
 def verify_and_extend_leader_fence(
     conn: Connection,
     *,
@@ -362,15 +435,11 @@ def verify_and_extend_leader_fence(
     heartbeat (the predicate is identity+epoch only — NEVER expiry: an idle
     N=1 leader whose seat lapsed mid-run must still pass its own fence).
 
-    The new deadline is written from the database's own clock, in SQL, so no
-    process clock and no caller-supplied ``now`` reaches the seat (ADR-047):
-    SQLite has no interval arithmetic, so its deadline is
-    ``strftime('%Y-%m-%d %H:%M:%S.000000', CURRENT_TIMESTAMP, '+N seconds')``
-    — the DateTime storage format every bound ``datetime`` is written in,
-    fraction included, so the in-SQL deadline compares byte-for-byte against
-    a bound value of the same instant and no liveness window has to absorb a
-    sub-second artefact; PostgreSQL adds an interval to the transaction
-    timestamp.
+    The first CAS preserves identity and takes the seat lock. Only after
+    that statement finishes does a separate Landscape clock query sample
+    the renewal instant (ADR-047). Raw Connection callers retain an explicit
+    renewal obligation; the outer transaction guard refuses an aged lease,
+    and the leader context renews again after a successful body.
 
     On rowcount 0 raises :class:`RunLeadershipLostError`. The caller (or
     :func:`fenced_leader_transaction`) records the ``fence_refusal`` event on
@@ -384,21 +453,7 @@ def verify_and_extend_leader_fence(
             run_coordination_table.c.leader_worker_id == token.worker_id,
             run_coordination_table.c.leader_epoch == token.leader_epoch,
         )
-        .values(
-            leader_heartbeat_expires_at=(
-                # SQLAlchemy's SQLite DateTime storage format, fraction included:
-                # CURRENT_TIMESTAMP alone is fractionless text and would sort
-                # before a bound value of the same second.
-                func.strftime("%Y-%m-%d %H:%M:%S.000000", func.current_timestamp(), f"+{window_seconds} seconds")
-                if conn.dialect.name == "sqlite"
-                else func.current_timestamp() + timedelta(seconds=window_seconds)
-            ),
-            updated_at=(
-                func.strftime("%Y-%m-%d %H:%M:%S.000000", func.current_timestamp())
-                if conn.dialect.name == "sqlite"
-                else func.current_timestamp()
-            ),
-        )
+        .values(leader_epoch=run_coordination_table.c.leader_epoch)
     )
     if result.rowcount != 1:
         raise RunLeadershipLostError(
@@ -407,6 +462,7 @@ def verify_and_extend_leader_fence(
             leader_epoch=token.leader_epoch,
             verb=verb,
         )
+    _renew_leader_deadline_on(conn, token=token, window_seconds=window_seconds, verb=verb)
 
 
 @contextmanager
@@ -427,10 +483,14 @@ def fenced_leader_transaction(
     (finalize / run-status / checkpoint / complete_barrier / ingest / repair
     sweep) wrap their existing transaction bodies in this.
     """
+    if not isinstance(token, CoordinationToken):
+        raise TypeError("leader fencing requires a CoordinationToken")
     try:
         with begin_write(engine) as conn:
             verify_and_extend_leader_fence(conn, token=token, window_seconds=window_seconds, verb=verb)
             yield conn
+            if has_issued_deadline(conn, key=_leader_deadline_key(token)):
+                _renew_leader_deadline_on(conn, token=token, window_seconds=window_seconds, verb=verb)
     except RunLeadershipLostError:
         # The begin_write context has exited (rolled back) by the time we get
         # here, so the fresh-connection write cannot deadlock on our own lock.
@@ -529,6 +589,8 @@ def fenced_member_transaction(
     keep their item-lease CAS (``expected_lease_owner``) as the payload's own
     WHERE — D4's third fence.
     """
+    if not isinstance(member_token, WorkerMembershipToken):
+        raise TypeError("membership fencing requires a WorkerMembershipToken")
     try:
         with begin_write(engine) as conn:
             verify_membership_fence(conn, member_token=member_token, verb=verb)
@@ -560,6 +622,49 @@ class RunCoordinationRepository:
 
     # ── seat lifecycle ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _finalize_leader_registration_on(conn: Connection, *, token: CoordinationToken, window_seconds: float) -> None:
+        """Finalize a newly minted seat/member pair while the owner holds both rows.
+
+        Registration events describe initial admission. This final renewal
+        extends that admitted pair together after the caller's composition;
+        it does not change registration identity or its historical stamps.
+        """
+        database_now = read_landscape_decision_time(conn)
+        expires = database_now + timedelta(seconds=window_seconds)
+        seat = conn.execute(
+            update(run_coordination_table)
+            .where(
+                run_coordination_table.c.run_id == token.run_id,
+                run_coordination_table.c.leader_worker_id == token.worker_id,
+                run_coordination_table.c.leader_epoch == token.leader_epoch,
+            )
+            .values(leader_heartbeat_expires_at=expires, updated_at=database_now)
+        )
+        if seat.rowcount != 1:
+            raise RunLeadershipLostError(
+                run_id=token.run_id, worker_id=token.worker_id, leader_epoch=token.leader_epoch, verb="finalize_leader_registration"
+            )
+        member = conn.execute(
+            update(run_workers_table)
+            .where(
+                run_workers_table.c.run_id == token.run_id,
+                run_workers_table.c.worker_id == token.worker_id,
+                run_workers_table.c.role == "leader",
+                run_workers_table.c.status == "active",
+            )
+            .values(heartbeat_expires_at=expires)
+        )
+        if member.rowcount != 1:
+            raise AuditIntegrityError(f"Newly registered leader {token.worker_id!r} has no active same-run leader membership")
+        record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
+        record_issued_deadline(
+            conn,
+            key=_worker_deadline_key(run_id=token.run_id, worker_id=token.worker_id),
+            expires_at=expires,
+            window_seconds=window_seconds,
+        )
+
     def register_run_leader_on(
         self,
         conn: Connection,
@@ -576,9 +681,11 @@ class RunCoordinationRepository:
         forensics), and the ``leader_acquire`` + ``worker_register`` events —
         all on ``conn``. The ``runs`` row must already exist in this
         transaction (FK). The seat's deadline and every stamp come from the
-        Landscape database clock read once on ``conn`` (ADR-047).
+        initial Landscape admission sample on ``conn`` (ADR-047). The outer
+        owner finalizes the pair after its body; returning this token has not
+        committed either the admission or its deadline.
         """
-        database_now = read_landscape_transaction_time(conn)
+        database_now = read_landscape_decision_time(conn)
         expires = database_now + timedelta(seconds=window_seconds)
         conn.execute(
             insert(run_coordination_table).values(
@@ -589,6 +696,8 @@ class RunCoordinationRepository:
                 updated_at=database_now,
             )
         )
+        token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=1)
+        record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
         self._insert_worker_row(
             conn,
             run_id=run_id,
@@ -596,6 +705,7 @@ class RunCoordinationRepository:
             role="leader",
             window_seconds=window_seconds,
             entry_point=entry_point,
+            database_now=database_now,
         )
         record_coordination_event(
             conn,
@@ -615,7 +725,7 @@ class RunCoordinationRepository:
             recorded_at=database_now,
             context={"entry_point": entry_point},
         )
-        return CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=1)
+        return token
 
     def acquire_run_leadership(
         self,
@@ -638,9 +748,8 @@ class RunCoordinationRepository:
            mutation and ``NonResumableRunError("run leadership is held by
            …")`` (the pinned refusal-before-mutation discipline);
         3. the run-status flip ``failed/interrupted → running`` (subsumes the
-           old ``update_run_status(RUNNING)`` first-durable-write at
-           resume.py:591; skipped by predicate on the dead-leader RUNNING
-           takeover arm);
+           old ``update_run_status(RUNNING)`` first-durable-write), clearing
+           prior finalization metadata even on dead-leader RUNNING takeover;
         4. identity-eviction of the deposed leader, unconditional — by
            identity, no heartbeat predicate (the expired seat IS the proof of
            lost custody); NO bulk follower eviction (§C.2 housekeeping is
@@ -657,13 +766,15 @@ class RunCoordinationRepository:
         """
         try:
             with begin_write(self._engine) as conn:
-                return self._acquire_run_leadership_on(
+                token = self._acquire_run_leadership_on(
                     conn,
                     run_id=run_id,
                     worker_id=worker_id,
                     window_seconds=window_seconds,
                     entry_point=entry_point,
                 )
+                self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)
+            return token
         except OperationalError as exc:
             if not _is_database_locked(exc):
                 raise
@@ -678,16 +789,16 @@ class RunCoordinationRepository:
         window_seconds: float,
         entry_point: str,
     ) -> CoordinationToken:
-        # The takeover decision compares the seat against the database's own
-        # clock, read once inside the write transaction (ADR-047): a lock-wait
-        # stale reading can only make the incumbent look LESS expired.
-        database_now = read_landscape_transaction_time(conn)
+        # Acquire the seat before sampling its expiry decision. A transaction
+        # start timestamp would retain the entire lock wait (ADR-047).
         seat = conn.execute(
             select(
                 run_coordination_table.c.leader_worker_id,
                 run_coordination_table.c.leader_epoch,
                 run_coordination_table.c.leader_heartbeat_expires_at,
-            ).where(run_coordination_table.c.run_id == run_id)
+            )
+            .where(run_coordination_table.c.run_id == run_id)
+            .with_for_update()
         ).one_or_none()
         if seat is None:
             # Epoch-21 invariant: begin_run mints the seat in the same
@@ -698,6 +809,7 @@ class RunCoordinationRepository:
                 "begin_run creates it atomically with the run. The audit DB is corrupt "
                 "or was written by incompatible code."
             )
+        database_now = read_landscape_decision_time(conn)
         prior_worker: str | None = seat.leader_worker_id
         expires = database_now + timedelta(seconds=window_seconds)
 
@@ -747,17 +859,23 @@ class RunCoordinationRepository:
             raise NonResumableRunError(
                 run_id,
                 f"run leadership is held by {prior_worker!r} (seat expires {expiry_text})",
+                cause=ResumeRefusalCause.LEADER_LIVE,
             )
         new_epoch = int(seat.leader_epoch) + 1
+        token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
+        record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
 
-        # The winner's run-status flip rides the same transaction (§B.4).
-        # Predicate-skipped on the dead-leader RUNNING takeover arm; terminal
-        # SUCCESS statuses were refused above by the immutable-success
-        # backstop before the seat CAS ran.
+        # The winner's run-status normalization rides the same transaction
+        # (§B.4). An inherited grade belongs to the prior attempt, including
+        # when that attempt left a stale grade on RUNNING. Terminal SUCCESS
+        # statuses were refused above before the seat CAS ran.
         conn.execute(
             update(runs_table)
-            .where(runs_table.c.run_id == run_id, runs_table.c.status.in_(_TAKEOVER_FLIPPABLE_RUN_STATUSES))
-            .values(status=RunStatus.RUNNING.value, completed_at=None)
+            .where(
+                runs_table.c.run_id == run_id,
+                runs_table.c.status.in_((*_TAKEOVER_FLIPPABLE_RUN_STATUSES, RunStatus.RUNNING.value)),
+            )
+            .values(status=RunStatus.RUNNING.value, completed_at=None, reproducibility_grade=None)
         )
 
         if prior_worker is not None and prior_worker != worker_id:
@@ -787,6 +905,7 @@ class RunCoordinationRepository:
             role="leader",
             window_seconds=window_seconds,
             entry_point=entry_point,
+            database_now=database_now,
         )
         record_coordination_event(
             conn,
@@ -806,7 +925,7 @@ class RunCoordinationRepository:
             recorded_at=database_now,
             context={"entry_point": entry_point, "deposed_leader_worker_id": prior_worker},
         )
-        return CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
+        return token
 
     def acquire_export_leadership(
         self,
@@ -829,32 +948,72 @@ class RunCoordinationRepository:
         """
         try:
             with begin_write(self._engine) as conn:
-                return self._acquire_export_leadership_on(
+                token = self._acquire_terminal_leadership_on(
                     conn,
                     run_id=run_id,
                     worker_id=worker_id,
                     window_seconds=window_seconds,
+                    purpose="export",
                 )
+                self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)
+            return token
         except OperationalError as exc:
             if not _is_database_locked(exc):
                 raise
             raise WriteLockHeldError(run_id=run_id, workers=self._read_registered_workers(run_id)) from exc
 
-    def _acquire_export_leadership_on(
+    def acquire_reconciliation_leadership(
+        self,
+        *,
+        run_id: str,
+        worker_id: str,
+        window_seconds: float,
+        expected_status: RunStatus,
+    ) -> CoordinationToken:
+        """Own a terminal projection without changing the engine's status.
+
+        The expected observation is rechecked after locking the leadership
+        seat, before any durable write. Hold a leader-fenced transaction while
+        projecting into another store if an arbitrary pause must not allow a
+        competing resumer to pass an expired lease.
+        """
+        if type(expected_status) is not RunStatus or expected_status.value not in _EXPORT_SEAT_RUN_STATUSES:
+            raise ValueError("Reconciliation requires an exact terminal RunStatus")
+        try:
+            with begin_write(self._engine) as conn:
+                token = self._acquire_terminal_leadership_on(
+                    conn,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    window_seconds=window_seconds,
+                    purpose="reconciliation",
+                    expected_status=expected_status,
+                )
+                self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)
+            return token
+        except OperationalError as exc:
+            if not _is_database_locked(exc):
+                raise
+            raise WriteLockHeldError(run_id=run_id, workers=self._read_registered_workers(run_id)) from exc
+
+    def _acquire_terminal_leadership_on(
         self,
         conn: Connection,
         *,
         run_id: str,
         worker_id: str,
         window_seconds: float,
+        purpose: Literal["export", "reconciliation"],
+        expected_status: RunStatus | None = None,
     ) -> CoordinationToken:
-        database_now = read_landscape_transaction_time(conn)
         seat = conn.execute(
             select(
                 run_coordination_table.c.leader_worker_id,
                 run_coordination_table.c.leader_epoch,
                 run_coordination_table.c.leader_heartbeat_expires_at,
-            ).where(run_coordination_table.c.run_id == run_id)
+            )
+            .where(run_coordination_table.c.run_id == run_id)
+            .with_for_update()
         ).one_or_none()
         if seat is None:
             raise AuditIntegrityError(
@@ -862,7 +1021,22 @@ class RunCoordinationRepository:
                 "begin_run creates it atomically with the run. The audit DB is corrupt "
                 "or was written by incompatible code."
             )
+        database_now = read_landscape_decision_time(conn)
         run_status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).scalar_one_or_none()
+        if expected_status is not None and run_status != expected_status.value:
+            from elspeth.core.checkpoint.recovery import NonResumableRunError
+
+            raise NonResumableRunError(
+                run_id,
+                "terminal status changed before reconciliation acquired authority",
+                cause=ResumeRefusalCause.TERMINAL_STATUS_CHANGED,
+            )
+        if run_status == RunStatus.RUNNING.value:
+            from elspeth.core.checkpoint.recovery import NonResumableRunError
+
+            raise NonResumableRunError(
+                run_id, "run is not terminal; its running leader owns finalization", cause=ResumeRefusalCause.RUN_NOT_FINALIZED
+            )
         if run_status not in _EXPORT_SEAT_RUN_STATUSES:
             raise AuditIntegrityError(
                 f"Cannot acquire export leadership: run {run_id} is {run_status!r}, not terminal. "
@@ -892,8 +1066,11 @@ class RunCoordinationRepository:
             raise NonResumableRunError(
                 run_id,
                 f"run leadership is held by {prior_worker!r} (seat expires {expiry_text})",
+                cause=ResumeRefusalCause.LEADER_LIVE,
             )
         new_epoch = int(seat.leader_epoch) + 1
+        token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
+        record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
         if prior_worker is not None and prior_worker != worker_id:
             evicted = conn.execute(
                 update(run_workers_table)
@@ -911,7 +1088,7 @@ class RunCoordinationRepository:
                     worker_id=prior_worker,
                     leader_epoch=new_epoch,
                     recorded_at=database_now,
-                    context={"evicted_by_worker_id": worker_id, "reason": "deposed_leader_export_takeover"},
+                    context={"evicted_by_worker_id": worker_id, "reason": f"deposed_leader_{purpose}_takeover"},
                 )
         self._insert_worker_row(
             conn,
@@ -919,7 +1096,8 @@ class RunCoordinationRepository:
             worker_id=worker_id,
             role="leader",
             window_seconds=window_seconds,
-            entry_point="export",
+            entry_point=purpose,
+            database_now=database_now,
         )
         record_coordination_event(
             conn,
@@ -928,7 +1106,7 @@ class RunCoordinationRepository:
             worker_id=worker_id,
             leader_epoch=new_epoch,
             recorded_at=database_now,
-            context={"role": "leader", "entry_point": "export"},
+            context={"role": "leader", "entry_point": purpose},
         )
         record_coordination_event(
             conn,
@@ -937,9 +1115,9 @@ class RunCoordinationRepository:
             worker_id=worker_id,
             leader_epoch=new_epoch,
             recorded_at=database_now,
-            context={"entry_point": "export", "deposed_leader_worker_id": prior_worker},
+            context={"entry_point": purpose, "deposed_leader_worker_id": prior_worker},
         )
-        return CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
+        return token
 
     def release_seat(self, *, token: CoordinationToken) -> SeatReleaseOutcome:
         """Graceful leader shutdown: vacate the seat + depart own row, leader-fenced. Idempotent.
@@ -974,7 +1152,7 @@ class RunCoordinationRepository:
             with fenced_leader_transaction(
                 self._engine, token=token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="release_seat"
             ) as conn:
-                database_now = read_landscape_transaction_time(conn)
+                database_now = read_landscape_decision_time(conn)
                 released = conn.execute(
                     update(run_coordination_table)
                     .where(
@@ -992,6 +1170,7 @@ class RunCoordinationRepository:
                         f"release_seat: the seat for run {token.run_id!r} passed its epoch fence but the vacate UPDATE matched "
                         f"{released.rowcount} rows; the run_coordination row changed inside one IMMEDIATE transaction."
                     )
+                forget_issued_deadline(conn, key=_leader_deadline_key(token))
                 departed = conn.execute(
                     update(run_workers_table)
                     .where(
@@ -1037,11 +1216,11 @@ class RunCoordinationRepository:
         Check-then-act at the caller is acceptable because the leadership CAS
         is the arbiter.
         """
-        with self._engine.connect() as conn:
-            database_now = read_landscape_transaction_time(conn)
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
+            database_now = read_landscape_decision_time(conn)
             # Liveness is decided in SQL against the bound database time — the
-            # same comparison the takeover CAS makes — so the advisory verdict
-            # and the arbiter agree even on the fence's whole-second SQLite text.
+            # same comparison the takeover CAS makes. This remains advisory:
+            # the arbiter samples again after it acquires the seat lock.
             seat = conn.execute(
                 select(
                     run_coordination_table.c.leader_worker_id,
@@ -1089,8 +1268,7 @@ class RunCoordinationRepository:
     def record_heartbeat_degraded(
         self,
         *,
-        run_id: str,
-        worker_id: str,
+        member_token: WorkerMembershipToken,
         failures: int,
         now: datetime,
     ) -> None:
@@ -1098,13 +1276,18 @@ class RunCoordinationRepository:
 
         Consumed by the slice-4 heartbeat thread after ``k`` consecutive busy
         failures, so a later eviction is diagnosable post-hoc as "could not
-        reach the DB" rather than "process died". Never raises.
+        reach the DB" rather than "process died". Database faults are best-effort;
+        invalid carrier types are programmer errors. This forensic event retains
+        its originating identity even after membership is lost, so it deliberately
+        does not require a live membership fence (ADR-048).
         """
+        if not isinstance(member_token, WorkerMembershipToken):
+            raise TypeError("heartbeat degradation requires a WorkerMembershipToken")
         _record_best_effort_event(
             self._engine,
-            run_id=run_id,
+            run_id=member_token.run_id,
             event_type="heartbeat_degraded",
-            worker_id=worker_id,
+            worker_id=member_token.worker_id,
             leader_epoch=None,
             recorded_at=now,
             context={"consecutive_busy_failures": failures},
@@ -1117,8 +1300,9 @@ class RunCoordinationRepository:
     ) -> CoordinationSnapshot | WorkerMembershipLost:
         """Member-fenced worker-row beat + seat snapshot, one transaction (§A.3).
 
-        SLICE-4 CONSUMER: the dedicated heartbeat thread. The membership fence
-        is the first statement (ADR-030 D4); its refusal — this worker is no
+        SLICE-4 CONSUMER: the dedicated heartbeat thread. Lock the seat before
+        fencing membership, matching takeover and release order. No liveness
+        write precedes the membership fence; its refusal — this worker is no
         longer ``active`` (departed at finalize, or evicted) — is this verb's
         DECLARED outcome, ``WorkerMembershipLost``, requiring no further read:
         the thread latches its coordination-lost flag on THAT, never on a DB error, and the
@@ -1132,34 +1316,45 @@ class RunCoordinationRepository:
         outcome: registration precedes the heartbeat thread by construction,
         so a vanished row is audit corruption (``AuditIntegrityError``).
         """
+        if not isinstance(member_token, WorkerMembershipToken):
+            raise TypeError("worker heartbeat requires a WorkerMembershipToken")
         try:
-            with fenced_member_transaction(self._engine, member_token=member_token, verb="worker_heartbeat") as conn:
-                database_now = read_landscape_transaction_time(conn)
+            with fenced_heartbeat_transaction(self._engine, member_token=member_token, verb="worker_heartbeat") as conn:
                 role = conn.execute(
                     select(run_workers_table.c.role).where(
                         run_workers_table.c.run_id == member_token.run_id,
                         run_workers_table.c.worker_id == member_token.worker_id,
                     )
                 ).scalar_one()
+                database_now = read_landscape_decision_time(conn)
+                expires = database_now + timedelta(seconds=window_seconds)
                 conn.execute(
                     update(run_workers_table)
                     .where(
                         run_workers_table.c.run_id == member_token.run_id,
                         run_workers_table.c.worker_id == member_token.worker_id,
                     )
-                    .values(heartbeat_expires_at=database_now + timedelta(seconds=window_seconds))
+                    .values(heartbeat_expires_at=expires)
                 )
+                record_issued_deadline(
+                    conn,
+                    key=_worker_deadline_key(run_id=member_token.run_id, worker_id=member_token.worker_id),
+                    expires_at=expires,
+                    window_seconds=window_seconds,
+                )
+                leader_renewed = False
                 if role == "leader":
-                    conn.execute(
+                    renewed = conn.execute(
                         update(run_coordination_table)
                         .where(
                             run_coordination_table.c.run_id == member_token.run_id,
                             run_coordination_table.c.leader_worker_id == member_token.worker_id,
                         )
-                        .values(leader_heartbeat_expires_at=database_now + timedelta(seconds=window_seconds), updated_at=database_now)
+                        .values(leader_heartbeat_expires_at=expires, updated_at=database_now)
                     )
-                # The seat's liveness is decided in SQL against the transaction's
-                # database time (ADR-047): NULL expiry or vacant seat reads dead.
+                    leader_renewed = renewed.rowcount == 1
+                # Snapshot liveness uses the same final heartbeat decision
+                # sample as both deadlines; vacant/NULL seats read dead.
                 seat = conn.execute(
                     select(
                         run_coordination_table.c.leader_worker_id,
@@ -1172,7 +1367,23 @@ class RunCoordinationRepository:
                         f"Run {member_token.run_id!r} has no run_coordination seat row; "
                         "worker registration requires a seat created atomically by begin_run."
                     )
+                if leader_renewed:
+                    record_issued_deadline(
+                        conn,
+                        key=DeadlineKey(DeadlineKind.LEADER, (member_token.run_id, member_token.worker_id, str(seat.leader_epoch))),
+                        expires_at=expires,
+                        window_seconds=window_seconds,
+                    )
         except RunMembershipLostError:
+            _record_best_effort_event(
+                self._engine,
+                run_id=member_token.run_id,
+                event_type="fence_refusal",
+                worker_id=member_token.worker_id,
+                leader_epoch=None,
+                recorded_at=datetime.now(UTC),
+                context={"verb": "worker_heartbeat", "fence": "membership"},
+            )
             return WorkerMembershipLost(member_token=member_token)
         return CoordinationSnapshot(
             leader_worker_id=seat.leader_worker_id,
@@ -1206,7 +1417,14 @@ class RunCoordinationRepository:
         and, in wave 2, its claim verbs. A caller never constructs one.
         """
         with begin_write(self._engine) as conn:
-            database_now = read_landscape_transaction_time(conn)
+            # Serialize admission with takeover and finalization before reading
+            # their predicates. In particular, a finalizer locks its follower
+            # roster before token decisions; joining after that snapshot must
+            # re-observe the terminal run instead of leaving an active orphan.
+            conn.execute(
+                select(run_coordination_table.c.run_id).where(run_coordination_table.c.run_id == run_id).with_for_update()
+            ).one_or_none()
+            database_now = read_landscape_decision_time(conn)
             run = conn.execute(select(runs_table.c.status, runs_table.c.config_hash).where(runs_table.c.run_id == run_id)).one_or_none()
             if run is None:
                 raise JoinRefusedError(run_id, "run not found")
@@ -1241,6 +1459,7 @@ class RunCoordinationRepository:
                 role="follower",
                 window_seconds=window_seconds,
                 entry_point="join",
+                database_now=database_now,
             )
             record_coordination_event(
                 conn,
@@ -1251,7 +1470,38 @@ class RunCoordinationRepository:
                 recorded_at=database_now,
                 context={"role": "follower", "entry_point": "join"},
             )
+            self._finalize_follower_admission_on(conn, run_id=run_id, worker_id=worker_id, window_seconds=window_seconds)
         return WorkerMembershipToken(run_id=run_id, worker_id=worker_id)
+
+    @staticmethod
+    def _finalize_follower_admission_on(conn: Connection, *, run_id: str, worker_id: str, window_seconds: float) -> None:
+        """Renew the new member only while the already-locked foreign seat is live."""
+        database_now = read_landscape_decision_time(conn)
+        live_seat = conn.execute(
+            select(run_coordination_table.c.run_id).where(
+                run_coordination_table.c.run_id == run_id,
+                run_coordination_table.c.leader_worker_id.is_not(None),
+                run_coordination_table.c.leader_heartbeat_expires_at >= database_now,
+            )
+        ).one_or_none()
+        if live_seat is None:
+            raise JoinRefusedError(run_id, "leader seat expired during follower admission")
+        expires = database_now + timedelta(seconds=window_seconds)
+        renewed = conn.execute(
+            update(run_workers_table)
+            .where(
+                run_workers_table.c.run_id == run_id,
+                run_workers_table.c.worker_id == worker_id,
+                run_workers_table.c.role == "follower",
+                run_workers_table.c.status == "active",
+            )
+            .values(heartbeat_expires_at=expires)
+        )
+        if renewed.rowcount != 1:
+            raise AuditIntegrityError(f"Newly admitted follower {worker_id!r} has no active same-run membership")
+        record_issued_deadline(
+            conn, key=_worker_deadline_key(run_id=run_id, worker_id=worker_id), expires_at=expires, window_seconds=window_seconds
+        )
 
     def depart_worker(self, *, member_token: WorkerMembershipToken) -> None:
         """Member-fenced ``active → departed`` + ``worker_depart`` event. Idempotent.
@@ -1266,7 +1516,7 @@ class RunCoordinationRepository:
         """
         try:
             with fenced_member_transaction(self._engine, member_token=member_token, verb="depart_worker") as conn:
-                database_now = read_landscape_transaction_time(conn)
+                database_now = read_landscape_decision_time(conn)
                 departed = conn.execute(
                     update(run_workers_table)
                     .where(
@@ -1323,10 +1573,6 @@ class RunCoordinationRepository:
         from elspeth.core.landscape.schema import token_work_items_table
 
         with fenced_leader_transaction(self._engine, token=token, window_seconds=window_seconds, verb="evict_worker") as conn:
-            # Liveness and the grace threshold are judged against the
-            # Landscape database clock read inside the fenced transaction
-            # (ADR-047); the fence above is the only earlier statement.
-            database_now = read_landscape_transaction_time(conn)
             # Serialize with membership-fenced claim/heartbeat verbs
             # (elspeth-6903f82511): lock the target's registry row BEFORE the
             # no-unexpired-leases precondition read.  Fenced lease verbs take
@@ -1353,6 +1599,7 @@ class RunCoordinationRepository:
             ).one_or_none()
             if target_registered is None:
                 return False
+            database_now = read_landscape_decision_time(conn)
             live_lease = conn.execute(
                 select(token_work_items_table.c.work_item_id)
                 .where(
@@ -1401,19 +1648,16 @@ class RunCoordinationRepository:
         role: str,
         window_seconds: float,
         entry_point: str,
+        database_now: datetime,
     ) -> None:
         """Register an ACTIVE member whose first heartbeat deadline is database time + window.
 
-        Reads the Landscape database clock on ``conn`` itself (ADR-047): no
-        caller hands this helper a clock. Inside the caller's transaction the
-        read is the same instant as the caller's own on PostgreSQL
-        (``CURRENT_TIMESTAMP`` is transaction time), so a seat minted in that
-        transaction and this row carry identical deadlines; on SQLite the two
-        statement-time reads can straddle a second boundary, a one-second
-        offset that the leader's first beat (which stamps both rows from one
-        read) erases and that no liveness window (>= 10 s) can observe.
+        The private caller passes its own Landscape admission sample so a
+        minted seat/member pair starts with identical deadlines and stamps.
+        Public mint/admission APIs accept no clock. Their transaction owner
+        explicitly finalizes issuance after its remaining composition.
         """
-        database_now = read_landscape_transaction_time(conn)
+        expires = database_now + timedelta(seconds=window_seconds)
         conn.execute(
             insert(run_workers_table).values(
                 worker_id=worker_id,
@@ -1421,11 +1665,14 @@ class RunCoordinationRepository:
                 role=role,
                 status="active",
                 registered_at=database_now,
-                heartbeat_expires_at=database_now + timedelta(seconds=window_seconds),
+                heartbeat_expires_at=expires,
                 pid=os.getpid(),
                 hostname=socket.gethostname(),
                 entry_point=entry_point,
             )
+        )
+        record_issued_deadline(
+            conn, key=_worker_deadline_key(run_id=run_id, worker_id=worker_id), expires_at=expires, window_seconds=window_seconds
         )
 
     def dead_non_leader_workers(
@@ -1452,8 +1699,8 @@ class RunCoordinationRepository:
         The caller then calls ``evict_worker`` for each, which is idempotent
         (benign skip if the worker heartbeated or holds a live lease).
         """
-        with self._engine.connect() as conn:
-            grace_threshold = read_landscape_transaction_time(conn) - timedelta(seconds=grace_seconds)
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
+            grace_threshold = read_landscape_decision_time(conn) - timedelta(seconds=grace_seconds)
             rows = conn.execute(
                 select(run_workers_table.c.worker_id)
                 .where(

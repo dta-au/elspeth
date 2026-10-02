@@ -23,6 +23,8 @@ export const EXECUTION_BLOCKED_VALIDATION_READINESS = {
       component_id: "pipeline",
       component_type: "pipeline",
       detail: "The selected runtime policy does not admit this pipeline.",
+      suggestion: null,
+      note: null,
     },
   ],
 } satisfies ValidationReadiness;
@@ -37,6 +39,8 @@ export const COMPLETION_BLOCKED_VALIDATION_READINESS = {
       component_id: null,
       component_type: null,
       detail: "Advisor sign-off is required before sharing for review.",
+      suggestion: null,
+      note: null,
     },
   ],
 } satisfies ValidationReadiness;
@@ -51,6 +55,8 @@ export const INVALID_VALIDATION_READINESS = {
       component_id: "node1",
       component_type: "transform",
       detail: "The transform did not pass validation.",
+      suggestion: null,
+      note: null,
     },
   ],
 } satisfies ValidationReadiness;

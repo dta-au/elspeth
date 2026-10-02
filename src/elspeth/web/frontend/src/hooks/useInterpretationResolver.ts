@@ -1,49 +1,3 @@
-// ============================================================================
-// useInterpretationResolver.ts — shared state machine for the interpretation
-// review widgets (Phase 5b.18b.4 + 5b.18b.5).
-//
-// Two surfaces consume the interpretation-review affordances:
-//
-//   1. InterpretationReviewTurn (guided mode) — a turn-card widget rendered
-//      inside the GuidedTurn dispatch.
-//   2. InterpretationReviewInlineMessage (freeform mode) — a chat-styled
-//      inline message rendered inside the ChatPanel message list.
-//
-// The two widgets differ ONLY in their visual rendering and a handful of
-// presentational concerns (mount-focus, region heading, button copy
-// placement).  The behaviour — when each handler is fired, how it interacts
-// with the store, how API errors are mapped, the 8 KB amendment cap, the
-// opt-out confirmation flow — is identical.  Duplicating that behaviour in
-// two components would be a maintenance hazard: a fix to the 409 multi-tab
-// recovery path on one widget would silently miss the other.
-//
-// This hook encapsulates the shared logic:
-//
-//   * The four-state UI state machine (mode, amendText, two in-flight
-//     flags, displayed error, opt-out confirm dialog visibility).
-//   * The four handlers (handleUseMine, handleSubmitAmend, handleConfirmOptOut,
-//     and the open/cancel helpers).
-//   * The error-shape mapper (409 → multi-tab, 422 → validation detail,
-//     other → generic with detail).
-//   * The 8 KB amendment cap measured in UTF-8 bytes (mirrors the backend
-//     pydantic validator in contracts/composer_interpretation.py).
-//
-// What stays in each component:
-//
-//   * The actual DOM (region wrapper vs. inline-message wrapper).
-//   * ARIA wiring (the headerId / statusId / errorId IDs are owned by the
-//     component because their placement depends on the surface layout).
-//   * Focus management on mount (the guided turn focuses the accept button
-//     immediately because mounting the widget IS the AT user's entry to
-//     that surface; the inline message lives inside the chat log under
-//     role="log" and must NOT yank focus away from a user typing in the
-//     chat input).
-//
-// Tier-discipline note: the hook does no I/O directly — it dispatches to
-// the interpretationEventsStore's resolveEvent / optOut actions and maps
-// thrown ApiError shapes back into a display-friendly envelope.  The
-// store actions handle the wire write and atomicity invariants.
-// ============================================================================
 
 import { useState } from "react";
 import type { ApiError, CompositionState } from "@/types/index";
@@ -94,14 +48,18 @@ function isApiError(err: unknown): err is ApiError {
 
 export function describeError(err: unknown): DisplayedError {
   if (isApiError(err)) {
-    if (err.status === 409) {
-      // F-12 multi-tab TOCTOU: the event was already resolved on the
-      // server (typically by another browser tab on the same session).
+    if (
+      err.status === 409 &&
+      err.error_type === "interpretation_already_resolved"
+    ) {
+      // Session-operation contention also returns 409. Only the explicit
+      // event code establishes that this review is no longer pending;
+      // it does not establish who resolved it or whether it was approved.
       return {
         heading: "Already resolved",
         body:
-          "This interpretation was already resolved in another tab — " +
-          "reload to see the latest.",
+          "This interpretation is no longer pending. " +
+          "Reload to see the latest.",
       };
     }
     if (err.status === 422) {

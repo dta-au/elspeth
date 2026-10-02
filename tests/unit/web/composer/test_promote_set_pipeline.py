@@ -29,6 +29,8 @@ Tests pin:
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -51,16 +53,27 @@ from elspeth.web.composer.redaction import (
     MANIFEST,
     SetPipelineArgumentsModel,
     redact_tool_call_arguments,
+    semantic_redacted_pipeline_arguments_hash,
 )
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import _execute_create_blob, _execute_set_pipeline, build_set_pipeline_candidate
 from elspeth.web.composer.tools._common import ToolContext as _ToolContext
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.session_fences import fenced_operation_context
+
+
+@pytest.fixture
+def operation_scopes() -> Iterator[ExitStack]:
+    """Keep explicitly acquired tool operations alive through each lifecycle."""
+    with ExitStack() as scopes:
+        yield scopes
 
 
 def _option_shape_summary(
@@ -130,6 +143,8 @@ def _session_engine_with_session() -> tuple[Any, str]:
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
     session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
@@ -337,7 +352,7 @@ class TestPromoteSetPipelineArgErrorRouting:
         assert isinstance(cause, PydanticValidationError)
         assert any(err["loc"] == ("outputs", 0, "plugin") for err in cause.errors())
 
-    def test_valid_arguments_dispatch_normally(self, tmp_path: Path) -> None:
+    def test_valid_arguments_dispatch_normally(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """Functional smoke: a valid inline_blob set_pipeline materialises
         the blob and binds it as the source.
 
@@ -392,6 +407,8 @@ class TestPromoteSetPipelineArgErrorRouting:
                 data_dir=str(tmp_path),
                 session_engine=engine,
                 session_id=session_id,
+                session_operation_context=operation_scopes.enter_context(fenced_operation_context(engine, session_id)),
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                 user_message_id=user_message_id,
                 user_message_content=user_message_content,
             ),
@@ -404,7 +421,7 @@ class TestPromoteSetPipelineArgErrorRouting:
         # Inline content must not leak into the affected/data summary.
         assert "hello" not in str(result.to_dict())
 
-    def test_inline_blob_without_message_or_composer_provenance_fails_closed(self, tmp_path: Path) -> None:
+    def test_inline_blob_without_message_or_composer_provenance_fails_closed(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """Inline source blobs must not silently persist as verbatim without provenance."""
         engine, session_id = _session_engine_with_session()
         args = {
@@ -436,6 +453,8 @@ class TestPromoteSetPipelineArgErrorRouting:
                     data_dir=str(tmp_path),
                     session_engine=engine,
                     session_id=session_id,
+                    session_operation_context=operation_scopes.enter_context(fenced_operation_context(engine, session_id)),
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                 ),
             )
 
@@ -448,6 +467,7 @@ class TestPromoteSetPipelineArgErrorRouting:
         self,
         tmp_path: Path,
         missing_user_message_id: str | None,
+        operation_scopes: ExitStack,
     ) -> None:
         """Verbatim inline blobs require both message content and message id."""
         engine, session_id = _session_engine_with_session()
@@ -481,6 +501,8 @@ class TestPromoteSetPipelineArgErrorRouting:
                     data_dir=str(tmp_path),
                     session_engine=engine,
                     session_id=session_id,
+                    session_operation_context=operation_scopes.enter_context(fenced_operation_context(engine, session_id)),
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                     user_message_id=missing_user_message_id,
                     user_message_content=user_message_content,
                 ),
@@ -521,9 +543,9 @@ class TestPromoteSetPipelineArgErrorRouting:
 
         assert result.success is False
         assert "source" not in result.updated_state.sources
-        assert SOURCE_AUTHORING_KEY in result.data["error"]
+        assert SOURCE_AUTHORING_KEY in result.validation.errors[0].message
 
-    def test_csv_fixed_schema_accepts_advertised_field_definition_shape(self, tmp_path: Path) -> None:
+    def test_csv_fixed_schema_accepts_advertised_field_definition_shape(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """CSV prevalidation accepts the field shape exposed by plugin JSON Schema."""
         user_message_content = "Use this exact CSV:\nurl\nhttps://example.test\n"
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
@@ -571,6 +593,8 @@ class TestPromoteSetPipelineArgErrorRouting:
                 data_dir=str(tmp_path),
                 session_engine=engine,
                 session_id=session_id,
+                session_operation_context=operation_scopes.enter_context(fenced_operation_context(engine, session_id)),
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                 user_message_id=user_message_id,
                 user_message_content=user_message_content,
             ),
@@ -582,7 +606,7 @@ class TestPromoteSetPipelineArgErrorRouting:
         assert source.plugin == "csv"
         assert source.options["schema"]["fields"] == ({"name": "url", "field_type": "str"},)
 
-    def test_inline_blob_llm_authored_source_records_authoring_metadata(self, tmp_path: Path) -> None:
+    def test_inline_blob_llm_authored_source_records_authoring_metadata(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """LLM-authored inline source blobs must stamp source-level provenance."""
         user_message_content = "Create a tiny generated CSV for the pipeline."
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
@@ -611,6 +635,8 @@ class TestPromoteSetPipelineArgErrorRouting:
                 data_dir=str(tmp_path),
                 session_engine=engine,
                 session_id=session_id,
+                session_operation_context=operation_scopes.enter_context(fenced_operation_context(engine, session_id)),
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                 user_message_id=user_message_id,
                 user_message_content=user_message_content,
                 composer_model_identifier="openai/gpt-5-mini",
@@ -649,7 +675,9 @@ class TestPromoteSetPipelineArgErrorRouting:
             row = conn.execute(select(blobs_table).where(blobs_table.c.id == options["blob_ref"])).one()
         assert row.creation_modality == CreationModality.LLM_GENERATED.value
 
-    def test_inline_blob_llm_authored_url_source_records_url_list_review_requirement(self, tmp_path: Path) -> None:
+    def test_inline_blob_llm_authored_url_source_records_url_list_review_requirement(
+        self, tmp_path: Path, operation_scopes: ExitStack
+    ) -> None:
         """Headered URL CSVs get the tutorial-stable invented-source user_term."""
         user_message_content = "Create a generated URL CSV for the pipeline."
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
@@ -679,6 +707,8 @@ class TestPromoteSetPipelineArgErrorRouting:
                 data_dir=str(tmp_path),
                 session_engine=engine,
                 session_id=session_id,
+                session_operation_context=operation_scopes.enter_context(fenced_operation_context(engine, session_id)),
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                 user_message_id=user_message_id,
                 user_message_content=user_message_content,
                 composer_model_identifier="openai/gpt-5-mini",
@@ -746,8 +776,8 @@ class TestPromoteSetPipelineArgErrorRouting:
         result = _execute_set_pipeline(args, _empty_state(), ToolContext(catalog=_mock_catalog()))
 
         assert result.success is False
-        assert "drop_raw_html_fields" in result.data["error"]
-        assert "pipeline_decision" in result.data["error"]
+        assert "drop_raw_html_fields" in result.validation.errors[0].message
+        assert "pipeline_decision" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_cleanup_named_mapper_that_preserves_web_scrape_raw_fields(self) -> None:
         """A node named as cleanup cannot preserve the exact raw fields it claims to drop."""
@@ -802,8 +832,8 @@ class TestPromoteSetPipelineArgErrorRouting:
         result = _execute_set_pipeline(args, _empty_state(), ToolContext(catalog=_mock_catalog()))
 
         assert result.success is False
-        assert "preserves web-scrape raw field" in result.data["error"]
-        assert "content" in result.data["error"]
+        assert "preserves web-scrape raw field" in result.validation.errors[0].message
+        assert "content" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_malformed_interpretation_requirements_without_crashing(self) -> None:
         """Malformed review metadata is Tier-3 tool input and must be a clean rejection."""
@@ -862,7 +892,7 @@ class TestPromoteSetPipelineArgErrorRouting:
         result = _execute_set_pipeline(args, _empty_state(), ToolContext(catalog=_mock_catalog()))
 
         assert result.success is False
-        assert "interpretation_requirements must be a list" in result.data["error"]
+        assert "interpretation_requirements must be a list" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_raw_cleanup_review_on_llm_node(self) -> None:
         """A raw-cleanup review must be attached to the field_mapper doing the cleanup."""
@@ -937,10 +967,10 @@ class TestPromoteSetPipelineArgErrorRouting:
         result = _execute_set_pipeline(args, _empty_state(), ToolContext(catalog=_mock_catalog()))
 
         assert result.success is False
-        assert "identify_primary_colours" in result.data["error"]
-        assert "must be implemented by a field_mapper" in result.data["error"]
+        assert "identify_primary_colours" in result.validation.errors[0].message
+        assert "must be implemented by a field_mapper" in result.validation.errors[0].message
 
-    def test_existing_llm_blob_url_source_records_url_list_review_requirement(self, tmp_path: Path) -> None:
+    def test_existing_llm_blob_url_source_records_url_list_review_requirement(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """source.blob_id preserves the same source-review gate as inline_blob."""
         user_message_content = "Create a generated URL CSV for the pipeline."
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
@@ -950,6 +980,8 @@ class TestPromoteSetPipelineArgErrorRouting:
             data_dir=str(tmp_path),
             session_engine=engine,
             session_id=session_id,
+            session_operation_context=operation_scopes.enter_context(fenced_operation_context(engine, session_id)),
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
             user_message_id=user_message_id,
             user_message_content=user_message_content,
             composer_model_identifier="openai/gpt-5-mini",
@@ -997,7 +1029,9 @@ class TestPromoteSetPipelineArgErrorRouting:
         assert requirement["user_term"] == "inline_source_url_list"
         assert requirement["draft"] == url_csv
 
-    def test_inline_blob_llm_authored_source_prevalidation_ignores_review_metadata(self, tmp_path: Path) -> None:
+    def test_inline_blob_llm_authored_source_prevalidation_ignores_review_metadata(
+        self, tmp_path: Path, operation_scopes: ExitStack
+    ) -> None:
         """Plugin prevalidation strips web-only interpretation metadata but preserves it in state."""
         user_message_content = "Create a generated CSV for later source review."
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
@@ -1035,6 +1069,8 @@ class TestPromoteSetPipelineArgErrorRouting:
                 data_dir=str(tmp_path),
                 session_engine=engine,
                 session_id=session_id,
+                session_operation_context=operation_scopes.enter_context(fenced_operation_context(engine, session_id)),
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                 user_message_id=user_message_id,
                 user_message_content=user_message_content,
                 composer_model_identifier="openai/gpt-5-mini",
@@ -1173,7 +1209,7 @@ def test_set_pipeline_metadata_matches_set_metadata_redaction_contract() -> None
 
 
 def test_set_pipeline_redaction_does_not_reintroduce_absent_inline_blob_default() -> None:
-    """Absent and explicit-null legacy custody fields have one audit shape.
+    """Sparse audit shapes preserve presence while retaining semantic hash equivalence.
 
     ``PipelineProposal`` validation materializes ``source.inline_blob=None``
     while the provider-authored proposal may omit the field. The redacted
@@ -1195,8 +1231,12 @@ def test_set_pipeline_redaction_does_not_reintroduce_absent_inline_blob_default(
         telemetry=NoopRedactionTelemetry(),
     )
 
-    assert omitted_redaction == explicit_null_redaction
     assert "inline_blob" not in omitted_redaction["source"]
+    assert explicit_null_redaction["source"]["inline_blob"] is None
+    assert omitted_redaction != explicit_null_redaction
+    assert semantic_redacted_pipeline_arguments_hash(omitted_redaction) == semantic_redacted_pipeline_arguments_hash(
+        explicit_null_redaction
+    )
 
 
 def test_redaction_substitutes_source_options_via_summarizer() -> None:
@@ -1318,17 +1358,9 @@ def test_redaction_substitutes_nested_node_and_output_dicts() -> None:
     # ``routes`` and ``trigger`` pass through with their original shapes
     # — structurally exempt under §4.4.2 (closed-list scalar element types).
     assert redacted["nodes"][0]["routes"] == {"true": _CANARY_ROUTES}
-    # ``trigger`` is dumped from :class:`_NodeTriggerModel` via the
-    # redaction walker's BaseModel descent — the redacted shape carries
-    # every declared field (the absent ``count`` / ``timeout_seconds``
-    # slots surface as ``None``, matching the model defaults).  The
-    # canary lives on ``condition``; the other slots are present but
-    # null.
-    assert redacted["nodes"][0]["trigger"] == {
-        "condition": _CANARY_TRIGGER,
-        "count": None,
-        "timeout_seconds": None,
-    }
+    # The sparse projection retains the supplied condition without adding
+    # absent count or timeout fields from model defaults.
+    assert redacted["nodes"][0]["trigger"] == {"condition": _CANARY_TRIGGER}
     # Option canaries are removed by the shared option summarizer. Routes and
     # triggers remain typed Python containers and keep their structural scalar
     # values under the F3 contract.
@@ -1415,6 +1447,7 @@ class TestSetPipelineInlineBlobTsvDelimiter:
     def _set_pipeline_with_inline_csv_blob(
         self,
         *,
+        operation_scopes: ExitStack,
         filename: str,
         content: str,
         tmp_path: Path,
@@ -1465,13 +1498,16 @@ class TestSetPipelineInlineBlobTsvDelimiter:
                 data_dir=str(tmp_path),
                 session_engine=engine,
                 session_id=session_id,
+                session_operation_context=operation_scopes.enter_context(fenced_operation_context(engine, session_id)),
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                 user_message_id=user_message_id,
                 user_message_content=user_message_content,
             ),
         )
 
-    def test_tsv_inline_blob_binds_csv_source_with_tab_delimiter(self, tmp_path: Path) -> None:
+    def test_tsv_inline_blob_binds_csv_source_with_tab_delimiter(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         result = self._set_pipeline_with_inline_csv_blob(
+            operation_scopes=operation_scopes,
             filename="rows.tsv",
             content="a\tb\tc\n1\t2\t3\n",
             tmp_path=tmp_path,
@@ -1481,8 +1517,9 @@ class TestSetPipelineInlineBlobTsvDelimiter:
         assert source.plugin == "csv"
         assert source.options.get("delimiter") == "\t"
 
-    def test_caller_supplied_delimiter_preserved_on_inline_path(self, tmp_path: Path) -> None:
+    def test_caller_supplied_delimiter_preserved_on_inline_path(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         result = self._set_pipeline_with_inline_csv_blob(
+            operation_scopes=operation_scopes,
             filename="rows.tsv",
             content="a;b;c\n1;2;3\n",
             tmp_path=tmp_path,
@@ -1492,8 +1529,9 @@ class TestSetPipelineInlineBlobTsvDelimiter:
         source = result.updated_state.sources["source"]
         assert source.options.get("delimiter") == ";"
 
-    def test_csv_inline_blob_does_not_inject_delimiter(self, tmp_path: Path) -> None:
+    def test_csv_inline_blob_does_not_inject_delimiter(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         result = self._set_pipeline_with_inline_csv_blob(
+            operation_scopes=operation_scopes,
             filename="rows.csv",
             content="a,b,c\n1,2,3\n",
             tmp_path=tmp_path,
@@ -1726,7 +1764,7 @@ class TestSetPipelineRowUnion:
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == state.version
-        assert "timeout_seconds" in result.data["error"]
+        assert "timeout_seconds" in result.validation.errors[0].message
 
     @pytest.mark.parametrize(
         "override",
@@ -1773,7 +1811,7 @@ class TestEchoedServerOwnedMetadata:
     rejects, so the provenance-forgery guard is intact.
     """
 
-    def _bound_blob_state(self, tmp_path: Path) -> tuple[Any, CompositionState, dict[str, Any]]:
+    def _bound_blob_state(self, tmp_path: Path, operation_scopes: ExitStack) -> tuple[Any, CompositionState, dict[str, Any]]:
         """Bind an LLM-authored inline CSV, returning (ctx, state, source options)."""
         user_message_content = "Create a tiny generated CSV for the pipeline."
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
@@ -1782,6 +1820,8 @@ class TestEchoedServerOwnedMetadata:
             data_dir=str(tmp_path),
             session_engine=engine,
             session_id=session_id,
+            session_operation_context=operation_scopes.enter_context(fenced_operation_context(engine, session_id)),
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
             user_message_id=user_message_id,
             user_message_content=user_message_content,
             composer_model_identifier="openai/gpt-5-mini",
@@ -1835,8 +1875,8 @@ class TestEchoedServerOwnedMetadata:
             "outputs": [],
         }
 
-    def test_exact_echo_is_accepted_with_an_advisory_note(self, tmp_path: Path) -> None:
-        ctx, state, stored_options = self._bound_blob_state(tmp_path)
+    def test_exact_echo_is_accepted_with_an_advisory_note(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
+        ctx, state, stored_options = self._bound_blob_state(tmp_path, operation_scopes)
 
         result = _execute_set_pipeline(self._echo_args(stored_options), state, ctx)
 
@@ -1862,8 +1902,10 @@ class TestEchoedServerOwnedMetadata:
             ("resolved_kind", "forged-kind"),
         ],
     )
-    def test_echo_differing_in_any_single_field_still_rejects(self, tmp_path: Path, tampered_field: str, tampered_value: str) -> None:
-        ctx, state, stored_options = self._bound_blob_state(tmp_path)
+    def test_echo_differing_in_any_single_field_still_rejects(
+        self, tmp_path: Path, tampered_field: str, tampered_value: str, operation_scopes: ExitStack
+    ) -> None:
+        ctx, state, stored_options = self._bound_blob_state(tmp_path, operation_scopes)
         tampered = {**stored_options[SOURCE_AUTHORING_KEY], tampered_field: tampered_value}
 
         result = _execute_set_pipeline(
@@ -1873,13 +1915,13 @@ class TestEchoedServerOwnedMetadata:
         )
 
         assert result.success is False
-        assert SOURCE_AUTHORING_KEY in result.data["error"]
+        assert SOURCE_AUTHORING_KEY in result.validation.errors[0].message
 
-    def test_tampered_requirement_row_still_rejects(self, tmp_path: Path) -> None:
+    def test_tampered_requirement_row_still_rejects(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """A row claiming resolver-owned resolution the server never wrote
         matches nothing in stored state and keeps the elspeth-4496f61e30
         rejection."""
-        ctx, state, stored_options = self._bound_blob_state(tmp_path)
+        ctx, state, stored_options = self._bound_blob_state(tmp_path, operation_scopes)
         forged_resolved = {**stored_options[INTERPRETATION_REQUIREMENTS_KEY][0], "status": "resolved"}
 
         result = _execute_set_pipeline(
@@ -1895,12 +1937,12 @@ class TestEchoedServerOwnedMetadata:
         )
 
         assert result.success is False
-        assert "resolved" in result.data["error"]
+        assert "resolved" in result.validation.errors[0].message
 
-    def test_forged_block_without_a_stored_counterpart_still_rejects(self, tmp_path: Path) -> None:
+    def test_forged_block_without_a_stored_counterpart_still_rejects(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """No stored source at all: nothing can match, so the reserved-key
         rejection is unchanged (the manual-authoring guard's original case)."""
-        ctx, _state, stored_options = self._bound_blob_state(tmp_path)
+        ctx, _state, stored_options = self._bound_blob_state(tmp_path, operation_scopes)
 
         result = _execute_set_pipeline(
             self._echo_args(stored_options),
@@ -1909,4 +1951,4 @@ class TestEchoedServerOwnedMetadata:
         )
 
         assert result.success is False
-        assert SOURCE_AUTHORING_KEY in result.data["error"]
+        assert SOURCE_AUTHORING_KEY in result.validation.errors[0].message

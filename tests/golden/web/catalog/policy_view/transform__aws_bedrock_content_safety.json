@@ -1,4 +1,5 @@
 {
+  "aggregation_output_modes": [],
   "composer_hints": [
     "Use OUTPUT after an LLM or INPUT when screening inbound content.",
     "AWS categories do not include Azure Content Safety self_harm parity.",
@@ -65,7 +66,14 @@
             "anyOf": [
               {
                 "items": {
-                  "$ref": "#/$defs/FieldDefinition"
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "$ref": "#/$defs/FieldDefinition"
+                    }
+                  ]
                 },
                 "type": "array"
               },
@@ -146,7 +154,7 @@
         "$ref": "#/$defs/SchemaConfig",
         "composer_description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "composer_placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "description": "This transform's INPUT contract: the schema of rows arriving from upstream. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "description": "This transform's schema declares arriving types for consumed fields and output types for fields it creates. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
         "title": "Schema"
       },
       "source": {

@@ -108,7 +108,7 @@ selector can disambiguate.
 A `e2e-frontend` GitHub Actions job runs the suite on every PR with
 `continue-on-error: true` for the first 2 weeks (informational baseline).
 After ≥99% green pass-rate, flip the gate. See `.github/workflows/ci.yaml`
-and the follow-up filigree task created during Step 4 of the install plan.
+and the follow-up issue created during Step 4 of the install plan.
 
 ## Debugging a CI failure
 

@@ -9,7 +9,7 @@ interleavings on a real PostgreSQL backend:
 
 * an eviction paused with its registry UPDATE uncommitted must BLOCK a fenced
   claim / heartbeat renewal, which then observes the committed eviction and
-  is refused with ``RunWorkerEvictedError`` (no lease granted or renewed);
+  is refused with ``RunMembershipLostError`` (no lease granted or renewed);
 * an in-flight fenced claim (shared membership lock held, lease uncommitted)
   must BLOCK ``evict_worker``, whose live-lease precondition then sees the
   committed lease and returns ``False`` (no eviction).
@@ -27,15 +27,20 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 from scripts.state_engine_profile_reporter import RuntimeProfileReporter
 from sqlalchemy import event, func, insert, select, update
+from sqlalchemy.engine import Connection
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import (
     assert_stamped_between,
+    expire_leader_seat,
     expire_lease,
     landscape_database_now,
     make_factory,
+    member_token_for,
     stamp_inside_next_transaction,
 )
 from tests.helpers.postgres_target import postgres_test_target
@@ -46,11 +51,11 @@ from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
 )
-from elspeth.contracts.errors import RunWorkerEvictedError, SchedulerLeaseLostError
+from elspeth.contracts.errors import RunMembershipLostError, SchedulerLeaseLostError
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -91,7 +96,7 @@ def _seed(
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -108,7 +113,7 @@ def _seed(
                     node_type=node_type,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -165,7 +170,7 @@ def _enqueue_ready_item(
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash=f"hash-{token_id}",
+                source_data_hash=fake_sha256(f"hash-{token_id}"),
                 created_at=now,
             )
         )
@@ -174,8 +179,10 @@ def _enqueue_ready_item(
     payload = TokenSchedulerRepository.serialize_row_payload(
         PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     )
+    leader = RunCoordinationRepository(engine).live_leader(run_id=run_id)
+    assert leader is not None
     return repo.enqueue_ready(
-        run_id=run_id,
+        member_token=member_token_for(engine, worker_id=leader.leader_worker_id, run_id=run_id),
         token_id=token_id,
         row_id=row_id,
         node_id="transform-1",
@@ -225,6 +232,8 @@ def _run_two_contenders(
     first: Callable[[], object],
     second_db: LandscapeDB,
     second: Callable[[], object],
+    *,
+    leader_serialized: bool = False,
 ) -> tuple[object, object]:
     release_update = threading.Event()
     reached_update = {
@@ -232,9 +241,11 @@ def _run_two_contenders(
         "second": threading.Event(),
     }
     outcomes: dict[str, object] = {}
+    pids: dict[str, int] = {}
+    second_done = threading.Event()
 
     def pause_before_work_item_update(
-        _conn: Any,
+        conn: Any,
         _cursor: Any,
         statement: str,
         _params: Any,
@@ -243,7 +254,10 @@ def _run_two_contenders(
     ) -> None:
         name = threading.current_thread().name
         contender = {"first-contender": "first", "second-contender": "second"}.get(name)
-        if contender is None or reached_update[contender].is_set():
+        if contender is None:
+            return
+        pids.setdefault(contender, _backend_pid(conn))
+        if reached_update[contender].is_set():
             return
         normalized = " ".join(statement.upper().split())
         if normalized.startswith("UPDATE TOKEN_WORK_ITEMS"):
@@ -256,6 +270,9 @@ def _run_two_contenders(
             outcomes[name] = operation()
         except BaseException as exc:  # pragma: no cover - asserted by caller
             outcomes[name] = exc
+        finally:
+            if name == "second":
+                second_done.set()
 
     threads = (
         threading.Thread(target=invoke, args=("first", first), name="first-contender"),
@@ -271,15 +288,34 @@ def _run_two_contenders(
         for thread in threads:
             thread.start()
             started.append(thread)
+            if leader_serialized and thread is threads[0]:
+                assert reached_update["first"].wait(timeout=10), "leader claimant never reached its CAS"
 
-        deadline = time.monotonic() + 15
-        while not all(gate.is_set() for gate in reached_update.values()):
-            exited_early = [name for name, gate in reached_update.items() if name in outcomes and not gate.is_set()]
-            assert not exited_early, f"PostgreSQL contenders exited before the pre-UPDATE race seam: {exited_early!r}"
-            if time.monotonic() >= deadline:
-                missing = [name for name, gate in reached_update.items() if not gate.is_set()]
-                raise AssertionError(f"PostgreSQL contenders did not reach the pre-UPDATE race seam: {missing!r}")
-            time.sleep(0.01)
+        if leader_serialized:
+            state = _await_done_or_lock_wait(first_db, done=second_done, pid_holder=pids, pid_key="second", timeout=4)
+            assert state == "lock_wait", f"second leader claimant must wait on the seat lock, got {state}: {outcomes!r}"
+            assert not reached_update["second"].is_set(), "second claimant crossed the held leader fence"
+        else:
+            deadline = time.monotonic() + 15
+            while not all(gate.is_set() for gate in reached_update.values()):
+                exited_early = [name for name, gate in reached_update.items() if name in outcomes and not gate.is_set()]
+                assert not exited_early, f"PostgreSQL contenders exited before the pre-UPDATE race seam: {exited_early!r}"
+                # Fresh issuance first locks the selected item. The second
+                # claimant therefore waits before its CAS; release the first
+                # only after PostgreSQL identifies it as that exact blocker.
+                reached = [name for name, gate in reached_update.items() if gate.is_set()]
+                if len(reached) == 1:
+                    holder = reached[0]
+                    waiter = "second" if holder == "first" else "first"
+                    if waiter in pids:
+                        with first_db.engine.connect() as observer:
+                            blockers = observer.execute(select(func.pg_blocking_pids(pids[waiter]))).scalar_one()
+                        if pids[holder] in blockers:
+                            break
+                if time.monotonic() >= deadline:
+                    missing = [name for name, gate in reached_update.items() if not gate.is_set()]
+                    raise AssertionError(f"PostgreSQL contenders did not reach the pre-UPDATE race seam: {missing!r}")
+                time.sleep(0.01)
 
         release_update.set()
         for thread in threads:
@@ -338,11 +374,13 @@ def test_postgresql_ready_claim_conditional_update_has_one_winner(
 
         first_repo = TokenSchedulerRepository(first_db.engine)
         second_repo = TokenSchedulerRepository(second_db.engine)
+        first_member = member_token_for(first_db.engine, worker_id=first_owner, run_id=run_id)
+        second_member = member_token_for(second_db.engine, worker_id=second_owner, run_id=run_id)
         outcomes = _run_two_contenders(
             first_db,
-            lambda: first_repo.claim_ready(run_id=run_id, lease_owner=first_owner, lease_seconds=30),
+            lambda: first_repo.claim_ready(member_token=first_member, lease_owner=first_owner, lease_seconds=30),
             second_db,
-            lambda: second_repo.claim_ready(run_id=run_id, lease_owner=second_owner, lease_seconds=30),
+            lambda: second_repo.claim_ready(member_token=second_member, lease_owner=second_owner, lease_seconds=30),
         )
         winners = [outcome for outcome in outcomes if isinstance(outcome, TokenWorkItem)]
         losers = [outcome for outcome in outcomes if outcome is None]
@@ -358,32 +396,33 @@ def test_postgresql_ready_claim_conditional_update_has_one_winner(
 
 @pytest.mark.timeout(120)
 def test_postgresql_pending_sink_conditional_update_preserves_exact_bundle(postgres_url: str) -> None:
-    """One redrive claimant wins while the complete sink bundle stays exact."""
+    """Leader redrive claimants serialize and preserve the exact sink bundle."""
     now = datetime(2026, 8, 12, 2, 0, tzinfo=UTC)
     run_id = "run-pending-sink-conditional-winner"
     first_owner = "leader-pending-sink"
-    second_owner = "worker-pending-sink"
     with ExitStack() as resources:
         first_db = LandscapeDB.from_url(postgres_url)
         resources.callback(first_db.close)
         second_db = LandscapeDB.from_url(postgres_url)
         resources.callback(second_db.close)
-        _seed(
+        leader_token = _seed(
             first_db.engine,
             run_id=run_id,
             leader_id=first_owner,
-            worker_id=second_owner,
-            worker_heartbeat_expires_at=now + timedelta(seconds=30),
+            worker_id=None,
+            worker_heartbeat_expires_at=None,
             now=now,
             leader_window_seconds=30,
         )
         first_repo = TokenSchedulerRepository(first_db.engine)
         second_repo = TokenSchedulerRepository(second_db.engine)
         item = _enqueue_ready_item(first_db.engine, run_id=run_id, token_id="tok-pending-winner", now=now)
-        claimed = first_repo.claim_ready(run_id=run_id, lease_owner=first_owner, lease_seconds=30)
+        member_token = member_token_for(first_db.engine, worker_id=first_owner, run_id=run_id)
+        claimed = first_repo.claim_ready(member_token=member_token, lease_owner=first_owner, lease_seconds=30)
         assert claimed is not None
         pending = first_repo.mark_pending_sink(
-            work_item_id=item.work_item_id,
+            member_token=member_token,
+            work_item_id=claimed.work_item_id,
             row_payload_json=item.row_payload_json,
             sink_name="sink-a",
             outcome="success",
@@ -391,7 +430,6 @@ def test_postgresql_pending_sink_conditional_update_preserves_exact_bundle(postg
             error_hash=None,
             error_message=None,
             expected_lease_owner=first_owner,
-            worker_id=first_owner,
         )
         exact_bundle = (
             pending.work_item_id,
@@ -405,9 +443,10 @@ def test_postgresql_pending_sink_conditional_update_preserves_exact_bundle(postg
         )
         outcomes = _run_two_contenders(
             first_db,
-            lambda: first_repo.claim_pending_sink(run_id=run_id, lease_owner=first_owner, lease_seconds=30),
+            lambda: first_repo.claim_pending_sink(coordination_token=leader_token, lease_owner=first_owner, lease_seconds=30),
             second_db,
-            lambda: second_repo.claim_pending_sink(run_id=run_id, lease_owner=second_owner, lease_seconds=30),
+            lambda: second_repo.claim_pending_sink(coordination_token=leader_token, lease_owner=first_owner, lease_seconds=30),
+            leader_serialized=True,
         )
         winners = [outcome for outcome in outcomes if isinstance(outcome, TokenWorkItem)]
         assert len(winners) == 1
@@ -424,7 +463,7 @@ def test_postgresql_pending_sink_conditional_update_preserves_exact_bundle(postg
             winner.pending_error_message,
         ) == exact_bundle
         assert winner.status is TokenWorkStatus.LEASED
-        assert winner.lease_owner in {first_owner, second_owner}
+        assert winner.lease_owner == first_owner
         assert _scheduler_event_types(first_db, run_id=run_id).count(SchedulerEventType.CLAIM_PENDING_SINK.value) == 1
 
 
@@ -447,17 +486,19 @@ def test_postgresql_registered_lease_heartbeat_changes_only_expiry_and_updated_a
         )
         repo = TokenSchedulerRepository(db.engine)
         item = _enqueue_ready_item(db.engine, run_id=run_id, token_id="tok-lease-heartbeat", now=now)
-        assert repo.claim_ready(run_id=run_id, lease_owner=owner, lease_seconds=10) is not None
+        member_token = member_token_for(db.engine, worker_id=owner, run_id=run_id)
+        claimed = repo.claim_ready(member_token=member_token, lease_owner=owner, lease_seconds=10)
+        assert claimed is not None
+        assert claimed.work_item_id == item.work_item_id
         before = _work_item_row(db, run_id=run_id)
         events_before = _scheduler_events(db, run_id=run_id)
 
         heartbeat_from = landscape_database_now(db.engine)
         new_expiry = repo.heartbeat_lease(
-            run_id=run_id,
-            work_item_id=item.work_item_id,
+            member_token=member_token,
+            work_item_id=claimed.work_item_id,
             lease_owner=owner,
             lease_seconds=30,
-            membership_fenced=True,
         )
         heartbeat_until = landscape_database_now(db.engine)
 
@@ -477,12 +518,12 @@ def test_postgresql_registered_lease_heartbeat_changes_only_expiry_and_updated_a
 
 
 def test_postgresql_enqueue_and_claim_in_one_transaction_replay_enqueue_then_claim(postgres_url: str) -> None:
-    """Epoch 38 (elspeth-2d436dd6e8): one transaction, one timestamp, ``seq`` still orders.
+    """Epoch 38 (elspeth-2d436dd6e8): tied forensic timestamps still replay by ``seq``.
 
     ``enqueue_ready_claimed`` writes ENQUEUE and CLAIM_READY inside one
-    transaction, so on PostgreSQL both carry the identical transaction
-    timestamp; a ``(recorded_at, event_id)`` key then replays them in hash
-    order. Eight tokens make a hash-order pass a 1-in-256 accident.
+    transaction. Pin only their forensic recorded_at values to a tie: a
+    ``(recorded_at, event_id)`` key then replays them in hash order. Eight
+    tokens make a hash-order pass a 1-in-256 accident.
     """
     now = datetime(2026, 8, 12, 2, 45, tzinfo=UTC)
     run_id = "run-postgresql-enqueue-claimed-order"
@@ -503,6 +544,7 @@ def test_postgresql_enqueue_and_claim_in_one_transaction_replay_enqueue_then_cla
             PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
         )
         token_ids = [f"tok-claimed-{index}" for index in range(8)]
+        member_token = member_token_for(db.engine, worker_id=owner, run_id=run_id)
         for index, token_id in enumerate(token_ids):
             row_id = f"row-{token_id}"
             with db.engine.begin() as conn:
@@ -514,13 +556,13 @@ def test_postgresql_enqueue_and_claim_in_one_transaction_replay_enqueue_then_cla
                         row_index=index,
                         source_row_index=index,
                         ingest_sequence=index,
-                        source_data_hash=f"hash-{token_id}",
+                        source_data_hash=fake_sha256(f"hash-{token_id}"),
                         created_at=now,
                     )
                 )
                 conn.execute(insert(tokens_table).values(token_id=token_id, row_id=row_id, run_id=run_id, created_at=now))
             repo.enqueue_ready_claimed(
-                run_id=run_id,
+                member_token=member_token,
                 token_id=token_id,
                 row_id=row_id,
                 node_id="transform-1",
@@ -531,6 +573,8 @@ def test_postgresql_enqueue_and_claim_in_one_transaction_replay_enqueue_then_cla
                 lease_seconds=30,
             )
 
+        with db.engine.begin() as conn:
+            conn.execute(update(scheduler_events_table).where(scheduler_events_table.c.run_id == run_id).values(recorded_at=now))
         query = make_factory(db).query
         for token_id in token_ids:
             events = query.get_scheduler_events(run_id=run_id, token_id=token_id)
@@ -562,7 +606,8 @@ def test_postgresql_heartbeat_cas_loss_after_strict_recovery_records_only_lease_
         repo = TokenSchedulerRepository(db.engine)
         coord = RunCoordinationRepository(db.engine)
         original = _enqueue_ready_item(db.engine, run_id=run_id, token_id="tok-heartbeat-cas-loss", now=now)
-        claimed = repo.claim_ready(run_id=run_id, lease_owner=lease_owner, lease_seconds=10)
+        member_token = member_token_for(db.engine, worker_id=lease_owner, run_id=run_id)
+        claimed = repo.claim_ready(member_token=member_token, lease_owner=lease_owner, lease_seconds=10)
         assert claimed is not None
         successor = coord.acquire_run_leadership(
             run_id=run_id,
@@ -577,11 +622,10 @@ def test_postgresql_heartbeat_cas_loss_after_strict_recovery_records_only_lease_
         heartbeat_from = landscape_database_now(db.engine)
         with pytest.raises(SchedulerLeaseLostError):
             repo.heartbeat_lease(
-                run_id=run_id,
-                work_item_id=original.work_item_id,
+                member_token=member_token,
+                work_item_id=claimed.work_item_id,
                 lease_owner=lease_owner,
                 lease_seconds=30,
-                membership_fenced=True,
             )
         heartbeat_until = landscape_database_now(db.engine)
 
@@ -636,7 +680,11 @@ def test_postgresql_transform_recovery_excludes_expiry_equality_then_rotates_onc
     repo = TokenSchedulerRepository(db.engine)
     coord = RunCoordinationRepository(db.engine)
     original = _enqueue_ready_item(db.engine, run_id=run_id, token_id="tok-transform-recovery", now=now)
-    claimed = repo.claim_ready(run_id=run_id, lease_owner=original_token.worker_id, lease_seconds=10)
+    claimed = repo.claim_ready(
+        member_token=member_token_for(db.engine, worker_id=original_token.worker_id, run_id=run_id),
+        lease_owner=original_token.worker_id,
+        lease_seconds=10,
+    )
     assert claimed is not None
     successor = coord.acquire_run_leadership(
         run_id=run_id,
@@ -646,16 +694,24 @@ def test_postgresql_transform_recovery_excludes_expiry_equality_then_rotates_onc
     try:
         before_equality = capture_state_engine_image(db, run_id=run_id)
         fenced_from = landscape_database_now(db.engine)
-        # Exact-expiry arm: the deadline is written from the sweep's OWN
-        # transaction time as its first statement, so it EQUALS the
-        # database_now the sweep decides on; ``lease_expires_at <
-        # database_now`` is strict, so nothing is recoverable.
-        with stamp_inside_next_transaction(
-            db.engine,
-            update(token_work_items_table)
-            .where(token_work_items_table.c.run_id == run_id)
-            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
-            .values(lease_expires_at=func.current_timestamp()),
+        # Pin the owned internal reader to this transaction's database sample
+        # solely for exact equality. Public APIs still receive no timestamp.
+        decision_samples: list[datetime] = []
+
+        def equality_clock(conn: Connection) -> datetime:
+            sampled = read_landscape_transaction_time(conn)
+            decision_samples.append(sampled)
+            return sampled
+
+        with (
+            stamp_inside_next_transaction(
+                db.engine,
+                update(token_work_items_table)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                .values(lease_expires_at=func.current_timestamp()),
+            ),
+            patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", side_effect=equality_clock),
         ):
             assert repo.recover_expired_leases(coordination_token=successor) == 0
         fenced_until = landscape_database_now(db.engine)
@@ -678,8 +734,7 @@ def test_postgresql_transform_recovery_excludes_expiry_equality_then_rotates_onc
         assert equality_seat[0] - equality_seat[1] == timedelta(seconds=WINDOW)
         assert_stamped_between(equality_seat[1], start=fenced_from, end=fenced_until)
         equality_image = _work_item_row(db, run_id=run_id)
-        # The stamped deadline IS the sweep's transaction time (the seat's updated_at).
-        assert equality_image["lease_expires_at"] == equality_seat[1]
+        assert decision_samples and all(sample == equality_image["lease_expires_at"] for sample in decision_samples)
         assert equality_image["work_item_id"] == original.work_item_id
         assert equality_image["status"] == TokenWorkStatus.LEASED.value
         assert equality_image["attempt"] == 1
@@ -722,10 +777,12 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
         now=now,
         join_group_id=join_group_id,
     )
-    claimed = repo.claim_ready(run_id=run_id, lease_owner=original_token.worker_id, lease_seconds=30)
+    member_token = member_token_for(db.engine, worker_id=original_token.worker_id, run_id=run_id)
+    claimed = repo.claim_ready(member_token=member_token, lease_owner=original_token.worker_id, lease_seconds=30)
     assert claimed is not None
     pending = repo.mark_pending_sink(
-        work_item_id=item.work_item_id,
+        member_token=member_token,
+        work_item_id=claimed.work_item_id,
         row_payload_json=item.row_payload_json,
         sink_name="sink-redrive",
         outcome=TerminalOutcome.SUCCESS.value,
@@ -733,9 +790,8 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
         error_hash=None,
         error_message=None,
         expected_lease_owner=original_token.worker_id,
-        worker_id=original_token.worker_id,
     )
-    redrive = repo.claim_pending_sink(run_id=run_id, lease_owner=original_token.worker_id, lease_seconds=10)
+    redrive = repo.claim_pending_sink(coordination_token=original_token, lease_owner=original_token.worker_id, lease_seconds=10)
     assert redrive is not None
     bundle_columns = (
         "work_item_id",
@@ -762,6 +818,7 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
         redrive.pending_error_message,
         redrive.join_group_id,
     ) == before_bundle
+    expire_leader_seat(db, run_id)
     successor = coord.acquire_run_leadership(
         run_id=run_id,
         worker_id="leader-sink-successor",
@@ -770,16 +827,22 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
     try:
         before_equality = capture_state_engine_image(db, run_id=run_id)
         fenced_from = landscape_database_now(db.engine)
-        # Exact-expiry arm: the deadline is written from the sweep's OWN
-        # transaction time as its first statement, so it EQUALS the
-        # database_now the sweep decides on; ``lease_expires_at <
-        # database_now`` is strict, so nothing is recoverable.
-        with stamp_inside_next_transaction(
-            db.engine,
-            update(token_work_items_table)
-            .where(token_work_items_table.c.run_id == run_id)
-            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
-            .values(lease_expires_at=func.current_timestamp()),
+        decision_samples: list[datetime] = []
+
+        def equality_clock(conn: Connection) -> datetime:
+            sampled = read_landscape_transaction_time(conn)
+            decision_samples.append(sampled)
+            return sampled
+
+        with (
+            stamp_inside_next_transaction(
+                db.engine,
+                update(token_work_items_table)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                .values(lease_expires_at=func.current_timestamp()),
+            ),
+            patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", side_effect=equality_clock),
         ):
             assert repo.recover_expired_leases(coordination_token=successor) == 0
         fenced_until = landscape_database_now(db.engine)
@@ -803,8 +866,7 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
         assert_stamped_between(equality_seat[1], start=fenced_from, end=fenced_until)
         equality_image = _work_item_row(db, run_id=run_id)
         assert tuple(equality_image[column] for column in bundle_columns) == before_bundle
-        # The stamped deadline IS the sweep's transaction time (the seat's updated_at).
-        assert equality_image["lease_expires_at"] == equality_seat[1]
+        assert decision_samples and all(sample == equality_image["lease_expires_at"] for sample in decision_samples)
 
         expire_lease(db.engine, redrive.work_item_id)
         assert repo.recover_expired_leases(coordination_token=successor) == 1
@@ -822,10 +884,10 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
 def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(postgres_url: str) -> None:
     """RC-07 backend semantics only; this does not enable PostgreSQL followers.
 
-    The grace predicate compares the member's deadline against the evicting
-    transaction's own database time (ADR-047), so each boundary arm stamps the
-    deadline INSIDE that transaction from ``CURRENT_TIMESTAMP``: exactly at
-    ``database_now - grace`` (inert) and one microsecond before it (evicted).
+    After the target worker lock, stamp its deadline from the decision's fresh
+    database sample (ADR-047): exactly at ``database_now - grace`` (inert) and
+    one microsecond before it (evicted). Only the owned internal reader is
+    patched; leader admission and completion still obtain fresh samples.
     """
     now = datetime(2026, 8, 12, 5, 0, tzinfo=UTC)
     run_id = "run-eviction-boundary"
@@ -840,11 +902,32 @@ def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(post
         now=now,
     )
     coord = RunCoordinationRepository(db.engine)
-    member_deadline = update(run_workers_table).where(run_workers_table.c.worker_id == worker_id)
+    member_deadline = update(run_workers_table).where(run_workers_table.c.worker_id == worker_id, run_workers_table.c.run_id == run_id)
     grace = timedelta(seconds=GRACE)
+    target_locked = False
+    boundary_offset = timedelta(0)
+    decision_samples: list[datetime] = []
+
+    def observe_target_lock(conn: Connection, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool) -> None:
+        nonlocal target_locked
+        if statement.startswith("SELECT run_workers.worker_id") and "FOR UPDATE" in statement:
+            assert parameters["worker_id_1"] == worker_id
+            assert parameters["run_id_1"] == run_id
+            target_locked = True
+
+    def boundary_clock(conn: Connection) -> datetime:
+        nonlocal target_locked
+        sampled = read_landscape_decision_time(conn)
+        if target_locked:
+            target_locked = False
+            conn.execute(member_deadline.values(heartbeat_expires_at=sampled - grace - boundary_offset))
+            decision_samples.append(sampled)
+        return sampled
+
+    event.listen(db.engine, "after_cursor_execute", observe_target_lock)
     try:
         before_equality = capture_state_engine_image(db, run_id=run_id)
-        with stamp_inside_next_transaction(db.engine, member_deadline.values(heartbeat_expires_at=func.current_timestamp() - grace)):
+        with patch("elspeth.core.landscape.run_coordination_repository.read_landscape_decision_time", side_effect=boundary_clock):
             assert (
                 coord.evict_worker(
                     token=token,
@@ -853,6 +936,14 @@ def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(post
                     window_seconds=WINDOW,
                 )
                 is False
+            )
+        assert len(decision_samples) == 1
+        with db.read_only_connection() as conn:
+            assert (
+                conn.execute(
+                    select(run_workers_table.c.heartbeat_expires_at).where(run_workers_table.c.worker_id == worker_id)
+                ).scalar_one()
+                == decision_samples[0] - grace
             )
         # The inert verb committed only its leader-fence refresh (and the
         # test's own boundary stamp): no status, eviction stamp, or event.
@@ -867,9 +958,8 @@ def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(post
             [],
         )
 
-        with stamp_inside_next_transaction(
-            db.engine, member_deadline.values(heartbeat_expires_at=func.current_timestamp() - grace - timedelta(microseconds=1))
-        ):
+        boundary_offset = timedelta(microseconds=1)
+        with patch("elspeth.core.landscape.run_coordination_repository.read_landscape_decision_time", side_effect=boundary_clock):
             assert (
                 coord.evict_worker(
                     token=token,
@@ -879,11 +969,21 @@ def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(post
                 )
                 is True
             )
+        assert len(decision_samples) == 2
+        with db.read_only_connection() as conn:
+            evicted = conn.execute(
+                select(run_workers_table.c.heartbeat_expires_at, run_workers_table.c.evicted_at).where(
+                    run_workers_table.c.worker_id == worker_id
+                )
+            ).one()
+        assert evicted.heartbeat_expires_at == decision_samples[1] - grace - timedelta(microseconds=1)
+        assert evicted.evicted_at == decision_samples[1]
         assert _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id) == (
             "evicted",
             [],
         )
     finally:
+        event.remove(db.engine, "after_cursor_execute", observe_target_lock)
         db.close()
 
 
@@ -988,6 +1088,7 @@ def test_fenced_claim_blocks_behind_in_flight_eviction_and_is_refused(postgres_u
     _enqueue_ready_item(db.engine, run_id=run_id, token_id="tok-claim", now=now)
     scheduler = TokenSchedulerRepository(db.engine)
     coord = RunCoordinationRepository(db.engine)
+    member_token = member_token_for(db.engine, worker_id=worker_id, run_id=run_id)
 
     pids: dict[str, int] = {}
     evictor_paused = threading.Event()
@@ -1013,7 +1114,7 @@ def test_fenced_claim_blocks_behind_in_flight_eviction_and_is_refused(postgres_u
 
     def claim() -> None:
         try:
-            results["claim"] = scheduler.claim_ready(run_id=run_id, lease_owner=worker_id, lease_seconds=300)
+            results["claim"] = scheduler.claim_ready(member_token=member_token, lease_owner=worker_id, lease_seconds=300)
         except BaseException as exc:
             results["claim"] = exc
         finally:
@@ -1047,8 +1148,8 @@ def test_fenced_claim_blocks_behind_in_flight_eviction_and_is_refused(postgres_u
 
     try:
         assert results["evict"] is True, f"eviction must commit, got: {results['evict']!r}"
-        assert isinstance(results["claim"], RunWorkerEvictedError), (
-            f"the racing claim must be refused with RunWorkerEvictedError, got: {results['claim']!r}"
+        assert isinstance(results["claim"], RunMembershipLostError), (
+            f"the racing claim must be refused with RunMembershipLostError, got: {results['claim']!r}"
         )
         status, live = _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id)
         assert status == "evicted"
@@ -1075,7 +1176,8 @@ def test_heartbeat_renewal_blocks_behind_in_flight_eviction_and_is_refused(postg
     _enqueue_ready_item(db.engine, run_id=run_id, token_id="tok-heartbeat", now=t0)
     scheduler = TokenSchedulerRepository(db.engine)
     coord = RunCoordinationRepository(db.engine)
-    item = scheduler.claim_ready(run_id=run_id, lease_owner=worker_id, lease_seconds=10)
+    member_token = member_token_for(db.engine, worker_id=worker_id, run_id=run_id)
+    item = scheduler.claim_ready(member_token=member_token, lease_owner=worker_id, lease_seconds=10)
     assert item is not None
     expire_lease(db.engine, item.work_item_id)  # expired on the database clock before the eviction runs
 
@@ -1104,11 +1206,10 @@ def test_heartbeat_renewal_blocks_behind_in_flight_eviction_and_is_refused(postg
     def heartbeat() -> None:
         try:
             results["heartbeat"] = scheduler.heartbeat_lease(
-                run_id=run_id,
+                member_token=member_token,
                 work_item_id=item.work_item_id,
                 lease_owner=worker_id,
                 lease_seconds=300,
-                membership_fenced=True,
             )
         except BaseException as exc:
             results["heartbeat"] = exc
@@ -1143,8 +1244,8 @@ def test_heartbeat_renewal_blocks_behind_in_flight_eviction_and_is_refused(postg
 
     try:
         assert results["evict"] is True, f"eviction must commit, got: {results['evict']!r}"
-        assert isinstance(results["heartbeat"], RunWorkerEvictedError), (
-            f"the racing renewal must be refused with RunWorkerEvictedError, got: {results['heartbeat']!r}"
+        assert isinstance(results["heartbeat"], RunMembershipLostError), (
+            f"the racing renewal must be refused with RunMembershipLostError, got: {results['heartbeat']!r}"
         )
         status, live = _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id)
         assert status == "evicted"
@@ -1178,6 +1279,7 @@ def test_eviction_defers_to_in_flight_fenced_claim(postgres_url: str) -> None:
     _enqueue_ready_item(db.engine, run_id=run_id, token_id="tok-defer", now=now)
     scheduler = TokenSchedulerRepository(db.engine)
     coord = RunCoordinationRepository(db.engine)
+    member_token = member_token_for(db.engine, worker_id=worker_id, run_id=run_id)
 
     pids: dict[str, int] = {}
     claimant_paused = threading.Event()
@@ -1201,7 +1303,7 @@ def test_eviction_defers_to_in_flight_fenced_claim(postgres_url: str) -> None:
         try:
             # evict_worker judges the lease against the database clock (ADR-047);
             # the claim mints its lease from that clock so the lease is live.
-            results["claim"] = scheduler.claim_ready(run_id=run_id, lease_owner=worker_id, lease_seconds=300)
+            results["claim"] = scheduler.claim_ready(member_token=member_token, lease_owner=worker_id, lease_seconds=300)
         except BaseException as exc:  # pragma: no cover - asserted below
             results["claim"] = f"RAISED {type(exc).__name__}: {exc}"
 

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 from elspeth.contracts import RunStatus
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.run_result import RunResult as RunResult  # re-exported
+from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
 from elspeth.engine.orchestrator.plugin_types import RowPlugin
 from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
 from elspeth.engine.orchestrator.run_state import (
@@ -105,6 +106,7 @@ class PipelineConfig:
     coalesce_settings: Sequence[CoalesceSettings] = field(default_factory=list)
     sink_effect_modes: Mapping[str, str] = field(default_factory=dict, repr=False)
     sink_effect_admission: object | None = field(default=None, repr=False, compare=False)
+    sink_effect_bindings: Mapping[str, SinkEffectRuntimeBinding] = field(default_factory=dict, repr=False)
     # Derived at graph build from the actual bound-region depth (+ margin);
     # never a bare constant (barrier-scopes spec §6.3). leader_drain iterates
     # the EOF barrier-flush fixpoint to exactly this bound.
@@ -117,6 +119,13 @@ class PipelineConfig:
             raise OrchestrationInvariantError("PipelineConfig requires at least one sink")
         if not self.sources:
             raise OrchestrationInvariantError("PipelineConfig requires at least one source")
+        if self.sink_effect_bindings and set(self.sink_effect_bindings) != set(self.sinks):
+            raise OrchestrationInvariantError("Pipeline sink effect bindings must exactly cover the named sinks")
+        for name, binding in self.sink_effect_bindings.items():
+            if type(binding) is not SinkEffectRuntimeBinding or binding.sink is not self.sinks[name] or binding.sink_name != name:
+                raise OrchestrationInvariantError("Pipeline sink effect binding must bind its exact named sink")
+        if len(self.sources) > 1 and any(source.config.get("snapshot_for_resume") is True for source in self.sources.values()):
+            raise OrchestrationInvariantError("snapshot_for_resume currently requires exactly one source in the pipeline")
         # Freeze mutable container fields. freeze_fields deep-freezes recursively,
         # converting nested dicts/lists to MappingProxyType/tuple throughout.
         # transforms/gates/coalesce_settings contain frozen dataclass instances
@@ -124,7 +133,7 @@ class PipelineConfig:
         object.__setattr__(self, "transforms", tuple(self.transforms))
         object.__setattr__(self, "gates", tuple(self.gates))
         object.__setattr__(self, "coalesce_settings", tuple(self.coalesce_settings))
-        freeze_fields(self, "sources", "sinks", "config", "aggregation_settings", "sink_effect_modes")
+        freeze_fields(self, "sources", "sinks", "config", "aggregation_settings", "sink_effect_modes", "sink_effect_bindings")
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +219,7 @@ class ExecutionCounters:
     rows_forked: int = 0
     rows_coalesced: int = 0
     rows_coalesce_failed: int = 0
+    collector_groups_failed: int = 0
     rows_expanded: int = 0
     rows_buffered: int = 0
     rows_diverted: int = 0
@@ -272,6 +282,7 @@ class ExecutionCounters:
             rows_forked=self.rows_forked,
             rows_coalesced=self.rows_coalesced,
             rows_coalesce_failed=self.rows_coalesce_failed,
+            collector_groups_failed=self.collector_groups_failed,
             rows_expanded=self.rows_expanded,
             rows_buffered=self.rows_buffered,
             rows_diverted=self.rows_diverted,

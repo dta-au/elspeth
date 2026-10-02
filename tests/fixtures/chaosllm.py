@@ -161,6 +161,25 @@ class ChaosLLMFixture:
         return self.client.post(url, json=body)
 
 
+_ERROR_INJECTION_KEYS = (
+    "rate_limit_pct",
+    "capacity_529_pct",
+    "service_unavailable_pct",
+    "bad_gateway_pct",
+    "gateway_timeout_pct",
+    "internal_error_pct",
+    "timeout_pct",
+    "connection_reset_pct",
+    "slow_response_pct",
+    "invalid_json_pct",
+    "truncated_pct",
+    "empty_body_pct",
+    "missing_fields_pct",
+    "wrong_content_type_pct",
+    "selection_mode",
+)
+
+
 def _build_config_from_marker(
     marker: pytest.Mark | None,
     tmp_path: Path,
@@ -174,27 +193,18 @@ def _build_config_from_marker(
     if marker is None:
         return ChaosLLMConfig(**base_config)
 
+    if marker.args:
+        raise pytest.UsageError("chaosllm marker does not accept positional arguments; use keyword arguments")
+    allowed_keys = {*_ERROR_INJECTION_KEYS, "base_ms", "jitter_ms", "mode", "preset"}
+    unknown_keys = marker.kwargs.keys() - allowed_keys
+    if unknown_keys:
+        raise pytest.UsageError(f"Unknown chaosllm marker argument(s): {', '.join(sorted(unknown_keys))}")
+
     preset = marker.kwargs.get("preset")
     overrides: dict[str, Any] = {}
 
-    error_overrides: dict[str, float] = {}
-    for key in [
-        "rate_limit_pct",
-        "capacity_529_pct",
-        "service_unavailable_pct",
-        "bad_gateway_pct",
-        "gateway_timeout_pct",
-        "internal_error_pct",
-        "timeout_pct",
-        "connection_reset_pct",
-        "slow_response_pct",
-        "invalid_json_pct",
-        "truncated_pct",
-        "empty_body_pct",
-        "missing_fields_pct",
-        "wrong_content_type_pct",
-        "selection_mode",
-    ]:
+    error_overrides: dict[str, float | str] = {}
+    for key in _ERROR_INJECTION_KEYS:
         if key in marker.kwargs:
             error_overrides[key] = marker.kwargs[key]
     if error_overrides:

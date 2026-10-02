@@ -243,8 +243,9 @@ class TestTemplateErrorProperties:
     def test_nan_in_row_raises_template_error(self) -> None:
         """Property: NaN in row data raises TemplateError (canonical_json rejects NaN).
 
-        This is defense-in-depth per CLAUDE.md: NaN/Infinity are strictly rejected
-        to protect audit integrity. The hash computation via canonical_json catches
+        This is defense-in-depth per the ``engine-patterns-reference`` skill §Canonical JSON:
+        NaN/Infinity are strictly rejected, not silently converted, to protect audit
+        integrity. The hash computation via canonical_json catches
         this even though the render itself would succeed.
         """
         t = PromptTemplate("{{ row.x }}")

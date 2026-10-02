@@ -201,6 +201,29 @@ class TestResolvePreflightDirect:
         with pytest.raises(FrameworkBugError, match="probes is required"):
             resolve_preflight(mock_config, Path("/fake/pipeline.yaml"), probes=None)
 
+    def test_probes_none_rejected_before_dependency_resolution(self) -> None:
+        """The probes injection guard must fire before dependency side effects."""
+        from elspeth.contracts.errors import FrameworkBugError
+        from elspeth.core.dependency_config import DependencyConfig
+        from elspeth.engine.bootstrap import resolve_preflight
+
+        mock_config = SimpleNamespace()
+        mock_config.depends_on = [DependencyConfig(name="indexer", settings="./index.yaml")]
+        mock_config.commencement_gates = [CommencementGateConfig(name="test_gate", condition="True")]
+
+        mock_runner = MagicMock(spec=PipelineRunner)
+
+        with (
+            patch("elspeth.engine.dependency_resolver.detect_cycles") as mock_detect,
+            patch("elspeth.engine.dependency_resolver.resolve_dependencies") as mock_resolve,
+            pytest.raises(FrameworkBugError, match="probes is required"),
+        ):
+            resolve_preflight(mock_config, Path("/fake/pipeline.yaml"), probes=None, runner=mock_runner)
+
+        mock_detect.assert_not_called()
+        mock_resolve.assert_not_called()
+        mock_runner.assert_not_called()
+
     def test_duplicate_dependency_names_rejected_before_execution(self) -> None:
         """Duplicate dependency names must raise before resolve_dependencies runs."""
         from elspeth.core.dependency_config import DependencyConfig

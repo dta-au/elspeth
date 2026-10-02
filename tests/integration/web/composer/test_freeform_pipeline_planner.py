@@ -40,7 +40,8 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 @dataclass
@@ -72,6 +73,8 @@ class _Response:
     usage: Mapping[str, object]
     model: str = "provider/planner-v1"
     id: str = "planner-request-1"
+    # OpenRouter's served-endpoint name; absent unless a test sets it.
+    provider: str | None = None
 
 
 def _empty_state() -> CompositionState:
@@ -193,7 +196,10 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
+        grant_test_pipeline_user(conn, identity_id="planner-user")
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     await sessions.update_composer_preferences(
         session.id,
@@ -232,9 +238,8 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -248,7 +253,7 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
         requests.append(kwargs)
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     result = await composer.compose(
         "Build a CSV to JSONL pipeline.",
@@ -295,6 +300,82 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
 
 
 @pytest.mark.asyncio
+async def test_planner_llm_call_audit_persists_the_served_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pipeline planner records its call through ``build_llm_call_record(response=...)``.
+
+    That branch reads the provider object directly rather than an admitted
+    metadata carrier, so ``provider_served`` must be proven on the persisted
+    ``llm_call_audit`` row of a real planner turn, not only on the compose loop.
+    """
+    engine = create_session_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
+        grant_test_pipeline_user(conn, identity_id="planner-user")
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session = await sessions.create_session("planner-user", "Planner", "local")
+    user_message = await sessions.add_message(
+        session.id,
+        "user",
+        "Build a CSV to JSONL pipeline.",
+        writer_principal="route_user_message",
+    )
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_boot_probe_enabled=False,
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+    )
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+    )
+    composer = ComposerServiceImpl.for_trained_operator(
+        create_catalog_service(),
+        settings,
+        sessions_service=sessions,
+        session_engine=engine,
+    )
+
+    async def completion(**_kwargs: Any) -> _Response:
+        response = _terminal_response(tmp_path, str(session.id))
+        response.provider = "DeepInfra"
+        return response
+
+    monkeypatch.setattr("litellm.acompletion", completion)
+
+    await composer.compose(
+        "Build a CSV to JSONL pipeline.",
+        [],
+        _empty_state(),
+        session_id=str(session.id),
+        user_id="planner-user",
+        user_message_id=str(user_message.id),
+    )
+
+    with engine.connect() as conn:
+        audit_rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
+    planner_calls = [
+        calls[0]["call"]
+        for role, calls in audit_rows
+        if role == "audit" and calls and calls[0].get("_kind") == "llm_call_audit" and calls[0]["call"]["planner_call_ordinal"] is not None
+    ]
+    assert len(planner_calls) == 1
+    assert planner_calls[0]["provider_served"] == "DeepInfra"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("initial_trust_mode", "flipped_trust_mode"),
     [("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")],
@@ -320,7 +401,10 @@ async def test_trust_mode_change_during_planning_revokes_auto_commit_authority(
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
+        grant_test_pipeline_user(conn, identity_id="planner-user")
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     await sessions.update_composer_preferences(
         session.id,
@@ -345,9 +429,8 @@ async def test_trust_mode_change_during_planning_revokes_auto_commit_authority(
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -367,7 +450,7 @@ async def test_trust_mode_change_during_planning_revokes_auto_commit_authority(
         )
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     result = await composer.compose(
         "Build a CSV to JSONL pipeline.",
@@ -413,7 +496,7 @@ async def test_referential_empty_build_projects_authoritative_prior_user_request
         requests.append(kwargs)
         return responses.pop(0)
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     await composer.compose(
         message,
@@ -467,7 +550,10 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
     """Cancelled auto mode terminalises; explicit review stays crash-resumable."""
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
+        grant_test_pipeline_user(conn, identity_id="planner-user")
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     await sessions.update_composer_preferences(
         session.id,
@@ -492,9 +578,8 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -506,11 +591,12 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
     async def completion(**_kwargs: Any) -> _Response:
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
-    worker_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    worker_started = asyncio.Event()
     release_worker = threading.Event()
-    worker_finished = threading.Event()
+    worker_finished = asyncio.Event()
     original_run_sync = sessions._run_sync  # type: ignore[attr-defined]
 
     async def pause_create_worker(func: Any, *args: Any, **kwargs: Any) -> Any:
@@ -518,13 +604,13 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
             return await original_run_sync(func, *args, **kwargs)
 
         def paused_create() -> Any:
-            worker_started.set()
+            loop.call_soon_threadsafe(worker_started.set)
             if not release_worker.wait(timeout=5.0):
                 raise TimeoutError("test did not release proposal creation worker")
             try:
                 return func(*args, **kwargs)
             finally:
-                worker_finished.set()
+                loop.call_soon_threadsafe(worker_finished.set)
 
         return await original_run_sync(paused_create)
 
@@ -539,13 +625,13 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
             user_message_id=str(user_message.id),
         )
     )
-    assert await asyncio.to_thread(worker_started.wait, 5.0), "proposal creation worker did not start"
+    await asyncio.wait_for(worker_started.wait(), timeout=5.0)
     compose_task.cancel()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     cancellation_escaped_before_worker = compose_task.done()
     release_worker.set()
-    assert await asyncio.to_thread(worker_finished.wait, 5.0), "proposal creation worker did not finish"
+    await asyncio.wait_for(worker_finished.wait(), timeout=5.0)
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(compose_task, timeout=5.0)
@@ -558,7 +644,6 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
     authority = await sessions.get_authoritative_pipeline_proposal(
         session_id=session.id,
         proposal_id=proposals[0].id,
-        reviewed_facts={},
     )
     assert authority.row.status == expected_status
 
@@ -609,7 +694,7 @@ async def test_auto_commit_cancellation_survives_rejection_failure_and_repeated_
     async def completion(**_kwargs: Any) -> _Response:
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
 
     proposal_created = asyncio.Event()
     release_create_result = asyncio.Event()
@@ -707,7 +792,10 @@ async def test_requests_outside_empty_mutation_gate_use_ordinary_compose_loop(
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
+        grant_test_pipeline_user(conn, identity_id="planner-user")
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
         session.id,
@@ -726,9 +814,8 @@ async def test_requests_outside_empty_mutation_gate_use_ordinary_compose_loop(
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -765,7 +852,10 @@ async def test_planner_audit_failure_publishes_no_proposal_authority_or_state(
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
+        grant_test_pipeline_user(conn, identity_id="planner-user")
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
         session.id,
@@ -784,9 +874,8 @@ async def test_planner_audit_failure_publishes_no_proposal_authority_or_state(
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -798,7 +887,7 @@ async def test_planner_audit_failure_publishes_no_proposal_authority_or_state(
     async def completion(**_kwargs: Any) -> _Response:
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    monkeypatch.setattr("litellm.acompletion", completion)
     # The planner audit cohort settles via add_messages_atomic
     # (elspeth-90231248dc); failing it is what must abort before any
     # proposal/authority/state row exists.
@@ -837,7 +926,10 @@ async def _recipe_composer_context(
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="planner-user")
+        grant_test_pipeline_user(conn, identity_id="planner-user")
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("planner-user", "Planner", "local")
     user_message = await sessions.add_message(
         session.id,
@@ -856,9 +948,8 @@ async def _recipe_composer_context(
         shareable_link_signing_key=b"\x00" * 32,
     )
     monkeypatch.setattr(
-        ComposerServiceImpl,
-        "_compute_availability",
-        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
     composer = ComposerServiceImpl.for_trained_operator(
         create_catalog_service(),
@@ -885,7 +976,7 @@ async def test_freeform_matching_provider_cancellation_persists_once_without_sel
     async def cancelling_completion(**_kwargs: Any) -> _Response:
         raise asyncio.CancelledError("provider cancelled matching freeform planner request")
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", cancelling_completion)
+    monkeypatch.setattr("litellm.acompletion", cancelling_completion)
 
     with pytest.raises(asyncio.CancelledError) as caught:
         await composer.compose(
@@ -957,7 +1048,7 @@ async def test_freeform_planner_manifest_mismatch_is_durable_before_failure(
         return _terminal_response(tmp_path, str(session.id))
 
     monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", mutating_completion)
+    monkeypatch.setattr("litellm.acompletion", mutating_completion)
 
     with pytest.raises(AuditIntegrityError, match="planner call inputs changed"):
         await composer.compose(
@@ -998,21 +1089,23 @@ async def test_freeform_manifest_mismatch_audit_write_defers_request_cancellatio
         kwargs["messages"][0]["content"] += "\nprovider-side mutation"
         return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", mutating_completion)
+    monkeypatch.setattr("litellm.acompletion", mutating_completion)
 
-    audit_worker_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    audit_worker_started = asyncio.Event()
     release_audit_worker = threading.Event()
-    audit_worker_finished = threading.Event()
+    audit_worker_finished = asyncio.Event()
     original_insert = sessions._insert_chat_message  # type: ignore[attr-defined]
 
     def pause_mismatch_audit_insert(*args: Any, **kwargs: Any) -> Any:
         row_id = original_insert(*args, **kwargs)
         tool_calls = kwargs["tool_calls"]
-        if kwargs["role"] == "audit" and tool_calls and tool_calls[0]["_kind"] == "llm_call_audit":
-            audit_worker_started.set()
+        # Physical evidence already checkpointed; race the manifest-mismatch cohort.
+        if kwargs["role"] == "audit" and tool_calls and tool_calls[0]["_kind"] == "planner_attempt_audit":
+            loop.call_soon_threadsafe(audit_worker_started.set)
             if not release_audit_worker.wait(timeout=5.0):
                 raise TimeoutError("test did not release mismatch audit worker")
-            audit_worker_finished.set()
+            loop.call_soon_threadsafe(audit_worker_finished.set)
         return row_id
 
     monkeypatch.setattr(sessions, "_insert_chat_message", pause_mismatch_audit_insert)
@@ -1026,12 +1119,12 @@ async def test_freeform_manifest_mismatch_audit_write_defers_request_cancellatio
             user_message_id=str(user_message.id),
         )
     )
-    assert await asyncio.to_thread(audit_worker_started.wait, 5.0), "mismatch audit worker did not start"
+    await asyncio.wait_for(audit_worker_started.wait(), timeout=5.0)
     compose_task.cancel("request cancelled during mismatch audit persistence")
     await asyncio.sleep(0)
     cancellation_escaped_before_worker = compose_task.done()
     release_audit_worker.set()
-    assert await asyncio.to_thread(audit_worker_finished.wait, 5.0), "mismatch audit worker did not finish"
+    await asyncio.wait_for(audit_worker_finished.wait(), timeout=5.0)
 
     with pytest.raises(asyncio.CancelledError) as caught:
         await asyncio.wait_for(compose_task, timeout=5.0)
@@ -1063,14 +1156,8 @@ async def test_freeform_compose_routes_to_the_planner_without_pipeline_side_effe
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Freeform compose has exactly one planning path: plan_pipeline.
-
-    This test formerly guarded the excised recipe router's fallback seam with
-    a prepare_pipeline_plan never-called sentinel. The router died in
-    9700470e2 and prepare_pipeline_plan itself was deleted with the guided
-    sketch bypass (elspeth-b4a286d517), so no server-derived branch exists to
-    sentinel against; what survives is the routing half — compose reaches the
-    provider planner, and a planner failure leaves zero pipeline side effects.
+    """Freeform compose reaches the provider planner, and a planner failure
+    leaves zero pipeline side effects.
     """
     message = "Build the requested pipeline."
     engine, _sessions, session, user_message, composer = await _recipe_composer_context(
@@ -1078,13 +1165,13 @@ async def test_freeform_compose_routes_to_the_planner_without_pipeline_side_effe
         monkeypatch,
         message=message,
     )
-    from elspeth.web.composer import service as composer_service
+    from elspeth.web.composer import planning_application
 
     fallback = AsyncMock(
-        spec=composer_service.plan_pipeline,
+        spec=planning_application.plan_pipeline,
         side_effect=PipelinePlannerError("fallback stopped", code="TEST_STOP"),
     )
-    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", fallback)
+    monkeypatch.setattr(planning_application, "plan_pipeline", fallback)
 
     with pytest.raises(PipelinePlannerError, match="fallback stopped"):
         await composer.compose(

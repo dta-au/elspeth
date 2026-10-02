@@ -25,6 +25,7 @@ export type IconName =
   | "eye"
   | "folder"
   | "key"
+  | "maximise"
   | "more"
   | "pipeline"
   | "play"
@@ -80,6 +81,17 @@ function renderIcon(name: IconName) {
       return <path d="m5 13 4.5 4.5 9.5-10" />;
     case "chevron-down":
       return <path d="m6 9.5 6 6 6-6" />;
+    // Four corner brackets: the conventional "maximise / enter full screen"
+    // mark. Open corners, so it cannot be read as a checkbox or a stop square.
+    case "maximise":
+      return (
+        <>
+          <path d="M4 9V4h5" />
+          <path d="M20 9V4h-5" />
+          <path d="M4 15v5h5" />
+          <path d="M20 15v5h-5" />
+        </>
+      );
     case "chevron-up":
       return <path d="m6 14.5 6-6 6 6" />;
     // Doubled chevrons: the sidebar collapse/expand vocabulary (points the

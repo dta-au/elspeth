@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer._producer_resolver import _IMPLICIT_SELF_PUBLISHING_NODE_TYPES
@@ -23,10 +24,7 @@ from elspeth.web.composer.capability_skill import (
     load_pipeline_capability_core,
     validate_capability_field_contract,
 )
-from elspeth.web.composer.guided.prompts import load_step_chat_skill, load_step_planner_skill
-from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.pipeline_planner import PLANNER_DISCOVERY_TOOL_NAMES, planner_tool_definitions
-from elspeth.web.composer.pipeline_proposal import PlannerSurface
 from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.skills import load_skill
 from elspeth.web.composer.state import COMPOSER_NODE_TYPES
@@ -43,36 +41,26 @@ def _messages(rendered_skill: str, *, sensitive_user_text: str = "build it") -> 
 def _manifest(
     rendered_skill: str,
     *,
-    surface: PlannerSurface,
-    profile: str,
     sensitive_user_text: str = "build it",
 ) -> PlannerCapabilityManifest:
     return build_planner_capability_manifest(
-        surface=surface,
-        profile=profile,
         messages=_messages(rendered_skill, sensitive_user_text=sensitive_user_text),
-        tools=planner_tool_definitions(),
+        tools=planner_tool_definitions(dialect=ToolContractDialect.NONE),
         canonical_schema=canonical_set_pipeline_schema(),
     )
 
 
-def test_freeform_and_every_guided_planner_prepend_identical_core_bytes() -> None:
+def test_freeform_planner_prepends_capability_core_once() -> None:
     core = load_pipeline_capability_core()
-    surfaces = [build_system_prompt(None), *(load_step_planner_skill(step) for step in GuidedStep)]
-
-    for rendered in surfaces:
-        assert rendered.startswith(core)
-        assert rendered.count(core) == 1
+    rendered = build_system_prompt(None)
+    assert rendered.startswith(core)
+    assert rendered.count(core) == 1
 
 
-def test_capability_core_names_no_surface_exclusive_terminal_tool() -> None:
-    # The core's exact bytes are prepended to the freeform tool-loop surface
-    # (whose roster has NO emit_pipeline_proposal) and to every planner
-    # surface (discovery + terminal). A tool that exists on only one side
-    # must never be instructed from the shared bytes: the planner terminal
-    # contract is delivered per-request by plan_pipeline instead
-    # (elspeth-3348db88f9). The canonical document shape (`set_pipeline`)
-    # remains the shared referent both surfaces author.
+def test_capability_core_names_no_planner_exclusive_terminal_tool() -> None:
+    # The core is shared by the freeform tool loop and proposal planner.
+    # The latter's terminal contract is delivered per request, while both
+    # author the canonical `set_pipeline` document shape.
     core = load_pipeline_capability_core()
 
     assert "emit_pipeline_proposal" not in core
@@ -107,46 +95,6 @@ def test_capability_core_treats_successful_mutation_echo_as_state_authority() ->
     assert "authoritative post-change state" in prose
     assert "do not call `get_pipeline_state` to confirm" in prose
     assert "a mutation and the read that confirms it may share one turn" not in prose
-
-
-def test_guided_chat_prompts_are_interaction_only_and_advertise_no_planner_terminal() -> None:
-    core = load_pipeline_capability_core()
-
-    for step in GuidedStep:
-        rendered = load_step_chat_skill(step)
-        assert not rendered.startswith(core)
-        assert core not in rendered
-        assert "emit_pipeline_proposal" not in rendered
-
-
-def test_guided_chat_prompts_name_only_tools_in_their_actual_palette() -> None:
-    prompts = {step: load_step_chat_skill(step) for step in GuidedStep}
-
-    for prompt in prompts.values():
-        assert "list_sources" not in prompt
-        assert "list_transforms" not in prompt
-        assert "list_models" not in prompt
-        # The per-step chat palettes are the step build tools and the
-        # deferred-intent tools; neither carries interpretation review, and
-        # neither does the planner palette these step files also render on.
-        # The capability core keeps the name for the freeform compose loop,
-        # which does carry it — and the core is never part of a chat prompt.
-        assert "request_interpretation_review" not in prompt
-        # retain_deferred_intent attaches only at steps 1 and 2, but these
-        # static files render into ALL FOUR steps, so naming it here would
-        # name an unattached tool at steps 3 and 4 — exactly what base.md's
-        # own "use only the tools attached to the current request" rule
-        # forbids. Its teaching therefore lives in the per-step DYNAMIC
-        # blocks (_deferred_intent_teaching_block, chat_solver.py), which
-        # this loop does not load. elspeth-1ebf08f8ec originally proposed
-        # putting it in base.md; this is the pin that refuses that.
-        assert "retain_deferred_intent" not in prompt
-
-    assert "list_sinks" not in prompts[GuidedStep.STEP_1_SOURCE]
-    assert "get_plugin_schema" not in prompts[GuidedStep.STEP_1_SOURCE]
-    assert "list_sinks" in prompts[GuidedStep.STEP_2_SINK]
-    assert "get_plugin_schema" in prompts[GuidedStep.STEP_2_SINK]
-    assert "confirm_wiring" not in prompts[GuidedStep.STEP_4_WIRE]
 
 
 def test_capability_facts_have_one_document_owner() -> None:
@@ -191,7 +139,7 @@ def test_capability_core_names_every_implicit_self_publisher_from_runtime_author
 
 
 def test_static_planner_guidance_contains_no_deployment_plugin_facts() -> None:
-    rendered_prompts = [build_system_prompt(None), *(load_step_planner_skill(step) for step in GuidedStep)]
+    rendered_prompts = [build_system_prompt(None)]
     forbidden_facts = (
         "web_scrape",
         "field_mapper",
@@ -229,28 +177,9 @@ def test_static_planner_guidance_contains_no_deployment_plugin_facts() -> None:
 def test_interpretation_requirement_guidance_uses_exact_public_shell() -> None:
     interaction = load_skill("pipeline_composer")
 
-    assert "You author ONLY `kind`, `user_term`, and `draft`." in interaction
+    assert "You author ONLY `kind`, `user_term`, `draft`, and optional `display_title`." in interaction
     assert "plus `id`" not in interaction
     assert "`status` defaults to `pending`" not in interaction
-
-
-def test_guided_skills_have_no_capability_reduction_disclaimers() -> None:
-    forbidden = (
-        "guided chains cannot include",
-        "chain cannot express",
-        "must be added as a gate after the guided build",
-        "switch to freeform for",
-        "supports only a single linear spine",
-        "cannot build multiple sources",
-        "cannot build multiple outputs",
-        "aggregation is unavailable",
-        "row expansion is unavailable",
-        "structured llm fields are unavailable",
-    )
-
-    for step in GuidedStep:
-        lowered = load_step_planner_skill(step).lower()
-        assert all(phrase not in lowered for phrase in forbidden)
 
 
 def test_capability_coverage_is_exactly_derived_from_canonical_authorities() -> None:
@@ -293,13 +222,11 @@ def test_capability_field_extraction_rejects_missing_required_schema_node() -> N
 def test_manifest_rejects_schema_and_terminal_updated_without_documented_field() -> None:
     schema = canonical_set_pipeline_schema()
     schema["properties"]["future_topology"] = {"type": "object"}
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     tools[-1]["function"]["parameters"]["properties"]["pipeline"] = schema
 
     with pytest.raises(AuditIntegrityError, match="documented capability fields drifted"):
         build_planner_capability_manifest(
-            surface=PlannerSurface.FREEFORM,
-            profile="ordinary",
             messages=_messages(build_system_prompt(None)),
             tools=tools,
             canonical_schema=schema,
@@ -324,8 +251,8 @@ def test_documented_field_inventory_fails_closed_on_drift(mutation: str) -> None
 
 
 def test_manifest_uses_exact_ordered_advertised_tool_definitions() -> None:
-    tools = planner_tool_definitions()
-    manifest = _manifest(build_system_prompt(None), surface=PlannerSurface.FREEFORM, profile="ordinary")
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
+    manifest = _manifest(build_system_prompt(None))
 
     assert [tool["function"]["name"] for tool in tools] == [*PLANNER_DISCOVERY_TOOL_NAMES, "emit_pipeline_proposal"]
     assert manifest.effective_tool_hash == stable_hash(tools)
@@ -333,13 +260,11 @@ def test_manifest_uses_exact_ordered_advertised_tool_definitions() -> None:
 
 
 def test_manifest_accepts_an_order_preserving_dynamic_discovery_subset() -> None:
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     retained = {"get_plugin_assistance", "get_plugin_schema", "list_models"}
     subset = [tool for tool in tools if tool["function"]["name"] in retained or tool is tools[-1]]
 
     manifest = build_planner_capability_manifest(
-        surface=PlannerSurface.FREEFORM,
-        profile="ordinary",
         messages=_messages(build_system_prompt(None)),
         tools=subset,
         canonical_schema=canonical_set_pipeline_schema(),
@@ -356,7 +281,7 @@ def test_manifest_accepts_an_order_preserving_dynamic_discovery_subset() -> None
 
 @pytest.mark.parametrize("mutation", ("reordered", "unknown"))
 def test_manifest_rejects_invalid_dynamic_discovery_subset(mutation: str) -> None:
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     subset = [tool for tool in tools if tool["function"]["name"] in {"get_plugin_assistance", "get_plugin_schema"} or tool is tools[-1]]
     if mutation == "reordered":
         subset[0], subset[1] = subset[1], subset[0]
@@ -365,50 +290,25 @@ def test_manifest_rejects_invalid_dynamic_discovery_subset(mutation: str) -> Non
 
     with pytest.raises(AuditIntegrityError, match="identities or order"):
         build_planner_capability_manifest(
-            surface=PlannerSurface.FREEFORM,
-            profile="ordinary",
             messages=_messages(build_system_prompt(None)),
             tools=subset,
             canonical_schema=canonical_set_pipeline_schema(),
         )
 
 
-@pytest.mark.parametrize(
-    ("surface", "profile", "rendered_skill"),
-    (
-        (PlannerSurface.FREEFORM, "ordinary", build_system_prompt(None)),
-        (PlannerSurface.GUIDED_FULL, "ordinary", build_system_prompt(None)),
-        (
-            PlannerSurface.GUIDED_STAGED,
-            "ordinary",
-            load_step_planner_skill(GuidedStep.STEP_3_TRANSFORMS),
-        ),
-        (
-            PlannerSurface.TUTORIAL_PROFILE,
-            "tutorial",
-            load_step_planner_skill(GuidedStep.STEP_3_TRANSFORMS),
-        ),
-    ),
-)
-def test_every_runtime_surface_builds_the_same_capability_manifest_core(
-    surface: PlannerSurface,
-    profile: str,
-    rendered_skill: str,
-) -> None:
-    manifest = _manifest(rendered_skill, surface=surface, profile=profile)
+def test_freeform_planner_builds_capability_manifest_core() -> None:
+    manifest = _manifest(build_system_prompt(None))
 
-    assert manifest.surface is surface
-    assert manifest.profile == profile
     assert manifest.capability_core_hash == hashlib.sha256(load_pipeline_capability_core().encode("utf-8")).hexdigest()
     assert manifest.canonical_schema_hash == stable_hash(canonical_set_pipeline_schema())
-    assert manifest.effective_tool_hash == stable_hash(planner_tool_definitions())
+    assert manifest.effective_tool_hash == stable_hash(planner_tool_definitions(dialect=ToolContractDialect.NONE))
 
 
 @pytest.mark.parametrize("mutation", ("missing_core", "duplicate_core", "reordered_tools", "mutated_schema"))
 def test_manifest_fails_closed_on_capability_identity_drift(mutation: str) -> None:
     core = load_pipeline_capability_core()
     messages = _messages(build_system_prompt(None))
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     if mutation == "missing_core":
         messages[0]["content"] = "interaction only"
     elif mutation == "duplicate_core":
@@ -420,8 +320,6 @@ def test_manifest_fails_closed_on_capability_identity_drift(mutation: str) -> No
 
     with pytest.raises(AuditIntegrityError):
         build_planner_capability_manifest(
-            surface=PlannerSurface.FREEFORM,
-            profile="ordinary",
             messages=messages,
             tools=tools,
             canonical_schema=canonical_set_pipeline_schema(),
@@ -434,22 +332,18 @@ def test_manifest_rejects_message_missing_required_role() -> None:
 
     with pytest.raises(KeyError, match="role"):
         build_planner_capability_manifest(
-            surface=PlannerSurface.FREEFORM,
-            profile="ordinary",
             messages=messages,
-            tools=planner_tool_definitions(),
+            tools=planner_tool_definitions(dialect=ToolContractDialect.NONE),
             canonical_schema=canonical_set_pipeline_schema(),
         )
 
 
 def test_manifest_rejects_terminal_missing_required_parameters() -> None:
-    tools = planner_tool_definitions()
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     del tools[-1]["function"]["parameters"]
 
     with pytest.raises(KeyError, match="parameters"):
         build_planner_capability_manifest(
-            surface=PlannerSurface.FREEFORM,
-            profile="ordinary",
             messages=_messages(build_system_prompt(None)),
             tools=tools,
             canonical_schema=canonical_set_pipeline_schema(),
@@ -464,16 +358,12 @@ def test_manifest_is_hash_only_and_never_copies_private_prompt_values(tmp_path: 
 
     manifest = _manifest(
         build_system_prompt(str(tmp_path)),
-        surface=PlannerSurface.FREEFORM,
-        profile="ordinary",
         sensitive_user_text=private_value,
     )
     rendered = repr(asdict(manifest))
 
     assert private_value not in rendered
     assert set(asdict(manifest)) == {
-        "surface",
-        "profile",
         "planner_implementation_id",
         "capability_core_hash",
         "canonical_schema_hash",

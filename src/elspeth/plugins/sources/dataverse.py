@@ -13,16 +13,20 @@ import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator, Mapping
-from typing import Any, ClassVar, Self
+from datetime import UTC, datetime
+from typing import Any, ClassVar, Literal, Self, TypedDict
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 import elspeth.contracts.errors as contract_errors
-from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, SourceRow
-from elspeth.contracts.contexts import LifecycleContext, SourceContext
+from elspeth.contracts import Call, CallStatus, CallType, Determinism, PluginSchema, SourceRow
+from elspeth.contracts.contexts import LifecycleContext, LimiterProtocol, SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
+from elspeth.contracts.events import DataverseLoadStatistics
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.wire_visible_identity import (
     is_operator_required_placeholder_value,
@@ -44,7 +48,6 @@ from elspeth.plugins.infrastructure.config_base import (
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldResolution,
@@ -53,6 +56,13 @@ from elspeth.plugins.sources.field_normalization import (
     normalize_field_name,
     resolve_field_names,
 )
+
+
+class _DataverseSourceRequest(TypedDict):
+    method: str
+    url: str | None
+    headers: dict[str, str] | None
+
 
 # OData annotation prefixes to strip from row data
 _ODATA_ANNOTATION_PATTERN = re.compile(r"^@odata\.|@Microsoft\.Dynamics\.CRM\.")
@@ -277,9 +287,10 @@ class DataverseSource(BaseSource):
     validated at the Tier 3 boundary (JSON parse, NaN/Infinity rejection).
     """
 
+    _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3bdedfd268c84048"
+    source_file_hash: str | None = "sha256:fe84ee1118943bf9"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -354,6 +365,12 @@ class DataverseSource(BaseSource):
 
         # Lazy-constructed client (needs lifecycle context)
         self._client: DataverseClient | None = None
+        self._source_limiter: LimiterProtocol | None = None
+        self._pending_verify_source_call_id: str | None = None
+        self._pages_fetched = 0
+        self._rows_yielded = 0
+        self._quarantine_count = 0
+        self._load_state: Literal["not_started", "partial", "exhausted", "failed"] = "not_started"
 
     def on_start(self, ctx: LifecycleContext) -> None:
         """Construct credential and DataverseClient.
@@ -361,11 +378,24 @@ class DataverseSource(BaseSource):
         Called before load() — acquires resources from lifecycle context.
         """
         super().on_start(ctx)
-        # Construct credential (azure-identity) — validates early
-        credential = self._auth_config.create_credential()
-
+        self._pages_fetched = 0
+        self._rows_yielded = 0
+        self._quarantine_count = 0
+        self._load_state = "not_started"
         # Obtain rate limiter (with null guard per spec)
         limiter = ctx.rate_limit_registry.get_limiter("dataverse_source") if ctx.rate_limit_registry is not None else None
+        self._source_limiter = limiter
+
+        # VERIFY first binds the source-load operation to an archived call.
+        # Credential and HTTP client construction are deferred until load().
+        session = ctx.call_mode_session
+        if session is not None and session.mode is RunMode.VERIFY:
+            self._client = None
+            self._pending_verify_source_call_id = None
+            return
+
+        # Construct credential (azure-identity) — validates early in LIVE.
+        credential = self._auth_config.create_credential()
 
         # Construct DataverseClient
         self._client = DataverseClient(
@@ -376,15 +406,43 @@ class DataverseSource(BaseSource):
             additional_domains=self._additional_domains,
         )
 
+    def _metadata_url(self, logical_name: str) -> str:
+        encoded_entity = urllib.parse.quote(logical_name, safe="")
+        return (
+            f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}"
+            f"/EntityDefinitions(LogicalName='{encoded_entity}')?$select=LogicalName,EntitySetName"
+        )
+
+    @staticmethod
+    def _verify_request_data(url: str) -> _DataverseSourceRequest:
+        return {
+            "method": "GET",
+            "url": fingerprint_url(url),
+            "headers": {
+                "Accept": "application/json",
+                "OData-MaxVersion": "4.0",
+                "OData-Version": "4.0",
+            },
+        }
+
+    def _preflight_verify_request(self, ctx: SourceContext, url: str) -> None:
+        session = ctx.call_mode_session
+        if session is None or session.mode is not RunMode.VERIFY:
+            return
+        operation_id = ctx.operation_id
+        if operation_id is None:
+            raise AuditIntegrityError("Dataverse verify requires a source-load operation")
+        evidence = session.preflight_verify_operation_http_managed_identity(
+            request_data=self._verify_request_data(url),
+            current_operation_id=operation_id,
+        )
+        self._pending_verify_source_call_id = evidence.source_call_id
+
     def _resolve_entity_set_name(self, ctx: SourceContext, logical_name: str) -> str:
         """Resolve a logical table name to its authoritative Web API entity set."""
         if self._client is None:
             raise RuntimeError("on_start() must be called before _resolve_entity_set_name() — this is a bug")
-        encoded_entity = urllib.parse.quote(logical_name, safe="")
-        metadata_url = (
-            f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}"
-            f"/EntityDefinitions(LogicalName='{encoded_entity}')?$select=LogicalName,EntitySetName"
-        )
+        metadata_url = self._metadata_url(logical_name)
         try:
             page = self._client.get_page(metadata_url)
         except DataverseClientError as e:
@@ -658,6 +716,44 @@ class DataverseSource(BaseSource):
 
         return result
 
+    def _verify_recorded_page_call(
+        self,
+        ctx: SourceContext,
+        *,
+        call: Call | None,
+        request_data: Mapping[str, str | dict[str, str] | None],
+        status: CallStatus,
+        response_data: Mapping[str, int | bool | str | dict[str, str] | None] | None = None,
+        error_data: Mapping[str, int | str | None] | None = None,
+    ) -> None:
+        session = ctx.call_mode_session
+        if session is None or session.mode is not RunMode.VERIFY:
+            return
+        source_call_id = self._pending_verify_source_call_id
+        operation_id = ctx.operation_id
+        if call is None or source_call_id is None or operation_id is None:
+            raise AuditIntegrityError("Dataverse verify page has no recorded call or pre-token source admission")
+        admitted_call_id = session.admit_verify_operation_http_managed_identity(
+            request_data=request_data,
+            current_operation_id=operation_id,
+            current_call_index=call.call_index,
+            source_call_id=source_call_id,
+        )
+        if admitted_call_id != source_call_id:
+            raise AuditIntegrityError("Dataverse source call changed after pre-token admission")
+        session.verify_call(
+            call_type=CallType.HTTP,
+            request_data=request_data,
+            current_state_id=None,
+            current_operation_id=operation_id,
+            current_call_index=call.call_index,
+            current_call_id=call.call_id,
+            live_status=status,
+            live_response_data=response_data,
+            live_error_data=error_data,
+        )
+        self._pending_verify_source_call_id = None
+
     def _record_page_call(
         self,
         ctx: SourceContext,
@@ -689,7 +785,7 @@ class DataverseSource(BaseSource):
                 "url": safe_url,
                 "headers": page.request_headers,  # Already fingerprinted by client
             }
-            response_data = {
+            response_data: dict[str, int | bool | str | dict[str, str] | None] = {
                 "status_code": page.status_code,
                 "row_count": len(page.rows),
                 "headers": page.headers,
@@ -698,13 +794,20 @@ class DataverseSource(BaseSource):
                 "more_records": page.more_records,
             }
             try:
-                ctx.record_call(
+                recorded_call = ctx.record_call(
                     call_type=CallType.HTTP,
                     status=CallStatus.SUCCESS,
                     request_data=request_data,
                     response_data=response_data,
                     latency_ms=page.latency_ms,
                     provider="dataverse",
+                )
+                self._verify_recorded_page_call(
+                    ctx,
+                    call=recorded_call,
+                    request_data=request_data,
+                    status=CallStatus.SUCCESS,
+                    response_data=response_data,
                 )
             except contract_errors.TIER_1_ERRORS:
                 raise
@@ -720,20 +823,27 @@ class DataverseSource(BaseSource):
                 "url": safe_url,
                 "headers": error.request_headers,  # Fingerprinted by client; mirrors the success path
             }
-            error_data = {
+            error_data: dict[str, int | str | None] = {
                 "error_type": type(error).__name__,
                 "message": str(error),
                 "status_code": error.status_code,
                 "reason": error_reason,
             }
             try:
-                ctx.record_call(
+                recorded_call = ctx.record_call(
                     call_type=CallType.HTTP,
                     status=CallStatus.ERROR,
                     request_data=request_data,
                     error=error_data,
                     latency_ms=error.latency_ms,
                     provider="dataverse",
+                )
+                self._verify_recorded_page_call(
+                    ctx,
+                    call=recorded_call,
+                    request_data=request_data,
+                    status=CallStatus.ERROR,
+                    error_data=error_data,
                 )
             except contract_errors.TIER_1_ERRORS:
                 raise
@@ -745,6 +855,19 @@ class DataverseSource(BaseSource):
                 ) from exc
 
     def load(self, ctx: SourceContext) -> Iterator[SourceRow]:
+        """Track source observations even when consumption stops before exhaustion."""
+        self._load_state = "partial"
+        try:
+            yield from self._load_rows(ctx)
+        except GeneratorExit:
+            raise
+        except BaseException:
+            self._load_state = "failed"
+            raise
+        else:
+            self._load_state = "exhausted"
+
+    def _load_rows(self, ctx: SourceContext) -> Iterator[SourceRow]:
         """Load rows from Dataverse via OData pagination.
 
         Yields SourceRow.valid() for validated rows and
@@ -753,18 +876,10 @@ class DataverseSource(BaseSource):
         # Instance-level flag — NOT reset per page (spec: schema lock scoping)
         self._first_valid_row_processed = False
         is_first_row = True
-        pages_fetched = 0
-        rows_yielded = 0
-        quarantine_count = 0
         source_row_index = 0
 
-        # Client must be constructed by on_start() before load()
-        if self._client is None:
-            raise RuntimeError("on_start() must be called before load() — this is a bug")
-
         if self._entity is not None:
-            entity_set_name = self._resolve_entity_set_name(ctx, self._entity)
-            url = self._build_query_url(entity_set_name)
+            logical_name = self._entity
         else:
             if self._fetch_xml is None:
                 raise RuntimeError("config validator ensures entity or fetch_xml — neither is set, this is a bug")
@@ -775,7 +890,25 @@ class DataverseSource(BaseSource):
             if "name" not in entity_elem.attrib:
                 raise RuntimeError("FetchXML <entity> element missing 'name' attribute")
             logical_name = entity_elem.attrib["name"]
-            entity_set_name = self._resolve_entity_set_name(ctx, logical_name)
+
+        if self._client is None:
+            session = ctx.call_mode_session
+            if session is None or session.mode is not RunMode.VERIFY:
+                raise RuntimeError("on_start() must be called before load() — this is a bug")
+            self._preflight_verify_request(ctx, self._metadata_url(logical_name))
+            credential = self._auth_config.create_credential()
+            self._client = DataverseClient(
+                environment_url=self._environment_url,
+                credential=credential,
+                api_version=self._api_version,
+                limiter=self._source_limiter,
+                additional_domains=self._additional_domains,
+                before_request=lambda url: self._preflight_verify_request(ctx, url),
+            )
+
+        entity_set_name = self._resolve_entity_set_name(ctx, logical_name)
+        if self._entity is not None:
+            url = self._build_query_url(entity_set_name)
 
         try:
             if self._entity is not None:
@@ -787,12 +920,11 @@ class DataverseSource(BaseSource):
                 page_iterator = self._client.paginate_fetchxml(entity_set_name, self._fetch_xml)
 
             for page in page_iterator:
-                pages_fetched += 1
-
                 # Record successful page fetch — use the actual URL from the
                 # response DTO, not the rebuilt initial URL. For pages 2+, the
                 # actual URL is the nextLink from the previous page.
                 self._record_page_call(ctx, url=page.request_url, page=page)
+                self._pages_fetched += 1
 
                 # Process rows
                 for raw_row in page.rows:
@@ -803,13 +935,13 @@ class DataverseSource(BaseSource):
                         cleaned_row = self._strip_odata_metadata(raw_row)
                     except ValueError as e:
                         # Formatted value collision — quarantine
-                        quarantine_count += 1
                         ctx.record_validation_error(
                             row=raw_row,
                             error=str(e),
                             schema_mode="odata_strip",
                             destination=self._on_validation_failure,
                         )
+                        self._quarantine_count += 1
                         if self._on_validation_failure != "discard":
                             yield SourceRow.quarantined(
                                 row=raw_row,
@@ -831,13 +963,13 @@ class DataverseSource(BaseSource):
                     try:
                         normalized_row = self._normalize_row_fields(cleaned_row, is_first_row)
                     except ExternalHeaderError as e:
-                        quarantine_count += 1
                         ctx.record_validation_error(
                             row=cleaned_row,
                             error=f"Field normalization failed: {e}",
                             schema_mode="field_normalization",
                             destination=self._on_validation_failure,
                         )
+                        self._quarantine_count += 1
                         if self._on_validation_failure != "discard":
                             yield SourceRow.quarantined(
                                 row=cleaned_row,
@@ -853,16 +985,16 @@ class DataverseSource(BaseSource):
                         validated = self._schema_class.model_validate(normalized_row)
                         validated_row = validated.to_row()
                     except ValidationError as e:
-                        quarantine_count += 1
                         # Input-free text: str(e) echoes the offending Tier-3
                         # value into audit surfaces (elspeth-a300402c58).
-                        error_text = safe_validation_error_text(e)
+                        error_text = safe_validation_error_text(e, self._schema_class)
                         ctx.record_validation_error(
                             row=normalized_row,
                             error=error_text,
                             schema_mode="validation",
                             destination=self._on_validation_failure,
                         )
+                        self._quarantine_count += 1
                         if self._on_validation_failure != "discard":
                             yield SourceRow.quarantined(
                                 row=normalized_row,
@@ -883,13 +1015,13 @@ class DataverseSource(BaseSource):
                         try:
                             self._contract_builder.process_first_row(validated_row, resolution_map)
                         except ContractFieldLimitExceeded as e:
-                            quarantine_count += 1
                             ctx.record_validation_error(
                                 row=validated_row,
                                 error=str(e),
                                 schema_mode=self._schema_config.mode,
                                 destination=self._on_validation_failure,
                             )
+                            self._quarantine_count += 1
                             if self._on_validation_failure != "discard":
                                 yield SourceRow.quarantined(
                                     row=validated_row,
@@ -918,13 +1050,13 @@ class DataverseSource(BaseSource):
                                 self._field_resolution.resolution_mapping,
                             )
                         except ContractFieldLimitExceeded as e:
-                            quarantine_count += 1
                             ctx.record_validation_error(
                                 row=validated_row,
                                 error=str(e),
                                 schema_mode=self._schema_config.mode,
                                 destination=self._on_validation_failure,
                             )
+                            self._quarantine_count += 1
                             if self._on_validation_failure != "discard":
                                 yield SourceRow.quarantined(
                                     row=validated_row,
@@ -945,6 +1077,7 @@ class DataverseSource(BaseSource):
                                 schema_mode=self._schema_config.mode,
                                 destination=self._on_validation_failure,
                             )
+                            self._quarantine_count += 1
                             if self._on_validation_failure != "discard":
                                 yield SourceRow.quarantined(
                                     row=validated_row,
@@ -954,7 +1087,7 @@ class DataverseSource(BaseSource):
                                 )
                             continue
 
-                    rows_yielded += 1
+                    self._rows_yielded += 1
                     yield SourceRow.valid(validated_row, contract=contract, source_row_index=current_source_row_index)
 
         except DataverseClientError as e:
@@ -975,21 +1108,23 @@ class DataverseSource(BaseSource):
         if not self._first_valid_row_processed and self._contract_builder is not None:
             self.set_schema_contract(self._contract_builder.contract.with_locked())
 
-        # Store counters for on_complete telemetry
-        self._pages_fetched = pages_fetched
-        self._rows_yielded = rows_yielded
-        self._quarantine_count = quarantine_count
-
     def on_complete(self, ctx: LifecycleContext) -> None:
-        """Source statistics available via stored counters.
-
-        No SourceCompleted telemetry event type exists yet (AzureBlobSource
-        has the same gap). Counters are stored as instance attributes by
-        load() for diagnostic access. When a SourceCompleted event is added
-        to contracts/events.py, emit here via ctx.telemetry_emit.
-        """
+        """Emit observed work, independently of the downstream run outcome."""
         super().on_complete(ctx)
-        # Counters stored by load(): _pages_fetched, _rows_yielded, _quarantine_count
+        if ctx.node_id is None:
+            raise FrameworkBugError("Dataverse statistics require a source node identity")
+        ctx.telemetry_emit(
+            DataverseLoadStatistics(
+                timestamp=datetime.now(UTC),
+                run_id=ctx.run_id,
+                node_id=ctx.node_id,
+                plugin_name=self.name,
+                pages_fetched=self._pages_fetched,
+                rows_yielded=self._rows_yielded,
+                rows_rejected=self._quarantine_count,
+                load_state=self._load_state,
+            )
+        )
 
     def get_field_resolution(self) -> tuple[Mapping[str, str], str | None] | None:
         """Return field normalization mapping for audit trail recovery."""
@@ -1016,7 +1151,7 @@ class DataverseSource(BaseSource):
                 composer_hints=(
                     "Tier-3 boundary: record what Dataverse provided. Don't infer absent fields from siblings — record None and let consumers decide.",
                     "Authentication is per-environment via DataverseAuthConfig — credentials wire through the secrets store, never inline in YAML.",
-                    "Choose query_mode 'fetchxml' for complex filters, 'odata' for simple field selection.",
+                    "Choose exactly one of entity (structured OData) or fetch_xml (FetchXML); select/filter/orderby/top require entity and cannot accompany fetch_xml.",
                     "The audit trail records the exact OData/FetchXML query, page count, and quarantine count — verify these are visible before declaring success.",
                     "If you have been asked to generate source rows yourself, do not pick `dataverse` — this source queries a live Microsoft Dataverse environment. Switch to a local-blob source (`csv`, `json`, or `text`) via `create_blob` plus `set_source_from_blob`.",
                     "Never synthesise an `environment_url`, entity name, OData filter, or FetchXML for content you authored — Dataverse is the source of truth for the queried entity and the audit row must point at a real environment, not invented identifiers.",

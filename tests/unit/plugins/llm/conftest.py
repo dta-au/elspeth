@@ -135,8 +135,9 @@ def chaosllm_azure_openai_client(
         request = {
             "model": kwargs["model"],
             "messages": kwargs["messages"],
-            "temperature": kwargs["temperature"],
         }
+        if "temperature" in kwargs:
+            request["temperature"] = kwargs["temperature"]
         if "max_tokens" in kwargs:
             request["max_tokens"] = kwargs["max_tokens"]
         return _build_chaosllm_response(
@@ -171,8 +172,9 @@ def chaosllm_azure_openai_responses(
         request = {
             "model": kwargs["model"],
             "messages": kwargs["messages"],
-            "temperature": kwargs["temperature"],
         }
+        if "temperature" in kwargs:
+            request["temperature"] = kwargs["temperature"]
         if "max_tokens" in kwargs:
             request["max_tokens"] = kwargs["max_tokens"]
         return _build_chaosllm_response(
@@ -207,8 +209,9 @@ def chaosllm_azure_openai_sequence(
         request = {
             "model": kwargs["model"],
             "messages": kwargs["messages"],
-            "temperature": kwargs["temperature"],
         }
+        if "temperature" in kwargs:
+            request["temperature"] = kwargs["temperature"]
         if "max_tokens" in kwargs:
             request["max_tokens"] = kwargs["max_tokens"]
 

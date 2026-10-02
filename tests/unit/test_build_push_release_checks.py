@@ -404,11 +404,26 @@ def test_build_workflow_uses_the_pinned_frontend_runtime_for_both_architectures(
 
     for name in ("Build and push to GHCR", "Build and push to ACR"):
         step = _step(_build_push_job(), name)
-        assert step["with"]["context"] == "."
+        assert step["with"]["context"] == "${{ env.CI_CHECKOUT_PATH }}"
         assert step["with"]["platforms"] == "${{ env.PLATFORMS }}"
         assert "build-contexts" not in step["with"]
 
     assert "--build-context" not in BUILD_PUSH_WORKFLOW.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("job_name", ["build-push", "smoke-test", "release"])
+def test_every_build_push_job_checks_out_into_its_own_per_run_directory(job_name: str) -> None:
+    """The runners' default workspace holds root-owned leftovers from container
+    jobs that actions/checkout cannot delete as the runner user (run
+    35535091770: EACCES on .agents/skills), so no job may check out there."""
+    job = _job(job_name)
+    path = job["env"]["CI_CHECKOUT_PATH"]
+
+    assert path == f"bp-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}-{job_name}"
+    assert job["defaults"]["run"]["working-directory"] == "${{ env.CI_CHECKOUT_PATH }}"
+    checkouts = [step for step in job["steps"] if str(step.get("uses", "")).startswith("actions/checkout@")]
+    assert len(checkouts) == 1
+    assert checkouts[0]["with"]["path"] == "${{ env.CI_CHECKOUT_PATH }}"
 
 
 @pytest.mark.parametrize(
@@ -662,7 +677,7 @@ def test_release_dockerfile_keeps_builder_os_packages_out_of_the_runtime() -> No
 
     assert (
         "FROM gcr.io/distroless/python3-debian13:debug-nonroot"
-        "@sha256:6418f576f2011f5d265d03f53aee812b4efcba5c6646a3f4d855b9fb51cd2d72 AS runtime"
+        "@sha256:83d04312b1f81179f887dca05ab99b86983c4f4970fc7c79ff9fd9204d7ebcf8 AS runtime"
     ) in runtime
     assert "COPY --from=builder /opt/venv /opt/venv" in runtime
     assert "COPY --from=builder /runtime-root/ /" in runtime

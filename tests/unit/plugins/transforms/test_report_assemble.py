@@ -288,18 +288,55 @@ class TestReportAssembleRendering:
         assert result.row is not None
         assert result.row["report_body"] == "alpha|beta"
 
-    def test_non_string_row_value_crashes(self) -> None:
-        # Plugin contract: text_field MUST be a string by the time it
-        # reaches the report assembler.  A non-string value is an
-        # upstream validation bug, not a row-data fault, so the transform
-        # must crash rather than coerce.
+    def test_non_string_row_value_fails_the_whole_batch_with_a_recorded_reason(self) -> None:
+        # A non-string text_field value is a row-level fact, but no report is
+        # assembled over the other rows: the WHOLE batch fails (ruling
+        # elspeth-d5034647f0) with a returned, non-retryable error that the
+        # aggregation routes to its on_error. No coercion — a number is not text.
         from elspeth.plugins.transforms.report_assemble import ReportAssemble
 
         transform = ReportAssemble({"schema": DYNAMIC_SCHEMA, "text_field": "line"})
-        ctx = _ctx(batch_size=1, row_end=1, rows_seen_total=1)
+        ctx = _ctx(batch_size=3)
 
-        with pytest.raises(TypeError, match="must be a string"):
-            transform.process([_row({"line": 3})], ctx)
+        # The bad row sits in the MIDDLE, so the reported index proves it is
+        # the batch index and not a constant 0.
+        rows = [_row({"line": "alpha"}), _row({"line": 48213}), _row({"line": "gamma"})]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.row is None and result.rows is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "line"
+        assert result.reason["expected"] == "a string"
+        assert result.reason["actual_type"] == "int"
+        assert "must be a string, got int in row 1" in result.reason["error"]
+        # The offending VALUE is row content and must not reach the audit trail.
+        assert "48213" not in repr(sorted(result.reason.items()))
+
+    def test_null_row_value_fails_the_whole_batch(self) -> None:
+        # report_assemble has no None skip branch, and none is added: a null
+        # text_field fails the batch through the same wrong-type guard.
+        from elspeth.plugins.transforms.report_assemble import ReportAssemble
+
+        transform = ReportAssemble({"schema": DYNAMIC_SCHEMA, "text_field": "line"})
+        ctx = _ctx(batch_size=3)
+
+        rows = [_row({"line": "alpha"}), _row({"line": "beta"}), _row({"line": None})]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.row is None and result.rows is None
+        assert result.reason is not None
+        assert result.reason["field"] == "line"
+        assert result.reason["expected"] == "a string"
+        assert result.reason["actual_type"] == "NoneType"
+        assert "got NoneType in row 2" in result.reason["error"]
 
     def test_empty_batch_returns_non_retryable_error(self) -> None:
         # An empty batch reaching a batch-aware transform indicates an

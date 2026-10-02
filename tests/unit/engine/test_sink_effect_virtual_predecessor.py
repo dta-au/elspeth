@@ -28,7 +28,7 @@ from elspeth.core.landscape.execution.sink_effect_identity import resolve_sink_e
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator
 from elspeth.plugins.sinks._remote_object_effects import RemoteObjectPreconditionError
-from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, leader_token_for, make_factory, make_landscape_db, register_test_node
 from tests.fixtures.stores import MockPayloadStore
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members
 from tests.unit.engine.test_sink_effect_executor import _execution_request
@@ -47,19 +47,18 @@ def _members_with_payloads(
     sink_id = register_test_node(factory.data_flow, run.run_id, "sink", node_type=NodeType.SINK, plugin_name="sink")
     candidates: list[SinkEffectMemberCandidate] = []
     for ordinal, payload in enumerate(payloads):
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source_id,
             row_index=ordinal,
             data=payload,
             source_row_index=ordinal,
             ingest_sequence=ordinal,
         )
-        token = factory.data_flow.create_token(row.row_id)
         factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data=payload,
         )

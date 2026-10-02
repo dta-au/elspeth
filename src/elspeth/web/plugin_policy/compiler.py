@@ -163,4 +163,5 @@ def compile_web_plugin_policy(*, registry: PluginRegistry, settings: RuntimeWebP
         preferences=tuple(preferences),
         control_modes=modes,
         plugin_code_identities=identities,
+        power_automate_allowed_origins=settings.power_automate_allowed_origins,
     )

@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace as _replace_dataclass
+from typing import Annotated
 
-from elspeth.contracts.errors import GuidedCustodyIntegrityError
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.session_operation import SessionOperationKind
-from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerResult
+from elspeth.web.compartments import compartment_ingress_record
+from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerAdmissionRefused, ComposerResult
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
+from elspeth.web.execution.completion_gates import completion_gate_decision_changes, parse_completion_gates
+from elspeth.web.sessions.protocol import MessageIngressAccepted, MessageIngressConflict, MessageIngressFresh
 from elspeth.web.sessions.titles import is_default_session_title
 
 from ._helpers import (
@@ -21,15 +27,11 @@ from ._helpers import (
     ComposerConvergenceError,
     ComposerPluginCrashError,
     ComposerProgressEvent,
-    ComposerRateLimiter,
     ComposerRuntimePreflightError,
     ComposerService,
     ComposerServiceError,
-    CompositionStateData,
     CompositionStateResponse,
     Depends,
-    FailedTurnMetadata,
-    GuidedSession,
     HTTPException,
     InvariantError,
     MessageWithStateResponse,
@@ -39,24 +41,33 @@ from ._helpers import (
     SendMessageRequest,
     SessionServiceProtocol,
     UserIdentity,
-    _BadRequestLLMError,
+    WebRateLimiter,
     _cancel_on_client_disconnect,
+    _capture_freeform_child,
+    _chat_ingress_inputs,
     _composer_chat_history,
     _composer_conversation_messages,
     _composer_conversation_or_llm_audit_messages,
     _composer_conversation_or_tool_messages,
     _composer_conversation_tool_or_llm_audit_messages,
+    _composer_heartbeat_cancel_of,
+    _composer_heartbeat_failed_progress_event,
     _composer_progress_sink,
     _ComposerRequestTerminalStatus,
-    _failed_turn_response_body,
+    _freeform_child_result,
+    _FreeformContinuationReceipt,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
+    _handle_composer_chargeable_refusal,
+    _handle_composer_provider_failure,
     _handle_convergence_error,
     _handle_planner_failure,
     _handle_plugin_crash,
     _handle_runtime_preflight_failure,
-    _initial_composition_state_with_guided_session,
+    _initial_composition_state,
     _is_client_disconnect_cancel,
+    _join_freeform_owned_task,
+    _join_shielded_task_after_cancellation,
     _litellm_error_detail,
     _llm_calls_from_exception,
     _message_response,
@@ -66,6 +77,7 @@ from ._helpers import (
     _publish_progress,
     _record_composer_request_terminal,
     _record_composer_runtime_preflight_telemetry,
+    _rejections_by_tool_call_id,
     _request_plugin_policy_context,
     _safe_frame_strings,
     _state_data_from_composer_state,
@@ -79,15 +91,13 @@ from ._helpers import (
     composer_turn_end_assistant_row,
     convergence_progress_event,
     freeform_planner_progress_reason,
-    get_current_user,
     get_rate_limiter,
     maybe_auto_title_session,
     merge_composer_meta_updates,
+    require_pipeline_user,
     slog,
-    validation_errors_for_composer_surface,
 )
 from .composer.pipeline_settlement import PipelineRouteSettlement, settle_auto_commit_intent
-from .guided_operations import _join_shielded_task_after_cancellation
 
 
 def _requests_audit_grade_messages_view(
@@ -95,8 +105,26 @@ def _requests_audit_grade_messages_view(
     include_tool_rows: bool,
     include_llm_audit: bool,
     include_raw_content: bool,
+    include_rejection_reasons: bool,
 ) -> bool:
-    return include_tool_rows or include_llm_audit or include_raw_content
+    return include_tool_rows or include_llm_audit or include_raw_content or include_rejection_reasons
+
+
+def _ingress_receipt_conflict(result: MessageIngressAccepted | MessageIngressConflict) -> HTTPException:
+    already_accepted = isinstance(result, MessageIngressAccepted)
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error_type": "message_already_accepted" if already_accepted else "message_idempotency_conflict",
+            "client_request_id": str(result.client_request_id),
+            "user_message_id": str(result.user_message_id),
+            "detail": (
+                "This message was already accepted. Refresh the session before retrying composition."
+                if already_accepted
+                else "This request identifier was already used with different message content or state."
+            ),
+        },
+    )
 
 
 def register_message_routes(router: APIRouter) -> None:
@@ -109,8 +137,8 @@ def register_message_routes(router: APIRouter) -> None:
         session_id: UUID,
         body: SendMessageRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
-        rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
+        rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
         # In-flight compose tally for the SPA's post-abort settlement signal
         # (elspeth-06a23adfcc); decrements only after the route fully unwinds.
         _inflight_tally: None = Depends(_track_compose_inflight),
@@ -126,12 +154,17 @@ def register_message_routes(router: APIRouter) -> None:
         7. Persist the assistant response message with post-compose state_id.
         8. Return the assistant message and (optionally) the new state.
         """
+        try:
+            require_no_credential_material(body.content, surface="web_message_ingress")
+        except CredentialMaterialRefused as exc:
+            raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
         # 0. Rate limit check — before any work
         await rate_limiter.check(user.user_id)
 
         session = await _verify_session_ownership(session_id, user, request)
         service: SessionServiceProtocol = request.app.state.session_service
         settings = request.app.state.settings
+        chat_ingress = compartment_ingress_record(body.content, own_compartment_id=settings.compartment_id)
         compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
         async with (
             compose_lock,
@@ -143,49 +176,38 @@ def register_message_routes(router: APIRouter) -> None:
                 lease_seconds=service.session_operation_lease_seconds,
             ) as compose_operation_lease,
         ):
+            existing_ingress = await service.lookup_message_ingress(
+                session.id,
+                client_request_id=body.client_request_id,
+                content=body.content,
+                requested_state_id=body.state_id,
+                session_operation_context=compose_operation_lease.context,
+            )
+            if isinstance(existing_ingress, (MessageIngressAccepted, MessageIngressConflict)):
+                raise _ingress_receipt_conflict(existing_ingress)
             # 1. Load or create CompositionState — needed before user message
             #    for pre-send provenance (AD-7: user msg records what user saw).
             state_record = await service.get_current_state(session.id)
             if state_record is None:
-                state = _initial_composition_state_with_guided_session()
-                pre_send_state_id: UUID | None = None
+                state = _initial_composition_state()
             else:
                 state = _state_from_record(state_record)
-                # If client provided a state_id, verify it belongs to this session.
-                # Use client-asserted state for provenance (AD-2) — it reflects
-                # what the user was looking at, which may differ from current if
-                # another tab mutated state.
-                if body.state_id is not None:
-                    client_state_id = body.state_id
-                    # Two 404 paths below return byte-identical bodies by
-                    # design. The commit that introduced this validation
-                    # called the RuntimeError/ValueError mapping
-                    # "load-bearing ... to avoid leaking other sessions'
-                    # state existence" — but distinguishable 404 *details*
-                    # would leak exactly that (an attacker could observe
-                    # "State not found" vs "State not found for this
-                    # session" and conclude the UUID exists in some OTHER
-                    # user's session, which is the IDOR information leak
-                    # the check exists to prevent). Keep both details
-                    # identical; if a future refactor needs diagnostic
-                    # precision, route it through structured audit/
-                    # telemetry (server-side only), not through the HTTP
-                    # response body.
-                    try:
-                        client_state = await service.get_state(client_state_id)
-                    except ValueError:
-                        raise HTTPException(
-                            status_code=404,
-                            detail="State not found",
-                        ) from None
-                    if client_state.session_id != session.id:
-                        raise HTTPException(
-                            status_code=404,
-                            detail="State not found",
-                        )
-                    pre_send_state_id = client_state_id
-                else:
-                    pre_send_state_id = state_record.id
+            # An explicit state is always checked, including when this session
+            # has no current head. Use it as the user row's provenance, while
+            # the compose loop itself still starts from the actual head.
+            if body.state_id is not None:
+                client_state_id = body.state_id
+                # Both missing and cross-session states receive byte-identical
+                # 404 details so the lookup does not disclose another session.
+                try:
+                    client_state = await service.get_state(client_state_id)
+                except ValueError:
+                    raise HTTPException(status_code=404, detail="State not found") from None
+                if client_state.session_id != session.id:
+                    raise HTTPException(status_code=404, detail="State not found")
+                pre_send_state_id: UUID | None = client_state_id
+            else:
+                pre_send_state_id = state_record.id if state_record is not None else None
 
             # Optimistic-concurrency baseline for the compose loop: the
             # ACTUAL head this request composes against (loaded above,
@@ -200,17 +222,13 @@ def register_message_routes(router: APIRouter) -> None:
             # send (elspeth-e08063c3a5). ``/recompose`` already seeds
             # from the head; this keeps the two routes symmetric.
             compose_base_state_id = state_record.id if state_record is not None else None
+            # The prior row's durable advisor gate fact, handed to the END
+            # gate (ruling 2026-09-22). Parsed here, outside every ``try``:
+            # a corrupt envelope is Tier 1 and must propagate, not be
+            # mistaken for a compose failure.
+            prior_completion_gates_facts = parse_completion_gates(state_record.composer_meta) if state_record is not None else None
             _policy_catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
             profile_registry = request.app.state.operator_profile_registry
-
-            # 1b. Detect guided→freeform mode transition (spec §8.2).
-            # The first freeform chat turn after guided_session.terminal is set
-            # uses a layered system prompt. ``transition_consumed`` guards against
-            # re-firing on subsequent turns.
-            _guided = state.guided_session
-            _guided_terminal_for_compose = (
-                _guided.terminal if (_guided is not None and _guided.terminal is not None and not _guided.transition_consumed) else None
-            )
 
             # 2. Persist user message with pre-send provenance AND take the
             # transcript snapshot in the SAME write-locked transaction.
@@ -221,17 +239,35 @@ def register_message_routes(router: APIRouter) -> None:
             # 500 on every send. The combined method returns a transcript
             # that ends at the inserted row BY CONSTRUCTION — never
             # re-call get_messages for this snapshot.
-            user_msg, records = await service.add_message_with_transcript(
-                session.id,
-                "user",
-                body.content,
-                composition_state_id=pre_send_state_id,
-                writer_principal="route_user_message",
-                session_operation_context=compose_operation_lease.context,
+            ingress = compose_operation_lease.create_task(
+                _capture_freeform_child(
+                    service.add_message_with_transcript(
+                        session.id,
+                        "user",
+                        body.content,
+                        client_request_id=body.client_request_id,
+                        requested_state_id=body.state_id,
+                        composition_state_id=pre_send_state_id,
+                        writer_principal="route_user_message",
+                        session_operation_context=compose_operation_lease.context,
+                    )
+                ),
+                name="send-message-ingress",
             )
+            ingress_outcome, ingress_cancellation = await _join_freeform_owned_task(ingress)
+            ingress_result = _freeform_child_result(ingress_outcome)
+            if isinstance(ingress_result, (MessageIngressAccepted, MessageIngressConflict)):
+                raise _ingress_receipt_conflict(ingress_result)
+            if not isinstance(ingress_result, MessageIngressFresh):
+                raise AuditIntegrityError("Message ingress returned an unrecognized outcome")
+            user_msg, records = ingress_result.message, ingress_result.transcript
+            if ingress_cancellation is not None:
+                raise ingress_cancellation
+            chat_ingress_inputs = _chat_ingress_inputs(records, own_compartment_id=settings.compartment_id)
             progress_registry = _get_composer_progress_registry(request)
-            progress_sink = _composer_progress_sink(
+            progress_sink = await _composer_progress_sink(
                 progress_registry,
+                request=request,
                 session_id=str(session.id),
                 request_id=str(user_msg.id),
                 user_id=str(user.user_id),
@@ -326,9 +362,222 @@ def register_message_routes(router: APIRouter) -> None:
 
                 # 4. Run the LLM composition loop
                 composer: ComposerService = request.app.state.composer_service
-                from litellm.exceptions import APIError as LiteLLMAPIError
-                from litellm.exceptions import AuthenticationError as LiteLLMAuthError
+                from openai import OpenAIError
 
+                async def settle_post_provider(result: ComposerResult) -> _FreeformContinuationReceipt:
+                    # 5. Save state if version changed — post-compose provenance.
+                    #
+                    # Path 2 (post-compose runtime preflight): the call to
+                    # _state_data_from_composer_state below uses
+                    # preflight_exception_policy="raise", which raises
+                    # ComposerRuntimePreflightError when the post-compose
+                    # preflight crashes. That raise site sits OUTSIDE the
+                    # compose-time try/except above, so the post-compose block is
+                    # wrapped in its own try/except that delegates to the same
+                    # shared helper. Without this wrapper, a path-2 raise escapes
+                    # as Starlette's bare 500 — partial_state is dropped from
+                    # the audit trail and the frontend receives an opaque error.
+                    #
+                    # Compute the metadata carried into the post-compose state.
+                    _post_compose_updates: dict[str, Any] = {
+                        "repair_turns_used": result.repair_turns_used,
+                        "ingress": chat_ingress,
+                        "chat_ingress_inputs": chat_ingress_inputs,
+                    }
+                    _post_compose_meta = merge_composer_meta_updates(
+                        state_record.composer_meta if state_record is not None else None,
+                        _post_compose_updates,
+                    )
+
+                    state_response: CompositionStateResponse | None = None
+                    post_compose_state_id: UUID | None = compose_base_state_id
+                    assistant_msg: ChatMessageRecord | None = None
+                    route_settlement: PipelineRouteSettlement | None = None
+                    if result.pipeline_commit_intent is not None:
+                        settlement_outcome = await settle_auto_commit_intent(
+                            request=request,
+                            session_operation_context=compose_operation_lease.context,
+                            user=user,
+                            service=service,
+                            session_id=session.id,
+                            intent=result.pipeline_commit_intent,
+                            composer_meta=_post_compose_meta,
+                            telemetry_source="compose",
+                        )
+                        if type(settlement_outcome) is PipelineRouteSettlement:
+                            route_settlement = settlement_outcome
+                        else:
+                            # Auto-commit authority was durably revoked before the
+                            # settlement transaction (elspeth-01d4c6e683): the
+                            # proposal stays pending, so this turn becomes an
+                            # ordinary review-path response.
+                            result = _replace_dataclass(
+                                result,
+                                message=PIPELINE_STAGED_REVIEW_MESSAGE,
+                                pipeline_commit_intent=None,
+                            )
+                    # Computed HERE, below the auto-commit-revoked branch above: that
+                    # branch rebinds ``result`` with the staged-review message, so a
+                    # pair hoisted to the top of the handler would be stale. Every
+                    # writer below shares this one — the turn-end row must not re-carry
+                    # prose the compose loop already committed mid-turn
+                    # (elspeth-d581b3da7f).
+                    _turn_end = composer_turn_end_assistant_row(result)
+                    if route_settlement is not None:
+                        state_response = _state_response(
+                            route_settlement.settlement.state,
+                            live_validation=route_settlement.validation,
+                        )
+                        post_compose_state_id = route_settlement.settlement.state.id
+                        assistant_msg = route_settlement.settlement.transition_message
+                    elif result.state.version != state.version or completion_gate_decision_changes(
+                        prior_completion_gates_facts, result.advisor_gate_decision, result.state
+                    ):
+                        await _publish_progress(
+                            progress_sink,
+                            event=ComposerProgressEvent(
+                                phase="validating",
+                                headline="The composer is validating the pipeline and its review status.",
+                                evidence=("The pipeline state and review outcome are being checked before persistence.",),
+                                likely_next="ELSPETH will save the validated pipeline snapshot.",
+                            ),
+                        )
+                        try:
+                            state_data, validation = await _state_data_from_composer_state(
+                                result.state,
+                                settings=settings,
+                                secret_service=request.app.state.scoped_secret_resolver,
+                                user_id=str(user.user_id),
+                                session_id=session.id,
+                                plugin_snapshot=plugin_snapshot,
+                                profile_registry=profile_registry,
+                                catalog=request.app.state.catalog_service,
+                                runtime_preflight=result.runtime_preflight,
+                                preflight_exception_policy="raise",
+                                initial_version=state.version,
+                                telemetry_source="compose",
+                                composer_meta=_post_compose_meta,
+                                advisor_gate_decision=result.advisor_gate_decision,
+                            )
+                        except ComposerRuntimePreflightError as rpf_exc:
+                            rpf_exc = ComposerRuntimePreflightError(
+                                original_exc=rpf_exc.original_exc,
+                                partial_state=rpf_exc.partial_state,
+                                tool_invocations=result.tool_invocations,
+                                llm_calls=result.llm_calls,
+                            )
+                            # UX-distinct from path 1 above: the LLM call already
+                            # succeeded, so the failure messaging frames this as
+                            # a validation/persistence-stage failure rather than
+                            # a compose-stage failure.
+                            await _publish_progress(
+                                progress_sink,
+                                event=ComposerProgressEvent(
+                                    phase="failed",
+                                    headline="The composer could not safely validate the pipeline update.",
+                                    evidence=("Runtime preflight failed during state persistence.",),
+                                    likely_next="Review the visible error message, then retry after the issue is resolved.",
+                                    reason="runtime_preflight_failed",
+                                ),
+                            )
+                            response_body = await _handle_runtime_preflight_failure(
+                                rpf_exc,
+                                service,
+                                session.id,
+                                str(user.user_id),
+                                "compose",
+                                compose_base_state_id,
+                                settings=settings,
+                                secret_service=request.app.state.scoped_secret_resolver,
+                                plugin_snapshot=plugin_snapshot,
+                                profile_registry=profile_registry,
+                                catalog=request.app.state.catalog_service,
+                                session_operation_context=compose_operation_lease.context,
+                                ingress=chat_ingress,
+                                chat_ingress_inputs=chat_ingress_inputs,
+                            )
+                            raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
+                        await _publish_progress(
+                            progress_sink,
+                            event=ComposerProgressEvent(
+                                phase="saving",
+                                headline="ELSPETH is saving the pipeline and review status.",
+                                evidence=("A new composition state version is being stored for this session.",),
+                                likely_next="The assistant response will appear after the save completes.",
+                            ),
+                        )
+                        new_state_record = await service.save_composition_state(
+                            session.id,
+                            state_data,
+                            # Successful send-message state advance after the LLM
+                            # composer returns a newer state version.
+                            provenance="post_compose",
+                            session_operation_context=compose_operation_lease.context,
+                        )
+                        state_response = _state_response(new_state_record, live_validation=validation)
+                        post_compose_state_id = new_state_record.id
+                    # 6. Persist assistant message with post-compose provenance
+                    if assistant_msg is None:
+                        assistant_msg = await service.add_message(
+                            session.id,
+                            "assistant",
+                            _turn_end.content,
+                            composition_state_id=post_compose_state_id,
+                            raw_content=_turn_end.raw_content,
+                            writer_principal="compose_loop",
+                            session_operation_context=compose_operation_lease.context,
+                        )
+                    # 6b. Persist per-tool-call audit trail. Each ComposerToolInvocation
+                    # lands as one role=tool chat message linked to the post-compose
+                    # state id (when version advanced) so the audit trail records
+                    # which tool calls produced this state. Tool rows and LLM
+                    # sidecars are ONE turn cohort and settle in a single
+                    # transaction (elspeth-90231248dc) even though they bind to
+                    # different state ids.
+                    await _persist_turn_audit_cohort(
+                        service,
+                        session.id,
+                        result.tool_invocations if not result.persisted_tool_call_turn else (),
+                        result.llm_calls,
+                        tool_composition_state_id=post_compose_state_id,
+                        llm_composition_state_id=compose_base_state_id,
+                        parent_assistant_id=assistant_msg.id,
+                        plugin_crash_pending=False,
+                        session_operation_context=compose_operation_lease.context,
+                    )
+                    # 7. Return response.
+                    #
+                    # Build the response object FIRST so a Pydantic packaging
+                    # failure (very unlikely — the inputs are already shaped
+                    # UUID/string fields, but contractually possible) does not
+                    # poison the terminal counter with a misleading
+                    # ``status=completed`` for a request that ultimately 500'd.
+                    # The flag flips only once the response is fully
+                    # constructed and ready to hand back to FastAPI.
+                    proposals = await _pending_proposal_responses(service, session.id)
+                    response = MessageWithStateResponse(
+                        message=_message_response(assistant_msg),
+                        state=state_response,
+                        proposals=proposals,
+                    )
+                    await _publish_progress(
+                        progress_sink,
+                        event=ComposerProgressEvent(
+                            phase="complete",
+                            headline="The composer has updated the pipeline."
+                            if result.state.version != state.version
+                            else "The composer response is ready.",
+                            evidence=("The assistant response has been saved for this session.",),
+                            likely_next="Review the response and current pipeline.",
+                            reason="composer_complete",
+                        ),
+                    )
+
+                    return _FreeformContinuationReceipt(response=response)
+
+                post_provider_error: BaseException | None = None
+                continuation_receipt: _FreeformContinuationReceipt | None = None
+                deferred_cancellation: asyncio.CancelledError | None = None
                 try:
                     # The watcher cancels this task if the client
                     # disconnects mid-compose (Stop button, SPA compose
@@ -347,7 +596,6 @@ def register_message_routes(router: APIRouter) -> None:
                             current_state_id=str(compose_base_state_id) if compose_base_state_id is not None else None,
                             user_id=str(user.user_id),
                             progress=progress_sink,
-                            guided_terminal=_guided_terminal_for_compose,
                             session_operation_context=compose_operation_lease.context,
                             # Bind the freshly persisted user message id so any
                             # inline_blob created by
@@ -359,7 +607,26 @@ def register_message_routes(router: APIRouter) -> None:
                             # would surface as an IntegrityError, not as a
                             # silent provenance corruption.
                             user_message_id=str(user_msg.id),
+                            completion_gates=prior_completion_gates_facts,
                         )
+                        _compose_result = result
+                        continuation = compose_operation_lease.create_task(
+                            _capture_freeform_child(settle_post_provider(result)),
+                            name="send-message-post-provider-settlement",
+                        )
+                        try:
+                            outcome, deferred_cancellation = await _join_freeform_owned_task(continuation)
+                            receipt = _freeform_child_result(outcome)
+                        except (Exception, asyncio.CancelledError) as exc:
+                            post_provider_error = exc
+                        else:
+                            continuation_receipt = receipt
+                            request.state.composer_durable_completed = True
+                            terminal_status = receipt.terminal_status
+                except asyncio.CancelledError as watcher_cancel:
+                    if post_provider_error is not None:
+                        raise post_provider_error from watcher_cancel
+                    raise
                 except ComposerConvergenceError as exc:
                     terminal_status = "timed_out" if exc.budget_exhausted == "timeout" else "failed"
                     # Discriminate the three sub-causes (composition / discovery /
@@ -383,95 +650,20 @@ def register_message_routes(router: APIRouter) -> None:
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
                         session_operation_context=compose_operation_lease.context,
+                        ingress=chat_ingress,
+                        chat_ingress_inputs=chat_ingress_inputs,
                     )
                     raise HTTPException(status_code=422, detail=response_body) from exc
-                except LiteLLMAuthError as exc:
-                    # ``str(exc)`` on LiteLLM exceptions can embed the provider
-                    # name, model ID, request payload fragments, and — on
-                    # certain provider code paths — the upstream HTTP response
-                    # body, which has been observed to echo the Authorization
-                    # header.  Redact the HTTP ``detail`` field to the class
-                    # name only; route the full exception to structured
-                    # server-side logging via ``slog.error`` with session
-                    # correlation.  Mirrors the ``partial_state_save_error``
-                    # contract on the SQLAlchemy 422 path in
-                    # ``_handle_convergence_error`` above.
-                    # exc_info deliberately omitted for the same reason
-                    # SQLAlchemy ``exc_info`` is dropped in the canonical
-                    # narrow-catch sites: ``__cause__`` chains on these
-                    # exception classes can carry upstream provider detail
-                    # that must not be retained in structured logs either.
-                    slog.error(
-                        "compose_llm_auth_error",
-                        session_id=str(session_id),
-                        exc_class=type(exc).__name__,
-                    )
-                    await _publish_progress(
-                        progress_sink,
-                        event=ComposerProgressEvent(
-                            phase="failed",
-                            headline="The composer model is not available.",
-                            evidence=("The model provider rejected the composer request.",),
-                            likely_next="Check the composer provider configuration before retrying.",
-                            reason="provider_auth_failed",
-                        ),
-                    )
-                    llm_calls = _llm_calls_from_exception(exc)
-                    if llm_calls:
-                        await _persist_llm_calls(
-                            service,
-                            session.id,
-                            llm_calls,
-                            compose_base_state_id,
-                            plugin_crash_pending=True,
-                            session_operation_context=compose_operation_lease.context,
-                        )
-                    raise HTTPException(
-                        status_code=502,
-                        detail=_litellm_error_detail(
-                            "llm_auth_error",
-                            exc,
-                            expose_provider_error=settings.composer_expose_provider_errors,
-                        ),
-                    ) from exc
-                except LiteLLMAPIError as exc:
-                    # Same redaction rationale as the auth-error block above.
-                    # ``LiteLLMAPIError`` message shape varies by provider (OpenAI,
-                    # Azure OpenAI, Anthropic, Bedrock) and can include
-                    # rate-limit window details, account/tenant identifiers,
-                    # and upstream request IDs that are operator-only material.
-                    slog.error(
-                        "compose_llm_unavailable",
-                        session_id=str(session_id),
-                        exc_class=type(exc).__name__,
-                    )
-                    await _publish_progress(
-                        progress_sink,
-                        event=ComposerProgressEvent(
-                            phase="failed",
-                            headline="The composer model is temporarily unavailable.",
-                            evidence=("The model provider did not complete the request.",),
-                            likely_next="Retry when the provider is available.",
-                            reason="provider_unavailable",
-                        ),
-                    )
-                    llm_calls = _llm_calls_from_exception(exc)
-                    if llm_calls:
-                        await _persist_llm_calls(
-                            service,
-                            session.id,
-                            llm_calls,
-                            compose_base_state_id,
-                            plugin_crash_pending=True,
-                            session_operation_context=compose_operation_lease.context,
-                        )
-                    raise HTTPException(
-                        status_code=502,
-                        detail=_litellm_error_detail(
-                            "llm_unavailable",
-                            exc,
-                            expose_provider_error=settings.composer_expose_provider_errors,
-                        ),
+                except OpenAIError as exc:
+                    raise await _handle_composer_provider_failure(
+                        exc,
+                        route="messages",
+                        service=service,
+                        session_id=session.id,
+                        composition_state_id=compose_base_state_id,
+                        progress_sink=progress_sink,
+                        session_operation_context=compose_operation_lease.context,
+                        expose_provider_error=settings.composer_expose_provider_errors,
                     ) from exc
                 except _BadRequestLLMError as exc:
                     slog.error(
@@ -548,6 +740,8 @@ def register_message_routes(router: APIRouter) -> None:
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
                         session_operation_context=compose_operation_lease.context,
+                        ingress=chat_ingress,
+                        chat_ingress_inputs=chat_ingress_inputs,
                     )
                     await _publish_progress(
                         progress_sink,
@@ -614,6 +808,8 @@ def register_message_routes(router: APIRouter) -> None:
                         profile_registry=profile_registry,
                         catalog=request.app.state.catalog_service,
                         session_operation_context=compose_operation_lease.context,
+                        ingress=chat_ingress,
+                        chat_ingress_inputs=chat_ingress_inputs,
                     )
                     raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                 except PipelinePlannerError as exc:
@@ -622,10 +818,8 @@ def register_message_routes(router: APIRouter) -> None:
                     # NOT caught by the generic ComposerServiceError arm below; without
                     # this clause it escaped as an unhandled 500 with no "failed"
                     # progress event and no closed failure-disposition record. The
-                    # guided-full route translates the same exception via
-                    # fail_guided_operation_with_audit; _handle_planner_failure is the
-                    # freeform mirror (persisting one durable, redacted disposition
-                    # row). The planner's LLM-call audit evidence is already durable
+                    # handler persists one durable, redacted disposition row.
+                    # The planner's LLM-call audit evidence is already durable
                     # (llm_calls_durable), so _handle_planner_failure MUST NOT — and
                     # does not — persist it again.
                     await _publish_progress(
@@ -633,11 +827,18 @@ def register_message_routes(router: APIRouter) -> None:
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer could not build a pipeline for this request.",
-                            evidence=("The composer model did not return a usable pipeline plan.",),
-                            likely_next="Retry the request; if it keeps failing, simplify it or check the composer provider.",
+                            evidence=(
+                                "Cost accounting could not admit the model response."
+                                if exc.code == "COST_UNAVAILABLE"
+                                else "The composer model did not return a usable pipeline plan.",
+                            ),
+                            likely_next=(
+                                "Ask an administrator to configure or correct model pricing before trying again."
+                                if exc.code == "COST_UNAVAILABLE"
+                                else "Retry the request; if it keeps failing, simplify it or check the composer provider."
+                            ),
                             # Attribute the failure to its actual actor rather than blaming the
-                            # provider for every planner code — the guided mirror already does
-                            # (guided_plan.py), and the closed vocabulary carries the codes.
+                            # provider for every planner code.
                             reason=freeform_planner_progress_reason(exc.code),
                         ),
                     )
@@ -649,6 +850,32 @@ def register_message_routes(router: APIRouter) -> None:
                         session_operation_context=compose_operation_lease.context,
                     )
                     raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
+                except ChargeableAdmissionRefused as exc:
+                    raise await _handle_composer_chargeable_refusal(
+                        exc,
+                        service=service,
+                        session_id=session.id,
+                        composition_state_id=compose_base_state_id,
+                        progress_sink=progress_sink,
+                        session_operation_context=compose_operation_lease.context,
+                    ) from exc
+                except ComposerAdmissionRefused as exc:
+                    await _publish_progress(
+                        progress_sink,
+                        event=ComposerProgressEvent(
+                            phase="failed",
+                            headline="This request was refused by the admission policy.",
+                            evidence=(str(exc),),
+                            likely_next="Ask an administrator to review your access and quota configuration.",
+                            reason="admission_refused",
+                        ),
+                    )
+                    if isinstance(exc, CredentialMaterialRefused):
+                        raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
+                    raise HTTPException(
+                        status_code=403,
+                        detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},
+                    ) from exc
                 except ComposerServiceError as exc:
                     await _publish_progress(
                         progress_sink,
@@ -697,329 +924,18 @@ def register_message_routes(router: APIRouter) -> None:
                             plugin_crash_pending=True,
                             session_operation_context=compose_operation_lease.context,
                         )
-                _compose_result = result
-
-                # 5. Save state if version changed — post-compose provenance.
-                #
-                # Path 2 (post-compose runtime preflight): the call to
-                # _state_data_from_composer_state below uses
-                # preflight_exception_policy="raise", which raises
-                # ComposerRuntimePreflightError when the post-compose
-                # preflight crashes. That raise site sits OUTSIDE the
-                # compose-time try/except above, so the post-compose block is
-                # wrapped in its own try/except that delegates to the same
-                # shared helper. Without this wrapper, a path-2 raise escapes
-                # as Starlette's bare 500 — partial_state is dropped from
-                # the audit trail and the frontend receives an opaque error.
-                #
-                # 5a. Compute the post-compose guided_session.
-                # If the transition prompt fired this turn, flip transition_consumed
-                # on the guided_session so subsequent turns use the freeform-only
-                # prompt.  The updated guided_session is included in composer_meta
-                # for both the version-changed save path and the version-unchanged
-                # standalone save below.
-                _post_compose_guided: GuidedSession | None = result.state.guided_session
-                if _guided_terminal_for_compose is not None:
-                    # transition_consumed flip — _guided is non-None because
-                    # _guided_terminal_for_compose was derived from _guided.terminal.
-                    # The explicit RuntimeError defends against an impossible state
-                    # (the gate above ensures _guided is not None when this fires)
-                    # and satisfies the type checker without defensive get() calls.
-                    if _guided is None:
-                        raise InvariantError(
-                            "guided_terminal_for_compose is set but guided_session is None — "
-                            "impossible state: transition gate should have blocked this path"
-                        )
-                    from dataclasses import replace as _replace_dc
-
-                    _post_compose_guided = _replace_dc(
-                        _guided,
-                        transition_consumed=True,
-                    )
-
-                # 5b. Compute the composer_meta that carries both repair_turns_used
-                # and guided_session.  Guided_session rides in composer_meta (not a
-                # first-class column) so any save must propagate it forward — failing
-                # to include it would silently drop the guided session from the DB on
-                # every freeform compose turn that mutates state.
-                _post_compose_updates: dict[str, Any] = {"repair_turns_used": result.repair_turns_used}
-                if _post_compose_guided is not None:
-                    _post_compose_updates["guided_session"] = _post_compose_guided.to_dict()
-                _post_compose_meta = merge_composer_meta_updates(
-                    state_record.composer_meta if state_record is not None else None,
-                    _post_compose_updates,
-                )
-
-                state_response: CompositionStateResponse | None = None
-                post_compose_state_id: UUID | None = compose_base_state_id
-                assistant_msg: ChatMessageRecord | None = None
-                route_settlement: PipelineRouteSettlement | None = None
-                if result.pipeline_commit_intent is not None:
-                    settlement_outcome = await settle_auto_commit_intent(
-                        request=request,
-                        session_operation_context=compose_operation_lease.context,
-                        user=user,
-                        service=service,
-                        session_id=session.id,
-                        intent=result.pipeline_commit_intent,
-                        composer_meta=_post_compose_meta,
-                        telemetry_source="compose",
-                        transition_assistant=composer_turn_end_assistant_row(result) if _guided_terminal_for_compose is not None else None,
-                    )
-                    if type(settlement_outcome) is PipelineRouteSettlement:
-                        route_settlement = settlement_outcome
-                    else:
-                        # Auto-commit authority was durably revoked before the
-                        # settlement transaction (elspeth-01d4c6e683): the
-                        # proposal stays pending, so this turn becomes an
-                        # ordinary review-path response.
-                        result = _replace_dataclass(
-                            result,
-                            message=PIPELINE_STAGED_REVIEW_MESSAGE,
-                            pipeline_commit_intent=None,
-                        )
-                # Computed HERE, below the auto-commit-revoked branch above: that
-                # branch rebinds ``result`` with the staged-review message, so a
-                # pair hoisted to the top of the handler would be stale. Every
-                # writer below shares this one — the turn-end row must not re-carry
-                # prose the compose loop already committed mid-turn
-                # (elspeth-d581b3da7f).
-                _turn_end = composer_turn_end_assistant_row(result)
-                if route_settlement is not None:
-                    state_response = _state_response(
-                        route_settlement.settlement.state,
-                        live_validation=route_settlement.validation,
-                    )
-                    post_compose_state_id = route_settlement.settlement.state.id
-                    assistant_msg = route_settlement.settlement.transition_message
-                elif result.state.version != state.version:
-                    await _publish_progress(
-                        progress_sink,
-                        event=ComposerProgressEvent(
-                            phase="validating",
-                            headline="The composer has updated the pipeline and is validating the result.",
-                            evidence=("The updated pipeline state is being checked before persistence.",),
-                            likely_next="ELSPETH will save the validated pipeline snapshot.",
-                        ),
-                    )
-                    try:
-                        state_data, validation = await _state_data_from_composer_state(
-                            result.state,
-                            settings=settings,
-                            secret_service=request.app.state.scoped_secret_resolver,
-                            user_id=str(user.user_id),
-                            session_id=session.id,
-                            plugin_snapshot=plugin_snapshot,
-                            profile_registry=profile_registry,
-                            catalog=request.app.state.catalog_service,
-                            runtime_preflight=result.runtime_preflight,
-                            preflight_exception_policy="raise",
-                            initial_version=state.version,
-                            telemetry_source="compose",
-                            composer_meta=_post_compose_meta,
-                        )
-                    except ComposerRuntimePreflightError as rpf_exc:
-                        rpf_exc = ComposerRuntimePreflightError(
-                            original_exc=rpf_exc.original_exc,
-                            partial_state=rpf_exc.partial_state,
-                            tool_invocations=result.tool_invocations,
-                            llm_calls=result.llm_calls,
-                        )
-                        # UX-distinct from path 1 above: the LLM call already
-                        # succeeded, so the failure messaging frames this as
-                        # a validation/persistence-stage failure rather than
-                        # a compose-stage failure.
-                        await _publish_progress(
-                            progress_sink,
-                            event=ComposerProgressEvent(
-                                phase="failed",
-                                headline="The composer could not safely validate the pipeline update.",
-                                evidence=("Runtime preflight failed during state persistence.",),
-                                likely_next="Review the visible error message, then retry after the issue is resolved.",
-                                reason="runtime_preflight_failed",
-                            ),
-                        )
-                        response_body = await _handle_runtime_preflight_failure(
-                            rpf_exc,
-                            service,
-                            session.id,
-                            str(user.user_id),
-                            "compose",
-                            compose_base_state_id,
-                            settings=settings,
-                            secret_service=request.app.state.scoped_secret_resolver,
-                            plugin_snapshot=plugin_snapshot,
-                            profile_registry=profile_registry,
-                            catalog=request.app.state.catalog_service,
-                            session_operation_context=compose_operation_lease.context,
-                        )
-                        raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
-                    await _publish_progress(
-                        progress_sink,
-                        event=ComposerProgressEvent(
-                            phase="saving",
-                            headline="ELSPETH is saving the pipeline update.",
-                            evidence=("A new composition state version is being stored for this session.",),
-                            likely_next="The assistant response will appear after the save completes.",
-                        ),
-                    )
-                    if _guided_terminal_for_compose is not None:
-                        transition_settlement = await service.commit_transition_response(
-                            session_id=session.id,
-                            expected_current_state_id=compose_base_state_id,
-                            state=state_data,
-                            assistant_content=_turn_end.content,
-                            raw_content=_turn_end.raw_content,
-                            session_operation_context=compose_operation_lease.context,
-                        )
-                        new_state_record = transition_settlement.state
-                        assistant_msg = transition_settlement.message
-                    else:
-                        new_state_record = await service.save_composition_state(
-                            session.id,
-                            state_data,
-                            # Successful send-message state advance after the LLM
-                            # composer returns a newer state version.
-                            provenance="post_compose",
-                            session_operation_context=compose_operation_lease.context,
-                        )
-                    state_response = _state_response(new_state_record, live_validation=validation)
-                    post_compose_state_id = new_state_record.id
-                elif _guided_terminal_for_compose is not None and _post_compose_guided is not None:
-                    # Version unchanged but transition_consumed must be flipped.
-                    # Persist the updated guided_session in a new state row so
-                    # subsequent turns pick up transition_consumed=True.
-                    _transition_state = result.state
-                    _transition_state_d = _transition_state.to_dict()
-                    _transition_state_data = CompositionStateData(
-                        sources=_transition_state_d["sources"],
-                        nodes=_transition_state_d["nodes"],
-                        edges=_transition_state_d["edges"],
-                        outputs=_transition_state_d["outputs"],
-                        metadata_=_transition_state_d["metadata"],
-                        is_valid=False,
-                        validation_errors=validation_errors_for_composer_surface(
-                            composer_meta=_post_compose_meta,
-                            is_valid=False,
-                            validation_errors=None,
-                        ),
-                        composer_meta=_post_compose_meta,
-                    )
-                    transition_settlement = await service.commit_transition_response(
-                        session_id=session.id,
-                        expected_current_state_id=compose_base_state_id,
-                        state=_transition_state_data,
-                        assistant_content=_turn_end.content,
-                        raw_content=_turn_end.raw_content,
-                        session_operation_context=compose_operation_lease.context,
-                    )
-                    _transition_record = transition_settlement.state
-                    assistant_msg = transition_settlement.message
-                    post_compose_state_id = _transition_record.id
-                    state_response = _state_response(_transition_record)
-
-                # 6. Persist assistant message with post-compose provenance
-                if assistant_msg is None:
-                    assistant_msg = await service.add_message(
-                        session.id,
-                        "assistant",
-                        _turn_end.content,
-                        composition_state_id=post_compose_state_id,
-                        raw_content=_turn_end.raw_content,
-                        writer_principal="compose_loop",
-                        session_operation_context=compose_operation_lease.context,
-                    )
-                # 6b. Persist per-tool-call audit trail. Each ComposerToolInvocation
-                # lands as one role=tool chat message linked to the post-compose
-                # state id (when version advanced) so the audit trail records
-                # which tool calls produced this state. Tool rows and LLM
-                # sidecars are ONE turn cohort and settle in a single
-                # transaction (elspeth-90231248dc) even though they bind to
-                # different state ids.
-                await _persist_turn_audit_cohort(
-                    service,
-                    session.id,
-                    result.tool_invocations if not result.persisted_tool_call_turn else (),
-                    result.llm_calls,
-                    tool_composition_state_id=post_compose_state_id,
-                    llm_composition_state_id=compose_base_state_id,
-                    parent_assistant_id=assistant_msg.id,
-                    plugin_crash_pending=False,
-                    session_operation_context=compose_operation_lease.context,
-                )
-                await _publish_progress(
-                    progress_sink,
-                    event=ComposerProgressEvent(
-                        phase="complete",
-                        headline="The composer has updated the pipeline."
-                        if result.state.version != state.version
-                        else "The composer response is ready.",
-                        evidence=("The assistant response has been saved for this session.",),
-                        likely_next="Review the response and current pipeline.",
-                        reason="composer_complete",
-                    ),
-                )
-
-                # 7. Return response.
-                #
-                # Build the response object FIRST so a Pydantic packaging
-                # failure (very unlikely — the inputs are already shaped
-                # UUID/string fields, but contractually possible) does not
-                # poison the terminal counter with a misleading
-                # ``status=completed`` for a request that ultimately 500'd.
-                # The flag flips only once the response is fully
-                # constructed and ready to hand back to FastAPI.
-                proposals = await _pending_proposal_responses(service, session.id)
-                response = MessageWithStateResponse(
-                    message=_message_response(assistant_msg),
-                    state=state_response,
-                    proposals=proposals,
-                )
-                terminal_status = "completed"
-                return response
-            except GuidedCustodyIntegrityError as exc:
-                # The pre-persist custody gate refused the post-compose tip
-                # (elspeth-4c442aaaa8): the user row is committed and the tip
-                # did not advance, so this is a failed turn — describe it from
-                # the compose result rather than let the app-level handler emit
-                # the no-metadata 500. Custody-only by design: every gate raise
-                # is Guided*, and any other AuditIntegrityError keeps the
-                # app-level handler surface with its own diagnostics.
-                if exc.failed_turn is None and _compose_result is not None:
-                    exc.failed_turn = FailedTurnMetadata(
-                        assistant_message_id=_compose_result.persisted_assistant_message_id,
-                        tool_calls_attempted=len(_compose_result.tool_invocations),
-                        tool_responses_persisted=None if _compose_result.persisted_tool_call_turn else 0,
-                    )
-                if exc.failed_turn is None or _compose_result is None:
-                    raise
-                slog.error(
-                    "http_audit_integrity_error",
-                    session_id=str(session_id),
-                    user_id=user.user_id,
-                    exc_class=type(exc).__name__,
-                    message=str(exc),
-                    site="send_message",
-                )
-                raise HTTPException(
-                    status_code=500,
-                    detail={
-                        "error_type": "audit_integrity_error",
-                        "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
-                        "failed_turn": await _failed_turn_response_body(service, session.id, exc.failed_turn),
-                    },
-                ) from exc
+                if post_provider_error is not None:
+                    raise post_provider_error
+                if continuation_receipt is None:
+                    raise InvariantError("Provider returned without a freeform continuation receipt")
+                if deferred_cancellation is not None:
+                    raise deferred_cancellation
+                return continuation_receipt.response
             except InvariantError as exc:
-                # Same B1-sanitization rationale as the /guided/respond
-                # transition and settlement handlers: server-invariant
-                # violations route through a static 500 detail and a
-                # structured slog event so on-call dashboards can filter on
-                # ``guided.invariant_violated``.  Without this handler an
-                # InvariantError raised from the post-compose transition_consumed
-                # impossible-state guard would land at FastAPI's default 500
-                # ({"detail": "Internal Server Error"}) with no structured log.
+                # Invariant failures return a static detail; diagnostic frames
+                # remain in the structured log rather than the HTTP response.
                 slog.error(
-                    "guided.invariant_violated",
+                    "composer.invariant_violated",
                     session_id=str(session_id),
                     user_id=user.user_id,
                     exc_class=type(exc).__name__,
@@ -1034,6 +950,14 @@ def register_message_routes(router: APIRouter) -> None:
                     },
                 ) from exc
             except asyncio.CancelledError as exc:
+                if request.state.composer_durable_completed:
+                    terminal_status = "completed"
+                    if _is_client_disconnect_cancel(exc):
+                        raise HTTPException(
+                            status_code=499,
+                            detail="Client disconnected after the compose turn completed.",
+                        ) from exc
+                    raise
                 # Client-disconnect or operator cancel during the
                 # composer-engaged window. The route task is already
                 # cancelling, so a plain await of either write below would
@@ -1057,18 +981,31 @@ def register_message_routes(router: APIRouter) -> None:
                                 session_operation_context=compose_operation_lease.context,
                             ),
                             name="send-message-cancelled-llm-call-persist",
-                        )
+                        ),
+                        primary_cancellation=exc,
                     )
+                # A cancel delivered by the compose heartbeat after it lost
+                # the request's lease is a server fault, not a user Stop
+                # (finding #28): publish ``failed`` and record ``failed``.
+                # The bare ``raise`` below hands it to
+                # ``_track_compose_inflight``, the single place that
+                # uncancels the task and answers with the structured 503.
+                heartbeat_cancel = _composer_heartbeat_cancel_of(exc)
                 await _join_shielded_task_after_cancellation(
                     asyncio.create_task(
                         _publish_progress(
                             progress_sink,
-                            event=client_cancelled_progress_event(),
+                            event=(
+                                client_cancelled_progress_event()
+                                if heartbeat_cancel is None
+                                else _composer_heartbeat_failed_progress_event()
+                            ),
                         ),
                         name="send-message-cancelled-progress-publish",
-                    )
+                    ),
+                    primary_cancellation=exc,
                 )
-                terminal_status = "cancelled"
+                terminal_status = "cancelled" if heartbeat_cancel is None else "failed"
                 if _is_client_disconnect_cancel(exc):
                     # Disconnect-initiated cancellation (our
                     # _cancel_on_client_disconnect watcher): the client is
@@ -1118,7 +1055,7 @@ def register_message_routes(router: APIRouter) -> None:
     async def get_messages(
         session_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
         include_llm_audit: bool = Query(
@@ -1127,6 +1064,13 @@ def register_message_routes(router: APIRouter) -> None:
         ),
         include_raw_content: bool = Query(False),
         include_tool_rows: bool = Query(False),
+        include_rejection_reasons: bool = Query(
+            False,
+            description=(
+                "Audit-grade: attach, to tool rows, the unredacted reason a refused composer tool call "
+                "returned to the planner (composition_rejection_events). Requires include_tool_rows=true."
+            ),
+        ),
     ) -> list[ChatMessageResponse]:
         """Get conversation history for a session.
 
@@ -1139,10 +1083,19 @@ def register_message_routes(router: APIRouter) -> None:
         """
         session = await _verify_session_ownership(session_id, user, request)
         service = request.app.state.session_service
+        if include_rejection_reasons and not include_tool_rows:
+            # Rejections attach to tool rows; without them the opt-in would
+            # return nothing and look like "no rejections". Refuse before the
+            # access-log write so no audit-grade read is recorded or served.
+            raise HTTPException(
+                status_code=422,
+                detail="include_rejection_reasons requires include_tool_rows=true",
+            )
         if _requests_audit_grade_messages_view(
             include_tool_rows=include_tool_rows,
             include_llm_audit=include_llm_audit,
             include_raw_content=include_raw_content,
+            include_rejection_reasons=include_rejection_reasons,
         ):
             audit_query_args = {key: value for key, value in request.query_params.items() if key in AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST}
             # The authority re-proves (session, principal, provider) against the
@@ -1188,4 +1141,15 @@ def register_message_routes(router: APIRouter) -> None:
             if has_tool_rows
             else None
         )
-        return [_message_response(m, include_raw_content=include_raw_content, tool_outcomes=tool_outcomes) for m in paged_messages]
+        rejections = (
+            _rejections_by_tool_call_id(await service.list_composition_rejection_events(session.id)) if include_rejection_reasons else None
+        )
+        return [
+            _message_response(
+                m,
+                include_raw_content=include_raw_content,
+                tool_outcomes=tool_outcomes,
+                rejections=rejections,
+            )
+            for m in paged_messages
+        ]

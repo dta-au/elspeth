@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -26,12 +26,15 @@ from elspeth.web.composer.tools import ToolResult, get_tool_definitions
 from elspeth.web.composer.tools import execute_tool as _execute_tool
 from elspeth.web.composer.tools._common import _SERVER_OWNED_SOURCE_OPTION_KEYS
 from elspeth.web.composer.yaml_generator import generate_pipeline_dict
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.session_fences import fenced_operation_context
 
 
 def _empty_state() -> CompositionState:
@@ -58,6 +61,7 @@ def _inline_ref_state() -> CompositionState:
                     "provider": "openrouter",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "model": "openai/gpt-4o",
+                    "system_prompt": "You classify each input row. Reply with one category label.",
                     "prompt_template": "Placeholder",
                     "required_input_fields": [],
                     "schema": {"mode": "observed"},
@@ -189,10 +193,12 @@ def execute_tool(
 
 
 @pytest.fixture()
-def blob_env(tmp_path: Path) -> dict[str, Any]:
+def blob_env(tmp_path: Path) -> Iterator[dict[str, Any]]:
     engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
-    session_id = "session-inline-blob"
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
+    session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
@@ -224,7 +230,14 @@ def blob_env(tmp_path: Path) -> dict[str, Any]:
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     (data_dir / "blobs").mkdir()
-    return {"engine": engine, "session_id": session_id, "data_dir": str(data_dir)}
+    with fenced_operation_context(engine, session_id) as context:
+        yield {
+            "engine": engine,
+            "session_id": session_id,
+            "data_dir": str(data_dir),
+            "operation": context,
+            "authority": SQLiteLocalSessionOperationAuthority(engine),
+        }
 
 
 def _create_blob(
@@ -254,6 +267,8 @@ def _create_blob(
         data_dir=blob_env["data_dir"],
         session_engine=blob_env["engine"],
         session_id=blob_env["session_id"],
+        session_operation_context=blob_env["operation"],
+        session_operation_authority=blob_env["authority"],
         user_message_id="user-message-1",
         user_message_content="Generate a source for me." if llm_authored else f"Use this exact content:\n{content}",
         **provenance_kwargs,
@@ -275,8 +290,11 @@ class TestListComposerBlobs:
             {},
             _empty_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is True
@@ -299,8 +317,11 @@ class TestListComposerBlobs:
             {},
             _empty_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is True
@@ -356,15 +377,18 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == state.version
         assert result.updated_state.nodes[0].options == {}
-        assert result.data["error"] == (
+        assert result.validation.errors[0].message == (
             "Inline blob references can only be wired into source, transform, aggregation, collector, or output plugin options."
         )
 
@@ -419,14 +443,17 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data["error_code"] == "interpretation_requirements_invalid"
-        assert "sk-sensitive-wire-review" not in result.data["error"]
+        assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+        assert "sk-sensitive-wire-review" not in result.validation.errors[0].message
 
     @pytest.mark.parametrize("field_path", ["source.options.endpoint_url", "output:main.options.endpoint_url"])
     def test_aws_s3_endpoint_url_field_is_rejected_without_mutating_state(
@@ -448,13 +475,15 @@ class TestWireBlobInlineRef:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == 5
-        assert result.data["error"] == AWS_S3_ENDPOINT_URL_POLICY_ERROR
-        assert blob.data["blob_id"] not in result.data["error"]
+        assert result.validation.errors[0].message == AWS_S3_ENDPOINT_URL_POLICY_ERROR
+        assert blob.to_dict()["data"]["blob_id"] not in result.validation.errors[0].message
 
     def test_authors_marker_with_authoritative_pinned_hash(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="Pinned prompt")
@@ -468,8 +497,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is True
@@ -493,8 +525,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         output_result = execute_tool(
             "wire_blob_inline_ref",
@@ -504,8 +539,11 @@ class TestWireBlobInlineRef:
             },
             source_result.updated_state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert source_result.success is True
@@ -526,8 +564,11 @@ class TestWireBlobInlineRef:
             },
             _named_sources_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is True
@@ -552,31 +593,36 @@ class TestWireBlobInlineRef:
             },
             _inline_ref_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
-        assert "not ready" in result.data["error"] or "status" in result.data["error"]
+        assert "not ready" in result.validation.errors[0].message or "status" in result.validation.errors[0].message
 
     def test_rejects_llm_typed_disagreeing_hash(self, blob_env: dict[str, Any]) -> None:
+        from elspeth.web.composer.protocol import ToolArgumentError
+
         blob = _create_blob(blob_env, content="hash source")
-
-        result = execute_tool(
-            "wire_blob_inline_ref",
-            {
-                "field_path": "node:classify.options.prompt_template",
-                "blob_id": blob.data["blob_id"],
-                "sha256_override": "b" * 64,
-            },
-            _inline_ref_state(),
-            _catalog(),
-            session_engine=blob_env["engine"],
-            session_id=blob_env["session_id"],
-        )
-
-        assert result.success is False
-        assert "sha256" in result.data["error"]
+        with pytest.raises(ToolArgumentError):
+            execute_tool(
+                "wire_blob_inline_ref",
+                {
+                    "field_path": "node:classify.options.prompt_template",
+                    "blob_id": blob.data["blob_id"],
+                    "sha256_override": "b" * 64,
+                },
+                _inline_ref_state(),
+                _catalog(),
+                data_dir=blob_env["data_dir"],
+                session_engine=blob_env["engine"],
+                session_id=blob_env["session_id"],
+                session_operation_context=blob_env["operation"],
+                session_operation_authority=blob_env["authority"],
+            )
 
     def test_rejects_llm_runtime_hash_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged prompt hash")
@@ -585,23 +631,26 @@ class TestWireBlobInlineRef:
         result = execute_tool(
             "wire_blob_inline_ref",
             {
-                "field_path": "node:classify.options.resolved_prompt_template_hash",
+                "field_path": "node:classify.options.approved_prompt_artifact_hash",
                 "blob_id": blob.data["blob_id"],
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
         assert result.updated_state is state
-        assert "resolved_prompt_template_hash" in result.data["error"]
-        assert "runtime-owned" in result.data["error"]
-        assert "field_path" in result.data["error"]
-        assert "patch_node_options" in result.data["error"]
-        assert "upsert_node" in result.data["error"]
-        assert "retry wire_blob_inline_ref" not in result.data["error"]
+        assert "approved_prompt_artifact_hash" in result.validation.errors[0].message
+        assert "runtime-owned" in result.validation.errors[0].message
+        assert "field_path" in result.validation.errors[0].message
+        assert "patch_node_options" in result.validation.errors[0].message
+        assert "upsert_node" in result.validation.errors[0].message
+        assert "retry wire_blob_inline_ref" not in result.validation.errors[0].message
 
     def test_rejects_llm_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -615,15 +664,18 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
         assert result.updated_state is state
-        assert "interpretation_requirements" in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
-        assert "resolve_interpretation_event" not in result.data["error"]
+        assert "interpretation_requirements" in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
+        assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
     def test_rejects_non_llm_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -643,15 +695,18 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
         assert result.updated_state is state
-        assert "interpretation_requirements" in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
-        assert "resolve_interpretation_event" not in result.data["error"]
+        assert "interpretation_requirements" in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
+        assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
     def test_rejects_source_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -665,15 +720,18 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
         assert result.updated_state is state
-        assert "interpretation_requirements" in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
-        assert "resolve_interpretation_event" not in result.data["error"]
+        assert "interpretation_requirements" in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
+        assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
     @pytest.mark.parametrize("field_name", sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
     def test_rejects_source_server_owned_root_field_path(
@@ -692,14 +750,17 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
         assert result.updated_state is state
-        assert field_name in result.data["error"]
-        assert "set_source_from_blob" in result.data["error"]
+        assert field_name in result.validation.errors[0].message
+        assert "set_source_from_blob" in result.validation.errors[0].message
 
     def test_rejects_output_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -713,15 +774,18 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
         assert result.updated_state is state
-        assert "interpretation_requirements" in result.data["error"]
-        assert "request_interpretation_review" in result.data["error"]
-        assert "resolve_interpretation_event" not in result.data["error"]
+        assert "interpretation_requirements" in result.validation.errors[0].message
+        assert "request_interpretation_review" in result.validation.errors[0].message
+        assert "resolve_interpretation_event" not in result.validation.errors[0].message
 
     def test_unrelated_wire_rejects_preexisting_output_interpretation_requirements(
         self,
@@ -755,14 +819,17 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
         assert result.updated_state is state
-        assert result.data["error_code"] == "interpretation_requirements_invalid"
-        assert "sk-sensitive-output-review" not in result.data["error"]
+        assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+        assert "sk-sensitive-output-review" not in result.validation.errors[0].message
 
     def test_rejects_invalid_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="prompt")
@@ -775,31 +842,37 @@ class TestWireBlobInlineRef:
             },
             _inline_ref_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
-        assert "field_path" in result.data["error"]
+        assert "field_path" in result.validation.errors[0].message
 
     def test_rejects_unknown_encoding(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="prompt")
 
-        result = execute_tool(
-            "wire_blob_inline_ref",
-            {
-                "field_path": "node:classify.options.prompt_template",
-                "blob_id": blob.data["blob_id"],
-                "encoding": "ascii",
-            },
-            _inline_ref_state(),
-            _catalog(),
-            session_engine=blob_env["engine"],
-            session_id=blob_env["session_id"],
-        )
+        from elspeth.web.composer.protocol import ToolArgumentError
 
-        assert result.success is False
-        assert "encoding" in result.data["error"]
+        with pytest.raises(ToolArgumentError):
+            execute_tool(
+                "wire_blob_inline_ref",
+                {
+                    "field_path": "node:classify.options.prompt_template",
+                    "blob_id": blob.data["blob_id"],
+                    "encoding": "ascii",
+                },
+                _inline_ref_state(),
+                _catalog(),
+                data_dir=blob_env["data_dir"],
+                session_engine=blob_env["engine"],
+                session_id=blob_env["session_id"],
+                session_operation_context=blob_env["operation"],
+                session_operation_authority=blob_env["authority"],
+            )
 
 
 class TestSetSourceFromBlobMode:
@@ -859,6 +932,8 @@ class TestSetSourceFromBlobMode:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success, result.to_dict()
@@ -889,7 +964,7 @@ class TestSetSourceFromBlobMode:
                         {
                             "kind": "vague_term",
                             "user_term": "inline_source_data",
-                            "draft": "sk-sensitive-source-review",
+                            "draft": "sensitive-source-review",
                         }
                     ],
                 },
@@ -899,12 +974,14 @@ class TestSetSourceFromBlobMode:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
         assert result.updated_state is state
-        assert "interpretation_requirements_invalid" in result.data["error"]
-        assert "sk-sensitive-source-review" not in result.data["error"]
+        assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+        assert "sensitive-source-review" not in result.validation.errors[0].message
 
     def test_set_source_from_blob_emits_explicit_bind_source_mode(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, filename="input.csv", mime_type="text/csv", content="name\nAda")
@@ -917,6 +994,8 @@ class TestSetSourceFromBlobMode:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is True
@@ -938,6 +1017,8 @@ class TestSetSourceFromBlobMode:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         pipeline = generate_pipeline_dict(result.updated_state)
@@ -1028,8 +1109,7 @@ def test_state_options_reference_blob_recognises_blob_id_vocabulary(options: Map
 
     Regression for elspeth-4f3cd4155b: the retention guard recognised only
     ``blob_ref``/``path``/``file``. A blob bound through the ``blob_id`` /
-    ``*_blob_id`` custody vocabulary, which
-    ``guided/stage_transitions._option_blob_ids`` honours, read as unbound
+    ``*_blob_id`` custody vocabulary read as unbound
     here and became updatable/deletable under an accepted composition.
     Negative rows pin that the vocabulary is exact: a near-miss key is not
     a binding, and neither is the id as a bare list element.

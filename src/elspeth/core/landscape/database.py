@@ -27,6 +27,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS, _scrub_odbc_connect_value
 from elspeth.core.landscape.journal import LandscapeJournal
+from elspeth.core.landscape.lease_deadlines import install_deadline_guard
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, metadata, schema_identity_table
 from elspeth.core.schema_identity import (
     SCHEMA_IDENTITY_TABLE_NAME,
@@ -67,6 +68,14 @@ Tier1Engine = NewType("Tier1Engine", Engine)
 # dashboard connections never carry it, so they never contend for the write
 # lock at BEGIN.
 WRITE_INTENT_OPTION = "elspeth_write_intent"
+
+# Every Landscape engine withholds bound parameters from SQLAlchemy's error
+# text. Landscape statements bind row payloads, row-derived fields and token
+# ids; with parameters rendered, a database error's str() carried every bound
+# value of the failing statement (measured: a 4096-row batch release put
+# 450,969 characters, row JSON included, into operations.error_message), and
+# that text reaches exception chains, logs and any wrap that interpolates it.
+LANDSCAPE_HIDE_BOUND_PARAMETERS = True
 
 _JOURNAL_WORKER_SUFFIX_RE = re.compile(r"[0-9a-f]+")
 
@@ -118,6 +127,7 @@ def verify_sqlite_tier1_pragmas(engine: Engine, *, owner: str) -> None:
     if engine.dialect.name != "sqlite":
         return
 
+    install_deadline_guard(engine)
     with _maybe_serialize_shared_connection(engine), engine.connect() as conn:
         fk_result = conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one_or_none()
         jm_result = conn.exec_driver_sql("PRAGMA journal_mode").scalar_one_or_none()
@@ -236,6 +246,13 @@ def _shared_connection_lock(engine: Engine) -> "threading.RLock | None":
 def _maybe_serialize_shared_connection(engine: Engine) -> Iterator[None]:
     """Hold the StaticPool serialization lock for the duration of a transaction,
     or do nothing on per-thread-connection (production) engines.
+
+    Every Landscape connection acquisition takes it, reads included: a plain
+    ``engine.connect()`` read autobegins a transaction on the shared connection,
+    and a locked writer on another thread that BEGINs inside it fails with
+    "cannot start a transaction within a transaction". Repositories that hold a
+    bare engine wrap their plain reads as
+    ``with _maybe_serialize_shared_connection(engine), engine.connect() as conn:``.
     """
     lock = _shared_connection_lock(engine)
     if lock is None:
@@ -300,6 +317,9 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("run_web_plugin_policy", "plugin_code_identities_json"),
     ("run_web_plugin_policy", "binding_generation_fingerprint"),
     ("run_web_plugin_policy", "decision_codes_json"),
+    # Epoch 40: exact admission decision, distinct from preparation evidence.
+    ("run_web_plugin_policy", "admission_decision_json"),
+    ("run_web_plugin_policy", "admission_decision_hash"),
     # Epoch 35 flip: lineage lives on token_lineage_frames + group_records now.
     ("token_lineage_frames", "member_key"),
     ("group_records", "member_count"),
@@ -360,7 +380,11 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("token_outcomes", "path"),
     # Phase 5b interpretation-review audit anchor — runtime LLM calls must
     # carry the resolved prompt hash used to join back to session DB events.
-    ("calls", "resolved_prompt_template_hash"),
+    ("calls", "approved_prompt_artifact_hash"),
+    ("calls", "prompt_tokens"),
+    ("calls", "completion_tokens"),
+    ("calls", "cached_prompt_tokens"),
+    ("calls", "reasoning_tokens"),
     # Phase 4 tutorial audit-story projection fields.
     ("runs", "llm_call_count"),
     ("runs", "seeded_from_cache"),
@@ -506,6 +530,8 @@ _EPOCH_26_REQUIRED_TABLES = (
     "sink_effect_export_snapshots",
 )
 _REQUIRED_COLUMNS += (
+    ("runs", "run_mode"),
+    ("runs", "replay_from_run_id"),
     *((table_name, column.name) for table_name in _EPOCH_26_REQUIRED_TABLES for column in metadata.tables[table_name].columns),
     ("operations", "sink_effect_id"),
     ("artifacts", "sink_effect_id"),
@@ -528,6 +554,19 @@ _REQUIRED_COLUMNS += tuple(
 # verified, so an epoch-36 store fails HERE, naming the column, instead of
 # raising an opaque SQL error the first time an admin opens the audit view.
 _REQUIRED_COLUMNS += (("auth_events", "identity_id"),)
+_REQUIRED_COLUMNS += (
+    ("calls", "source_call_id"),
+    ("call_verifications", "current_call_id"),
+    ("call_verifications", "current_run_id"),
+    ("call_verifications", "source_run_id"),
+    ("call_verifications", "source_call_id"),
+    ("call_verifications", "is_match"),
+    ("call_verifications", "differences_json"),
+    ("call_verifications", "recorded_at"),
+    ("operations", "occurrence_index"),
+    *(("collector_group_failures", column.name) for column in metadata.tables["collector_group_failures"].columns),
+    ("rows", "source_contract_json"),
+)
 
 # Required foreign keys for audit integrity (Tier 1 trust).
 # Format: (table_name, column_name, referenced_table)
@@ -562,6 +601,8 @@ _REQUIRED_COMPOSITE_FOREIGN_KEYS: tuple[tuple[str, tuple[str, ...], str, tuple[s
     ("token_outcomes", ("batch_id", "run_id"), "batches", ("batch_id", "run_id")),
     ("node_states", ("token_id", "run_id"), "tokens", ("token_id", "run_id")),
     ("node_states", ("node_id", "run_id"), "nodes", ("node_id", "run_id")),
+    ("collector_group_failures", ("run_id", "group_id"), "group_records", ("run_id", "group_id")),
+    ("collector_group_failures", ("collector_node_id", "run_id"), "nodes", ("node_id", "run_id")),
     ("validation_errors", ("node_id", "run_id"), "nodes", ("node_id", "run_id")),
     ("transform_errors", ("token_id", "run_id"), "tokens", ("token_id", "run_id")),
     ("transform_errors", ("transform_id", "run_id"), "nodes", ("node_id", "run_id")),
@@ -671,6 +712,7 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("auth_events", "ck_auth_events_provider"),
     ("run_attributions", "ck_run_attributions_auth_provider_type"),
     ("run_web_plugin_policy", "ck_run_web_plugin_policy_schema_version"),
+    ("run_web_plugin_policy", "ck_run_web_plugin_policy_admission_pair"),
     ("run_sources", "ck_run_sources_lifecycle_state"),
     ("token_work_items", "ck_token_work_items_status"),
     ("token_work_items", "ck_token_work_items_lease_owner_required_when_leased"),
@@ -680,6 +722,14 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("scheduler_events", "ck_scheduler_events_from_attempt_non_negative"),
     ("scheduler_events", "ck_scheduler_events_to_attempt_non_negative"),
     ("calls", "calls_has_parent"),
+    ("runs", "ck_runs_mode"),
+    ("runs", "ck_runs_mode_source"),
+    ("call_verifications", "ck_call_verifications_distinct_runs"),
+    ("call_verifications", "ck_call_verifications_match_has_source"),
+    ("calls", "calls_prompt_tokens_nonnegative"),
+    ("calls", "calls_completion_tokens_nonnegative"),
+    ("calls", "calls_cached_prompt_tokens_nonnegative"),
+    ("calls", "calls_reasoning_tokens_nonnegative"),
     ("preflight_results", "ck_preflight_result_type"),
     ("runs", "ck_runs_openrouter_catalog_source"),
     # Epoch 21: multi-worker coordination substrate (ADR-030).
@@ -742,6 +792,8 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("aggregation_result_members", "ck_aggregation_result_members_ordinal"),
     ("aggregation_result_members", "ck_aggregation_result_members_action"),
     ("aggregation_result_members", "ck_aggregation_result_members_error_hash_hex"),
+    # Epoch 45: the collector group-failure reason is a closed vocabulary.
+    ("collector_group_failures", "ck_collector_group_failures_failure_reason"),
 )
 
 # Required indexes (including partial unique indexes) for audit integrity.
@@ -753,7 +805,9 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("run_attributions", "ix_run_attributions_user"),
     ("calls", "ix_calls_state_call_index_unique"),
     ("calls", "ix_calls_operation_call_index_unique"),
-    ("calls", "ix_calls_resolved_prompt_template_hash"),
+    ("calls", "ix_calls_approved_prompt_artifact_hash"),
+    ("call_verifications", "ix_call_verifications_run"),
+    ("node_states", "ix_node_states_run"),
     ("checkpoints", "ix_checkpoints_run_sequence_unique"),
     ("preflight_results", "ix_preflight_results_run"),
     ("token_outcomes", "ix_token_outcomes_terminal_unique"),
@@ -776,6 +830,7 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("tokens", "uq_tokens_coalesce_result_identity"),
     ("node_states", "uq_node_states_coalesce_member_identity"),
     ("operations", "uq_operations_sink_effect_id"),
+    ("operations", "uq_operations_occurrence"),
     ("sink_effect_streams", "uq_sink_effect_stream_identity"),
     ("sink_effect_members", "uq_sink_effect_member_binding"),
     ("audit_export_snapshots", "uq_audit_export_snapshots_registry_key"),
@@ -785,14 +840,18 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("aggregation_result_outputs", "ix_aggregation_result_outputs_ref"),
 )
 
-_REQUIRED_TRIGGERS: tuple[str, ...] = (
-    "trg_audit_export_chunk_insert_validate",
-    "trg_audit_export_snapshot_insert_seal",
-    "trg_audit_export_snapshot_immutable",
-    "trg_audit_export_snapshot_immutable_delete",
-    "trg_audit_export_chunk_immutable",
-    "trg_audit_export_chunk_immutable_delete",
+# PostgreSQL tgtype bits: ROW=1, BEFORE=2, INSERT=4, DELETE=8, UPDATE=16.
+_REQUIRED_POSTGRES_TRIGGERS: Mapping[str, tuple[str, str, int]] = MappingProxyType(
+    {
+        "trg_audit_export_chunk_insert_validate": ("audit_export_snapshot_chunks", "fn_audit_export_chunk_insert_validate", 7),
+        "trg_audit_export_snapshot_insert_seal": ("audit_export_snapshots", "fn_audit_export_snapshot_insert_seal", 7),
+        "trg_audit_export_snapshot_immutable": ("audit_export_snapshots", "fn_audit_export_snapshot_immutable", 19),
+        "trg_audit_export_snapshot_immutable_delete": ("audit_export_snapshots", "fn_audit_export_snapshot_immutable", 11),
+        "trg_audit_export_chunk_immutable": ("audit_export_snapshot_chunks", "fn_audit_export_chunk_immutable", 19),
+        "trg_audit_export_chunk_immutable_delete": ("audit_export_snapshot_chunks", "fn_audit_export_chunk_immutable", 11),
+    }
 )
+_REQUIRED_TRIGGERS: tuple[str, ...] = tuple(_REQUIRED_POSTGRES_TRIGGERS)
 
 _ADDITIVE_INDEX_OWNERS: Mapping[str, str] = MappingProxyType({"ix_tokens_run_id": "tokens"})
 _ADDITIVE_INDEX_NAMES: frozenset[str] = frozenset(_ADDITIVE_INDEX_OWNERS)
@@ -1021,6 +1080,7 @@ class LandscapeDB:
             self._engine = create_engine(
                 self.connection_string,
                 echo=False,  # Set True for SQL debugging
+                hide_parameters=LANDSCAPE_HIDE_BOUND_PARAMETERS,
                 **engine_kwargs,
             )
             # SQLite-specific configuration
@@ -1028,6 +1088,7 @@ class LandscapeDB:
                 LandscapeDB._configure_sqlite(self._engine)
         if self._journal is not None:
             self._journal.attach(self._engine)
+        install_deadline_guard(self._engine)
         # Tier-1: probe the SQLite PRAGMAs we just configured — if any
         # didn't take effect, the audit DB does not meet the durability /
         # concurrency contract and we MUST refuse to open it.  Skipped for
@@ -1312,7 +1373,7 @@ class LandscapeDB:
             conn.execute(f'PRAGMA key = "{escaped}"')
             return conn
 
-        return create_engine("sqlite:///", creator=_creator, echo=False)
+        return create_engine("sqlite:///", creator=_creator, echo=False, hide_parameters=LANDSCAPE_HIDE_BOUND_PARAMETERS)
 
     def _create_tables(self) -> None:
         """Create all tables if they don't exist."""
@@ -1627,11 +1688,27 @@ class LandscapeDB:
                 if self.engine.dialect.name == "sqlite":
                     trigger_names = set(connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type = 'trigger'").scalars())
                 else:
-                    trigger_names = set(
-                        connection.exec_driver_sql(
-                            "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = current_schema()"
-                        ).scalars()
+                    # information_schema.triggers hides real triggers from
+                    # SELECT-only nonowners. Catalog inspection needs no write
+                    # privilege and binds each trigger to its actual relation,
+                    # function, event, and origin-enabled execution mode.
+                    trigger_rows = connection.exec_driver_sql(
+                        "SELECT trigger.tgname, relation.relname, function.proname, trigger.tgtype "
+                        "FROM pg_catalog.pg_trigger AS trigger "
+                        "JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid "
+                        "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
+                        "JOIN pg_catalog.pg_proc AS function ON function.oid = trigger.tgfoid "
+                        "WHERE namespace.nspname = pg_catalog.current_schema() "
+                        "AND function.pronamespace = namespace.oid "
+                        "AND NOT trigger.tgisinternal AND trigger.tgenabled IN ('O', 'A') "
+                        "AND trigger.tgqual IS NULL AND trigger.tgnargs = 0"
                     )
+                    trigger_names = {
+                        row.tgname
+                        for row in trigger_rows
+                        if row.tgname in _REQUIRED_POSTGRES_TRIGGERS
+                        and (row.relname, row.proname, row.tgtype) == _REQUIRED_POSTGRES_TRIGGERS[row.tgname]
+                    }
             missing_triggers = sorted(set(_REQUIRED_TRIGGERS) - trigger_names)
 
         epoch_incompatible = bool(present_landscape_tables) and epoch_incompatible
@@ -1801,6 +1878,7 @@ class LandscapeDB:
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
             echo=False,
+            hide_parameters=LANDSCAPE_HIDE_BOUND_PARAMETERS,
         )
         cls._configure_sqlite(engine)
         cls._verify_sqlite_pragmas(engine, "sqlite:///:memory:")
@@ -1893,56 +1971,65 @@ class LandscapeDB:
             if engine_kwargs:
                 raise ValueError("SQLCipher construction does not accept SQLAlchemy engine kwargs")
             engine = cls._create_sqlcipher_engine(url, passphrase, read_only=read_only)
-            cls._configure_sqlite(engine, read_only=read_only)
-            if not read_only:
-                # Tier-1 PRAGMA probe — see _verify_sqlite_pragmas docstring.
-                cls._verify_sqlite_pragmas(engine, url)
         else:
             engine_url = cls._sqlite_read_only_url(url) if read_only and url.startswith("sqlite") else url
-            engine = create_engine(engine_url, echo=False, **engine_kwargs)
+            engine = create_engine(engine_url, echo=False, hide_parameters=LANDSCAPE_HIDE_BOUND_PARAMETERS, **engine_kwargs)
+
+        try:
             # SQLite-specific configuration
-            if url.startswith("sqlite"):
+            if passphrase is not None or url.startswith("sqlite"):
                 cls._configure_sqlite(engine, read_only=read_only)
                 if not read_only:
+                    # Tier-1 PRAGMA probe — see _verify_sqlite_pragmas docstring.
                     cls._verify_sqlite_pragmas(engine, url)
 
-        journal: LandscapeJournal | None = None
-        if dump_to_jsonl:
-            journal_path = cls._resolve_journal_path(
+            journal: LandscapeJournal | None = None
+            if dump_to_jsonl:
+                journal_path = cls._resolve_journal_path(
+                    url,
+                    explicit_path=dump_to_jsonl_path,
+                    worker_suffix=dump_to_jsonl_worker_suffix,
+                )
+                journal = LandscapeJournal(
+                    journal_path,
+                    fail_on_error=dump_to_jsonl_fail_on_error,
+                    include_payloads=dump_to_jsonl_include_payloads,
+                    payload_base_path=dump_to_jsonl_payload_base_path,
+                )
+                journal.attach(engine)
+
+            install_deadline_guard(engine)
+
+            instance = cls._from_parts(
                 url,
-                explicit_path=dump_to_jsonl_path,
-                worker_suffix=dump_to_jsonl_worker_suffix,
+                engine,
+                passphrase=passphrase,
+                journal=journal,
+                require_existing_schema=not create_tables,
+                read_only=read_only,
             )
-            journal = LandscapeJournal(
-                journal_path,
-                fail_on_error=dump_to_jsonl_fail_on_error,
-                include_payloads=dump_to_jsonl_include_payloads,
-                payload_base_path=dump_to_jsonl_payload_base_path,
-            )
-            journal.attach(engine)
 
-        instance = cls._from_parts(
-            url,
-            engine,
-            passphrase=passphrase,
-            journal=journal,
-            require_existing_schema=not create_tables,
-            read_only=read_only,
-        )
+            # Validate BEFORE create_all - catches old schema with missing columns
+            # before we try to use it. For fresh DBs, validation passes (no tables yet).
+            instance._validate_schema()
 
-        # Validate BEFORE create_all - catches old schema with missing columns
-        # before we try to use it. For fresh DBs, validation passes (no tables yet).
-        instance._validate_schema()
-
-        if create_tables:
-            instance._sync_sqlite_schema_epoch()
-            metadata.create_all(engine)
-            instance._create_additive_indexes()
-            instance._sync_schema_identity()
-            instance._sync_sqlite_schema_epoch()
-        if journal is not None:
-            journal.recover_pending(engine)
-        return instance
+            if create_tables:
+                instance._sync_sqlite_schema_epoch()
+                metadata.create_all(engine)
+                instance._create_additive_indexes()
+                instance._sync_schema_identity()
+                instance._sync_sqlite_schema_epoch()
+            if journal is not None:
+                journal.recover_pending(engine)
+            return instance
+        except BaseException as exc:
+            # Ownership transfers only on a successful return. Schema or
+            # initialization failures must not abandon a newly-created pool.
+            try:
+                engine.dispose()
+            except BaseException as cleanup_exc:
+                exc.add_note(f"Landscape engine disposal also failed: {type(cleanup_exc).__name__}")
+            raise
 
     @staticmethod
     def _resolve_journal_path(

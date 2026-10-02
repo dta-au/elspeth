@@ -13,7 +13,7 @@ def test_cleanup_session_lock_weakly_reclaims_idle_base_and_namespaced_locks() -
         session_id = "11111111-1111-4111-8111-111111111111"
         other_session_id = "22222222-2222-4222-8222-222222222222"
         base = await registry.get_lock(session_id)
-        admission = await registry.get_lock(f"{session_id}:guided-respond-admission")
+        admission = await registry.get_lock(f"{session_id}:message-admission")
         other = await registry.get_lock(other_session_id)
         base_ref = weakref.ref(base)
         admission_ref = weakref.ref(admission)
@@ -21,14 +21,14 @@ def test_cleanup_session_lock_weakly_reclaims_idle_base_and_namespaced_locks() -
         await registry.cleanup_session_lock(session_id)
 
         assert await registry.get_lock(session_id) is base
-        assert await registry.get_lock(f"{session_id}:guided-respond-admission") is admission
+        assert await registry.get_lock(f"{session_id}:message-admission") is admission
         assert await registry.get_lock(other_session_id) is other
         del base, admission
         gc.collect()
         assert base_ref() is None
         assert admission_ref() is None
         assert await registry.get_lock(session_id) is not None
-        assert await registry.get_lock(f"{session_id}:guided-respond-admission") is not None
+        assert await registry.get_lock(f"{session_id}:message-admission") is not None
 
     asyncio.run(exercise())
 
@@ -36,7 +36,7 @@ def test_cleanup_session_lock_weakly_reclaims_idle_base_and_namespaced_locks() -
 def test_cleanup_session_lock_preserves_held_admission_lock_until_waiters_drain() -> None:
     async def exercise() -> None:
         registry = _SessionComposeLockRegistry()
-        key = "11111111-1111-4111-8111-111111111111:guided-respond-admission"
+        key = "11111111-1111-4111-8111-111111111111:message-admission"
         admission = await registry.get_lock(key)
         await admission.acquire()
         waiter = asyncio.create_task(admission.acquire())

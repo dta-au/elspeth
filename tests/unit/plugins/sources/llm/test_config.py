@@ -29,7 +29,7 @@ TRANSFORM_ONLY_FIELDS = {
     "backoff_multiplier",
     "recovery_step_ms",
     "max_capacity_retry_seconds",
-    "resolved_prompt_template_hash",
+    "approved_prompt_artifact_hash",
     # image_inputs binds to a ROW column (`field`); the LLM source has no
     # input row (its prompt_template is static Jinja2 with no `row.*`
     # context), so there is nothing for an image input to bind to.
@@ -70,6 +70,24 @@ def test_source_provider_models_are_rooted_in_data_plugin_config(
     assert SOURCE_PROVIDER_CONFIGS[provider] is model
     assert issubclass(model, DataPluginConfig)
     assert model._plugin_component_type == "source"
+
+
+def test_azure_source_rejects_an_api_version_older_than_max_completion_tokens(
+    provider_configs: dict[str, dict[str, Any]],
+) -> None:
+    with pytest.raises(PluginConfigError, match="max_completion_tokens"):
+        AzureOpenAILLMSourceConfig.from_dict({**provider_configs["azure"], "api_version": "2024-02-01"})
+
+
+def test_azure_source_accepts_a_null_temperature(provider_configs: dict[str, dict[str, Any]]) -> None:
+    cfg = AzureOpenAILLMSourceConfig.from_dict({**provider_configs["azure"], "temperature": None})
+    assert cfg.temperature is None
+
+
+@pytest.mark.parametrize("pricing_model", ["", "  ", "\n", 10, False])
+def test_source_rejects_invalid_pricing_identity(provider_configs: dict[str, dict[str, Any]], pricing_model: object) -> None:
+    with pytest.raises(PluginConfigError):
+        AzureOpenAILLMSourceConfig.from_dict({**provider_configs["azure"], "pricing_model": pricing_model})
 
 
 def test_source_prompt_rejects_row_access_but_accepts_lookup(openrouter_config: Callable[..., dict[str, Any]]) -> None:
@@ -494,3 +512,45 @@ def test_gateway_source_structured_accepted_with_capability(provider_configs: di
         plugin_name="llm",
     )
     assert cfg.required_capabilities == ("json_schema",)
+
+
+class TestBedrockSourceCredentials:
+    """The source variant carries the same optional credential contract as the transform."""
+
+    def test_no_credential_is_the_default_chain(self, provider_configs: dict[str, dict[str, Any]]) -> None:
+        config = BedrockLLMSourceConfig.from_dict(provider_configs["bedrock"], plugin_name="llm")
+
+        assert (config.api_key, config.aws_access_key_id, config.aws_secret_access_key, config.aws_session_token) == (None,) * 4
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"api_key": "bedrock-api-key"},
+            {"aws_access_key_id": "access-id", "aws_secret_access_key": "secret-access"},
+            {"aws_access_key_id": "access-id", "aws_secret_access_key": "secret-access", "aws_session_token": "session"},
+        ],
+        ids=["api-key", "static-pair", "static-pair-with-session"],
+    )
+    def test_each_credential_shape_is_accepted(self, overrides: dict[str, str], provider_configs: dict[str, dict[str, Any]]) -> None:
+        config = BedrockLLMSourceConfig.from_dict({**provider_configs["bedrock"], **overrides}, plugin_name="llm")
+
+        assert {name: value for name, value in config.model_dump().items() if name in overrides} == overrides
+        for value in overrides.values():
+            assert value not in repr(config)
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"api_key": "k", "aws_access_key_id": "a", "aws_secret_access_key": "s"}, "mutually exclusive"),
+            ({"aws_access_key_id": "a"}, "required together"),
+            ({"aws_session_token": "t"}, "aws_session_token requires"),
+        ],
+    )
+    def test_inconsistent_credentials_are_rejected(
+        self,
+        overrides: dict[str, str],
+        message: str,
+        provider_configs: dict[str, dict[str, Any]],
+    ) -> None:
+        with pytest.raises(PluginConfigError, match=message):
+            BedrockLLMSourceConfig.from_dict({**provider_configs["bedrock"], **overrides}, plugin_name="llm")

@@ -33,6 +33,8 @@ from elspeth.web.sessions.converters import state_from_record as _state_from_rec
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
+    CompositionValidationError,
+    serialize_composition_validation_errors,
 )
 
 # ---------------------------------------------------------------------------
@@ -108,6 +110,7 @@ def _make_state_record(
     Mirrors what the service layer produces when saving state.
     """
     d = state.to_dict()
+    validation = state.validate()
     return CompositionStateRecord(
         id=state_id or uuid4(),
         session_id=session_id or uuid4(),
@@ -117,8 +120,11 @@ def _make_state_record(
         edges=d["edges"],
         outputs=d["outputs"],
         metadata_=d["metadata"],
-        is_valid=state.validate().is_valid,
-        validation_errors=[e.message for e in state.validate().errors] if state.validate().errors else None,
+        is_valid=validation.is_valid,
+        validation_errors=[
+            CompositionValidationError(message=e.message, error_code=e.error_code, component=e.component) for e in validation.errors
+        ]
+        or None,
         created_at=datetime.now(UTC),
         derived_from_state_id=None,
     )
@@ -244,11 +250,18 @@ class TestStateToStateData:
             outputs=state_d["outputs"],
             metadata_=state_d["metadata"],
             is_valid=validation.is_valid,
-            validation_errors=[e.message for e in validation.errors] if validation.errors else None,
+            validation_errors=[
+                CompositionValidationError(message=e.message, error_code=e.error_code, component=e.component) for e in validation.errors
+            ]
+            or None,
         )
         assert data.sources == {}
         assert not data.is_valid  # No source, no sinks
         assert data.validation_errors is not None
+        assert isinstance(data.validation_errors, tuple)
+        assert serialize_composition_validation_errors(data.validation_errors) == [
+            {"message": e.message, "error_code": e.error_code, "component": e.component} for e in validation.errors
+        ]
 
     def test_populated_state_to_state_data(self) -> None:
         """Populated state produces a valid CompositionStateData with correct fields."""
@@ -262,10 +275,16 @@ class TestStateToStateData:
             outputs=state_d["outputs"],
             metadata_=state_d["metadata"],
             is_valid=validation.is_valid,
-            validation_errors=[e.message for e in validation.errors] if validation.errors else None,
+            validation_errors=[
+                CompositionValidationError(message=e.message, error_code=e.error_code, component=e.component) for e in validation.errors
+            ]
+            or None,
         )
         assert data.sources is not None
         assert data.metadata_ is not None
+        assert serialize_composition_validation_errors(data.validation_errors) == [
+            {"message": e.message, "error_code": e.error_code, "component": e.component} for e in validation.errors
+        ]
 
 
 # ---------------------------------------------------------------------------

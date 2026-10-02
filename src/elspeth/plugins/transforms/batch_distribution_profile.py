@@ -17,11 +17,12 @@ from pydantic import Field, field_validator, model_validator
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
-from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
 if TYPE_CHECKING:
@@ -29,24 +30,39 @@ if TYPE_CHECKING:
 
 type BatchDistributionProfileRow = dict[str, object]
 
-_GUARANTEED_PROFILE_FIELDS = frozenset(
-    {
-        "batch_size",
-        "count",
-        "field",
-        "max",
-        "mean",
-        "median",
-        "min",
-        "missing_count",
-        "non_finite_count",
-        "p25",
-        "p75",
-        "stdev",
-        "summary",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050). Only
+# int and float values reach the arithmetic (``_finite_values_for`` fails the
+# batch on any other type), so ``mean`` (true division), ``median``/``p25``/
+# ``p75`` (``_percentile`` returns ``float(...)``) and ``stdev``
+# (``statistics.stdev``) are floats whatever the input's numeric type;
+# ``stdev`` is undefined at n=1 and emitted None then. ``min`` and ``max`` are
+# the smallest and largest INPUT values, copied unconverted (an int stays an
+# int), but the plugin itself admits only finite int and float values to the
+# set they are taken from, so they are declared ``float``: an int value
+# satisfies a float declaration (ADR-050 Decision 5, ruling C3), and a value
+# of any other type would be this plugin's filter failing. ``field`` is the
+# configured value field name and ``summary`` the rendered text. The index
+# lists are written only when a row was skipped (optional) and are lists the
+# schema DSL has no type for.
+_PROFILE_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("count", "int"),
+    FieldDefinition("field", "str"),
+    FieldDefinition("max", "float"),
+    FieldDefinition("mean", "float"),
+    FieldDefinition("median", "float"),
+    FieldDefinition("min", "float"),
+    FieldDefinition("missing_count", "int"),
+    FieldDefinition("non_finite_count", "int"),
+    FieldDefinition("p25", "float"),
+    FieldDefinition("p75", "float"),
+    FieldDefinition("stdev", "float", nullable=True),
+    FieldDefinition("summary", "str"),
+    FieldDefinition("missing_indices", "any", required=False),
+    FieldDefinition("non_finite_indices", "any", required=False),
 )
-_CONDITIONAL_PROFILE_FIELDS = frozenset({"missing_indices", "non_finite_indices"})
+_GUARANTEED_PROFILE_FIELDS = frozenset(field.name for field in _PROFILE_CREATED_FIELDS if field.required)
+_CONDITIONAL_PROFILE_FIELDS = frozenset(field.name for field in _PROFILE_CREATED_FIELDS if not field.required)
 _PROFILE_OUTPUT_KEYS = _GUARANTEED_PROFILE_FIELDS | _CONDITIONAL_PROFILE_FIELDS
 
 
@@ -108,9 +124,11 @@ class BatchDistributionProfile(BaseTransform):
     name = "batch_distribution_profile"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3515c098fc194ed5"
+    source_file_hash: str | None = "sha256:e4a5e61cadd31134"
     config_model = BatchDistributionProfileConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use for numeric descriptive statistics and optional group profiles within each window. When configured, "
         "group_by partitions one flushed batch and never accumulates a group across windows."
@@ -221,6 +239,7 @@ class BatchDistributionProfile(BaseTransform):
                 issue_code=None,
                 summary="Aggregate numeric descriptive statistics — mean, stddev, quartiles, optionally per group. Numeric-only; categorical counts go to batch_top_k.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_distribution_profile under aggregations with a trigger; it summarizes a flushed batch.",
                     "value_field must be int or float. Strings (theme/category names) belong in batch_top_k, not here.",
                     "group_by partitions by a categorical field; omit it for a single distribution over all rows.",
@@ -246,6 +265,12 @@ class BatchDistributionProfile(BaseTransform):
                 "Words like distribution, barrier counts, theme frequency, category counts, or categorical summary should map to batch_top_k unless the requested statistic is numeric.",
             ),
         )
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed table above, plus ``group_by`` carrying the group's row value (``any``) when configured."""
+        if self._group_by is None:
+            return _PROFILE_CREATED_FIELDS
+        return (*_PROFILE_CREATED_FIELDS, FieldDefinition(self._group_by, "any"))
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the aggregate output path for the backward invariant."""
@@ -291,6 +316,7 @@ class BatchDistributionProfile(BaseTransform):
         groups: list[tuple[Any, list[tuple[int, PipelineRow]]]] = []
         for row_index, row in enumerate(rows):
             group_value = row[self._group_by]
+            require_scalar_group_key(group_value, field=self._group_by, row_index=row_index)
             for existing_value, grouped_rows in groups:
                 if same_scalar_bucket_value(group_value, existing_value):
                     grouped_rows.append((row_index, row))
@@ -315,11 +341,22 @@ class BatchDistributionProfile(BaseTransform):
                 missing_indices.append(row_index)
                 continue
 
+            # Use type() instead of isinstance() to reject bool (bool is subclass of int).
             if type(raw_value) not in (int, float):
-                raise TypeError(
-                    f"Field '{self._value_field}' must be numeric (int or float), "
-                    f"got {type(raw_value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                # BATCH-level failure, not a skip. The branches either side of
+                # this one skip-and-report deliberately (a missing value and a
+                # non-finite float are recoverable); a wrong TYPE is not, and
+                # John's ruling (elspeth-d5034647f0) fails the whole batch
+                # rather than publishing a profile over a set the operator never
+                # specified. No coercion: a str that is not a number is not a
+                # number. Raised here and converted once in `process`, because
+                # this helper returns values, not results. `row_index` is the
+                # BATCH index (`_group_rows` carries it through every group).
+                raise BatchRowTypeError(
+                    field=self._value_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(raw_value).__name__,
                 )
 
             if type(raw_value) is float and not math.isfinite(raw_value):
@@ -333,7 +370,6 @@ class BatchDistributionProfile(BaseTransform):
     def _error_for_no_finite_values(
         self,
         grouped_rows: list[tuple[int, PipelineRow]],
-        group_value: Any,
         missing_indices: list[int],
         non_finite_indices: list[int],
     ) -> TransformResult:
@@ -351,8 +387,10 @@ class BatchDistributionProfile(BaseTransform):
             "row_errors": row_errors,
         }
         if self._group_by is not None:
+            # The group is named by its field and identified by the batch row
+            # indices in `row_errors` (every member is listed: valid_count is
+            # 0). Its VALUE is row content and stays out of the audit reason.
             reason["group_by"] = self._group_by
-            reason["group_value"] = group_value
         return TransformResult.error(reason, retryable=False)
 
     @staticmethod
@@ -395,7 +433,7 @@ class BatchDistributionProfile(BaseTransform):
     ) -> tuple[BatchDistributionProfileRow, TransformResult | None]:
         values, missing_indices, non_finite_indices = self._finite_values_for(grouped_rows)
         if not values:
-            return {}, self._error_for_no_finite_values(grouped_rows, group_value, missing_indices, non_finite_indices)
+            return {}, self._error_for_no_finite_values(grouped_rows, missing_indices, non_finite_indices)
 
         sorted_values = sorted(values)
         count = len(values)
@@ -416,8 +454,9 @@ class BatchDistributionProfile(BaseTransform):
                 "valid_count": count,
             }
             if self._group_by is not None:
+                # Field name only: the group VALUE is row content and stays out
+                # of the audit reason.
                 reason["group_by"] = self._group_by
-                reason["group_value"] = group_value
             return {}, TransformResult.error(reason, retryable=False)
 
         result: BatchDistributionProfileRow = {
@@ -450,22 +489,6 @@ class BatchDistributionProfile(BaseTransform):
 
         return result, None
 
-    def _output_contract_for(self, results: list[BatchDistributionProfileRow]) -> SchemaContract:
-        """Build one shared output contract for profile result rows."""
-        field_names = list(dict.fromkeys(key for result in results for key in result))
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,
-                required=False,
-                source="inferred",
-            )
-            for key in field_names
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
-
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext
     ) -> TransformResult:
@@ -477,6 +500,21 @@ class BatchDistributionProfile(BaseTransform):
         if non_finite_error is not None:
             return non_finite_error
 
+        try:
+            return self._profile_all_groups(rows)
+        except BatchRowTypeError as exc:
+            # A wrongly-typed value fails the WHOLE batch with a value-free
+            # reason naming the batch row, the field, and the expected and found
+            # types. The structural caller owns disposition: an aggregation
+            # applies its declared on_error (AggregationExecutor._complete_error_flush
+            # records the reason and the DIVERT; RowProcessor.handle_timeout_flush
+            # sends every buffered row to the on_error sink, or records it
+            # discarded), while a collector turns this into a whole-group
+            # failure settled by scope policy and nesting.
+            return TransformResult.error(exc.as_reason(), retryable=False)
+
+    def _profile_all_groups(self, rows: list[PipelineRow]) -> TransformResult:
+        """Group, profile and assemble — the body `process` guards."""
         results: list[BatchDistributionProfileRow] = []
         for group_value, grouped_rows in self._group_rows(rows):
             profile, error = self._aggregate_group(grouped_rows, group_value)
@@ -484,7 +522,7 @@ class BatchDistributionProfile(BaseTransform):
                 return error
             results.append(profile)
 
-        output_contract = self._output_contract_for(results)
+        output_contract = self._batch_output_contract(key for result in results for key in result)
         fields_added = [field.normalized_name for field in output_contract.fields]
         pipeline_rows = [PipelineRow(result, output_contract) for result in results]
 

@@ -6,14 +6,12 @@ They are NOT persisted to the audit trail (those are in audit.py).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from enum import StrEnum
 
 from elspeth.contracts.audit import Checkpoint
 from elspeth.contracts.barrier_scalars import BarrierScalars
-from elspeth.contracts.freeze import freeze_fields, require_int
-from elspeth.contracts.types import NodeID
+from elspeth.contracts.freeze import require_int
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +47,28 @@ class CheckpointDraft:
         require_int(self.format_version, "CheckpointDraft.format_version", min_value=0)
 
 
+class ResumeRefusalCause(StrEnum):
+    """Cause observed by a resume, abandon, or export admission decision."""
+
+    RUN_NOT_FOUND = "run_not_found"
+    RUN_TERMINAL = "run_terminal"
+    RUN_NOT_RUNNING = "run_not_running"
+    LEADER_LIVE = "leader_live"
+    RUN_NOT_FINALIZED = "run_not_finalized"
+    CHECKPOINT_MISSING = "checkpoint_missing"
+    CHECKPOINT_NOT_LATEST = "checkpoint_not_latest"
+    CHECKPOINT_FORMAT_MISSING = "checkpoint_format_missing"
+    CHECKPOINT_FORMAT_INCOMPATIBLE = "checkpoint_format_incompatible"
+    CHECKPOINT_TOPOLOGY_CHANGED = "checkpoint_topology_changed"
+    PLUGIN_IMPLEMENTATION_CHANGED = "plugin_implementation_changed"
+    FIRST_EFFECT_BOUNDARY_CROSSED = "first_effect_boundary_crossed"
+    TERMINAL_STATUS_CHANGED = "terminal_status_changed"
+    SOURCE_NOT_EXHAUSTED = "source_not_exhausted"
+    UNCERTAIN_REMOTE_EFFECT = "uncertain_remote_effect"
+    GROUP_UNSATISFIABLE = "group_unsatisfiable"
+    EXPORT_ALREADY_COMPLETED = "export_already_completed"
+
+
 @dataclass(frozen=True, slots=True)
 class ResumeCheck:
     """Result of checking if a run can be resumed.
@@ -59,12 +79,17 @@ class ResumeCheck:
 
     can_resume: bool
     reason: str | None = None
+    cause: ResumeRefusalCause | None = None
 
     def __post_init__(self) -> None:
         if self.can_resume and self.reason is not None:
             raise ValueError("can_resume=True should not have a reason")
         if not self.can_resume and self.reason is None:
             raise ValueError("can_resume=False must have a reason explaining why")
+        if self.can_resume and self.cause is not None:
+            raise ValueError("can_resume=True must not have a cause")
+        if not self.can_resume and not isinstance(self.cause, ResumeRefusalCause):
+            raise ValueError("can_resume=False must have a ResumeRefusalCause")
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,9 +107,10 @@ class ResumePoint:
     def __post_init__(self) -> None:
         """Validate resume point fields — Tier 1 crash on invalid data.
 
-        Per CLAUDE.md Data Manifesto: Checkpoints are Tier 1 audit data.
-        Wrong types indicate corrupted checkpoint data — crash immediately
-        with distinct error messages.
+        Per the three-tier trust model (see
+        docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model),
+        checkpoints are Tier 1 audit data. Wrong types indicate corrupted
+        checkpoint data — crash immediately with distinct error messages.
         """
         if not isinstance(self.checkpoint, Checkpoint):
             raise TypeError(f"ResumePoint.checkpoint must be Checkpoint, got {type(self.checkpoint).__name__}")
@@ -99,56 +125,3 @@ class ResumePoint:
                 f"ResumePoint.sequence_number ({self.sequence_number}) does not match "
                 f"checkpoint.sequence_number ({self.checkpoint.sequence_number})"
             )
-
-
-@dataclass(frozen=True, slots=True)
-class ResumedRow:
-    """A single row recovered from the audit trail for resume processing.
-
-    Per ADR-025 Decision §4: every persisted row carries
-    ``rows.source_node_id`` (NOT NULL in the schema), and resume must
-    look up that row's schema contract via source node identity. The
-    previous ``(row_id, row_index, row_data) | (row_id, row_index,
-    source_node_id, row_data)`` 3|4-tuple union — discriminated at the
-    consumer by ``len()`` — was the carrier for the singular/plural
-    dual-truth surface that ADR-025 deletes. This dataclass replaces
-    both shapes with a single, non-optional carrier for
-    ``source_node_id``.
-
-    ``row_data`` is typed as ``Mapping[str, Any]`` and deep-frozen in
-    ``__post_init__`` (per CLAUDE.md's frozen-dataclass deep-freeze
-    contract — no loose mutable dicts on frozen records). Consumers
-    that need a mutable dict (notably ``PipelineRow``, which demands
-    ``type(data) is dict`` as a Tier-1 anti-coercion check) construct
-    one explicitly at the boundary via ``dict(row.row_data)``;
-    ``PipelineRow.__init__`` then immediately re-freezes the copy
-    via ``deep_freeze``. No mutation surface exists at any point in
-    the chain.
-    """
-
-    row_id: str
-    row_index: int
-    source_node_id: NodeID
-    row_data: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        """Tier-1 read-side validation — crash on garbage from our own DB.
-
-        Per CLAUDE.md Data Manifesto: rows recovered from the audit
-        trail are Tier 1 data. Wrong types or empty identifiers
-        indicate corruption.
-        """
-        if not isinstance(self.row_id, str):
-            raise TypeError(f"ResumedRow.row_id must be str, got {type(self.row_id).__name__}: {self.row_id!r}")
-        if not self.row_id:
-            raise ValueError("ResumedRow.row_id must not be empty")
-        require_int(self.row_index, "ResumedRow.row_index", min_value=0)
-        if not isinstance(self.source_node_id, str):
-            raise TypeError(
-                f"ResumedRow.source_node_id must be NodeID (str), got {type(self.source_node_id).__name__}: {self.source_node_id!r}"
-            )
-        if not self.source_node_id:
-            raise ValueError("ResumedRow.source_node_id must not be empty")
-        if not isinstance(self.row_data, Mapping):
-            raise TypeError(f"ResumedRow.row_data must be Mapping, got {type(self.row_data).__name__}")
-        freeze_fields(self, "row_data")

@@ -16,6 +16,7 @@ import hashlib
 import json
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Barrier
@@ -28,6 +29,7 @@ from jsonschema import Draft202012Validator
 from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer import planner_authoring_aids
@@ -43,11 +45,14 @@ from elspeth.web.composer.planner_authoring_aids import (
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate
 from elspeth.web.composer.tools import execute_tool as _dispatch_tool
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.session_fences import fenced_operation_context
 
 
 def _empty_state() -> CompositionState:
@@ -183,8 +188,7 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
     """Live-deployment posture: one OpenRouter LLM operator profile.
 
     Mirrors ``_operator_profile_view`` in ``test_set_pipeline_candidate.py`` —
-    the posture every failing planner surface (tutorial, guided, freeform web)
-    actually runs under, where llm nodes are authored via a profile alias.
+    the planner posture where llm nodes are authored via a profile alias.
     """
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.availability import build_plugin_snapshot
@@ -509,6 +513,8 @@ def _session_with_user_message(content: str) -> tuple[Any, str, str, str]:
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="authoring-aids-user")
     session_id = str(uuid4())
     message_id = str(uuid4())
     message_content = f"Use this exact content:\n{content}"
@@ -578,18 +584,21 @@ def _create_real_blob(tmp_path: Path, *, filename: str, mime_type: str, content:
         user_message_id=message_id,
         user_message_content=message_content,
     )
-    result = _dispatch_tool(
-        "create_blob",
-        {"filename": filename, "mime_type": mime_type, "content": content},
-        _empty_state(),
-        view,
-        plugin_snapshot=snapshot,
-        data_dir=str(tmp_path),
-        session_engine=engine,
-        session_id=session_id,
-        user_message_id=message_id,
-        user_message_content=message_content,
-    )
+    with fenced_operation_context(engine, session_id) as operation:
+        result = _dispatch_tool(
+            "create_blob",
+            {"filename": filename, "mime_type": mime_type, "content": content},
+            _empty_state(),
+            view,
+            plugin_snapshot=snapshot,
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            user_message_id=message_id,
+            user_message_content=message_content,
+            session_operation_context=operation,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+        )
     assert result.success is True, result.to_dict()
     return result.data["blob_id"], context
 
@@ -605,7 +614,7 @@ class TestSourceCustodyExemplar:
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"inline custody exemplar rejected: {rejection}"
 
     def test_existing_blob_exemplar_validates_with_a_real_session_blob(self, tmp_path: Path) -> None:
@@ -624,9 +633,19 @@ class TestSourceCustodyExemplar:
         args = source_custody_exemplar_args(view, blob_id=blob_id)
         assert args is not None
 
-        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+        assert context.session_engine is not None and context.session_id is not None
+        with fenced_operation_context(context.session_engine, context.session_id) as operation:
+            candidate = build_set_pipeline_candidate(
+                args,
+                _empty_state(),
+                replace(
+                    context,
+                    session_operation_context=operation,
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(context.session_engine),
+                ),
+            )
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"existing-blob exemplar rejected: {rejection}"
         # Single-source contract: only the binding differs between the two
         # variants the prompt shows; everything downstream is byte-identical.
@@ -718,7 +737,7 @@ class TestForkCoalesceExemplar:
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"fork/coalesce exemplar rejected: {rejection}"
         state = candidate.result.updated_state
         coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
@@ -792,7 +811,7 @@ class TestForkCoalesceExemplar:
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"control-required fork exemplar rejected: {rejection}"
 
     def test_selected_controls_are_wired_into_the_forked_llm_exemplar(self, tmp_path: Path) -> None:
@@ -854,7 +873,7 @@ class TestForkCoalesceExemplar:
         context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
-        assert candidate.acceptable is True, (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, candidate.result.validation.errors[0].message
 
         result = view.validate_authored_state(candidate.result.updated_state)
         coverage = [finding for finding in result.findings if finding.stage == "required_control_coverage"]
@@ -923,7 +942,7 @@ class TestForkRowUnionExemplar:
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"fork/row_union exemplar rejected: {rejection}"
         nodes = {node["id"]: node for node in args["nodes"]}
         gate = next(node for node in nodes.values() if node["node_type"] == "gate")
@@ -995,7 +1014,7 @@ class TestForkRowUnionExemplar:
 
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
 
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"alias-less control exemplar rejected: {rejection}"
 
     def test_recommended_alias_less_controls_do_not_mutate_the_exemplar(self, tmp_path: Path) -> None:
@@ -1054,7 +1073,7 @@ class TestForkRowUnionExemplar:
         content = args["source"]["inline_blob"]["content"]
         context = _custody_context(tmp_path, content)
         candidate = build_set_pipeline_candidate(args, _empty_state(), context)
-        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
         assert candidate.acceptable is True, f"topology exemplar rejected: {rejection}"
 
     def test_trained_posture_payload_carries_the_topology_exemplar(self) -> None:
@@ -1274,6 +1293,7 @@ class TestDiscoveryDigest:
                     # reads as a narrower rule than the one declared.
                     assert entry["not_for"] == plugin.usage_when_not_to_use
                 assert entry.get("capability_tags", []) == list(plugin.capability_tags)
+                assert entry.get("aggregation_output_modes", []) == list(plugin.aggregation_output_modes)
 
     def test_digest_fits_the_canonical_utf8_selection_budget(self) -> None:
         from elspeth.core.canonical import canonical_json
@@ -1671,29 +1691,49 @@ class TestModelCatalogAid:
         catalog = planner_model_catalog()
 
         rendered = canonical_json(catalog).encode("utf-8")
-        assert len(rendered) <= 32 * 1024
+        assert len(rendered) <= 8 * 1024
         assert catalog["budget"]["canonical_bytes_used"] == len(rendered)
-        assert catalog["budget"]["max_canonical_bytes"] == 32 * 1024
-        assert catalog["models_omitted"] == []
-        assert catalog["budget"]["omitted_provider_count"] == 0
+        assert catalog["budget"]["max_canonical_bytes"] == 8 * 1024
+        assert catalog["budget"]["omitted_provider_count"] == len(catalog["models_omitted"])
+
+    def test_catalog_growth_defers_large_provider_without_dropping_small_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.core.canonical import canonical_json
+
+        bedrock = ["bedrock/test-model-a", "bedrock/test-model-b"]
+        openrouter = frozenset(f"openrouter/provider/model-{index:04d}-with-a-long-deployment-name" for index in range(300))
+        monkeypatch.setattr(planner_authoring_aids, "read_litellm_model_list", lambda: tuple(bedrock))
+        monkeypatch.setattr(planner_authoring_aids, "get_catalog_values", lambda _catalog: openrouter)
+
+        catalog = planner_model_catalog()
+
+        assert catalog["models_by_provider"] == {"bedrock": bedrock}
+        assert catalog["provider_model_counts"] == {"bedrock": 2, "openrouter": 300}
+        assert catalog["total_models"] == 302
+        assert catalog["models_omitted"] == [{"provider": "openrouter", "model_count": 300, "details_via": "list_models"}]
+        assert len(canonical_json(catalog).encode("utf-8")) <= 8 * 1024
+        assert planner_model_catalog() == catalog
 
     def test_over_budget_defers_whole_lists_and_keeps_the_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Whole lists or none: a sliced list reads as a complete one."""
         from elspeth.core.canonical import canonical_json
 
+        monkeypatch.setattr(planner_authoring_aids, "_MODEL_CATALOG_MAX_CANONICAL_BYTES", 128 * 1024)
         full = planner_model_catalog()
         monkeypatch.setattr(planner_authoring_aids, "_MODEL_CATALOG_MAX_CANONICAL_BYTES", 4 * 1024)
 
         catalog = planner_model_catalog()
 
-        assert catalog["models_by_provider"] == {}
         assert catalog["provider_model_counts"] == full["provider_model_counts"]
         assert catalog["total_models"] == full["total_models"]
+        for provider, identifiers in catalog["models_by_provider"].items():
+            assert identifiers == full["models_by_provider"][provider]
         assert catalog["models_omitted"] == [
             {"provider": provider, "model_count": len(identifiers), "details_via": "list_models"}
             for provider, identifiers in sorted(full["models_by_provider"].items())
+            if provider not in catalog["models_by_provider"]
         ]
-        assert catalog["budget"]["omitted_provider_count"] == len(full["models_by_provider"])
+        assert catalog["models_omitted"]
+        assert catalog["budget"]["omitted_provider_count"] + len(catalog["models_by_provider"]) == len(full["models_by_provider"])
         assert len(canonical_json(catalog).encode("utf-8")) <= 4 * 1024
 
     def test_catalog_fails_closed_when_the_counts_alone_exceed_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1737,8 +1777,21 @@ class TestModelCatalogAid:
         assert "models_omitted" in guidance
         assert "details_via" in guidance
         assert "Never invent a slug" in guidance
+        assert "catalog list_models serves" in guidance
+        assert "provider_model_counts and total_models include every known provider" in guidance
+        assert "absence from models_by_provider means identifiers were not carried" in guidance
+        assert "closed llm provider-option set" in guidance
+        assert "only its identifiers are carried or authorable" in guidance
+        assert "no catalogued identifiers" in guidance
+        assert "operator-configured" in guidance
+        assert "over-budget provider with model_count and details_via" in guidance
+        assert "follow that marker before binding its slug" in guidance
+        assert "recall one from training" in guidance
+        assert "preflight rejects an unserved slug" in guidance
 
-    def test_a_profile_bound_slug_reaches_the_prompt_only_as_public_inventory(self, tmp_path: Path) -> None:
+    def test_a_profile_bound_slug_reaches_the_prompt_only_as_public_inventory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The operator's binding stays private; the public catalog stays public.
 
         ``_source_only_profile_view`` binds ``anthropic/claude-sonnet-4.6``
@@ -1750,9 +1803,8 @@ class TestModelCatalogAid:
         is that the carried list is the public reader's whole content, never a
         deployment-selected subset.
         """
-        from elspeth.contracts.value_source import get_catalog_values
-        from elspeth.plugins.transforms.llm.model_catalog import MODEL_CATALOG_OPENROUTER
-
+        public_models = frozenset({"anthropic/claude-sonnet-4.6", "openai/gpt-4o"})
+        monkeypatch.setattr(planner_authoring_aids, "get_catalog_values", lambda _catalog: public_models)
         view, _snapshot = _source_only_profile_view(tmp_path)
 
         aids = build_planner_authoring_aids(view)
@@ -1762,7 +1814,7 @@ class TestModelCatalogAid:
         # leak that landed under some OTHER provider key could never reach the
         # prompt either, whatever it was.
         assert aids["model_catalog"]["catalog"] == planner_model_catalog()
-        assert carried == sorted(get_catalog_values(MODEL_CATALOG_OPENROUTER))
+        assert carried == sorted(public_models)
         assert "anthropic/claude-sonnet-4.6" in carried
         without_public_inventory = json.loads(json.dumps(aids))
         without_public_inventory["model_catalog"]["catalog"]["models_by_provider"] = {}
@@ -1876,7 +1928,8 @@ class TestExpressionGrammarAid:
 class TestAuthoringAidsPayload:
     def test_set_pipeline_exemplars_match_the_web_provider_argument_envelope(self) -> None:
         """Prompt examples wrap flat canonical documents exactly as the web tool does."""
-        from elspeth.web.composer.service import ComposerServiceImpl
+        from elspeth.contracts.composer_llm_audit import ToolContractDialect
+        from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
         view, _snapshot = _trained_view()
         payload = build_planner_authoring_aids(view)
@@ -1890,8 +1943,9 @@ class TestAuthoringAidsPayload:
             payload["fork_coalesce"]["set_pipeline_exemplar"],
             payload["fork_row_union"]["set_pipeline_exemplar"],
         )
-        service = object.__new__(ComposerServiceImpl)
-        provider_tool = next(tool for tool in service._get_litellm_tools() if tool["function"]["name"] == "set_pipeline")
+        provider_tool = next(
+            tool for tool in composer_loop_tool_definitions(ToolContractDialect.NONE) if tool["function"]["name"] == "set_pipeline"
+        )
         provider_schema = provider_tool["function"]["parameters"]
         validator = Draft202012Validator(provider_schema)
 
@@ -2079,8 +2133,7 @@ class TestPromptShieldRules:
         assert "aws_bedrock_prompt_shield" in rendered
 
     def test_section_renders_under_the_live_profile_posture(self, tmp_path: Path) -> None:
-        # The failing surface is the tutorial/guided walk under the operator-
-        # profile posture — pin that the section actually reaches it (web_scrape
+        # Pin that the section reaches the operator-profile posture (web_scrape
         # and llm are policy-visible there), not just the trained fixture.
         from elspeth.web.interpretation_state import PROMPT_SHIELD_USER_TERM
 
@@ -2167,6 +2220,61 @@ class TestRequiredModeAutoWireAids:
         )
         assert "automatically splices" not in rendered
         assert PROMPT_SHIELD_WARNING_DRAFT in rendered
+
+
+class TestSessionRepairGuidance:
+    """Prompt-content contracts; provider adherence needs a separate live evaluation."""
+
+    def test_single_variable_comparison_keeps_output_constraints_equal(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = " ".join(build_planner_authoring_aids(view)["fork_coalesce"]["rules"])
+
+        assert "A/B comparison" in rules
+        assert "response_format" in rules
+        assert "output_fields" in rules
+        assert "same enum values" in rules
+        assert "model/profile, sampling settings" in rules
+        assert "output field names may differ" in rules
+
+    def test_supplied_prompt_text_cannot_be_silently_normalized(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = " ".join(build_planner_authoring_aids(view)["user_disclosure"]["rules"])
+
+        assert "Preserve supplied literal prompts character-for-character" in rules
+        assert "capitalization, punctuation, and whitespace" in rules
+
+    def test_review_tool_requires_current_pending_site(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = " ".join(build_planner_authoring_aids(view)["review_registry"]["rules"])
+
+        assert "currently pending" in rules
+        assert "already resolved" in rules
+        assert "do not re-stage unchanged content" in rules
+
+    def test_fork_cleanup_teaches_mapping_direction(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = " ".join(build_planner_authoring_aids(view)["fork_coalesce"]["rules"])
+
+        assert "field_mapper mapping keys are existing INPUT fields" in rules
+        assert "values are the desired OUTPUT names" in rules
+
+    def test_computed_source_contract_demand_does_not_require_a_persisted_review_row(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["review_registry"]["rules"]
+        source_rules = [rule for rule in rules if "source_data_contract" in rule]
+
+        assert source_rules, "Computed source review must remain reachable under pending-site guidance"
+        assert any("no persisted interpretation_requirements row" in rule for rule in source_rules)
+        assert any("current missing source fields" in rule for rule in source_rules)
+        assert not any("call it only for a currently pending requirement" in rule for rule in rules)
+
+    def test_saved_configuration_does_not_prove_provider_delivery_or_compliance(self) -> None:
+        view, _snapshot = _trained_view()
+        rules = " ".join(build_planner_authoring_aids(view)["user_disclosure"]["rules"])
+
+        assert "Saved configuration does not prove the provider request bytes" in rules
+        assert "provider receipt does not prove model compliance" in rules
+        assert "observations, hypotheses, and verified causes" in rules
 
 
 class TestModelCustody:
@@ -2433,6 +2541,17 @@ class TestNamedButMissingFile:
         assert "named gap" in rules
 
 
+def test_llm_rules_distinguish_upstream_requirements_from_generated_output_declarations() -> None:
+    view, _snapshot = _trained_view()
+    rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+    assert "declares any guaranteed prefixed fields" not in rendered
+    assert "STILL required" not in rendered
+    assert "required_input_fields names upstream columns" in rendered
+    assert "schema.fields can declare output types (ADR-050)" in rendered
+    assert "output_fields" in rendered and "downstream" in rendered
+    assert "every query supplies" in rendered
+
+
 class TestRun2PackEdits:
     """Pack pressure-suite run-2 gap closures (G2/G3/G4/G6/G9), pinned.
 
@@ -2588,7 +2707,7 @@ class TestRun5PackEdits:
         view, _snapshot = _trained_view()
         digest = discovery_digest(view)
         llm_entry = next(e for e in digest["transforms"] if e["name"] == "llm")
-        assert set(llm_entry["required_options"]) == {"schema", "provider", "prompt_template"}
+        assert set(llm_entry["required_options"]) == {"schema", "provider"}
 
 
 class TestSession891b7b1eLiveReviewEdits:
@@ -2650,7 +2769,6 @@ class TestSession891b7b1eLiveReviewEdits:
     def test_proposal_planner_custody_rule_names_no_unadvertised_tool(self) -> None:
         """Shared aids must not teach proposal planners calls absent from their palette."""
         from elspeth.web.composer.pipeline_planner import PlannerDiscoveryPolicy, planner_tool_definitions
-        from elspeth.web.composer.pipeline_proposal import PlannerSurface
         from elspeth.web.composer.tools import get_tool_definitions
 
         view, _snapshot = _trained_view()
@@ -2659,10 +2777,11 @@ class TestSession891b7b1eLiveReviewEdits:
         registered_names = {definition["name"] for definition in get_tool_definitions()}
         named_tools = {name for name in registered_names if name in proposal_rule}
 
-        for surface in PlannerSurface:
-            policy = PlannerDiscoveryPolicy.initial(surface)
-            advertised_names = {definition["function"]["name"] for definition in planner_tool_definitions(policy)}
-            assert named_tools <= advertised_names
+        policy = PlannerDiscoveryPolicy.initial()
+        advertised_names = {
+            definition["function"]["name"] for definition in planner_tool_definitions(policy, dialect=ToolContractDialect.NONE)
+        }
+        assert named_tools <= advertised_names
 
         assert "get_pipeline_state" not in proposal_rule
         assert "patch_source_options" not in proposal_rule
@@ -2753,3 +2872,17 @@ class TestLlmOnErrorRuleGating:
         rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
 
         assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE in rules
+
+
+def test_llm_output_contract_rules_teach_row_prefixed_per_query_variables() -> None:
+    """Session 94f6f00c: the rule taught per-query templates to "reference plain
+    query variables only" while ``LLMConfig._validate_template_variable_bindings``
+    rejects a bare ``{{ colour }}`` and demands ``{{ row.colour }}`` (measured both
+    ways). The planner's first ``set_pipeline`` followed the teaching and was
+    rejected. The teaching must match the validator."""
+    rules = "\n".join(planner_authoring_aids._LLM_OUTPUT_CONTRACT_RULES)
+
+    assert "plain query variables" not in rules
+    assert "{{ row.<variable> }}" in rules
+    assert "input_fields" in rules
+    assert "bare {{ <variable> }} is rejected" in rules

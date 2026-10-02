@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,10 +21,11 @@ from elspeth.web.composer.source_demand import (
     source_data_contract_artifact_hash,
 )
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
-from elspeth.web.composer.tools import ToolContext
+from elspeth.web.composer.tools import ToolContext, execute_tool
 from elspeth.web.composer.tools.sessions import _execute_get_pipeline_state, _execute_set_pipeline
 from elspeth.web.composer.tools.sources import _execute_patch_source_options
 from elspeth.web.composer.tools.transforms import _execute_patch_node_options, _execute_upsert_node
+from elspeth.web.composer.turn_audit import _state_payload_for_compose_turn
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -185,7 +187,7 @@ def test_exact_authoring_payload_validates_and_omits_server_owned_review_fields(
             _node(
                 options={
                     "model": model,
-                    "resolved_prompt_template_hash": "server-owned-node-hash",
+                    "approved_prompt_artifact_hash": "server-owned-node-hash",
                     INTERPRETATION_REQUIREMENTS_KEY: [resolved],
                     "schema": {"mode": "observed"},
                 }
@@ -201,7 +203,7 @@ def test_exact_authoring_payload_validates_and_omits_server_owned_review_fields(
     assert "version" not in result.data
     assert "inspection" not in result.data
     options = result.data["nodes"][0]["options"]
-    assert "resolved_prompt_template_hash" not in options
+    assert "approved_prompt_artifact_hash" not in options
     shell = options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert shell == {
         "kind": InterpretationKind.LLM_MODEL_CHOICE.value,
@@ -251,7 +253,7 @@ def test_named_blob_source_reports_round_trip_unavailable() -> None:
     result = _exact_arguments(state)
 
     assert not result.success
-    assert result.data["error_code"] == "round_trip_unavailable"
+    assert result.validation.errors[0].error_code == "round_trip_unavailable"
     assert result.updated_state is state
 
 
@@ -278,7 +280,7 @@ def test_unsafe_blob_identity_reports_round_trip_unavailable(source_options: dic
     result = _exact_arguments(state)
 
     assert not result.success
-    assert result.data["error_code"] == "round_trip_unavailable"
+    assert result.validation.errors[0].error_code == "round_trip_unavailable"
     assert result.updated_state is state
 
 
@@ -307,8 +309,8 @@ def test_legacy_resolved_vague_term_without_parts_reports_round_trip_unavailable
     result = _exact_arguments(state)
 
     assert not result.success
-    assert result.data["error_code"] == "round_trip_unavailable"
-    assert "warm" not in result.data["error"]
+    assert result.validation.errors[0].error_code == "round_trip_unavailable"
+    assert "warm" not in result.validation.errors[0].message
     assert result.updated_state is state
 
 
@@ -569,6 +571,102 @@ def test_resolved_source_contract_survives_unrelated_source_patch() -> None:
     assert carried["accepted_artifact_hash"] == source_data_contract_artifact_hash(["colour"])
 
 
+@pytest.mark.parametrize("compact_shell", [False, True])
+@pytest.mark.parametrize("skip_rows", [0, 1])
+def test_public_set_source_preserves_unchanged_acknowledgement(tmp_path: Path, compact_shell: bool, skip_rows: int) -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    source = previous.sources["source"]
+    options = deep_thaw(source.options)
+    options["path"] = str(tmp_path / "blobs" / "session" / "rows.csv")
+    previous = previous.with_named_source("source", replace(source, options=options))
+    acknowledged = dict(options[INTERPRETATION_REQUIREMENTS_KEY][0])
+    supplied = deep_thaw(options)
+    supplied["skip_rows"] = skip_rows
+    if compact_shell:
+        supplied[INTERPRETATION_REQUIREMENTS_KEY] = [{key: acknowledged[key] for key in ("kind", "user_term", "draft")}]
+    context = _trained_context()
+
+    result = execute_tool(
+        "set_source",
+        {"plugin": "csv", "options": supplied, "on_success": "in", "on_validation_failure": "discard"},
+        previous,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+        data_dir=str(tmp_path),
+        session_id="session",
+        validate_arguments=True,
+        require_data_dir_for_paths=True,
+    )
+
+    assert result.success, result.data
+    carried = deep_thaw(result.updated_state.sources["source"].options)[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert carried == acknowledged
+    assert result.updated_state.sources["source"].options["skip_rows"] == skip_rows
+    persisted = _state_payload_for_compose_turn(result).data
+    assert persisted.sources["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]["event_id"] == "event-1"
+    assert persisted.sources["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY][0][
+        "accepted_artifact_hash"
+    ] == source_data_contract_artifact_hash(["colour"])
+
+
+def test_public_set_source_cannot_erase_blocking_corrupt_acknowledgement(tmp_path: Path) -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    source = previous.sources["source"]
+    options = deep_thaw(source.options)
+    options["path"] = str(tmp_path / "blobs" / "session" / "rows.csv")
+    options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_artifact_hash"] = "a" * 64
+    previous = previous.with_named_source("source", replace(source, options=options))
+    assert len(interpretation_sites(previous)) == 1
+    context = _trained_context()
+
+    result = execute_tool(
+        "set_source",
+        {"plugin": "csv", "options": options, "on_success": "in", "on_validation_failure": "discard"},
+        previous,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+        data_dir=str(tmp_path),
+        session_id="session",
+        validate_arguments=True,
+        require_data_dir_for_paths=True,
+    )
+
+    assert not result.success
+    assert result.updated_state is previous
+    assert result.validation.errors[0].error_code == "review_reconciliation_failed"
+    assert len(interpretation_sites(result.updated_state)) == 1
+
+
+def test_public_set_source_reopens_acknowledgement_when_guarantee_is_removed(tmp_path: Path) -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    source = previous.sources["source"]
+    options = deep_thaw(source.options)
+    options["path"] = str(tmp_path / "blobs" / "session" / "rows.csv")
+    previous = previous.with_named_source("source", replace(source, options=options))
+    supplied = deep_thaw(options)
+    supplied["schema"] = {"mode": "observed"}
+    context = _trained_context()
+
+    result = execute_tool(
+        "set_source",
+        {"plugin": "csv", "options": supplied, "on_success": "in", "on_validation_failure": "discard"},
+        previous,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+        data_dir=str(tmp_path),
+        session_id="session",
+        validate_arguments=True,
+        require_data_dir_for_paths=True,
+    )
+
+    assert result.success, result.data
+    reopened = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert reopened["status"] == "pending"
+    assert reopened["event_id"] is None
+    assert reopened["accepted_artifact_hash"] is None
+    assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
+
+
 def test_planner_widening_of_acknowledged_guarantee_is_rejected() -> None:
     """John's ruling 2026-09-01 (elspeth-1dddcfee3a; supersedes the widening
     tolerance pinned earlier the same day in 915001735): even a SUPERSET over
@@ -587,8 +685,8 @@ def test_planner_widening_of_acknowledged_guarantee_is_rejected() -> None:
     result = _execute_set_pipeline(proposal, previous, _trained_context())
 
     assert result.success is False
-    assert "guaranteed_fields" in result.data["error"]
-    assert "request_interpretation_review" in result.data["error"]
+    assert "guaranteed_fields" in result.validation.errors[0].message
+    assert "request_interpretation_review" in result.validation.errors[0].message
 
 
 def test_deleting_resolved_source_contract_guarantee_reopens_review() -> None:
@@ -632,7 +730,7 @@ def test_exact_round_trip_rejects_incoherent_stored_source_contract_evidence() -
 
     assert not result.success
     assert result.updated_state is forged
-    assert result.data["error_code"] == "review_reconciliation_failed"
+    assert result.validation.errors[0].error_code == "review_reconciliation_failed"
 
 
 def test_exact_round_trip_refuses_unsupported_source_contract() -> None:
@@ -677,8 +775,8 @@ def test_public_set_pipeline_cannot_forge_resolved_source_contract_artifact() ->
 
     assert not result.success
     assert result.updated_state is previous
-    assert result.data["error_code"] == "interpretation_requirements_invalid"
-    assert "resolver-owned status 'resolved'" in result.data["error"]
+    assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+    assert "resolver-owned status 'resolved'" in result.validation.errors[0].message
 
 
 def test_stale_source_contract_round_trip_remains_blocked_for_review() -> None:
@@ -1145,8 +1243,8 @@ def test_unknown_pipeline_decision_user_term_fails_closed() -> None:
     assert not result.success
     assert result.updated_state is previous
     assert result.updated_state.version == previous.version
-    assert result.data["error_code"] == "interpretation_requirements_invalid"
-    assert "unknown-decision" not in result.data["error"]
+    assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+    assert "unknown-decision" not in result.validation.errors[0].message
 
 
 def _reconciler_stale_hash_state() -> CompositionState:
@@ -1204,9 +1302,9 @@ def test_review_reconciliation_failure_names_the_underlying_cause() -> None:
     assert not result.success
     assert result.updated_state is previous
     assert result.updated_state.version == previous.version
-    assert result.data["error_code"] == "review_reconciliation_failed"
+    assert result.validation.errors[0].error_code == "review_reconciliation_failed"
     # The specific invariant, not just the generic retry instruction.
-    assert "hash drifted" in result.data["error"], result.data["error"]
+    assert "hash drifted" in result.validation.errors[0].message, result.validation.errors[0].message
     # ...and WHICH requirement drifted. This asserts a server-owned requirement
     # id reaching the planner, which is deliberate and redaction-safe: the id is
     # a pipeline identifier derived from kind + node id, not row content, and
@@ -1214,7 +1312,7 @@ def test_review_reconciliation_failure_names_the_underlying_cause() -> None:
     # plugin prevalidation (the ``_prevalidate_plugin_options`` messages). Without
     # the id, a pipeline carrying several resolved reviews still leaves the
     # planner guessing which one to re-send.
-    assert "model_choice_review:enrich" in result.data["error"], result.data["error"]
+    assert "model_choice_review:enrich" in result.validation.errors[0].message, result.validation.errors[0].message
 
 
 def _unwired_vague_term_state() -> CompositionState:
@@ -1273,12 +1371,12 @@ def test_set_pipeline_rejects_unwired_pending_vague_term() -> None:
 
     assert not result.success
     assert result.updated_state is previous
-    assert result.data["error_code"] == "vague_term_unwired"
+    assert result.validation.errors[0].error_code == "vague_term_unwired"
     # The rejection must name the node and the term so the planner can repair.
-    assert "score_lead" in result.data["error"], result.data["error"]
-    assert "lead quality" in result.data["error"], result.data["error"]
+    assert "score_lead" in result.validation.errors[0].message, result.validation.errors[0].message
+    assert "lead quality" in result.validation.errors[0].message, result.validation.errors[0].message
     # ...and the repair itself: wire a prompt_template_parts interpretation_ref.
-    assert "prompt_template_parts" in result.data["error"], result.data["error"]
+    assert "prompt_template_parts" in result.validation.errors[0].message, result.validation.errors[0].message
 
 
 def test_set_pipeline_accepts_wired_pending_vague_term() -> None:

@@ -22,6 +22,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
     validation_errors_table,
 )
+from elspeth.core.landscape.terminal_transform_failures import failed_collector_groups
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.discard_summary import DISCARD_DESTINATION, _sqlite_database_file_missing, _unique_run_ids
 from elspeth.web.execution.schemas import (
@@ -294,6 +295,7 @@ def load_run_accounting_map_from_db(
         missing_terminal_outcomes = _zero_counts(present_run_ids)
         duplicate_terminal_outcomes = _zero_counts(present_run_ids)
         abandoned_tokens = _zero_counts(present_run_ids)
+        collector_groups_failed = _zero_counts(present_run_ids)
 
         source_name = func.coalesce(run_sources_table.c.source_name, rows_table.c.source_node_id).label("source_name")
         source_stmt = (
@@ -363,6 +365,12 @@ def load_run_accounting_map_from_db(
         )
         for run_id, count in conn.execute(emitted_stmt):
             emitted_tokens[str(run_id)] = int(count)
+
+        # G, the failed-group count, from the one counting authority.
+        failed_groups = failed_collector_groups(present_run_ids).subquery("failed_collector_groups")
+        collector_failures_stmt = select(failed_groups.c.run_id, func.count().label("count")).group_by(failed_groups.c.run_id)
+        for run_id, count in conn.execute(collector_failures_stmt):
+            collector_groups_failed[str(run_id)] = int(count)
 
         terminal_stmt = (
             select(
@@ -550,6 +558,7 @@ def load_run_accounting_map_from_db(
                     quarantined=quarantined[run_id],
                     discarded=discarded[run_id],
                 ),
+                collector_groups_failed=collector_groups_failed[run_id],
                 integrity=RunAccountingIntegrity(
                     closure=closure,
                     missing_terminal_outcomes=missing_terminal_outcomes[run_id],

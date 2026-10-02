@@ -7,7 +7,7 @@ These tests verify the end-to-end integration of:
 3. PipelineRow dual-name access
 4. Contract checkpoint serialization
 
-Per CLAUDE.md Test Path Integrity: These tests use production code paths
+Per the ``engine-patterns-reference`` skill §Test Path Integrity: these tests use production code paths
 (CSVSource, SchemaContract, PipelineRow) rather than manual construction.
 """
 

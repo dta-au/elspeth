@@ -11,29 +11,34 @@ complete copy-paste command is ``_SEQUENTIAL_TEST_COMMAND`` in the sibling
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib
 import json
 import os
 import re
+import threading
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import psycopg
 import pytest
 from click.testing import Result
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from psycopg import sql
 from pydantic import SecretBytes
-from sqlalchemy import create_engine, inspect, update
-from sqlalchemy.engine import URL, make_url
+from sqlalchemy import create_engine, event, inspect, update
+from sqlalchemy.engine import URL, Engine, make_url
 from sqlalchemy.exc import ProgrammingError
 from typer.testing import CliRunner
 
 from elspeth.cli import app as cli_app
+from elspeth.web import readiness
 from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
 from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
@@ -238,6 +243,10 @@ def _clear_inherited_web_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in tuple(os.environ):
         if key.startswith("ELSPETH_WEB__"):
             monkeypatch.delenv(key, raising=False)
+    # Model the identity Container Apps injects, including the revision used
+    # by its PostgreSQL membership row. Other startup profiles ignore it.
+    monkeypatch.setenv("CONTAINER_APP_REVISION", "elspeth--postgres-contract")
+    monkeypatch.setenv("CONTAINER_APP_REPLICA_NAME", "elspeth--postgres-contract-replica")
 
 
 def _prepare_directories(tmp_path: Path) -> tuple[Path, Path]:
@@ -270,6 +279,8 @@ def _settings(
 ) -> WebSettings:
     data_dir, payload_dir = _prepare_directories(tmp_path)
     target_settings = _aws_settings() if target == "aws-ecs" else {}
+    if target == "azure-container-apps":
+        target_settings["operator_telemetry_release"] = "a" * 40
     return WebSettings(
         deployment_target=target,  # type: ignore[arg-type]
         deployment_state_mode="external-postgresql",
@@ -370,12 +381,43 @@ def _assert_ddl_denied(url: str) -> None:
 
 
 @pytest.mark.usefixtures("aws_rds_trust_test_override")
-@pytest.mark.parametrize("target", _RUNTIME_CONTRACT_TARGETS)
+@pytest.mark.parametrize(
+    ("target", "query_delay", "hold_first_probe"),
+    [pytest.param(target, 0.0, False, id=target) for target in _RUNTIME_CONTRACT_TARGETS]
+    + [
+        pytest.param("kubernetes", 0.006, False, id="kubernetes-network-latency"),
+        pytest.param("kubernetes", 0.0, True, id="kubernetes-transient-probe-timeout"),
+    ],
+)
 def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
     tmp_path: Path,
     database_pair: _DatabasePair,
     target: str,
+    query_delay: float,
+    hold_first_probe: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    original_probe = readiness._probe_database_engine
+    entered = threading.Event()
+    release = threading.Event()
+
+    def latency(*_args: object) -> None:
+        time.sleep(query_delay)
+
+    def delayed_probe(engine: Engine, *, kind: Literal["session", "landscape"]) -> tuple[readiness.ReadinessCheck, ...]:
+        if hold_first_probe and kind == "session" and not entered.is_set():
+            entered.set()
+            assert release.wait(timeout=15), "test did not release the first readiness probe"
+        event.listen(engine, "before_cursor_execute", latency)
+        try:
+            return original_probe(engine, kind=kind)
+        finally:
+            event.remove(engine, "before_cursor_execute", latency)
+
+    if query_delay or hold_first_probe:
+        # A modest per-query roundtrip cost must fit the unchanged readiness
+        # deadline; this fails when every table is reflected independently.
+        monkeypatch.setattr(readiness, "_probe_database_engine", delayed_probe)
     environment = _doctor_environment(
         tmp_path,
         target=target,
@@ -412,7 +454,36 @@ def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
         before_landscape = tuple(sorted(inspect(landscape_owner).get_table_names()))
         web_app = create_app(settings)
         with TestClient(web_app) as client:
-            response = client.get("/api/ready")
+            try:
+                response = client.get("/api/ready")
+                if hold_first_probe:
+                    assert entered.is_set()
+                    assert response.status_code == 503
+                    by_name = {check["name"]: check for check in response.json()["checks"]}
+                    assert by_name["session_db"]["detail"] == "probe timed out"
+                    assert by_name["session_schema"]["ok"] is False
+            finally:
+                release.set()
+            # Readiness deliberately fails closed on a transient probe timeout.
+            # Wait for a fresh successful probe without relaxing its deadline or
+            # retrying a schema/auth/filesystem refusal. The cache expires in 2s.
+            deadline = time.monotonic() + 10
+            transient_details = {
+                "probe timed out",
+                "probe already in flight",
+                "probe failed (OperationalError)",
+                "not checked: connectivity probe failed",
+            }
+            while response.status_code == 503 and time.monotonic() < deadline:
+                failed_checks = [check for check in response.json()["checks"] if not check["ok"]]
+                if not failed_checks or any(
+                    check["name"] not in {"session_db", "session_schema", "landscape_db", "landscape_schema"}
+                    or check["detail"] not in transient_details
+                    for check in failed_checks
+                ):
+                    break
+                time.sleep(0.1)
+                response = client.get("/api/ready")
 
         assert response.status_code == 200, response.text
         assert response.json()["ready"] is True
@@ -421,6 +492,51 @@ def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
     finally:
         session_owner.dispose()
         landscape_owner.dispose()
+
+
+def test_external_apps_share_all_web_rate_budgets(tmp_path: Path, database_pair: _DatabasePair) -> None:
+    """Real startup wiring must enforce one budget across separate app instances."""
+    environment = _doctor_environment(
+        tmp_path,
+        target="kubernetes",
+        session_url=database_pair.session_owner_url,
+        landscape_url=database_pair.landscape_owner_url,
+    )
+    initialized = _invoke_doctor(environment, init_schema=True)
+    assert initialized.exit_code == 0, initialized.output
+    settings = _settings(
+        tmp_path,
+        target="kubernetes",
+        session_url=database_pair.session_owner_url,
+        landscape_url=database_pair.landscape_owner_url,
+    ).model_copy(
+        update={
+            "composer_rate_limit_per_minute": 2,
+            "write_rate_limit_per_minute": 2,
+            "auth_rate_limit_per_minute": 2,
+        }
+    )
+    first = create_app(settings)
+    second = create_app(settings)
+
+    async def check_budgets() -> None:
+        for left, right in (
+            (first.state.rate_limiter, second.state.rate_limiter),
+            (first.state.write_rate_limiter, second.state.write_rate_limiter),
+            (first.state.auth_rate_limiter, second.state.auth_rate_limiter),
+        ):
+            await left.check("shared-subject")
+            await right.check("shared-subject")
+            with pytest.raises(HTTPException) as refused:
+                await right.check("shared-subject")
+            assert refused.value.status_code == 429
+            assert int(refused.value.headers["Retry-After"]) > 0
+
+    try:
+        asyncio.run(check_budgets())
+    finally:
+        first.state.session_engine.dispose()
+        second.state.session_engine.dispose()
 
 
 def test_doctor_rejects_same_database_without_leaking_credentials(

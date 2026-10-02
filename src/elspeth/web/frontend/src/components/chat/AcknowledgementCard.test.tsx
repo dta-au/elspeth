@@ -65,7 +65,7 @@ function makeEvent(
     hash_domain_version: null,
     runtime_model_identifier_at_resolve: null,
     runtime_model_version_at_resolve: null,
-    resolved_prompt_template_hash: null,
+    approved_prompt_artifact_hash: null,
     ...overrides,
   };
 }
@@ -124,7 +124,11 @@ function renderCard(
       event={event}
       sessionId="sess-1"
       stepLabel={props.stepLabel ?? "Summarise"}
-      compositionState={props.compositionState}
+      compositionState={props.compositionState === undefined && event.kind === "llm_prompt_template" ? {
+        ...makeCompositionState(),
+        nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
+          options: { prompt_template: event.llm_draft ?? "" } }],
+      } : props.compositionState}
       showAmend={props.showAmend ?? event.kind === "vague_term"}
       onResolved={props.onResolved}
     />,
@@ -556,9 +560,12 @@ describe("AcknowledgementCard — amend", () => {
 // ── Error mapping ────────────────────────────────────────────────────────────
 
 describe("AcknowledgementCard — error mapping", () => {
-  it("409 → already-resolved-in-another-tab message", async () => {
+  it("coded 409 reports an already-resolved review without inventing another tab", async () => {
     const user = userEvent.setup();
-    vi.mocked(api.resolveInterpretation).mockRejectedValue(makeApiError(409));
+    vi.mocked(api.resolveInterpretation).mockRejectedValue({
+      ...makeApiError(409),
+      error_type: "interpretation_already_resolved",
+    });
     renderCard(makeEvent());
     await user.click(
       screen.getByRole("button", {
@@ -566,7 +573,8 @@ describe("AcknowledgementCard — error mapping", () => {
       }),
     );
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/already resolved in another tab/i);
+    expect(alert.textContent).toMatch(/already resolved/i);
+    expect(alert.textContent).not.toMatch(/another tab/i);
   });
 
   it("other (500) → generic could-not-resolve message with detail", async () => {
@@ -630,6 +638,87 @@ describe("AcknowledgementCard — error mapping", () => {
 // Approve button that stays disabled until the prompt has been viewed.
 
 describe("AcknowledgementCard — prompt-template View/Approve controls", () => {
+  it("does not approve a bounded draft while full prompt state is unavailable", async () => {
+    const user = userEvent.setup();
+    renderCard(makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" }), {
+      compositionState: null,
+    });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    await user.click(screen.getByRole("button", { name: /approve the llm prompt template/i }));
+    expect(api.resolveInterpretation).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /approve the llm prompt template/i })).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("requires viewing the full prompt after a collapsed preview loads", async () => {
+    const user = userEvent.setup();
+    const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" });
+    const { rerender } = renderCard(event, { compositionState: null });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    await user.click(screen.getByRole("button", { name: "Hide prompt" }));
+    const state: CompositionState = {
+      ...makeCompositionState(),
+      nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
+        options: { prompt_template: "Complete instruction previously omitted" } }],
+    };
+    rerender(<AcknowledgementCard event={event} sessionId="sess-1" stepLabel="Summarise" compositionState={state} />);
+    const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
+    expect(approve).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByText("Complete instruction previously omitted")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    expect(screen.getByText("Complete instruction previously omitted")).toBeVisible();
+    expect(approve).not.toHaveAttribute("aria-disabled");
+    vi.mocked(api.resolveInterpretation).mockResolvedValue(makeResolveResponse(event));
+    await user.click(approve);
+    expect(api.resolveInterpretation).toHaveBeenCalledTimes(1);
+  });
+
+  it("unlocks when the full prompt loads into an open disclosure and stays unlocked after collapse", async () => {
+    const user = userEvent.setup();
+    const event = makeEvent({ kind: "llm_prompt_template", llm_draft: "Shortened preview" });
+    const { rerender } = renderCard(event, { compositionState: null });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const approve = screen.getByRole("button", { name: /approve the llm prompt template/i });
+    expect(approve).toHaveAttribute("aria-disabled", "true");
+    const state: CompositionState = {
+      ...makeCompositionState(),
+      nodes: [{ id: "node-1", node_type: "transform", plugin: "llm", input: "rows", on_success: null, on_error: null,
+        options: { prompt_template: "Complete instruction previously omitted" } }],
+    };
+    rerender(<AcknowledgementCard event={event} sessionId="sess-1" stepLabel="Summarise" compositionState={state} />);
+    expect(screen.getByText("Complete instruction previously omitted")).toBeVisible();
+    expect(approve).not.toHaveAttribute("aria-disabled");
+    await user.click(screen.getByRole("button", { name: "Hide prompt" }));
+    expect(approve).not.toHaveAttribute("aria-disabled");
+  });
+
+  it("shows both prompt roles before approval of a single-prompt LLM node", async () => {
+    const user = userEvent.setup();
+    const state: CompositionState = {
+      ...makeCompositionState(7),
+      nodes: [{
+        id: "node-1", node_type: "transform", plugin: "llm",
+        input: "rows", on_success: null, on_error: null,
+        options: {
+          system_prompt: "You are a careful reviewer.",
+          prompt_template: "Summarise {{ row.text }}.",
+        },
+      }],
+    };
+    renderCard(
+      makeEvent({
+        kind: "llm_prompt_template",
+        llm_draft: "System prompt:\nYou are a careful reviewer.\n\nPrompt template:\nSummarise {{ row.text }}.",
+      }),
+      { showAmend: false, compositionState: state },
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    expect(region).toHaveTextContent("System prompt");
+    expect(region).toHaveTextContent("You are a careful reviewer.");
+    expect(region).toHaveTextContent("User prompt");
+    expect(region).toHaveTextContent("Summarise {{ row.text }}.");
+  });
+
   it("renders two distinct controls pre-view: an enabled View prompt toggle and a disabled Approve", () => {
     renderCard(
       makeEvent({
@@ -1168,6 +1257,83 @@ describe("AcknowledgementCard — resolved-prompt rendering", () => {
     );
     expect(slotText("resolved")).toBe("accepted value: concise and neutral");
     expect(slotText("pending")).toBeNull();
+  });
+
+  it("multi-query card: renders every query and the live node-level template, in a scrolling region", async () => {
+    // The bounded staging-time draft omits queries the review anchor covers;
+    // the card must show the live, complete surface instead.
+    const user = userEvent.setup();
+    const queries: Record<string, unknown> = {};
+    for (let index = 0; index < 40; index += 1) {
+      queries[`q_${index}`] = {
+        template: `Template ${index}: ${"words ".repeat(50)}done ${index}.`,
+      };
+    }
+    queries.shared = {};
+    const frozenDraft =
+      "Multi-query LLM node: for every row the model receives one call per query below.\n\nQueries not listed in this draft: the last 18 of 41; the review attests their names and templates in full.";
+    const state: CompositionState = {
+      ...makeCompositionState(7),
+      nodes: [
+        {
+          id: "node-1",
+          node_type: "transform",
+          plugin: "llm",
+          input: "rows",
+          on_success: null,
+          on_error: null,
+          options: {
+            prompt_template: "Summarise concise and neutral.",
+            prompt_template_parts: [
+              { kind: "text", text: "Summarise " },
+              { kind: "interpretation_ref", requirement_id: "req-1" },
+              { kind: "text", text: "." },
+            ],
+            interpretation_requirements: [RESOLVED_REQUIREMENT],
+            system_prompt: "Reply briefly.",
+            queries,
+          },
+        },
+      ],
+    };
+    renderCard(
+      makeEvent({ kind: "llm_prompt_template", llm_draft: frozenDraft }),
+      { showAmend: false, compositionState: state },
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+
+    const region = screen.getByRole("region", {
+      name: /prompt template review/i,
+    });
+    // A long surface scrolls inside the region rather than growing the card.
+    expect(region.style.maxHeight).toBe("16rem");
+    expect(region.style.overflow).toBe("auto");
+    const primaryPre = region.querySelector("pre.ack-card-prompt-pre");
+    const text = primaryPre?.textContent ?? "";
+    expect(text).toContain("System prompt (sent with every query):\nReply briefly.\n");
+    for (let index = 0; index < 40; index += 1) {
+      expect(text).toContain(
+        `Query 'q_${index}':\nTemplate ${index}: ${"words ".repeat(50)}done ${index}.\n`,
+      );
+    }
+    expect(text).toContain(
+      "Query 'shared': uses the node-level prompt_template (below).",
+    );
+    expect(text).toContain(
+      "Node-level prompt_template, used by queries without their own template: shared\nSummarise accepted value: concise and neutral.",
+    );
+    expect(text).not.toContain("not listed");
+    // Slot highlighting still works inside the node-level template.
+    const mark = region.querySelector("mark.ack-card-prompt-slot--resolved");
+    expect(mark?.textContent).toBe("accepted value: concise and neutral");
+    expect(screen.getByText("Accepted value")).toBeTruthy();
+    // Every part rendered from live options: no stored-template notice.
+    expect(screen.queryByText(/showing the stored prompt template/i)).toBeNull();
+    // The frozen draft stays reachable only behind the secondary disclosure.
+    const disclosure = screen.getByText("View original template");
+    expect(disclosure.closest("details")?.textContent).toContain(
+      "Queries not listed in this draft",
+    );
   });
 });
 

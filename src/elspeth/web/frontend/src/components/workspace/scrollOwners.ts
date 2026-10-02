@@ -24,9 +24,7 @@
  * `authoring` would trip the cap in a state the layout permits.
  */
 export const WORKSPACE_SCROLL_OWNERS = [
-  // The conversation transcript. Bound by BOTH `.chat-panel-messages`
-  // (freeform) and `.guided-authoring-scroll` (guided): the two mount
-  // exclusively, so one name — and the cap holds the exclusivity.
+  // The conversation transcript in `.chat-panel-messages`.
   "authoring",
   // Docked chrome between transcript and composer (elspeth-ecf973fb9f). A
   // scroll container BY DESIGN: that is what zeroes its automatic minimum
@@ -38,8 +36,8 @@ export const WORKSPACE_SCROLL_OWNERS = [
   // The active artifact tab panel — the one owner that may also scroll
   // horizontally (wide YAML, wide graphs).
   "artifact",
-  // The inspector drawer's body.
-  "inspector",
+  // Expanded Workflow Wiring table, capped so it does not consume the graph.
+  "wiring",
 ] as const;
 
 export type WorkspaceScrollOwner = (typeof WORKSPACE_SCROLL_OWNERS)[number];

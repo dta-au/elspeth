@@ -147,6 +147,7 @@
         "json",
         "llm",
         "null",
+        "power_automate",
         "text"
       ],
       "transforms": [
@@ -154,6 +155,7 @@
         "aws_bedrock_prompt_shield",
         "aws_textract_document_analysis",
         "aws_textract_inline_analysis",
+        "azure_ai_search",
         "azure_content_safety",
         "azure_document_intelligence",
         "azure_prompt_shield",
@@ -165,6 +167,7 @@
         "batch_experiment_compare",
         "batch_outlier_annotator",
         "batch_paired_preference",
+        "batch_rank",
         "batch_replicate",
         "batch_stats",
         "batch_threshold_summary",
@@ -197,6 +200,7 @@
         "dataverse",
         "document",
         "json",
+        "power_automate",
         "text"
       ],
       "inventory_rule": "The list is the literal class-level plugin name inventory under src/elspeth/plugins at the assessed commit; a catalog revision is required when it changes."
@@ -6677,7 +6681,7 @@
       "id": "PB-01",
       "family": "production_boundary",
       "title": "Source ingress",
-      "contract": "Accepted rows enter TS-02 with source completion; before plugin execution resume repairs only an exact pre-fix missing-witness image and fails closed on ambiguity, while pre-row failures and quarantine exclusions create no scheduler work.",
+      "contract": "Accepted rows enter TS-02 with source completion; before plugin execution resume repairs only an exact pre-fix missing-witness image and fails closed on ambiguity. Pre-row source failures create no scheduler work; a quarantined source row atomically records its row, token, failed source state, DIVERT routing event, and durable PENDING_SINK work item.",
       "required_cases": [
         {
           "case_id": "leg-contract",
@@ -15494,6 +15498,531 @@
           }
         },
         {
+          "case_id": "source:power_automate@sas_url",
+          "plugin_key": "source:power_automate",
+          "variant_id": "sas_url",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "source:power_automate@service_principal",
+          "plugin_key": "source:power_automate",
+          "variant_id": "service_principal",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "source:power_automate@managed_identity",
+          "plugin_key": "source:power_automate",
+          "variant_id": "managed_identity",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
           "case_id": "transform:aws_bedrock_content_safety",
           "plugin_key": "transform:aws_bedrock_content_safety",
           "variant_id": "default",
@@ -18296,6 +18825,181 @@
         {
           "case_id": "transform:batch_paired_preference",
           "plugin_key": "transform:batch_paired_preference",
+          "variant_id": "default",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "transform:batch_rank",
+          "plugin_key": "transform:batch_rank",
           "variant_id": "default",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
@@ -21619,9 +22323,9 @@
           }
         },
         {
-          "case_id": "transform:rag_retrieval@azure-search-api-key",
-          "plugin_key": "transform:rag_retrieval",
-          "variant_id": "azure-search-api-key",
+          "case_id": "transform:azure_ai_search@api-key",
+          "plugin_key": "transform:azure_ai_search",
+          "variant_id": "api-key",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -21794,9 +22498,9 @@
           }
         },
         {
-          "case_id": "transform:rag_retrieval@azure-search-managed-identity",
-          "plugin_key": "transform:rag_retrieval",
-          "variant_id": "azure-search-managed-identity",
+          "case_id": "transform:azure_ai_search@managed-identity",
+          "plugin_key": "transform:azure_ai_search",
+          "variant_id": "managed-identity",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -25992,6 +26696,531 @@
               }
             }
           }
+        },
+        {
+          "case_id": "sink:power_automate@sas_url",
+          "plugin_key": "sink:power_automate",
+          "variant_id": "sas_url",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "sink:power_automate@service_principal",
+          "plugin_key": "sink:power_automate",
+          "variant_id": "service_principal",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "sink:power_automate@managed_identity",
+          "plugin_key": "sink:power_automate",
+          "variant_id": "managed_identity",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
         }
       ]
     },
@@ -29578,8 +30807,8 @@
     {
       "id": "RM-09",
       "family": "read_model",
-      "title": "Active source-row scheduler identities",
-      "contract": "Returns the exact row identities with non-final scheduler work that drive mixed scheduler/source resume refusal.",
+      "title": "Retired: active source-row scheduler identities",
+      "contract": "Retired after QR: resume re-drives durable scheduler work; no active source-row identity read model or mixed scheduler/source refusal remains.",
       "required_cases": [
         {
           "case_id": "leg-contract",
@@ -29588,170 +30817,170 @@
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "sqlite-wal-same-host-leader-plus-claim-only-followers": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "postgresql-16-aws-single-leader-landscape": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             }
           }
@@ -29761,8 +30990,8 @@
     {
       "id": "RM-10",
       "family": "read_model",
-      "title": "Blocked barrier token identities",
-      "contract": "Returns the exact distinct token identities represented by barrier-backed BLOCKED work so buffered tokens are excluded from redrive.",
+      "title": "Retired: blocked barrier token identities",
+      "contract": "Retired after QR: barrier journal restoration and durable scheduler work own buffered-token recovery; no blocked-barrier token identity read model remains.",
       "required_cases": [
         {
           "case_id": "leg-contract",
@@ -29771,170 +31000,170 @@
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "sqlite-wal-same-host-leader-plus-claim-only-followers": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "postgresql-16-aws-single-leader-landscape": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             }
           }

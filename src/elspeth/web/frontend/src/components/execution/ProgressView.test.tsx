@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ProgressView } from "./ProgressView";
 import { useWebSocket } from "@/hooks/useWebSocket";
+import { useExecutionStore } from "@/stores/executionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
@@ -36,6 +37,10 @@ describe("ProgressView", () => {
     vi.clearAllMocks();
     resetStore(usePreferencesStore);
     resetStore(useSessionStore);
+    // ProgressView reads wsStreamEnded straight from the execution store
+    // rather than through the mocked useWebSocket hook, so this store has to
+    // be reset here too or the banner cases below leak into every later test.
+    resetStore(useExecutionStore);
   });
 
   it("renders live progress with explicit source and token units", () => {
@@ -160,6 +165,7 @@ describe("ProgressView", () => {
             quarantined: 0,
             discarded: 0,
           },
+          collector_groups_failed: 0,
           integrity: {
             closure: "closed",
             missing_terminal_outcomes: 0,
@@ -428,6 +434,51 @@ describe("ProgressView", () => {
 
     expect(screen.queryByText("Running — counts so far")).not.toBeInTheDocument();
   });
+
+  // Disconnect banner (polling audit 2026-09-22, finding 1). The two causes
+  // are not interchangeable: one is a socket that is retrying by itself, the
+  // other is a stream the server ended for good, where a REST status poll is
+  // the only thing that will ever retire the run. Telling a user "Reconnecting"
+  // when nothing is reconnecting is the visible half of that defect.
+  it("says the connection is reconnecting while the socket is still retrying", () => {
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: true,
+      progress: progressFixture({ status: "running" }),
+    });
+
+    render(<ProgressView />);
+
+    expect(screen.getByText("Live progress connection lost. Reconnecting...")).toBeInTheDocument();
+    expect(screen.queryByText(/connection ended/)).not.toBeInTheDocument();
+  });
+
+  it("says the connection ended once the stream is over and only the status poll remains", () => {
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: true,
+      progress: progressFixture({ status: "running" }),
+    });
+    useExecutionStore.setState({ wsStreamEnded: true });
+
+    render(<ProgressView />);
+
+    expect(screen.getByText("Live progress connection ended. Checking run status...")).toBeInTheDocument();
+    expect(screen.queryByText(/Reconnecting/)).not.toBeInTheDocument();
+  });
+
+  it("hides the disconnect banner entirely once the run is terminal", () => {
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: true,
+      progress: progressFixture({ status: "completed" }),
+    });
+    useExecutionStore.setState({ wsStreamEnded: true });
+
+    render(<ProgressView />);
+
+    expect(screen.queryByText(/Live progress connection/)).not.toBeInTheDocument();
+  });
 });
 
 function mountProgress(overrides: Record<string, unknown>) {
@@ -444,6 +495,7 @@ function accounting(integrity: Partial<{ closure: string; missing_terminal_outco
     source: { rows_processed: 1, rows_rejected: 0, rows_read: 1 },
     tokens: { emitted: 4, terminal: 4, succeeded: 4, failed: 0, structural: 0, pending: 0, abandoned: 0 },
     routing: { routed_success: 0, routed_failure: 0, quarantined: 0, discarded: 0 },
+    collector_groups_failed: 0,
     integrity: { closure: "closed", missing_terminal_outcomes: 0, duplicate_terminal_outcomes: 0, ...integrity },
   };
 }
@@ -451,17 +503,26 @@ function accounting(integrity: Partial<{ closure: string; missing_terminal_outco
 describe("detail level (elspeth-05a240b82a)", () => {
   beforeEach(() => {
     resetStore(usePreferencesStore);
+    resetStore(useExecutionStore);
     useSessionStore.setState({ compositionState: null } as never);
   });
 
-  it("keeps the closure verdict visible and collapses the six-cell grid by default", () => {
+  it("keeps the closure verdict visible and collapses the accounting grid by default", () => {
     const { container } = mountProgress({ status: "completed", accounting: accounting({}) });
     expect(screen.getByText("Audit closure: complete — every row is accounted for.")).toBeInTheDocument();
     const detail = screen.getByText("Accounting detail").closest("details") as HTMLElement;
     expect(detail).not.toBeNull();
     expect(detail).not.toHaveAttribute("open");
     expect(within(detail).getByText("Tokens emitted")).toBeInTheDocument();
+    expect(within(detail).getByText("Collector groups failed")).toBeInTheDocument();
     expectNoIdentifiersInDefaultDom(container);
+  });
+
+  it("shows failed collector groups separately from failed tokens", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    mountProgress({ status: "completed_with_failures", accounting: { ...accounting({}), collector_groups_failed: 1 } });
+    const detail = screen.getByText("Accounting detail").closest("details") as HTMLElement;
+    expect(within(detail).getByText("Collector groups failed").nextElementSibling).toHaveTextContent("1");
   });
 
   it("opens the grid when show_advanced is on, and keeps integrity warnings out of the disclosure", () => {

@@ -541,7 +541,7 @@ locals {
     { name = "ELSPETH_WEB__PUBLIC_BASE_URL", value = "https://${aws_lb.web.dns_name}" },
     # Stamped into exports, library rows and audit metadata. The scenario is
     # the compartment for a disposable acceptance environment.
-    { name = "ELSPETH_WEB__COMPARTMENT_ID", value = var.scenario_id },
+    { name = "ELSPETH_WEB__COMPARTMENT_ID", value = local.scenario_id_lower },
     { name = "ELSPETH_WEB__QUOTA_DEFAULT_TOKENS_PER_DAY", value = tostring(var.quota_default_tokens_per_day) },
     { name = "ELSPETH_WEB__QUOTA_DEFAULT_STORAGE_BYTES", value = tostring(var.quota_default_storage_bytes) },
     ], local.bedrock_backend ? [] : [

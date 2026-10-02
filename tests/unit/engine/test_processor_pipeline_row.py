@@ -1,7 +1,7 @@
 # tests/unit/engine/test_processor_pipeline_row.py
 """Tests for RowProcessor with PipelineRow support (Task 6)."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -9,9 +9,9 @@ from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.engine.processor import DAGTraversalContext
 from elspeth.engine.spans import SpanFactory
-from elspeth.testing import make_field, make_row, make_source_row
+from elspeth.testing import make_field, make_source_row
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import make_recorder_with_run
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 
 def _make_contract() -> SchemaContract:
@@ -39,9 +39,9 @@ def _make_mock_factory() -> MagicMock:
         source_plugin_name="test-source",
     )
     factory = setup.factory
-    factory.data_flow.create_row = MagicMock(wraps=factory.data_flow.create_row)  # type: ignore[method-assign]
     factory.data_flow.create_token = MagicMock(wraps=factory.data_flow.create_token)  # type: ignore[method-assign]
     factory.data_flow.create_row_with_token = MagicMock(wraps=factory.data_flow.create_row_with_token)  # type: ignore[method-assign]
+    factory.data_flow.insert_row_with_token_on = MagicMock(wraps=factory.data_flow.insert_row_with_token_on)
     return factory  # type: ignore[return-value]
 
 
@@ -80,6 +80,7 @@ class TestRowProcessorPipelineRow:
             source_plugin=None,
             traversal=_empty_traversal(),
             scheduler=factory.scheduler,
+            coordination_token=leader_coordination_token(factory, "run_001"),
         )
 
         assert processor._source_plugin is None
@@ -102,10 +103,13 @@ class TestRowProcessorPipelineRow:
             source_plugin=None,
             traversal=_empty_traversal(),
             scheduler=factory.scheduler,
+            coordination_token=leader_coordination_token(factory, "run_001"),
         )
 
         source_row = make_source_row({"amount": 100}, contract=contract)
-        ctx = make_context(run_id="run_001", landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            coordination_token=leader_coordination_token(factory, "run_001"), run_id="run_001", landscape=factory.plugin_audit_writer()
+        )
 
         # No transforms - token should be created and completed immediately
         processor.process_row(
@@ -118,7 +122,7 @@ class TestRowProcessorPipelineRow:
         )
 
         # Should have created a row and token atomically via data_flow repository
-        factory.data_flow.create_row_with_token.assert_called_once()
+        factory.data_flow.insert_row_with_token_on.assert_called_once()
 
     def test_process_row_creates_pipeline_row(self) -> None:
         """process_row should create token with PipelineRow containing contract."""
@@ -137,10 +141,13 @@ class TestRowProcessorPipelineRow:
             source_on_success="default",
             traversal=_empty_traversal(),
             scheduler=factory.scheduler,
+            coordination_token=leader_coordination_token(factory, "run_001"),
         )
 
         source_row = make_source_row({"amount": 100}, contract=contract)
-        ctx = make_context(run_id="run_001", landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            coordination_token=leader_coordination_token(factory, "run_001"), run_id="run_001", landscape=factory.plugin_audit_writer()
+        )
 
         results = processor.process_row(
             row_index=0,
@@ -158,133 +165,9 @@ class TestRowProcessorPipelineRow:
         assert result.token.row_data["amount"] == 100
         assert result.token.row_data.contract is contract
 
-    def test_process_row_requires_contract_on_source_row(self) -> None:
-        """process_row should raise if SourceRow has no contract.
-
-        The error propagates from TokenManager.create_initial_token(),
-        which enforces this requirement.
-        """
-        from elspeth.engine.processor import RowProcessor
-
-        factory = _make_mock_factory()
-        span_factory = _make_mock_span_factory()
-
-        RowProcessor(
-            execution=factory.execution,
-            data_flow=factory.data_flow,
-            span_factory=span_factory,
-            run_id="run_001",
-            source_node_id=NodeID("source_001"),
-            source_on_success="default",
-            traversal=_empty_traversal(),
-            scheduler=factory.scheduler,
-        )
-
-        # Since elspeth-a27e71979f, SourceRow.__post_init__ rejects contract=None
-        # at construction time, so the engine's guard is now unreachable via
-        # normal construction. Verify the earlier guard fires instead.
+    def test_source_row_requires_contract_before_processing(self) -> None:
+        """A non-quarantined source row rejects a missing contract at construction."""
         from elspeth.contracts import SourceRow
 
-        with pytest.raises(TypeError, match="contract"):
-            SourceRow.valid({"amount": 100})  # type: ignore[call-arg]
-
-
-class TestRowProcessorExistingRow:
-    """Tests for RowProcessor.process_existing_row() with PipelineRow."""
-
-    def test_process_existing_row_accepts_pipeline_row(self) -> None:
-        """process_existing_row should accept PipelineRow for resume scenarios."""
-        from elspeth.engine.processor import RowProcessor
-
-        contract = _make_contract()
-        factory = _make_mock_factory()
-        span_factory = _make_mock_span_factory()
-
-        processor = RowProcessor(
-            execution=factory.execution,
-            data_flow=factory.data_flow,
-            span_factory=span_factory,
-            run_id="run_001",
-            source_node_id=NodeID("source_001"),
-            source_on_success="default",
-            traversal=_empty_traversal(),
-            scheduler=factory.scheduler,
-        )
-
-        # PipelineRow for resume (row already exists in database)
-        row_data = make_row({"amount": 100}, contract=contract)
-        factory.data_flow.create_row(
-            run_id="run_001",
-            source_node_id="source_001",
-            row_index=0,
-            source_row_index=0,
-            ingest_sequence=0,
-            row_id="existing_row_001",
-            data=row_data.to_dict(),
-        )
-        factory.data_flow.create_row.reset_mock()
-        ctx = make_context(run_id="run_001", landscape=factory.plugin_audit_writer())
-
-        results = processor.process_existing_row(
-            row_id="existing_row_001",
-            row_data=row_data,
-            transforms=[],
-            ctx=ctx,
-        )
-
-        # Should create token for existing row (NOT create_row)
-        factory.data_flow.create_token.assert_called_once()
-        factory.data_flow.create_row.assert_not_called()
-
-        # Single-token no-transform resume path should produce exactly one terminal result.
-        assert len(results) == 1
-        [result] = results
-        assert isinstance(result.token.row_data, PipelineRow)
-        assert result.token.row_data.contract is contract
-
-    def test_process_existing_row_does_not_run_source_boundary_checks(self) -> None:
-        """Resume path reuses original source provenance and skips source boundary VAL."""
-        from elspeth.engine.processor import RowProcessor
-
-        contract = _make_contract()
-        factory = _make_mock_factory()
-        span_factory = _make_mock_span_factory()
-        source_plugin = type("ResumeSourcePlugin", (), {})()
-        source_plugin.name = "resume-source"
-        source_plugin.node_id = "source_001"
-        source_plugin.declared_guaranteed_fields = frozenset({"amount"})
-
-        processor = RowProcessor(
-            execution=factory.execution,
-            data_flow=factory.data_flow,
-            span_factory=span_factory,
-            run_id="run_001",
-            source_node_id=NodeID("source_001"),
-            source_on_success="default",
-            source_plugin=source_plugin,
-            traversal=_empty_traversal(),
-            scheduler=factory.scheduler,
-        )
-
-        row_data = make_row({"amount": 100}, contract=contract)
-        factory.data_flow.create_row(
-            run_id="run_001",
-            source_node_id="source_001",
-            row_index=0,
-            source_row_index=0,
-            ingest_sequence=0,
-            row_id="existing_row_001",
-            data=row_data.to_dict(),
-        )
-        factory.data_flow.create_row.reset_mock()
-        ctx = make_context(run_id="run_001", landscape=factory.plugin_audit_writer())
-
-        with patch("elspeth.engine.processor.run_boundary_checks") as boundary_check:
-            processor.process_existing_row(
-                row_id="existing_row_001",
-                row_data=row_data,
-                transforms=[],
-                ctx=ctx,
-            )
-
-        boundary_check.assert_not_called()
+        with pytest.raises(ValueError, match="Valid SourceRow must have a contract"):
+            SourceRow(row={"amount": 100}, is_quarantined=False, contract=None, source_row_index=0)

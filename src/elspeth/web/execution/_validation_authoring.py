@@ -39,6 +39,7 @@ from elspeth.web.execution._semantic_helpers import (
     semantic_component_attribution,
     serialize_semantic_contracts,
 )
+from elspeth.web.execution._validation_materialization import _source_policy_component_id
 from elspeth.web.execution._validation_model import (
     AuthoredValidatedState,
     InterpretationValidatedState,
@@ -92,6 +93,7 @@ _DEFAULT_PLUGIN_POLICY_SUGGESTION = "Choose an available plugin or repair the re
 
 _WEB_HTTP_FETCH_MAX_TIMEOUT_SECONDS = 30
 _WEB_HTTP_FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024
+_WEB_HTTP_FETCH_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 _WEB_HTTP_FETCH_INT_ADAPTER: TypeAdapter[int] = TypeAdapter(int)
 
 
@@ -278,7 +280,7 @@ def validate_path_policy(
 
     for source_name, source in state.sources.items():
         source_options = dict(source.options)
-        source_component = "source" if source_name == "source" else f"source:{source_name}"
+        source_component = _source_policy_component_id(source_name)
         for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
             value = source_options.get(key)
             if value is None:
@@ -386,10 +388,11 @@ def validate_path_policy(
     # ``node.plugin is None`` rather than a node-kind set: only a node that
     # hosts a plugin can have that plugin act on the path, and this adds no
     # fifth restatement of the node-kind vocabulary (elspeth-b3117ec3ac).
-    # Structural kinds CAN carry an inert ``provider_config`` today
-    # (gate/queue/coalesce accept it; only row_union rejects non-empty
-    # options), so skipping them is deliberate: gating an option nothing
-    # reads would reject a harmless composition that passes today.
+    # Structural kinds already refuse a stray ``provider_config`` at composer
+    # validation (gate_config_invalid, coalesce_config_invalid, the queue
+    # option allowlist, row_union's empty-options rule), so skipping them here
+    # is deliberate: this gate would only restate that refusal for an option
+    # no plugin reads.
     #
     # The gate fires on the RESOLVED PATH, not on the option's presence — an
     # in-subtree persist_directory passes on every node kind — so widening
@@ -609,6 +612,35 @@ def validate_web_resource_policy(
                             error_code="web_fetch_resource_limit_exceeded",
                         )
                     )
+            if "max_request_body_bytes" in http_options:
+                raw_max_request_body_bytes = http_options["max_request_body_bytes"]
+                parsed_max_request_body_bytes = _parse_resource_limit(
+                    raw_max_request_body_bytes,
+                    component_id=node.id,
+                    plugin_name=node.plugin,
+                    option_name="max_request_body_bytes",
+                    maximum=_WEB_HTTP_FETCH_MAX_REQUEST_BODY_BYTES,
+                )
+                if parsed_max_request_body_bytes.error is not None:
+                    errors.append(parsed_max_request_body_bytes.error)
+                elif (
+                    parsed_max_request_body_bytes.value is not None
+                    and parsed_max_request_body_bytes.value > _WEB_HTTP_FETCH_MAX_REQUEST_BODY_BYTES
+                ):
+                    errors.append(
+                        ValidationError(
+                            component_id=node.id,
+                            component_type="transform",
+                            message=(
+                                f"{node.plugin}.http.max_request_body_bytes={parsed_max_request_body_bytes.value} "
+                                f"exceeds the web execution limit of {_WEB_HTTP_FETCH_MAX_REQUEST_BODY_BYTES} bytes."
+                            ),
+                            suggestion=(
+                                f"Set {node.plugin}.http.max_request_body_bytes to {_WEB_HTTP_FETCH_MAX_REQUEST_BODY_BYTES} or less."
+                            ),
+                            error_code="web_fetch_resource_limit_exceeded",
+                        )
+                    )
     if errors:
         return PhaseFailure(
             passed_checks=(),
@@ -733,7 +765,7 @@ def validate_secret_evidence(
     if secret_service is not None and user_id is not None:
         env_ref_names = {item.name for item in secret_service.list_refs(user_id)}
         for source_name, source in state.sources.items():
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
+            source_component = _source_policy_component_id(source_name)
             all_refs.extend(_collect_secret_refs(source.options, env_ref_names))
             fabricated = collect_credential_field_violations(source.options, env_ref_names)
             if fabricated:
@@ -775,7 +807,7 @@ def validate_secret_evidence(
         # profile-lowered credential markers are server-authored and exempt.
         authored = policy.authored_state
         for source_name, source in authored.sources.items():
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
+            source_component = _source_policy_component_id(source_name)
             _collect_unauthorized(source_component, "source", source.plugin, source.options)
         for node in authored.nodes:
             _collect_unauthorized(node.id, "transform", node.plugin or "<unset>", node.options)

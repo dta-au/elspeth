@@ -95,7 +95,7 @@ def test_unspecced_mock_gate_rejects_new_file_regressions(tmp_path: Path, monkey
         test_no_unspecced_direct_mock_constructors()
 
 
-def test_claude_code_is_scanned_but_nested_agent_worktrees_are_pruned(
+def test_claude_code_is_scanned_but_nested_agent_state_is_pruned(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -105,6 +105,9 @@ def test_claude_code_is_scanned_but_nested_agent_worktrees_are_pruned(
     worktree = tmp_path / ".claude" / "worktrees" / "agent" / "ignored.py"
     worktree.parent.mkdir(parents=True)
     worktree.write_text("from unittest.mock import Mock\nMock()\n", encoding="utf-8")
+    lane = tmp_path / ".claude" / "lanes" / "campaign" / "ignored.py"
+    lane.parent.mkdir(parents=True)
+    lane.write_text("from unittest.mock import Mock\nMock()\n", encoding="utf-8")
     module = sys.modules[__name__]
     monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(module, "SCAN_ROOT", tmp_path)

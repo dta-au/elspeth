@@ -8,15 +8,19 @@ tracer wiring, and multi-query partial failure atomicity.
 
 from __future__ import annotations
 
+import json
 import threading
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.errors import RuntimePreflightFailedError
+from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import TransformResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
@@ -29,6 +33,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
+from elspeth.plugins.infrastructure.templates import ALL_FIELDS
 from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
     LLMAuditParent,
@@ -37,6 +42,7 @@ from elspeth.plugins.transforms.llm.provider import (
     UnrecognizedFinishReason,
 )
 from elspeth.testing import make_field, make_pipeline_row
+from tests.fixtures.factories import make_context
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -98,14 +104,12 @@ def _make_row(data: dict[str, Any] | None = None) -> PipelineRow:
     return make_pipeline_row(data or {"text": "hello"})
 
 
-def _make_ctx() -> SimpleNamespace:
-    """Create a minimal transform context double."""
-    return SimpleNamespace(
+def _make_ctx() -> PluginContext:
+    """Create an explicitly authorized mock transform context."""
+    return make_context(
         state_id="state-123",
         run_id="run-123",
-        token=SimpleNamespace(token_id="token-1"),
-        shutdown_event=None,
-        payload_store=None,
+        token=TokenInfo(row_id="row-1", token_id="token-1", row_data=make_pipeline_row({})),
     )
 
 
@@ -148,6 +152,179 @@ def _declared_input_row() -> PipelineRow:
             locked=True,
         ),
     )
+
+
+@pytest.mark.parametrize("multi_query", [False, True], ids=["single", "multi"])
+@pytest.mark.parametrize(
+    ("output_type", "python_type", "value"),
+    [("string", str, "green"), ("integer", int, 3), ("number", float, 0.5), ("boolean", bool, True), ("enum", str, "green")],
+)
+def test_successful_structured_fields_are_required_and_nonnullable(
+    multi_query: bool, output_type: str, python_type: type, value: object
+) -> None:
+    output_field = {"suffix": "answer", "type": output_type}
+    if output_type == "enum":
+        output_field["values"] = ["green", "blue"]
+    config = _make_config(schema={"mode": "flexible", "fields": ["text: str"]})
+    if multi_query:
+        config["queries"] = {"quality": {"input_fields": {"text": "text"}, "output_fields": [output_field]}}
+    else:
+        config["output_fields"] = [output_field]
+    transform, provider = _make_transform_with_mock_provider(config)
+    provider.execute_query.return_value = LLMQueryResult(
+        content=json.dumps({"answer": value}), usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
+    )
+    result = transform._process_row(_make_row(), _make_ctx())
+    assert result.status == "success"
+    assert result.row is not None
+    _run_post_emission_check(transform, result.row)
+    field_name = "quality_answer" if multi_query else "answer"
+    prefix = "quality_llm_response" if multi_query else "llm_response"
+    data = result.row.to_dict()
+    transform.output_schema.model_validate(data, strict=True)
+    assert transform._output_schema_config is not None
+    declared = {field.name: field for field in transform._output_schema_config.fields}
+    for name, expected_type in ((field_name, python_type), (prefix, str), (f"{prefix}_model", str)):
+        model_field = transform.output_schema.model_fields[name]
+        assert model_field.annotation is expected_type
+        assert model_field.is_required()
+        assert declared[name].required is True
+        assert declared[name].nullable is False
+        emitted = result.row.contract.get_field(name)
+        assert emitted.python_type is expected_type
+        assert emitted.required is True
+        assert emitted.nullable is False
+        for invalid in ({key: item for key, item in data.items() if key != name}, {**data, name: None}):
+            with pytest.raises(ValidationError):
+                transform.output_schema.model_validate(invalid, strict=True)
+    usage_name = f"{prefix}_usage"
+    assert transform.output_schema.model_fields[usage_name].is_required()
+    assert declared[usage_name].field_type == "any"
+    with pytest.raises(ValidationError):
+        transform.output_schema.model_validate({key: item for key, item in data.items() if key != usage_name}, strict=True)
+
+
+@pytest.mark.parametrize("multi_query", [False, True], ids=["single", "multi"])
+def test_observed_success_preserves_dynamic_schema_and_upstream_contract(multi_query: bool) -> None:
+    config = _make_config()
+    output_fields = [{"suffix": "answer", "type": "string"}]
+    if multi_query:
+        config["queries"] = {"quality": {"input_fields": {"text": "text"}, "output_fields": output_fields}}
+    else:
+        config["output_fields"] = output_fields
+    transform, provider = _make_transform_with_mock_provider(config)
+    provider.execute_query.return_value = LLMQueryResult(
+        content='{"answer": "green"}', usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
+    )
+    row = _make_row({"text": "hello", "upstream": 7})
+    result = transform._process_row(row, _make_ctx())
+    assert result.status == "success"
+    assert result.row is not None
+    _run_post_emission_check(transform, result.row)
+    assert not transform.output_schema.model_fields
+    assert transform._output_schema_config is not None
+    assert transform._output_schema_config.fields is None
+    assert result.row["upstream"] == 7
+    assert result.row.contract.get_field("upstream") == row.contract.get_field("upstream")
+
+
+@pytest.mark.parametrize("response_field", ["llm_response", "custom_response"])
+@pytest.mark.parametrize("collision_suffix", ["", "_model", "_usage"])
+def test_multi_query_operational_fields_keep_emission_precedence(response_field: str, collision_suffix: str) -> None:
+    """Accepted name collisions must describe the operational value that wins at emission."""
+    suffix = f"{response_field}{collision_suffix}"
+    config = _make_config(
+        response_field=response_field,
+        schema={"mode": "flexible", "fields": ["text: str"]},
+        queries={
+            "quality": {
+                "input_fields": {"text": "text"},
+                "output_fields": [{"suffix": suffix, "type": "integer"}, {"suffix": "answer", "type": "integer"}],
+            }
+        },
+    )
+    transform, provider = _make_transform_with_mock_provider(config)
+    content = json.dumps({suffix: 42, "answer": 7})
+    usage = TokenUsage.known(10, 5)
+    provider.execute_query.return_value = LLMQueryResult(content=content, usage=usage, model="gpt-4o", finish_reason=FinishReason.STOP)
+    result = transform._process_row(_make_row(), _make_ctx())
+    assert result.status == "success"
+    assert result.row is not None
+    _run_post_emission_check(transform, result.row)
+    transform.output_schema.model_validate(result.row.to_dict(), strict=True)
+    prefix = f"quality_{response_field}"
+    assert result.row[prefix] == content
+    assert result.row[f"{prefix}_model"] == "gpt-4o"
+    assert result.row[f"{prefix}_usage"] == usage.to_dict()
+    assert result.row["quality_answer"] == 7
+    assert transform._output_schema_config is not None
+    assert transform._output_schema_config.fields is not None
+    names = [field.name for field in transform._output_schema_config.fields]
+    assert names == ["text", prefix, f"{prefix}_usage", f"{prefix}_model", "quality_answer"]
+    assert list(transform.output_schema.model_fields) == names
+    for name, expected_type in ((prefix, str), (f"{prefix}_model", str), (f"{prefix}_usage", object), ("quality_answer", int)):
+        emitted = result.row.contract.get_field(name)
+        assert emitted.python_type is expected_type
+        assert emitted.required is True
+        assert emitted.nullable is (expected_type is object)
+        model_field = transform.output_schema.model_fields[name]
+        assert model_field.annotation is (Any if expected_type is object else expected_type)
+        assert model_field.is_required()
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+@pytest.mark.parametrize("suffix", ["llm_response", "llm_response_model", "llm_response_usage"])
+def test_operational_collision_output_admission_matches_the_emitted_type(compatible: bool, suffix: str) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+    emitted_type = "any" if suffix.endswith("_usage") else "str"
+    authored_type = emitted_type if compatible else "int"
+    config = _make_config(
+        schema={"mode": "flexible", "fields": ["text: str", f"quality_{suffix}: {authored_type}"]},
+        queries={"quality": {"input_fields": {"text": "text"}, "output_fields": [{"suffix": suffix, "type": "integer"}]}},
+    )
+    if not compatible:
+        with pytest.raises(PluginConfigError, match=r"never admits|token-usage mapping"):
+            LLMTransform(config)
+    else:
+        transform = LLMTransform(config)
+        declarations = {field.name: field.field_type for field in transform.created_output_fields()}
+        assert declarations[f"quality_{suffix}"] == emitted_type
+
+
+@pytest.mark.parametrize("operational_last", [False, True])
+def test_multi_query_overlapping_generated_fields_follow_query_order(operational_last: bool) -> None:
+    """Cross-query overlap follows the same last-query precedence as row assembly."""
+    queries = {
+        "quality": {"input_fields": {"text": "text"}, "output_fields": [{"suffix": "detail_llm_response", "type": "integer"}]},
+        "quality_detail": {"input_fields": {"text": "text"}},
+    }
+    if not operational_last:
+        queries = dict(reversed(tuple(queries.items())))
+    transform, provider = _make_transform_with_mock_provider(
+        _make_config(schema={"mode": "flexible", "fields": ["text: str"]}, queries=queries)
+    )
+    content = '{"detail_llm_response": 42}'
+    provider.execute_query.return_value = LLMQueryResult(
+        content=content, usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
+    )
+    result = transform._process_row(_make_row(), _make_ctx())
+    assert result.status == "success"
+    assert result.row is not None
+    _run_post_emission_check(transform, result.row)
+    transform.output_schema.model_validate(result.row.to_dict(), strict=True)
+    name = "quality_detail_llm_response"
+    assert result.row[name] == (content if operational_last else 42)
+    emitted = result.row.contract.get_field(name)
+    assert emitted.python_type is (str if operational_last else int)
+    assert emitted.required is True
+    assert emitted.nullable is False
+    assert transform._output_schema_config is not None
+    assert transform._output_schema_config.fields is not None
+    names = [field.name for field in transform._output_schema_config.fields]
+    assert len(names) == len(set(names))
+    assert list(transform.output_schema.model_fields) == names
 
 
 def _make_config(*, provider: str = "azure", **overrides: Any) -> dict[str, Any]:
@@ -215,6 +392,26 @@ def _make_transform_with_mock_provider(
 class TestProviderDispatch:
     """Verify correct provider creation based on provider field."""
 
+    @pytest.mark.parametrize("provider_name", ["azure", "openrouter", "bedrock"])
+    def test_pricing_identity_reaches_provider_without_changing_route(self, provider_name: str) -> None:
+        from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider
+        from elspeth.plugins.transforms.llm.providers.bedrock import BedrockLLMProvider
+        from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        transform = LLMTransform(_make_config(provider=provider_name, pricing_model="azure/gpt-4o"))
+        ctx = _make_ctx()
+        ctx.landscape = object()
+        transform.on_start(ctx)
+        try:
+            provider = transform._provider
+            assert isinstance(provider, (AzureLLMProvider, OpenRouterLLMProvider, BedrockLLMProvider))
+            assert provider._pricing_model == "azure/gpt-4o"
+            if isinstance(provider, AzureLLMProvider):
+                assert provider._deployment_name == "gpt-4o"
+        finally:
+            transform.close()
+
     def test_unknown_provider_raises_with_valid_options(self) -> None:
         from elspeth.plugins.transforms.llm.transform import LLMTransform
 
@@ -253,22 +450,28 @@ class TestTransformProperties:
 
     def test_runtime_preflight_delegates_to_provider_with_operation_parent(self) -> None:
         transform, mock_provider = _make_transform_with_mock_provider()
-        ctx = SimpleNamespace(operation_id="op-runtime-preflight")
+        ctx = make_context()
+        ctx.operation_id = "op-runtime-preflight"
 
         transform.runtime_preflight(ctx)
 
         mock_provider.runtime_preflight.assert_called_once_with(
             operation_id="op-runtime-preflight",
             model="gpt-4o",
+            coordination_token=ctx.require_coordination_token(),
         )
 
     def test_runtime_preflight_wraps_provider_failure(self) -> None:
         transform, mock_provider = _make_transform_with_mock_provider()
-        mock_provider.runtime_preflight.side_effect = LLMClientError("401 unauthorized", retryable=False)
-        ctx = SimpleNamespace(operation_id="op-runtime-preflight")
+        provider_failure = LLMClientError("401 unauthorized", retryable=False)
+        mock_provider.runtime_preflight.side_effect = provider_failure
+        ctx = make_context()
+        ctx.operation_id = "op-runtime-preflight"
 
-        with pytest.raises(RuntimePreflightFailedError, match=r"pre_flight_failed.*401 unauthorized"):
+        with pytest.raises(RuntimePreflightFailedError, match=r"pre_flight_failed.*401 unauthorized") as exc_info:
             transform.runtime_preflight(ctx)
+
+        assert exc_info.value.__cause__ is provider_failure
 
 
 # ---------------------------------------------------------------------------
@@ -810,6 +1013,41 @@ class TestTemplateTierPolicy:
         assert result.status == "error"
         assert result.reason["reason"] == "template_rendering_failed"
 
+    def test_render_error_reason_names_no_row_value(self) -> None:
+        """A lookup key computed from the row never reaches the reason (RAG-F1).
+
+        Before the shared renderer the reason quoted Jinja: ``Undefined
+        variable: '...PipelineRow object' has no attribute 'SENTINEL-llm-2b9d'``.
+        """
+        config = _make_config(prompt_template="{{ row[row.k] }}", required_input_fields=[])
+        transform, mock_provider = _make_transform_with_mock_provider(config)
+
+        result = transform._process_row(_make_row({"text": "hello", "k": "SENTINEL-llm-2b9d"}), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason == {
+            "reason": "template_rendering_failed",
+            "error": ("Undefined variable: the row has no field <a key the template does not spell out>"),
+            "template_hash": transform._template.template_hash,
+        }
+        mock_provider.execute_query.assert_not_called()
+
+    def test_multi_query_render_error_reason_names_no_row_value(self) -> None:
+        """The per-query template path renders through the same value-free renderer."""
+        config = _make_multi_query_config(required_input_fields=[])
+        config["queries"] = {
+            "quality": {"input_fields": {"text_content": "text", "key": "k"}, "template": "{{ row[row.key] }}"},
+        }
+        transform, mock_provider = _make_transform_with_mock_provider(config)
+
+        result = transform._process_row(_make_row({"text": "hello", "k": "SENTINEL-llm-mq-6a0c"}), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "template_rendering_failed"
+        assert result.reason["error"] == "Undefined variable: 'dict object' has no attribute <a key the template does not spell out>"
+        mock_provider.execute_query.assert_not_called()
+
 
 class TestMultiQueryPartialFailure:
     """Verify multi-query atomicity — partial failure discards all results."""
@@ -1045,7 +1283,8 @@ class TestMultiQueryJSONExtraction:
         assert result.reason is not None
         assert result.reason["reason"] == "missing_output_field"
         assert result.reason["field"] == "missing_field"
-        assert "score" in result.reason["available_fields"]
+        # The response's own keys are external content: never listed (C3).
+        assert "available_fields" not in result.reason
 
     def test_output_fields_json_parse_failure_returns_error(self) -> None:
         """When LLM returns invalid JSON and output_fields expects JSON, return error."""
@@ -1974,11 +2213,13 @@ class TestMultiQueryFieldTypeValidation:
     def test_integer_field_rejects_string(self) -> None:
         """String value for integer field must be rejected."""
         transform, provider = self._make_typed_query_transform([{"suffix": "score", "type": "integer"}])
-        result = self._execute_with_content(transform, provider, '{"score": "high"}')
+        result = self._execute_with_content(transform, provider, '{"score": "SENTINEL_HIGH"}')
         assert result.status == "error"
         assert result.reason["reason"] == "field_type_mismatch"
         assert result.reason["field"] == "score"
         assert "expected integer" in result.reason["error"]
+        # The model's value is external content echoing row data: never in the reason (C3).
+        assert "SENTINEL_HIGH" not in repr(result.reason)
 
     def test_integer_field_rejects_boolean(self) -> None:
         """Boolean value for integer field must be rejected (bool is subclass of int)."""
@@ -2451,11 +2692,13 @@ class TestMultiQueryParallelExecution:
             pool_size=4,
         )
         transform = LLMTransform(config)
-        call_count = [0]
 
         def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
-            call_count[0] += 1
-            if call_count[0] == 1:
+            # Concurrent calls can arrive in either order. Match the response
+            # to the output contract in the prompt sent for this query.
+            prompt = messages[-1].content
+            assert isinstance(prompt, str)
+            if '"label"' in prompt:
                 return LLMQueryResult(
                     content='{"score": 85, "label": "high"}',
                     usage=TokenUsage.known(10, 5),
@@ -3002,6 +3245,7 @@ class TestParallelErrorReasonNotFabricated:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -3086,6 +3330,7 @@ class TestParallelAuditMetadataThreadSafety:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -3168,6 +3413,7 @@ class TestParallelAuditMetadataThreadSafety:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -3256,6 +3502,7 @@ class TestMultiQueryFinishReasonAudit:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -3303,6 +3550,7 @@ class TestMultiQueryFinishReasonAudit:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -3355,6 +3603,7 @@ class TestSequentialErrorReasonNotFabricated:
         strategy = MultiQueryStrategy(
             query_specs=query_specs,
             template=template,
+            row_projection=ALL_FIELDS,
             system_prompt=None,
             system_prompt_source=None,
             model="gpt-4o",
@@ -3586,10 +3835,9 @@ class TestLLMDeclaredOutputFieldContracts:
         The output schema config declares every field it guarantees — a
         guaranteed-but-undeclared field is the invalid SchemaConfig state
         that made the output contract forbid the transform's own outputs
-        (elspeth-97487736ca). The side fields are declared as required
-        any-typed fields, so the restamp reaches them: declared source,
-        required, object-typed. Before that fix they stayed inferred and
-        optional, understating what the plugin has always guaranteed.
+        (elspeth-97487736ca). Successful response and model fields are
+        strings; usage retains its provider-dependent type. All three are
+        required and restamped as declared fields.
         """
         transform, mock_provider = _make_transform_with_mock_provider(
             _make_config(schema=DECLARED_SCHEMA),
@@ -3607,14 +3855,36 @@ class TestLLMDeclaredOutputFieldContracts:
         assert result.row is not None
         assert transform._output_schema_config is not None
         declared_by_name = {field.name: field for field in transform._output_schema_config.fields}
-        for side_field in ("llm_response", "llm_response_usage", "llm_response_model"):
+        for side_field, field_type in (("llm_response", "str"), ("llm_response_usage", "any"), ("llm_response_model", "str")):
             assert side_field in declared_by_name
-            assert declared_by_name[side_field].field_type == "any"
+            assert declared_by_name[side_field].field_type == field_type
             emitted = result.row.contract.get_field(side_field)
             assert emitted.source == "declared"
             assert emitted.required is True
         # Guarantees continue to admit them, and the declaration now matches.
         assert {"llm_response", "llm_response_usage", "llm_response_model"} <= set(transform._output_schema_config.guaranteed_fields)
+
+
+@pytest.mark.parametrize("multi_query", [False, True])
+def test_generated_output_contract_uses_successful_runtime_types(multi_query: bool) -> None:
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+    schema = {"mode": "flexible", "fields": ["text: str", "answer: any?"]}
+    query = {"input_fields": {"text": "text"}, "template": "{{ row.text }}", "output_fields": [{"suffix": "answer", "type": "string"}]}
+    config = (
+        _make_config(schema=schema, queries={"quality": query})
+        if multi_query
+        else _make_config(schema=schema, output_fields=[{"suffix": "answer", "type": "string"}])
+    )
+    transform = LLMTransform(config)
+    assert transform._output_schema_config is not None
+    assert transform._output_schema_config.fields is not None
+    generated = "quality_answer" if multi_query else "answer"
+    fields = {field.name: field for field in transform._output_schema_config.fields}
+    assert fields[generated].field_type == "str"
+    assert fields[generated].required is True
+    assert fields[generated].nullable is False
+    assert transform.output_schema.model_fields[generated].annotation is str
 
 
 # ---------------------------------------------------------------------------
@@ -3797,6 +4067,23 @@ class TestSingleQueryStructuredOutputExecution:
         # Raw content retained for audit traceability
         assert result.row["llm_response"] == '{"score": 42, "label": "pass"}'
         assert result.row["llm_response_model"] == "gpt-4o"
+        assert {"score", "label"} <= transform.declared_output_fields
+
+        plain_transform, plain_provider = _make_transform_with_mock_provider(_make_config())
+        plain_provider.execute_query.return_value = mock_provider.execute_query.return_value
+        plain_result = plain_transform._process_row(_make_row(), _make_ctx())
+        assert plain_result.row is not None
+        assert "score" not in plain_result.row
+        assert "score" not in plain_transform.declared_output_fields
+        assert plain_result.row["llm_response"] == result.row["llm_response"]
+
+        assistance = transform.get_agent_assistance()
+        assert assistance is not None
+        hints = " ".join(assistance.composer_hints)
+        assert "Prompt wording alone does not create separate JSON fields" in hints
+        assert "output_fields" in hints
+        assert "no downstream parser is needed" in hints
+        assert "unless another transform parses them" not in hints
 
     def test_missing_output_field_returns_error(self) -> None:
         transform, mock_provider = self._make_structured_transform()
@@ -3873,3 +4160,308 @@ class TestSingleQueryStructuredOutputExecution:
         model_fields = transform.output_schema.model_fields
         assert "score" in model_fields
         assert "label" in model_fields
+
+
+@pytest.mark.parametrize("with_fallback", [False, True])
+def test_effective_query_templates_execute_and_keep_their_own_audit_identity(with_fallback: bool) -> None:
+    from hashlib import sha256
+
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+    config = _make_config(
+        queries={
+            "own": {"input_fields": {"text_content": "text"}, "template": "Own {{ row.text_content }}"},
+            "second": {"input_fields": {"text_content": "text"}, "template": "Second {{ row.text_content }}"},
+        },
+    )
+    if with_fallback:
+        config["prompt_template"] = "Fallback {{ row.text_content }}"
+        del config["queries"]["second"]["template"]
+    else:
+        del config["prompt_template"]
+    transform = LLMTransform(config)
+    provider = Mock(spec=LLMProvider)
+    provider.execute_query.return_value = LLMQueryResult(
+        content="answer", usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
+    )
+    transform._provider = provider
+    result = transform._process_row(_make_row(), _make_ctx())
+    assert result.status == "success"
+    assert [call.args[0] for call in provider.execute_query.call_args_list] == [
+        [ChatMessage(role="user", content="Own hello")],
+        [ChatMessage(role="user", content="Fallback hello" if with_fallback else "Second hello")],
+    ]
+    assert result.success_reason is not None
+    metadata = result.success_reason["metadata"]
+    assert metadata["own_llm_response_template_hash"] == sha256(b"Own {{ row.text_content }}").hexdigest()
+    second_template = "Fallback {{ row.text_content }}" if with_fallback else "Second {{ row.text_content }}"
+    assert metadata["second_llm_response_template_hash"] == sha256(second_template.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# ADR-050: every created field carries the type the PLUGIN's code fixes, and
+# each structured ``output_fields`` entry is BOUND to the row type of its
+# ``OutputFieldConfig.type``. The binding lands together with the Tier-3
+# numeric parse INTO that type (operator ruling 2026-09-25): JSON has one
+# number type, so ``5.0`` under ``integer`` reaches the row as the int 5 and
+# ``7`` under ``number`` as the float 7.0; the engine's value check then
+# enforces the declaration on every emitted value.
+# ---------------------------------------------------------------------------
+
+
+_STRUCTURED_FIELDS = [
+    {"suffix": "score", "type": "integer"},
+    {"suffix": "confidence", "type": "number"},
+    {"suffix": "approved", "type": "boolean"},
+    {"suffix": "label", "type": "enum", "values": ["pass", "fail"]},
+    {"suffix": "rationale", "type": "string"},
+]
+_BOUND_TYPES = {"score": int, "confidence": float, "approved": bool, "label": str, "rationale": str}
+
+
+def _structured_query_result(content: str) -> LLMQueryResult:
+    return LLMQueryResult(content=content, usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP)
+
+
+class TestStructuredOutputTypeBinding:
+    """The declared type of every LLM-created field, and the parse that makes the emitted value satisfy it."""
+
+    def test_single_query_declares_every_created_field_with_its_bound_type(self) -> None:
+        from elspeth.contracts.schema import FieldDefinition
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        transform = LLMTransform(_make_config(output_fields=_STRUCTURED_FIELDS))
+
+        assert set(transform.created_output_fields()) == {
+            FieldDefinition("llm_response", "str"),
+            FieldDefinition("llm_response_model", "str"),
+            FieldDefinition("llm_response_usage", "any"),
+            FieldDefinition("score", "int"),
+            FieldDefinition("confidence", "float"),
+            FieldDefinition("approved", "bool"),
+            FieldDefinition("label", "str"),
+            FieldDefinition("rationale", "str"),
+        }
+        assert {definition.name for definition in transform.created_output_fields()} == set(transform.declared_output_fields)
+
+    def test_multi_query_declares_each_query_s_prefixed_fields_with_their_bound_types(self) -> None:
+        from elspeth.contracts.schema import FieldDefinition
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            prompt_template="Evaluate: {{ row.text_content }}",
+            queries={
+                "quality": {"input_fields": {"text_content": "text"}, "output_fields": _STRUCTURED_FIELDS[:2]},
+                "tone": {"input_fields": {"text_content": "text"}},
+            },
+        )
+        transform = LLMTransform(config)
+
+        assert set(transform.created_output_fields()) == {
+            FieldDefinition("quality_llm_response", "str"),
+            FieldDefinition("quality_llm_response_model", "str"),
+            FieldDefinition("quality_llm_response_usage", "any"),
+            FieldDefinition("quality_score", "int"),
+            FieldDefinition("quality_confidence", "float"),
+            FieldDefinition("tone_llm_response", "str"),
+            FieldDefinition("tone_llm_response_model", "str"),
+            FieldDefinition("tone_llm_response_usage", "any"),
+        }
+        assert {definition.name for definition in transform.created_output_fields()} == set(transform.declared_output_fields)
+
+    @pytest.mark.parametrize(
+        ("score", "confidence", "expected_score", "expected_confidence"),
+        [
+            ("5.0", "7", 5, 7.0),
+            ("5", "7.0", 5, 7.0),
+            ("-2.0", "0.25", -2, 0.25),
+            ("4", "1", 4, 1.0),
+        ],
+        ids=["integral-float-and-int", "int-and-integral-float", "negative-integral-float-and-fraction", "int-and-int"],
+    )
+    def test_single_query_emits_the_bound_types_and_satisfies_its_declaration(
+        self, score: str, confidence: str, expected_score: int, expected_confidence: float
+    ) -> None:
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+
+        transform, provider = _make_transform_with_mock_provider(_make_config(output_fields=_STRUCTURED_FIELDS))
+        provider.execute_query.return_value = _structured_query_result(
+            f'{{"score": {score}, "confidence": {confidence}, "approved": true, "label": "pass", "rationale": "ok"}}'
+        )
+        input_row = _make_row()
+
+        result = transform._process_row(input_row, _make_ctx())
+
+        assert result.status == "success", result.reason
+        assert result.row is not None
+        emitted = result.row
+        assert (emitted["score"], type(emitted["score"])) == (expected_score, int)
+        assert (emitted["confidence"], type(emitted["confidence"])) == (expected_confidence, float)
+        for name, python_type in _BOUND_TYPES.items():
+            field = emitted.contract.get_field(name)
+            assert field is not None
+            assert (field.source, field.python_type) == ("declared", python_type), name
+            assert type(emitted[name]) is python_type, name
+        verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[emitted])
+
+    def test_multi_query_emits_the_bound_types(self) -> None:
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            prompt_template="Evaluate: {{ row.text_content }}",
+            queries={"quality": {"input_fields": {"text_content": "text"}, "output_fields": _STRUCTURED_FIELDS[:2]}},
+        )
+        transform = LLMTransform(config)
+        provider = Mock(spec=LLMProvider)
+        provider.execute_query.return_value = _structured_query_result('{"score": 9.0, "confidence": 3}')
+        transform._provider = provider
+        input_row = _make_row()
+
+        result = transform._process_row(input_row, _make_ctx())
+
+        assert result.status == "success", result.reason
+        assert result.row is not None
+        assert (result.row["quality_score"], type(result.row["quality_score"])) == (9, int)
+        assert (result.row["quality_confidence"], type(result.row["quality_confidence"])) == (3.0, float)
+        verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[result.row])
+
+    def test_a_non_integral_float_under_integer_is_a_row_error_not_a_conversion(self) -> None:
+        transform, provider = _make_transform_with_mock_provider(_make_config(output_fields=_STRUCTURED_FIELDS[:2]))
+        provider.execute_query.return_value = _structured_query_result('{"score": 3.5, "confidence": 1}')
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert (result.reason["reason"], result.reason["field"]) == ("field_type_mismatch", "score")
+
+    def test_a_parse_that_stops_converting_is_caught_by_the_value_check_as_the_plugin_s_fault(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The binding without the parse routes a benign ``5.0`` under ``integer`` (why the ruling pairs them).
+
+        The ``number`` side is not what the value check catches: an ``int``
+        satisfies a ``float`` declaration (ADR-050 Decision 5), so the
+        unconverted ``7`` passes; the ``integer`` side is, because ``5.0`` is
+        not an int. ``declared_by`` is ``plugin`` although the operator wrote
+        ``type: integer``: the declared row type is the plugin's promise about
+        its own parser, so when the check fires the parser drifted and "fix
+        the transform" is the right message. The reason names the field and
+        both type names, never the value.
+        """
+        from elspeth.contracts.errors import DeclaredOutputTypeViolation
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+        from elspeth.plugins.transforms.llm import validation
+
+        real_parse = validation.parse_field_value
+
+        def parse_without_conversion(value: Any, field_config: Any) -> tuple[Any, str | None]:
+            _parsed, error = real_parse(value, field_config)
+            return (None, error) if error is not None else (value, None)
+
+        monkeypatch.setattr(validation, "parse_field_value", parse_without_conversion)
+        transform, provider = _make_transform_with_mock_provider(_make_config(output_fields=_STRUCTURED_FIELDS[:2]))
+        provider.execute_query.return_value = _structured_query_result('{"score": 5.0, "confidence": 7}')
+        input_row = _make_row()
+
+        result = transform._process_row(input_row, _make_ctx())
+        assert result.status == "success"
+        assert result.row is not None
+        assert (type(result.row["score"]), type(result.row["confidence"])) == (float, int)
+        with pytest.raises(DeclaredOutputTypeViolation) as excinfo:
+            verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[result.row])
+
+        reason = excinfo.value.to_transform_error_reason()
+        assert (reason["field"], reason["expected"], reason["actual"], reason["authorship"], reason["declared_by"]) == (
+            "score",
+            "int",
+            "float",
+            "computed",
+            "plugin",
+        )
+        assert "5.0" not in json.dumps(reason)
+
+    def test_an_unconverted_int_under_number_satisfies_the_float_declaration(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Control for the test above: with the parse's conversion removed, ``7`` under ``number`` alone routes nothing.
+
+        The ``number`` conversion exists so the delivered value IS the bound
+        row type (``float``), not because the engine would refuse an ``int``.
+        """
+        from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+        from elspeth.plugins.transforms.llm import validation
+
+        real_parse = validation.parse_field_value
+
+        def parse_without_conversion(value: Any, field_config: Any) -> tuple[Any, str | None]:
+            _parsed, error = real_parse(value, field_config)
+            return (None, error) if error is not None else (value, None)
+
+        monkeypatch.setattr(validation, "parse_field_value", parse_without_conversion)
+        transform, provider = _make_transform_with_mock_provider(_make_config(output_fields=_STRUCTURED_FIELDS[:2]))
+        provider.execute_query.return_value = _structured_query_result('{"score": 5, "confidence": 7}')
+        input_row = _make_row()
+
+        result = transform._process_row(input_row, _make_ctx())
+        assert result.status == "success"
+        assert result.row is not None
+        assert type(result.row["confidence"]) is int
+        verify_produced_output_types(transform=transform, input_row=input_row, emitted_rows=[result.row])
+
+
+# ---------------------------------------------------------------------------
+# ADR-051: a template sees only its node's declared fields
+# ---------------------------------------------------------------------------
+
+
+class TestTemplateSeesOnlyDeclaredFields:
+    """The LLM node projects every row to its ``required_input_fields`` before its templates render."""
+
+    _SENTINEL = "SENTINEL-P2-LLM-51c"
+
+    def _sent(self, config: dict[str, Any]) -> str:
+        transform, mock_provider = _make_transform_with_mock_provider(config)
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 1}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+        result = transform._process_row(_make_row({"text": "hello", "secret": self._SENTINEL}), _make_ctx())
+        assert result.status == "success"
+        return " ".join(str(call) for call in mock_provider.execute_query.call_args_list)
+
+    def test_the_node_reads_its_declaration_as_the_projection(self) -> None:
+        from elspeth.plugins.infrastructure.templates import ALL_FIELDS, DeclaredFields
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        assert LLMTransform(_make_config())._strategy.row_projection == DeclaredFields(frozenset({"text"}))
+        assert LLMTransform(_make_config(required_input_fields=[]))._strategy.row_projection is ALL_FIELDS
+        assert LLMTransform(_make_multi_query_config())._strategy.row_projection == DeclaredFields(frozenset({"text"}))
+
+    def test_a_single_prompt_whole_row_form_sends_only_the_declared_fields(self) -> None:
+        # A form the static analysis cannot follow (review-S0-sandbox-r3): only the projection stops it.
+        sent = self._sent(
+            _make_config(prompt_template="{% for a, b in [(1, [row])] %}Classify: {{ row.text }} {{ b[0] | dictsort }}{% endfor %}")
+        )
+        assert "('text', 'hello')" in sent
+        assert self._SENTINEL not in sent
+
+    def test_a_multi_query_source_row_sends_only_the_declared_fields(self) -> None:
+        sent = self._sent(
+            _make_multi_query_config(
+                prompt_template="{% for a, b in [(1, [row.source_row])] %}Process {{ row.text_content }} {{ b[0] | dictsort }}{% endfor %}"
+            )
+        )
+        assert "('text', 'hello')" in sent
+        assert self._SENTINEL not in sent
+
+    def test_the_opt_out_sends_the_whole_row(self) -> None:
+        """Positive control: ``[]`` keeps the whole row, so the same template sends the undeclared column."""
+        sent = self._sent(
+            _make_config(
+                prompt_template="{% for a, b in [(1, [row])] %}Classify: {{ row.text }} {{ b[0] | dictsort }}{% endfor %}",
+                required_input_fields=[],
+            )
+        )
+        assert self._SENTINEL in sent

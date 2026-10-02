@@ -1,4 +1,4 @@
-// Tests for interpretation.ts — type-assertion style mirroring guided.test.ts.
+// Tests for interpretation.ts — compile-time and runtime contract assertions.
 //
 // The compile-time `Equals<A, B>` helper is the load-bearing test: drift
 // between the TS union and the Python StrEnum's value set turns into a
@@ -22,7 +22,6 @@ import type {
   InterpretationOptOutResponse,
   OptOutSummaryResponse,
 } from "./interpretation";
-import type { TurnType } from "./guided";
 
 // Compile-time mutual-extends check.
 type Equals<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
@@ -93,33 +92,10 @@ describe("interpretation protocol types", () => {
     expect(isInterpretationKind(null)).toBe(false);
   });
 
-  it("TurnType union has 7 current values", () => {
-    const _exact: Equals<
-      TurnType,
-      | "inspect_and_confirm"
-      | "single_select"
-      | "multi_select_with_custom"
-      | "schema_form"
-      | "review_components"
-      | "propose_pipeline"
-      | "confirm_wiring"
-    > = true;
-    const all: TurnType[] = [
-      "inspect_and_confirm",
-      "single_select",
-      "multi_select_with_custom",
-      "schema_form",
-      "review_components",
-      "propose_pipeline",
-      "confirm_wiring",
-    ];
-    expect(_exact).toBe(true);
-    expect(all).toHaveLength(7);
-  });
 
-  it("InterpretationEvent has the exhaustive 23-field shape (compile-time exact-keys check)", () => {
+  it("InterpretationEvent has the exhaustive 24-field shape (compile-time exact-keys check)", () => {
     // Adding/removing a field on the TS interface breaks this assignment.
-    // The 23-field count mirrors the InterpretationEventResponse pydantic
+    // The 24-field count mirrors the InterpretationEventResponse pydantic
     // schema in src/elspeth/web/sessions/schemas.py.
     const _exact: Equals<
       keyof InterpretationEvent,
@@ -137,6 +113,7 @@ describe("interpretation protocol types", () => {
       | "resolved_at"
       | "actor"
       | "interpretation_source"
+      | "surface_origin"
       | "model_identifier"
       | "model_version"
       | "provider"
@@ -145,7 +122,7 @@ describe("interpretation protocol types", () => {
       | "hash_domain_version"
       | "runtime_model_identifier_at_resolve"
       | "runtime_model_version_at_resolve"
-      | "resolved_prompt_template_hash"
+      | "approved_prompt_artifact_hash"
     > = true;
     expect(_exact).toBe(true);
   });
@@ -176,7 +153,7 @@ describe("interpretation protocol types", () => {
       hash_domain_version: null,
       runtime_model_identifier_at_resolve: null,
       runtime_model_version_at_resolve: null,
-      resolved_prompt_template_hash: null,
+      approved_prompt_artifact_hash: null,
     };
     expect(event.choice).toBe("pending");
     expect(event.accepted_value).toBeNull();
@@ -208,7 +185,7 @@ describe("interpretation protocol types", () => {
       hash_domain_version: null,
       runtime_model_identifier_at_resolve: null,
       runtime_model_version_at_resolve: null,
-      resolved_prompt_template_hash: null,
+      approved_prompt_artifact_hash: null,
     };
     expect(event.composition_state_id).toBeNull();
     expect(event.interpretation_source).toBe("auto_interpreted_opt_out");
@@ -240,7 +217,7 @@ describe("interpretation protocol types", () => {
       hash_domain_version: null,
       runtime_model_identifier_at_resolve: null,
       runtime_model_version_at_resolve: null,
-      resolved_prompt_template_hash: null,
+      approved_prompt_artifact_hash: null,
     };
     expect(event.interpretation_source).toBe("auto_interpreted_no_surfaces");
     expect(event.model_identifier).toBe("anthropic/claude-opus-4-7");

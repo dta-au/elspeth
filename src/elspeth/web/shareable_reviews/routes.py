@@ -20,18 +20,19 @@ which is wired in ``web/app.py``.
 
 from __future__ import annotations
 
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from elspeth.contracts.payload_store import PayloadNotFoundError
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import get_current_user, require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.middleware.rate_limit import (
-    ComposerRateLimiter,
+    WebRateLimiter,
     get_rate_limiter,
     get_write_rate_limiter,
 )
@@ -65,9 +66,9 @@ def create_shareable_reviews_router() -> APIRouter:
     async def mark_ready_for_review(
         session_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         # Write bucket: cheap DB write / token mint, not an LLM call.
-        rate_limiter: ComposerRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
+        rate_limiter: WebRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
     ) -> JSONResponse:
         """Mint a signed share artifact for the current composition state.
 
@@ -125,9 +126,9 @@ def create_shareable_reviews_router() -> APIRouter:
     async def get_shareable_link(
         session_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         # Write bucket: cheap DB write / token mint, not an LLM call.
-        rate_limiter: ComposerRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
+        rate_limiter: WebRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
     ) -> JSONResponse:
         """Re-mint a fresh token for the current (session, state).
 
@@ -156,7 +157,7 @@ def create_shareable_reviews_router() -> APIRouter:
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
         # Strict bucket: abuse-sensitive token probe stays strict.
-        rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+        rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
     ) -> JSONResponse:
         """Read-only inspect view of a shared composition.
 

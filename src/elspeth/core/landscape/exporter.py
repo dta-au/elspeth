@@ -16,8 +16,8 @@ from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import copy
-from datetime import UTC
-from typing import Any, BinaryIO, Protocol, cast
+from datetime import UTC, datetime
+from typing import Any, BinaryIO, Literal, Protocol, cast
 
 from elspeth.contracts import (
     BatchMember,
@@ -29,7 +29,9 @@ from elspeth.contracts import (
     TokenOutcome,
     TokenParent,
 )
+from elspeth.contracts.audit import CallVerification
 from elspeth.contracts.audit_export import (
+    AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION,
     AUDIT_EXPORT_MAX_CHUNKS,
     AUDIT_EXPORT_MAX_TOTAL_BYTES,
     AUDIT_EXPORT_MAX_TOTAL_RECORDS,
@@ -39,12 +41,18 @@ from elspeth.contracts.audit_export import (
     AuditExportTerminalWitness,
     derive_audit_export_bundle,
     stream_audit_export_bundle_to_spool,
+    validate_compartment_id,
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.export_records import (
+    AuditExportConfigRecord,
+    AuthEventCoverageExportRecord,
+    AuthEventExportRecord,
     BatchExportRecord,
     BatchMemberExportRecord,
     CallExportRecord,
+    CallVerificationExportRecord,
+    CollectorGroupFailureExportRecord,
     EdgeExportRecord,
     ExportRecord,
     GroupLossExportRecord,
@@ -64,6 +72,7 @@ from elspeth.contracts.export_records import (
     WebPluginPolicyExportRecord,
 )
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.identity import LineageFrame
 from elspeth.core.canonical import canonical_json
 from elspeth.core.landscape.database import LandscapeDB
@@ -84,6 +93,8 @@ class ExportReadModel(Protocol):
 
     def get_run(self, run_id: str) -> Any | None: ...
 
+    def iter_auth_events(self, cutoff: datetime, *, batch_size: int) -> Iterator[AuthEventExportRecord]: ...
+
     def get_run_attribution(self, run_id: str) -> tuple[str, str] | None: ...
 
     def get_web_plugin_policy_evidence(self, run_id: str) -> Any | None: ...
@@ -98,6 +109,8 @@ class ExportReadModel(Protocol):
 
     def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]: ...
 
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]: ...
+
     def get_validation_errors_for_run(self, run_id: str) -> list[Any]: ...
 
     def get_transform_errors_for_run(self, run_id: str) -> list[Any]: ...
@@ -111,6 +124,8 @@ class ExportReadModel(Protocol):
     def get_group_records_for_run(self, run_id: str) -> list[Any]: ...
 
     def get_group_losses_for_run(self, run_id: str) -> list[Any]: ...
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]: ...
 
     def get_token_parents_for_tokens(self, token_ids: list[str]) -> list[Any]: ...
 
@@ -148,6 +163,9 @@ class RecorderFactoryExportReadModel:
     def get_run(self, run_id: str) -> Any | None:
         return self._factory.run_lifecycle.get_run(run_id)
 
+    def iter_auth_events(self, cutoff: datetime, *, batch_size: int) -> Iterator[AuthEventExportRecord]:
+        raise AuditIntegrityError("Deployment auth export requires a snapshot-bound export read model")
+
     def get_run_attribution(self, run_id: str) -> tuple[str, str] | None:
         return self._factory.run_lifecycle.get_run_attribution(run_id)
 
@@ -169,6 +187,9 @@ class RecorderFactoryExportReadModel:
     def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]:
         return self._factory.execution.get_all_operation_calls_for_run(run_id)
 
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        return self._factory.execution.iter_verification_decisions_for_run(run_id, batch_size=batch_size)
+
     def get_validation_errors_for_run(self, run_id: str) -> list[Any]:
         return self._factory.data_flow.get_validation_errors_for_run(run_id)
 
@@ -189,6 +210,9 @@ class RecorderFactoryExportReadModel:
 
     def get_group_losses_for_run(self, run_id: str) -> list[Any]:
         return self._factory.data_flow.get_group_losses_for_run(run_id)
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]:
+        return self._factory.execution.get_collector_group_failures_for_run(run_id)
 
     def get_token_parents_for_tokens(self, token_ids: list[str]) -> list[Any]:
         return self._factory.query.get_token_parents_for_tokens(token_ids)
@@ -278,6 +302,7 @@ class LandscapeExporter:
     - node_state: Processing records
     - routing_event: Routing decisions
     - call: External calls (may have state_id OR operation_id)
+    - call_verification: Persisted verify verdicts and source-call comparison evidence
     - batch: Aggregation batches
     - batch_member: Batch membership
     - artifact: Sink outputs
@@ -294,7 +319,7 @@ class LandscapeExporter:
 
     Example:
         db = LandscapeDB.from_url("sqlite:///audit.db")
-        exporter = LandscapeExporter(db)
+        exporter = LandscapeExporter(db, compartment_id="my-compartment")
 
         # Export to JSON lines
         for record in exporter.export_run(run_id):
@@ -311,11 +336,13 @@ class LandscapeExporter:
         signing_key: bytes | None = None,
         *,
         include_raw_error_rows: bool = False,
+        auth_events: Literal["omitted", "deployment_snapshot"] = "omitted",
+        compartment_id: str | None = None,
         row_batch_size: int = 500,
         read_model: ExportReadModel | None = None,
         signer_key_id: str | None = None,
         export_format: str = "json",
-        exporter_version: str = "landscape-exporter-v1",
+        exporter_version: str | None = None,
         serialization_version: str = AUDIT_EXPORT_SERIALIZATION_VERSION,
         chunking_algorithm_version: str = "record-framing-v1",
         per_chunk_byte_limit: int = 64 * 1024 * 1024,
@@ -355,10 +382,17 @@ class LandscapeExporter:
         self._read_model_is_caller_owned = read_model is not None
         self._signing_key = signing_key
         self._include_raw_error_rows = include_raw_error_rows
+        if auth_events not in ("omitted", "deployment_snapshot"):
+            raise ValueError("auth_events must be omitted or deployment_snapshot")
+        resolved_exporter_version = AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION if exporter_version is None else exporter_version
+        if resolved_exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        self._auth_events = auth_events
+        self._compartment_id = compartment_id
         self._row_batch_size = row_batch_size
         self._signer_key_id = signer_key_id
         self._export_format = export_format
-        self._exporter_version = exporter_version
+        self._exporter_version = resolved_exporter_version
         self._serialization_version = serialization_version
         self._chunking_algorithm_version = chunking_algorithm_version
         self._per_chunk_byte_limit = per_chunk_byte_limit
@@ -398,9 +432,16 @@ class LandscapeExporter:
 
     @staticmethod
     def _parse_tier1_json(raw_json: str, field_name: str, context: str) -> Any:
-        """Parse JSON from Tier 1 audit data, crashing with context on corruption."""
+        """Parse stored canonical JSON from Tier 1 audit data, crashing with context on corruption.
+
+        ``settings_json`` and ``config_json`` are written by ``canonical_json``,
+        so they are read with its inverse: a plain ``json.loads`` reads an
+        integral double beyond 2**53 (printed in integer notation) back as an
+        ``int`` -- not the value that was hashed, and one the canonical encoder
+        refuses when the export record is serialized.
+        """
         try:
-            return json.loads(raw_json)
+            return canonical_json_loads(raw_json)
         except json.JSONDecodeError as exc:
             raise AuditIntegrityError(
                 f"Corrupt {field_name} for {context}: database corruption (Tier 1 violation). Parse error: {exc}"
@@ -466,7 +507,7 @@ class LandscapeExporter:
                 terminal_witness=terminal_witness,
             )
             stream = stream_audit_export_bundle_to_spool(
-                exporter._iter_records(run_id),
+                exporter._configured_records(run_id, derivation_config),
                 derivation_config,
                 cast(BinaryIO, _DiscardSpool()),
                 max_total_records=AUDIT_EXPORT_MAX_TOTAL_RECORDS,
@@ -489,7 +530,7 @@ class LandscapeExporter:
         sign: bool = False,
         derivation_config: AuditExportDerivationConfig | None = None,
     ) -> AuditExportDerivedBundle:
-        """Return the exact v2 byte graph for one immutable terminal run."""
+        """Return the current serialization byte graph for one immutable terminal run."""
         if sign and self._signing_key is None:
             raise ValueError("Signing requested but no signing_key provided")
         with self._public_export_scope(run_id) as (exporter, terminal_witness):
@@ -499,7 +540,22 @@ class LandscapeExporter:
                 derivation_config=derivation_config,
                 terminal_witness=terminal_witness,
             )
-            return derive_audit_export_bundle(exporter._iter_records(run_id), derivation_config)
+            return derive_audit_export_bundle(exporter._configured_records(run_id, derivation_config), derivation_config)
+
+    def _configured_records(self, run_id: str, config: AuditExportDerivationConfig) -> Iterator[ExportRecord]:
+        scoped = copy(self)
+        scoped._auth_events = config.auth_events
+        scoped._compartment_id = config.compartment_id
+        scoped._exporter_version = config.exporter_version
+        scoped._include_raw_error_rows = config.include_raw_error_rows
+        scoped._signing_key = config.signing_key
+        scoped._signer_key_id = config.signer_key_id
+        scoped._export_format = config.export_format
+        scoped._serialization_version = config.serialization_version
+        scoped._chunking_algorithm_version = config.chunking_algorithm_version
+        scoped._per_chunk_byte_limit = config.per_chunk_byte_limit
+        scoped._per_chunk_record_limit = config.per_chunk_record_limit
+        yield from scoped._iter_records(run_id)
 
     def _resolve_derivation_config(
         self,
@@ -551,6 +607,8 @@ class LandscapeExporter:
                 serialization_version=self._serialization_version,
                 chunking_algorithm_version=self._chunking_algorithm_version,
                 include_raw_error_rows=self._include_raw_error_rows,
+                auth_events=self._auth_events,
+                compartment_id=self._compartment_id,
                 per_chunk_byte_limit=self._per_chunk_byte_limit,
                 per_chunk_record_limit=self._per_chunk_record_limit,
                 signing_mode=signing_mode,  # type: ignore[arg-type]
@@ -578,6 +636,9 @@ class LandscapeExporter:
                     f"derivation config signing_mode {derivation_config.signing_mode!r} contradicts the "
                     f"requested export (sign={sign} requires signing_mode {expected_signing_mode!r})"
                 )
+        if derivation_config.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        validate_compartment_id(derivation_config.compartment_id)
         return derivation_config
 
     def iter_unsigned_run_records(self, run_id: str) -> Iterator[ExportRecord]:
@@ -620,6 +681,10 @@ class LandscapeExporter:
         Raises:
             ValueError: If run_id is not found
         """
+        if self._exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        compartment_id = validate_compartment_id(self._compartment_id)
+
         # Run metadata
         run = self._read_model.get_run(run_id)
         if run is None:
@@ -642,6 +707,48 @@ class LandscapeExporter:
         }
         yield run_record
 
+        if self._signing_key is not None and self._signer_key_id is None:
+            raise ValueError("Signed export requires an explicit signer_key_id")
+        public_config: AuditExportConfigRecord = {
+            "record_type": "audit_export_config",
+            "public_config": {
+                "auth_events": self._auth_events,
+                "compartment_id": compartment_id,
+                "chunking_algorithm_version": self._chunking_algorithm_version,
+                "export_format": self._export_format,
+                "exporter_version": self._exporter_version,
+                "include_raw_error_rows": self._include_raw_error_rows,
+                "per_chunk_byte_limit": self._per_chunk_byte_limit,
+                "per_chunk_record_limit": self._per_chunk_record_limit,
+                "serialization_version": self._serialization_version,
+                "signer_key_id": self._signer_key_id if self._signer_key_id is not None and self._signing_key is not None else "UNSIGNED",
+                "signing_mode": "hmac_sha256" if self._signing_key is not None else "unsigned",
+            },
+        }
+        yield public_config
+        selected_count = 0
+        cutoff = run.completed_at
+        if cutoff is None and self._auth_events == "deployment_snapshot":
+            raise AuditIntegrityError("Auth coverage requires completed run timestamp")
+        if cutoff is not None and cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+        if self._auth_events == "deployment_snapshot":
+            assert cutoff is not None
+            for auth_event in self._read_model.iter_auth_events(cutoff, batch_size=self._row_batch_size):
+                selected_count += 1
+                yield auth_event
+        coverage: AuthEventCoverageExportRecord = {
+            "record_type": "auth_event_coverage",
+            "policy": self._auth_events,
+            "selection_cutoff": cutoff.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            if self._auth_events == "deployment_snapshot" and cutoff is not None
+            else None,
+            "selection_basis": "visible_rows_at_or_before_run_completion" if self._auth_events == "deployment_snapshot" else None,
+            "selected_count": selected_count if self._auth_events == "deployment_snapshot" else None,
+            "reason": "deployment_snapshot" if self._auth_events == "deployment_snapshot" else "not_requested",
+        }
+        yield coverage
+
         policy_evidence = self._read_model.get_web_plugin_policy_evidence(run_id)
         if policy_evidence is not None:
             policy_record: WebPluginPolicyExportRecord = {
@@ -658,6 +765,12 @@ class LandscapeExporter:
                 "plugin_code_identities": [list(item) for item in policy_evidence.plugin_code_identities],
                 "binding_generation_fingerprint": policy_evidence.binding_generation_fingerprint,
                 "decision_codes": list(policy_evidence.decision_codes),
+                "admission_decision_json": (
+                    policy_evidence.admission_decision.model_dump_json() if policy_evidence.admission_decision is not None else None
+                ),
+                "admission_decision_hash": (
+                    policy_evidence.admission_decision.canonical_hash if policy_evidence.admission_decision is not None else None
+                ),
             }
             yield policy_record
 
@@ -691,7 +804,6 @@ class LandscapeExporter:
                 "config_hash": node.config_hash,
                 # Full resolved config for audit trail portability (not just hash)
                 "config": self._parse_tier1_json(node.config_json, "config_json", f"node {node.node_id} in run {run_id}"),
-                "schema_hash": node.schema_hash,
                 "schema_mode": node.schema_mode,
                 "schema_fields": deep_thaw(node.schema_fields) if node.schema_fields is not None else None,
                 "sequence_in_pipeline": node.sequence_in_pipeline,
@@ -762,7 +874,11 @@ class LandscapeExporter:
                     "status": call.status.value,
                     "request_hash": call.request_hash,
                     "response_hash": call.response_hash,
-                    "resolved_prompt_template_hash": call.resolved_prompt_template_hash,
+                    "approved_prompt_artifact_hash": call.approved_prompt_artifact_hash,
+                    "prompt_tokens": call.prompt_tokens,
+                    "completion_tokens": call.completion_tokens,
+                    "cached_prompt_tokens": call.cached_prompt_tokens,
+                    "reasoning_tokens": call.reasoning_tokens,
                     "latency_ms": call.latency_ms,
                     "request_ref": call.request_ref,
                     "response_ref": call.response_ref,
@@ -858,7 +974,33 @@ class LandscapeExporter:
             }
             yield group_loss_record
 
+        for failure in self._read_model.get_collector_group_failures_for_run(run_id):
+            failure_record: CollectorGroupFailureExportRecord = {
+                "record_type": "collector_group_failure",
+                "run_id": run_id,
+                "group_id": failure.group_id,
+                "collector_node_id": failure.collector_node_id,
+                "failure_reason": failure.failure_reason,
+                "recorded_at": failure.recorded_at.isoformat(),
+            }
+            yield failure_record
+
         yield from self._iter_batch_and_artifact_records(run_id)
+
+        # Verdicts refer to both state-parented and operation-parented calls.
+        # Read them through the same snapshot as the rest of the export.
+        for decision in self._read_model.iter_verification_decisions_for_run(run_id, batch_size=self._row_batch_size):
+            verification_record: CallVerificationExportRecord = {
+                "record_type": "call_verification",
+                "run_id": decision.current_run_id,
+                "current_call_id": decision.current_call_id,
+                "source_run_id": decision.source_run_id,
+                "source_call_id": decision.source_call_id,
+                "is_match": decision.is_match,
+                "differences_json": decision.differences_json,
+                "recorded_at": decision.recorded_at.isoformat(),
+            }
+            yield verification_record
 
     def _iter_sink_effect_records(self, run_id: str) -> Iterator[ExportRecord]:
         """Yield complete safe recovery history in deterministic family order."""
@@ -948,6 +1090,7 @@ class LandscapeExporter:
                 "source_node_id": row.source_node_id,
                 "source_data_hash": row.source_data_hash,
                 "source_data_ref": row.source_data_ref,
+                "source_contract_json": row.source_contract_json,
                 "created_at": row.created_at.isoformat(),
             }
             yield row_record
@@ -1080,7 +1223,11 @@ class LandscapeExporter:
                             "status": call.status.value,
                             "request_hash": call.request_hash,
                             "response_hash": call.response_hash,
-                            "resolved_prompt_template_hash": call.resolved_prompt_template_hash,
+                            "approved_prompt_artifact_hash": call.approved_prompt_artifact_hash,
+                            "prompt_tokens": call.prompt_tokens,
+                            "completion_tokens": call.completion_tokens,
+                            "cached_prompt_tokens": call.cached_prompt_tokens,
+                            "reasoning_tokens": call.reasoning_tokens,
                             "latency_ms": call.latency_ms,
                             "request_ref": call.request_ref,
                             "response_ref": call.response_ref,

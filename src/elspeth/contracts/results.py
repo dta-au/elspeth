@@ -548,14 +548,23 @@ class RowResult:
         error: For ON_ERROR_ROUTED, type-safe error details for audit
         scheduler_pending_sink: True only after the durable scheduler row for
             this exact token has been transitioned to PENDING_SINK.
-        authoritative_error_hash: For ON_ERROR_ROUTED results REBUILT from a
-            persisted pending sink (crash-recovery replay), the ORIGINAL
-            audited error hash. The outcome accumulator prefers this over
-            recomputing from the synthetic replay FailureInfo, so the replayed
-            audit record correlates with the pre-crash one
-            (filigree elspeth-d74d19f901). None for live results.
+        authoritative_error_hash: The ORIGINAL audited error hash, which the
+            outcome accumulator uses instead of recomputing one. Set on an
+            ON_ERROR_ROUTED result REBUILT from a persisted pending sink
+            (crash-recovery replay), so the replayed audit record correlates
+            with the pre-crash one (archived issue elspeth-d74d19f901); None
+            for live ON_ERROR_ROUTED results. REQUIRED on the sink-carrying
+            source-quarantine result, live and replayed alike: the hash was
+            recorded with the quarantine at ingest and is never recomputed.
         join_group_id: For COALESCED results, the merge-event identity of the
             coalesce that produced this token. None for all other paths.
+        counts_failed_barrier: True on exactly ONE result per failed
+            coalesce/row_union group — the live ``rows_coalesce_failed`` unit
+            (one per failed barrier group, never one per consumed token). Set
+            only by the failed-group surfacing helpers; every consumed token
+            still surfaces its own (FAILURE, UNROUTED) result, so
+            ``rows_failed`` counts tokens while this counts groups. Legal only
+            on (FAILURE, UNROUTED).
     """
 
     token: TokenInfo
@@ -567,8 +576,17 @@ class RowResult:
     scheduler_pending_sink: bool = False
     authoritative_error_hash: str | None = None
     join_group_id: str | None = None
+    counts_failed_barrier: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.counts_failed_barrier) is not bool:
+            raise OrchestrationInvariantError(
+                f"RowResult.counts_failed_barrier must be bool, got {type(self.counts_failed_barrier).__name__}"
+            )
+        if self.counts_failed_barrier and (self.outcome, self.path) != (TerminalOutcome.FAILURE, TerminalPath.UNROUTED):
+            raise OrchestrationInvariantError(
+                f"RowResult.counts_failed_barrier is only valid for (FAILURE, UNROUTED) results, got ({self.outcome!r}, {self.path!r})"
+            )
         if type(self.scheduler_pending_sink) is not bool:
             raise OrchestrationInvariantError(
                 f"RowResult.scheduler_pending_sink must be bool, got {type(self.scheduler_pending_sink).__name__}"
@@ -576,9 +594,10 @@ class RowResult:
         if self.authoritative_error_hash is not None:
             if type(self.authoritative_error_hash) is not str or not self.authoritative_error_hash:
                 raise OrchestrationInvariantError("RowResult.authoritative_error_hash must be a non-empty string when set")
-            if self.path != TerminalPath.ON_ERROR_ROUTED:
+            if self.path not in (TerminalPath.ON_ERROR_ROUTED, TerminalPath.QUARANTINED_AT_SOURCE):
                 raise OrchestrationInvariantError(
-                    f"RowResult.authoritative_error_hash is only valid for ON_ERROR_ROUTED results, got path={self.path!r}"
+                    "RowResult.authoritative_error_hash is only valid for ON_ERROR_ROUTED and source-quarantine "
+                    f"results, got path={self.path!r}"
                 )
         if self.outcome is not None and (self.outcome, self.path) not in _LEGAL_TERMINAL_PAIRS:
             raise OrchestrationInvariantError(f"RowResult: illegal (outcome, path) pair: ({self.outcome!r}, {self.path!r})")
@@ -604,12 +623,60 @@ class RowResult:
                 )
             if not isinstance(self.error, FailureInfo):
                 raise OrchestrationInvariantError("(FAILURE, ON_ERROR_ROUTED) outcome requires error to be a FailureInfo instance")
+        if self.path == TerminalPath.QUARANTINED_AT_SOURCE:
+            # (FAILURE, QUARANTINED_AT_SOURCE) is a SHARED pair. With a sink it
+            # is a source-quarantined row handed to its quarantine sink: the
+            # fenced ingest parked it durably and recorded its error hash, so
+            # both must travel with it. Without a sink it is a discard (a
+            # transform or batch on_error: discard, a rule-9 closer), whose
+            # outcome is already recorded — it carries neither.
+            if self.sink_name is not None:
+                if not self.scheduler_pending_sink or self.authoritative_error_hash is None:
+                    raise OrchestrationInvariantError(
+                        "A source-quarantine result bound for a sink requires its durable PENDING_SINK handoff "
+                        "(scheduler_pending_sink=True) and its audited authoritative_error_hash"
+                    )
+            elif self.scheduler_pending_sink or self.authoritative_error_hash is not None:
+                raise OrchestrationInvariantError(
+                    "A discarded (FAILURE, QUARANTINED_AT_SOURCE) result has no sink, so it carries neither a "
+                    "PENDING_SINK handoff nor an authoritative_error_hash"
+                )
         if self.path == TerminalPath.COALESCED and self.sink_name is None:
             raise OrchestrationInvariantError("(SUCCESS, COALESCED) outcome requires sink_name to be set")
         if self.path == TerminalPath.COALESCED and self.join_group_id is None:
             raise OrchestrationInvariantError("(SUCCESS, COALESCED) outcome requires join_group_id to be set")
         if self.path != TerminalPath.COALESCED and self.join_group_id is not None:
             raise OrchestrationInvariantError(f"RowResult.join_group_id is only valid for COALESCED results, got path={self.path!r}")
+
+
+def failed_barrier_group_results(
+    consumed_tokens: Sequence[TokenInfo],
+    *,
+    exception_type: Literal["CoalesceFailure", "RowUnionFailure"],
+    failure_reason: str,
+) -> tuple[RowResult, ...]:
+    """Surface a failed coalesce/row_union group: one result PER consumed token.
+
+    The single shape every group-failure arm returns (intake, durable loss
+    replay, live loss, timeout/EOF sweeps): each consumed token gets its own
+    (FAILURE, UNROUTED) result — the live ``rows_failed`` unit, matching the
+    one terminal outcome the audit derive counts per token — and exactly ONE
+    of them (the first) carries ``counts_failed_barrier``, the live
+    ``rows_coalesce_failed`` unit (one per failed group). An empty
+    ``consumed_tokens`` (a zero-arrival failure) surfaces nothing.
+    """
+    error = FailureInfo(exception_type=exception_type, message=failure_reason)
+    return tuple(
+        RowResult(
+            token=token,
+            final_data=token.row_data,
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.UNROUTED,
+            error=error,
+            counts_failed_barrier=index == 0,
+        )
+        for index, token in enumerate(consumed_tokens)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -749,7 +816,7 @@ class SourceRow:
             if on_validation_failure != "discard":
                 yield SourceRow.quarantined(
                     row=row,
-                    error=str(e),
+                    error=safe_validation_error_text(e, schema),  # never str(e): it echoes the value
                     destination=on_validation_failure,
                     source_row_index=source_row_index,
                 )
@@ -765,6 +832,9 @@ class SourceRow:
     quarantine_destination: str | None = None
     contract: SchemaContract | None = None
     source_row_index: int | None = None
+    # Engine-owned provenance for sealed finite-source emissions. Ordinary
+    # streaming sources leave this unset; intake consumes their context queue.
+    validation_error_id: str | None = None
 
     def __post_init__(self) -> None:
         """Validate quarantine field invariants.
@@ -782,6 +852,8 @@ class SourceRow:
             _require_non_empty_str(self.quarantine_error, "quarantine_error")
             if self.quarantine_destination is None:
                 raise ValueError("Quarantined SourceRow must have quarantine_destination")
+            if self.validation_error_id is not None:
+                _require_non_empty_str(self.validation_error_id, "validation_error_id")
         else:
             if self.source_row_index is None:
                 raise ValueError("Valid SourceRow must have source_row_index. Pass source_row_index= to SourceRow.valid().")
@@ -790,6 +862,8 @@ class SourceRow:
                 raise ValueError(f"Non-quarantined SourceRow must not have quarantine_error, got: {self.quarantine_error!r}")
             if self.quarantine_destination is not None:
                 raise ValueError(f"Non-quarantined SourceRow must not have quarantine_destination, got: {self.quarantine_destination!r}")
+            if self.validation_error_id is not None:
+                raise ValueError("Non-quarantined SourceRow must not have validation_error_id")
             # Valid rows MUST have a contract — the engine requires it at
             # tokenization. Catching it here prevents a misleading crash later.
             if self.contract is None:
@@ -823,6 +897,7 @@ class SourceRow:
         destination: str,
         *,
         source_row_index: int,
+        validation_error_id: str | None = None,
     ) -> SourceRow:
         """Create a quarantined row result.
 
@@ -833,6 +908,7 @@ class SourceRow:
             destination: The sink name to route this row to
             source_row_index: Source-authored row position for emitted
                 quarantined rows.
+            validation_error_id: Existing audit identity sealed by engine intake.
         """
         return cls(
             row=row,
@@ -841,6 +917,7 @@ class SourceRow:
             quarantine_destination=destination,
             contract=None,  # Quarantined rows don't have contracts
             source_row_index=source_row_index,
+            validation_error_id=validation_error_id,
         )
 
     def to_pipeline_row(self) -> PipelineRow:

@@ -32,9 +32,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import rfc8785
 
-from elspeth.contracts.composer_audit import ComposerToolStatus
+from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.audit import build_canonicalization_sentinel
 from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
@@ -42,16 +43,22 @@ from elspeth.web.composer.protocol import (
     ComposerRuntimePreflightError,
     ToolArgumentError,
 )
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import (
     CompositionState,
     PipelineMetadata,
     ValidationSummary,
 )
 from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools import execute_tool as _strict_execute_tool
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
-from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
+from tests.unit.web.composer._helpers import (
+    _composer_service_with_session,
+    _persisted_tool_responses,
+    _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
+)
 
 # ---------------------------------------------------------------------------
 # Test doubles — mirror the shapes used by tests/unit/web/composer/test_service.py
@@ -145,7 +152,7 @@ def _make_settings(**overrides: Any) -> WebSettings:
 def _make_llm_response(
     content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
-) -> _FakeLLMResponse:
+) -> _AdmittedLLMCompletion:
     fake_tool_calls: list[_FakeToolCall] | None = None
     if tool_calls:
         fake_tool_calls = [
@@ -158,17 +165,19 @@ def _make_llm_response(
             )
             for tc in tool_calls
         ]
-    return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=fake_tool_calls))])
+    return _admit_composer_llm_completion(
+        _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=fake_tool_calls))])
+    )
 
 
 @pytest.fixture(autouse=True)
 def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Skip the boot-time API key check — these tests target compose behavior."""
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +200,8 @@ async def test_compose_loop_records_success_arg_error_plugin_crash_sequence() ->
     Asserts:
 
     - ``ComposerPluginCrashError`` propagates out of ``compose()``
-    - ``exc.tool_invocations`` carries exactly three records, in order
+    - The recorder captures exactly three records, in order; persisted
+      responses remain durable and the exception carries no replay trail.
     - status / version_after / error_class line up with the dispatch
       semantics: SUCCESS bumps the version, ARG_ERROR and PLUGIN_CRASH
       both record ``version_after is None``.
@@ -202,7 +212,7 @@ async def test_compose_loop_records_success_arg_error_plugin_crash_sequence() ->
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     # Three LLM turns — one tool_call each. The arguments here only need
@@ -252,8 +262,12 @@ async def test_compose_loop_records_success_arg_error_plugin_crash_sequence() ->
         affected_nodes=(),
     )
 
+    from elspeth.web.composer.audit import BufferingRecorder
+
+    recorder = BufferingRecorder()
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch("elspeth.web.composer.service.BufferingRecorder", return_value=recorder),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[
@@ -269,42 +283,84 @@ async def test_compose_loop_records_success_arg_error_plugin_crash_sequence() ->
     ):
         mock_llm.side_effect = [turn1, turn2, turn3]
         with pytest.raises(ComposerPluginCrashError) as exc_info:
-            await service.compose("Drive the sequence", [], state)
+            await service.compose("Drive the sequence", [], state, session_id=session_id)
 
-    invocations = exc_info.value.tool_invocations
+    assert exc_info.value.tool_invocations == ()
+    durable_responses = _persisted_tool_responses(service, session_id)
+    assert [row["tool_call_id"] for row in durable_responses] == [
+        "call_success",
+        "call_arg_error",
+        "call_plugin_crash",
+    ]
+    success_payload = json.loads(durable_responses[0]["result_canonical"])
+    assert success_payload["success"] is True
+    assert success_payload["version"] == 2
+    state_id = durable_responses[0]["composition_state_id"]
+    assert state_id is not None
+    assert durable_responses[1]["composition_state_id"] is None
+    assert durable_responses[2]["composition_state_id"] is None
+    assert json.loads(durable_responses[1]["result_canonical"]) == {
+        "_redaction_status": "arg_error",
+        "error_class": "ToolArgumentError",
+        # S0: the closed category persists beside the honest class.
+        "error_category": "semantic_rule",
+        "error_message": "<redacted-arg-error-message>",
+    }
+    assert json.loads(durable_responses[2]["result_canonical"]) == {
+        "_redaction_status": "plugin_crash",
+        "error_class": "RuntimeError",
+        "error_message": "<redacted-failure-message>",
+    }
+    from sqlalchemy import select
+
+    from elspeth.web.sessions.models import composition_rejection_events_table
+
+    with service._require_sessions_service()._engine.connect() as conn:
+        rejections = conn.execute(
+            select(composition_rejection_events_table)
+            .where(
+                composition_rejection_events_table.c.session_id == session_id,
+            )
+            .order_by(composition_rejection_events_table.c.created_at)
+        ).all()
+    assert [(row.tool_call_id, row.error_code, row.message, row.composition_state_id) for row in rejections] == [
+        ("call_arg_error", "ToolArgumentError", "'tool argument' must be a string, got int", state_id),
+        ("call_plugin_crash", "RuntimeError", "RuntimeError", state_id),
+    ]
+    invocations = [invocation.to_dict() for invocation in recorder.invocations]
     assert len(invocations) == 3, (
-        f"Expected 3 audit invocations (SUCCESS, ARG_ERROR, PLUGIN_CRASH); got {len(invocations)}: {[inv.status for inv in invocations]}"
+        f"Expected 3 audit invocations (SUCCESS, ARG_ERROR, PLUGIN_CRASH); got {len(invocations)}: {[inv['status'] for inv in invocations]}"
     )
 
     # SUCCESS — version advanced from 1 to 2
     success_inv = invocations[0]
-    assert success_inv.status == ComposerToolStatus.SUCCESS
-    assert success_inv.tool_call_id == "call_success"
-    assert success_inv.version_before == 1
-    assert success_inv.version_after == 2
-    assert success_inv.version_after is not None
-    assert success_inv.version_after > success_inv.version_before
-    assert success_inv.error_class is None
+    assert success_inv["status"] == ComposerToolStatus.SUCCESS
+    assert success_inv["tool_call_id"] == "call_success"
+    assert success_inv["version_before"] == 1
+    assert success_inv["version_after"] == 2
+    assert success_inv["version_after"] is not None
+    assert success_inv["version_after"] > success_inv["version_before"]
+    assert success_inv["error_class"] is None
 
     # ARG_ERROR — version_after must be None (dispatch did not complete)
     arg_error_inv = invocations[1]
-    assert arg_error_inv.status == ComposerToolStatus.ARG_ERROR
-    assert arg_error_inv.tool_call_id == "call_arg_error"
-    assert arg_error_inv.version_after is None
-    assert arg_error_inv.error_class == "ToolArgumentError"
+    assert arg_error_inv["status"] == ComposerToolStatus.ARG_ERROR
+    assert arg_error_inv["tool_call_id"] == "call_arg_error"
+    assert arg_error_inv["version_after"] is None
+    assert arg_error_inv["error_class"] == "ToolArgumentError"
 
     # PLUGIN_CRASH — version_after None, error_class is the original
     # exception class. error_message MUST be class-name only (redaction
     # discipline; pin against future drift that would echo str(exc)).
     plugin_crash_inv = invocations[2]
-    assert plugin_crash_inv.status == ComposerToolStatus.PLUGIN_CRASH
-    assert plugin_crash_inv.tool_call_id == "call_plugin_crash"
-    assert plugin_crash_inv.version_after is None
-    assert plugin_crash_inv.error_class == "RuntimeError"
-    assert plugin_crash_inv.error_message == "RuntimeError"
+    assert plugin_crash_inv["status"] == ComposerToolStatus.PLUGIN_CRASH
+    assert plugin_crash_inv["tool_call_id"] == "call_plugin_crash"
+    assert plugin_crash_inv["version_after"] is None
+    assert plugin_crash_inv["error_class"] == "RuntimeError"
+    assert plugin_crash_inv["error_message"] == "RuntimeError"
 
     # Tool-call ordering reflects the dispatch sequence as the loop saw it.
-    assert [inv.tool_call_id for inv in invocations] == [
+    assert [inv["tool_call_id"] for inv in invocations] == [
         "call_success",
         "call_arg_error",
         "call_plugin_crash",
@@ -328,7 +384,7 @@ async def test_compose_loop_records_assertion_error_before_reraise() -> None:
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     turn = _make_llm_response(
@@ -360,7 +416,7 @@ async def test_compose_loop_records_assertion_error_before_reraise() -> None:
             captured_recorder["instance"] = self
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=AssertionError("Tier-1 invariant breach"),
@@ -369,7 +425,7 @@ async def test_compose_loop_records_assertion_error_before_reraise() -> None:
     ):
         mock_llm.return_value = turn
         with pytest.raises(AssertionError):
-            await service.compose("Trigger invariant", [], state)
+            await service.compose("Trigger invariant", [], state, session_id=session_id)
 
     spy = captured_recorder["instance"]
     invocations = spy.invocations
@@ -412,7 +468,7 @@ async def test_compose_loop_crashes_when_success_canonical_json_fails() -> None:
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     mutated_state = replace(state, version=2)
@@ -457,8 +513,8 @@ async def test_compose_loop_crashes_when_success_canonical_json_fails() -> None:
     passing_preflight = _passing_preflight()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             return_value=bad_result,
@@ -466,7 +522,7 @@ async def test_compose_loop_crashes_when_success_canonical_json_fails() -> None:
         pytest.raises(ComposerPluginCrashError) as exc_info,
     ):
         mock_llm.side_effect = [turn1, turn2]
-        await service.compose("Trigger non-finite payload", [], state)
+        await service.compose("Trigger non-finite payload", [], state, session_id=session_id)
 
     # The canonicalization failure on our own dispatch output surfaces as
     # a loud crash whose root cause is the rfc8785 ``ValueError`` — never
@@ -486,7 +542,7 @@ async def test_timeout_after_successful_tool_carries_audit_invocations() -> None
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     mutated_state = replace(state, version=2)
@@ -515,21 +571,21 @@ async def test_timeout_after_successful_tool_carries_audit_invocations() -> None
 
     calls = {"count": 0}
 
-    async def first_tool_then_timeout_llm(*_args: Any, **_kwargs: Any) -> _FakeLLMResponse:
+    async def first_tool_then_timeout_llm(*_args: Any, **_kwargs: Any) -> _AdmittedLLMCompletion:
         calls["count"] += 1
         if calls["count"] == 1:
             return turn
         raise TimeoutError
 
     with (
-        patch.object(service, "_call_llm", new=first_tool_then_timeout_llm),
+        patch.object(service._provider_gateway, "_call_llm", new=first_tool_then_timeout_llm),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             return_value=success_result,
         ) as mock_execute_tool,
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
-        await service.compose("Timeout after the tool", [], state)
+        await service.compose("Timeout after the tool", [], state, session_id=session_id)
 
     assert exc_info.value.budget_exhausted == "timeout"
     assert calls["count"] == 2
@@ -553,7 +609,7 @@ async def test_preview_runtime_preflight_failure_records_tool_invocation() -> No
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     turn = _make_llm_response(
@@ -567,13 +623,13 @@ async def test_preview_runtime_preflight_failure_records_tool_invocation() -> No
     )
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_runtime_preflight", side_effect=RuntimeError("synthetic runtime preflight bug")),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._preflight, "runtime_preflight", side_effect=RuntimeError("synthetic runtime preflight bug")),
         patch("elspeth.web.composer.tool_batch.execute_tool") as mock_execute_tool,
         pytest.raises(ComposerRuntimePreflightError) as exc_info,
     ):
         mock_llm.return_value = turn
-        await service.compose("Preview the current pipeline", [], state)
+        await service.compose("Preview the current pipeline", [], state, session_id=session_id)
 
     mock_execute_tool.assert_not_called()
     invocations = exc_info.value.tool_invocations
@@ -601,7 +657,7 @@ async def test_preview_tolerant_preflight_failure_records_tool_invocation() -> N
 
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     handoff = ValidationResult(
@@ -614,6 +670,8 @@ async def test_preview_tolerant_preflight_failure_records_tool_invocation() -> N
             completion_ready=True,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
+                    note=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="llm1",
                     component_type="transform",
@@ -639,13 +697,13 @@ async def test_preview_tolerant_preflight_failure_records_tool_invocation() -> N
     )
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_runtime_preflight", side_effect=strict_handoff_tolerant_crash),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._preflight, "runtime_preflight", side_effect=strict_handoff_tolerant_crash),
         patch("elspeth.web.composer.tool_batch.execute_tool") as mock_execute_tool,
         pytest.raises(ComposerRuntimePreflightError) as exc_info,
     ):
         mock_llm.return_value = turn
-        await service.compose("Preview the current pipeline", [], state)
+        await service.compose("Preview the current pipeline", [], state, session_id=session_id)
 
     mock_execute_tool.assert_not_called()
     invocations = exc_info.value.tool_invocations
@@ -671,7 +729,7 @@ async def test_handoff_shaped_preview_threads_the_structural_callback_into_execu
 
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     handoff = ValidationResult(
@@ -684,6 +742,8 @@ async def test_handoff_shaped_preview_threads_the_structural_callback_into_execu
             completion_ready=True,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
+                    note=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="llm1",
                     component_type="transform",
@@ -701,20 +761,6 @@ async def test_handoff_shaped_preview_threads_the_structural_callback_into_execu
 
     def strict_handoff_or_tolerant(*args: Any, **kwargs: Any) -> ValidationResult:
         return tolerant if kwargs.get("allow_pending_interpretation_placeholders") else handoff
-
-    preview_result = ToolResult(
-        success=True,
-        updated_state=state,
-        validation=ValidationSummary(
-            is_valid=True,
-            errors=(),
-            warnings=(),
-            suggestions=(),
-            semantic_contracts=(),
-        ),
-        affected_nodes=(),
-        data={"is_valid": False},
-    )
 
     turn = _make_llm_response(
         tool_calls=[
@@ -735,15 +781,15 @@ async def test_handoff_shaped_preview_threads_the_structural_callback_into_execu
         raise TimeoutError
 
     with (
-        patch.object(service, "_call_llm", new=tool_turn_then_timeout),
-        patch.object(service, "_runtime_preflight", side_effect=strict_handoff_or_tolerant),
+        patch.object(service._provider_gateway, "_call_llm", new=tool_turn_then_timeout),
+        patch.object(service._preflight, "runtime_preflight", side_effect=strict_handoff_or_tolerant),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
-            return_value=preview_result,
+            wraps=_strict_execute_tool,
         ) as mock_execute_tool,
         pytest.raises(ComposerConvergenceError),
     ):
-        await service.compose("Preview the current pipeline", [], state)
+        await service.compose("Preview the current pipeline", [], state, session_id=session_id)
 
     assert mock_execute_tool.call_count == 1
     kwargs = mock_execute_tool.call_args.kwargs
@@ -789,7 +835,7 @@ async def test_dispatch_records_cancelled_status_on_cancelled_error() -> None:
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     turn = _make_llm_response(
@@ -816,7 +862,7 @@ async def test_dispatch_records_cancelled_status_on_cancelled_error() -> None:
             captured_recorder["instance"] = self
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=asyncio.CancelledError("raw cancellation detail must not persist"),
@@ -825,7 +871,7 @@ async def test_dispatch_records_cancelled_status_on_cancelled_error() -> None:
     ):
         mock_llm.return_value = turn
         with pytest.raises(asyncio.CancelledError):
-            await service.compose("Trigger client disconnect", [], state)
+            await service.compose("Trigger client disconnect", [], state, session_id=session_id)
 
     spy = captured_recorder["instance"]
     invocations = spy.invocations
@@ -848,11 +894,13 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
     Python's ``json.loads`` accepts ``NaN``/``Infinity`` constants even
     though canonical JSON rejects them. The compose loop must record a
     corrective ARG_ERROR tool row and continue, rather than raising from
-    ``begin_dispatch`` before the recorder fires.
+    ``begin_dispatch`` before the recorder fires. The bounded decoder
+    rejects the constant (``ValueError``), so the row is
+    ``wire_json_invalid``; canonicalisation is never reached.
     """
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     turn1 = _make_llm_response(
@@ -868,12 +916,12 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
     passing_preflight = _passing_preflight()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         patch("elspeth.web.composer.tool_batch.execute_tool") as mock_execute_tool,
     ):
         mock_llm.side_effect = [turn1, turn2]
-        result = await service.compose("Trigger non-finite object arguments", [], state)
+        result = await service.compose("Trigger non-finite object arguments", [], state, session_id=session_id)
 
     assert result.message == "Recovered."
     mock_execute_tool.assert_not_called()
@@ -882,6 +930,7 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
     assert inv.status == ComposerToolStatus.ARG_ERROR
     assert inv.tool_call_id == "call_non_finite_object"
     assert inv.error_class == "ValueError"
+    assert inv.error_category is ToolArgumentErrorCategory.WIRE_JSON_INVALID
     assert inv.error_message == "ValueError"
     assert inv.version_after is None
 
@@ -892,10 +941,10 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
 
 @pytest.mark.asyncio
 async def test_compose_loop_records_arg_error_for_non_finite_non_object_arguments() -> None:
-    """Top-level Infinity must use the non-object ARG_ERROR audit path."""
+    """Top-level Infinity is rejected by the bounded decoder as ``wire_json_invalid``."""
     catalog = _mock_catalog()
     settings = _make_settings()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     turn1 = _make_llm_response(
@@ -911,12 +960,12 @@ async def test_compose_loop_records_arg_error_for_non_finite_non_object_argument
     passing_preflight = _passing_preflight()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         patch("elspeth.web.composer.tool_batch.execute_tool") as mock_execute_tool,
     ):
         mock_llm.side_effect = [turn1, turn2]
-        result = await service.compose("Trigger non-finite scalar arguments", [], state)
+        result = await service.compose("Trigger non-finite scalar arguments", [], state, session_id=session_id)
 
     assert result.message == "Recovered."
     mock_execute_tool.assert_not_called()
@@ -925,6 +974,7 @@ async def test_compose_loop_records_arg_error_for_non_finite_non_object_argument
     assert inv.status == ComposerToolStatus.ARG_ERROR
     assert inv.tool_call_id == "call_non_finite_scalar"
     assert inv.error_class == "ValueError"
+    assert inv.error_category is ToolArgumentErrorCategory.WIRE_JSON_INVALID
     assert inv.error_message == "ValueError"
     assert inv.version_after is None
 
@@ -955,49 +1005,10 @@ async def test_compose_loop_records_arg_error_for_non_finite_non_object_argument
 # ``test_compose_loop_records_success_when_canonical_json_fails``).
 #
 # Matrix: 4 discovery tools x {cache miss, cache hit} = 8 invocation
-# scenarios. The cache-hit path (`service.py:980-992`) hand-builds a
-# slim audit dict from raw ``cached_result.data`` — bypassing
-# ``ToolResult.to_dict()`` — so the only normalization site that
-# catches it is ``finish_success`` itself.
+# scenarios. Real handlers now cross selected response admission before
+# audit, while cache hits readmit the owned value and build a slim audit
+# envelope. Both paths must preserve the same catalog data.
 # ---------------------------------------------------------------------------
-
-
-def _discovery_result(
-    tool_name: str,
-    state: CompositionState,
-    catalog: MagicMock,
-) -> ToolResult:
-    """Build a real ToolResult mirroring what _handle_list_*/get_plugin_schema produce.
-
-    This goes through the same construction path as the production
-    handlers (`tools.py:_discovery_result`) so the freeze-on-data
-    discipline (``__post_init__`` calls ``freeze_fields(self, "data")``)
-    runs identically and the test exercises the actual audit-ingress
-    shape rather than a hand-rolled payload.
-    """
-    if tool_name == "list_sources":
-        data: Any = catalog.list_sources()
-    elif tool_name == "list_transforms":
-        data = catalog.list_transforms()
-    elif tool_name == "list_sinks":
-        data = catalog.list_sinks()
-    elif tool_name == "get_plugin_schema":
-        data = catalog.get_schema("source", "csv")
-    else:
-        raise AssertionError(f"unexpected discovery tool: {tool_name}")
-    return ToolResult(
-        success=True,
-        updated_state=state,
-        validation=ValidationSummary(
-            is_valid=True,
-            errors=(),
-            warnings=(),
-            suggestions=(),
-            semantic_contracts=(),
-        ),
-        affected_nodes=(),
-        data=data,
-    )
 
 
 def _assert_payload_preserved(payload: dict[str, Any], tool_name: str) -> None:
@@ -1022,12 +1033,13 @@ def _assert_payload_preserved(payload: dict[str, Any], tool_name: str) -> None:
 
     data = payload["data"]
     if tool_name == "list_sources":
-        assert isinstance(data, list)
-        assert len(data) == 1
-        assert data[0]["name"] == "csv"
-        assert data[0]["plugin_type"] == "source"
+        assert set(data) == {"available", "prohibited"}
+        assert data["prohibited"] == []
+        assert len(data["available"]) == 1
+        assert data["available"][0]["name"] == "csv"
+        assert data["available"][0]["plugin_type"] == "source"
     elif tool_name in ("list_transforms", "list_sinks"):
-        assert data == []
+        assert data == {"available": [], "prohibited": []}
     elif tool_name == "get_plugin_schema":
         assert isinstance(data, dict)
         assert data["name"] == "csv"
@@ -1060,18 +1072,13 @@ class TestComposerDiscoveryAuditPreservesResult:
     async def test_cache_miss_audit_preserves_pydantic_payload(self, tool_name: str, tool_args: dict[str, Any]) -> None:
         """A first-time discovery dispatch records the real catalog data.
 
-        Cache miss exercises the regular dispatch path:
-        ``execute_tool`` → real ``ToolResult`` →
-        ``_result_to_audit_payload`` → ``ToolResult.to_dict()`` →
-        ``finish_success`` → ``_normalize_audit_payload`` →
-        ``canonical_json``.
+        Real catalog producers cross selected response admission before
+        the success audit envelope is canonicalized.
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
-
-        discovery_result = _discovery_result(tool_name, state, catalog)
 
         turn1 = _make_llm_response(
             tool_calls=[
@@ -1090,15 +1097,19 @@ class TestComposerDiscoveryAuditPreservesResult:
         passing_preflight = _passing_preflight()
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
-                return_value=discovery_result,
+                wraps=_strict_execute_tool,
             ),
         ):
             mock_llm.side_effect = [turn1, turn2]
-            result = await service.compose(f"Run {tool_name}", [], state)
+            result = await service.compose(f"Inspect {tool_name}", [], state, session_id=session_id)
+
+        # Discovery-only requests finish without the empty-state build
+        # reconciliation turn; the two provider replies cover the full walk.
+        assert mock_llm.await_count == 2
 
         invocations = result.tool_invocations
         assert len(invocations) == 1, f"{tool_name}: expected exactly one audit row"
@@ -1124,16 +1135,9 @@ class TestComposerDiscoveryAuditPreservesResult:
     async def test_cache_hit_audit_preserves_pydantic_payload(self, tool_name: str, tool_args: dict[str, Any]) -> None:
         """Cache-hit replay records the cached catalog data, not the sentinel.
 
-        Cache hit exercises the second dispatch path:
-        ``cached_payload = {"success": ..., "data":
-        cached_result.data, "cache_hit": True}`` (hand-built in
-        ``service.py:980-992``, bypasses ``ToolResult.to_dict()``) →
-        ``finish_success`` → ``_normalize_audit_payload`` → ``canonical_json``.
-
-        ``finish_success`` is the single SUCCESS-path audit choke
-        point, so normalizing there catches both cache-miss and
-        cache-hit paths uniformly. This test pins that invariant
-        against any future refactor that might split the two paths.
+        Cache hits readmit the owned response and build a slim audit
+        envelope. Its canonical data must equal the original miss even
+        though the cache avoids a second handler dispatch.
 
         Sequence: two compose loop turns each issuing the same
         cacheable tool call, then a final text turn. The first call
@@ -1141,10 +1145,8 @@ class TestComposerDiscoveryAuditPreservesResult:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
-
-        discovery_result = _discovery_result(tool_name, state, catalog)
 
         # Same arguments dict on both turns → identical cache key.
         turn1 = _make_llm_response(
@@ -1170,15 +1172,15 @@ class TestComposerDiscoveryAuditPreservesResult:
         passing_preflight = _passing_preflight()
 
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
-                return_value=discovery_result,
+                wraps=_strict_execute_tool,
             ) as mock_execute_tool,
         ):
             mock_llm.side_effect = [turn1, turn2, turn3]
-            result = await service.compose(f"Cache {tool_name}", [], state)
+            result = await service.compose(f"Cache {tool_name}", [], state, session_id=session_id)
 
         # Cache hit means execute_tool was called only once across both
         # turns — the second turn served the result from
@@ -1216,9 +1218,10 @@ class TestComposerDiscoveryAuditPreservesResult:
         assert hit_payload["success"] is True
         assert hit_payload["cache_hit"] is True
         assert "data" in hit_payload
+        assert hit_payload["data"] == miss_payload["data"]
 
         if tool_name == "list_sources":
-            assert hit_payload["data"][0]["name"] == "csv"
+            assert hit_payload["data"]["available"][0]["name"] == "csv"
         elif tool_name == "get_plugin_schema":
             assert hit_payload["data"]["name"] == "csv"
             assert hit_payload["data"]["json_schema"] == {"title": "Config", "properties": {}}
@@ -1253,12 +1256,12 @@ async def test_canonicalization_sentinel_omits_detail_for_non_rfc8785_errors() -
 
 
 def test_canonicalization_sentinel_captures_detail_for_rfc8785_errors() -> None:
-    """rfc8785 errors are message-safe by spec — capture full detail.
+    """The base rfc8785 error's messages are type/rule strings — capture them.
 
-    :class:`rfc8785.CanonicalizationError` messages are bounded type
-    or rule strings (``"unsupported type: <class 'X'>"``,
-    ``"<value> is not representable in JCS"``) that never echo
-    arbitrary payload bytes. Capturing them in
+    The base :class:`rfc8785.CanonicalizationError` messages are bounded
+    type or rule strings (``"unsupported type: <class 'X'>"``) that never
+    echo payload bytes (its value-echoing subclasses are pinned below).
+    Capturing them in
     ``_canonicalization_detail`` gives auditors the offending Python
     type name without correlating to operational logs — exactly the
     forensic value the diagnostic upgrade is for.
@@ -1274,6 +1277,30 @@ def test_canonicalization_sentinel_captures_detail_for_rfc8785_errors() -> None:
     assert "PluginSummary" in detail
     assert "unsupported type" in detail
     assert sentinel["_payload_keys"] == ["data", "success", "validation"]
+
+
+@pytest.mark.parametrize(
+    ("value", "echo"),
+    [(9_007_199_254_740_993, "9007199254740993"), (float("inf"), "inf")],
+    ids=["IntegerDomainError", "FloatDomainError"],
+)
+def test_canonicalization_sentinel_omits_detail_for_rfc8785_domain_errors(value: object, echo: str) -> None:
+    """rfc8785's domain errors echo the value, so they get no detail (H3, lane 5887).
+
+    Measured: ``IntegerDomainError`` renders ``"<the integer> exceeds safe
+    integer domain for JSON floats"`` and ``FloatDomainError`` ``"<the float>
+    is not representable in JCS"``. The planner's tool arguments can carry a
+    value copied from a user's data, and the sentinel is persisted, so only
+    the class name is kept.
+    """
+    with pytest.raises(rfc8785.CanonicalizationError) as exc_info:
+        rfc8785.dumps({"n": value})
+    assert echo in str(exc_info.value)  # the echo the sentinel must not carry
+
+    sentinel = build_canonicalization_sentinel(exc_info.value, {"n": value})
+
+    assert sentinel == {"_canonicalization_error": type(exc_info.value).__name__, "_payload_keys": ["n"]}
+    assert echo not in json.dumps(sentinel)
 
 
 def test_canonicalization_sentinel_caps_detail_at_512_chars() -> None:

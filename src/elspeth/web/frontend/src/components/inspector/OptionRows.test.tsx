@@ -32,7 +32,7 @@ describe("OptionRows", () => {
     render(<OptionRows options={OPTIONS} ariaLabel="assess options" />);
     const region = screen.getByRole("region", { name: "assess options" });
     const terms = within(region).getAllByRole("term").map((t) => t.textContent);
-    expect(terms.slice(0, 3)).toEqual(["Prompt", "Model profile", "Row schema"]);
+    expect(terms.slice(0, 3)).toEqual(["User prompt", "Model profile", "Row schema"]);
     expect(region.textContent).not.toMatch(/prompt_template|schema_mode/);
     const advanced = within(region).getByText("Advanced settings (2)").closest("details");
     expect(advanced).not.toHaveAttribute("open");
@@ -162,11 +162,14 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
     description: "",
     json_schema: {},
     knob_schema: {
+      // `schema` is listed BEFORE `profile` on purpose: the prompt pair leads
+      // every llm step regardless of partition, so the schema-order vs
+      // fallback-order oracle below rides on these two keys instead.
       fields: [
+        { name: "schema", tier: "common" },
         { name: "profile", tier: "common" },
         { name: "prompt_template", tier: "common" },
         { name: "temperature", tier: "advanced" },
-        { name: "schema", tier: "common" },
       ],
     },
   } as const;
@@ -214,11 +217,11 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
       .map((term) => term.textContent);
 
     if (maxTokensIsAdvanced) {
-      expect(visibleTerms).toEqual(["Provider"]);
+      expect(visibleTerms).toEqual(["System prompt", "User prompt", "Provider"]);
       const advanced = within(region).getByText("Advanced settings (1)").closest("details");
       expect(within(advanced as HTMLElement).getByText("Max Tokens")).toBeInTheDocument();
     } else {
-      expect(visibleTerms).toEqual(["Provider", "Max Tokens"]);
+      expect(visibleTerms).toEqual(["System prompt", "User prompt", "Provider", "Max Tokens"]);
       expect(within(region).queryByText(/Advanced settings/)).not.toBeInTheDocument();
     }
   });
@@ -230,10 +233,10 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
     // `.graph-config-nested` excluded: OPTIONS.schema is a record, and ConfigValue
     // renders its keys as nested <dt>s (ConfigRows.tsx:41-52) in the visible partition.
     const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
-    // Schema field order — DIFFERENT from the fallback's label-map order
-    // (["Prompt", "Model profile", "Row schema"]); this is the oracle that
-    // distinguishes the two partitions.
-    expect(visibleTerms).toEqual(["Model profile", "Prompt", "Row schema"]);
+    // The prompt pair leads; the rest follow schema field order — DIFFERENT
+    // from the fallback's label-map order (["Model profile", "Row schema"]);
+    // this is the oracle that distinguishes the two partitions.
+    expect(visibleTerms).toEqual(["System prompt", "User prompt", "Row schema", "Model profile"]);
     const advanced = within(region).getByText("Advanced settings (2)").closest("details") as HTMLElement;
     expect(within(advanced).getByText("Temperature")).toBeInTheDocument(); // advanced tier
     expect(within(advanced).getByText("Max Retries")).toBeInTheDocument(); // unknown to the schema
@@ -245,10 +248,11 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
   // regression pin — a regression that dropped the essentials branch, or
   // interleaved essentials and commons instead of ordering essentials ahead,
   // would not have been caught. This fixture's schema order deliberately
-  // puts the essential field (prompt_template) THIRD, behind two commons
-  // (profile, schema is 3rd too — profile is 1st, prompt_template is 2nd,
-  // schema is 3rd) so the assertion only passes if tier — not schema
-  // position — decides who goes first.
+  // puts the essential field (schema) LAST of the visible three, behind a
+  // common (profile), so the assertion only passes if tier — not schema
+  // position — decides who goes first. (The essential field used to be
+  // prompt_template; the prompt pair now leads every llm step outside the
+  // partition, so it can no longer carry this oracle.)
   it("orders an essential-tier field ahead of commons even when it comes later in schema order", () => {
     const schemaWithEssential = {
       name: "llm",
@@ -258,8 +262,8 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
       knob_schema: {
         fields: [
           { name: "profile", tier: "common" },
-          { name: "prompt_template", tier: "essential" },
-          { name: "schema", tier: "common" },
+          { name: "prompt_template", tier: "common" },
+          { name: "schema", tier: "essential" },
           { name: "temperature", tier: "advanced" },
         ],
       },
@@ -268,9 +272,9 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
     render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
     const region = screen.getByRole("region", { name: "assess options" });
     const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
-    // prompt_template (essential) jumps ahead of profile and schema (both
-    // common), even though schema order lists it after profile.
-    expect(visibleTerms).toEqual(["Prompt", "Model profile", "Row schema"]);
+    // schema (essential) jumps ahead of profile (common), even though schema
+    // order lists it after profile.
+    expect(visibleTerms).toEqual(["System prompt", "User prompt", "Row schema", "Model profile"]);
   });
 
   // Live regression (build index-D3qXar6h.js, session 39578c6f): the operator
@@ -301,7 +305,7 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
     const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
     // Schema field order, all four present keys — including `temperature`,
     // which the tiered LLM_SCHEMA above sends to the disclosure.
-    expect(visibleTerms).toEqual(["Model profile", "Prompt", "Temperature", "Row schema"]);
+    expect(visibleTerms).toEqual(["System prompt", "User prompt", "Model profile", "Temperature", "Row schema"]);
     // The disclosure holds ONLY the key the schema does not list. An absent
     // tier promotes a known field; it does not promote an unknown one.
     const advanced = within(region).getByText("Advanced settings (1)").closest("details") as HTMLElement;
@@ -313,7 +317,7 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
     const { container } = render(<OptionRows options={OPTIONS} ariaLabel="assess options" plugin={{ kind: "transform", name: "llm" }} />);
     // The value cells are an identifier surface BY DESIGN at this component:
     // `prompt_template` is in FALLBACK_VISIBLE_OPTION_KEYS under the reader
-    // label "Prompt", so the wave deliberately renders authored prompt text —
+    // label "User prompt", so the wave deliberately renders authored prompt text —
     // `Rate {{ row['case_study1'] }}` here — to the reader. An underscore
     // inside content the USER wrote is not ELSPETH leaking an identifier, and
     // the pin cannot tell the two apart. Scanning the <dt> labels is what this
@@ -324,7 +328,7 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
     expectNoIdentifiersInDefaultDom(container, { allowSelectors: ["dl.graph-config-rows dd"] });
     const region = screen.getByRole("region", { name: "assess options" });
     const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
-    expect(visibleTerms).toEqual(["Prompt", "Model profile", "Row schema"]);
+    expect(visibleTerms).toEqual(["System prompt", "User prompt", "Model profile", "Row schema"]);
   });
 
   it("re-partitions when the catalog loads after mount (no request is made before the catalog has a key)", () => {
@@ -336,7 +340,7 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
     expect(loadSchema).toHaveBeenCalledWith("transform", "llm");
     const region = screen.getByRole("region", { name: "assess options" });
     const visibleTerms = within(region).getAllByRole("term").filter((t) => t.closest("details") === null && t.closest(".graph-config-nested") === null).map((t) => t.textContent);
-    expect(visibleTerms).toEqual(["Model profile", "Prompt", "Row schema"]);
+    expect(visibleTerms).toEqual(["System prompt", "User prompt", "Row schema", "Model profile"]);
   });
 
   it("masks a blob:<ref> path even when the catalog tiers `path` advanced (masking binds to the value, not the partition)", () => {
@@ -354,5 +358,123 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
     const advanced = within(region).getByText("Advanced settings (1)").closest("details") as HTMLElement;
     expect(within(advanced).getByText("Uploaded sample data")).toHaveAttribute("title", "blob:f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0");
     expect(region.textContent).not.toMatch(/f976fd8b-4432/);
+  });
+});
+
+// Session 60ab6a67: an llm step authored with a user prompt only rendered a
+// lone "Prompt" row, so the box gave no sign a role was missing. Both roles
+// are always shown for an llm step, system first, present or not.
+describe("llm prompt roles", () => {
+  const LLM = { kind: "transform", name: "llm" } as const;
+
+  function roleRows(region: HTMLElement): Array<[string | null, string | null]> {
+    const block = region.querySelector(".option-rows-prompt-roles") as HTMLElement;
+    expect(block).not.toBeNull();
+    return Array.from(block.querySelectorAll("dt")).map((dt) => [dt.textContent, dt.nextElementSibling?.textContent ?? null]);
+  }
+
+  it("leads with System prompt then User prompt when both are authored", () => {
+    render(
+      <OptionRows
+        options={{ profile: "sonnet", prompt_template: "Name a colour pair for {{ row.room }}", system_prompt: "You are a talented interior decorator." }}
+        ariaLabel="decorator options"
+        plugin={LLM}
+      />,
+    );
+    const region = screen.getByRole("region", { name: "decorator options" });
+    expect(roleRows(region)).toEqual([
+      ["System prompt", "You are a talented interior decorator."],
+      ["User prompt", "Name a colour pair for {{ row.room }}"],
+    ]);
+    const terms = within(region).getAllByRole("term").map((t) => t.textContent);
+    expect(terms.slice(0, 2)).toEqual(["System prompt", "User prompt"]);
+    expect(terms.filter((t) => t === "System prompt" || t === "User prompt")).toHaveLength(2);
+  });
+
+  it.each([[undefined], [null], [""], ["   \n"]])("names a missing system prompt instead of dropping the row (%j)", (systemPrompt) => {
+    render(
+      <OptionRows
+        options={{ profile: "sonnet", prompt_template: "Classify {{ row.text }}", system_prompt: systemPrompt }}
+        ariaLabel="arm options"
+        plugin={LLM}
+      />,
+    );
+    const rows = roleRows(screen.getByRole("region", { name: "arm options" }));
+    expect(rows[0]).toEqual(["System prompt", "Not set. Every LLM step needs a system prompt."]);
+    expect(rows[1]).toEqual(["User prompt", "Classify {{ row.text }}"]);
+  });
+
+  it("names a missing user prompt", () => {
+    render(<OptionRows options={{ system_prompt: "You classify tickets." }} ariaLabel="arm options" plugin={LLM} />);
+    const rows = roleRows(screen.getByRole("region", { name: "arm options" }));
+    expect(rows[1]).toEqual(["User prompt", "Not set. Every LLM step needs a user prompt."]);
+  });
+
+  it.each([
+    ["mapping form", { tone: { template: "Tone of {{ row.text }}?" }, urgency: { template: "Urgency of {{ row.text }}?" } }],
+    ["list form", [{ name: "tone", template: "Tone of {{ row.text }}?" }, { name: "urgency", template: "Urgency of {{ row.text }}?" }]],
+  ])("shows one system prompt and every query's user prompt for a multi-query step (%s)", (_form, queries) => {
+    render(<OptionRows options={{ system_prompt: "You assess tickets.", queries }} ariaLabel="multi options" plugin={LLM} />);
+    const region = screen.getByRole("region", { name: "multi options" });
+    expect(roleRows(region)).toEqual([
+      ["System prompt", "You assess tickets."],
+      ["User prompt", "toneTone of {{ row.text }}?"],
+      ["User prompt", "urgencyUrgency of {{ row.text }}?"],
+    ]);
+    // The per-query prompts sit in the always-open block, never only behind
+    // the collapsed disclosure the uncached fallback sends `queries` to.
+    const block = region.querySelector(".option-rows-prompt-roles") as HTMLElement;
+    expect(block.closest("details")).toBeNull();
+    expect(Array.from(block.querySelectorAll(".option-rows-query-name")).map((n) => n.textContent)).toEqual(["tone", "urgency"]);
+  });
+
+  it("shows the shared fallback for a query without its own template, and names one with no user prompt at all", () => {
+    const { unmount } = render(
+      <OptionRows
+        options={{ system_prompt: "You assess tickets.", prompt_template: "Assess {{ row.text }}", queries: { tone: { template: "Tone?" }, urgency: {} } }}
+        ariaLabel="multi options"
+        plugin={LLM}
+      />,
+    );
+    expect(roleRows(screen.getByRole("region", { name: "multi options" })).slice(1)).toEqual([
+      ["User prompt", "toneTone?"],
+      ["User prompt", "urgencyAssess {{ row.text }}"],
+    ]);
+    unmount();
+    render(<OptionRows options={{ system_prompt: "You assess tickets.", queries: { urgency: {} } }} ariaLabel="multi options" plugin={LLM} />);
+    expect(roleRows(screen.getByRole("region", { name: "multi options" }))[1]).toEqual([
+      "User prompt",
+      "urgencyNot set. Every LLM step needs a user prompt.",
+    ]);
+  });
+
+  it("shows both roles even when the catalog tiers them advanced", () => {
+    usePluginCatalogStore.setState({
+      key: "alice:fp-1",
+      principal: "alice",
+      fingerprint: "fp-1",
+      schemas: {
+        "transform:llm": {
+          name: "llm",
+          plugin_type: "transform",
+          description: "",
+          json_schema: {},
+          knob_schema: { fields: [{ name: "system_prompt", tier: "advanced" }, { name: "prompt_template", tier: "advanced" }] },
+        },
+      },
+    } as never);
+    render(
+      <OptionRows options={{ prompt_template: "Classify {{ row.text }}", system_prompt: "You classify tickets." }} ariaLabel="arm options" plugin={LLM} />,
+    );
+    const region = screen.getByRole("region", { name: "arm options" });
+    expect(roleRows(region)).toHaveLength(2);
+    expect(within(region).queryByText(/Advanced settings/)).not.toBeInTheDocument();
+  });
+
+  it("adds no prompt rows to a step that is not an llm transform", () => {
+    render(<OptionRows options={{ mapping: { id: "id" } }} ariaLabel="tidy options" plugin={{ kind: "transform", name: "field_mapper" }} />);
+    const region = screen.getByRole("region", { name: "tidy options" });
+    expect(region.querySelector(".option-rows-prompt-roles")).toBeNull();
+    expect(region.textContent).not.toMatch(/System prompt|User prompt/);
   });
 });

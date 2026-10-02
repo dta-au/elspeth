@@ -19,7 +19,7 @@ from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.engine.processor import DAGTraversalContext, RowProcessor
 from elspeth.engine.spans import SpanFactory
 from elspeth.testing import make_row
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db
 
 
 @st.composite
@@ -45,8 +45,9 @@ def _make_processor(
     source_node_id = NodeID("source-0")
 
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
+    coordination_token = leader_token_for(db, run_id)
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=coordination_token,
         plugin_name="test-source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -79,6 +80,7 @@ def _make_processor(
         traversal=traversal,
         coalesce_executor=coalesce_executor,
         scheduler=factory.scheduler,
+        coordination_token=coordination_token,
     )
 
     return processor, coalesce_executor if coalesce_executor is not None else _CoalesceExecutorFake()
@@ -173,15 +175,15 @@ class TestCoalesceTriggerEquivalence:
         assert handled is node_should_handle
 
         # Slice 3 re-pin (ADR-030 §E.2): acceptance is journal-first — the
-        # in-claim accept is gone for every arm. A handled token stashes its
-        # live barrier hold for the next drain iteration's intake instead.
-        # For the no-executor (follower) arm, the live_barrier_holds stash is
-        # SKIPPED — followers return early before the stash; mark_blocked is
-        # the only durable signal.
+        # in-claim accept is gone for every arm. A handled token records its
+        # arrival for the drain, leader and follower alike (elspeth-5887fb7928
+        # AC-R4): the drain persists the BLOCKED row's barrier_key and held row
+        # from it, and the leader's next intake consumes it.
         coalesce_executor.accept.assert_not_called()
         assert result is None
-        if node_should_handle_with_executor:
+        if node_should_handle:
             hold = processor._live_barrier_holds["token-1"]
             assert hold.barrier_key == "merge"
+            assert hold.token is token
         else:
             assert "token-1" not in processor._live_barrier_holds

@@ -43,6 +43,7 @@ def _build_view(
     deployment_aws_region: str | None = None,
     aws_s3_source_profiles: tuple[dict[str, str], ...] = (),
     aws_textract_profiles: tuple[dict[str, str], ...] = (),
+    azure_search_profiles: tuple[dict[str, object], ...] = (),
 ) -> PolicyCatalogView:
     settings = WebSettings(
         composer_max_composition_turns=4,
@@ -54,6 +55,7 @@ def _build_view(
         deployment_aws_region=deployment_aws_region,
         aws_s3_source_profiles=aws_s3_source_profiles,
         aws_textract_profiles=aws_textract_profiles,
+        azure_search_profiles=azure_search_profiles,
         llm_profiles={
             "task-role": {
                 "provider": "bedrock",
@@ -145,6 +147,68 @@ def test_textract_web_summary_schema_and_digest_use_operator_profile() -> None:
     assert digest_entry["profile_aliases"] == ["acceptance-docs"]
     assert "profile" in digest_entry["required_options"]
     assert not set(digest_entry["required_options"]) & {"region", "auth_mode", "bucket_field"}
+
+
+_AZURE_SEARCH_PRIVATE_NAMES = ("endpoint", "api_key", "use_managed_identity", "client_id", "api_version")
+_AZURE_SEARCH_VIEW_PROFILE: dict[str, object] = {
+    "alias": "policies",
+    "endpoint": "https://operator-private-marker.search.windows.net",
+    "auth": "managed_identity",
+    "indexes": ["approved-documents"],
+}
+
+
+def _azure_search_view() -> PolicyCatalogView:
+    return _build_view(plugin_allowlist=("transform:azure_ai_search",), azure_search_profiles=(_AZURE_SEARCH_VIEW_PROFILE,))
+
+
+def test_azure_ai_search_web_summary_schema_and_digest_use_operator_profile() -> None:
+    from elspeth.web.composer.planner_authoring_aids import discovery_digest
+
+    view = _azure_search_view()
+
+    summary = next(item for item in view.list_transforms() if item.name == "azure_ai_search")
+    field_names = {field.name for field in summary.config_fields}
+    assert {"profile", "index", "query_field", "output_prefix"} <= field_names
+    assert not field_names & set(_AZURE_SEARCH_PRIVATE_NAMES)
+    assert summary.example_use is not None
+    assert "profile: policies" in summary.example_use
+    for private_name in _AZURE_SEARCH_PRIVATE_NAMES:
+        assert f"{private_name}:" not in summary.example_use
+    assert "Azure RAG" in " ".join((summary.usage_when_to_use or "", *summary.composer_hints))
+    assert "operator-private-marker" not in summary.model_dump_json()
+
+    schema = view.get_schema("transform", "azure_ai_search")
+    assert schema.json_schema["properties"]["profile"]["enum"] == ["policies"]
+    assert schema.json_schema["properties"]["index"]["enum"] == ["approved-documents"]
+    assert "operator-private-marker" not in schema.model_dump_json()
+    digest_entry = next(item for item in discovery_digest(view)["transforms"] if item["name"] == "azure_ai_search")
+    assert digest_entry["profile_aliases"] == ["policies"]
+    assert {"profile", "index"} <= set(digest_entry["required_options"])
+    assert not set(digest_entry["required_options"]) & set(_AZURE_SEARCH_PRIVATE_NAMES)
+
+
+def test_azure_ai_search_is_hidden_from_the_web_catalog_without_a_profile() -> None:
+    view = _build_view(plugin_allowlist=("transform:azure_ai_search",))
+
+    assert all(item.name != "azure_ai_search" for item in view.list_transforms())
+
+
+def test_azure_ai_search_web_assistance_uses_only_profile_guidance() -> None:
+    view = _azure_search_view()
+    result = _execute_get_plugin_assistance(
+        {"plugin_type": "transform", "plugin_name": "azure_ai_search"},
+        CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+        ToolContext(catalog=view, plugin_snapshot=view.snapshot),
+    )
+
+    assert result.success is True
+    payload = result.to_dict()["data"]
+    guidance = " ".join((payload["summary"], *payload["composer_hints"]))
+    assert "Azure RAG" in guidance
+    assert "profile" in guidance.casefold()
+    for private_name in (*_AZURE_SEARCH_PRIVATE_NAMES, "secret_ref", "operator-private-marker"):
+        assert private_name not in guidance
 
 
 def test_trained_operator_textract_summary_retains_explicit_raw_config() -> None:

@@ -16,6 +16,7 @@ from collections import defaultdict as collections_defaultdict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 from unittest.mock import patch
 
@@ -26,6 +27,7 @@ from elspeth.contracts.audit import (
     Batch,
     BatchMember,
     Call,
+    CallVerification,
     Edge,
     Node,
     NodeStateCompleted,
@@ -91,7 +93,6 @@ _NODE = Node(
     config_hash="node-cfg-hash",
     config_json='{"path": "data.csv"}',
     registered_at=_DT,
-    schema_hash="schema-hash",
     sequence_in_pipeline=0,
     schema_mode="observed",
     schema_fields=[{"name": "id", "type": "int"}],
@@ -473,6 +474,9 @@ class _ExecutionRecorder:
     def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]:
         return self.operation_calls
 
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        return iter(())
+
     def get_batches(self, run_id: str) -> list[Any]:
         return self.batches
 
@@ -503,6 +507,7 @@ class _QueryRecorder:
     lineage_paths: dict[str, tuple[Any, ...]] = field(default_factory=dict)
     group_records: list[Any] = field(default_factory=list)
     group_losses: list[Any] = field(default_factory=list)
+    collector_group_failures: list[Any] = field(default_factory=list)
 
     def iter_rows_for_run(self, run_id: str, *, batch_size: int) -> Iterator[list[Any]]:
         for offset in range(0, len(self.rows), batch_size):
@@ -520,6 +525,9 @@ class _QueryRecorder:
 
     def get_group_losses_for_run(self, run_id: str) -> list[Any]:
         return self.group_losses
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]:
+        return self.collector_group_failures
 
     def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
         wanted = set(token_ids)
@@ -583,6 +591,9 @@ class _ExportReadModelRecorder:
     def get_all_operation_calls_for_run(self, run_id: str) -> list[Any]:
         return self._execution.get_all_operation_calls_for_run(run_id)
 
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        return self._execution.iter_verification_decisions_for_run(run_id, batch_size=batch_size)
+
     def get_batches(self, run_id: str) -> list[Any]:
         return self._execution.get_batches(run_id)
 
@@ -618,6 +629,9 @@ class _ExportReadModelRecorder:
 
     def get_group_losses_for_run(self, run_id: str) -> list[Any]:
         return self._query.get_group_losses_for_run(run_id)
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]:
+        return self._query.get_collector_group_failures_for_run(run_id)
 
     def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
         return self._query.get_token_parents_for_tokens(token_ids)
@@ -668,6 +682,8 @@ def _make_exporter(
     """Create an exporter with in-memory recorder fakes."""
     return LandscapeExporter(
         _fake_landscape_db(),
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id="test-compartment",
         signing_key=signing_key,
         signer_key_id="test-signer-v1" if signing_key is not None else None,
         include_raw_error_rows=include_raw_error_rows,
@@ -787,7 +803,7 @@ class TestConstructor:
         db = _fake_landscape_db()
         factory = object()
         with patch("elspeth.core.landscape.exporter.RecorderFactory", autospec=True, return_value=factory) as recorder_factory:
-            exporter = LandscapeExporter(db)
+            exporter = LandscapeExporter(db, compartment_id="test-compartment")
         assert exporter._db is db
         assert isinstance(exporter._read_model, RecorderFactoryExportReadModel)
         recorder_factory.assert_called_once_with(db)
@@ -798,7 +814,7 @@ class TestConstructor:
         factory = object()
         key = b"secret-key"
         with patch("elspeth.core.landscape.exporter.RecorderFactory", autospec=True, return_value=factory):
-            exporter = LandscapeExporter(db, signing_key=key)
+            exporter = LandscapeExporter(db, signing_key=key, compartment_id="test-compartment")
         assert isinstance(exporter._read_model, RecorderFactoryExportReadModel)
         assert exporter._signing_key == key
 
@@ -807,7 +823,7 @@ class TestConstructor:
         read_model = _make_export_read_model()
 
         with patch("elspeth.core.landscape.exporter.RecorderFactory", autospec=True) as recorder_factory:
-            exporter = LandscapeExporter(db, read_model=read_model)
+            exporter = LandscapeExporter(db, read_model=read_model, compartment_id="test-compartment")
 
         recorder_factory.assert_not_called()
         assert not hasattr(read_model, "run_lifecycle")
@@ -829,7 +845,31 @@ class TestConstructor:
                 "auth_provider_type": None,
                 "settings": {"key": "value"},
                 "reproducibility_grade": "full_reproducible",
-            }
+            },
+            {
+                "record_type": "audit_export_config",
+                "public_config": {
+                    "auth_events": "omitted",
+                    "chunking_algorithm_version": "record-framing-v1",
+                    "export_format": "json",
+                    "exporter_version": "landscape-exporter-auth-v2",
+                    "compartment_id": "test-compartment",
+                    "include_raw_error_rows": False,
+                    "per_chunk_byte_limit": 64 * 1024 * 1024,
+                    "per_chunk_record_limit": 1_000_000,
+                    "serialization_version": "audit-export-v3",
+                    "signer_key_id": "UNSIGNED",
+                    "signing_mode": "unsigned",
+                },
+            },
+            {
+                "record_type": "auth_event_coverage",
+                "policy": "omitted",
+                "selection_cutoff": None,
+                "selection_basis": None,
+                "selected_count": None,
+                "reason": "not_requested",
+            },
         ]
 
     def test_rejects_non_positive_row_batch_size(self) -> None:
@@ -886,10 +926,10 @@ class TestExportRunUnsigned:
         with pytest.raises(ValueError, match="Run not found"):
             list(exporter.export_run("unknown-run"))
 
-    def test_empty_run_yields_run_record_only(self) -> None:
+    def test_empty_run_yields_run_record_and_coverage(self) -> None:
         exporter = _make_exporter()
         records = list(exporter.export_run("run-1"))
-        assert len(records) == 2
+        assert len(records) == 4
         assert records[0]["record_type"] == "run"
         assert records[0]["run_id"] == "run-1"
         assert records[0]["status"] == "completed"
@@ -932,8 +972,13 @@ class TestExportRunUnsigned:
 
         records = list(exporter.export_run("run-1"))
 
-        assert [record["record_type"] for record in records[:2]] == ["run", "web_plugin_policy"]
-        assert records[1] == {
+        assert [record["record_type"] for record in records[:4]] == [
+            "run",
+            "audit_export_config",
+            "auth_event_coverage",
+            "web_plugin_policy",
+        ]
+        assert records[3] == {
             "record_type": "web_plugin_policy",
             "run_id": "run-1",
             "schema_version": 1,
@@ -950,6 +995,8 @@ class TestExportRunUnsigned:
             ],
             "binding_generation_fingerprint": "c" * 64,
             "decision_codes": ["policy_allowed"],
+            "admission_decision_json": None,
+            "admission_decision_hash": None,
         }
 
     def test_run_record_has_timestamps(self) -> None:
@@ -1019,7 +1066,7 @@ class TestExportRunSigned:
         manifest = records[-1]
         assert manifest["record_type"] == "manifest"
         assert manifest["run_id"] == "run-1"
-        assert manifest["record_count"] == 1  # Just the run record
+        assert manifest["record_count"] == 3  # Run, public config, explicit auth coverage
         assert manifest["hash_algorithm"] == "sha256"
         assert manifest["signature_algorithm"] == "hmac_sha256"
         assert manifest["schema"] == "elspeth.audit-export-manifest.v2"
@@ -1034,8 +1081,8 @@ class TestExportRunSigned:
         )
         records = list(exporter.export_run("run-1", sign=True))
         manifest = records[-1]
-        # run + node + edge = 3
-        assert manifest["record_count"] == 3
+        # run + public config + auth coverage + node + edge = 5
+        assert manifest["record_count"] == 5
 
 
 # ===========================================================================
@@ -1067,6 +1114,7 @@ class _SpyReadModel:
             "get_transform_errors_for_run",
             "get_operations_for_run",
             "get_all_operation_calls_for_run",
+            "iter_verification_decisions_for_run",
             "get_batches",
             "get_all_batch_members_for_run",
             "get_artifacts",
@@ -1079,6 +1127,7 @@ class _SpyReadModel:
             "get_lineage_paths_for_tokens",
             "get_group_records_for_run",
             "get_group_losses_for_run",
+            "get_collector_group_failures_for_run",
             "get_token_parents_for_tokens",
             "get_token_outcomes_for_tokens",
             "get_scheduler_events_for_tokens",
@@ -1140,6 +1189,10 @@ class _SpyReadModel:
         self._record("get_all_operation_calls_for_run")
         return self._inner.get_all_operation_calls_for_run(run_id)
 
+    def iter_verification_decisions_for_run(self, run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
+        self._record("iter_verification_decisions_for_run")
+        return self._inner.iter_verification_decisions_for_run(run_id, batch_size=batch_size)
+
     def get_batches(self, run_id: str) -> list[Any]:
         self._record("get_batches")
         return self._inner.get_batches(run_id)
@@ -1187,6 +1240,10 @@ class _SpyReadModel:
     def get_group_losses_for_run(self, run_id: str) -> list[Any]:
         self._record("get_group_losses_for_run")
         return self._inner.get_group_losses_for_run(run_id)
+
+    def get_collector_group_failures_for_run(self, run_id: str) -> list[Any]:
+        self._record("get_collector_group_failures_for_run")
+        return self._inner.get_collector_group_failures_for_run(run_id)
 
     def get_token_parents_for_tokens(self, token_ids: Sequence[str]) -> list[Any]:
         self._record("get_token_parents_for_tokens")
@@ -1238,7 +1295,7 @@ class TestExportRunStreaming:
     def test_first_record_yields_before_later_query_families(self) -> None:
         """Pulling the first record must not touch nodes/edges/rows/batches/artifacts."""
         read_model = _SpyReadModel(_make_export_read_model(nodes=[_NODE], edges=[_EDGE], rows=[_make_row(0)]))
-        exporter = LandscapeExporter(_fake_landscape_db(), read_model=read_model)
+        exporter = LandscapeExporter(_fake_landscape_db(), read_model=read_model, compartment_id="test-compartment")
 
         iterator = exporter.export_run("run-1")
         first = next(iterator)
@@ -1270,7 +1327,7 @@ class TestExportRunStreaming:
         # generator matches iter_rows_for_run's signature exactly, so no
         # suppression is needed now that the method is written out.
         read_model.iter_rows_for_run = counting_iter
-        exporter = LandscapeExporter(_fake_landscape_db(), read_model=read_model, row_batch_size=1)
+        exporter = LandscapeExporter(_fake_landscape_db(), read_model=read_model, row_batch_size=1, compartment_id="test-compartment")
 
         iterator = exporter.export_run("run-1")
         first_row = next(record for record in iterator if record["record_type"] == "row")
@@ -1316,6 +1373,8 @@ def _make_derivation_config(
     signer_key_id: str,
     signing_key: bytes | None,
     source_run_id: str = "run-1",
+    exporter_version: str = "landscape-exporter-auth-v2",
+    compartment_id: str | None = "test-compartment",
 ) -> Any:
     from elspeth.contracts.audit_export import (
         AUDIT_EXPORT_SERIALIZATION_VERSION,
@@ -1327,7 +1386,7 @@ def _make_derivation_config(
         source_status="completed",
         source_completed_at="2026-01-15T13:00:00.000000Z",
         export_format="json",
-        exporter_version="landscape-exporter-v1",
+        exporter_version=exporter_version,
         serialization_version=AUDIT_EXPORT_SERIALIZATION_VERSION,
         chunking_algorithm_version="record-framing-v1",
         include_raw_error_rows=False,
@@ -1336,6 +1395,7 @@ def _make_derivation_config(
         signing_mode=signing_mode,  # type: ignore[arg-type]
         signer_key_id=signer_key_id,
         signing_key=signing_key,
+        compartment_id=compartment_id,
     )
 
 
@@ -1344,7 +1404,13 @@ def _unsigned_config() -> Any:
 
 
 def _hmac_config() -> Any:
-    return _make_derivation_config(signing_mode="hmac_sha256", signer_key_id="explicit-signer-v1", signing_key=b"explicit-key")
+    return _make_derivation_config(
+        signing_mode="hmac_sha256",
+        signer_key_id="explicit-signer-v1",
+        signing_key=b"explicit-key",
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id="test-compartment",
+    )
 
 
 class TestDerivationConfigSignEnforcement:
@@ -1398,6 +1464,23 @@ class TestDerivationConfigSignEnforcement:
         bundle = exporter.derive_run_bundle("run-1", sign=True, derivation_config=_hmac_config())
         assert bundle.final_manifest["signature"] is not None
         assert "signature" in bundle.record_objects[0]
+        assert (
+            next(record for record in bundle.record_objects if record["record_type"] == "audit_export_config")["public_config"][
+                "compartment_id"
+            ]
+            == "test-compartment"
+        )
+
+    @pytest.mark.parametrize("legacy_version", ["landscape-exporter-v1", "landscape-exporter-auth-v1"])
+    @pytest.mark.parametrize("signing_mode", ["unsigned", "hmac_sha256"])
+    def test_derivation_config_refuses_unsupported_exporter_version(self, legacy_version: str, signing_mode: str) -> None:
+        with pytest.raises(ValueError, match="exporter_version"):
+            _make_derivation_config(
+                signing_mode=signing_mode,
+                signer_key_id="explicit-signer-v1" if signing_mode == "hmac_sha256" else "UNSIGNED",
+                signing_key=b"explicit-key" if signing_mode == "hmac_sha256" else None,
+                exporter_version=legacy_version,
+            )
 
     def test_mismatched_source_run_id_still_fails_closed(self) -> None:
         exporter = _make_exporter()
@@ -1527,7 +1610,6 @@ class TestNodeRecords:
             config_hash="node-cfg-hash",
             config_json='{"path": "data.csv"}',
             registered_at=_DT,
-            schema_hash="schema-hash",
             sequence_in_pipeline=0,
             schema_mode="observed",
             schema_fields=[{"name": "id", "type": "int"}],
@@ -1869,6 +1951,20 @@ class TestStateCallRecords:
         assert c["operation_id"] is None  # State calls don't have operation_id
         assert c["call_type"] == "llm"
 
+    def test_call_summary_exports_payload_reference_without_provider_response(self) -> None:
+        """Opaque SDK pagination tokens stay in the protected call payload."""
+        exporter = _make_exporter(
+            rows=[_ROW],
+            tokens=[_TOKEN],
+            node_states=[_NODE_STATE_COMPLETED],
+            state_calls=[_STATE_CALL],
+        )
+        calls = [record for record in exporter.export_run("run-1") if record["record_type"] == "call"]
+        assert len(calls) == 1
+        assert calls[0]["response_ref"] == "resp-ref-2"
+        assert "response_data" not in calls[0]
+        assert "next_token" not in calls[0]
+
 
 # ===========================================================================
 # Batch records
@@ -1936,6 +2032,8 @@ class TestSparseLookupMemory:
 
         assert [record["record_type"] for record in records] == [
             "run",
+            "audit_export_config",
+            "auth_event_coverage",
             "operation",
             "row",
             "token",
@@ -2077,6 +2175,29 @@ class TestErrorRecords:
 class TestRecordOrder:
     """Tests for record yield order in export."""
 
+    def test_collector_group_failure_exports_as_one_group_record(self) -> None:
+        read_model = _make_export_read_model()
+        read_model._query.collector_group_failures.append(
+            SimpleNamespace(
+                group_id="group-1",
+                collector_node_id="collector-1",
+                failure_reason="collector_missing_members",
+                recorded_at=datetime(2026, 9, 24, tzinfo=UTC),
+            )
+        )
+        exporter = LandscapeExporter(_fake_landscape_db(), read_model=read_model, compartment_id="test-compartment")
+        failures = [record for record in exporter.export_run("run-1") if record["record_type"] == "collector_group_failure"]
+        assert failures == [
+            {
+                "record_type": "collector_group_failure",
+                "run_id": "run-1",
+                "group_id": "group-1",
+                "collector_node_id": "collector-1",
+                "failure_reason": "collector_missing_members",
+                "recorded_at": "2026-09-24T00:00:00+00:00",
+            }
+        ]
+
     def test_order_is_run_secrets_nodes_edges_ops_rows_batches_artifacts(self) -> None:
         """Records should yield in the documented order."""
         exporter = _make_exporter(
@@ -2189,7 +2310,7 @@ class TestExportRunGrouped:
         )
         groups = exporter.export_run_grouped("run-1", sign=True)
 
-        assert groups["manifest"][0]["record_count"] == 3
+        assert groups["manifest"][0]["record_count"] == 5
         assert "signature" in groups["validation_error"][0]
         assert "signature" in groups["transform_error"][0]
 
@@ -2395,6 +2516,8 @@ class TestFullPipelineExport:
 
         assert type_counts == {
             "run": 1,
+            "audit_export_config": 1,
+            "auth_event_coverage": 1,
             "secret_resolution": 1,
             "node": 1,
             "edge": 1,
@@ -2451,3 +2574,65 @@ class TestFullPipelineExport:
         for batch_size in (1, 2, 3):
             records = list(_make_exporter(**kwargs, row_batch_size=batch_size).export_run("run-1"))
             assert records == baseline, f"row_batch_size={batch_size} changed the export stream"
+
+
+# ===========================================================================
+# Stored canonical settings/config read back to the hashed value
+# ===========================================================================
+
+
+class TestExportReadsStoredCanonicalJson:
+    """The exported settings/config are the values that were hashed.
+
+    RFC 8785 prints an integral double in [2**53, 1e21) in integer notation
+    (``1e17`` -> ``100000000000000000``). A plain ``json.loads`` reads that
+    back as an ``int`` -- a different value from the hashed double, and one
+    the canonical encoder itself refuses when the record is signed.
+    """
+
+    _BIG = 1e17
+
+    def _export(self, *, sign: bool) -> list[dict[str, Any]]:
+        from elspeth.contracts.schema import SchemaConfig
+        from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
+
+        db = make_landscape_db()
+        factory = make_factory(db)
+        factory.run_lifecycle.begin_run(
+            config={"threshold": self._BIG},
+            canonical_version="v1",
+            run_id="run-1",
+            openrouter_catalog_sha256="0" * 64,
+            openrouter_catalog_source="bundled",
+        )
+        factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            plugin_name="csv",
+            node_type=NodeType.SOURCE,
+            plugin_version="1.0.0",
+            config={"path": "in.csv", "limit": self._BIG},
+            schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+        )
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
+        exporter = LandscapeExporter(
+            db,
+            signing_key=b"test-key" if sign else None,
+            signer_key_id="test-signer-v1" if sign else None,
+            compartment_id="test-compartment",
+        )
+        return list(exporter.export_run("run-1", sign=sign))
+
+    def test_settings_and_node_config_float_beyond_2_53_read_back_as_the_same_double(self) -> None:
+        records = self._export(sign=False)
+        threshold = records[0]["settings"]["threshold"]
+        node_config = next(r for r in records if r["record_type"] == "node")["config"]
+        assert type(threshold) is float
+        assert threshold == self._BIG
+        assert type(node_config["limit"]) is float
+        assert node_config["limit"] == self._BIG
+
+    def test_signed_export_of_float_beyond_2_53_settings_completes(self) -> None:
+        records = self._export(sign=True)
+        assert records[-1]["record_type"] == "manifest"
+        assert all("signature" in record for record in records)
+        assert records[0]["settings"]["threshold"] == self._BIG

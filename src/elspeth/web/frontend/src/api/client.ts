@@ -1,3 +1,4 @@
+import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwnsCredential } from "./authSession";
 // ============================================================================
 // ELSPETH API Client
 //
@@ -7,8 +8,10 @@
 // in development; same-origin serving works in production.
 // ============================================================================
 
+import { isValidationReadiness } from "./validationReadiness";
 import type {
   ApiError,
+  ApiStructuredError,
   AuthConfig,
   BlobCreationModalityWire,
   BlobMetadata,
@@ -44,21 +47,10 @@ import type {
   SystemStatus,
   MessageWithStateResponse,
 } from "@/types/index";
-import type {
-  GetGuidedResponse,
-  GuidedChatRequest,
-  GuidedChatResponse,
-  GuidedRespondRequest,
-  GuidedRespondResponse,
-  GuidedStartOperationReconciliation,
-  TutorialSampleResponse,
-} from "@/types/guided";
 import {
-  decodeGetGuidedResponse,
-  decodeGuidedChatResponse,
-  decodeGuidedRespondResponse,
-  decodeGuidedStartOperationReconciliation,
-} from "./guidedDecoder";
+  decodeCompositionState,
+  decodeCompositionStateVersions,
+} from "./compositionDecoder";
 import { decodeUserComposerPreferences } from "./preferencesDecoder";
 import type {
   InterpretationEvent,
@@ -75,6 +67,8 @@ import type {
   TutorialOrphanCleanupResponse,
   TutorialRunRequest,
   TutorialRunResponse,
+  TutorialReadinessResponse,
+  TutorialSampleResponse,
   UserComposerPreferencesPayload,
   UpdateUserComposerPreferencesPayload,
 } from "@/types/api";
@@ -101,6 +95,74 @@ export function authHeaders(contentType?: string): HeadersInit {
     headers["Content-Type"] = contentType;
   }
   return headers;
+}
+
+// Review decisions and validation both acquire a backend session lease. Queue
+// these calls per session so rapid decisions across cards, or validation after
+// a decision, do not race each other into a lease-conflict response. Nginx's
+// production read timeout is 360s; a slightly longer client deadline also
+// bounds this queue when a direct/local connection loses its response.
+const REVIEW_MUTATION_TIMEOUT_MS = 370_000;
+const REVIEW_MUTATION_RECOVERY_MESSAGE =
+  "The request outcome is uncertain. Refresh the page to reload this session before making another review decision.";
+const reviewMutationTails = new Map<string, Promise<void>>();
+const ambiguousReviewMutations = new Set<string>();
+
+function isDefinitiveReviewRejection(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("status" in error)) {
+    return false;
+  }
+  const status = error.status;
+  // A 4xx other than request timeout means the server rejected this action.
+  // A 5xx, malformed success, or transport failure may follow a committed
+  // decision, so later queued actions must wait for a fresh session reload.
+  return typeof status === "number" && status >= 400 && status < 500 && status !== 408;
+}
+
+function serializeReviewMutation<T>(
+  sessionId: string,
+  action: (signal: AbortSignal) => Promise<T>,
+  externalSignal?: AbortSignal,
+): Promise<T> {
+  const authGeneration = currentAuthGeneration();
+  const token = getToken();
+  const key = `${authGeneration}:${sessionId}`;
+  const previous = reviewMutationTails.get(key) ?? Promise.resolve();
+  const result = previous.then(async () => {
+    if (!isCurrentAuthGeneration(authGeneration) || getToken() !== token) {
+      throw { status: 0, detail: "Authentication changed before request dispatch" } satisfies ApiError;
+    }
+    if (ambiguousReviewMutations.has(key)) {
+      throw { status: 504, detail: REVIEW_MUTATION_RECOVERY_MESSAGE } satisfies ApiError;
+    }
+    if (externalSignal?.aborted) {
+      throw { status: 0, detail: "Request cancelled before dispatch" } satisfies ApiError;
+    }
+    const deadline = new AbortController();
+    const signal = externalSignal === undefined
+      ? deadline.signal
+      : AbortSignal.any([externalSignal, deadline.signal]);
+    const timer = setTimeout(() => deadline.abort(), REVIEW_MUTATION_TIMEOUT_MS);
+    try {
+      return await action(signal);
+    } catch (error) {
+      if (deadline.signal.aborted || externalSignal?.aborted || !isDefinitiveReviewRejection(error)) {
+        ambiguousReviewMutations.add(key);
+        throw { status: 504, detail: REVIEW_MUTATION_RECOVERY_MESSAGE } satisfies ApiError;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+  const tail = result.then(() => undefined, () => undefined);
+  reviewMutationTails.set(key, tail);
+  void tail.then(() => {
+    if (reviewMutationTails.get(key) === tail) {
+      reviewMutationTails.delete(key);
+    }
+  });
+  return result;
 }
 
 // ── Response Parsing ────────────────────────────────────────────────────────
@@ -132,6 +194,35 @@ function firstStringField(
     }
   }
   return undefined;
+}
+
+/**
+ * FastAPI's global RequestValidationError handler (app.py) returns
+ * `{detail: [{type, loc, msg}, ...], request_id}` -- an ARRAY `detail`, not
+ * the string/object shape every other route uses. Neither `firstStringField`
+ * nor the `errors` lookup below reads an array, so without this the human
+ * `msg` the backend already allowlisted as safe was dropped and every caller
+ * fell back to `response.statusText` ("Unprocessable Entity", or "" over
+ * HTTP/2). Map each entry with a string `msg` into a structured error,
+ * loc-prefixed so "body -> content: String should have at most 65536
+ * characters" beats a bare status phrase.
+ */
+function fastApiValidationErrors(
+  detailArray: readonly unknown[],
+): ApiStructuredError[] {
+  const out: ApiStructuredError[] = [];
+  for (const entry of detailArray) {
+    const msg = ownField(entry, "msg");
+    if (typeof msg !== "string") {
+      continue;
+    }
+    const loc = ownField(entry, "loc");
+    const locPath = Array.isArray(loc)
+      ? loc.filter((part) => typeof part === "string" || typeof part === "number").join(" -> ")
+      : undefined;
+    out.push({ message: locPath ? `${locPath}: ${msg}` : msg });
+  }
+  return out;
 }
 
 function optionalResponseHeader(response: Response, name: string): string | undefined {
@@ -179,16 +270,6 @@ export function isForkCommittedResponseError(error: unknown): error is ForkCommi
   return error instanceof ForkCommittedResponseError;
 }
 
-export class GuidedResponseReceiptError extends Error {
-  readonly received = true;
-  readonly cause: unknown;
-
-  constructor(cause: unknown) {
-    super("The guided response was received but could not be read.");
-    this.name = "GuidedResponseReceiptError";
-    this.cause = cause;
-  }
-}
 
 const CANONICAL_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -211,19 +292,12 @@ export async function parseResponse<T>(
   options: ParseResponseOptions = {},
 ): Promise<T> {
   if (!response.ok) {
-    // Global 401 interceptor -- trigger logout on any auth failure.
+    // A rejected credential can only invalidate the login that sent it.
     // Dynamic import avoids circular dependency at module load time
     // (authStore imports from client, client imports authStore for logout).
-    //
-    // Skip the logout call when the store already shows no token. Otherwise a
-    // 401 from an unauthenticated request (e.g., a pre-login probe) calls
-    // logout() against an already-empty session — harmless on its own, but if
-    // the response arrives AFTER a successful login completes, it would wipe
-    // the freshly-acquired token. Guarding on token!==null defuses that race
-    // without changing the legitimate "token expired mid-session" path.
     if (response.status === 401 && options.logoutOnUnauthorized !== false) {
       const { useAuthStore } = await import("@/stores/authStore");
-      if (useAuthStore.getState().token !== null) {
+      if (responseOwnsCredential(response, useAuthStore.getState().token)) {
         await useAuthStore.getState().logout();
       }
     }
@@ -234,8 +308,14 @@ export async function parseResponse<T>(
     // responses.
     let detail = response.statusText;
     let errorType: string | undefined;
+    let currentState: string | undefined;
+    let storageQuota: ApiError["storage_quota"];
+    let sources: string[] | undefined;
     let requestId: string | undefined;
+    let clientRequestId: string | undefined;
+    let userMessageId: string | undefined;
     let failureCode: string | undefined;
+    let guidance: string | undefined;
     let componentId: string | undefined;
     let pluginId: string | undefined;
     let nestedSnapshotFingerprint: string | undefined;
@@ -262,11 +342,29 @@ export async function parseResponse<T>(
 
       errorType = firstStringField(
         [body, nestedDetail],
-        ["error_type", "error_code", "code", "kind"],
+        ["error_type", "error_code", "refusal", "code", "kind"],
       );
+      currentState = firstStringField([body, nestedDetail], ["current_state"]);
+      if (response.status === 413 && errorType === "storage_quota_exceeded") {
+        const dimension = firstDefined(ownField(nestedDetail, "dimension"), ownField(body, "dimension"));
+        const cap = firstDefined(ownField(nestedDetail, "cap"), ownField(body, "cap"));
+        const ceiling = firstDefined(ownField(nestedDetail, "ceiling"), ownField(body, "ceiling"));
+        const usage = firstDefined(ownField(nestedDetail, "usage"), ownField(body, "usage"));
+        const validLimit = (value: unknown): value is number | null => value === null || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+        if (dimension === "storage" && validLimit(cap) && validLimit(ceiling) && typeof usage === "number" && Number.isSafeInteger(usage) && usage >= 0) {
+          storageQuota = { cap, ceiling, usage };
+        }
+      }
+      const rawSources = firstDefined(ownField(body, "sources"), ownField(nestedDetail, "sources"));
+      sources = Array.isArray(rawSources) && rawSources.every((source): source is string => typeof source === "string")
+        ? rawSources
+        : undefined;
 
       requestId = firstStringField([body, nestedDetail], ["request_id"]);
+      clientRequestId = firstStringField([body, nestedDetail], ["client_request_id"]);
+      userMessageId = firstStringField([body, nestedDetail], ["user_message_id"]);
       failureCode = firstStringField([body, nestedDetail], ["failure_code"]);
+      guidance = firstStringField([body, nestedDetail], ["guidance"]);
 
       // Convergence discriminator + its recovery copy. Kept off `detail` so
       // the SPA branches on the taxonomy rather than parsing prose.
@@ -343,7 +441,7 @@ export async function parseResponse<T>(
         ownField(body, "errors"),
         ownField(nestedDetail, "errors"),
       );
-      errors = Array.isArray(rawErrors)
+      const filteredErrors = Array.isArray(rawErrors)
         ? rawErrors.filter(
             (entry): entry is NonNullable<ApiError["errors"]>[number] =>
               typeof entry === "object" &&
@@ -352,6 +450,15 @@ export async function parseResponse<T>(
               typeof ownField(entry, "message") === "string",
           )
         : undefined;
+      // FastAPI's global RequestValidationError envelope puts its own
+      // array shape on `detail` (see fastApiValidationErrors above), not on
+      // `errors` -- only reached when nothing already claimed `errors`.
+      const fastApiErrors =
+        filteredErrors === undefined && Array.isArray(body.detail)
+          ? fastApiValidationErrors(body.detail)
+          : undefined;
+      errors =
+        filteredErrors ?? (fastApiErrors && fastApiErrors.length > 0 ? fastApiErrors : undefined);
 
       const explicitDetail = firstStringField(
         [nestedDetail, body],
@@ -404,8 +511,14 @@ export async function parseResponse<T>(
       status: response.status,
       detail,
       error_type: errorType,
+      current_state: currentState,
+      storage_quota: storageQuota,
+      sources,
       request_id: requestId,
+      client_request_id: clientRequestId,
+      user_message_id: userMessageId,
       failure_code: failureCode,
+      guidance,
       component_id: componentId,
       plugin_id: pluginId,
       reason,
@@ -439,7 +552,7 @@ export async function parseResponse<T>(
  * callable before login. Returns provider type and OIDC params.
  */
 export async function fetchAuthConfig(): Promise<AuthConfig> {
-  const response = await fetch("/api/auth/config", { cache: "no-store" });
+  const response = await authFetch("/api/auth/config", { cache: "no-store" });
   return parseResponse<AuthConfig>(response);
 }
 
@@ -451,7 +564,7 @@ export async function login(
   username: string,
   password: string,
 ): Promise<{ access_token: string }> {
-  const response = await fetch("/api/auth/login", {
+  const response = await authFetch("/api/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
@@ -463,7 +576,7 @@ export async function login(
  * Refresh the current auth token. Returns a new access token.
  */
 export async function refreshToken(): Promise<{ access_token: string }> {
-  const response = await fetch("/api/auth/token", {
+  const response = await authFetch("/api/auth/token", {
     method: "POST",
     headers: authHeaders("application/json"),
   });
@@ -474,11 +587,11 @@ export async function refreshToken(): Promise<{ access_token: string }> {
  * Get the current user's profile. Used to validate the stored token
  * on page load and to populate the user display.
  */
-export async function fetchCurrentUser(): Promise<UserProfile> {
-  const response = await fetch("/api/auth/me", {
+export async function fetchCurrentUser(options: ParseResponseOptions = {}): Promise<UserProfile> {
+  const response = await authFetch("/api/auth/me", {
     headers: authHeaders(),
   });
-  return parseResponse<UserProfile>(response);
+  return parseResponse<UserProfile>(response, options);
 }
 
 // ── Dev-admin user management (env-gated; 404 unless the backend's
@@ -486,7 +599,7 @@ export async function fetchCurrentUser(): Promise<UserProfile> {
 
 /** List every local-auth account (dev admin only). */
 export async function fetchAdminUsers(): Promise<{ users: AdminUserSummary[] }> {
-  const response = await fetch("/api/auth/admin/users", {
+  const response = await authFetch("/api/auth/admin/users", {
     headers: authHeaders(),
   });
   return parseResponse<{ users: AdminUserSummary[] }>(response);
@@ -498,7 +611,7 @@ export async function createAdminUser(body: {
   display_name: string;
   email?: string;
 }): Promise<AdminGeneratedPassword> {
-  const response = await fetch("/api/auth/admin/users", {
+  const response = await authFetch("/api/auth/admin/users", {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),
@@ -510,7 +623,7 @@ export async function createAdminUser(body: {
 export async function resetAdminUserPassword(
   userId: string,
 ): Promise<AdminGeneratedPassword> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/auth/admin/users/${encodeURIComponent(userId)}/reset-password`,
     { method: "POST", headers: authHeaders() },
   );
@@ -518,10 +631,22 @@ export async function resetAdminUserPassword(
 }
 
 /** Delete a local-auth account. Backend returns 204 No Content. */
-export async function deleteAdminUser(userId: string): Promise<void> {
-  const response = await fetch(
+/** Longest deletion reason the server accepts (LOCAL_DELETION_REASON_MAX_LENGTH). */
+export const DELETE_ADMIN_USER_REASON_MAX_LENGTH = 480;
+
+/**
+ * Delete a local account. `reason` is required and lands in the audit trail:
+ * deleting must not cost less than disabling, which asks for one. It travels
+ * in the body, not the query string, which access logs record.
+ */
+export async function deleteAdminUser(userId: string, reason: string): Promise<void> {
+  const response = await authFetch(
     `/api/auth/admin/users/${encodeURIComponent(userId)}`,
-    { method: "DELETE", headers: authHeaders() },
+    {
+      method: "DELETE",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    },
   );
   if (!response.ok) {
     await parseResponse<never>(response);
@@ -534,7 +659,7 @@ export async function fetchSystemStatus(): Promise<SystemStatus> {
   // for the OS connect timeout (30-120s), which made the outage banner's
   // Retry button look dead (operator-observed). 5s is generous for a
   // same-origin health endpoint.
-  const response = await fetch("/api/system/status", {
+  const response = await authFetch("/api/system/status", {
     signal: AbortSignal.timeout(5000),
   });
   return parseResponse<SystemStatus>(response);
@@ -549,7 +674,7 @@ export async function fetchSessions(includeArchived = true): Promise<Session[]> 
     params.set("include_archived", "true");
   }
   const query = params.size > 0 ? `?${params.toString()}` : "";
-  const response = await fetch(`/api/sessions${query}`, {
+  const response = await authFetch(`/api/sessions${query}`, {
     headers: authHeaders(),
   });
   return parseResponse<Session[]>(response);
@@ -562,7 +687,7 @@ export async function fetchSessions(includeArchived = true): Promise<Session[]> 
  * shares one naming convention (elspeth-ef8c18a6cb).
  */
 export async function createSession(): Promise<Session> {
-  const response = await fetch("/api/sessions", {
+  const response = await authFetch("/api/sessions", {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({}),
@@ -572,7 +697,7 @@ export async function createSession(): Promise<Session> {
 
 /** Get a single session by ID. */
 export async function getSession(sessionId: string): Promise<Session> {
-  const response = await fetch(`/api/sessions/${sessionId}`, {
+  const response = await authFetch(`/api/sessions/${sessionId}`, {
     headers: authHeaders(),
   });
   return parseResponse<Session>(response);
@@ -583,7 +708,7 @@ export async function renameSession(
   sessionId: string,
   title: string,
 ): Promise<Session> {
-  const response = await fetch(`/api/sessions/${sessionId}`, {
+  const response = await authFetch(`/api/sessions/${sessionId}`, {
     method: "PATCH",
     headers: authHeaders("application/json"),
     body: JSON.stringify({ title }),
@@ -600,7 +725,7 @@ export async function runTutorialPipeline(
   body: TutorialRunRequest,
   signal?: AbortSignal,
 ): Promise<TutorialRunResponse> {
-  const response = await fetch("/api/tutorial/run", {
+  const response = await authFetch("/api/tutorial/run", {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),
@@ -618,7 +743,7 @@ export async function runTutorialPipeline(
 export async function cancelTutorialRun(
   sessionId: string,
 ): Promise<TutorialCancelResponse> {
-  const response = await fetch("/api/tutorial/cancel", {
+  const response = await authFetch("/api/tutorial/cancel", {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({ session_id: sessionId }),
@@ -635,7 +760,7 @@ export async function cancelTutorialRun(
  * `navigator.sendBeacon` cannot carry, so this is a keepalive fetch (the
  * browser lets it outlive the page). */
 export function sendTutorialAbandonBeacon(): void {
-  void fetch("/api/tutorial/abandon", {
+  void authFetch("/api/tutorial/abandon", {
     method: "POST",
     headers: authHeaders(),
     keepalive: true,
@@ -649,7 +774,7 @@ export async function getRunAuditSummary(
   sessionId: string,
   runId: string,
 ): Promise<RunAuditStoryResponse> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/runs/${runId}/audit-story`,
     { headers: authHeaders() },
   );
@@ -658,7 +783,7 @@ export async function getRunAuditSummary(
 
 /** Clean up orphaned tutorial sessions for the authenticated user. */
 export async function deleteTutorialOrphans(): Promise<TutorialOrphanCleanupResponse> {
-  const response = await fetch("/api/tutorial/orphans", {
+  const response = await authFetch("/api/tutorial/orphans", {
     method: "DELETE",
     headers: authHeaders(),
   });
@@ -667,7 +792,7 @@ export async function deleteTutorialOrphans(): Promise<TutorialOrphanCleanupResp
 
 /** Archive (soft-delete) a session. Backend returns 204 No Content. */
 export async function archiveSession(sessionId: string): Promise<void> {
-  const response = await fetch(`/api/sessions/${sessionId}`, {
+  const response = await authFetch(`/api/sessions/${sessionId}`, {
     method: "DELETE",
     headers: authHeaders(),
   });
@@ -680,7 +805,7 @@ export async function archiveSession(sessionId: string): Promise<void> {
 
 /** Get all messages for a session. */
 export async function fetchMessages(sessionId: string): Promise<ChatMessage[]> {
-  const response = await fetch(`/api/sessions/${sessionId}/messages`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/messages`, {
     headers: authHeaders(),
   });
   return parseResponse<ChatMessage[]>(response);
@@ -696,7 +821,7 @@ export async function fetchRecoveryTranscript(
     limit: String(opts.limit ?? 500),
     offset: String(opts.offset ?? 0),
   });
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/messages?${params}`,
     {
       headers: authHeaders(),
@@ -709,7 +834,7 @@ export async function fetchRecoveryTranscript(
 export async function fetchComposerProgress(
   sessionId: string,
 ): Promise<ComposerProgressSnapshot> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/composer-progress`,
     {
       headers: authHeaders(),
@@ -722,7 +847,7 @@ export async function fetchComposerProgress(
 export async function fetchComposerPreferences(
   sessionId: string,
 ): Promise<ComposerPreferences> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/composer/preferences`,
     {
       headers: authHeaders(),
@@ -736,7 +861,7 @@ export async function updateComposerPreferences(
   sessionId: string,
   body: Pick<ComposerPreferences, "trust_mode" | "density_default">,
 ): Promise<ComposerPreferences> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/composer/preferences`,
     {
       method: "PATCH",
@@ -753,7 +878,7 @@ export async function updateComposerPreferences(
 
 /** Get the user's account-level composer preferences. */
 export async function fetchUserComposerPreferences(): Promise<UserComposerPreferencesPayload> {
-  const response = await fetch("/api/composer-preferences", {
+  const response = await authFetch("/api/composer-preferences", {
     headers: authHeaders(),
   });
   return decodeUserComposerPreferences(await parseResponse<unknown>(response));
@@ -763,7 +888,7 @@ export async function fetchUserComposerPreferences(): Promise<UserComposerPrefer
 export async function updateUserComposerPreferences(
   payload: UpdateUserComposerPreferencesPayload,
 ): Promise<UserComposerPreferencesPayload> {
-  const response = await fetch("/api/composer-preferences", {
+  const response = await authFetch("/api/composer-preferences", {
     method: "PATCH",
     headers: authHeaders("application/json"),
     body: JSON.stringify(payload),
@@ -775,7 +900,7 @@ export async function updateUserComposerPreferences(
 export async function fetchCompositionProposals(
   sessionId: string,
 ): Promise<CompositionProposal[]> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/proposals?status=pending`,
     {
       headers: authHeaders(),
@@ -790,7 +915,7 @@ export async function acceptCompositionProposal(
   proposalId: string,
   draftHash: string | null,
 ): Promise<CompositionProposal> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/proposals/${proposalId}/accept`,
     {
       method: "POST",
@@ -806,7 +931,7 @@ export async function rejectCompositionProposal(
   sessionId: string,
   proposalId: string,
 ): Promise<CompositionProposal> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/proposals/${proposalId}/reject`,
     {
       method: "POST",
@@ -827,14 +952,18 @@ export async function rejectCompositionProposal(
 export async function sendMessage(
   sessionId: string,
   content: string,
-  stateId?: string,
+  clientRequestId: string,
+  stateId?: string | null,
   signal?: AbortSignal,
 ): Promise<MessageWithStateResponse> {
-  const body: { content: string; state_id?: string } = { content };
-  if (stateId) {
+  const body: { content: string; client_request_id: string; state_id?: string | null } = {
+    content,
+    client_request_id: clientRequestId,
+  };
+  if (stateId !== undefined) {
     body.state_id = stateId;
   }
-  const response = await fetch(`/api/sessions/${sessionId}/messages`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/messages`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),
@@ -847,53 +976,29 @@ export async function sendMessage(
  *  Used by the retry flow when the user message is already persisted. */
 export async function recompose(
   sessionId: string,
+  expectedUserMessageId: string,
   signal?: AbortSignal,
 ): Promise<MessageWithStateResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/recompose`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/recompose`, {
     method: "POST",
     headers: authHeaders("application/json"),
+    body: JSON.stringify({ expected_user_message_id: expectedUserMessageId }),
     signal,
   });
   return parseResponse<MessageWithStateResponse>(response);
 }
 
-/**
- * Fetch the current guided-session state for a session.
- *
- * Returns the active GuidedSession (step + history + terminal), the
- * server-emitted next turn payload (if any), and the current composition
- * state.  When no guided session has started for the session, the server
- * returns an in-memory initial GuidedSession and Step 1 turn without creating
- * a composition-state version.
- */
-export async function getGuided(
-  sessionId: string,
-  signal?: AbortSignal,
-): Promise<GetGuidedResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided`, {
-    method: "GET",
-    headers: authHeaders(),
-    signal,
-  });
-  return decodeGetGuidedResponse(await parseResponse<unknown>(response));
-}
 
 /**
- * Fetch the runtime-derived synthetic-scrape sample URLs for the active
- * TUTORIAL session's resolved origin (p4 Task 8a GET surface).
- *
- * Consumed by `TutorialGuidedShell`: the URLs are computed server-side from the
- * resolved base at request time (they cannot ride the frozen profile
- * constants), so the shell fetches them and appends them to the locked STEP_1
- * prompt. The synthetic pages are publicly hosted, so the tutorial's web_scrape
- * node carries no SSRF allowlist (it uses the plugin default `public_only`).
+ * Fetch runtime-derived sample URLs for the freeform tutorial brief.
+ * They are data, not a server-authored pipeline proposal.
  */
 export async function getTutorialSample(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<TutorialSampleResponse> {
-  const response = await fetch(
-    `/api/sessions/${sessionId}/guided/tutorial-sample`,
+  const response = await authFetch(
+    `/api/tutorial/${sessionId}/sample`,
     {
       method: "GET",
       headers: authHeaders(),
@@ -903,177 +1008,24 @@ export async function getTutorialSample(
   return parseResponse<TutorialSampleResponse>(response);
 }
 
-/**
- * Seed a guided session with a server-owned WorkflowProfile.
- *
- * The `profileKind` is a closed-enum discriminator ("live" | "tutorial"); the
- * SERVER constructs the concrete profile object and persists the GuidedSession.
- * Idempotent (D16): a second call for a session that already has a persisted
- * guided session returns the existing session unchanged.
- *
- * `intent` is required for BOTH profiles (goal-first start, elspeth-378cfa0e18
- * / elspeth-13579d1110). It is the session's visible root intent: the goal the
- * user typed on the goal card, or — for the tutorial — the frozen lesson prompt
- * the shell seeds, which is the same shape a live goal takes. The server 400s a
- * start with no intent for every profile, so a planner run can never be reached
- * without one. The old `profile === "live"` conditional that STRIPPED intent for
- * the tutorial is gone; sending it is not a tutorial-special path, it is the one
- * path (ADR-031).
- */
-interface GuidedStartCommand {
-  profile: "live" | "tutorial";
-  intent: string;
-  operationId: string;
-}
-
-export async function startGuidedSession(
+export async function getTutorialReadiness(
   sessionId: string,
-  command: GuidedStartCommand,
   signal?: AbortSignal,
-): Promise<GetGuidedResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided/start`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify({
-      profile: command.profile,
-      intent: command.intent,
-      operation_id: command.operationId,
-    }),
+): Promise<TutorialReadinessResponse> {
+  const response = await authFetch(`/api/tutorial/${sessionId}/readiness`, {
+    method: "GET",
+    headers: authHeaders(),
     signal,
   });
-  if (!response.ok) {
-    return parseResponse<never>(response);
-  }
-  try {
-    return decodeGetGuidedResponse(await parseResponse<unknown>(response));
-  } catch (cause) {
-    throw new GuidedResponseReceiptError(cause);
-  }
+  return parseResponse<TutorialReadinessResponse>(response);
 }
 
-export async function reconcileGuidedStartOperation(
-  sessionId: string,
-  operationId: string,
-  signal?: AbortSignal,
-): Promise<GuidedStartOperationReconciliation> {
-  const response = await fetch(
-    `/api/sessions/${sessionId}/guided/start/${operationId}/reconcile`,
-    {
-      method: "POST",
-      headers: authHeaders(),
-      signal,
-    },
-  );
-  return decodeGuidedStartOperationReconciliation(await parseResponse<unknown>(response));
-}
 
-/**
- * Post a user response to the active guided turn.
- *
- * Server consumes the response, advances the state machine, and returns
- * the replacement GuidedSession + next turn (or terminal state).  The
- * client is expected to atomically replace its cached guided state with
- * the response shape — no optimistic updates (spec §7.3).
- */
-export async function respondGuided(
-  sessionId: string,
-  body: GuidedRespondRequest,
-  signal?: AbortSignal,
-): Promise<GuidedRespondResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided/respond`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify(body),
-    signal,
-  });
-  if (!response.ok) {
-    return parseResponse<never>(response);
-  }
-  try {
-    return decodeGuidedRespondResponse(await parseResponse<unknown>(response));
-  } catch (cause) {
-    throw new GuidedResponseReceiptError(cause);
-  }
-}
 
-/**
- * Re-enter guided mode after a deliberate user exit to freeform.
- *
- * Server clears the reversible exited_to_freeform/user_pressed_exit terminal
- * and returns the same envelope shape as GET /guided.
- */
-export async function reenterGuided(
-  sessionId: string,
-  operationId: string,
-  signal?: AbortSignal,
-): Promise<GetGuidedResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided/reenter`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify({ operation_id: operationId }),
-    signal,
-  });
-  return decodeGetGuidedResponse(await parseResponse<unknown>(response));
-}
 
-/**
- * Convert a freeform session into guided mode.
- *
- * "Switch to guided" on a session that has already done freeform composition
- * work cannot go through GET /guided — that endpoint 400s by design for a
- * session with no persisted guided_session (and must, since it is also the
- * passive freeform-probe on session select). This POST is the explicit
- * conversion: it seeds a FRESH wizard as a new composition-state version,
- * setting the freeform pipeline aside (recoverable from version history), and
- * returns the same envelope shape as GET /guided.
- *
- * `intent` is REQUIRED (goal-first, elspeth-378cfa0e18): the converted wizard is
- * rooted on the goal the user stated in the mode-switch card, exactly as a live
- * start is. A convert is no longer idempotent-by-silence for an already-guided
- * session — the server 409s `guided_already_started` rather than discarding the
- * client's goal — so callers must probe GET /guided first (the store's GET-first
- * `enterGuided` does) and only convert on the documented 400.
- */
-export async function convertToGuided(
-  sessionId: string,
-  intent: string,
-  operationId: string,
-  signal?: AbortSignal,
-): Promise<GetGuidedResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided/convert`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify({ operation_id: operationId, intent }),
-    signal,
-  });
-  return decodeGetGuidedResponse(await parseResponse<unknown>(response));
-}
 
-/**
- * Post a free-text chat message scoped to the user's current wizard step.
- *
- * The server runs bounded Step 1/2 provider work, projects supported results
- * through the schema-8 transition authority, and returns the authoritative
- * post-settlement session, turn, terminal, and composition state. Generated
- * inline source bytes are reported as a typed non-applying failure until blob
- * custody can join the same atomic settlement.
- *
- * The required turn token binds the request to the server-held current
- * unanswered occurrence; stale tokens return 409 before provider work.
- */
-export async function chatGuided(
-  sessionId: string,
-  body: GuidedChatRequest,
-  signal?: AbortSignal,
-): Promise<GuidedChatResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/guided/chat`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify(body),
-    signal,
-  });
-  return decodeGuidedChatResponse(await parseResponse<unknown>(response));
-}
+
+
 
 /** Fork a session from a specific user message. */
 export async function forkFromMessage(
@@ -1082,7 +1034,7 @@ export async function forkFromMessage(
   fromMessageId: string,
   newMessageContent: string,
 ): Promise<{ session_id: string }> {
-  const response = await fetch(`/api/sessions/${sessionId}/fork`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/fork`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({
@@ -1107,23 +1059,24 @@ export async function forkFromMessage(
 export async function fetchCompositionState(
   sessionId: string,
 ): Promise<CompositionState | null> {
-  const response = await fetch(`/api/sessions/${sessionId}/state`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/state`, {
     headers: authHeaders(),
   });
   if (response.status === 404) {
     return null;
   }
-  return parseResponse<CompositionState>(response);
+  const body = await parseResponse<unknown>(response);
+  return body === null ? null : decodeCompositionState(body);
 }
 
 /** Get all composition state versions for a session. */
 export async function fetchStateVersions(
   sessionId: string,
 ): Promise<CompositionStateVersion[]> {
-  const response = await fetch(`/api/sessions/${sessionId}/state/versions`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/state/versions`, {
     headers: authHeaders(),
   });
-  return parseResponse<CompositionStateVersion[]>(response);
+  return decodeCompositionStateVersions(await parseResponse<unknown>(response));
 }
 
 /**
@@ -1136,7 +1089,7 @@ export async function revertToVersion(
   stateId: string,
   operationId: string,
 ): Promise<CompositionState> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/state/revert`,
     {
       method: "POST",
@@ -1144,7 +1097,7 @@ export async function revertToVersion(
       body: JSON.stringify({ operation_id: operationId, state_id: stateId }),
     },
   );
-  return parseResponse<CompositionState>(response);
+  return decodeCompositionState(await parseResponse<unknown>(response));
 }
 
 /** Fetch the generated YAML for the current composition state. */
@@ -1161,7 +1114,7 @@ export async function revertToVersion(
 export async function fetchYaml(
   sessionId: string,
 ): Promise<{ yaml: string; source_blob_ids?: Record<string, string> }> {
-  const response = await fetch(`/api/sessions/${sessionId}/state/yaml`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/state/yaml`, {
     headers: authHeaders(),
   });
   return parseResponse<{ yaml: string; source_blob_ids?: Record<string, string> }>(
@@ -1183,30 +1136,22 @@ export interface ImportCompositionYamlRequest {
 }
 
 /**
- * Composition state as returned by the YAML-import endpoint
- * (`CompositionStateResponse`, sessions/schemas.py:234). Deliberately a
- * narrow local type rather than the frontend's `CompositionState` (types/
- * index.ts) -- this route's response additionally carries `is_valid` /
- * `validation_errors`, and `edges` is always `[]` here (graph routing
- * derives from node on_success/on_error/routes, not a persisted edge list).
- * Callers that need the full canonical state re-fetch it (e.g. via
- * `selectSession`); this type only covers what an import confirmation needs
- * to render immediately.
+ * Import confirmations consume this subset of CompositionStateResponse.
+ * The HTTP boundary still decodes the full state using the shared decoder;
+ * callers re-fetch through selectSession to synchronize the session stores.
  */
 export interface ImportedCompositionState {
   id: string;
   version: number;
   is_valid: boolean;
-  validation_errors: string[] | null;
+  validation_errors: CompositionState["validation_errors"];
   plugin_policy_findings?: PluginPolicyFinding[];
 }
 
 /**
  * Import (replace) a session's composition state from hand-edited or
  * previously-exported YAML (elspeth-24c56585f9 T-1). This REPLACES the
- * current composition -- the backend does not merge -- and always resets
- * the session's guided_session to null server-side, landing the session in
- * freeform. The prior version remains reachable via `fetchStateVersions` /
+ * current composition -- the backend does not merge. The prior version remains reachable via `fetchStateVersions` /
  * `revertToVersion`. A 200 response does not imply the imported pipeline is
  * runnable: check `is_valid`/`validation_errors` on the result.
  */
@@ -1218,12 +1163,12 @@ export async function importCompositionYaml(
   const body: ImportCompositionYamlRequest = sourceBlobIds
     ? { yaml: yamlText, source_blob_ids: sourceBlobIds }
     : { yaml: yamlText };
-  const response = await fetch(`/api/sessions/${sessionId}/state/yaml`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/state/yaml`, {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify(body),
   });
-  return parseResponse<ImportedCompositionState>(response);
+  return decodeCompositionState(await parseResponse<unknown>(response));
 }
 
 // ── Plugin Catalog ──────────────────────────────────────────────────────────
@@ -1243,7 +1188,7 @@ async function parsePluginSnapshotResponse<T>(
 
 /** Fetch the current principal's immutable plugin-policy snapshot metadata. */
 export async function fetchPluginPolicy(): Promise<PluginSnapshotResponse<PluginPolicyResponse>> {
-  const response = await fetch("/api/catalog/policy", {
+  const response = await authFetch("/api/catalog/policy", {
     headers: authHeaders(),
     cache: "no-store",
   });
@@ -1252,7 +1197,7 @@ export async function fetchPluginPolicy(): Promise<PluginSnapshotResponse<Plugin
 
 /** List available source plugins. */
 export async function listSources(): Promise<PluginSnapshotResponse<PluginSummary[]>> {
-  const response = await fetch("/api/catalog/sources", {
+  const response = await authFetch("/api/catalog/sources", {
     headers: authHeaders(),
   });
   return parsePluginSnapshotResponse<PluginSummary[]>(response);
@@ -1260,7 +1205,7 @@ export async function listSources(): Promise<PluginSnapshotResponse<PluginSummar
 
 /** List available transform plugins. */
 export async function listTransforms(): Promise<PluginSnapshotResponse<PluginSummary[]>> {
-  const response = await fetch("/api/catalog/transforms", {
+  const response = await authFetch("/api/catalog/transforms", {
     headers: authHeaders(),
   });
   return parsePluginSnapshotResponse<PluginSummary[]>(response);
@@ -1268,7 +1213,7 @@ export async function listTransforms(): Promise<PluginSnapshotResponse<PluginSum
 
 /** List available sink plugins. */
 export async function listSinks(): Promise<PluginSnapshotResponse<PluginSummary[]>> {
-  const response = await fetch("/api/catalog/sinks", {
+  const response = await authFetch("/api/catalog/sinks", {
     headers: authHeaders(),
   });
   return parsePluginSnapshotResponse<PluginSummary[]>(response);
@@ -1286,7 +1231,7 @@ export async function getPluginSchema(
   // REST URL uses plural path segments; the route handler translates
   // plural -> singular before calling CatalogService.
   const pluralType = `${pluginType}s`;
-  const response = await fetch(
+  const response = await authFetch(
     `/api/catalog/${pluralType}/${pluginName}/schema`,
     { headers: authHeaders() },
   );
@@ -1308,11 +1253,19 @@ export async function validatePipeline(
     params.set("state_id", stateId);
   }
   const query = params.size > 0 ? `?${params.toString()}` : "";
-  const response = await fetch(`/api/sessions/${sessionId}/validate${query}`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
+  const { result, status } = await serializeReviewMutation(sessionId, async (signal) => {
+    const response = await authFetch(`/api/sessions/${sessionId}/validate${query}`, {
+      method: "POST",
+      headers: authHeaders("application/json"),
+      signal,
+    });
+    const result = await parseResponse<ValidationResult>(response);
+    return { result, status: response.status };
   });
-  return parseResponse<ValidationResult>(response);
+  if (typeof result !== "object" || result === null || !isValidationReadiness(result.readiness)) {
+    throw { status, detail: "Unexpected readiness shape from validate endpoint" } satisfies ApiError;
+  }
+  return result;
 }
 
 /**
@@ -1347,13 +1300,13 @@ export async function executePipeline(
     }
     init.body = JSON.stringify(body);
   }
-  const response = await fetch(`/api/sessions/${sessionId}/execute${query}`, init);
+  const response = await authFetch(`/api/sessions/${sessionId}/execute${query}`, init);
   return parseResponse<{ run_id: string }>(response);
 }
 
 /** Get the status of a specific run. */
 export async function getRunStatus(runId: string): Promise<Run> {
-  const response = await fetch(`/api/runs/${runId}`, {
+  const response = await authFetch(`/api/runs/${runId}`, {
     headers: authHeaders(),
   });
   return parseResponse<Run>(response);
@@ -1361,7 +1314,7 @@ export async function getRunStatus(runId: string): Promise<Run> {
 
 /** Cancel a running pipeline execution. */
 export async function cancelRun(runId: string): Promise<CancelRunResponse> {
-  const response = await fetch(`/api/runs/${runId}/cancel`, {
+  const response = await authFetch(`/api/runs/${runId}/cancel`, {
     method: "POST",
     headers: authHeaders("application/json"),
   });
@@ -1372,7 +1325,7 @@ export async function cancelRun(runId: string): Promise<CancelRunResponse> {
 export async function createRunWebSocketTicket(
   runId: string,
 ): Promise<WebSocketTicketResponse> {
-  const response = await fetch(`/api/runs/${runId}/ws-ticket`, {
+  const response = await authFetch(`/api/runs/${runId}/ws-ticket`, {
     method: "POST",
     headers: authHeaders("application/json"),
   });
@@ -1383,16 +1336,17 @@ export async function createRunWebSocketTicket(
 export async function getRunResults(
   runId: string,
 ): Promise<Run> {
-  const response = await fetch(`/api/runs/${runId}/results`, {
+  const response = await authFetch(`/api/runs/${runId}/results`, {
     headers: authHeaders(),
   });
   return parseResponse<Run>(response);
 }
 
 /** List runs for a session. */
-export async function fetchRuns(sessionId: string): Promise<Run[]> {
-  const response = await fetch(`/api/sessions/${sessionId}/runs`, {
+export async function fetchRuns(sessionId: string, signal?: AbortSignal): Promise<Run[]> {
+  const response = await authFetch(`/api/sessions/${sessionId}/runs`, {
     headers: authHeaders(),
+    signal,
   });
   return parseResponse<Run[]>(response);
 }
@@ -1402,7 +1356,7 @@ export async function fetchRunDiagnostics(
   runId: string,
   limit = 50,
 ): Promise<RunDiagnostics> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/runs/${runId}/diagnostics?limit=${encodeURIComponent(String(limit))}`,
     {
       headers: authHeaders(),
@@ -1416,7 +1370,7 @@ export async function evaluateRunDiagnostics(
   runId: string,
   limit = 50,
 ): Promise<RunDiagnosticsEvaluation> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/runs/${runId}/diagnostics/evaluate?limit=${encodeURIComponent(String(limit))}`,
     {
       method: "POST",
@@ -1433,7 +1387,7 @@ export async function evaluateRunDiagnostics(
  * unbounded and intended for the per-run Outputs section.
  */
 export async function fetchRunOutputs(runId: string): Promise<RunOutputsResponse> {
-  const response = await fetch(`/api/runs/${runId}/outputs`, {
+  const response = await authFetch(`/api/runs/${runId}/outputs`, {
     headers: authHeaders(),
   });
   return parseResponse<RunOutputsResponse>(response);
@@ -1447,7 +1401,7 @@ export async function fetchRunOutputPreview(
   runId: string,
   artifactId: string,
 ): Promise<RunOutputArtifactPreview> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/runs/${runId}/outputs/${encodeURIComponent(artifactId)}/preview`,
     {
       headers: authHeaders(),
@@ -1471,7 +1425,7 @@ export async function downloadRunOutputContent(
   runId: string,
   artifactId: string,
 ): Promise<{ data: Blob; filename: string }> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/runs/${runId}/outputs/${encodeURIComponent(artifactId)}/content`,
     { headers: authHeaders() },
   );
@@ -1501,7 +1455,7 @@ export async function uploadBlob(
     headers["Authorization"] = `Bearer ${token}`;
   }
 
-  const response = await fetch(`/api/sessions/${sessionId}/blobs`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/blobs`, {
     method: "POST",
     headers,
     body: formData,
@@ -1511,7 +1465,7 @@ export async function uploadBlob(
 
 /** List all blobs for a session. */
 export async function listBlobs(sessionId: string): Promise<BlobMetadata[]> {
-  const response = await fetch(`/api/sessions/${sessionId}/blobs`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/blobs`, {
     headers: authHeaders(),
   });
   return parseResponse<BlobMetadata[]>(response);
@@ -1560,7 +1514,7 @@ export async function getBlobMetadata(
   sessionId: string,
   blobId: string,
 ): Promise<BlobMetadata> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/blobs/${blobId}`,
     { headers: authHeaders() },
   );
@@ -1572,7 +1526,7 @@ export async function downloadBlobContent(
   sessionId: string,
   blobId: string,
 ): Promise<{ data: Blob; filename: string }> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/blobs/${blobId}/content`,
     { headers: authHeaders() },
   );
@@ -1592,7 +1546,7 @@ export async function previewBlobContent(
   sessionId: string,
   blobId: string,
 ): Promise<string> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/blobs/${blobId}/content`,
     { headers: authHeaders() },
   );
@@ -1614,7 +1568,7 @@ export async function previewBlobContentSnippet(
   blobId: string,
   limit: number,
 ): Promise<BlobContentPreview> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/blobs/${blobId}/preview?limit=${limit}`,
     { headers: authHeaders() },
   );
@@ -1634,7 +1588,7 @@ export async function deleteBlob(
   sessionId: string,
   blobId: string,
 ): Promise<void> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/blobs/${blobId}`,
     { method: "DELETE", headers: authHeaders() },
   );
@@ -1654,7 +1608,7 @@ function emitPluginCatalogInvalidation(): void {
 
 /** List all available secret references (no values). */
 export async function listSecrets(): Promise<SecretInventoryItem[]> {
-  const response = await fetch("/api/secrets", { headers: authHeaders() });
+  const response = await authFetch("/api/secrets", { headers: authHeaders() });
   return parseResponse<SecretInventoryItem[]>(response);
 }
 
@@ -1663,7 +1617,7 @@ export async function createSecret(
   name: string,
   value: string,
 ): Promise<{ name: string; scope: string; available: boolean }> {
-  const response = await fetch("/api/secrets", {
+  const response = await authFetch("/api/secrets", {
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({ name, value }),
@@ -1675,7 +1629,7 @@ export async function createSecret(
 
 /** Delete a user-scoped secret. */
 export async function deleteSecret(name: string): Promise<void> {
-  const response = await fetch(`/api/secrets/${encodeURIComponent(name)}`, {
+  const response = await authFetch(`/api/secrets/${encodeURIComponent(name)}`, {
     method: "DELETE",
     headers: authHeaders(),
   });
@@ -1728,7 +1682,7 @@ export async function listInterpretationEvents(
   // does percent-encoding correctly for any future status-value extension
   // and keeps the call site free of manual string concatenation.
   const qs = new URLSearchParams({ status });
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/interpretations?${qs.toString()}`,
     {
       method: "GET",
@@ -1758,16 +1712,18 @@ export async function resolveInterpretation(
   body: InterpretationResolveRequest,
   signal?: AbortSignal,
 ): Promise<InterpretationResolveResponse> {
-  const response = await fetch(
-    `/api/sessions/${sessionId}/interpretations/${eventId}/resolve`,
-    {
-      method: "POST",
-      headers: authHeaders("application/json"),
-      body: JSON.stringify(body),
-      signal,
-    },
-  );
-  return parseResponse<InterpretationResolveResponse>(response);
+  return serializeReviewMutation(sessionId, async (requestSignal) => {
+    const response = await authFetch(
+      `/api/sessions/${sessionId}/interpretations/${eventId}/resolve`,
+      {
+        method: "POST",
+        headers: authHeaders("application/json"),
+        body: JSON.stringify(body),
+        signal: requestSignal,
+      },
+    );
+    return parseResponse<InterpretationResolveResponse>(response);
+  }, signal);
 }
 
 /**
@@ -1784,19 +1740,21 @@ export async function optOutOfInterpretations(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<InterpretationOptOutResponse> {
-  const response = await fetch(
-    `/api/sessions/${sessionId}/interpretations/opt_out`,
-    {
-      method: "POST",
-      headers: authHeaders("application/json"),
-      // The route accepts an empty body; sending "{}" rather than omitting
-      // body entirely so the Content-Type: application/json header has a
-      // matching payload (some HTTP intermediaries reject the inverse).
-      body: "{}",
-      signal,
-    },
-  );
-  return parseResponse<InterpretationOptOutResponse>(response);
+  return serializeReviewMutation(sessionId, async (requestSignal) => {
+    const response = await authFetch(
+      `/api/sessions/${sessionId}/interpretations/opt_out`,
+      {
+        method: "POST",
+        headers: authHeaders("application/json"),
+        // The route accepts an empty body; sending "{}" rather than omitting
+        // body entirely so the Content-Type: application/json header has a
+        // matching payload (some HTTP intermediaries reject the inverse).
+        body: "{}",
+        signal: requestSignal,
+      },
+    );
+    return parseResponse<InterpretationOptOutResponse>(response);
+  }, signal);
 }
 
 /**
@@ -1812,7 +1770,7 @@ export async function getInterpretationOptOutSummary(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<InterpretationEvent[]> {
-  const response = await fetch(
+  const response = await authFetch(
     `/api/sessions/${sessionId}/interpretations/opt_out_summary`,
     {
       method: "GET",
@@ -1858,7 +1816,7 @@ export async function register(
   if (email !== undefined) {
     body.email = email;
   }
-  const response = await fetch("/api/auth/register", {
+  const response = await authFetch("/api/auth/register", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -1870,7 +1828,7 @@ export async function register(
  * Consume an email-verification token and return a normal local-auth JWT.
  */
 export async function verifyEmail(token: string): Promise<AuthTokenResponse> {
-  const response = await fetch("/api/auth/verify-email", {
+  const response = await authFetch("/api/auth/verify-email", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ token }),
@@ -1888,7 +1846,7 @@ export async function verifyEmail(token: string): Promise<AuthTokenResponse> {
  * must not evict a session that may already be signed in.
  */
 export async function completeSsoLogin(code: string): Promise<AuthTokenResponse> {
-  const response = await fetch("/api/auth/sso/complete", {
+  const response = await authFetch("/api/auth/sso/complete", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ code }),

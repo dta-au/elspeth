@@ -73,7 +73,7 @@ def test_drain_follower_ready_work_claims_ready_only_and_threads_before_claim() 
 
     spy.calls.clear()
     with patch.object(follower, "_process_single_token", new=fake_process):
-        results = follower.drain_follower_ready_work(_ctx(setup), before_claim=probe)
+        results = follower.drain_follower_ready_work(_ctx(setup, worker_id=FOLLOWER_OWNER), before_claim=probe)
 
     assert [result.token.token_id for result in results] == [token.token_id]
 
@@ -279,7 +279,7 @@ def test_follower_drain_cadence_never_runs_lease_recovery() -> None:
     """
     follower, spy, setup, _clock = _build(lease_owner=FOLLOWER_OWNER, mode=ProcessorMode.FOLLOWER)
     _register_worker(setup, FOLLOWER_OWNER)
-    ctx = _ctx(setup)
+    ctx = _ctx(setup, worker_id=FOLLOWER_OWNER)
 
     spy.calls.clear()
     for _ in range(SCHEDULER_MAINTENANCE_INTERVAL):

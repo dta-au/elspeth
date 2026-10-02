@@ -34,9 +34,7 @@ type FocusIntent = "collapse" | "restore" | null;
 export interface ComposerWorkspaceProps {
   authoring: ReactNode;
   artifact: ReactNode;
-  inspector: ReactNode;
   actionBar: ReactNode;
-  authoringStatus?: ReactNode;
   collapsedStatus?: ReactNode | {
     text: string;
     tone: "neutral" | "busy" | "error";
@@ -70,9 +68,7 @@ function layoutMode(workspaceWidth: number):
 export function ComposerWorkspace({
   authoring,
   artifact,
-  inspector,
   actionBar,
-  authoringStatus,
   collapsedStatus = {
     text: "Authoring pane collapsed",
     tone: "neutral",
@@ -353,7 +349,6 @@ export function ComposerWorkspace({
             >
               <ErrorBoundary label="Authoring pane">{authoring}</ErrorBoundary>
             </div>
-            <div className="workspace-authoring-status">{authoringStatus}</div>
           </section>
           {paneState.authoringCollapsed && (
             <div
@@ -487,12 +482,6 @@ export function ComposerWorkspace({
           </div>
         </div>
 
-        <div
-          className="workspace-inspector-slot"
-          data-workspace-part="inspector"
-        >
-          {inspector}
-        </div>
       </div>
     </WorkspacePaneProvider>
   );

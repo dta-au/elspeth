@@ -24,15 +24,22 @@ from collections.abc import Callable
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Protocol
 
+from elspeth.contracts.events import TelemetryEvent
+
 if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType
     from elspeth.contracts.audit_protocols import PluginAuditWriter
+    from elspeth.contracts.call_data import CallPayload
+    from elspeth.contracts.call_governance import LLMCallGovernance
+    from elspeth.contracts.call_mode import CallModeSession
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
-    from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+    from elspeth.contracts.enums import RunMode
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.node_state_context import AggregationBatchContext
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_context import ValidationErrorToken
+    from elspeth.contracts.scheduler import TokenWorkItem
     from elspeth.contracts.schema_contract import SchemaContract
 
 
@@ -83,8 +90,16 @@ class SourceContext(Protocol):
     - Telemetry: telemetry_emit for operational visibility
     """
 
+    def require_coordination_token(self) -> CoordinationToken: ...
+
     @property
     def run_id(self) -> str: ...
+
+    @property
+    def run_mode(self) -> RunMode: ...
+
+    @property
+    def call_mode_session(self) -> CallModeSession | None: ...
 
     @property
     def node_id(self) -> str | None: ...
@@ -96,7 +111,7 @@ class SourceContext(Protocol):
     def landscape(self) -> PluginAuditWriter | None: ...
 
     @property
-    def telemetry_emit(self) -> Callable[[Any], None]: ...
+    def telemetry_emit(self) -> Callable[[TelemetryEvent], None]: ...
 
     @property
     def shutdown_event(self) -> threading.Event | None: ...
@@ -134,8 +149,35 @@ class TransformContext(Protocol):
     - Checkpoint: get/set/clear_checkpoint for crash recovery (batch transforms)
     """
 
+    def require_member_token(self) -> WorkerMembershipToken: ...
+
+    def require_work_item(self) -> TokenWorkItem: ...
+
+    def allocate_call_index(self) -> int: ...
+
+    def record_row_call(
+        self,
+        *,
+        call_index: int,
+        call_type: CallType,
+        status: CallStatus,
+        request_data: CallPayload,
+        response_data: CallPayload | None = None,
+        latency_ms: float | None = None,
+        source_call_id: str | None = None,
+    ) -> Call: ...
+
+    @property
+    def landscape(self) -> PluginAuditWriter | None: ...
+
     @property
     def run_id(self) -> str: ...
+
+    @property
+    def run_mode(self) -> RunMode: ...
+
+    @property
+    def call_mode_session(self) -> CallModeSession | None: ...
 
     @property
     def state_id(self) -> str | None: ...
@@ -185,6 +227,12 @@ class SinkContext(Protocol):
     def run_id(self) -> str: ...
 
     @property
+    def run_mode(self) -> RunMode: ...
+
+    @property
+    def call_mode_session(self) -> CallModeSession | None: ...
+
+    @property
     def contract(self) -> SchemaContract | None: ...
 
     @property
@@ -222,6 +270,15 @@ class LifecycleContext(Protocol):
     def run_id(self) -> str: ...
 
     @property
+    def run_mode(self) -> RunMode: ...
+
+    @property
+    def call_mode_session(self) -> CallModeSession | None: ...
+
+    @property
+    def llm_call_governance(self) -> LLMCallGovernance | None: ...
+
+    @property
     def node_id(self) -> str | None: ...  # [R1] Set by orchestrator before on_start()
 
     @property
@@ -232,6 +289,10 @@ class LifecycleContext(Protocol):
 
     @property
     def coordination_token(self) -> CoordinationToken | None: ...
+
+    def require_coordination_token(self) -> CoordinationToken: ...
+
+    def require_member_token(self) -> WorkerMembershipToken: ...
 
     def record_readiness_check(
         self,
@@ -250,7 +311,7 @@ class LifecycleContext(Protocol):
     def rate_limit_registry(self) -> RateLimitRegistryProtocol | None: ...
 
     @property
-    def telemetry_emit(self) -> Callable[[Any], None]: ...
+    def telemetry_emit(self) -> Callable[[TelemetryEvent], None]: ...
 
     @property
     def concurrency_config(self) -> RuntimeConcurrencyConfig | None: ...

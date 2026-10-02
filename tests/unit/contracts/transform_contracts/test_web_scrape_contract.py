@@ -24,6 +24,8 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
 from elspeth.plugins.transforms.web_scrape_errors import ForbiddenError, NotFoundError, UnauthorizedError
 from elspeth.testing import make_pipeline_row
+from tests.fixtures.factories import make_token_info
+from tests.fixtures.mock_audit import mock_audit_authority
 
 from .test_transform_protocol import TransformContractPropertyTestBase
 
@@ -60,23 +62,23 @@ _TEST_IP = "93.184.216.34"
 # (which would short-circuit on the always-blocked tier first).
 _SSRF_BLOCKED_CASES: tuple[tuple[str, str, str], ...] = (
     # ALWAYS_BLOCKED_RANGES (unconditional — no allowlist bypass)
-    ("aws_metadata_v4", "169.254.169.254", "Always-blocked IP range"),
-    ("ipv4_mapped_metadata", "::ffff:169.254.169.254", "Always-blocked IP range"),
-    ("aws_metadata_v6", "fd00:ec2::254", "Always-blocked IP range"),
-    ("ipv6_link_local", "fe80::1", "Always-blocked IP range"),
-    ("broadcast_v4", "255.255.255.255", "Always-blocked IP range"),
-    ("multicast_v4", "224.0.0.1", "Always-blocked IP range"),
-    ("multicast_v6", "ff02::1", "Always-blocked IP range"),
+    ("aws_metadata_v4", "169.254.169.254", "always_blocked_range"),
+    ("ipv4_mapped_metadata", "::ffff:169.254.169.254", "always_blocked_range"),
+    ("aws_metadata_v6", "fd00:ec2::254", "always_blocked_range"),
+    ("ipv6_link_local", "fe80::1", "always_blocked_range"),
+    ("broadcast_v4", "255.255.255.255", "always_blocked_range"),
+    ("multicast_v4", "224.0.0.1", "always_blocked_range"),
+    ("multicast_v6", "ff02::1", "always_blocked_range"),
     # BLOCKED_IP_RANGES (default blocklist; bypassable only via allowed_ranges)
-    ("current_network_v4", "0.0.0.1", "Blocked IP range"),
-    ("loopback_v4", "127.0.0.1", "Blocked IP range"),
-    ("loopback_v6", "::1", "Blocked IP range"),
-    ("rfc1918_class_a", "10.0.0.1", "Blocked IP range"),
-    ("rfc1918_class_b", "172.16.0.1", "Blocked IP range"),
-    ("rfc1918_class_c", "192.168.1.1", "Blocked IP range"),
-    ("cgnat_v4", "100.64.0.1", "Blocked IP range"),
-    ("ipv6_ula", "fc00::1", "Blocked IP range"),
-    ("ipv4_mapped_ipv6", "::ffff:10.0.0.1", "Blocked IP range"),
+    ("current_network_v4", "0.0.0.1", "blocked_range"),
+    ("loopback_v4", "127.0.0.1", "blocked_range"),
+    ("loopback_v6", "::1", "blocked_range"),
+    ("rfc1918_class_a", "10.0.0.1", "blocked_range"),
+    ("rfc1918_class_b", "172.16.0.1", "blocked_range"),
+    ("rfc1918_class_c", "192.168.1.1", "blocked_range"),
+    ("cgnat_v4", "100.64.0.1", "blocked_range"),
+    ("ipv6_ula", "fc00::1", "blocked_range"),
+    ("ipv4_mapped_ipv6", "::ffff:10.0.0.1", "blocked_range"),
 )
 
 
@@ -217,6 +219,8 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
         mock_payload_store.store.return_value = "test-processed-content-hash"
 
         return PluginContext(
+            **mock_audit_authority("test-run-001", node_id="test-transform"),
+            token=make_token_info(token_id="token-1"),
             run_id="test-run-001",
             config={},
             node_id="test-transform",
@@ -244,6 +248,9 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
             "fetch_request_hash": "test-request-ref-hash",
             "fetch_response_raw_hash": "test-response-ref-hash",
             "fetch_response_processed_hash": "test-processed-content-hash",
+            "fetch_charset": "utf-8",
+            "fetch_content_type": "text/html",
+            "fetch_decoded_body_bytes": 38,
         }
 
         limiter = _context_mock(ctx.rate_limit_registry.get_limiter.return_value, "rate limiter")
@@ -251,7 +258,9 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
         payload_store = _context_mock(ctx.payload_store, "payload_store")
 
         limiter.acquire.assert_called_once_with()
-        landscape.allocate_call_index.assert_called_once_with("test-state-001")
+        landscape.allocate_call_index.assert_called_once_with(
+            "test-state-001", member_token=ctx.require_member_token(), work_item=ctx.require_work_item()
+        )
         landscape.record_call.assert_called_once()
         call_kwargs = landscape.record_call.call_args.kwargs
         assert call_kwargs["state_id"] == "test-state-001"
@@ -261,7 +270,7 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
         payload_store.store.assert_called_once_with(result.row["page_content"].encode())
 
     @pytest.mark.parametrize(
-        ("case_id", "resolved_ip", "tier_prefix"),
+        ("case_id", "resolved_ip", "expected_kind"),
         _SSRF_BLOCKED_CASES,
         ids=[case[0] for case in _SSRF_BLOCKED_CASES],
     )
@@ -272,7 +281,7 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
         mock_httpx: Mock,
         case_id: str,
         resolved_ip: str,
-        tier_prefix: str,
+        expected_kind: str,
     ) -> None:
         """SSRF rejection is a pre-fetch validation result, not an audited HTTP call.
 
@@ -310,12 +319,14 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
         assert result.reason["error_type"] == "SSRFBlockedError", (
             f"case {case_id}: expected SSRFBlockedError, got {result.reason['error_type']!r}"
         )
-        # The error message must include the verbatim resolved IP and the
-        # blocklist-tier prefix. Both are load-bearing for audit clarity:
-        # downstream tooling distinguishes the tiers when reporting.
-        assert f"{tier_prefix}: {resolved_ip}" in result.reason["error"], (
-            f"case {case_id}: error message {result.reason['error']!r} did not contain {tier_prefix!r}: {resolved_ip!r}"
+        # The blocklist tier that refused the URL travels as the value-free
+        # ``cause`` (deleting either tier's check moves these cases to the other
+        # kind or lets them through); the resolved address is derived from the
+        # row's URL, so it never enters the reason (C3).
+        assert result.reason["cause"] == expected_kind, (
+            f"case {case_id}: expected cause={expected_kind!r}, got {result.reason.get('cause')!r}"
         )
+        assert resolved_ip not in repr(result.reason), f"case {case_id}: reason names the resolved address {resolved_ip!r}"
         assert result.retryable is False, f"case {case_id}: SSRF rejection must not be retryable"
 
         # SSRF is rejected before any HTTP call; the audit recorder, payload
@@ -341,10 +352,12 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
         assert result.reason["reason"] == "validation_failed"
         assert result.reason["error_type"] == "SSRFBlockedError"
 
-        error_text = result.reason["error"]
-        assert "Forbidden URL scheme 'ftp'" in error_text
-        assert "host='example.com'" in error_text
-        assert "url_sha256=" in error_text
+        assert result.reason["cause"] == "forbidden_scheme"
+        error_text = repr(result.reason)
+        # No part of the row's URL is persisted: not the scheme, host or a hash (C3).
+        assert "ftp" not in error_text
+        assert "example.com" not in error_text
+        assert "url_sha256" not in error_text
         assert raw_url not in error_text
         assert token not in error_text
         assert "operator:" not in error_text
@@ -372,9 +385,11 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
         assert result.reason["reason"] == "validation_failed"
         assert result.reason["error_type"] == "SSRFBlockedError"
 
-        error_text = result.reason["error"]
-        assert "Malformed URL" in error_text
-        assert "url_sha256=" in error_text
+        assert result.reason["cause"] == "malformed_url"
+        error_text = repr(result.reason)
+        # No part of the row's URL is persisted: not the host or a hash (C3).
+        assert "evil.com" not in error_text
+        assert "url_sha256" not in error_text
         assert raw_url not in error_text
         assert token not in error_text
         assert "operator:" not in error_text

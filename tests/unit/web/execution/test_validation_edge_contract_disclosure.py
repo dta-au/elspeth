@@ -16,6 +16,7 @@ phase 3 — that mock is exactly why this gap survived.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,12 @@ from elspeth.web.config import WebSettings
 from elspeth.web.execution import validation as validation_module
 from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE
 from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    model_choice_artifact_hash,
+    prompt_review_anchor_hash_from_options,
+    prompt_review_draft_from_options,
+)
 
 _SESSION_ID = "test-session"
 
@@ -154,9 +161,11 @@ def test_build_raised_edge_failure_discloses_consumer_patch_suggestion(
     assert "consumer requires 'float', producer emits 'str'" in error.message
     assert error.suggestion is not None
     assert "Change the declared field type(s) to match what the producer emits" in error.suggestion
-    # The consumer-side patch call survives even though the graph never built
-    # (patch-target resolution degrades to the DAG node id by design).
-    assert "patch_node_options(node_id='transform_coerce_score_" in error.suggestion
+    # Build failures still retain the exact config identity the author can patch.
+    assert error.component_id == "coerce_score"
+    assert "patch_node_options(node_id='coerce_score'" in error.suggestion
+    assert "producer node 'source'" in error.message
+    assert "consumer node 'coerce_score'" in error.message
 
 
 def test_build_raised_edge_failure_stays_owned_by_graph_structure_check(
@@ -311,3 +320,90 @@ def test_build_raised_source_producer_failure_surfaces_the_data_contract_review(
     # the interpretation-review blocker, not a graph-structure failure.
     hard_failures = [check for check in result.checks if not check.passed and check.outcome_code is None]
     assert [check.name for check in hard_failures] == ["interpretation_review"]
+
+
+@pytest.mark.parametrize("answer_type", ["str", "int"])
+def test_multi_query_answers_validate_against_their_actual_success_types(tmp_path: Path, answer_type: str) -> None:
+    """Exercise the reported edge through real plugin construction and preflight.
+
+    The consumer keeps its requirements: string answers must pass, while an
+    integer consumer is a negative control for the same edge validator.
+    """
+    source_dir = tmp_path / "blobs" / _SESSION_ID
+    source_dir.mkdir(parents=True)
+    (source_dir / "input.csv").write_text("colour\nred\nblue\ngreen\nyellow\npurple\n")
+    options: dict[str, Any] = {
+        "provider": "bedrock",
+        "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+        "region_name": "us-east-1",
+        "max_capacity_retry_seconds": 1,
+        "system_prompt": "Give concise factual colour answers in the requested format.",
+        "prompt_template": "Answer the question about {{ row.colour }}.",
+        "required_input_fields": ["colour"],
+        "schema": {"mode": "flexible", "fields": ["colour: str"]},
+        "queries": {
+            "good_colour_pair": {
+                "input_fields": {"colour": "colour"},
+                "template": "What colour pairs well with {{ row.colour }}?",
+                "response_format": "structured",
+                "output_fields": [{"suffix": "answer", "type": "string"}],
+            },
+            "approximate_hex": {
+                "input_fields": {"colour": "colour"},
+                "template": "What is an approximate hex value for {{ row.colour }}?",
+                "response_format": "structured",
+                "output_fields": [{"suffix": "answer", "type": "string"}],
+            },
+        },
+    }
+    prompt_draft = prompt_review_draft_from_options(options)
+    prompt_hash = prompt_review_anchor_hash_from_options(options)
+    assert prompt_draft is not None and prompt_hash is not None
+    options[INTERPRETATION_REQUIREMENTS_KEY] = [
+        {
+            "id": f"{kind}:answer_colour_questions",
+            "kind": kind,
+            "user_term": f"{kind}:answer_colour_questions",
+            "status": "resolved",
+            "draft": draft,
+            "event_id": f"event-{kind}",
+            "accepted_value": draft,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": artifact_hash,
+        }
+        for kind, draft, artifact_hash in (
+            ("llm_prompt_template", prompt_draft, prompt_hash),
+            ("llm_model_choice", options["model"], model_choice_artifact_hash(options["model"])),
+        )
+    ]
+    base = _coerce_state("str")
+    source = SourceSpec(
+        plugin="csv",
+        on_success="colour_rows",
+        options={"path": f"blobs/{_SESSION_ID}/input.csv", "schema": {"mode": "fixed", "fields": ["colour: str"]}},
+        on_validation_failure="discard",
+    )
+    answers = ("good_colour_pair_answer", "approximate_hex_answer")
+    business_fields = ["colour: str", *(f"{name}: {answer_type}" for name in answers)]
+    llm = replace(base.nodes[0], id="answer_colour_questions", plugin="llm", input="colour_rows", on_success="answers", options=options)
+    mapper = replace(
+        base.nodes[0],
+        id="select_csv_columns",
+        plugin="field_mapper",
+        input="answers",
+        options={
+            "mapping": {name: name for name in ("colour", *answers)},
+            "select_only": True,
+            "schema": {"mode": "flexible", "fields": business_fields},
+        },
+    )
+    sink = replace(base.outputs[0], options={"path": "outputs/results.csv", "schema": {"mode": "fixed", "fields": business_fields}})
+    state = CompositionState(source=source, nodes=(llm, mapper), edges=(), outputs=(sink,), metadata=PipelineMetadata(), version=1)
+
+    result = validate_pipeline_for_trained_operator(state, _web_settings(tmp_path), production_yaml_generator, session_id=_SESSION_ID)
+
+    if answer_type == "str":
+        assert result.is_valid, [error.message for error in result.errors]
+    else:
+        assert not result.is_valid
+        assert any("consumer requires 'int', producer emits 'str'" in error.message for error in result.errors), result.errors

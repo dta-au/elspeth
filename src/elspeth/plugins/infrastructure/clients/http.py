@@ -7,11 +7,17 @@ to prevent DNS rebinding attacks. See core/security/web.py for details.
 from __future__ import annotations
 
 import base64
+import binascii
+import json as json_module
+import math
 import re
 import time
-from collections.abc import Mapping, Sequence
+import zlib
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from ipaddress import IPv4Network, IPv6Network
+from threading import Lock
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -19,14 +25,42 @@ import structlog
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
-from elspeth.contracts.call_data import CallPayload, HTTPCallError, HTTPCallRequest, HTTPCallResponse
+from elspeth.contracts.call_data import (
+    CallPayload,
+    HTTPCallError,
+    HTTPCallRequest,
+    HTTPCallResponse,
+    HTTPDecodedBodyEvidence,
+    HTTPRedirectReplayHop,
+    HTTPResponseTransport,
+    MultipartMetadata,
+    RawCallPayload,
+    encode_urlencoded_form,
+    validate_multipart_form,
+)
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.events import ExternalCallCompleted
-from elspeth.core.canonical import stable_hash
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.http_policy import HTTP_FAILURE_CODES, HTTPAuditPolicy, HTTPFailureCode
+from elspeth.contracts.json_parser import _reject_duplicate_keys, _reject_non_finite, check_json_depth
+from elspeth.contracts.json_parser import parse_json_strict as _parse_json_strict
+from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
+from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.security.web import (
+    HTTPOrigin,
     SSRFSafeRequest,
+    validate_allowed_http_origin,
     validate_url_for_ssrf,
 )
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
+from elspeth.plugins.infrastructure.clients.deadline import (
+    DeadlineHTTPTransport,
+    HTTPDeadline,
+    HTTPDeadlineExceeded,
+)
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     filter_response_headers as _filter_response_headers,
 )
@@ -42,11 +76,11 @@ from elspeth.plugins.infrastructure.clients.fingerprinting import (
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
     is_sensitive_header as _is_sensitive_header_fn,
 )
-from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict as _parse_json_strict
 
 logger = structlog.get_logger(__name__)
 
 _HTTP_URL_IN_TEXT = re.compile(r"https?://\S+", re.IGNORECASE)
+_FINGERPRINTED_AUTH = re.compile(r"<fingerprint:[0-9a-f]{64}>\Z")
 
 
 def _sanitize_http_error_message(message: str) -> str:
@@ -67,6 +101,7 @@ def _sanitize_http_error_message(message: str) -> str:
 if TYPE_CHECKING:
     from elspeth.contracts import Call
     from elspeth.contracts.audit_protocols import CallRecorder
+    from elspeth.contracts.call_mode import CallModeSession, ReplayCallEvidence
     from elspeth.contracts.contexts import LimiterProtocol
 
 
@@ -87,6 +122,69 @@ class HTTPResponseBodyTooLargeError(httpx.HTTPError):
         self.max_body_bytes = max_body_bytes
         self.response_payload = response_payload
         self.response_data = response_payload.to_dict()
+
+
+class HTTPResponseEncodingLimitError(httpx.HTTPError):
+    """A streamed encoded response exceeded a declared transfer policy."""
+
+    def __init__(self, *, reason: str, response_payload: HTTPCallResponse) -> None:
+        super().__init__(f"HTTP response encoding policy refused: {reason}")
+        self.reason = reason
+        self.response_payload = response_payload
+        self.response_data = response_payload.to_dict()
+
+
+class HTTPPolicyError(httpx.HTTPError):
+    """A value-free external failure with separately retained body evidence."""
+
+    def __init__(self, code: HTTPFailureCode, *, response_payload: HTTPCallResponse | None = None) -> None:
+        if code not in HTTP_FAILURE_CODES:
+            raise ValueError("HTTP policy error requires a closed failure code")
+        super().__init__(code)
+        self.code = code
+        self.response_payload = response_payload
+
+
+def _policy_failure_code(error: Exception) -> HTTPFailureCode:
+    if isinstance(error, HTTPPolicyError):
+        return error.code
+    if isinstance(error, (HTTPDeadlineExceeded, httpx.TimeoutException)):
+        return "deadline_exceeded"
+    if isinstance(error, (HTTPResponseBodyTooLargeError,)):
+        return "response_too_large"
+    if isinstance(error, (HTTPResponseEncodingLimitError, httpx.DecodingError, UnicodeError, zlib.error)):
+        return "invalid_encoding"
+    if isinstance(error, contract_errors.TIER_1_ERRORS):
+        return "authority_refused"
+    return "transport_failed"
+
+
+def _policy_json_body(content: bytes) -> Any:
+    """Apply the strict JSON hooks with fixed diagnostics and bounded depth."""
+    try:
+        text = content.decode("utf-8", errors="strict")
+    except UnicodeError:
+        return {"_json_parse_failed": True, "_error": "invalid_encoding"}
+    try:
+        check_json_depth(text, max_depth=64)
+    except ValueError:
+        return {"_json_parse_failed": True, "_error": "depth_exceeded"}
+
+    def finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("invalid_json")
+        return parsed
+
+    try:
+        return json_module.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_non_finite,
+            parse_float=finite_float,
+        )
+    except (ValueError, RecursionError):
+        return {"_json_parse_failed": True, "_error": "invalid_json"}
 
 
 class AuditedHTTPClient(AuditedClientBase):
@@ -129,7 +227,16 @@ class AuditedHTTPClient(AuditedClientBase):
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
         operation_id: str | None = None,
+        coordination_token: CoordinationToken | None = None,
+        member_token: WorkerMembershipToken | None = None,
+        work_item: TokenWorkItem | None = None,
         max_response_body_bytes: int | None = None,
+        max_encoded_response_bytes: int | None = None,
+        max_decompression_ratio: int | None = None,
+        call_mode_session: CallModeSession | None = None,
+        archived_auth_for_replay: bool = False,
+        semantic_managed_identity_verify: bool = False,
+        audit_policy: HTTPAuditPolicy = HTTPAuditPolicy.GENERIC,
     ) -> None:
         """Initialize audited HTTP client.
 
@@ -150,18 +257,51 @@ class AuditedHTTPClient(AuditedClientBase):
         """
         if max_response_body_bytes is not None and max_response_body_bytes <= 0:
             raise ValueError("max_response_body_bytes must be > 0 when configured")
-        super().__init__(execution, state_id, run_id, telemetry_emit, operation_id=operation_id, limiter=limiter, token_id=token_id)
+        if not isinstance(audit_policy, HTTPAuditPolicy):
+            raise TypeError("audit_policy must be HTTPAuditPolicy")
+        if audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1 and max_response_body_bytes is None:
+            raise ValueError("Power Automate HTTP policy requires a response body cap")
+        if max_encoded_response_bytes is not None and max_encoded_response_bytes <= 0:
+            raise ValueError("max_encoded_response_bytes must be > 0 when configured")
+        if max_decompression_ratio is not None and max_decompression_ratio <= 0:
+            raise ValueError("max_decompression_ratio must be > 0 when configured")
+        if archived_auth_for_replay and (call_mode_session is None or call_mode_session.mode is not RunMode.REPLAY):
+            raise ValueError("archived_auth_for_replay requires a replay call-mode session")
+        if semantic_managed_identity_verify and (call_mode_session is None or call_mode_session.mode is not RunMode.VERIFY):
+            raise ValueError("semantic_managed_identity_verify requires a verify call-mode session")
+        super().__init__(
+            execution,
+            state_id,
+            run_id,
+            telemetry_emit,
+            operation_id=operation_id,
+            limiter=limiter,
+            token_id=token_id,
+            coordination_token=coordination_token,
+            member_token=member_token,
+            work_item=work_item,
+        )
         self._timeout = timeout
+        self._audit_policy = audit_policy
         self._base_url = base_url
         self._default_headers = headers or {}
         self._max_response_body_bytes = max_response_body_bytes
+        self._max_encoded_response_bytes = max_encoded_response_bytes
+        self._max_decompression_ratio = max_decompression_ratio
+        self._call_mode_session = call_mode_session
+        self._archived_auth_for_replay = archived_auth_for_replay
+        self._semantic_managed_identity_verify = semantic_managed_identity_verify
         # Shared httpx.Client for connection pooling and TCP reuse.
         # httpx.Client is thread-safe; the internal pool handles concurrency.
         # Per-request timeouts override the default via timeout= kwarg.
         # follow_redirects=False: SSRF-safe methods manage redirects manually.
-        self._client = httpx.Client(
-            timeout=self._timeout,
-            follow_redirects=False,
+        # VERIFY waits until the first request has passed source-call admission.
+        self._client_init_lock = Lock()
+        self._client = (
+            None
+            if audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1
+            or (call_mode_session is not None and call_mode_session.mode in (RunMode.REPLAY, RunMode.VERIFY))
+            else httpx.Client(timeout=self._timeout, follow_redirects=False)
         )
 
     # Delegate to shared module functions. Instance methods preserved for
@@ -169,11 +309,15 @@ class AuditedHTTPClient(AuditedClientBase):
     def _is_sensitive_header(self, header_name: str) -> bool:
         return _is_sensitive_header_fn(header_name)
 
-    def _filter_request_headers(self, headers: dict[str, str]) -> dict[str, str]:
-        return _fingerprint_headers(headers)
+    def _filter_request_headers(self, headers: dict[str, str], *, force_fingerprint_names: frozenset[str] = frozenset()) -> dict[str, str]:
+        return _fingerprint_headers(
+            headers,
+            force_fingerprint_names=force_fingerprint_names,
+            honor_development_mode=self._audit_policy is HTTPAuditPolicy.GENERIC,
+        )
 
     def _filter_response_headers(self, headers: dict[str, str]) -> dict[str, str]:
-        return _filter_response_headers(headers)
+        return _filter_response_headers(headers, honor_development_mode=self._audit_policy is HTTPAuditPolicy.GENERIC)
 
     def _record_call(
         self,
@@ -185,10 +329,13 @@ class AuditedHTTPClient(AuditedClientBase):
         response_data: CallPayload | None = None,
         error: CallPayload | None = None,
         latency_ms: float | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        llm_call_attempt: str | None = None,
+        source_call_id: str | None = None,
     ) -> Call:
         """Sanitize HTTP error URLs at the shared audit persistence boundary."""
-        if isinstance(error, HTTPCallError):
+        if type(error) is HTTPCallError:
             error = HTTPCallError(
                 type=error.type,
                 message=_sanitize_http_error_message(error.message),
@@ -202,7 +349,10 @@ class AuditedHTTPClient(AuditedClientBase):
             response_data=response_data,
             error=error,
             latency_ms=latency_ms,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
+            approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+            token_usage=token_usage,
+            llm_call_attempt=llm_call_attempt,
+            source_call_id=source_call_id,
         )
 
     def _extract_provider(self, url: str) -> str:
@@ -227,7 +377,8 @@ class AuditedHTTPClient(AuditedClientBase):
 
     def close(self) -> None:
         """Close the underlying httpx client and release connections."""
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
 
     def _resolve_url(self, url: str) -> str:
         """Join base_url with path, handling slash combinations."""
@@ -248,7 +399,11 @@ class AuditedHTTPClient(AuditedClientBase):
         # below — never fabricated into a concrete type.
         content_type = response.headers["content-type"] if "content-type" in response.headers else ""
 
-        if "application/json" in content_type:
+        if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1:
+            content_type = content_type.partition(";")[0].strip().lower()
+            if content_type == "application/json":
+                return _policy_json_body(response.content)
+        elif "application/json" in content_type:
             parsed, error = _parse_json_strict(response.text)
             if error is not None:
                 # JSON parse failure is captured in the audit trail via the
@@ -282,6 +437,7 @@ class AuditedHTTPClient(AuditedClientBase):
         request_payload: CallPayload,
         response_payload: CallPayload | None = None,
         token_id_override: str | None = None,
+        source_call_id: str | None = None,
     ) -> Call:
         """Record call to audit trail and emit telemetry event.
 
@@ -295,6 +451,12 @@ class AuditedHTTPClient(AuditedClientBase):
         Returns:
             Call object from Landscape recording (contains request_ref and response_ref blob hashes).
         """
+        if type(error_data) is HTTPCallError:
+            error_data = HTTPCallError(
+                type=error_data.type,
+                message=_sanitize_http_error_message(error_data.message),
+                status_code=error_data.status_code,
+            )
         call = self._record_call(
             call_index=call_index,
             call_type=CallType.HTTP,
@@ -303,6 +465,7 @@ class AuditedHTTPClient(AuditedClientBase):
             response_data=response_payload,
             error=error_data,
             latency_ms=latency_ms,
+            source_call_id=source_call_id,
         )
 
         # Telemetry emitted AFTER successful Landscape recording
@@ -318,7 +481,307 @@ class AuditedHTTPClient(AuditedClientBase):
             call_type_label="http",
         )
 
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            self._call_mode_session.verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_data,
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+                current_call_id=call.call_id,
+                live_status=call_status,
+                live_response_data=response_data,
+                live_error_data=error_data.to_dict() if error_data is not None else None,
+            )
+
         return call
+
+    def _restore_replay_response(
+        self,
+        evidence: ReplayCallEvidence,
+        *,
+        method: str,
+        expected_url: str | None,
+        request_headers: dict[str, str],
+        redirect_hop: bool = False,
+    ) -> httpx.Response:
+        """Parse retained transport as untrusted audit data before any egress."""
+        payload = evidence.response_data
+        if payload is None:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has no response payload")
+        if "status_code" not in payload:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has invalid status")
+        if "transport" not in payload:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} lacks exact transport")
+        status_code = payload["status_code"]
+        transport = payload["transport"]
+        body_size = payload["body_size"] if "body_size" in payload else None
+        if type(status_code) is not int or not 100 <= status_code <= 999:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has invalid status")
+        if (body_size is not None and (type(body_size) is not int or body_size < 0)) or type(transport) not in (dict, MappingProxyType):
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} lacks exact transport")
+        try:
+            encoded_body = transport["body_b64"]
+            header_pairs = transport["headers"]
+            recorded_url = transport["request_url"]
+        except KeyError as exc:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} lacks required transport fields") from exc
+        if type(encoded_body) is not str or type(recorded_url) is not str or (expected_url is not None and recorded_url != expected_url):
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has incomplete or divergent transport")
+        if type(header_pairs) not in (tuple, list):
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} lacks ordered headers")
+        headers: list[tuple[str, str]] = []
+        for pair in header_pairs:
+            if type(pair) not in (tuple, list) or len(pair) != 2 or type(pair[0]) is not str or type(pair[1]) is not str:
+                raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has invalid headers")
+            name, value = pair
+            if self._filter_response_headers({name: value}) != {name: value} or name.lower() == "content-encoding":
+                raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has unsafe transport headers")
+            headers.append((name, value))
+        try:
+            body = base64.b64decode(encoded_body, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has invalid body encoding") from exc
+        if body_size is not None and len(body) != body_size:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has inconsistent body size")
+        if _fingerprint_url(recorded_url) != recorded_url:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has unsafe transport URL")
+        request = httpx.Request(method, recorded_url, headers=request_headers)
+        response = httpx.Response(status_code, headers=headers, content=body, request=request)
+        expected_status = (
+            CallStatus.SUCCESS if (200 <= status_code < 300 or (redirect_hop and 300 <= status_code < 400)) else CallStatus.ERROR
+        )
+        if evidence.status is not expected_status:
+            raise AuditIntegrityError(f"HTTP replay call {evidence.source_call_id} has contradictory status")
+        return response
+
+    def _replay_request(
+        self,
+        *,
+        method: str,
+        full_url: str,
+        request_dto: HTTPCallRequest,
+        request_headers: dict[str, str],
+        params: dict[str, str | int | float] | None,
+        call_index: int,
+        token_id: str | None,
+    ) -> httpx.Response:
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.REPLAY:
+            raise AuditIntegrityError("HTTP replay requested without a replay session")
+        if self._archived_auth_for_replay:
+            raise AuditIntegrityError("Archived HTTP credential replay requires the SSRF-safe request path")
+        request_data = request_dto.to_dict()
+        evidence = session.replay_call(
+            call_type=CallType.HTTP,
+            request_data=request_data,
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=call_index,
+        )
+        expected_url = str(httpx.Request(method, full_url, params=params).url)
+        response = self._restore_replay_response(evidence, method=method, expected_url=expected_url, request_headers=request_headers)
+        response_payload = RawCallPayload(evidence.response_data or {})
+        error_payload = RawCallPayload(evidence.error_data) if evidence.error_data is not None else None
+        self._record_and_emit(
+            call_index=call_index,
+            full_url=full_url,
+            request_data=request_data,
+            response=response,
+            response_data=evidence.response_data,
+            error_data=error_payload,
+            latency_ms=evidence.latency_ms or 0.0,
+            call_status=evidence.status,
+            request_payload=request_dto,
+            response_payload=response_payload,
+            token_id_override=token_id,
+            source_call_id=evidence.source_call_id,
+        )
+        return response
+
+    def _replay_ssrf_request(
+        self,
+        *,
+        method: str,
+        request: SSRFSafeRequest,
+        request_dto: HTTPCallRequest,
+        request_headers: dict[str, str],
+        params: dict[str, str | int | float] | None,
+        call_index: int,
+        follow_redirects: bool,
+        max_redirects: int,
+        allowed_origins: Sequence[HTTPOrigin],
+        bound_header_origin: HTTPOrigin | None,
+    ) -> tuple[httpx.Response, str, Call]:
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.REPLAY:
+            raise AuditIntegrityError("SSRF-safe HTTP replay requested without a replay session")
+        request_data = request_dto.to_dict()
+        replay_request_data: Mapping[str, Any] = request_data
+        audit_request_data = request_data
+        audit_request_payload: CallPayload = request_dto
+        archived_request_id: str | None = None
+        if self._archived_auth_for_replay:
+            archived = session.archived_call_request(
+                call_type=CallType.HTTP,
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+            )
+            archived_request_data = {key: deep_thaw(value) for key, value in archived.request_data.items()}
+            if "headers" not in archived_request_data or "headers" not in request_data:
+                raise AuditIntegrityError("Archived HTTP request has no headers")
+            archived_headers = archived_request_data["headers"]
+            current_headers = request_data["headers"]
+            if type(archived_headers) is not dict or type(current_headers) is not dict:
+                raise AuditIntegrityError("Archived HTTP request has invalid headers")
+            archived_auth = [(key, value) for key, value in archived_headers.items() if type(key) is str and key.lower() == "authorization"]
+            if len(archived_auth) != 1 or any(type(key) is str and key.lower() == "authorization" for key in current_headers):
+                raise AuditIntegrityError("Archived HTTP request has ambiguous credential identity")
+            fingerprint = archived_auth[0][1]
+            if type(fingerprint) is not str or _FINGERPRINTED_AUTH.fullmatch(fingerprint) is None:
+                raise AuditIntegrityError("Archived HTTP credential has no trusted fingerprint")
+            comparable = dict(archived_request_data)
+            comparable["headers"] = {key: value for key, value in archived_headers.items() if key != archived_auth[0][0]}
+            if comparable != request_data:
+                raise AuditIntegrityError("Current HTTP request differs from archived non-auth fields")
+            replay_request_data = archived_request_data
+            archived_request_id = archived.source_call_id
+            audit_request_data = {
+                **archived_request_data,
+                "replay_credential_origin": {
+                    "source_run_id": session.source_run_id,
+                    "source_call_id": archived.source_call_id,
+                    "identity": "archived_fingerprint",
+                },
+            }
+            audit_request_payload = RawCallPayload(audit_request_data)
+        evidence = session.replay_call(
+            call_type=CallType.HTTP,
+            request_data=replay_request_data,
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=call_index,
+        )
+        if archived_request_id is not None and evidence.source_call_id != archived_request_id:
+            raise AuditIntegrityError("Archived HTTP credential does not belong to the replayed source call")
+        payload = evidence.response_data
+        if payload is None or "transport" not in payload:
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks transport")
+        transport = payload["transport"]
+        if type(transport) not in (dict, MappingProxyType):
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks transport")
+        raw_hops = transport["redirect_hops"] if "redirect_hops" in transport else ()
+        redirect_count = payload["redirect_count"] if "redirect_count" in payload else 0
+        if type(redirect_count) is not int or type(raw_hops) not in (tuple, list) or redirect_count != len(raw_hops):
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} has incomplete redirects")
+        if (not follow_redirects and redirect_count) or redirect_count > max_redirects:
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} exceeds requested redirect policy")
+        last_hop_url: str | None = None
+        last_hop_transport_url: str | None = None
+        for raw_hop in raw_hops:
+            if type(raw_hop) not in (dict, MappingProxyType):
+                raise AuditIntegrityError("SSRF-safe HTTP replay has malformed redirect evidence")
+            if "request" not in raw_hop or "response" not in raw_hop:
+                raise AuditIntegrityError("SSRF-safe HTTP replay has missing redirect payloads")
+            hop_request = raw_hop["request"]
+            hop_response = raw_hop["response"]
+            if type(hop_request) not in (dict, MappingProxyType) or type(hop_response) not in (dict, MappingProxyType):
+                raise AuditIntegrityError("SSRF-safe HTTP replay has missing redirect payloads")
+            hop_index = self._next_call_index()
+            hop_evidence = session.replay_call(
+                call_type=CallType.HTTP_REDIRECT,
+                request_data=hop_request,
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=hop_index,
+            )
+            if hop_evidence.response_data != hop_response:
+                raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} differs from parent archive")
+            if "method" not in hop_request or "transport" not in hop_response:
+                raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks required fields")
+            hop_method = hop_request["method"]
+            hop_transport = hop_response["transport"]
+            if type(hop_transport) not in (dict, MappingProxyType) or "request_url" not in hop_transport:
+                raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks transport URL")
+            hop_url = hop_transport["request_url"]
+            if type(hop_method) is not str or type(hop_url) is not str:
+                raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks transport URL")
+            if "url" not in hop_request:
+                raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks logical URL")
+            archived_hop_url = hop_request["url"]
+            if type(archived_hop_url) is not str:
+                raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks logical URL")
+            validate_allowed_http_origin(archived_hop_url, allowed_origins)
+            if bound_header_origin is not None:
+                validate_allowed_http_origin(archived_hop_url, (bound_header_origin,))
+            last_hop_url = archived_hop_url
+            last_hop_transport_url = hop_url
+            self._restore_replay_response(
+                hop_evidence, method=hop_method, expected_url=hop_url, request_headers=request_headers, redirect_hop=True
+            )
+            hop_audit_request: Mapping[str, Any] = hop_request
+            if self._archived_auth_for_replay:
+                if "headers" not in hop_request:
+                    raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} has no headers")
+                hop_headers = hop_request["headers"]
+                if type(hop_headers) not in (dict, MappingProxyType):
+                    raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} has invalid headers")
+                hop_auth = [(key, value) for key, value in hop_headers.items() if type(key) is str and key.lower() == "authorization"]
+                if len(hop_auth) > 1 or (
+                    hop_auth and (type(hop_auth[0][1]) is not str or _FINGERPRINTED_AUTH.fullmatch(hop_auth[0][1]) is None)
+                ):
+                    raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} has invalid credential evidence")
+                if hop_auth:
+                    hop_audit_request = {
+                        **hop_request,
+                        "replay_credential_origin": {
+                            "source_run_id": session.source_run_id,
+                            "source_call_id": hop_evidence.source_call_id,
+                            "identity": "archived_fingerprint",
+                        },
+                    }
+            self._record_call(
+                call_index=hop_index,
+                call_type=CallType.HTTP_REDIRECT,
+                status=hop_evidence.status,
+                request_data=RawCallPayload(hop_audit_request),
+                response_data=RawCallPayload(hop_response),
+                error=RawCallPayload(hop_evidence.error_data) if hop_evidence.error_data is not None else None,
+                latency_ms=hop_evidence.latency_ms,
+                source_call_id=hop_evidence.source_call_id,
+            )
+        if "logical_url" not in transport or "request_url" not in transport:
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks redirect URLs")
+        logical_url = transport["logical_url"]
+        if type(logical_url) is not str:
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks logical URL")
+        validate_allowed_http_origin(logical_url, allowed_origins)
+        if _fingerprint_url(logical_url) != logical_url:
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} has unsafe logical URL")
+        expected_logical_url = str(httpx.Request(method, request.original_url, params=params).url)
+        if redirect_count == 0 and logical_url != expected_logical_url:
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} changed URL")
+        if redirect_count and (logical_url != last_hop_url or transport["request_url"] != last_hop_transport_url):
+            raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} has inconsistent final redirect")
+        expected_url = str(httpx.Request(method, request.connection_url, params=params).url) if redirect_count == 0 else None
+        response = self._restore_replay_response(
+            evidence, method=method if redirect_count == 0 else "GET", expected_url=expected_url, request_headers=request_headers
+        )
+        call = self._record_and_emit(
+            call_index=call_index,
+            full_url=logical_url,
+            request_data=audit_request_data,
+            response=response,
+            response_data=payload,
+            error_data=RawCallPayload(evidence.error_data) if evidence.error_data is not None else None,
+            latency_ms=evidence.latency_ms or 0.0,
+            call_status=evidence.status,
+            request_payload=audit_request_payload,
+            response_payload=RawCallPayload(payload or {}),
+            source_call_id=evidence.source_call_id,
+        )
+        return response, logical_url, call
 
     def _emit_telemetry_after_audit(
         self,
@@ -371,19 +834,150 @@ class AuditedHTTPClient(AuditedClientBase):
                 exc_info=True,
             )
 
+    def _verify_redirect_call(
+        self,
+        *,
+        call: Call,
+        call_index: int,
+        request_data: HTTPCallRequest,
+        status: CallStatus,
+        response_data: HTTPCallResponse | None = None,
+        error_data: HTTPCallError | None = None,
+    ) -> None:
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.VERIFY:
+            return
+        session.verify_call(
+            call_type=CallType.HTTP_REDIRECT,
+            request_data=request_data.to_dict(),
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=call_index,
+            current_call_id=call.call_id,
+            live_status=status,
+            live_response_data=response_data.to_dict() if response_data is not None else None,
+            live_error_data=error_data.to_dict() if error_data is not None else None,
+        )
+
+    def _admit_verify_call(self, *, call_type: CallType, request_data: Mapping[str, Any], call_index: int) -> None:
+        session = self._call_mode_session
+        if session is None or session.mode is not RunMode.VERIFY:
+            return
+        session.admit_verify_call(
+            call_type=call_type,
+            request_data=request_data,
+            current_state_id=self._state_id,
+            current_operation_id=self._operation_id,
+            current_call_index=call_index,
+        )
+
     def _build_response_payload(
-        self, response: httpx.Response, full_url: str, *, redirect_count: int = 0
+        self,
+        response: httpx.Response,
+        full_url: str,
+        *,
+        redirect_count: int = 0,
+        logical_url: str | None = None,
+        redirect_hops: tuple[HTTPRedirectReplayHop, ...] = (),
     ) -> tuple[HTTPCallResponse, dict[str, Any]]:
         """Build typed and dict response payloads from an HTTP response."""
-        response_body = self._parse_response_body(response, full_url)
+        decoded_body: HTTPDecodedBodyEvidence | None = None
+        deadline: HTTPDeadline | None = None
+        if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1:
+            capture = response.extensions["elspeth_decoded_body"]
+            if not isinstance(capture, HTTPDecodedBodyEvidence):
+                raise contract_errors.FrameworkBugError("HTTP decoded capture has invalid owned type")
+            decoded_body = capture
+            budget = response.extensions["elspeth_http_deadline"]
+            if not isinstance(budget, HTTPDeadline):
+                raise contract_errors.FrameworkBugError("HTTP deadline has invalid owned type")
+            deadline = budget
+        expired = False
+        invalid_representation = False
+        try:
+            if deadline is not None:
+                deadline.remaining()
+            response_body = self._parse_response_body(response, full_url)
+            if deadline is not None:
+                # Parsed external JSON must fit the audit's canonical wire
+                # domain before any DTO, hash, telemetry or rendered failure.
+                try:
+                    canonical_json(response_body)
+                except (ValueError, UnicodeError):
+                    invalid_representation = True
+                deadline.remaining()
+        except HTTPDeadlineExceeded:
+            expired = True
+        if expired:
+            if decoded_body is None:
+                raise contract_errors.FrameworkBugError("Expired HTTP parse has no body evidence")
+            incomplete = HTTPDecodedBodyEvidence(decoded_body.body_b64, decoded_body.decoded_size, False, "deadline_exceeded")
+            payload = HTTPCallResponse(
+                response.status_code,
+                self._filter_response_headers(dict(response.headers)),
+                body_size=len(response.content),
+                body={"_incomplete": True, "_error": "deadline_exceeded"},
+                decoded_body=incomplete,
+            )
+            raise HTTPPolicyError("deadline_exceeded", response_payload=payload)
+        if invalid_representation:
+            payload = HTTPCallResponse(
+                response.status_code,
+                self._filter_response_headers(dict(response.headers)),
+                body_size=len(response.content),
+                decoded_body=decoded_body,
+            )
+            raise HTTPPolicyError("invalid_json", response_payload=payload)
         response_dto = HTTPCallResponse(
             status_code=response.status_code,
             headers=self._filter_response_headers(dict(response.headers)),
             body_size=len(response.content),
             body=response_body,
             redirect_count=redirect_count,
+            transport=self._build_replay_transport(response, logical_url=logical_url, redirect_hops=redirect_hops),
+            decoded_body=decoded_body,
         )
         return response_dto, response_dto.to_dict()
+
+    def _build_replay_transport(
+        self, response: httpx.Response, *, logical_url: str | None = None, redirect_hops: tuple[HTTPRedirectReplayHop, ...] = ()
+    ) -> HTTPResponseTransport | None:
+        """Keep exact observable bytes and headers only when audit-safe.
+
+        A filtered header, fingerprinted URL or compressed wire response has
+        no exact reconstruction from the available httpx object. Such calls
+        remain valid live audit records but are ineligible for replay.
+        """
+        if type(response.headers) is not httpx.Headers:
+            return None
+        raw_headers = dict(response.headers)
+        if any(hop.response.transport is None for hop in redirect_hops):
+            return None
+        if self._filter_response_headers(raw_headers) != raw_headers:
+            return None
+        if "content-encoding" in response.headers:
+            return None
+        try:
+            request_url = str(response.request.url)
+        except RuntimeError:
+            # A test or custom transport can return a response without its
+            # originating request. Audit the response, but it cannot be
+            # reconstructed exactly for replay without that URL.
+            return None
+        try:
+            if _fingerprint_url(request_url) != request_url:
+                return None
+            if logical_url is not None and _fingerprint_url(logical_url) != logical_url:
+                return None
+        except (ValueError, UnicodeError, contract_errors.FrameworkBugError):
+            return None
+        return HTTPResponseTransport(
+            body_b64=base64.b64encode(response.content).decode("ascii"),
+            headers=tuple(response.headers.multi_items()),
+            request_url=request_url,
+            logical_url=logical_url,
+            redirect_hops=redirect_hops,
+        )
 
     def _build_truncated_response_payload(
         self,
@@ -392,6 +986,7 @@ class AuditedHTTPClient(AuditedClientBase):
         full_url: str,
         observed_body_size: int,
         redirect_count: int = 0,
+        reason: str = "body_too_large",
     ) -> HTTPCallResponse:
         """Build bounded audit metadata for a response aborted by the body cap."""
         response_dto = HTTPCallResponse(
@@ -400,7 +995,7 @@ class AuditedHTTPClient(AuditedClientBase):
             body_size=observed_body_size,
             body={
                 "_truncated": True,
-                "_reason": "body_too_large",
+                "_reason": reason,
                 "_captured_body": False,
                 "_observed_body_size": observed_body_size,
                 "_max_body_bytes": self._require_response_body_cap(full_url),
@@ -425,8 +1020,30 @@ class AuditedHTTPClient(AuditedClientBase):
         max_body_bytes = self._require_response_body_cap(full_url)
         chunks: list[bytes] = []
         observed_body_size = 0
-        chunk_size = min(max_body_bytes + 1, 64 * 1024)
-        for chunk in response.iter_bytes(chunk_size=chunk_size):
+        observed_encoded_size = 0
+        encoding = (response.headers["content-encoding"] if "content-encoding" in response.headers else "identity").strip().lower()
+        if encoding not in {"identity", "gzip", "deflate"}:
+            raise HTTPResponseEncodingLimitError(
+                reason="unsupported_content_encoding",
+                response_payload=self._build_truncated_response_payload(
+                    response, full_url=full_url, observed_body_size=0, redirect_count=redirect_count, reason="unsupported_content_encoding"
+                ),
+            )
+        predecoded = response.is_stream_consumed
+        decoder = (
+            None
+            if predecoded or encoding == "identity"
+            else zlib.decompressobj(16 + zlib.MAX_WBITS)
+            if encoding == "gzip"
+            else zlib.decompressobj()
+        )
+        # HTTP's deflate label is used for both zlib-wrapped and raw DEFLATE
+        # streams. Retain only the bounded prefix until the wrapped decoder
+        # produces output, so a header failure can be retried from byte zero.
+        deflate_prefix: bytearray | None = bytearray() if encoding == "deflate" and not predecoded else None
+
+        def append_decoded(chunk: bytes) -> None:
+            nonlocal observed_body_size
             observed_body_size += len(chunk)
             if observed_body_size > max_body_bytes:
                 response_payload = self._build_truncated_response_payload(
@@ -443,14 +1060,147 @@ class AuditedHTTPClient(AuditedClientBase):
                 )
             chunks.append(chunk)
 
-        # ``iter_bytes()`` above has ALREADY applied content-decoding
-        # (gzip/deflate/br) to the body. Reconstructing the Response with the
-        # original ``Content-Encoding`` header makes httpx re-decode the
-        # already-decoded body on read -> DecodingError ("incorrect header
-        # check"). Drop the now-inaccurate content-encoding/length so the
-        # reconstructed body is treated as identity. (iter_bytes is kept
-        # deliberately: the body cap is measured on the DECODED size, which is
-        # the decompression-bomb-relevant size.)
+        def decode_pending(encoded: bytes) -> None:
+            if decoder is None:
+                raise RuntimeError("compressed decoder is absent")
+            pending = encoded
+            while pending:
+                previous = pending
+                decoded = decoder.decompress(pending, min(64 * 1024, max_body_bytes - observed_body_size + 1))
+                append_decoded(decoded)
+                pending = decoder.unconsumed_tail
+                if pending == previous and not decoded:
+                    raise zlib.error("compressed decoder made no progress")
+
+        if predecoded:
+            append_decoded(response.content)
+            if encoding == "identity":
+                observed_encoded_size = observed_body_size
+            else:
+                length_header = response.headers["content-length"] if "content-length" in response.headers else ""
+                if not length_header.isascii() or not length_header.isdecimal():
+                    raise HTTPResponseEncodingLimitError(
+                        reason="unmeasured_content_encoding",
+                        response_payload=self._build_truncated_response_payload(
+                            response,
+                            full_url=full_url,
+                            observed_body_size=observed_body_size,
+                            redirect_count=redirect_count,
+                            reason="unmeasured_content_encoding",
+                        ),
+                    )
+                observed_encoded_size = int(length_header)
+            if self._max_encoded_response_bytes is not None and observed_encoded_size > self._max_encoded_response_bytes:
+                raise HTTPResponseEncodingLimitError(
+                    reason="encoded_body_too_large",
+                    response_payload=self._build_truncated_response_payload(
+                        response,
+                        full_url=full_url,
+                        observed_body_size=observed_body_size,
+                        redirect_count=redirect_count,
+                        reason="encoded_body_too_large",
+                    ),
+                )
+
+        raw_chunk_size = min(max_body_bytes + 1, 64 * 1024)
+        if self._max_encoded_response_bytes is not None:
+            raw_chunk_size = min(raw_chunk_size, self._max_encoded_response_bytes + 1)
+        for raw_chunk in () if predecoded else response.iter_raw(chunk_size=raw_chunk_size):
+            observed_encoded_size += len(raw_chunk)
+            if self._max_encoded_response_bytes is not None and observed_encoded_size > self._max_encoded_response_bytes:
+                raise HTTPResponseEncodingLimitError(
+                    reason="encoded_body_too_large",
+                    response_payload=self._build_truncated_response_payload(
+                        response,
+                        full_url=full_url,
+                        observed_body_size=observed_body_size,
+                        redirect_count=redirect_count,
+                        reason="encoded_body_too_large",
+                    ),
+                )
+            if decoder is None:
+                append_decoded(raw_chunk)
+                continue
+            if deflate_prefix is not None:
+                prefix_cap = self._max_encoded_response_bytes or max_body_bytes
+                if len(deflate_prefix) + len(raw_chunk) > prefix_cap:
+                    raise HTTPResponseEncodingLimitError(
+                        reason="encoded_body_too_large",
+                        response_payload=self._build_truncated_response_payload(
+                            response,
+                            full_url=full_url,
+                            observed_body_size=observed_body_size,
+                            redirect_count=redirect_count,
+                            reason="encoded_body_too_large",
+                        ),
+                    )
+                deflate_prefix.extend(raw_chunk)
+            try:
+                decode_pending(raw_chunk)
+            except zlib.error as exc:
+                if deflate_prefix is not None and observed_body_size == 0:
+                    decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+                    try:
+                        decode_pending(bytes(deflate_prefix))
+                    except zlib.error as raw_exc:
+                        raise HTTPResponseEncodingLimitError(
+                            reason="invalid_content_encoding",
+                            response_payload=self._build_truncated_response_payload(
+                                response,
+                                full_url=full_url,
+                                observed_body_size=observed_body_size,
+                                redirect_count=redirect_count,
+                                reason="invalid_content_encoding",
+                            ),
+                        ) from raw_exc
+                    deflate_prefix = None
+                else:
+                    raise HTTPResponseEncodingLimitError(
+                        reason="invalid_content_encoding",
+                        response_payload=self._build_truncated_response_payload(
+                            response,
+                            full_url=full_url,
+                            observed_body_size=observed_body_size,
+                            redirect_count=redirect_count,
+                            reason="invalid_content_encoding",
+                        ),
+                    ) from exc
+            if observed_body_size > 0:
+                deflate_prefix = None
+
+        if decoder is not None:
+            if not decoder.eof or decoder.unused_data:
+                raise HTTPResponseEncodingLimitError(
+                    reason="invalid_content_encoding",
+                    response_payload=self._build_truncated_response_payload(
+                        response,
+                        full_url=full_url,
+                        observed_body_size=observed_body_size,
+                        redirect_count=redirect_count,
+                        reason="invalid_content_encoding",
+                    ),
+                )
+            append_decoded(decoder.flush(max_body_bytes - observed_body_size + 1))
+
+        if (
+            encoding != "identity"
+            and self._max_decompression_ratio is not None
+            and observed_encoded_size > 0
+            and observed_body_size > observed_encoded_size * self._max_decompression_ratio
+        ):
+            raise HTTPResponseEncodingLimitError(
+                reason="decompression_ratio_exceeded",
+                response_payload=self._build_truncated_response_payload(
+                    response,
+                    full_url=full_url,
+                    observed_body_size=observed_body_size,
+                    redirect_count=redirect_count,
+                    reason="decompression_ratio_exceeded",
+                ),
+            )
+
+        # Reconstruct from bounded decoded bytes without the old wire encoding
+        # headers, so callers cannot accidentally decompress the content twice.
         decoded_headers = httpx.Headers(
             [(key, value) for key, value in response.headers.multi_items() if key.lower() not in ("content-encoding", "content-length")]
         )
@@ -462,6 +1212,132 @@ class AuditedHTTPClient(AuditedClientBase):
             extensions=response.extensions,
         )
 
+    def _consume_policy_response(self, response: httpx.Response, *, deadline: HTTPDeadline) -> httpx.Response:
+        """Retain decoded evidence under the cap and one absolute deadline."""
+        cap = self._max_response_body_bytes
+        if cap is None:
+            raise contract_errors.FrameworkBugError("Power Automate response cap is absent")
+        captured = bytearray()
+        encoded_size = 0
+        failure: HTTPFailureCode | None = None
+        encoding = response.headers.get("content-encoding", "identity").strip().lower()
+        predecoded = response.is_stream_consumed
+        decoder = (
+            None
+            if predecoded or encoding == "identity"
+            else zlib.decompressobj(16 + zlib.MAX_WBITS)
+            if encoding == "gzip"
+            else zlib.decompressobj()
+        )
+        deflate_prefix = bytearray() if encoding == "deflate" and not predecoded else None
+
+        def append_decoded(chunk: bytes) -> None:
+            remaining = cap - len(captured)
+            captured.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                raise HTTPPolicyError("response_too_large")
+            deadline.remaining()
+
+        def decode_pending(encoded: bytes) -> None:
+            if decoder is None:
+                raise contract_errors.FrameworkBugError("Power Automate compressed decoder is absent")
+            pending = encoded
+            while pending:
+                deadline.remaining()
+                previous = pending
+                decoded = decoder.decompress(pending, min(64 * 1024, cap - len(captured) + 1))
+                append_decoded(decoded)
+                pending = decoder.unconsumed_tail
+                if pending == previous and not decoded:
+                    raise HTTPPolicyError("invalid_encoding")
+
+        try:
+            deadline.remaining()
+            if encoding not in {"identity", "gzip", "deflate"}:
+                raise HTTPPolicyError("invalid_encoding")
+            if predecoded:
+                append_decoded(response.content)
+                if encoding == "identity":
+                    encoded_size = len(response.content)
+                else:
+                    header = response.headers.get("content-length", "")
+                    if not header.isascii() or not header.isdecimal():
+                        raise HTTPPolicyError("invalid_encoding")
+                    encoded_size = int(header)
+                if self._max_encoded_response_bytes is not None and encoded_size > self._max_encoded_response_bytes:
+                    raise HTTPPolicyError("response_too_large")
+            else:
+                raw_chunks = iter(response.iter_raw())
+                while True:
+                    deadline.remaining()
+                    try:
+                        raw_chunk = next(raw_chunks)
+                    except StopIteration:
+                        break
+                    deadline.remaining()
+                    encoded_size += len(raw_chunk)
+                    if self._max_encoded_response_bytes is not None and encoded_size > self._max_encoded_response_bytes:
+                        raise HTTPPolicyError("response_too_large")
+                    if decoder is None:
+                        append_decoded(raw_chunk)
+                        continue
+                    if deflate_prefix is not None:
+                        prefix_cap = self._max_encoded_response_bytes or cap
+                        if len(deflate_prefix) + len(raw_chunk) > prefix_cap:
+                            raise HTTPPolicyError("response_too_large")
+                        deflate_prefix.extend(raw_chunk)
+                    try:
+                        decode_pending(raw_chunk)
+                    except zlib.error:
+                        if deflate_prefix is None or captured:
+                            raise
+                        decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+                        decode_pending(bytes(deflate_prefix))
+                        deflate_prefix = None
+                    if captured:
+                        deflate_prefix = None
+            if decoder is not None:
+                deadline.remaining()
+                if not decoder.eof or decoder.unused_data:
+                    raise HTTPPolicyError("invalid_encoding")
+                append_decoded(decoder.flush(cap - len(captured) + 1))
+            if (
+                encoding != "identity"
+                and self._max_decompression_ratio is not None
+                and encoded_size > 0
+                and len(captured) > encoded_size * self._max_decompression_ratio
+            ):
+                raise HTTPPolicyError("response_too_large")
+            deadline.remaining()
+        except (httpx.HTTPError, zlib.error, UnicodeError) as error:
+            failure = _policy_failure_code(error)
+
+        evidence = HTTPDecodedBodyEvidence(
+            base64.b64encode(captured).decode("ascii"),
+            len(captured),
+            failure is None,
+            failure,
+        )
+        if failure is not None:
+            payload = HTTPCallResponse(
+                status_code=response.status_code,
+                headers=self._filter_response_headers(dict(response.headers)),
+                body_size=len(captured),
+                body={"_incomplete": True, "_error": failure},
+                decoded_body=evidence,
+            )
+            raise HTTPPolicyError(failure, response_payload=payload)
+        headers = httpx.Headers(
+            [(key, value) for key, value in response.headers.multi_items() if key.lower() not in {"content-encoding", "content-length"}]
+        )
+        return httpx.Response(
+            response.status_code,
+            headers=headers,
+            content=bytes(captured),
+            request=response.request,
+            extensions={**response.extensions, "elspeth_decoded_body": evidence, "elspeth_http_deadline": deadline},
+        )
+
     def _request_with_optional_body_cap(
         self,
         client: httpx.Client,
@@ -471,19 +1347,32 @@ class AuditedHTTPClient(AuditedClientBase):
         headers: dict[str, str],
         timeout: float | None = None,
         json: Mapping[str, Any] | None = None,
+        form: tuple[tuple[str, str], ...] | None = None,
+        multipart_body: bytes | None = None,
         params: dict[str, str | int | float] | None = None,
         extensions: dict[str, str] | None = None,
+        deadline: HTTPDeadline | None = None,
     ) -> httpx.Response:
         """Send one request, streaming only when a response body cap is configured."""
         request_kwargs: dict[str, Any] = {"headers": headers}
         if timeout is not None:
             request_kwargs["timeout"] = timeout
-        if json is not None or method == "POST":
+        if multipart_body is not None:
+            request_kwargs["content"] = multipart_body
+        elif form is not None:
+            request_kwargs["content"] = encode_urlencoded_form(form)
+        elif json is not None or method == "POST":
             request_kwargs["json"] = json
         if params is not None or method == "GET":
             request_kwargs["params"] = params
         if extensions is not None:
             request_kwargs["extensions"] = extensions
+
+        if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1:
+            if deadline is None:
+                raise contract_errors.FrameworkBugError("Power Automate HTTP request requires a deadline")
+            with client.stream(method, full_url, **request_kwargs) as response:
+                return self._consume_policy_response(response, deadline=deadline)
 
         if self._max_response_body_bytes is None:
             if method == "GET":
@@ -531,7 +1420,12 @@ class AuditedHTTPClient(AuditedClientBase):
         Raises:
             httpx.HTTPError: For network/HTTP errors
         """
-        self._acquire_rate_limit()
+        if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1:
+            raise contract_errors.FrameworkBugError("Power Automate HTTP policy requires IP-pinned requests")
+        if self._semantic_managed_identity_verify:
+            raise AuditIntegrityError("Managed identity verify requires the SSRF-safe request path")
+        if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY:
+            self._acquire_rate_limit()
         call_index = self._next_call_index()
 
         full_url = self._resolve_url(url)
@@ -551,13 +1445,35 @@ class AuditedHTTPClient(AuditedClientBase):
         )
         request_data = request_dto.to_dict()
 
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY:
+            return self._replay_request(
+                method=method,
+                full_url=full_url,
+                request_dto=request_dto,
+                request_headers=merged_headers,
+                params=params,
+                call_index=call_index,
+                token_id=token_id,
+            )
+
+        self._admit_verify_call(call_type=CallType.HTTP, request_data=request_data, call_index=call_index)
+
         start = time.perf_counter()
         response: httpx.Response | None = None
 
         try:
+            if self._client is None:
+                with self._client_init_lock:
+                    if self._client is None:
+                        if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.VERIFY:
+                            raise AuditIntegrityError("HTTP client absent outside admitted verify mode")
+                        self._client = httpx.Client(timeout=self._timeout, follow_redirects=False)
+            client = self._client
+            if client is None:
+                raise AuditIntegrityError("HTTP client absent after verify admission")
             # Dispatch to the correct httpx method
             response = self._request_with_optional_body_cap(
-                self._client,
+                client,
                 method,
                 full_url,
                 json=json,
@@ -569,7 +1485,7 @@ class AuditedHTTPClient(AuditedClientBase):
             latency_ms = (time.perf_counter() - start) * 1000
             response_payload: HTTPCallResponse | None = None
             response_data: Mapping[str, Any] | None = None
-            if isinstance(e, HTTPResponseBodyTooLargeError):
+            if isinstance(e, (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError)):
                 response_payload = e.response_payload
                 response_data = e.response_data
 
@@ -696,6 +1612,23 @@ class AuditedHTTPClient(AuditedClientBase):
             token_id=token_id,
         )
 
+    def _run_before_send(self, before_send: Callable[[], None] | None) -> None:
+        """Check dispatch authority after preparation, preserving owned bugs."""
+        if before_send is not None:
+            refused = False
+            try:
+                before_send()
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except (TypeError, AttributeError, KeyError, NameError):
+                raise
+            except Exception:
+                if self._audit_policy is HTTPAuditPolicy.GENERIC:
+                    raise
+                refused = True
+            if refused:
+                raise HTTPPolicyError("authority_refused")
+
     def _send_ssrf_safe_request(
         self,
         client: httpx.Client,
@@ -705,14 +1638,41 @@ class AuditedHTTPClient(AuditedClientBase):
         headers: dict[str, str],
         extensions: dict[str, str] | None,
         json: Mapping[str, Any] | None,
+        form: tuple[tuple[str, str], ...] | None,
+        multipart_body: bytes | None,
         params: dict[str, str | int | float] | None,
+        before_send: Callable[[], None] | None = None,
     ) -> httpx.Response:
         """Send one IP-pinned request with method-specific httpx handling."""
+        if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1:
+            deadline = HTTPDeadline(time.monotonic() + self._timeout, clock=time.monotonic)
+            with httpx.Client(
+                timeout=self._timeout,
+                follow_redirects=False,
+                trust_env=False,
+                transport=DeadlineHTTPTransport(deadline),
+            ) as deadline_client:
+                self._run_before_send(before_send)
+                return self._request_with_optional_body_cap(
+                    deadline_client,
+                    method,
+                    connection_url,
+                    json=json,
+                    form=form,
+                    multipart_body=multipart_body,
+                    params=params,
+                    headers=headers,
+                    extensions=extensions,
+                    deadline=deadline,
+                )
+        self._run_before_send(before_send)
         return self._request_with_optional_body_cap(
             client,
             method,
             connection_url,
             json=json,
+            form=form,
+            multipart_body=multipart_body,
             params=params,
             headers=headers,
             extensions=extensions,
@@ -724,11 +1684,18 @@ class AuditedHTTPClient(AuditedClientBase):
         request: SSRFSafeRequest,
         *,
         headers: dict[str, str] | None = None,
+        fingerprinted_header_names: frozenset[str] = frozenset(),
         json: Mapping[str, Any] | None = None,
+        form: tuple[tuple[str, str], ...] | None = None,
+        multipart_body: bytes | None = None,
+        multipart_metadata: MultipartMetadata | None = None,
         params: dict[str, str | int | float] | None = None,
         follow_redirects: bool = False,
         max_redirects: int = 10,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+        allowed_origins: Sequence[HTTPOrigin] = (),
+        verify_source_call_id: str | None = None,
+        before_send: Callable[[], None] | None = None,
     ) -> tuple[httpx.Response, str, Call]:
         """HTTP request with SSRF-safe IP pinning and redirect validation.
 
@@ -748,6 +1715,8 @@ class AuditedHTTPClient(AuditedClientBase):
                 blocklist when validating redirect targets. This must match
                 the ranges used to create the initial SSRFSafeRequest so every
                 redirect hop preserves the same caller-approved boundary.
+            verify_source_call_id: Source HTTP call admitted before managed
+                identity token acquisition in verify mode.
 
         Returns:
             Tuple of (httpx.Response, final hostname URL as string, Call).
@@ -763,7 +1732,34 @@ class AuditedHTTPClient(AuditedClientBase):
             SSRFBlockedError: If redirect target resolves to blocked IP
         """
         method_upper = method.upper()
-        self._acquire_rate_limit()
+        if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1 and follow_redirects:
+            raise ValueError("Power Automate HTTP policy refuses redirects")
+        if form is not None:
+            if method_upper != "POST" or json is not None or multipart_body is not None:
+                raise ValueError("form requires POST without a JSON body")
+            encode_urlencoded_form(form)
+            if any(key.casefold() == "content-type" for key in (headers or {})):
+                raise ValueError("form content type is controlled by AuditedHTTPClient")
+        if (multipart_body is None) != (multipart_metadata is None):
+            raise ValueError("multipart body and metadata must be supplied together")
+        if multipart_metadata is not None:
+            if method_upper != "POST" or json is not None or form is not None or follow_redirects:
+                raise ValueError("multipart requires POST without another body or redirects")
+            if type(multipart_body) is not bytes:
+                raise ValueError("multipart body must be bytes")
+            validate_multipart_form(multipart_body, multipart_metadata)
+            if any(key.casefold() == "content-type" for key in (headers or {})):
+                raise ValueError("multipart content type is controlled by AuditedHTTPClient")
+        validate_allowed_http_origin(request.original_url, allowed_origins)
+        if self._semantic_managed_identity_verify:
+            if not verify_source_call_id:
+                raise AuditIntegrityError("Managed identity verify requires a preflight source call")
+            if follow_redirects:
+                raise AuditIntegrityError("Managed identity verify does not support redirect following")
+        elif verify_source_call_id is not None:
+            raise AuditIntegrityError("Verify source call identity requires managed identity verify mode")
+        if self._call_mode_session is None or self._call_mode_session.mode is not RunMode.REPLAY:
+            self._acquire_rate_limit()
 
         call_index = self._next_call_index()
 
@@ -772,8 +1768,16 @@ class AuditedHTTPClient(AuditedClientBase):
             **(headers or {}),
             "Host": request.host_header,
         }
+        bound_header_origin: HTTPOrigin | None = None
+        if fingerprinted_header_names:
+            bound_header_origin = (request.scheme, request.bare_hostname.lower(), request.port)
+        if form is not None:
+            merged_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
+        if multipart_metadata is not None:
+            merged_headers["Content-Type"] = multipart_metadata.content_type
 
         connection_url = request.connection_url
+        logical_request_url = str(httpx.Request(method_upper, request.original_url, params=params).url) if params else request.original_url
         effective_timeout = self._timeout
 
         # TLS SNI: use original hostname for certificate verification
@@ -785,16 +1789,51 @@ class AuditedHTTPClient(AuditedClientBase):
         # DTO stays alive for typed telemetry payload; dict form used for Landscape hashing.
         request_dto = HTTPCallRequest(
             method=method_upper,
-            url=_fingerprint_url(request.original_url),
-            headers=self._filter_request_headers(merged_headers),
+            url=_fingerprint_url(request.original_url, honor_development_mode=self._audit_policy is HTTPAuditPolicy.GENERIC),
+            headers=self._filter_request_headers(merged_headers, force_fingerprint_names=fingerprinted_header_names),
             json=json,
-            params=_fingerprint_params(params),
+            form=form,
+            multipart=multipart_metadata,
+            params=_fingerprint_params(params, honor_development_mode=self._audit_policy is HTTPAuditPolicy.GENERIC),
             resolved_ip=request.resolved_ip,
         )
         request_data = request_dto.to_dict()
 
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.REPLAY:
+            return self._replay_ssrf_request(
+                method=method_upper,
+                request=request,
+                request_dto=request_dto,
+                request_headers=merged_headers,
+                params=params,
+                call_index=call_index,
+                follow_redirects=follow_redirects,
+                max_redirects=max_redirects,
+                allowed_origins=allowed_origins,
+                bound_header_origin=bound_header_origin,
+            )
+
+        if self._semantic_managed_identity_verify:
+            session = self._call_mode_session
+            if session is None or verify_source_call_id is None:
+                raise AuditIntegrityError("Managed identity verify session or source call is missing")
+            admitted_source_call_id = session.admit_verify_http_managed_identity(
+                request_data=request_data,
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+                source_call_id=verify_source_call_id,
+            )
+            if admitted_source_call_id != verify_source_call_id:
+                raise AuditIntegrityError("Managed identity verify admitted a different source call")
+        else:
+            self._admit_verify_call(call_type=CallType.HTTP, request_data=request_data, call_index=call_index)
+
         start = time.perf_counter()
         response: httpx.Response | None = None
+        replay_hops: list[HTTPRedirectReplayHop] = []
+        policy_failure: HTTPFailureCode | None = None
+        policy_response: HTTPCallResponse | None = None
 
         try:
             # Ephemeral client for SSRF-safe requests: connection_url uses the
@@ -805,6 +1844,7 @@ class AuditedHTTPClient(AuditedClientBase):
             with httpx.Client(
                 timeout=effective_timeout,
                 follow_redirects=False,
+                trust_env=self._audit_policy is HTTPAuditPolicy.GENERIC,
             ) as ssrf_client:
                 response = self._send_ssrf_safe_request(
                     ssrf_client,
@@ -813,20 +1853,27 @@ class AuditedHTTPClient(AuditedClientBase):
                     headers=merged_headers,
                     extensions=extensions if extensions else None,
                     json=json,
+                    form=form,
+                    multipart_body=multipart_body,
                     params=params,
+                    before_send=before_send,
                 )
 
             # Handle redirects with SSRF validation at each hop
             redirect_count = 0
-            final_hostname_url = request.original_url
+            final_hostname_url = logical_request_url
             if follow_redirects:
                 response, redirect_count, final_hostname_url = self._follow_redirects_safe(
                     response,
                     max_redirects,
                     effective_timeout,
                     merged_headers,
-                    original_url=request.original_url,
+                    original_url=logical_request_url,
                     allowed_ranges=allowed_ranges,
+                    allowed_origins=allowed_origins,
+                    bound_header_origin=bound_header_origin,
+                    fingerprinted_header_names=fingerprinted_header_names,
+                    replay_hops=replay_hops,
                 )
 
             latency_ms = (time.perf_counter() - start) * 1000
@@ -834,13 +1881,21 @@ class AuditedHTTPClient(AuditedClientBase):
             is_success = 200 <= response.status_code < 300
             call_status = CallStatus.SUCCESS if is_success else CallStatus.ERROR
 
-            response_dto, response_data = self._build_response_payload(response, final_hostname_url, redirect_count=redirect_count)
+            response_dto, response_data = self._build_response_payload(
+                response,
+                final_hostname_url,
+                redirect_count=redirect_count,
+                logical_url=final_hostname_url,
+                redirect_hops=tuple(replay_hops),
+            )
 
             error_data: CallPayload | None = None
             if not is_success:
                 error_data = HTTPCallError(
                     type="HTTPError",
-                    message=f"HTTP {response.status_code}",
+                    message="transport_failed"
+                    if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1
+                    else f"HTTP {response.status_code}",
                     status_code=response.status_code,
                 )
 
@@ -849,22 +1904,39 @@ class AuditedHTTPClient(AuditedClientBase):
 
             response_payload: HTTPCallResponse | None = None
             error_response_data: Mapping[str, Any] | None = None
-            if isinstance(e, HTTPResponseBodyTooLargeError):
+            if isinstance(e, HTTPPolicyError):
+                response_payload = e.response_payload
+                error_response_data = response_payload.to_dict() if response_payload is not None else None
+            elif isinstance(e, (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError)):
                 response_payload = e.response_payload
                 error_response_data = e.response_data
-            elif response is not None:
+            elif response is not None and self._audit_policy is HTTPAuditPolicy.GENERIC:
                 response_payload, error_response_data = self._build_response_payload(response, request.original_url)
+            elif response is not None:
+                retained = response.extensions["elspeth_decoded_body"]
+                if not isinstance(retained, HTTPDecodedBodyEvidence):
+                    raise contract_errors.FrameworkBugError("Failed HTTP parse has invalid owned capture") from None
+                response_payload = HTTPCallResponse(
+                    response.status_code,
+                    self._filter_response_headers(dict(response.headers)),
+                    body_size=len(response.content),
+                    decoded_body=retained,
+                )
+                error_response_data = response_payload.to_dict()
 
-            _ = self._record_call(
+            safe_code = _policy_failure_code(e) if self._audit_policy is HTTPAuditPolicy.POWER_AUTOMATE_V1 else None
+            error_payload = HTTPCallError(
+                type="HTTPPolicyError" if safe_code is not None else type(e).__name__,
+                message=safe_code if safe_code is not None else _sanitize_http_error_message(str(e)),
+                status_code=response_payload.status_code if safe_code is not None and response_payload is not None else None,
+            )
+            failed_call = self._record_call(
                 call_index=call_index,
                 call_type=CallType.HTTP,
                 status=CallStatus.ERROR,
                 request_data=request_dto,
                 response_data=response_payload,
-                error=HTTPCallError(
-                    type=type(e).__name__,
-                    message=str(e),
-                ),
+                error=error_payload,
                 latency_ms=latency_ms,
             )
 
@@ -879,7 +1951,33 @@ class AuditedHTTPClient(AuditedClientBase):
                 call_type_label="http_ssrf_safe",
             )
 
-            raise
+            if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+                self._call_mode_session.verify_call(
+                    call_type=CallType.HTTP,
+                    request_data=request_data,
+                    current_state_id=self._state_id,
+                    current_operation_id=self._operation_id,
+                    current_call_index=call_index,
+                    current_call_id=failed_call.call_id,
+                    live_status=CallStatus.ERROR,
+                    live_response_data=error_response_data,
+                    live_error_data=error_payload.to_dict(),
+                )
+
+            if safe_code is None or isinstance(
+                e, (*contract_errors.TIER_1_ERRORS, TypeError, AttributeError, KeyError, NameError, AssertionError)
+            ):
+                raise
+            policy_failure = safe_code
+            policy_response = response_payload
+
+        if policy_failure is not None:
+            # Raise after the exception handler so external context is absent,
+            # including when callers inspect chains rather than rendering them.
+            raise HTTPPolicyError(policy_failure, response_payload=policy_response)
+
+        if response is None:
+            raise contract_errors.FrameworkBugError("HTTP dispatch completed without a response")
 
         # Success path: record + emit OUTSIDE the network try block, mirroring
         # _execute_request (post/get). _emit_telemetry_after_audit re-raises
@@ -911,6 +2009,19 @@ class AuditedHTTPClient(AuditedClientBase):
             call_type_label="http_ssrf_safe",
         )
 
+        if self._call_mode_session is not None and self._call_mode_session.mode is RunMode.VERIFY:
+            self._call_mode_session.verify_call(
+                call_type=CallType.HTTP,
+                request_data=request_data,
+                current_state_id=self._state_id,
+                current_operation_id=self._operation_id,
+                current_call_index=call_index,
+                current_call_id=call.call_id,
+                live_status=call_status,
+                live_response_data=response_data,
+                live_error_data=error_data.to_dict() if error_data is not None else None,
+            )
+
         return response, final_hostname_url, call
 
     def get_ssrf_safe(
@@ -918,9 +2029,12 @@ class AuditedHTTPClient(AuditedClientBase):
         request: SSRFSafeRequest,
         *,
         headers: dict[str, str] | None = None,
+        fingerprinted_header_names: frozenset[str] = frozenset(),
         follow_redirects: bool = False,
         max_redirects: int = 10,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+        allowed_origins: Sequence[HTTPOrigin] = (),
+        verify_source_call_id: str | None = None,
     ) -> tuple[httpx.Response, str, Call]:
         """GET with SSRF-safe IP pinning and redirect validation.
 
@@ -931,9 +2045,12 @@ class AuditedHTTPClient(AuditedClientBase):
             "GET",
             request,
             headers=headers,
+            fingerprinted_header_names=fingerprinted_header_names,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
             allowed_ranges=allowed_ranges,
+            allowed_origins=allowed_origins,
+            verify_source_call_id=verify_source_call_id,
         )
 
     def _follow_redirects_safe(
@@ -945,6 +2062,10 @@ class AuditedHTTPClient(AuditedClientBase):
         original_url: str,
         *,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+        allowed_origins: Sequence[HTTPOrigin] = (),
+        fingerprinted_header_names: frozenset[str] = frozenset(),
+        bound_header_origin: HTTPOrigin | None = None,
+        replay_hops: list[HTTPRedirectReplayHop] | None = None,
     ) -> tuple[httpx.Response, int, str]:
         """Follow HTTP redirects with SSRF validation at each hop.
 
@@ -1001,7 +2122,12 @@ class AuditedHTTPClient(AuditedClientBase):
             hop_number = redirects_followed + 1
             hop_start = time.perf_counter()
 
-            hop_headers = {k: v for k, v in original_headers.items() if k.lower() != "host"}
+            # Before admission, a blocked hop's evidence must not claim that
+            # origin-bound values were sent. Restore them only after the
+            # redirect has passed the exact-origin check below.
+            hop_headers = {
+                k: v for k, v in original_headers.items() if k.lower() != "host" and k.casefold() not in fingerprinted_header_names
+            }
             redirect_url_obj = httpx.URL(redirect_url)
             redirect_host = redirect_url_obj.host or "unknown"
             default_port = 443 if redirect_url_obj.scheme == "https" else 80
@@ -1011,28 +2137,44 @@ class AuditedHTTPClient(AuditedClientBase):
             blocked_hop_request_dto = HTTPCallRequest(
                 method="GET",
                 url=_fingerprint_url(redirect_url),
-                headers=self._filter_request_headers(hop_headers),
+                headers=self._filter_request_headers(hop_headers, force_fingerprint_names=fingerprinted_header_names),
                 hop_number=hop_number,
                 redirect_from=_fingerprint_url(redirect_from),
             )
 
             # CRITICAL: Validate the redirect target for SSRF
             try:
+                validate_allowed_http_origin(redirect_url, allowed_origins)
+                if bound_header_origin is not None:
+                    validate_allowed_http_origin(redirect_url, (bound_header_origin,))
                 redirect_request = validate_url_for_ssrf(redirect_url, allowed_ranges=allowed_ranges)
             except contract_errors.TIER_1_ERRORS:
                 raise
             except Exception as redirect_err:
+                self._admit_verify_call(
+                    call_type=CallType.HTTP_REDIRECT,
+                    request_data=blocked_hop_request_dto.to_dict(),
+                    call_index=hop_call_index,
+                )
                 hop_latency_ms = (time.perf_counter() - hop_start) * 1000
-                self._record_call(
+                error_data = HTTPCallError(
+                    type=type(redirect_err).__name__,
+                    message=_sanitize_http_error_message(str(redirect_err)),
+                )
+                blocked_call = self._record_call(
                     call_index=hop_call_index,
                     call_type=CallType.HTTP_REDIRECT,
                     status=CallStatus.ERROR,
                     request_data=blocked_hop_request_dto,
-                    error=HTTPCallError(
-                        type=type(redirect_err).__name__,
-                        message=str(redirect_err),
-                    ),
+                    error=error_data,
                     latency_ms=hop_latency_ms,
+                )
+                self._verify_redirect_call(
+                    call=blocked_call,
+                    call_index=hop_call_index,
+                    request_data=blocked_hop_request_dto,
+                    status=CallStatus.ERROR,
+                    error_data=error_data,
                 )
                 raise
 
@@ -1042,6 +2184,7 @@ class AuditedHTTPClient(AuditedClientBase):
             hostname_url = httpx.URL(redirect_url)
 
             # Build headers for this hop (Host header for virtual hosting)
+            hop_headers.update({k: v for k, v in original_headers.items() if k.casefold() in fingerprinted_header_names})
             hop_headers["Host"] = redirect_request.host_header
 
             # TLS SNI for this hop
@@ -1059,11 +2202,12 @@ class AuditedHTTPClient(AuditedClientBase):
             hop_request_dto = HTTPCallRequest(
                 method="GET",
                 url=_fingerprint_url(redirect_url),
-                headers=self._filter_request_headers(hop_headers),
+                headers=self._filter_request_headers(hop_headers, force_fingerprint_names=fingerprinted_header_names),
                 resolved_ip=redirect_request.resolved_ip,
                 hop_number=hop_number,
                 redirect_from=_fingerprint_url(redirect_from),
             )
+            self._admit_verify_call(call_type=CallType.HTTP_REDIRECT, request_data=hop_request_dto.to_dict(), call_index=hop_call_index)
             redirects_followed += 1
 
             # Ephemeral client per redirect hop: same TLS/SNI isolation rationale
@@ -1083,19 +2227,32 @@ class AuditedHTTPClient(AuditedClientBase):
                     )
             except Exception as hop_err:
                 hop_latency_ms = (time.perf_counter() - hop_start) * 1000
-                hop_response_payload = hop_err.response_payload if isinstance(hop_err, HTTPResponseBodyTooLargeError) else None
+                hop_response_payload = (
+                    hop_err.response_payload
+                    if isinstance(hop_err, (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError))
+                    else None
+                )
                 # Record the failed hop in the audit trail so lineage is complete
-                self._record_call(
+                error_data = HTTPCallError(
+                    type=type(hop_err).__name__,
+                    message=_sanitize_http_error_message(str(hop_err)),
+                )
+                failed_hop_call = self._record_call(
                     call_index=hop_call_index,
                     call_type=CallType.HTTP_REDIRECT,
                     status=CallStatus.ERROR,
                     request_data=hop_request_dto,
                     response_data=hop_response_payload,
-                    error=HTTPCallError(
-                        type=type(hop_err).__name__,
-                        message=str(hop_err),
-                    ),
+                    error=error_data,
                     latency_ms=hop_latency_ms,
+                )
+                self._verify_redirect_call(
+                    call=failed_hop_call,
+                    call_index=hop_call_index,
+                    request_data=hop_request_dto,
+                    status=CallStatus.ERROR,
+                    response_data=hop_response_payload,
+                    error_data=error_data,
                 )
                 raise
 
@@ -1106,15 +2263,26 @@ class AuditedHTTPClient(AuditedClientBase):
             hop_response_dto = HTTPCallResponse(
                 status_code=response.status_code,
                 headers=self._filter_response_headers(dict(response.headers)),
+                transport=self._build_replay_transport(response),
             )
+            if replay_hops is not None:
+                replay_hops.append(HTTPRedirectReplayHop(request=hop_request_dto, response=hop_response_dto))
 
-            self._record_call(
+            hop_status = CallStatus.SUCCESS if response.status_code < 400 else CallStatus.ERROR
+            hop_call = self._record_call(
                 call_index=hop_call_index,
                 call_type=CallType.HTTP_REDIRECT,
-                status=CallStatus.SUCCESS if response.status_code < 400 else CallStatus.ERROR,
+                status=hop_status,
                 request_data=hop_request_dto,
                 response_data=hop_response_dto,
                 latency_ms=hop_latency_ms,
+            )
+            self._verify_redirect_call(
+                call=hop_call,
+                call_index=hop_call_index,
+                request_data=hop_request_dto,
+                status=hop_status,
+                response_data=hop_response_dto,
             )
 
         if response.is_redirect and redirects_followed >= max_redirects:

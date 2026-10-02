@@ -34,4 +34,4 @@ def test_database_ops_uses_narrow_connection_provider_protocol() -> None:
     from elspeth.core.landscape import _database_ops
 
     methods = _protocol_methods(Path(_database_ops.__file__), "DatabaseOpsConnectionProvider")
-    assert methods == {"is_read_only", "read_only_connection", "write_connection"}
+    assert methods == {"is_read_only", "read_only_connection"}

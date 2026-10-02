@@ -21,10 +21,10 @@ This guide covers common errors and their solutions when running ELSPETH pipelin
 - [Configuration Issues](#configuration-issues)
   - [YAML Parsing Errors](#yaml-parsing-errors)
   - [Schema Validation Failures](#schema-validation-failures)
-- [Web Composer — Guided Mode](#web-composer--guided-mode)
-  - [Guided chat did not advance the stage](#guided-chat-did-not-advance-the-stage)
-  - [Wiring confirmation failed](#wiring-confirmation-failed)
-  - [Guided source schema or blob interpretation looks wrong](#guided-source-schema-or-blob-interpretation-looks-wrong)
+- [Web Composer](#web-composer)
+  - [A Composer proposal was not accepted](#a-composer-proposal-was-not-accepted)
+  - [Wiring validation failed](#wiring-validation-failed)
+  - [Source schema or blob interpretation looks wrong](#source-schema-or-blob-interpretation-looks-wrong)
 
 ---
 
@@ -140,15 +140,14 @@ docker run --rm \
 {
   "reason": "missing_output_field",
   "query_name": "classify",
-  "field": "category",
-  "available_fields": ["label", "confidence"]
+  "field": "category"
 }
 ```
 
 **Solution:**
 
 1. Check your prompt template — ensure it instructs the LLM to include the required fields
-2. Review the `available_fields` in the error to see what the LLM actually returned
+2. Inspect the recorded LLM call's response (the row's `calls` record, e.g. the Landscape MCP `get_calls` tool) to see what the LLM actually returned — the error reason deliberately carries no response content, because the response can echo row data
 3. Consider adding few-shot examples to your prompt to guide the output format
 4. If the field is genuinely optional, remove it from `output_fields` in your query spec
 
@@ -437,60 +436,56 @@ The readiness probe prevents traffic before the app is ready. The liveness probe
 
 ---
 
-## Web Composer — Guided Mode
+## Web Composer
 
-### Guided chat did not advance the stage
+### A Composer proposal was not accepted
 
-**Cause:** In 0.7.0 guided mode, `/guided/chat` asks the model to propose the
-next source, sink, transform, or wiring change. ELSPETH then validates the
-proposal before committing it. The stage stays put when the proposal fails
-validation, when the request races a stale `step_index`, or when a pending
-interpretation card must be reviewed first.
+**Cause:** Composer asks the model to propose a pipeline change. ELSPETH
+validates the proposal before committing it. A proposal stays pending when
+validation fails, another tab changes the composition first, or an
+interpretation card still needs review.
 
 **Solution:**
 
-1. Read the validation summary and the latest guided turn. The rejected field,
+1. Read the validation summary and the latest Composer turn. The rejected field,
    edge, plugin option, or interpretation card is usually named directly.
 2. If an interpretation card is pending, open it, read the model rationale, and
    approve or revise it before trying to advance.
-3. If the browser was open in multiple tabs, refresh the stale tab and retry
-   from the current `step_index`.
-4. Rephrase the stage instruction with the missing constraint instead of
+3. If the browser was open in multiple tabs, refresh the stale tab before
+   trying again.
+4. Rephrase the instruction with the missing constraint instead of
    forcing the same prompt through again.
 5. If the same valid instruction repeatedly fails, open an issue with a
-   sanitized reproduction. Include the guided stage, validation text, ELSPETH
+   sanitized reproduction. Include the validation text, ELSPETH
    version, and minimal pipeline shape. Do not attach raw chat history, blob
    contents, sample rows, secret references, tokens, PII, URLs, or
    organization-specific identifiers.
 
 ---
 
-### Wiring confirmation failed
+### Wiring validation failed
 
-**Cause:** The final guided stage (`STEP_4_WIRE`) accepts only a valid
-`CONFIRM_WIRING` payload. The wire turn is re-emitted when connection labels do
-not map to valid edges or when required/nested keys are missing.
+**Cause:** Proposed connections do not satisfy the graph or plugin contracts.
 
 **Solution:**
 
-1. Review the graph overlay and the listed source/sink/transform contracts.
-2. Correct the connection labels or ask the guided chat to revise the wiring
-   using the exact node names shown in the overlay.
+1. Review the graph and the listed source, sink, and transform contracts.
+2. Ask Composer to revise the wiring using the exact node names shown in the
+   graph and the missing connection identified by validation.
 
 ---
 
-### Guided source schema or blob interpretation looks wrong
+### Source schema or blob interpretation looks wrong
 
-**Cause:** Guided mode uses the same blob/source inspection and schema-contract
-machinery as the rest of Composer. A mismatch usually means the uploaded blob
-has the wrong MIME type, the file has unusual CSV/JSON structure, or the model
+**Cause:** A mismatch usually means the uploaded blob has the wrong MIME type,
+the file has unusual CSV/JSON structure, or the model
 interpreted the source intent too broadly.
 
 **Solution:**
 
 1. Inspect the displayed columns, sample values, and validation summary.
-2. Revise the source stage with the concrete correction: delimiter, header row,
-   expected fields, URL/source type, or blob reference.
+2. Revise the source through chat with the concrete correction: delimiter,
+   header row, expected fields, URL/source type, or blob reference.
 3. If the source is actually a remote document workflow, model it as a manifest
    source followed by `blob_fetch` and a parser transform such as
    `blob_csv_expand`, not as a new source plugin.

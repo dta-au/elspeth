@@ -37,7 +37,9 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import (
     REDACTED_UNKNOWN_RESPONSE_FIELD,
     REDACTED_UNKNOWN_RESPONSE_KEY,
@@ -65,6 +67,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.fixtures.factories import make_context
+from tests.fixtures.identities import grant_test_pipeline_user
 from tests.helpers.session_fences import acquire_compose_context, seed_session_operation_fence
 from tests.integration.web.conftest import _make_session
 
@@ -73,7 +76,7 @@ pytestmark = pytest.mark.composer_llm_eval
 
 SOURCE_REPORT = "docs/composer/evidence/composer-llm-eval-2026-04-28.md"
 EVAL_MODEL = "openrouter/openai/gpt-5.5"
-EVAL_USER_ID = "dta_user"
+EVAL_USER_ID = "eval-user"
 
 ISSUE_CHARACTERIZATION = "elspeth-a5481032bd"
 ISSUE_BLOB_PATH = "elspeth-411435710b"
@@ -124,10 +127,10 @@ class FakeLLMResponse:
 class _ReplayLLM:
     """Callable fake LLM for CL-PP compose-loop characterization cases."""
 
-    def __init__(self, responses: tuple[FakeLLMResponse, ...]) -> None:
+    def __init__(self, responses: tuple[_AdmittedLLMCompletion, ...]) -> None:
         self._responses = list(responses)
 
-    async def __call__(self, _messages: Any, _tools: Any) -> FakeLLMResponse:
+    async def __call__(self, _messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
         if not self._responses:
             return _make_llm_response(content="Done.")
         return self._responses.pop(0)
@@ -179,7 +182,7 @@ def _trained_operator_catalog() -> PolicyCatalogView:
 def _make_llm_response(
     content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
-) -> FakeLLMResponse:
+) -> _AdmittedLLMCompletion:
     fake_tool_calls: list[FakeToolCall] | None = None
     if tool_calls is not None:
         fake_tool_calls = [
@@ -192,7 +195,8 @@ def _make_llm_response(
             )
             for tool_call in tool_calls
         ]
-    return FakeLLMResponse(choices=[FakeChoice(message=FakeMessage(content=content, tool_calls=fake_tool_calls))])
+    response = FakeLLMResponse(choices=[FakeChoice(message=FakeMessage(content=content, tool_calls=fake_tool_calls))])
+    return _admit_composer_llm_completion(response)
 
 
 def _empty_state() -> CompositionState:
@@ -240,6 +244,7 @@ def _session_service_for_characterization(
     )
     with engine.begin() as conn:
         _make_session(conn, session_id=session_id, user_id=EVAL_USER_ID)
+        grant_test_pipeline_user(conn, identity_id=EVAL_USER_ID)
         # Production sessions are born with their released epoch-1 fence;
         # a hand-inserted row needs the same so the compose lease can be
         # acquired without a repair write (which the commit-failure
@@ -1119,7 +1124,7 @@ def test_scenario_3_get_pipeline_state_preserves_redacted_patched_blob_path_that
         data_dir=str(data_dir),
     )
     assert rejected.success is False
-    assert "blob-backed source" in rejected.data["error"]
+    assert "blob-backed source" in rejected.validation.errors[0].message
 
     # The redaction contract still holds for canonical-path blob sources
     # (the shape set_source_from_blob produces).
@@ -1143,18 +1148,22 @@ def test_scenario_3_get_pipeline_state_preserves_redacted_patched_blob_path_that
 async def _failed_progress_for_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ComposerProgressEvent:
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     settings = _web_settings(tmp_path / "data", composer_timeout_seconds=0.05)
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)
+    sessions_service = _session_service_for_characterization(
+        data_dir=tmp_path / "data",
+        session_id=SCENARIO_1A_SESSION_ID,
+    )
+    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings, sessions_service=sessions_service)
     events: list[ComposerProgressEvent] = []
 
     async def record_progress(event: ComposerProgressEvent) -> None:
         events.append(event)
 
-    async def slow_llm(*args: Any, **kwargs: Any) -> FakeLLMResponse:
+    async def slow_llm(*args: Any, **kwargs: Any) -> _AdmittedLLMCompletion:
         del args, kwargs
         await asyncio.sleep(1.0)
         return _make_llm_response(content="too late")
 
-    with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
         mock_llm.side_effect = slow_llm
         with pytest.raises(ComposerConvergenceError) as exc_info:
             await service.compose(
@@ -1207,7 +1216,7 @@ async def _failed_progress_for_composition_budget(tmp_path: Path, monkeypatch: p
         ]
     )
 
-    with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
         mock_llm.side_effect = [mutation, bonus_mutation]
         with pytest.raises(ComposerConvergenceError) as exc_info:
             await service.compose(
@@ -1308,14 +1317,14 @@ async def test_final_completion_claim_is_augmented_with_runtime_preflight_failur
     changed_state = replace(state, version=state.version + 1)
     model_prose = "The pipeline is complete and valid."
 
-    result = await composer._finalize_no_tool_response(
+    result = await composer._completion._finalize_no_tool_response(
         content=model_prose,
         state=changed_state,
         initial_version=state.version,
         user_id=EVAL_USER_ID,
         session_id=SCENARIO_2_SESSION_ID,
         last_runtime_preflight=None,
-        runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+        runtime_preflight_cache=composer._preflight.new_cache(),
         session_scope="session:eval",
     )
 

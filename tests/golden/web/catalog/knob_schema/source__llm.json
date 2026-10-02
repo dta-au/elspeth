@@ -44,6 +44,20 @@
         }
       },
       {
+        "default": null,
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
         "description": "Static Jinja2 prompt template",
         "kind": "text",
         "label": "Prompt Template",
@@ -71,12 +85,12 @@
         }
       },
       {
-        "default": 0.0,
-        "description": "Sampling temperature",
+        "default": null,
+        "description": "Sampling temperature. Omitted or null uses the deployment default; set explicitly for deployments supporting sampling.",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "common",
         "visible_when": {
@@ -308,6 +322,20 @@
         }
       },
       {
+        "default": null,
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
         "description": "Static Jinja2 prompt template",
         "kind": "text",
         "label": "Prompt Template",
@@ -336,11 +364,11 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "common",
         "visible_when": {
@@ -560,6 +588,20 @@
         }
       },
       {
+        "default": null,
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
         "description": "Static Jinja2 prompt template",
         "kind": "text",
         "label": "Prompt Template",
@@ -588,11 +630,11 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "common",
         "visible_when": {
@@ -745,6 +787,62 @@
       },
       {
         "default": null,
+        "description": "Optional resolved Amazon Bedrock API key (bearer token); mutually exclusive with the static AWS credential pair.",
+        "kind": "text",
+        "label": "API Key",
+        "name": "api_key",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional resolved AWS access-key identifier; required together with aws_secret_access_key.",
+        "kind": "text",
+        "label": "Aws Access Key ID",
+        "name": "aws_access_key_id",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional resolved AWS secret access key; required together with aws_access_key_id.",
+        "kind": "text",
+        "label": "Aws Secret Access Key",
+        "name": "aws_secret_access_key",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional resolved AWS session token for temporary static credentials.",
+        "kind": "text",
+        "label": "Aws Session Token",
+        "name": "aws_session_token",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
         "description": "Tier 2 tracing configuration",
         "kind": "json-object",
         "label": "Tracing",
@@ -785,6 +883,20 @@
         }
       },
       {
+        "default": null,
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
         "description": "Static Jinja2 prompt template",
         "kind": "text",
         "label": "Prompt Template",
@@ -813,11 +925,11 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "common",
         "visible_when": {

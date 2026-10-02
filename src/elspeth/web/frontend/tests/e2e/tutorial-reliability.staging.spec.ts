@@ -1,8 +1,8 @@
 // Tutorial reliability battery (non-mocked staging spec).
 //
 // Drives the REAL first-run composer tutorial against elspeth.example.gov.au,
-// resets between every run, grades each run on four dimensions (a/b/c/d), does a
-// real-system re-run for dim (b), and writes one JSON RunRecord per run under
+// resets between every run, grades each run on four dimensions (a/b/c/d), and
+// writes one JSON RunRecord per run under
 // tests/e2e/.harness-results/<batch_id>/run-NN.json (gitignored).
 //
 // Integrates plan Tasks 4 (skeleton flow + selectors), 5 (id/cache capture),
@@ -13,7 +13,7 @@
 // and cache-as-fakery; it does not fix them.
 //
 // Per-transition ledger (elspeth-f191ba494a / elspeth-515096e18c): every
-// guided transition (start, each respond, each chat, the run) is recorded with
+// freeform compose and tutorial run transition is recorded with
 // its gestures, provider calls, planner runs and wall clock, attributed from
 // the backend's durable audit rows. The record's `transitions` field is the
 // "before" column for the 2026-09-02 remediation plan (Phase 0 → Phase 5).
@@ -27,9 +27,7 @@ import {
   JUDGE_RUBRIC,
 } from "./harness/prompt-and-rubric";
 import { classifyOutcome, type StepSignal } from "./harness/classify";
-import { ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES } from "./harness/guided-driver";
 import { renderLedgerMarkdown, type TransitionLedger } from "./harness/transition-ledger";
-import { tutorialPlannerShapeViolations } from "./harness/tutorial-planner-shape";
 import type { RunRecord } from "./harness/types";
 import { TransitionLedgerRecorder } from "./helpers/transition-ledger-recorder";
 import {
@@ -50,21 +48,18 @@ import {
 
 const BATCH_ID = process.env.HARNESS_BATCH_ID ?? "skeleton";
 const BATCH_SIZE = Number(process.env.HARNESS_BATCH_SIZE ?? "1");
-// Deployment switch for the Phase 0 baseline ONLY: a deployment that predates
-// the explicit Run button (593cad72c) mounts the run turn straight into
-// POST /tutorial/run on the learner's last acknowledge click, so no Run gesture
-// exists to make. With HARNESS_LEGACY_AUTO_RUN=1 the harness accepts and
-// RECORDS that auto-fire (the ledger's run transition carries the acknowledge
-// click as its gesture) instead of asserting it away. Off by default: against
-// a current deployment the run must not fire before Run is clicked.
-const LEGACY_AUTO_RUN = process.env.HARNESS_LEGACY_AUTO_RUN === "1";
+const ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES = [
+  /^View prompt$/,
+  /^Approve the LLM prompt template$/,
+  /^Acknowledge/i,
+];
 
 type EfficiencyRunRecord = RunRecord & {
   efficiency: PlannerEfficiency;
   transitions: TransitionLedger | null;
 };
 
-// Acknowledge every pending guided interpretation card currently rendered, then
+// Acknowledge every pending interpretation card currently rendered, then
 // return how many were acknowledged this pass.
 //
 // Post-redesign (acknowledge card-stack): the cards render in the pinned
@@ -99,7 +94,6 @@ async function resolveVisibleReviews(
   const primaryButtons = ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES.map((name) =>
     page.getByRole("button", { name }),
   );
-  const legacyViewToggles = page.getByRole("button", { name: /^View$/ });
   const promptRegions = page.getByRole("region", {
     name: "Prompt template review",
   });
@@ -107,12 +101,6 @@ async function resolveVisibleReviews(
   // Bounded inner loop: each acknowledged card unmounts, shrinking the list.
   // Prompt-template cards take two iterations (View prompt -> Approve).
   for (let guard = 0; guard < 12; guard++) {
-    // Keep the retired exact-"View" path for old staging bundles while the
-    // current bundle uses the two-stage primary handled below.
-    const toggleCount = await legacyViewToggles.count().catch(() => 0);
-    for (let i = 0; i < toggleCount; i++) {
-      await clickGesture(legacyViewToggles.nth(i), "View", ledger);
-    }
     const regionCount = await promptRegions.count().catch(() => 0);
     for (let i = 0; i < regionCount; i++) {
       await promptRegions
@@ -145,239 +133,36 @@ async function resolveVisibleReviews(
   return actions;
 }
 
-// Drive the staged guided walk (source → sink → recipe/transforms → wire) to
-// completion.
-//
-// !! UNVERIFIED (operator-env blocked) !! This driver could not be run: it needs
-// a live, LLM-backed staging deploy (chat-resolve of the source + LLM-proposed
-// transforms have no provider in any environment reachable here). It is a
-// best-effort scaffold; the source-stage chat affordance and any downstream
-// schema_form stages the pump cannot fill are the named residual risks — a live
-// run is required to finalize it. See the task report.
-//
-// Shape: the canonical hello-world source is dynamic-source-from-chat — the user
-// DESCRIBES the URL scenario in the step-1 "Describe what you want" chat and the
-// LLM resolves a complete inline source request, advancing the wizard (guided.ts
-// GuidedChatResponse: "Step 1 source chat may resolve a complete inline source
-// request; then these fields mirror /guided/respond"). We seed FIXED_PROMPT into
-// that chat once at step_1_source, then run a robust turn-pump: each pass
-// resolves surfaced per-stage interpretation cards, then advances by the enabled
-// stage primary ("Confirm wiring" — the D12 wire gate that frees once cards are
-// resolved — or "Continue" for schema forms). Exits once the run
-// turn mounts or the deadline trips. A driver that drove the source via a
-// plugin+schema_form instead would test a deterministic path and defeat the
-// harness's purpose (grading the real LLM-backed scenario, dims a/b/c/d).
-async function driveGuidedWalk(page: Page, ledger: TransitionLedgerRecorder): Promise<void> {
-  const guidedPanel = page.getByLabel(/guided composer/i);
-  // The run turn mounts on its PRE-RUN card (I-1): "Ready to run." with an
-  // explicit Run button. Nothing executes until the caller clicks it. A
-  // pre-593cad72c deployment (HARNESS_LEGACY_AUTO_RUN=1) has no such card: its
-  // run turn mounts already running, headed "Running your pipeline".
-  const runHeading = page.getByRole("heading", {
-    name: LEGACY_AUTO_RUN ? /Ready to run|Running your pipeline/i : /Ready to run/i,
-  });
-  const stepChat = page.getByRole("region", { name: "Describe what you want" });
-  const stepChatInput = stepChat.getByLabel("Message input");
-  const stepChatSend = stepChat.getByRole("button", { name: "Send message" });
+/** Drive the fixed freeform brief through normal Composer review to Run. */
+async function driveFreeformWalk(page: Page, ledger: TransitionLedgerRecorder): Promise<void> {
+  await expect(page.getByRole("heading", { name: "Build with the Composer." })).toBeVisible({ timeout: 60_000 });
+  ledger.notePhase("Build");
+  const sendBrief = page.getByRole("button", { name: "Send tutorial brief" });
+  await expect(sendBrief).toBeEnabled({ timeout: 30_000 });
+  await clickGesture(sendBrief, "Send tutorial brief", ledger);
 
-  // The tutorial is the NORMAL guided flow with the intent PRELOCKED — that lock
-  // is the ONLY difference from guided mode. Since the goal-first change
-  // (B-2.1/2.2) the lesson's prompt is also the session's GOAL: the tutorial
-  // starts the guided session with it (POST /guided/start carries the intent for
-  // both profiles), and the learner then presses Send on the prelocked prompt at
-  // the source and output phases, where the apply-capable /guided/chat drivers
-  // (resolve_source → resolve_sink) each extract their part of it. The
-  // transforms are planned from that same goal on the step-2 finish, so the
-  // transforms phase has no Send at all.
-  // We therefore drive each driven phase by Send (once per phase) and advance
-  // through the structured result via the stage primaries. Wait for the locked
-  // prompt to populate (synthetic URLs are fetched + appended async).
-  await expect(stepChatInput).toBeVisible({ timeout: 30_000 });
-  await expect(stepChatInput).not.toHaveValue("", { timeout: 30_000 });
-
-  // Stage primary affordances, in priority order. "Confirm wiring" is the wire
-  // gate (D12): it stays disabled until the stage's interpretation cards are
-  // resolved, which resolveVisibleReviews handles each pass.
-  //
-  // "Review wiring" carried a send-first guard until the goal-first change
-  // (B-2.1/2.2): the step-2→step-3 transition used to auto-plan a FIRST proposal
-  // from a server-authored fallback intent BEFORE the locked transforms prompt
-  // was sent, and accepting that one committed a source→sink passthrough the
-  // tutorial launch gate rejects (run 18, session 07e8a3a8). Both halves of that
-  // shape are gone: the walk states its goal at the start, the ONE planner run
-  // happens on "Finish outputs" from that goal, and a respond that would plan
-  // with no intent behind it is refused by the backend. There is no transforms
-  // Send left to order the driver against, so the guard is gone with it.
-  // Its job is now done by EVIDENCE rather than by driver order:
-  // tutorialPlannerShapeViolations (asserted in runOnce) fails the run if a
-  // planner run lands on any other transition, or if a second one appears.
-  // Each primary carries the label the ledger records as the learner's gesture.
-  const primaries: Array<{ label: string; locator: Locator }> = [
-    { label: "Confirm wiring", locator: page.getByRole("button", { name: "Confirm wiring", exact: true }) },
-    // Pipeline proposal turn (propose_pipeline): the transforms phase yields a
-    // REAL planner proposal; accepting it (chosen ["review_wiring"]) is the
-    // only advance into the wire stage. Renders only on the proposal turn.
-    {
-      label: "Review wiring",
-      locator: page.getByRole("button", { name: "Review wiring", exact: true }),
-    },
-    // Output required-fields turn (multi_select_with_custom): the sink the LLM
-    // built is observed-mode (pass-all-through), and the real output fields come
-    // from the downstream transforms — so the correct, designed answer here is
-    // the escape, not ticking the source's `url` column. Since design review
-    // 2026-09-02 (I-3) the escape IS that turn's primary: nothing is pre-pinned,
-    // the secondary is "Pin these fields" (disabled until a chip is ticked), and
-    // the turn carries no "Continue". It is listed BEFORE "Continue" because a
-    // pre-be1dccc8d deployment (the Phase 0 baseline target) still renders that
-    // turn with `url` pre-pinned and Continue as its primary — the wrong answer
-    // the review's ledger deliberately avoided. Only renders on this one turn,
-    // so it never preempts another stage's primary.
-    {
-      label: "Let source decide (pass all fields through)",
-      locator: page.getByRole("button", { name: "Let source decide (pass all fields through)", exact: true }),
-    },
-    { label: "Continue", locator: page.getByRole("button", { name: "Continue", exact: true }) },
-    // Source inspection review (inspect_and_confirm): rendered after the
-    // chat-resolved inline source is materialized into a session blob and
-    // inspected — confirming the observed columns is the designed answer.
-    { label: "Looks right", locator: page.getByRole("button", { name: "Looks right", exact: true }) },
-    // Component review turns: once the chat-resolved source/output lands as a
-    // reviewed component, the stage ends on its review turn — finishing it is
-    // the designed advance (mirrors composer-guided-live).
-    { label: "Finish sources", locator: page.getByRole("button", { name: "Finish sources", exact: true }) },
-    { label: "Finish outputs", locator: page.getByRole("button", { name: "Finish outputs", exact: true }) },
-    // Transient provider failure on a step chat leaves a Retry affordance;
-    // pressing it is the designed recovery. Last in priority so it never
-    // preempts forward progress. Scoped HARD to the provider-unavailable
-    // failure bubble on the transcript's LAST row: run 19 (session 921491db)
-    // showed a recovered step-1 failure kept a live Retry that the pump then
-    // clicked every pass at the sink stage — re-sending the stale source
-    // prompt ~22 times (each answered by an advisory) and starving the
-    // phase-Send branch until the walk deadline. The frontend now withholds
-    // Retry on non-final turns; this scope keeps the driver correct against
-    // a stale build too.
-    {
-      label: "Retry",
-      locator: page
-        .locator(".message-row")
-        .last()
-        .filter({ hasText: "I'm unavailable right now; you can still use the wizard controls." })
-        .getByRole("button", { name: "Retry", exact: true }),
-    },
-  ];
-
-  // The phases the learner drives with a Send. Since the goal-first change the
-  // Transforms phase is NOT one of them: the planner builds the transforms from
-  // the goal the session started with, on the step-2 finish, and the tutorial no
-  // longer locks a step-3 prompt (its step-3 box is the empty confirm-only one).
-  // Recipe + Wire were always confirm-only. Labels come from the workflow
-  // stepper.
-  const drivenPhases = new Set(["Source", "Output"]);
-
-  // Active guided phase, read from the stepper's aria-current step — used to send
-  // the locked prompt exactly ONCE per phase (re-sending mid-build would
-  // re-trigger the driver).
-  async function currentPhase(): Promise<string | null> {
-    const label = page.locator(".guided-workflow-step--current .guided-workflow-label").first();
-    const text = await label.textContent().catch(() => null);
-    return text ? text.trim() : null;
-  }
-
-  let lastDrivenPhase: string | null = null;
-  // One-shot guard: the redesigned guided decision renders as a READ-ONLY
-  // summary (.guided-schema-summary), not an editable form. The first time a
-  // summary is visible, assert no editable schema input is shown alongside it.
-  let assertedSummary = false;
-  // Keep generous infrastructure headroom. Planner efficiency is gated below
-  // from durable attempt/call structure, not by treating provider wall-clock
-  // variance as a correctness signal or lowering this deadline.
   const deadline = Date.now() + 900_000;
   while (Date.now() < deadline) {
-    // Done once the guided surface is replaced by the run turn.
-    if (await runHeading.isVisible().catch(() => false)) {
-      // Non-vacuous: by the time the run turn appears we must have observed at
-      // least one read-only decision summary (the source decision is one), so
-      // the guard above cannot silently no-op.
-      expect(assertedSummary, "expected to observe a read-only decision summary").toBe(true);
+    const ready = page.getByRole("button", { name: "Continue to Run" });
+    if (await ready.isEnabled().catch(() => false)) {
+      await clickGesture(ready, "Continue to Run", ledger);
+      await expect(page.getByRole("heading", { name: /Ready to run/i })).toBeVisible({ timeout: 60_000 });
       return;
     }
-    if (!(await guidedPanel.isVisible().catch(() => false))) {
-      // On terminal=completed the guided panel is replaced by the completion
-      // surface ("Pipeline summary") — which may still hold pending Accept
-      // cards: the wire-confirm commit surfaces interpretation events AFTER
-      // the terminal lands, and TutorialGuidedShell defers the run handoff
-      // until they drain. Keep pumping resolveVisibleReviews there; the run
-      // turn mounts (and the loop exits above) once the last card resolves.
-      // Exit only when NEITHER surface is present.
-      const completionVisible = await page
-        .getByRole("region", { name: /pipeline summary/i })
-        .isVisible()
-        .catch(() => false);
-      if (!completionVisible) return;
-    }
-
-    // Observe the read-only decision summary whenever it is on screen. Checked
-    // at the top of the pass AND again right before a primary is clicked: the
-    // schema_form turn renders during resolveVisibleReviews' idle wait and its
-    // Continue is enabled at once, so a top-of-pass check alone can miss the
-    // turn entirely (the first Phase 0 baseline run failed exactly so).
-    const observeSummary = async (): Promise<void> => {
-      if (
-        !assertedSummary &&
-        (await page.locator(".guided-schema-summary").first().isVisible().catch(() => false))
-      ) {
-        assertedSummary = true;
-        // Capture the redesigned rationale-led read-only decision for a visual
-        // check (named, single artifact; overwritten each run).
-        await page
-          .screenshot({ path: "test-results/guided-decision-summary.png", fullPage: true })
-          .catch(() => {});
-        if ((await page.locator(".guided-schema-input").count().catch(() => 0)) > 0) {
-          throw new Error(
-            "guided decision rendered an editable form, expected a read-only summary",
-          );
-        }
-      }
-    };
-    await observeSummary();
-
-    // Read the stepper once per pass so every gesture below is attributed to
-    // the phase the learner was looking at (ledger `phase_before`).
-    const phase = await currentPhase();
-    ledger.notePhase(phase);
-    await resolveVisibleReviews(page, ledger);
-    await observeSummary();
-
-    // 1. Advance through the structured result via an enabled stage primary.
-    let advanced = false;
-    for (const primary of primaries) {
-      if (
-        (await primary.locator.count().catch(() => 0)) > 0 &&
-        (await primary.locator.isEnabled().catch(() => false))
-      ) {
-        await clickGesture(primary.locator, primary.label, ledger);
-        advanced = true;
-        break;
-      }
-    }
-    if (advanced) {
-      await page.waitForTimeout(750);
+    const accept = page.getByRole("region", { name: /Awaiting your decision/ })
+      .getByRole("button", { name: /Accept proposal:/ }).first();
+    if (await accept.isEnabled().catch(() => false)) {
+      await clickGesture(accept, "Accept proposal", ledger);
       continue;
     }
-
-    // 2. No primary yet — drive the CURRENT LLM phase with the locked prompt. A
-    //    confirm primary appears once the result renders.
-    const canSend = await stepChatSend.isEnabled().catch(() => false);
-    if (canSend && phase !== null && drivenPhases.has(phase) && phase !== lastDrivenPhase) {
-      await clickGesture(stepChatSend, "Send", ledger);
-      lastDrivenPhase = phase;
-      await page.waitForTimeout(2_000); // let the /guided/chat round-trip settle
-      continue;
+    if (await resolveVisibleReviews(page, ledger) > 0) continue;
+    const error = page.locator(".tutorial-error").first();
+    if (await error.isVisible().catch(() => false)) {
+      throw new Error(`freeform tutorial Build did not become runnable: ${(await error.textContent()) ?? "unknown"}`);
     }
-
     await page.waitForTimeout(1_000);
   }
-  throw new Error("guided walk never reached the run turn before the deadline");
+  throw new Error("freeform tutorial Build never reached the Run turn before the deadline");
 }
 
 // Dimension (d) output-substance (spec §6): count rows that carry a meaningful,
@@ -445,12 +230,9 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
   });
   const step = { compose: mkStep(), run: mkStep() };
   const startMs: { compose: number | null; run: number | null } = { compose: null, run: null };
-  // Staged guided flow (P7): the compose phase drives the guided wizard via
-  // POST /guided/respond (one per stage), not a single big-bang POST /messages.
-  // We treat the FIRST guided/respond as the compose signal so the de-conflation
-  // classifier still has a blocking-step status to key on.
+  // Build now submits one fixed brief through the ordinary freeform endpoint.
   const isCompose = (url: string, method: string) =>
-    method === "POST" && /\/api\/sessions\/[0-9a-f-]{36}\/guided\/respond\b/i.test(url);
+    method === "POST" && /\/api\/sessions\/[0-9a-f-]{36}\/messages\b/i.test(url);
   const isRun = (url: string, method: string) =>
     method === "POST" && url.includes("/api/tutorial/run");
 
@@ -458,9 +240,8 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
     const url = req.url();
     const method = req.method();
     if (isCompose(url, method)) {
-      // The staged walk fires multiple guided/respond calls; record the FIRST
-      // as the compose-phase start so the timing/status reflects the whole
-      // compose phase, not just the last stage.
+      // The first authoring POST is the fixed brief; later freeform amendments
+      // are recorded by the ledger as separate transitions.
       if (!step.compose.fired) {
         step.compose.fired = true;
         startMs.compose = Date.now();
@@ -510,11 +291,11 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
   });
 
   // Per-transition ledger (elspeth-f191ba494a). Installed before navigation
-  // so the guided/start transition is the first entry. It holds each guided
-  // response back from the browser until the backend's durable audit rows have
+  // so the freeform brief transition is the first authoring entry. It holds each
+  // authoring response back from the browser until the backend's durable audit rows have
   // been re-read, which is what makes per-transition attribution exact.
   const ledgerCtx = await harnessCtx();
-  const ledger = new TransitionLedgerRecorder(page, ledgerCtx, { legacyAutoRun: LEGACY_AUTO_RUN });
+  const ledger = new TransitionLedgerRecorder(page, ledgerCtx);
   await ledger.install();
   let transitions: TransitionLedger | null = null;
   let ledgerError: string | null = null;
@@ -534,46 +315,20 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
         .catch(() => null),
     );
 
-    // Welcome bookend → Start mounts the guided composer surface.
+    // Welcome bookend → Start mounts the freeform Composer surface.
     // Bookend clicks log their gesture first (see clickGesture) and let a
     // click failure throw as before.
     ledger.gesture("Let's go");
     await page.getByRole("button", { name: "Let's go" }).click();
     turnReached = 1;
 
-    // Staged guided walk (P7): the tutorial is now the real guided engine driven
-    // with the tutorial profile (POST /guided/start happens inside
-    // TutorialGuidedShell). The compose phase is the staged source → sink →
-    // recipe/transforms → wire walk over POST /guided/respond, with per-stage
-    // interpretation reviews surfaced inline (D12 gate). Drive it to completion;
-    // the guided session reaching terminal=completed mounts the run turn's
-    // pre-run card.
-    await expect(page.getByLabel(/guided composer/i)).toBeVisible({
-      timeout: 60_000,
-    });
+    // Build sends the fixed brief through ordinary freeform Composer and
+    // reviews its proposal before the Run card appears.
     turnReached = 2;
-    await driveGuidedWalk(page, ledger);
-
-    if (LEGACY_AUTO_RUN) {
-      // Pre-593cad72c deployment (Phase 0 baseline): the run turn mounted
-      // straight into POST /tutorial/run on the last acknowledge click. Wait
-      // for that auto-fire and let the ledger record it as the run transition
-      // whose gesture is the acknowledge that triggered it.
-      await expect
-        .poll(() => step.run.fired, {
-          message: "legacy deployment: the tutorial run should auto-fire once the guided walk completes",
-          timeout: 60_000,
-        })
-        .toBe(true);
-    } else {
-      // On guided terminal=completed, TutorialGuidedShell hands off to the run
-      // turn, which shows the committed graph and an explicit Run button (I-1)
-      // — the run NEVER auto-starts. Assert nothing fired, then click Run as
-      // the learner would.
-      expect(step.run.fired, "the tutorial run must not fire before Run is clicked").toBe(false);
-      ledger.gesture("Run");
-      await page.getByRole("button", { name: "Run", exact: true }).click();
-    }
+    await driveFreeformWalk(page, ledger);
+    expect(step.run.fired, "the tutorial run must not fire before Run is clicked").toBe(false);
+    ledger.gesture("Run");
+    await page.getByRole("button", { name: "Run", exact: true }).click();
 
     // Wait for completion, continue to the audit story. Headroom for
     // LLM-provider latency over the heavy 5-source canonical scenario plus
@@ -592,20 +347,15 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
     await page.getByRole("button", { name: "Continue" }).click();
     turnReached = 5;
 
-    // Graduation: the staged flow saves the guided default + renames the session
-    // and creates a fresh composer session on this single button (the old Turn-6
-    // mode-choice radio is gone — graduation now owns the default-mode save).
+    // Graduation persists completion and opens the same freeform session.
+    await expect(page.getByRole("heading", { name: "You're ready to use the composer." })).toBeVisible();
     ledger.gesture("Take me to the composer");
     await page
       .getByRole("button", { name: "Take me to the composer" })
       .click();
     turnReached = 6;
 
-    await expect(
-      page.getByRole("heading", {
-        name: "You're ready to use the composer.",
-      }),
-    ).toBeVisible();
+    await expect(page.getByLabel("Chat panel", { exact: true })).toBeVisible();
     turnReached = 7;
     graduated = true;
 
@@ -774,7 +524,7 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
       },
       efficiency,
       // Per-transition ledger: gestures, provider calls, planner runs and wall
-      // clock for every guided transition, from the durable audit rows.
+      // clock for every authoring transition, from the durable audit rows.
       transitions,
       // Backend step evidence (the de-conflation inputs) — kept in the record so
       // a future batch is diagnosable without re-running: did each POST fire,
@@ -838,19 +588,12 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
         ledgerViolations,
         `per-transition ledger violations: ${ledgerViolations.join("; ")}`,
       ).toEqual([]);
-      // Goal-first planner shape (B-2.1/2.2): exactly ONE planner run in the
-      // whole walk, on the "Finish outputs" transition, handing back the
-      // proposal — and no other transition paying a planner call. This is the
-      // per-TRANSITION half the walk-level efficiency gate above cannot see
-      // (it counts calls over the whole walk), and the check that replaces the
-      // drivers' send-first guard. Pure + unit-tested in
-      // harness/tutorial-planner-shape.test.ts; the collector scenario below
-      // is deliberately NOT graded by it.
-      const plannerShape = tutorialPlannerShapeViolations(transitions, ledgerError);
-      expect(
-        plannerShape,
-        `goal-first planner shape: ${plannerShape.join("; ")}`,
-      ).toEqual([]);
+      // One freeform compose request owns the planner work that authored the
+      // tutorial pipeline. The ledger's per-transition invariant above refuses
+      // a published state or proposal with zero attributed planner calls.
+      const freeformCompose = transitions?.entries.filter((entry) => entry.endpoint === "freeform/compose") ?? [];
+      expect(freeformCompose.length, "the fixed brief must go through freeform Composer").toBeGreaterThan(0);
+      expect(freeformCompose.some((entry) => entry.evidence.planner_calls > 0)).toBe(true);
     }
   }
 }
@@ -878,244 +621,4 @@ test.describe("tutorial reliability battery", () => {
       await runOnce(page, i);
     });
   }
-});
-
-// ── Collector-authoring scenario (WS6 guard lift; ADR-031 amendment 2026-08-25) ──
-//
-// NOT the tutorial: the tutorial's frozen prompt and script are UNTOUCHED
-// (Q8-1 ruling — amending them would reset the red-attribution baseline during
-// the riskiest window). This scenario drives an ORDINARY guided session with a
-// fixed collector-authoring prompt through the same backend, so the battery
-// covers the collector variant of the guided surface that the frozen tutorial
-// cannot exercise. Same doctrine as the tutorial walk: fixed input, no
-// improvisation — a red here is a machinery investigation.
-//
-// !! PENDING CALIBRATION — DO NOT GRADE YET !! The baseline of record is
-// tool-call counts + repair rounds per scenario, and those numbers do not
-// exist until John fires a calibration round (the battery is manual-fire ONLY;
-// never overlap rounds). Until COLLECTOR_BASELINE carries calibrated values
-// this scenario records observations into its RunRecord and asserts nothing
-// beyond completion. ADR-031 reconsideration triggers (2026-08-25 amendment):
-//   T1: any battery round where the collector scenario needs a repair round on
-//       the collector/scope step or exceeds its calibrated call count =
-//       suspected machinery defect; two consecutive → escalate to a standing
-//       live canary.
-//   T2: any collector-authoring defect found by a human/staging/downstream
-//       layer that the mocked spec or battery should have caught = immediate
-//       reconsideration, no threshold.
-//   T3: guided-authoring-path changes (planner skills, projection, guided
-//       backend) accumulating without a collector-covering battery round in
-//       the same slice = the cited control is inert; fire a round before the
-//       next guided-surface merge or upgrade.
-//
-// !! UNVERIFIED (operator-env blocked) !! Like driveGuidedWalk above, this
-// driver needs a live LLM-backed staging deploy. Named residuals for the
-// calibration round: the ordinary-session entry affordance (this driver
-// assumes goto "/" lands on a fresh guided-mode session once first-run is
-// consumed), and any schema_form stages the pump cannot fill.
-
-const COLLECTOR_SCENARIO_PROMPT =
-  "Read this synthetic multi-document JSON file, split each document into one " +
-  "row per section, have an LLM write a one-sentence gist of each section, " +
-  "then gather each document's section rows back together into a single " +
-  "batch per document (every section must make it back — fail the document " +
-  "if one is lost) and write one summary row per document to a JSON file.\n" +
-  "https://dta-au.github.io/elspeth/tutorial-site/multi-doc-sections.json";
-
-const COLLECTOR_BASELINE: {
-  max_provider_calls: number | null;
-  max_repair_turns: number | null;
-} = {
-  // STAYS NULL ON THIS SURFACE (2026-08-26 ruling): collector-authoring cost
-  // is now calibrated on the FREEFORM battery, not through this browser walk
-  // — evals/composer-battery/calibration/run_collector_calibration.py, round
-  // 2026-08-26-collector-calibration-freeform (3/3 authored a require_all
-  // scoped collector; ceiling 13 provider calls). Five guided firings spent
-  // their budget answering wizard turn types that have nothing to do with the
-  // measurement, so the browser scenario keeps its ADR-031 job — proving the
-  // guided lane can author a collector at all — and records without grading.
-  // Do NOT paste the freeform numbers here: a guided walk pays for wizard
-  // turns the freeform planner never makes, so they would grade a cost this
-  // surface was never measured at.
-  max_provider_calls: null,
-  max_repair_turns: null,
-};
-
-async function driveCollectorScenarioWalk(page: Page): Promise<void> {
-  const runbookDeadline = Date.now() + 900_000;
-  const stepChat = page.getByRole("region", { name: "Describe what you want" });
-  const stepChatInput = stepChat.getByLabel("Message input");
-  const stepChatSend = stepChat.getByRole("button", { name: "Send message" });
-  const completion = page.getByRole("region", { name: /pipeline summary/i });
-  // Source and Output only, for the same reason as the tutorial walk: since the
-  // goal-first change the transforms are planned once, on the step-2 finish,
-  // from the session's goal (the scenario prompt, set on the convert below)
-  // plus whatever this walk's sends retained as deferred intents. There is no
-  // transforms Send.
-  const drivenPhases = new Set(["Source", "Output"]);
-  const primaries = [
-    page.getByRole("button", { name: "Confirm wiring", exact: true }),
-    // No send-first guard: with the pre-Send auto-proposal gone there is no
-    // unpaid-for proposal to accept early. This scenario RECORDS its ledger
-    // without grading it (COLLECTOR_BASELINE is null), so the tutorial walk's
-    // per-transition planner assertions deliberately do not apply here.
-    page.getByRole("button", { name: "Review wiring", exact: true }),
-    page.getByRole("button", { name: "Continue", exact: true }),
-    page.getByRole("button", { name: "Looks right", exact: true }),
-    page.getByRole("button", { name: "Finish sources", exact: true }),
-    page.getByRole("button", { name: "Finish outputs", exact: true }),
-    page.getByRole("button", { name: "Let source decide (pass all fields through)", exact: true }),
-  ];
-  async function currentPhase(): Promise<string | null> {
-    const label = page.locator(".guided-workflow-step--current .guided-workflow-label").first();
-    const text = await label.textContent().catch(() => null);
-    return text ? text.trim() : null;
-  }
-  let lastDrivenPhase: string | null = null;
-  const sendsByPhase = new Map<string, number>();
-  let sourceChipClicked = false;
-  while (Date.now() < runbookDeadline) {
-    if (await completion.isVisible().catch(() => false)) return;
-    await resolveVisibleReviews(page);
-    let advanced = false;
-    for (const primary of primaries) {
-      if (
-        (await primary.count().catch(() => 0)) > 0 &&
-        (await primary.isEnabled().catch(() => false))
-      ) {
-        await primary.click().catch(() => {});
-        advanced = true;
-        break;
-      }
-    }
-    if (advanced) {
-      await page.waitForTimeout(750);
-      continue;
-    }
-    const phase = await currentPhase();
-    // Wizard select arm: after the scenario prompt has been sent at Source
-    // (its future-stage halves are retained as deferred intents — the
-    // elspeth-3a21f09f09 flow), the step-1 single-select still owns the
-    // source choice. Answer it the way a user would: pick JSON, the
-    // scenario's stated source kind. One click, chat-first guarded.
-    if (!sourceChipClicked && phase === "Source" && (sendsByPhase.get("Source") ?? 0) > 0) {
-      const jsonChip = page.getByRole("button", { name: "JSON", exact: true });
-      if ((await jsonChip.count().catch(() => 0)) > 0 && (await jsonChip.isEnabled().catch(() => false))) {
-        await jsonChip.click().catch(() => {});
-        sourceChipClicked = true;
-        // The select answer re-arms the chat for this phase: the JSON source
-        // wizard turn that follows may need the scenario's URL restated.
-        lastDrivenPhase = null;
-        await page.waitForTimeout(1_000);
-        continue;
-      }
-    }
-    // Gate on the INPUT, not the Send button: with an empty composer Send is
-    // disabled by design (ChatInput requires non-empty text), so checking
-    // Send first spins forever in ordinary guided mode — the 2026-08-26
-    // calibration round's second finding. Tutorial mode masked this via its
-    // prelocked prompt.
-    const canType = await stepChatInput.isEnabled().catch(() => false);
-    // Two sends per phase, not one: with multi-retain intact the planner
-    // holds a real conversation (e.g. it may ask for source structure before
-    // resolving), so a single blocked send per phase deadlocks the walk.
-    if (canType && phase !== null && drivenPhases.has(phase) && (sendsByPhase.get(phase) ?? 0) < 2 && phase !== lastDrivenPhase) {
-      // Ordinary guided mode has no prelocked prompt: type the fixed scenario
-      // prompt, then Send — one drive per phase, like the tutorial walk.
-      await stepChatInput.fill(COLLECTOR_SCENARIO_PROMPT).catch(() => {});
-      const sent = await stepChatSend
-        .isEnabled()
-        .catch(() => false)
-        .then(async (enabled) => {
-          if (!enabled) return false;
-          await stepChatSend.click();
-          return true;
-        })
-        .catch(() => false);
-      if (sent) {
-        lastDrivenPhase = phase;
-        sendsByPhase.set(phase, (sendsByPhase.get(phase) ?? 0) + 1);
-        await page.waitForTimeout(2_000);
-      } else {
-        await stepChatInput.fill("").catch(() => {});
-        await page.waitForTimeout(1_000);
-      }
-      continue;
-    }
-    await page.waitForTimeout(1_000);
-  }
-  throw new Error("collector scenario walk never reached completion before the deadline");
-}
-
-test.describe("collector-authoring scenario (ordinary guided surface)", () => {
-  // Manual-fire opt-in on top of the battery's own manual-fire status, so a
-  // tutorial round never silently spends provider budget on this scenario and
-  // the two are never graded as one population.
-  test.skip(
-    process.env.HARNESS_COLLECTOR !== "1",
-    "PENDING CALIBRATION (Q8-1): John fires the calibration round manually (HARNESS_COLLECTOR=1); baselines are recorded, not guessed.",
-  );
-
-  test("collector scenario run", async ({ page }) => {
-    // Live planner walk (runbook deadline <=900s) + audit capture: the suite
-    // default timeout cannot hold it (2026-08-26 calibration round finding).
-    test.setTimeout(1_200_000);
-
-    // Entry affordance (the driver's named residual, resolved by the same
-    // calibration round): goto "/" resumes the LAST session in whatever mode
-    // it was left in — the first firing landed inside a freeform battery
-    // session and the guided region never appeared. The scenario needs a
-    // FRESH guided session: create + convert via the API (the same
-    // POST /guided/convert the "Switch to guided" affordance calls), then
-    // deep-link it by hash (#/{sessionId}).
-    //
-    // The convert carries the scenario prompt as the session's GOAL: since the
-    // goal-first change no guided session starts without a visible intent, and
-    // the "Switch to guided" card the affordance renders now collects one. The
-    // scenario prompt is this walk's fixed input, so it is also its goal — the
-    // same relationship the tutorial's frozen lesson prompt has to the tutorial
-    // session. The driver still sends it at the source and output phases, where
-    // the chat solvers extract their halves of it.
-    const entry = await harnessCtx();
-    const created = await entry.post("/api/sessions", { data: {} });
-    if (!created.ok()) throw new Error(`create session failed ${created.status()}: ${await created.text()}`);
-    const sessionId = ((await created.json()) as { id: string }).id;
-    const converted = await entry.post(`/api/sessions/${sessionId}/guided/convert`, {
-      data: { operation_id: crypto.randomUUID(), intent: COLLECTOR_SCENARIO_PROMPT },
-    });
-    if (!converted.ok()) throw new Error(`guided convert failed ${converted.status()}: ${await converted.text()}`);
-    await entry.dispose();
-
-    await page.goto(`/#/${sessionId}`);
-    await expect(page.getByLabel(/guided composer/i)).toBeVisible({ timeout: 60_000 });
-    await driveCollectorScenarioWalk(page);
-
-    const ctx = await harnessCtx();
-    const audit = await fetchPlannerAuditEvidence(ctx, sessionId).catch(() => null);
-    const efficiency = audit === null
-      ? unavailablePlannerEfficiency("planner audit evidence unavailable")
-      : classifyPlannerEfficiency(audit, true);
-    const record = {
-      scenario: "collector-authoring",
-      prompt: COLLECTOR_SCENARIO_PROMPT,
-      session_id: sessionId,
-      efficiency,
-      baseline: COLLECTOR_BASELINE,
-      calibrated: COLLECTOR_BASELINE.max_provider_calls !== null,
-    };
-    const dir = `tests/e2e/.harness-results/${BATCH_ID}`;
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(`${dir}/collector-run.json`, JSON.stringify(record, null, 2));
-    await ctx.dispose();
-
-    // Grade ONLY once calibrated (T1 lives here): a repair round on the
-    // collector/scope step or a call count above baseline is a suspected
-    // machinery defect, not model variance (ADR-031 §4).
-    if (COLLECTOR_BASELINE.max_provider_calls !== null && efficiency.provider_calls !== null) {
-      expect(efficiency.provider_calls).toBeLessThanOrEqual(COLLECTOR_BASELINE.max_provider_calls);
-    }
-    if (COLLECTOR_BASELINE.max_repair_turns !== null && efficiency.repair_turns !== null) {
-      expect(efficiency.repair_turns).toBeLessThanOrEqual(COLLECTOR_BASELINE.max_repair_turns);
-    }
-  });
 });

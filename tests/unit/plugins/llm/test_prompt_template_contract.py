@@ -3,9 +3,15 @@
 
 import pytest
 
-from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.plugins.infrastructure.templates import DeclaredFields, TemplateRow
 from elspeth.plugins.transforms.llm.templates import PromptTemplate, RenderedPrompt
 from elspeth.testing import make_field
+
+
+def _template_row(data: dict[str, object], contract: SchemaContract) -> TemplateRow:
+    """The row as a node declaring every contract field sees it: both spellings of each (ADR-051)."""
+    return TemplateRow.project(PipelineRow(data, contract), DeclaredFields(frozenset(fc.normalized_name for fc in contract.fields)))
 
 
 class TestPromptTemplateWithContract:
@@ -35,7 +41,7 @@ class TestPromptTemplateWithContract:
         """Contract-aware render works with normalized names."""
         template = PromptTemplate("Amount: {{ row.amount_usd }}")
 
-        result = template.render(data, contract=contract)
+        result = template.render(_template_row(data, contract))
 
         assert result == "Amount: 100"
 
@@ -43,7 +49,7 @@ class TestPromptTemplateWithContract:
         """Contract-aware render works with original names."""
         template = PromptTemplate("Amount: {{ row[\"'Amount USD'\"] }}")
 
-        result = template.render(data, contract=contract)
+        result = template.render(_template_row(data, contract))
 
         assert result == "Amount: 100"
 
@@ -60,11 +66,11 @@ class TestPromptTemplateWithContract:
         template = PromptTemplate("{{ row.amount_usd }}")
 
         # Render with original name access
-        result1 = template.render_with_metadata(data, contract=contract)
+        result1 = template.render_with_metadata(_template_row(data, contract), contract=contract)
 
         # Render with normalized name access (same template different style)
         template2 = PromptTemplate("{{ row['amount_usd'] }}")
-        result2 = template2.render_with_metadata(data, contract=contract)
+        result2 = template2.render_with_metadata(_template_row(data, contract), contract=contract)
 
         # Same data = same variables_hash
         assert result1.variables_hash == result2.variables_hash
@@ -73,7 +79,7 @@ class TestPromptTemplateWithContract:
         """Rendered metadata includes contract hash when provided."""
         template = PromptTemplate("{{ row.amount_usd }}")
 
-        result = template.render_with_metadata(data, contract=contract)
+        result = template.render_with_metadata(_template_row(data, contract), contract=contract)
 
         assert isinstance(result, RenderedPrompt)
         assert result.contract_hash is not None
@@ -94,7 +100,7 @@ Amount: {{ row.amount_usd }}
 High value: {% if row["'Amount USD'"] > 50 %}YES{% else %}NO{% endif %}
 """)
 
-        result = template.render(data, contract=contract)
+        result = template.render(_template_row(data, contract))
 
         assert "Customer: Alice" in result
         assert "Amount: 100" in result
@@ -108,7 +114,7 @@ High value: {% if row["'Amount USD'"] > 50 %}YES{% else %}NO{% endif %}
         template = PromptTemplate("{{ row[\"'Amount USD'\"] }}")
 
         # Without contract, this would fail
-        result = template.render(data, contract=contract)
+        result = template.render(_template_row(data, contract))
 
         assert result == "100"
 
@@ -133,8 +139,8 @@ class TestContractHashStability:
         template = PromptTemplate("{{ row.amount_usd }}")
         data = {"amount_usd": 100, "customer_name": "Alice"}
 
-        result1 = template.render_with_metadata(data, contract=contract)
-        result2 = template.render_with_metadata(data, contract=contract)
+        result1 = template.render_with_metadata(_template_row(data, contract), contract=contract)
+        result2 = template.render_with_metadata(_template_row(data, contract), contract=contract)
 
         assert result1.contract_hash == result2.contract_hash
 

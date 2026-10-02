@@ -36,13 +36,14 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.integration.web.conftest import (
     _ensure_released_session_operation_fence,
     _make_session,
     _save_composition_state_with_compose_authority,
 )
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _settings(tmp_path: Path) -> WebSettings:
@@ -64,9 +65,11 @@ class _FakeExecutionService:
 
     def __init__(self) -> None:
         self.cancelled: list[UUID] = []
+        self.cancelling_users: list[UserIdentity] = []
 
-    async def cancel(self, run_id: UUID) -> None:
+    async def cancel(self, run_id: UUID, *, user: UserIdentity) -> None:
         self.cancelled.append(run_id)
+        self.cancelling_users.append(user)
 
 
 def _app(tmp_path: Path) -> FastAPI:
@@ -77,7 +80,7 @@ def _app(tmp_path: Path) -> FastAPI:
     )
     initialize_session_schema(engine)
     settings = _settings(tmp_path)
-    session_service = DualFencedSessionServiceHarness(
+    session_service = FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -91,6 +94,7 @@ def _app(tmp_path: Path) -> FastAPI:
     app.state.preferences_service = PreferencesService(engine)
     app.state.rate_limiter = ComposerRateLimiter(limit=settings.composer_rate_limit_per_minute)
     app.state.execution_service = _FakeExecutionService()
+    wire_test_pipeline_user_authority(app, identity_id="alice", engine=engine)
 
     identity = UserIdentity(user_id="alice", username="alice")
 
@@ -118,6 +122,82 @@ def _seed_session_with_state(app: FastAPI) -> UUID:
         )
     )
     return session_id
+
+
+def test_get_sample_returns_runtime_urls_for_owned_freeform_session(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    session_id = uuid4()
+    with app.state.session_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="alice")
+
+    response = TestClient(app).get(f"/api/tutorial/{session_id}/sample")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "sample_urls": [
+            "https://dta-au.github.io/elspeth/tutorial-site/project-1.html",
+            "https://dta-au.github.io/elspeth/tutorial-site/project-2.html",
+            "https://dta-au.github.io/elspeth/tutorial-site/project-3.html",
+        ]
+    }
+
+
+def test_get_sample_hides_another_users_session(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    session_id = uuid4()
+    with app.state.session_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="bob")
+
+    response = TestClient(app).get(f"/api/tutorial/{session_id}/sample")
+
+    assert response.status_code == 404
+
+
+def test_get_sample_uses_configured_public_base(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"tutorial_sample_base_url": "https://example.gov.au/samples"})
+    session_id = uuid4()
+    with app.state.session_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="alice")
+
+    response = TestClient(app).get(f"/api/tutorial/{session_id}/sample")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "sample_urls": [
+            "https://example.gov.au/samples/tutorial-site/project-1.html",
+            "https://example.gov.au/samples/tutorial-site/project-2.html",
+            "https://example.gov.au/samples/tutorial-site/project-3.html",
+        ]
+    }
+
+
+def test_get_readiness_rejects_freeform_session_without_committed_state(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    session_id = uuid4()
+    with app.state.session_engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id), user_id="alice")
+
+    response = TestClient(app).get(f"/api/tutorial/{session_id}/readiness")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "tutorial_state_missing"
+
+
+def test_get_readiness_returns_exact_committed_state_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app(tmp_path)
+    session_id = _seed_session_with_state(app)
+    state_id = uuid4()
+
+    async def _ready(**_kwargs: Any) -> UUID:
+        return state_id
+
+    monkeypatch.setattr(tutorial_service_module, "_require_tutorial_launch_readiness", _ready)
+
+    response = TestClient(app).get(f"/api/tutorial/{session_id}/readiness")
+
+    assert response.status_code == 200
+    assert response.json() == {"state_id": str(state_id)}
 
 
 def _install_fake_live_run(
@@ -267,6 +347,7 @@ def test_post_cancel_with_active_run_cancels_via_run_cancel_machinery(tmp_path: 
     # The session's active run was cancelled through the EXISTING run-cancel
     # machinery (ExecutionService.cancel keyed by run_id), not a tutorial fork.
     assert app.state.execution_service.cancelled == [run.id]
+    assert app.state.execution_service.cancelling_users == [UserIdentity(user_id="alice", username="alice")]
 
 
 def test_post_cancel_without_active_run_is_idempotent(tmp_path: Path) -> None:
@@ -389,7 +470,7 @@ def test_delete_orphans_never_touches_the_resumable_tutorial_session(tmp_path: P
         app.state.preferences_service.update_composer_preferences(
             "alice",
             UpdateComposerPreferencesRequest(
-                tutorial_stage="guided",
+                tutorial_stage="build",
                 tutorial_session_id=str(resumable_id),
             ),
         )

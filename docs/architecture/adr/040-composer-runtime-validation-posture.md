@@ -4,6 +4,7 @@
 **Status:** Accepted
 **Deciders:** ELSPETH maintainers
 **Tags:** composer-authoring, validation, runtime-parity, divergence-registry
+**Amended by:** [ADR-051](051-a-template-sees-only-its-declared-fields.md) — the confidentiality of a template transform's undeclared fields is enforced on the executor surface, by construction; Stages 1/2 carry only the early error
 
 ## Context
 
@@ -113,6 +114,11 @@ it leaves open is not yet understood.
   validity are different acts.
 - The registry grows an amend-on-close obligation; a fix PR that closes a
   shape without amending its entry is incomplete.
+- A guarantee may move between surfaces (ADR-051): what a template transform
+  may send to its provider is now the executor's to enforce, by projecting the
+  row to the node's declaration before render. The Stage 1/2 template
+  analysis is the early, explainable error for reads it can name, not the
+  guarantee, and its authority is recorded per rule as §4 requires.
 
 ## Related
 

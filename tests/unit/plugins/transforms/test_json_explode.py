@@ -3,8 +3,10 @@
 JSONExplode transforms one row containing an array field into multiple rows,
 one for each element in the array. This is the inverse of aggregation.
 
-THREE-TIER TRUST MODEL:
-- A missing array field is an upstream contract violation and raises ``KeyError``
+ROW FAILURES (see the plugin's module docstring):
+- A missing array field never reaches ``process()``: ``array_field`` is a declared
+  input, so the engine refuses the row first (routed ``missing_field`` unless the
+  build proved the field present — R2, ADR-013 Amendment 2026-09-27)
 - A present field with the wrong value type is a row-level data failure
 - Wrong value types return ``TransformResult.error()`` so ``on_error`` can route
   them without coercing or fabricating array elements
@@ -225,7 +227,13 @@ class TestJSONExplodeHappyPath:
         assert "items" not in output
 
     def test_array_field_original_name_is_resolved(self, ctx: PluginContext) -> None:
-        """Configured original array_field names resolve through PipelineRow contract."""
+        """``process()`` itself still resolves an original array_field through the PipelineRow contract.
+
+        Plugin-level only: ``array_field`` is a declared input (R2), so in a
+        pipeline the engine refuses a header spelling of a field the row
+        carries before ``process()`` runs (field-name spelling rule;
+        tests/integration/pipeline/test_field_name_spelling_rule.py).
+        """
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
         transform = JSONExplode(
@@ -292,10 +300,9 @@ class TestJSONExplodeHappyPath:
 
 
 class TestJSONExplodeTypeViolations:
-    """Distinguish missing-field contract violations from wrong-type row failures.
+    """Distinguish the missing-field refusal from wrong-type row failures.
 
-    Per three-tier trust model:
-    - A missing array field remains an upstream bug and raises ``KeyError``
+    - A missing array field is refused by the engine before ``process()`` (declared input)
     - A present field with the wrong value type returns a non-retryable error
     - Strings and mappings are rejected rather than iterated into fabricated rows
     """
@@ -305,21 +312,19 @@ class TestJSONExplodeTypeViolations:
         """Create minimal plugin context."""
         return make_context()
 
-    def test_missing_field_crashes(self, ctx: PluginContext) -> None:
-        """Missing array field is upstream bug - should crash (KeyError)."""
+    def test_the_array_field_is_a_declared_input(self) -> None:
+        """The array field is the one column the transform cannot run without, so it is declared.
+
+        It used to reach ``row[array_field]`` as a raw KeyError that ended the
+        run; as a declared input the engine settles its presence before
+        ``process()`` (the routed arm is pinned end to end in
+        tests/integration/pipeline/test_declared_input_miss.py).
+        """
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
-        transform = JSONExplode(
-            {
-                "schema": DYNAMIC_SCHEMA,
-                "array_field": "items",
-            }
-        )
+        transform = JSONExplode({"schema": DYNAMIC_SCHEMA, "array_field": "items", "output_field": "item"})
 
-        row = {"id": 1}  # Missing 'items' field
-
-        with pytest.raises(KeyError, match="items"):
-            transform.process(make_pipeline_row(row), ctx)
+        assert transform.declared_input_fields == frozenset({"items"})
 
     def test_none_value_routes_as_a_failed_row(self, ctx: PluginContext) -> None:
         """None for the array field is a ROW-level failure, routed via on_error.
@@ -736,11 +741,14 @@ class TestJSONExplodeContractPropagation:
 
 
 class TestJSONExplodeHeterogeneousTypes:
-    """Tests for heterogeneous array type handling.
+    """The output field is DECLARED ``any`` (nullable) before the first row (ADR-050).
 
-    When the exploded array contains elements of different types (e.g.,
-    ["a", {"k": 1}]), the output field contract must use `object` (the
-    universal type) rather than inferring from only the first element.
+    Nothing is inferred from the elements: a heterogeneous array
+    (``["a", {"k": 1}]``), a homogeneous one and a single element all record
+    the same contract, so two rows whose arrays differ in element type never
+    conflict at the node-contract merge. An operator who wants the element
+    typed declares it (``page: int``), and the engine enforces that on every
+    emitted value.
     """
 
     @pytest.fixture
@@ -799,8 +807,8 @@ class TestJSONExplodeHeterogeneousTypes:
         assert element_field is not None
         assert element_field.python_type is object
 
-    def test_homogeneous_array_preserves_inferred_type(self, ctx: PluginContext) -> None:
-        """Array with all same-type elements preserves the inferred type."""
+    def test_homogeneous_array_is_declared_any_too(self, ctx: PluginContext) -> None:
+        """A homogeneous array records the same declared ``any`` contract as a mixed one."""
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
         transform = JSONExplode(
@@ -819,11 +827,13 @@ class TestJSONExplodeHeterogeneousTypes:
 
         item_field = result.rows[0].contract.get_field("item")
         assert item_field is not None
-        # For homogeneous str array, type should be inferred as str (not object)
-        assert item_field.python_type is str
+        assert item_field.python_type is object
+        assert item_field.nullable is True
+        assert item_field.required is True
+        assert item_field.source == "declared"
 
-    def test_single_element_array_preserves_inferred_type(self, ctx: PluginContext) -> None:
-        """Single-element array preserves the inferred type (no heterogeneity)."""
+    def test_single_element_array_is_declared_any_too(self, ctx: PluginContext) -> None:
+        """A single-element array records the declared ``any`` contract, not the element's type."""
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
         transform = JSONExplode(
@@ -842,7 +852,8 @@ class TestJSONExplodeHeterogeneousTypes:
 
         item_field = result.rows[0].contract.get_field("item")
         assert item_field is not None
-        assert item_field.python_type is int
+        assert item_field.python_type is object
+        assert item_field.source == "declared"
 
     def test_mixed_none_and_value_uses_object_type(self, ctx: PluginContext) -> None:
         """Array with None and non-None elements gets output_field type=object."""

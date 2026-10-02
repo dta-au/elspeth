@@ -1,9 +1,4 @@
-"""Tests for the dev-admin user management routes -- /api/auth/admin/users.
-
-The surface exists only when WebSettings.dev_admin_user names a local-auth
-user; every other configuration must 404 exactly like the hidden /login and
-/register arms so probes cannot learn the surface exists.
-"""
+"""Local account management: configured dev admin or live local-auth administrator."""
 
 from __future__ import annotations
 
@@ -13,9 +8,14 @@ from httpx import ASGITransport, AsyncClient
 
 from elspeth.web.auth.admin_routes import create_dev_admin_router
 from elspeth.web.auth.local import LocalAuthProvider
+from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.routes import create_auth_router
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.identity_authority import IdentityAdminActor, RepositoryIdentityAuthority
 from elspeth.web.middleware.request_id import RequestIdMiddleware
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.schema import initialize_session_schema
 
 from .conftest import build_local_auth_provider
 
@@ -34,13 +34,20 @@ class _NoopAuthAuditRecorder:
         return None
 
 
-def _create_test_app(provider, **settings_overrides) -> FastAPI:
+def _create_test_app(provider, *, authority: RepositoryIdentityAuthority | None = None, **settings_overrides) -> FastAPI:
     """Create a FastAPI app with the auth + dev-admin routers mounted."""
     from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
     app = FastAPI()
     app.add_middleware(RequestIdMiddleware)
     app.state.auth_provider = provider
+    if authority is None:
+        # Match build_local_auth_provider's default identity substrate.
+        authority = RepositoryIdentityAuthority(
+            create_session_engine(f"sqlite:///{provider._db_path.parent / 'identity-substrate.db'}"),
+            lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply,
+        )
+    app.state.identity_authority = authority
     app.state.settings = WebSettings(
         composer_max_composition_turns=15,
         composer_max_discovery_turns=10,
@@ -76,7 +83,7 @@ async def _bearer(client: AsyncClient, username: str, password: str) -> dict[str
 
 @pytest.mark.asyncio
 class TestDevAdminGuard:
-    async def test_all_routes_404_when_flag_unset(self, tmp_path) -> None:
+    async def test_all_routes_404_for_non_admin_when_flag_unset(self, tmp_path) -> None:
         provider = _provider_with_admin(tmp_path)
         app = _create_test_app(provider)
 
@@ -101,14 +108,16 @@ class TestDevAdminGuard:
                 await client.post("/api/auth/admin/users", headers=headers, json={"username": "a", "display_name": "A"})
             ).status_code == 404
             assert (await client.post("/api/auth/admin/users/john/reset-password", headers=headers)).status_code == 404
-            assert (await client.delete("/api/auth/admin/users/john", headers=headers)).status_code == 404
+            assert (
+                await client.request("DELETE", "/api/auth/admin/users/john", headers=headers, json={"reason": "left the team"})
+            ).status_code == 404
 
-    async def test_routes_404_without_credentials_when_disabled(self, tmp_path) -> None:
+    async def test_routes_401_without_credentials_when_flag_unset(self, tmp_path) -> None:
         provider = _provider_with_admin(tmp_path)
         app = _create_test_app(provider)
 
         async with _client_for(app) as client:
-            assert (await client.get("/api/auth/admin/users")).status_code == 404
+            assert (await client.get("/api/auth/admin/users")).status_code == 401
 
     async def test_routes_401_without_credentials_when_enabled(self, tmp_path) -> None:
         provider = _provider_with_admin(tmp_path)
@@ -224,6 +233,27 @@ class TestResetPassword:
 
 @pytest.mark.asyncio
 class TestDeleteUser:
+    async def test_changed_credential_refuses_removal_without_retiring_identity(self, tmp_path, monkeypatch) -> None:
+        provider = _provider_with_admin(tmp_path)
+        provider.create_user("alice", "user-password-1", display_name="Alice")
+        app = _create_test_app(provider, dev_admin_user="john")
+        original_retire = provider._retire_identity
+
+        def retire_after_password_reset(username, reason, credential_exists, delete_credential):
+            provider.set_password(username, "replacement-password")
+            return original_retire(username, reason, credential_exists, delete_credential)
+
+        monkeypatch.setattr(provider, "_retire_identity", retire_after_password_reset)
+        async with _client_for(app) as client:
+            headers = await _bearer(client, "john", "admin-password-1")
+            alice_headers = await _bearer(client, "alice", "user-password-1")
+            response = await client.request("DELETE", "/api/auth/admin/users/alice", headers=headers, json={"reason": "left the team"})
+
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["refusal"] == "credential_changed"
+            assert (await client.get("/api/auth/me", headers=alice_headers)).status_code == 200
+            assert (await client.post("/api/auth/login", json={"username": "alice", "password": "replacement-password"})).status_code == 200
+
     async def test_delete_removes_account(self, tmp_path) -> None:
         provider = _provider_with_admin(tmp_path)
         provider.create_user("alice", "user-password-1", display_name="Alice")
@@ -231,11 +261,36 @@ class TestDeleteUser:
 
         async with _client_for(app) as client:
             headers = await _bearer(client, "john", "admin-password-1")
-            response = await client.delete("/api/auth/admin/users/alice", headers=headers)
+            response = await client.request("DELETE", "/api/auth/admin/users/alice", headers=headers, json={"reason": "left the team"})
             assert response.status_code == 204
 
             login = await client.post("/api/auth/login", json={"username": "alice", "password": "user-password-1"})
             assert login.status_code == 401
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"json": {}},
+            {"json": {"reason": ""}},
+            {"json": {"reason": "   "}},
+            {"json": {"reason": "x" * 481}},
+            {"json": {"reason": "left the team", "extra": "field"}},
+        ],
+    )
+    async def test_delete_without_a_usable_reason_is_refused_and_deletes_nothing(self, tmp_path, kwargs) -> None:
+        # Disabling requires a reason; deleting is the graver act and must not
+        # cost less (ruling D3, 2026-09-20).
+        provider = _provider_with_admin(tmp_path)
+        provider.create_user("alice", "user-password-1", display_name="Alice")
+        app = _create_test_app(provider, dev_admin_user="john")
+
+        async with _client_for(app) as client:
+            headers = await _bearer(client, "john", "admin-password-1")
+            response = await client.request("DELETE", "/api/auth/admin/users/alice", headers=headers, **kwargs)
+            assert response.status_code == 422
+            login = await client.post("/api/auth/login", json={"username": "alice", "password": "user-password-1"})
+            assert login.status_code == 200
 
     async def test_admin_cannot_delete_own_account(self, tmp_path) -> None:
         provider = _provider_with_admin(tmp_path)
@@ -243,7 +298,7 @@ class TestDeleteUser:
 
         async with _client_for(app) as client:
             headers = await _bearer(client, "john", "admin-password-1")
-            response = await client.delete("/api/auth/admin/users/john", headers=headers)
+            response = await client.request("DELETE", "/api/auth/admin/users/john", headers=headers, json={"reason": "left the team"})
         assert response.status_code == 400
         assert provider.list_users()[0].user_id == "john"
 
@@ -253,7 +308,7 @@ class TestDeleteUser:
 
         async with _client_for(app) as client:
             headers = await _bearer(client, "john", "admin-password-1")
-            response = await client.delete("/api/auth/admin/users/ghost", headers=headers)
+            response = await client.request("DELETE", "/api/auth/admin/users/ghost", headers=headers, json={"reason": "left the team"})
         assert response.status_code == 404
 
 
@@ -289,3 +344,95 @@ class TestMeDevAdminFlag:
             response = await client.get("/api/auth/me", headers=headers)
         assert response.status_code == 200
         assert response.json()["dev_admin"] is False
+
+
+def _substrate(tmp_path) -> tuple[LocalAuthProvider, RepositoryIdentityAuthority]:
+    """A provider and an authority over ONE identity substrate.
+
+    The dev admin's power is a CREDENTIAL flag; the last-administrator rule
+    (R5) lives in the identity store. A test of where they meet needs both
+    halves bound to the same rows, which the default fixture hides.
+    """
+    engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+    initialize_session_schema(engine)
+    authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+    provider = build_local_auth_provider(tmp_path / "auth.db", session_engine=engine)
+    provider.create_user("john", "admin-password-1", display_name="John")
+    return provider, authority
+
+
+def _bootstrap_identity_admin(provider: LocalAuthProvider, authority: RepositoryIdentityAuthority, username: str) -> str:
+    provider.create_user(username, "user-password-1", display_name=username.title())
+    event = authority.bootstrap_admin(
+        claims=IdentityClaims(provider="local", subject=username, username=username),
+        note="test bootstrap",
+        quota_tokens_per_day=None,
+        quota_storage_bytes=None,
+        record=lambda _event: None,
+    )
+    return event.record.identity_id
+
+
+@pytest.mark.asyncio
+class TestDeleteUserLastAdministrator:
+    """Deleting a local account retires its identity, so R5 must hold here too.
+
+    The dev admin is named by configuration and need not hold the identity
+    ``admin`` role, so ``disable_identity``'s own-identity and last-admin
+    refusals never see this path: before the repair the deletion below
+    answered 204 and left the container with no administrator at all.
+    """
+
+    async def test_refuses_to_delete_the_last_active_human_administrator(self, tmp_path) -> None:
+        provider, authority = _substrate(tmp_path)
+        _bootstrap_identity_admin(provider, authority, "alice")
+        assert authority.count_active_human_admins() == 1
+        app = _create_test_app(provider, authority=authority, dev_admin_user="john")
+
+        async with _client_for(app) as client:
+            headers = await _bearer(client, "john", "admin-password-1")
+            response = await client.request("DELETE", "/api/auth/admin/users/alice", headers=headers, json={"reason": "left the team"})
+            assert response.status_code == 409, response.text
+            assert response.json()["detail"]["refusal"] == "last_active_admin_protected"
+            # The refusal is decided BEFORE the credential goes: a refused
+            # deletion that had already removed the password would leave the
+            # only administrator with an identity and no way to sign in.
+            await _bearer(client, "alice", "user-password-1")
+
+        assert authority.count_active_human_admins() == 1
+        assert authority.read_identity_by_natural_key(provider="local", subject="alice") is not None
+
+    async def test_deletes_an_administrator_when_another_remains(self, tmp_path) -> None:
+        provider, authority = _substrate(tmp_path)
+        alice_id = _bootstrap_identity_admin(provider, authority, "alice")
+        provider.create_user("bob", "user-password-1", display_name="Bob")
+        bob = authority.ensure_identity(
+            claims=IdentityClaims(provider="local", subject="bob", username="bob"),
+            activate=True,
+            quota_tokens_per_day=None,
+            quota_storage_bytes=None,
+            identity_dormancy_days=90,
+            record_admission=lambda *_args: None,
+            record_rebound=lambda *_args: None,
+            record_dormant=lambda *_args: None,
+        )
+        authority.grant_role(
+            actor=IdentityAdminActor(identity_id=alice_id, on_behalf_of=None, console_request_id=None),
+            identity_id=bob.record.identity_id,
+            role="admin",
+            scope=None,
+            expires_at=None,
+            note=None,
+            record=lambda _event: None,
+        )
+        assert authority.count_active_human_admins() == 2
+        app = _create_test_app(provider, authority=authority, dev_admin_user="john")
+
+        async with _client_for(app) as client:
+            headers = await _bearer(client, "john", "admin-password-1")
+            assert (
+                await client.request("DELETE", "/api/auth/admin/users/alice", headers=headers, json={"reason": "left the team"})
+            ).status_code == 204
+
+        assert authority.count_active_human_admins() == 1
+        assert authority.read_identity_by_natural_key(provider="local", subject="alice") is None

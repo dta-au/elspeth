@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-21 (rev 3.2)
 **Status:** SPEC — supersedes rev 2.1 of this document and the design content of
-`2026-08-21-barrier-scope-proposal.md` (whose blocker analysis remains the authority on
+[the original barrier-scope proposal](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/specs/2026-08-21-barrier-scope-proposal.md) (whose blocker analysis remains the historical authority on
 *why*).
 **Decision (maintainer ruling, 2026-08-21, in-session):** unify fork/coalesce/row_union
 and barrier scopes into ONE lineage and settlement system NOW, accepting the schedule

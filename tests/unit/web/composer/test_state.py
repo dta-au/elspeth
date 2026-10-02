@@ -32,6 +32,61 @@ from elspeth.web.composer.yaml_generator import generate_yaml
 from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
 
 
+@pytest.mark.parametrize("auth", [{}, {"credential": "literal"}, {"credential": None}, {"credential": {"secret_ref": "WEB_TOKEN"}}])
+def test_web_scrape_auth_is_unavailable_during_authoring(auth: dict[str, object]) -> None:
+    state = CompositionState(
+        sources={"default": SourceSpec(plugin="csv", on_success="scrape", options={}, on_validation_failure="discard")},
+        nodes=(
+            NodeSpec.from_dict(
+                {
+                    "id": "scrape",
+                    "node_type": "transform",
+                    "plugin": "web_scrape",
+                    "input": "scrape",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": {"auth": auth},
+                }
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    errors = [error for error in state.validate().errors if error.error_code == "web_scrape_auth_unavailable"]
+    assert len(errors) == 1
+    assert errors[0].component == "node:scrape"
+    assert errors[0].severity == "high"
+    assert "response evidence" in errors[0].message
+    assert "literal" not in errors[0].message
+
+
+@pytest.mark.parametrize(("plugin", "options"), [("web_scrape", {}), ("web_scrape", {"auth": None}), ("passthrough", {"auth": {}})])
+def test_auth_refusal_does_not_reject_unauthenticated_or_other_plugins(plugin: str, options: dict[str, object]) -> None:
+    state = CompositionState(
+        sources={"default": SourceSpec(plugin="csv", on_success="scrape", options={}, on_validation_failure="discard")},
+        nodes=(
+            NodeSpec.from_dict(
+                {
+                    "id": "scrape",
+                    "node_type": "transform",
+                    "plugin": plugin,
+                    "input": "scrape",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": options,
+                }
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    assert not any(error.error_code == "web_scrape_auth_unavailable" for error in state.validate().errors)
+
+
 class TestSourceSpec:
     def test_frozen(self) -> None:
         s = SourceSpec(plugin="csv", on_success="t1", options={}, on_validation_failure="discard")
@@ -1156,6 +1211,46 @@ class TestStage1Validation:
         assert any("Route destination 'continue' has been removed" in m for m in messages), result.errors
         assert any("Fork branch names must not be empty" in m for m in messages), result.errors
         assert any("Fork branch name '__hidden' starts with '__'" in m for m in messages), result.errors
+
+    @pytest.mark.parametrize(
+        ("on_error", "fragment"),
+        [
+            pytest.param("   ", "on_error must be a sink name or 'discard'", id="blank"),
+            pytest.param("__errors", "starts with '__'", id="dunder"),
+            pytest.param("has space", "invalid characters", id="chars"),
+        ],
+    )
+    def test_aggregation_on_error_follows_runtime_label_rules(self, on_error: str, fragment: str) -> None:
+        """AggregationSettings.on_error has the same parse-time validator as a
+        transform's (it is now a live __error_<name>__ edge target), so Stage 1
+        mirrors it (elspeth-d2e3f29d10)."""
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="agg_in"))
+        state = state.with_node(
+            NodeSpec(
+                id="stats",
+                node_type="aggregation",
+                plugin="batch_stats",
+                input="agg_in",
+                on_success="main",
+                on_error=on_error,
+                options={"schema": {"mode": "observed"}, "value_field": "value"},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                trigger={"count": 2},
+                output_mode="transform",
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        messages = [e.message for e in result.errors if e.error_code == "connection_label_invalid" and e.component == "node:stats"]
+        assert any(fragment in m for m in messages), result.errors
 
     def test_coalesce_branch_labels_follow_runtime_rules(self) -> None:
         """Branch keys/values must be non-empty, valid, and not collide after trimming or repeat in list form."""
@@ -4193,12 +4288,19 @@ class TestPromptTemplateUndeclaredRowFields:
         assert errors
         assert "declare as 'original_header'" in errors[0].message
 
-    def test_case_variant_reference_is_reported(self) -> None:
-        """``{{ row.Name }}`` against a declared ``name`` resolves only by accident
-        of the producer's header, which no validator can see."""
-        errors = self._errors(self._state("Hello {{ row.Name }}", required_input_fields=["name"]))
+    def test_header_spelling_of_a_declared_field_is_accepted(self) -> None:
+        """``{{ row.Name }}`` under a declared ``name`` reads it by its header spelling (ADR-051 (b), S-02).
+
+        The composer shares ``undeclared_row_fields`` with the plugin layer, so
+        it admits exactly what ``LLMConfig`` admits; a row whose header is
+        spelled otherwise fails that row at render.
+        """
+        assert not self._errors(self._state("Hello {{ row.Name }}", required_input_fields=["name"]))
+
+    def test_spelling_of_an_undeclared_field_is_reported(self) -> None:
+        errors = self._errors(self._state("Hello {{ row.Title }}", required_input_fields=["name"]))
         assert errors
-        assert "'Name'" in errors[0].message
+        assert "'Title'" in errors[0].message
 
     def test_interpretation_placeholder_does_not_silence_the_rule(self) -> None:
         """Unmasked, ``{{interpretation:...}}`` is a TemplateSyntaxError that would
@@ -4266,15 +4368,15 @@ class TestPromptTemplateUndeclaredRowFields:
         assert self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study_1", 5]))
 
     def test_advice_leads_with_rewrite_and_qualifies_declaring(self) -> None:
-        """Declaring a read name the producer does not guarantee is accepted at
-        config time and then fails every row (``verify_declared_required_fields``
-        is a plain set difference with no dual-name limb), so the ordering of
-        the two remedies is load-bearing."""
+        """Declaring a read name the producer does not guarantee is refused when
+        the pipeline is validated (``schema_contract_violation``), so a repair
+        that leads with it trades this error for another: the ordering of the
+        two remedies is load-bearing."""
         from elspeth.web.composer.state import _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX as fix
 
         assert fix.index("Rewrite each reference") < fix.index("Add a name to options.required_input_fields")
         assert "ONLY if the upstream producer guarantees that exact name" in fix
-        assert "fails every row at run time" in fix
+        assert "refused when the pipeline is validated" in fix
         assert "patch_node_options replaces the option's value, it does not append" in fix
 
     def test_both_authoring_surfaces_carry_the_same_substantive_advice(self) -> None:
@@ -4288,8 +4390,177 @@ class TestPromptTemplateUndeclaredRowFields:
         for text in (plugin_fix, composer_fix):
             assert text.index("Rewrite each reference") < text.index("Add a name to options.required_input_fields")
             assert "ONLY if the upstream producer guarantees that exact name" in text
-            assert "fails every row at run time" in text
+            assert "refused when the pipeline is validated" in text
             assert "withdraws the contract for every field" in text
+
+
+class TestLLMPromptRolesRequired:
+    """Every composer-authored ``llm`` node carries BOTH prompt roles.
+
+    Session 60ab6a67 (2026-09-20): the user supplied a user prompt per A/B arm
+    and the planner shipped both nodes with ``prompt_template`` only. The
+    skill told it to fill the missing role; the plugin schema it read last
+    called the field "Optional system prompt", and nothing at Stage 1 pushed
+    back, so the omission reached the approval card unseen. A rejection the
+    planner must repair is the enforcement; the server never writes the text.
+    """
+
+    def _state_with_llm(self, options: dict[str, Any]) -> CompositionState:
+        node = NodeSpec(
+            id="classify",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="classified",
+            on_error="discard",
+            options=options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _errors(self, state: CompositionState, code: str) -> list[ValidationEntry]:
+        return [e for e in state.validate().errors if e.error_code == code]
+
+    def test_user_prompt_without_system_prompt_is_rejected(self) -> None:
+        """The session-60ab6a67 shape: a supplied user prompt, no system role."""
+        state = self._state_with_llm(
+            {"profile": "sonnet", "prompt_template": "Classify: {{ row.text }}", "required_input_fields": ["text"]}
+        )
+        errors = self._errors(state, "llm_system_prompt_missing")
+        assert len(errors) == 1
+        entry = errors[0]
+        assert entry.component == "node:classify"
+        assert entry.severity == "high"
+        assert "options.system_prompt" in entry.message
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    @pytest.mark.parametrize("blank", [None, "", "   \n\t"])
+    def test_blank_system_prompt_is_not_a_system_prompt(self, blank: str | None) -> None:
+        """``transform.py`` sends the system message only ``if self.system_prompt``."""
+        state = self._state_with_llm({"prompt_template": "Classify: {{ row.text }}", "system_prompt": blank})
+        assert len(self._errors(state, "llm_system_prompt_missing")) == 1
+
+    def test_both_roles_present_is_accepted(self) -> None:
+        state = self._state_with_llm(
+            {"prompt_template": "Classify: {{ row.text }}", "system_prompt": "You classify support tickets by sentiment."}
+        )
+        assert not self._errors(state, "llm_system_prompt_missing")
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    def test_system_prompt_without_user_prompt_is_rejected(self) -> None:
+        state = self._state_with_llm({"system_prompt": "You classify support tickets by sentiment."})
+        errors = self._errors(state, "llm_user_prompt_missing")
+        assert len(errors) == 1
+        assert errors[0].component == "node:classify"
+        assert errors[0].severity == "high"
+        assert "options.prompt_template" in errors[0].message
+        assert not self._errors(state, "llm_system_prompt_missing")
+
+    def test_node_with_neither_role_reports_both(self) -> None:
+        state = self._state_with_llm({"profile": "sonnet"})
+        assert len(self._errors(state, "llm_system_prompt_missing")) == 1
+        assert len(self._errors(state, "llm_user_prompt_missing")) == 1
+
+    def test_multi_query_node_needs_the_shared_system_prompt(self) -> None:
+        """``system_prompt`` is shared by every query, so one rule covers both modes."""
+        state = self._state_with_llm({"queries": {"tone": {"template": "Tone of {{ row.text }}?", "input_fields": {"text": "text"}}}})
+        assert len(self._errors(state, "llm_system_prompt_missing")) == 1
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    @pytest.mark.parametrize(
+        "queries",
+        [
+            pytest.param(
+                {
+                    "tone": {"template": "Tone of {{ row.text }}?", "input_fields": {"text": "text"}},
+                    "urgency": {"template": "Urgency of {{ row.text }}?", "input_fields": {"text": "text"}},
+                },
+                id="mapping-form",
+            ),
+            pytest.param(
+                [
+                    {"name": "tone", "template": "Tone of {{ row.text }}?", "input_fields": {"text": "text"}},
+                    {"name": "urgency", "template": "Urgency of {{ row.text }}?", "input_fields": {"text": "text"}},
+                ],
+                id="list-form",
+            ),
+        ],
+    )
+    def test_multi_query_one_system_prompt_many_user_prompts_is_the_supported_shape(self, queries: Any) -> None:
+        """One shared ``system_prompt`` plus a user prompt per query needs no node-level ``prompt_template``."""
+        state = self._state_with_llm({"system_prompt": "You assess support tickets.", "queries": queries})
+        assert not self._errors(state, "llm_system_prompt_missing")
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    def test_multi_query_without_any_user_template_names_the_query(self) -> None:
+        """A query with no ``template`` falls back to the node-level ``prompt_template``; with neither it has no user prompt."""
+        state = self._state_with_llm(
+            {
+                "system_prompt": "You assess support tickets.",
+                "queries": {
+                    "tone": {"template": "Tone of {{ row.text }}?", "input_fields": {"text": "text"}},
+                    "urgency": {"input_fields": {"text": "text"}},
+                },
+            }
+        )
+        errors = self._errors(state, "llm_user_prompt_missing")
+        assert len(errors) == 1
+        assert "'urgency'" in errors[0].message
+        assert "'tone'" not in errors[0].message
+
+    def test_multi_query_falls_back_to_the_node_level_template(self) -> None:
+        state = self._state_with_llm(
+            {
+                "system_prompt": "You assess support tickets.",
+                "prompt_template": "Assess {{ row.text }}",
+                "queries": {"urgency": {"input_fields": {"text": "text"}}},
+            }
+        )
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    def test_user_uploaded_blob_marker_counts_as_supplied(self) -> None:
+        """ADR-034 lets a user-uploaded prompt artifact back either role as an inline marker mapping.
+
+        Whether the marker is well formed and user-authored is owned by the
+        inline-blob rules; this rule only asks whether the role was supplied.
+        """
+        marker = {"inline_content": {"blob_id": "00000000-0000-0000-0000-000000000001"}}
+        state = self._state_with_llm({"prompt_template": marker, "system_prompt": marker})
+        assert not self._errors(state, "llm_system_prompt_missing")
+        assert not self._errors(state, "llm_user_prompt_missing")
+
+    def test_non_llm_transform_is_not_subject_to_the_rule(self) -> None:
+        node = NodeSpec(
+            id="tidy",
+            node_type="transform",
+            plugin="field_mapper",
+            input="rows",
+            on_success="tidied",
+            on_error="discard",
+            options={"mapping": {"id": "id"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(source=None, nodes=(node,), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+        codes = {e.error_code for e in state.validate().errors}
+        assert "llm_system_prompt_missing" not in codes
+        assert "llm_user_prompt_missing" not in codes
 
 
 class TestMultiQueryTemplateVariableBindings:
@@ -4337,6 +4608,47 @@ class TestMultiQueryTemplateVariableBindings:
 
     def _errors(self, state: CompositionState, code: str) -> list[ValidationEntry]:
         return [e for e in state.validate().errors if e.error_code == code]
+
+    def test_shared_node_template_column_check_does_not_scale_with_query_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Queries without an override share the node-level prompt_template; the
+        required-input column and generated-input checks must analyse it a
+        constant number of times, not once per query (#230: O(queries x
+        template) on a composer edit)."""
+        from elspeth.web.composer import state as state_module
+
+        template = "Assess {{ row.input_1 }} against {{ row.source_row.column_0 }}"
+        shared_template_calls = 0
+
+        def counting(original: Any) -> Any:
+            def wrapper(candidate: str, *args: Any, **kwargs: Any) -> Any:
+                nonlocal shared_template_calls
+                if template in candidate:
+                    shared_template_calls += 1
+                return original(candidate, *args, **kwargs)
+
+            return wrapper
+
+        monkeypatch.setattr(state_module, "_parse_template_names", counting(state_module._parse_template_names))
+        monkeypatch.setattr(state_module, "multi_query_source_row_columns", counting(state_module.multi_query_source_row_columns))
+
+        def calls_for(query_count: int) -> int:
+            nonlocal shared_template_calls
+            shared_template_calls = 0
+            node = replace(
+                self._state(template, {}).nodes[0],
+                options={
+                    "prompt_template": template,
+                    "model": "test-model",
+                    "schema": {"mode": "observed"},
+                    "required_input_fields": [f"column_{index}" for index in range(query_count)],
+                    "queries": [{"name": f"query_{index}", "input_fields": {"input_1": f"column_{index}"}} for index in range(query_count)],
+                },
+            )
+            assert state_module._validate_multi_query_required_input_columns(node) == ()
+            assert state_module._validate_multi_query_generated_input_requirements(node) == ()
+            return shared_template_calls
+
+        assert calls_for(1) == calls_for(50)
 
     def test_bare_name_in_query_override_is_rejected(self) -> None:
         """The task-shaped defect: an override interpolating a bare input_fields
@@ -5064,7 +5376,6 @@ class TestSchemaContractValidation:
                     },
                     "mapping": {"text": "body"},
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )
@@ -5097,7 +5408,6 @@ class TestSchemaContractValidation:
                 "schema": {"mode": "fixed", "fields": ["body: str", "text: str"]},
                 "mapping": {"text": "body"},
                 "select_only": True,
-                "strict": True,
             },
         )
 
@@ -5121,10 +5431,10 @@ class TestSchemaContractValidation:
         merge: str | None = "union",
         policy: str | None = "require_all",
         branch_order: tuple[str, str] = ("path_a", "path_b"),
-        branch_plugin: str = "value_transform",
+        branch_plugin: str = "passthrough",
         timeout_seconds: float | None = None,
     ) -> CompositionState:
-        """Build a legal transformed fork/coalesce shape for schema-mode parity tests."""
+        """Build a schema boundary without introducing an unproven expression result type."""
         state = self._empty_state()
         state = state.with_source(
             self._make_source(
@@ -5365,7 +5675,6 @@ class TestSchemaContractValidation:
                 options={
                     "schema": {"mode": "observed"},
                     "mapping": {"text": "body"},
-                    "strict": True,
                 },
             )
         )
@@ -5561,8 +5870,9 @@ class TestSchemaContractValidation:
         the producer-probe sites at ``state.py:884`` and ``state.py:1057`` and
         the semantic-validator helpers in ``_semantic_validator.py`` — is
         that the exception MUST propagate so the bug surfaces at composer-time
-        rather than being silently deferred to ``/execute``. Per CLAUDE.md
-        (plugin-as-system-code policy: a plugin method that raises is a bug
+        rather than being silently deferred to ``/execute``. Per
+        docs/guides/data-trust-and-error-handling.md §Plugin Ownership
+        (plugin-as-system-code: a plugin method that raises is a bug
         we MUST know about), Rule C swallowing every exception with a bare
         ``except Exception: continue`` would conceal genuine framework bugs.
 
@@ -5603,7 +5913,6 @@ class TestSchemaContractValidation:
                 },
                 "mapping": {"text": "body"},
                 "select_only": True,
-                "strict": True,
             },
         )
         sink = OutputSpec(
@@ -6034,7 +6343,7 @@ class TestSchemaContractValidation:
         assert sink_contract.satisfied is True
 
     @pytest.mark.parametrize("proven_sources", [("raw_url", "raw_summary"), ("raw_url",)])
-    def test_guided_select_only_mapper_declares_all_derived_target_guarantees(self, proven_sources: tuple[str, ...]) -> None:
+    def test_select_only_mapper_declares_all_derived_target_guarantees(self, proven_sources: tuple[str, ...]) -> None:
         """Upstream schema lower bounds do not narrow successful-row outputs."""
         state = self._empty_state()
         state = state.with_source(
@@ -6124,7 +6433,7 @@ class TestSchemaContractValidation:
     def test_contract_probe_ignores_authoring_metadata(self) -> None:
         """Composer-only authoring keys must not break the contract probe.
 
-        The guided flow stages ``interpretation_requirements`` inside node
+        The composer stages ``interpretation_requirements`` inside node
         options; every plugin config rejects unknown keys, so probing with
         unstripped options is a guaranteed ValueError -> a spurious
         "Computed contract probe ... failed" warning surfaced to the user
@@ -6227,7 +6536,6 @@ class TestSchemaContractValidation:
                 plugin="field_mapper",
                 options={
                     "select_only": True,
-                    "strict": False,
                     "mapping": {"first_name": "fname", "user.name": "uname", "Name": "nm"},
                     "schema": {"mode": "flexible", "fields": ["fname: str", "uname: str", "nm: str"]},
                 },
@@ -6272,7 +6580,6 @@ class TestSchemaContractValidation:
                 plugin="field_mapper",
                 options={
                     "select_only": True,
-                    "strict": False,
                     "mapping": {"user.name": "uname"},
                     "schema": {"mode": "fixed", "fields": ["user: any"]},
                 },
@@ -6305,8 +6612,8 @@ class TestSchemaContractValidation:
         """The fixed input model names ``user``; the emitted target is not an input.
 
         The old target-only schema is rejected at construction. With the root
-        declared, a present leaf succeeds and a missing child routes in
-        non-strict mode, which is the behavior that makes ``uname`` guaranteed
+        declared, a present leaf succeeds and a missing child routes, which is
+        the behavior that makes ``uname`` guaranteed
         on every successful row. The historical regression identifier is kept
         for integration-matrix traceability.
         """
@@ -6314,7 +6621,6 @@ class TestSchemaContractValidation:
 
         incoherent = {
             "select_only": True,
-            "strict": True,
             "mapping": {"user.name": "uname"},
             "schema": {"mode": "fixed", "fields": ["uname: str"]},
         }
@@ -6323,7 +6629,6 @@ class TestSchemaContractValidation:
 
         coherent = {
             "select_only": True,
-            "strict": False,
             "mapping": {"user.name": "uname"},
             "schema": {"mode": "fixed", "fields": ["user: any"]},
         }
@@ -6904,6 +7209,34 @@ class TestSchemaContractValidation:
         state = self._make_coalesce_schema_mode_state(
             source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
             transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_union_coalesce_rejects_unproven_expression_output_type(self) -> None:
+        """An expression target the branch does not type is ``any``: the arriving int is no proof of its output type."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: any"]},
+            branch_plugin="value_transform",
+        )
+
+        result = state.validate()
+
+        assert not result.is_valid
+        [entry] = [error for error in result.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert entry.coalesce_union_type is not None
+        assert entry.coalesce_union_type.field == "value"
+        assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == {"int", "any"}
+
+    def test_union_coalesce_accepts_a_typed_expression_target_as_its_declared_type(self) -> None:
+        """A target the branch TYPES is the operator's output declaration, enforced by value_transform's pin (ADR-050)."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            branch_plugin="value_transform",
         )
 
         result = state.validate()
@@ -8346,7 +8679,6 @@ class TestSchemaContractValidation:
                         "sum": "sum",
                     },
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )
@@ -8414,6 +8746,7 @@ class TestSchemaContractValidation:
             "model": "anthropic/claude-sonnet-4.6",
             "endpoint": "https://gateway.example.invalid/v1",
             "api_key": "${LLM_API_KEY}",
+            "system_prompt": "You rewrite headlines. Reply with the rewritten headline only.",
             "prompt_template": "Title-case this: {headline}",
             "response_field": response_field,
             "schema": {"mode": "observed"},
@@ -8504,8 +8837,8 @@ class TestSchemaContractValidation:
     def test_rule_d_skips_a_select_only_field_mapper_that_cannot_overwrite(self) -> None:
         """Rule D is capability-keyed: a fresh-dict writer cannot overwrite (elspeth-6ea3619737).
 
-        A ``select_only`` + ``strict`` field_mapper declares its rename target
-        (an honest guarantee — strict promises the source), and the target name
+        A ``select_only`` field_mapper declares its rename target (an honest
+        guarantee — the mapping requires its source), and the target name
         definitely arrives on its input. But ``process`` builds its output from
         a fresh ``{}``: the arriving field is dropped, never overwritten —
         which is what select_only MEANS. Before the capability key this shape
@@ -8527,7 +8860,6 @@ class TestSchemaContractValidation:
                 options={
                     "mapping": {"a": "b"},
                     "select_only": True,
-                    "strict": True,
                     "schema": {"mode": "observed"},
                 },
             )
@@ -8971,7 +9303,6 @@ class TestSchemaContractValidation:
                         "sum": "sum",
                     },
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )
@@ -9076,7 +9407,6 @@ class TestSchemaContractValidation:
                         "sum": "sum",
                     },
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )
@@ -9911,6 +10241,22 @@ class TestCompositionStateQueueGuaranteePropagation:
         assert result.is_valid, [e.message for e in result.errors]
         assert self._queue_skip_warnings(result) == []
 
+    @pytest.mark.parametrize("required", [["name"], ["Name"]], ids=["canonical", "header_spelling_candidate"])
+    def test_an_abstaining_queue_is_reported_once_per_consumer(self, required: list[str]) -> None:
+        # The presence rule and the field-name spelling rule both walk the
+        # consumer's connection back through the queue. Each skipped check is
+        # one warning: the spelling pass must not repeat what the presence
+        # rule already reported, whether or not its declarations can be
+        # header spellings (measured: 2 identical warnings for both shapes
+        # before the spelling pass kept its walk's reports apart).
+        state = self._state(
+            sources={"orders": self._source(), "refunds": self._source()},
+            nodes=(self._queue(), self._consumer(required=required)),
+            outputs=(self._sink(),),
+        )
+        result = state.validate()
+        assert len(self._queue_skip_warnings(result)) == 1
+
     def test_queue_consumer_requiring_unguaranteed_field_is_rejected(self) -> None:
         # Red-parity direction: the engine rejects this at graph build
         # ("guarantees: (none - dynamic schema)" pre-fix / missing-field
@@ -10153,6 +10499,62 @@ def test_gate_on_error_must_reference_declared_sink_or_discard() -> None:
     }
 
 
+@pytest.mark.parametrize("on_error", ["missing_error_sink", "merge"])
+def test_aggregation_on_error_route_facts_match_the_unknown_sink_rule(on_error: str) -> None:
+    """An aggregation's dangling on_error ships repair facts like a transform's.
+
+    No rule-9 closer relax for an aggregation: a closer-shaped value ('merge'
+    names a coalesce here) is still an unknown sink, both in the error rule
+    and in the facts, because rule 6 keeps aggregations out of every bound
+    region (elspeth-d2e3f29d10 parity with the DAG builder).
+    """
+    aggregation = NodeSpec(
+        id="stats",
+        node_type="aggregation",
+        plugin="batch_stats",
+        input="rows",
+        on_success="high",
+        on_error=on_error,
+        options={"schema": {"mode": "observed"}, "value_field": "amount"},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+        trigger={"count": 2},
+        output_mode="transform",
+    )
+    merge = NodeSpec(
+        id="merge",
+        node_type="coalesce",
+        plugin=None,
+        input="merge_in",
+        on_success="high",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches={"a": "a_in", "b": "b_in"},
+        policy="require_all",
+        merge="union",
+    )
+    state = CompositionState(
+        source=SourceSpec(plugin="csv", on_success="rows", options={}, on_validation_failure="discard"),
+        nodes=(aggregation, merge),
+        edges=(),
+        outputs=(OutputSpec(name="high", plugin="csv", options={}, on_write_failure="discard"),),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+    result = state.validate()
+
+    assert ("node:stats", "aggregation_on_error_unknown_sink") in {(entry.component, entry.error_code) for entry in result.errors}
+    assert route_destination_facts(state)["node:stats"] == {"dangling_on_error": on_error, "declared_sinks": ["high"]}
+
+
 def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:
     """Mirror the engine's fork-branch destination rule at composition time.
 
@@ -10327,6 +10729,7 @@ class TestCompositionStateRowUnion:
                 "schema": {"mode": "observed"},
                 "provider": "openrouter",
                 "model": "anthropic/claude-sonnet-4.6",
+                "system_prompt": "You judge each row. Reply with a one-word verdict.",
                 "prompt_template": "Judge this row.",
                 "api_key": "env:OPENROUTER_API_KEY",
                 "response_field": response_field,
@@ -10494,6 +10897,43 @@ class TestCompositionStateRowUnion:
         result = self._state().validate()
 
         assert result.is_valid, result.errors
+
+    def test_repeated_row_union_mappings_reuse_lineage_queries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.web.composer import state as state_module
+
+        state = self._state()
+        original_lineage = state_module._runtime_connection_lineage
+        lineage_queries: list[tuple[str, str]] = []
+
+        def recording_lineage(
+            origin: str,
+            target: str,
+            sources: dict[str, SourceSpec],
+            nodes: tuple[NodeSpec, ...],
+        ) -> tuple[bool, tuple[NodeSpec, ...]]:
+            lineage_queries.append((origin, target))
+            return original_lineage(origin, target, sources, nodes)
+
+        monkeypatch.setattr(state_module, "_runtime_connection_lineage", recording_lineage)
+        repeated_unions = tuple(
+            replace(
+                self._row_union(),
+                id=f"variant_union_{index}",
+                on_success=f"union_out_{index}",
+            )
+            for index in range(20)
+        )
+        state = replace(
+            state,
+            nodes=tuple(node for node in state.nodes if node.node_type != "row_union") + repeated_unions,
+        )
+
+        state.validate()
+
+        assert lineage_queries == [
+            ("control_branch", "control_done"),
+            ("treatment_branch", "treatment_done"),
+        ]
 
     @pytest.mark.parametrize("output_mode", [None, "transform"])
     def test_row_union_rejects_transform_mode_aggregation_inside_branch(self, output_mode: str | None) -> None:

@@ -27,7 +27,7 @@ from elspeth.web.sessions.skill_markdown_history import (
     SkillMarkdownHistoryAuthority,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _hash(content: str) -> str:
@@ -160,7 +160,7 @@ def test_session_service_delegates_through_run_sync(engine, tmp_path: Path) -> N
             return False
 
     authority = RecordingAuthority()
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

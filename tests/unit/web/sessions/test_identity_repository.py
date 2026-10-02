@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import IdentityRetired, RepositoryIdentityAuthority
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.identity_repository import IdentityRowCorruptionError
@@ -39,7 +40,7 @@ def engine():
 
 @pytest.fixture
 def authority(engine) -> RepositoryIdentityAuthority:
-    return RepositoryIdentityAuthority(engine)
+    return RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
 
 def _noop(_identity_id: str, _username: str, _quota_written: bool) -> None:
@@ -56,6 +57,22 @@ def _no_rebound(_event: object) -> None:
     with the authority.
     """
     return None
+
+
+def _no_dormancy(_event: object) -> None:
+    """R9 recorder for the cases that are not about R9.
+
+    Never invoked here for a different reason than ``_no_rebound``: R9 does
+    NOT exclude local auth, but every login in this file lands on a row whose
+    ``last_login_at`` is either NULL or this same second, and neither is
+    dormant. R9's own tests live with the authority.
+    """
+    return None
+
+
+# R9's window for the fixtures below. Passed explicitly rather than defaulted
+# so no test in this file can be made to trip R9 by an edit to ``WebSettings``.
+_DORMANCY_DAYS = 90
 
 
 def _record_no_retirement(_outcome: IdentityRetired) -> None:
@@ -81,13 +98,22 @@ def _ensure(authority: RepositoryIdentityAuthority, *, activate: bool, **claim_o
         activate=activate,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=_noop,
         record_rebound=_no_rebound,
+        record_dormant=_no_dormancy,
     )
 
 
 def _retire(authority: RepositoryIdentityAuthority, subject: str = "ada", *, reason: str = "local credential deleted"):
-    return authority.retire_identity(provider="local", subject=subject, reason=reason, record=_record_no_retirement)
+    return authority.retire_identity(
+        provider="local",
+        subject=subject,
+        reason=reason,
+        record=_record_no_retirement,
+        credential_exists=lambda: True,
+        delete_credential=lambda: None,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -344,8 +370,10 @@ def test_the_admission_audit_runs_before_the_activation_commits(authority) -> No
         activate=True,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=lambda identity_id, username, _quota: seen.append((identity_id, username)),
         record_rebound=_no_rebound,
+        record_dormant=_no_dormancy,
     )
 
     assert seen == [(outcome.record.identity_id, "ada")]
@@ -369,8 +397,10 @@ def test_a_failed_admission_audit_rolls_the_whole_activation_back(engine, author
             activate=True,
             quota_tokens_per_day=_TOKENS,
             quota_storage_bytes=_STORAGE,
+            identity_dormancy_days=_DORMANCY_DAYS,
             record_admission=_audit_fails,
             record_rebound=_no_rebound,
+            record_dormant=_no_dormancy,
         )
 
     # Nothing survives: no identity, and therefore no quota row either.
@@ -396,8 +426,10 @@ def test_a_retry_after_a_failed_audit_admits_and_audits(authority) -> None:
             activate=True,
             quota_tokens_per_day=_TOKENS,
             quota_storage_bytes=_STORAGE,
+            identity_dormancy_days=_DORMANCY_DAYS,
             record_admission=_fails_once,
             record_rebound=_no_rebound,
+            record_dormant=_no_dormancy,
         )
 
     outcome = authority.ensure_identity(
@@ -405,8 +437,10 @@ def test_a_retry_after_a_failed_audit_admits_and_audits(authority) -> None:
         activate=True,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=_fails_once,
         record_rebound=_no_rebound,
+        record_dormant=_no_dormancy,
     )
 
     assert outcome.record.is_active is True
@@ -422,8 +456,10 @@ def test_a_pending_admission_writes_no_audit(authority) -> None:
         activate=False,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=lambda identity_id, _username, _quota: seen.append(identity_id),
         record_rebound=_no_rebound,
+        record_dormant=_no_dormancy,
     )
 
     assert seen == []
@@ -442,8 +478,10 @@ def test_a_returning_active_user_writes_no_second_audit(authority) -> None:
             activate=True,
             quota_tokens_per_day=_TOKENS,
             quota_storage_bytes=_STORAGE,
+            identity_dormancy_days=_DORMANCY_DAYS,
             record_admission=recorder,
             record_rebound=_no_rebound,
+            record_dormant=_no_dormancy,
         )
 
     assert len(seen) == 1
@@ -499,8 +537,10 @@ def test_the_loser_does_not_write_a_second_activation_audit(authority, monkeypat
         activate=True,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=lambda identity_id, _username, _quota: seen.append(identity_id),
         record_rebound=_no_rebound,
+        record_dormant=_no_dormancy,
     )
 
     assert outcome.activated_now is False
@@ -548,8 +588,10 @@ def test_no_quota_is_claimed_when_no_quota_row_is_written(engine, authority, tok
         activate=True,
         quota_tokens_per_day=tokens,
         quota_storage_bytes=storage,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=lambda _i, _u, _q: None,
         record_rebound=_no_rebound,
+        record_dormant=_no_dormancy,
     )
 
     assert outcome.quota_written is False
@@ -565,8 +607,10 @@ def test_a_written_quota_row_is_reported_to_the_caller(authority) -> None:
         activate=True,
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
+        identity_dormancy_days=_DORMANCY_DAYS,
         record_admission=lambda _i, _u, quota_written: seen.append(quota_written),
         record_rebound=_no_rebound,
+        record_dormant=_no_dormancy,
     )
 
     assert outcome.quota_written is True

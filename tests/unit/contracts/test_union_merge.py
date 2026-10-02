@@ -343,3 +343,30 @@ class TestMergeForBatchDelegation:
         via_function = merge_union_contracts({"self": a, "other": b}, require_all=False, branch_order=("self", "other"))
         assert via_method == via_function
         assert via_method.version_hash() == via_function.version_hash()
+
+
+class TestAnyAgainstAConcreteTypeAtACoalesce:
+    """ADR-050 D11: ``any`` is not a wildcard at a coalesce — it conflicts with a concrete type.
+
+    A union coalesce PROMISES one type to its consumers, and ``any`` promises
+    nothing, so a branch whose field is ``any`` (an undeclared transform
+    target under ADR-050) beside a branch declaring ``int`` is a conflict in
+    either order, exactly as the build-time check treats ``any`` vs ``int``.
+    The operator's lever is to declare the type on the transform's schema.
+    """
+
+    @pytest.mark.parametrize("require_all", [True, False])
+    def test_any_against_int_raises_in_either_order(self, require_all: bool) -> None:
+        any_branch = SchemaContract(
+            mode="OBSERVED",
+            fields=(FieldContract("value", "value", object, True, "declared", nullable=True),),
+            locked=True,
+        )
+        int_branch = SchemaContract(
+            mode="FLEXIBLE",
+            fields=(FieldContract("value", "value", int, True, "declared"),),
+            locked=True,
+        )
+        for order in (("a", "b"), ("b", "a")):
+            with pytest.raises(ContractMergeError, match="'value'"):
+                merge_union_contracts({"a": any_branch, "b": int_branch}, require_all=require_all, branch_order=order)

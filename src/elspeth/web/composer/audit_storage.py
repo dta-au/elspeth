@@ -119,6 +119,7 @@ def _redacted_arguments(
     if invocation.status == ComposerToolStatus.ARG_ERROR:
         arg_error_projection = redact_arg_error_response(
             error_class=invocation.error_class,
+            error_category=invocation.error_category,
             error_message=None,
         )
         return {
@@ -171,6 +172,7 @@ def _redacted_result_canonical(
         return canonical_json(
             redact_arg_error_response(
                 error_class=invocation.error_class,
+                error_category=invocation.error_category,
                 error_message=invocation.error_message,
                 result=result,
             )
@@ -204,6 +206,7 @@ def redacted_tool_invocation_content_and_envelope(
     arg_error_projection = (
         redact_arg_error_response(
             error_class=invocation.error_class,
+            error_category=invocation.error_category,
             error_message=invocation.error_message,
             result=_load_canonical_mapping(invocation.result_canonical),
         )

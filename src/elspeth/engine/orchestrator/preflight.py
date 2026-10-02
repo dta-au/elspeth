@@ -31,8 +31,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, NoReturn, cast, final
 
+from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import SinkEffectCapabilityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.sink_effect_http import HTTPSinkEffectCapability, SinkEffectHTTPPostFactory
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     AuditExportFormat,
@@ -423,6 +425,35 @@ def _capability_fingerprint(sink: object) -> tuple[object, ...]:
     )
 
 
+def _http_factory_for_admission(
+    sink_name: str,
+    sink: SinkProtocol,
+    runtime_bindings: Mapping[str, SinkEffectRuntimeBinding],
+    run_mode: RunMode,
+) -> SinkEffectHTTPPostFactory | None:
+    binding = runtime_bindings[sink_name] if sink_name in runtime_bindings else None
+    if binding is not None and (
+        type(binding) is not SinkEffectRuntimeBinding
+        or binding.sink_name != sink_name
+        or binding.sink is not sink
+        or binding.sink_type is not type(sink)
+    ):
+        raise SinkEffectCapabilityError("HTTP runtime binding must bind the exact named sink")
+    factory = binding.http_post_factory if binding is not None else None
+    if run_mode is not RunMode.LIVE:
+        if factory is not None:
+            raise SinkEffectCapabilityError("nonlive sink admission must not carry a live HTTP factory")
+        return None
+    if isinstance(sink, HTTPSinkEffectCapability):
+        if not isinstance(factory, SinkEffectHTTPPostFactory):
+            raise SinkEffectCapabilityError(f"HTTP sink {sink_name!r} requires its nominal runtime factory")
+        if factory.safe_config_fingerprint != stable_hash(sink.config):
+            raise SinkEffectCapabilityError("HTTP factory does not bind the exact safe sink configuration")
+    elif factory is not None:
+        raise SinkEffectCapabilityError("HTTP factory requires a nominal HTTP-capable sink")
+    return factory
+
+
 def _build_sink_effect_admission_authority() -> tuple[
     Callable[..., _SinkEffectCapabilityAdmission],
     Callable[..., bool],
@@ -435,10 +466,13 @@ def _build_sink_effect_admission_authority() -> tuple[
         sink: object
         mode: str
         capability_fingerprint: tuple[object, ...]
+        http_factory: SinkEffectHTTPPostFactory | None
+        http_config_fingerprint: str | None
 
     @dataclass(frozen=True, slots=True, repr=False)
     class _AdmissionRecord:
         required_input_kind: SinkEffectInputKind
+        run_mode: RunMode
         bindings: tuple[_AdmissionBinding, ...]
 
     registry: weakref.WeakKeyDictionary[_SinkEffectCapabilityAdmission, _AdmissionRecord] = weakref.WeakKeyDictionary()
@@ -449,7 +483,13 @@ def _build_sink_effect_admission_authority() -> tuple[
         *,
         configured_modes: Mapping[str, str],
         required_input_kind: SinkEffectInputKind,
+        runtime_bindings: Mapping[str, SinkEffectRuntimeBinding],
+        run_mode: RunMode,
     ) -> _SinkEffectCapabilityAdmission:
+        if type(run_mode) is not RunMode:
+            raise SinkEffectCapabilityError("Sink admission run_mode must be an exact RunMode")
+        if runtime_bindings and set(runtime_bindings) != set(sinks):
+            raise SinkEffectCapabilityError("Runtime bindings must exactly cover the admitted sinks")
         extra_modes = set(configured_modes) - set(sinks)
         if extra_modes:
             raise SinkEffectCapabilityError(f"Sink effect configured modes contain non-runtime sink names: {sorted(extra_modes)!r}")
@@ -464,17 +504,21 @@ def _build_sink_effect_admission_authority() -> tuple[
                 mode=mode,
                 required_input_kind=required_input_kind,
             )
+            http_factory = _http_factory_for_admission(sink_name, sink, runtime_bindings, run_mode)
             bindings.append(
                 _AdmissionBinding(
                     name=sink_name,
                     sink=sink,
                     mode=mode,
                     capability_fingerprint=_capability_fingerprint(sink),
+                    http_factory=http_factory,
+                    http_config_fingerprint=http_factory.safe_config_fingerprint if http_factory is not None else None,
                 )
             )
         receipt = object.__new__(_SinkEffectCapabilityAdmission)
         record = _AdmissionRecord(
             required_input_kind=required_input_kind,
+            run_mode=run_mode,
             bindings=tuple(bindings),
         )
         with lock:
@@ -486,6 +530,8 @@ def _build_sink_effect_admission_authority() -> tuple[
         sinks: Mapping[str, SinkProtocol],
         configured_modes: Mapping[str, str],
         required_input_kind: SinkEffectInputKind,
+        runtime_bindings: Mapping[str, SinkEffectRuntimeBinding],
+        run_mode: RunMode,
     ) -> bool:
         if type(receipt) is not _SinkEffectCapabilityAdmission:
             return False
@@ -493,11 +539,14 @@ def _build_sink_effect_admission_authority() -> tuple[
             if receipt not in registry:
                 return False
             record = registry[receipt]
-        if record.required_input_kind is not required_input_kind:
+        if record.required_input_kind is not required_input_kind or record.run_mode is not run_mode:
+            return False
+        if runtime_bindings and set(runtime_bindings) != set(sinks):
             return False
         if set(configured_modes) != set(sinks) or len(record.bindings) != len(sinks):
             return False
         for binding, (sink_name, sink) in zip(record.bindings, sinks.items(), strict=True):
+            http_factory = _http_factory_for_admission(sink_name, sink, runtime_bindings, run_mode)
             if sink_name in configured_modes:
                 mode = configured_modes[sink_name]
             else:
@@ -507,6 +556,8 @@ def _build_sink_effect_admission_authority() -> tuple[
                 or binding.sink is not sink
                 or binding.mode != mode
                 or binding.capability_fingerprint != _capability_fingerprint(sink)
+                or binding.http_factory is not http_factory
+                or binding.http_config_fingerprint != (http_factory.safe_config_fingerprint if http_factory is not None else None)
             ):
                 return False
         return True
@@ -523,12 +574,16 @@ def validate_pipeline_sink_effect_capabilities(
     *,
     configured_modes: Mapping[str, str],
     required_input_kind: SinkEffectInputKind,
+    runtime_bindings: Mapping[str, SinkEffectRuntimeBinding] | None = None,
+    run_mode: RunMode = RunMode.LIVE,
 ) -> _SinkEffectCapabilityAdmission:
     """Validate every resolved sink before per-run context/lifecycle setup."""
     return _issue_sink_effect_admission(
         sinks,
         configured_modes=configured_modes,
         required_input_kind=required_input_kind,
+        runtime_bindings=runtime_bindings if runtime_bindings is not None else {},
+        run_mode=run_mode,
     )
 
 
@@ -538,6 +593,8 @@ def require_sink_effect_admission(
     configured_modes: Mapping[str, str],
     required_input_kind: SinkEffectInputKind,
     admission: object | None,
+    runtime_bindings: Mapping[str, SinkEffectRuntimeBinding] | None = None,
+    run_mode: RunMode = RunMode.LIVE,
 ) -> _SinkEffectCapabilityAdmission:
     """Accept one exact prior proof or perform the one production validation."""
     if admission is None:
@@ -545,8 +602,17 @@ def require_sink_effect_admission(
             sinks,
             configured_modes=configured_modes,
             required_input_kind=required_input_kind,
+            runtime_bindings=runtime_bindings,
+            run_mode=run_mode,
         )
-    if _lookup_sink_effect_admission(admission, sinks, configured_modes, required_input_kind):
+    if _lookup_sink_effect_admission(
+        admission,
+        sinks,
+        configured_modes,
+        required_input_kind,
+        runtime_bindings if runtime_bindings is not None else {},
+        run_mode,
+    ):
         return cast(_SinkEffectCapabilityAdmission, admission)
     raise SinkEffectCapabilityError(
         "Sink effect admission is not validator-issued and does not bind the exact runtime sinks, modes, capability, and input kind"
@@ -596,6 +662,7 @@ def assemble_and_validate_pipeline_config(
     graph: ExecutionGraph,
     sink_effect_modes: Mapping[str, str] | None = None,
     sink_effect_admission: object | None = None,
+    sink_effect_bindings: Mapping[str, SinkEffectRuntimeBinding] | None = None,
 ) -> PipelineConfig:
     """Fold aggregations into transforms, build :class:`PipelineConfig`, and
     run the four orchestrator route-target validators.
@@ -652,13 +719,13 @@ def assemble_and_validate_pipeline_config(
         coalesce_settings=(list(settings.coalesce) if settings.coalesce else []),
         sink_effect_modes=execution_modes,
         sink_effect_admission=sink_effect_admission,
+        sink_effect_bindings=execution_sink_bindings_for_runtime(settings, sink_effect_bindings or {}),
         escalation_fixpoint_bound=graph.escalation_fixpoint_bound,
     )
 
     validate_pipeline_route_targets(
         config=pipeline_config,
         route_resolution_map=graph.get_route_resolution_map(),
-        transform_id_map=graph.get_transform_id_map(),
         config_gate_id_map=graph.get_config_gate_id_map(),
         closer_names=frozenset(graph.get_error_routable_closer_names()),
     )

@@ -257,9 +257,9 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
                 built = cls(candidate)
             except Exception:
                 # A plugin-local guard rejecting this shape is a SEPARATE contract
-                # and an acceptable answer — batch_outlier_annotator and
-                # batch_replicate refuse a schema that collides with the fields
-                # they overwrite. json_explode / line_explode used to land here
+                # and an acceptable answer — batch_outlier_annotator, batch_rank
+                # and batch_replicate refuse a schema that collides with the
+                # fields they overwrite. json_explode / line_explode used to land here
                 # by refusing a schema that omitted their source field; once the
                 # candidates began declaring consumed columns
                 # (elspeth-d3958d90f5) that guard is satisfied and both moved
@@ -283,7 +283,7 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
         # The deliberate fail-closed rejections are PINNED, not counted. A count
         # would let one plugin stop guarding while another started, silently
         # swapping coverage; naming the set makes either change fail loudly.
-        assert rebuild_rejected == {"batch_outlier_annotator", "batch_replicate"}, (
+        assert rebuild_rejected == {"batch_outlier_annotator", "batch_rank", "batch_replicate"}, (
             f"the set of transforms rejecting the fixed-mode re-declaration changed: "
             f"{sorted(rebuild_rejected)}. Each is a deliberate plugin-local guard; if one "
             f"stopped rejecting it now needs to satisfy this arm instead."

@@ -12,6 +12,7 @@ import structlog
 from sqlalchemy.exc import DatabaseError, OperationalError
 
 from elspeth.contracts import Artifact, NodeState, NodeStateCompleted, NodeStateFailed, NodeStateOpen, NodeStatePending, Token, TokenOutcome
+from elspeth.contracts.audit import CallVerification
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape import explain as explain_lineage
@@ -88,6 +89,7 @@ class LoadedState:
     tree: LineageTree
     focused_state_by_node_id: Mapping[str, NodeState] = field(default_factory=dict)
     latest_state_by_node_id: Mapping[str, NodeState] = field(default_factory=dict)
+    verification_decisions: tuple[CallVerification, ...] = ()
 
     def __post_init__(self) -> None:
         freeze_fields(self, "focused_state_by_node_id", "latest_state_by_node_id")
@@ -236,6 +238,7 @@ class ExplainScreen:
                 tree=tree,
                 focused_state_by_node_id=focused_state_by_node_id,
                 latest_state_by_node_id=latest_state_by_node_id,
+                verification_decisions=tuple(factory.execution.get_verification_decisions_for_run(run_id)),
             )
         except _RECOVERABLE_DB_ERRORS as e:
             # Database connection/availability errors are recoverable via retry
@@ -393,11 +396,14 @@ class ExplainScreen:
         """Build detail panel content for non-node tree selections."""
         kind = selection["kind"]
         if kind == "run":
-            return {
+            run_detail: SelectionDetailInfo = {
                 "detail_kind": "run",
                 "title": "Run summary",
                 "run_id": selection["run_id"],
             }
+            if isinstance(self._state, LoadedState):
+                run_detail["verification_decisions"] = self._state.verification_decisions
+            return run_detail
         if kind == "token":
             token_detail: SelectionDetailInfo = {
                 "detail_kind": "token",

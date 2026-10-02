@@ -13,7 +13,7 @@ from elspeth.contracts import NodeType
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.database import _REQUIRED_COMPOSITE_FOREIGN_KEYS
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, token_parents_table, tokens_table
-from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
 
 
 def _forge_token_run(*, setup, token_id: str, forged_run_id: str) -> None:
@@ -37,7 +37,13 @@ def test_current_epoch_preserves_token_row_run_ownership_for_sqlite_and_postgres
     # auth provider CHECKs) and epoch 38 (elspeth-2d436dd6e8, the
     # scheduler_events seq key) do not touch the tokens/rows composite FK
     # this test pins; bumped to track the live constant.
-    assert SQLITE_SCHEMA_EPOCH == 38
+    # Epoch 39 adds the durable web admission binding.
+    # Epoch 40 adds call usage and admission policy evidence, retaining this FK.
+    # Epoch 41 renames the approved prompt artifact anchor.
+    # Epoch 42 rejects stored v1 admission evidence, retaining this FK.
+    # Epoch 43 adds digest shape CHECKs, retaining this FK.
+    # Epochs 44-49 retain this FK.
+    assert SQLITE_SCHEMA_EPOCH == 49
     assert (
         "tokens",
         ("row_id", "run_id"),
@@ -51,15 +57,14 @@ def test_current_epoch_preserves_token_row_run_ownership_for_sqlite_and_postgres
 
 def test_fresh_sqlite_rejects_cross_run_token_parent() -> None:
     setup = make_recorder_with_run(run_id="parent-child-run-A", source_node_id="source-A")
-    child_row = setup.data_flow.create_row(
-        "parent-child-run-A",
+    _child_row, child = setup.data_flow.create_row_with_token(
         "source-A",
+        coordination_token=leader_coordination_token(setup.factory, "parent-child-run-A"),
         row_index=0,
         data={"side": "child"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    child = setup.data_flow.create_token(child_row.row_id)
 
     setup.factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="parent-child-run-B")
     source_b = register_test_node(
@@ -69,15 +74,14 @@ def test_fresh_sqlite_rejects_cross_run_token_parent() -> None:
         node_type=NodeType.SOURCE,
         plugin_name="source",
     )
-    parent_row = setup.data_flow.create_row(
-        "parent-child-run-B",
+    _parent_row, parent = setup.data_flow.create_row_with_token(
         source_b,
+        coordination_token=leader_coordination_token(setup.factory, "parent-child-run-B"),
         row_index=0,
         data={"side": "parent"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    parent = setup.data_flow.create_token(parent_row.row_id)
 
     values: dict[str, object] = {
         "token_id": child.token_id,
@@ -93,9 +97,9 @@ def test_fresh_sqlite_rejects_cross_run_token_parent() -> None:
 
 def test_fresh_sqlite_rejects_cross_run_token_row_pair() -> None:
     setup = make_recorder_with_run(run_id="run-A", source_node_id="source-A")
-    row = setup.data_flow.create_row(
-        "run-A",
+    row, _token = setup.data_flow.create_row_with_token(
         "source-A",
+        coordination_token=leader_coordination_token(setup.factory, "run-A"),
         row_index=0,
         data={"value": 1},
         row_id="row-A",
@@ -117,16 +121,16 @@ def test_fresh_sqlite_rejects_cross_run_token_row_pair() -> None:
 
 def test_read_path_rejects_legacy_forged_token_run_mismatch() -> None:
     setup = make_recorder_with_run(run_id="run-A", source_node_id="source-A")
-    row = setup.data_flow.create_row(
-        "run-A",
+    _row, token = setup.data_flow.create_row_with_token(
         "source-A",
+        coordination_token=leader_coordination_token(setup.factory, "run-A"),
+        token_id="token-A",
         row_index=0,
         data={"value": 1},
         row_id="row-A",
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = setup.data_flow.create_token(row.row_id, token_id="token-A")
     setup.factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
     _forge_token_run(setup=setup, token_id=token.token_id, forged_run_id="run-B")
 

@@ -18,11 +18,13 @@ from typing import Any
 import pytest
 from hypothesis import strategies as st
 
+from elspeth.contracts.declaration_contracts import _snapshot_registry_for_tests
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
 
 @pytest.fixture(autouse=True)
-def _verify_plugin_manager_clean(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def _verify_plugin_manager_clean() -> Iterator[None]:
     """Ensure plugin manager is not left in a modified state after a test.
 
     Tests that use ``monkeypatch`` to patch ``get_shared_plugin_manager``
@@ -30,7 +32,29 @@ def _verify_plugin_manager_clean(monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     check that the restore actually happened. A divergent plugin list would
     silently corrupt harness coverage.
     """
+    manager = get_shared_plugin_manager()
+    sources = manager.get_sources()
+    transforms = manager.get_transforms()
+    sinks = manager.get_sinks()
+    declarations = _snapshot_registry_for_tests()
     yield
+    current = get_shared_plugin_manager()
+    assert current is manager, "Plugin registry changed: shared manager was replaced"
+    assert (current.get_sources(), current.get_transforms(), current.get_sinks()) == (sources, transforms, sinks), (
+        "Plugin registry changed: registered source, transform or sink classes leaked across a test"
+    )
+    assert _snapshot_registry_for_tests() == declarations, "Declaration registry changed across a test"
+
+
+@pytest.fixture
+def monkeypatch(_verify_plugin_manager_clean: None) -> Iterator[pytest.MonkeyPatch]:
+    """Restore patches before the registry guard compares its snapshots.
+
+    The dependency makes this ordering explicit, including when another
+    autouse fixture requests monkeypatch before the test starts.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
 
 
 @pytest.fixture(autouse=True, scope="session")

@@ -11,9 +11,30 @@ the operator procedures are the three runbooks
 [existing-service redeploy](../../docs/runbooks/azure-container-apps-existing-service-redeploy.md),
 [full disposable acceptance](../../docs/runbooks/azure-container-apps-deployment.md)).
 
-> **Status.** Prepared before the first live run. Until the sanitized receipt
-> at `docs/operator/evidence/azure-container-apps/0.8.0.json` exists, this
-> bundle is a program under acceptance, not a support claim.
+> **Status.** Implemented; desktop acceptance closed `elspeth-5ec3befc1a` on
+> 2026-09-10 under the operator's desktop-analysis ruling. No live cloud
+> acceptance is claimed. A future operator run may produce the sanitized receipt
+> at `docs/operator/evidence/azure-container-apps/0.8.1.json`; that receipt is
+> no longer a tracker closure or documentation-promotion condition.
+
+The supported operating configuration is `Single` revision mode, `sticky`
+session affinity and 2–4 replicas, with one web process per replica. External
+PostgreSQL provides single-use tickets, durable run-event replay on authorized
+peer reconnect, renewable Composer request leases with saved progress and
+current inflight accounting, and shared budgets for auth, writes and
+Composer/execution work. An interrupted provider request is not automatically
+resumed. Automatic run handoff is implemented for durable admission,
+permit-bound PREPARED initialization and eligible checkpoint resume, with
+fresh web and Landscape authority and explicit `recovery_required` exclusions.
+Integrated verification is recorded in the
+[ACA plan](../../docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification); see the
+[handoff contract](../../docs/reference/deployment-platforms.md#durable-run-handoff).
+
+Verification is limited to local PostgreSQL mechanism and integration evidence;
+no cloud receipt or no-affinity deployment qualification is claimed. The legacy
+v2 P4b receipt remains conservative `cannot_pass` with `owner_affine` and does
+not measure these new runtime capabilities. Receipt evolution is deferred;
+Single/sticky remains the operating configuration.
 
 ## Storage contract (stated once)
 
@@ -32,19 +53,67 @@ the operator procedures are the three runbooks
 | file | scope | content |
 |---|---|---|
 | `main.bicep` | subscription | resource group + `environment.bicep`; tags the group with `elspeth.acceptance-run-id` when given |
-| `environment.bicep` | resource group | VNet (delegated infrastructure subnet + private-endpoint subnet, NSG allowing 445/2049), Log Analytics, user-assigned identity, four private DNS zones, Premium FileStorage account with the NFS share (`NoRootSquash`, encryption in transit off), StorageV2 account with the payload blob container (identity is Blob Data Contributor on that container only), Key Vault (RBAC, Secrets User for the identity), Flexible Server (password auth, both databases, private endpoint, optional operator firewall rule), the Container Apps environment (Log Analytics destination, NFS storage definition), and `AcrPull` on the **existing** registry |
+| `environment.bicep` | resource group | VNet (delegated infrastructure subnet + private-endpoint subnet, NSG allowing 445/2049), Log Analytics, separate runtime and schema-owner identities and Key Vaults, four private DNS zones, Premium FileStorage account with the NFS share (`NoRootSquash`, encryption in transit off), StorageV2 account with the payload blob container (runtime identity is Blob Data Contributor on that container only), Flexible Server (password auth, both databases, private endpoint, optional operator firewall rule), the Container Apps environment (Log Analytics destination, NFS storage definition), and `AcrPull` for both identities on the **existing** registry |
 | `modules/registry-pull-role.bicep` | registry's resource group | the `AcrPull` assignment on the existing registry |
-| `workload.bicep` | resource group | the `elspeth-web` app (digest-pinned image, Key Vault secret references, NFS volume, startup/liveness/readiness probes, session affinity, scale, grace period) and the manual Jobs `provision-storage` (root image), `doctor-schema-init` (schema-owner URLs, `doctor deployment --init-schema --json`) and `doctor-runtime[-a|-b]` (runtime URLs, `doctor deployment --json`) |
+| `workload.bicep` | resource group | the `elspeth-web` app (digest-pinned image, Key Vault secret references, NFS volume, startup/liveness/readiness probes, session affinity, scale, grace period) and the manual Jobs `provision-storage` (root image), `doctor-schema-init` (schema-owner URLs, `doctor deployment --init-schema --json`), `doctor-runtime[-a|-b]` (runtime URLs, `doctor deployment --json`) and optional `verify-blob-managed-identity` (production source/sink lifecycles) |
 | `main.example.bicepparam` / `environment.example.bicepparam` | | production stack parameters |
 | `main.acceptance.bicepparam` | | disposable acceptance group: zone redundancy off, purge protection off, Burstable server with public access + operator firewall rule, 30-day retention |
 | `workload.production.bicepparam` | | `Single` mode, `sticky` affinity, 2–4 replicas, ceiling 210 s |
+| `application.example.json` | | operator application input example: required budgets, Entra login, Azure OpenAI roles and pipeline profile; replace placeholders outside Git |
 | `workload.acceptance.bicepparam` | | `Multiple` mode, `none` affinity, 1 replica, `runtimeRoleLabel` a (deploy again with b) |
 | `kql/*.kql` | | doctor report by execution; run sentinel by replica; replica lifecycle; fence-conflict 409s — SHA-256 bound into the receipt; column names verified live, never pinned by a test |
-| `scripts/acceptance.sh` | | the stage driver (group → image copy → Jobs → rollout → probes → evidence → cleanup) |
+| `scripts/acceptance.sh` | | the stage driver (environment → image copy → bootstrap → Jobs → PostgreSQL tests → production rollout/receipts → labelled probes → Single-revision probes → evidence → cleanup → bundle validation) |
 
-The `verify-blob-managed-identity` Job and the probe/receipt facade land with
-the acceptance package (6b-5); the driver's `probes` stage stops with a static
-class until then.
+Cold installation deploys `workload.bicep` with `deployWebApp=false` in
+Incremental mode before starting any Job. After storage provisioning and both
+doctors succeed, deploying with `deployWebApp=true` creates the app. The pinned
+managed-environment AVM uses the storage definition name as its physical NFS
+share name, so both are `elspeth`.
+
+Only `doctor-schema-init` attaches the schema-owner identity and reads owner
+database URLs from the schema-owner vault. Both identities read application
+keys from the runtime vault; web replicas cannot access owner credentials.
+The root `provision-storage` Job has no managed identity. The required
+`identityClientId` sets web `AZURE_CLIENT_ID` for Azure plugin authentication;
+`schemaOwnerIdentityResourceId` selects the schema-init Job identity.
+Existing shared-identity installations need the credential isolation migration
+in the redeploy runbook before using the ordinary image-only path.
+
+Acceptance parameters carry both roles in `acceptanceRuntimeSecretUrls`:
+`{a: {sessionDbUrl, landscapeUrl}, b: {sessionDbUrl, landscapeUrl}}`.
+The production, A and B parameter files carry this same object and preserve
+the production runtime URL parameters. Every deployment retains the production
+and both acceptance roles' application-scoped secret references through the
+final Single-revision pass; `runtimeRoleLabel` selects one pair per revision,
+including after restart.
+
+`scripts/resolve-workload-parameters.sh` writes concrete operator-local ARM
+JSON from environment outputs, verified image digests and Key Vault version
+IDs captured in `<secret-name>.version` files under `SECRET_VERSION_DIR`,
+plus a flat JSON object of application parameters from `APPLICATION_PARAMETERS`.
+It does not reselect latest secret versions. `scripts/validate-workload-parameters.jq` rejects placeholders before
+what-if. Redeployment reuses the retained file to preserve secret versions and
+configuration. `scripts/run-job.sh` waits on the exact newly started execution.
+The acceptance driver uses the landed probe facade; claiming live evidence
+requires an actual operator-run acceptance.
+
+The final `single-revision` stage deploys `r<sha12>-single` with `Single`
+revision mode, `sticky` affinity and exactly two replicas. Fresh P1 and P4a
+probes use persistent cookie clients through the default ingress, with process
+identities checked against the revision's replica inventory. It stores
+`single-p1.receipt.json` and `single-p4.receipt.json` under the private evidence
+directory and admits them to the receipt store. `all` includes this stage;
+the standalone stage requires the retained environment/Job evidence, resolved
+parameters, observer credentials and an existing acceptance bearer token.
+These executable checks do not constitute a completed live acceptance.
+
+For a fresh acceptance, `scripts/bootstrap-acceptance.sh` creates SQL roles and
+versioned Key Vault secrets from explicit operator-local secret files before
+Jobs start. It produces production and a/b workload parameter files plus a
+mode-0600 `acceptance-env.json` containing host observer credentials. That file
+is private operational configuration and must never enter a receipt or Git.
+The cold-only SQL scripts fail on existing roles; investigate a partial failure
+before retrying. The bootstrap commands have bounded execution time and output.
 
 ## Compile
 
@@ -65,14 +134,44 @@ against each parameter file, never on Bicep text.
 
 ## Parameters the operator must decide
 
+- `composerMaxCompositionTurns`, `composerMaxDiscoveryTurns`,
+  `composerTimeoutSeconds`, `composerRateLimitPerMinute` — required runtime
+  budgets, supplied to web and both doctors. `extraEnvironment` is web-only.
+- `authProvider` — explicit nonlocal production authentication, with SSO
+  settings, first administrator subject and quota defaults in `extraEnvironment`;
+  keep `registrationMode=closed`. Local authentication would put SQLite on NFS.
+- `composerModel` / `composerAdvisorModel` and credentials for both roles.
+  Custom endpoint URLs and key references are paired independently per role;
+  native Azure uses the `AZURE_API_*` environment values instead.
+- `extraSecrets` — `{name, keyVaultUrl}` entries for SSO/provider secrets;
+  `extraEnvironment` references these with `secretRef`. Configure pipeline
+  `ELSPETH_WEB__LLM_PROFILES` and its standard `ELSPETH_WEB__DEFAULT_LLM_PROFILE`
+  separately from Composer roles.
 - `composerTransportIdleCeilingSeconds` — required, no default, at most 240:
   the Container Apps ingress request timeout is a fixed 240 seconds; a Front
   Door or other hop in front lowers it further.
 - `image` — the registry reference **by digest**, a digest-preserving copy of
   the GitHub Container Registry image (two builds never share a digest).
+- `candidateSourceSha` — the full source commit bound to that image, used by
+  membership and operator telemetry. Revision suffixes use `r<sha12>` so a
+  hexadecimal SHA beginning with a digit remains a valid Azure suffix.
 - `provisionStorageImage` — a digest-pinned root image; the runtime image is
   `USER 1654` and the platform offers no `runAsUser`.
 - Every secret URL — a **versioned** Key Vault reference.
+
+An unsigned RC can use this same bundle: digest identity, the source OCI label
+and image smoke checks are required; CI signing and an acceptance receipt are
+not cold-install prerequisites. A newer deployment checkout can configure an
+older RC image without rebuilding it. Record the deployment checkout commit
+separately from `candidateSourceSha`, which always names the image's source.
+
+Before the window, verify the existing ACR supports the bundle's `AcrPull`
+assignments (`LegacyRegistryPermissions`) and ARM audience authentication,
+and that the ACA VNet can reach its login/data endpoints. The bundle creates
+no ACR private endpoint, VPN or operator host. The operator needs deployment
+and role-assignment rights in the target group and registry scope, nested
+deployment rights in the registry's group, and registry push rights. See the
+cold-install runbook for exact read-only checks and private SQL/Key Vault access.
 
 ## Exclusions on the record (plan D4)
 

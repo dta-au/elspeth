@@ -1,10 +1,10 @@
 """Expected boundary partition for the audit-readiness panel.
 
-ELSPETH's Three-Tier Trust Model (CLAUDE.md) treats external data as
-crossing Tier-3 at sources, at sinks, and at transforms that make
-external calls (HTTP, LLM, blob store, downstream service). The
-audit-readiness panel uses this partition to highlight which catalog
-entries an auditor must trace to source on every run.
+ELSPETH's three-tier trust model (docs/guides/data-trust-and-error-handling.md
+§The Three-Tier Trust Model) treats external data as crossing Tier-3 at
+sources, at sinks, and at transforms that make external calls (HTTP, LLM,
+blob store, downstream service). The audit-readiness panel uses this partition
+to highlight which catalog entries an auditor must trace to source on every run.
 
 Runtime classification lives in
 ``elspeth.web.audit_readiness.service._build_plugin_trust_row`` via the
@@ -176,6 +176,7 @@ EXPECTED_SOURCE_DETERMINISMS: dict[str, Determinism] = {
     "json": Determinism.IO_READ,
     "llm": Determinism.NON_DETERMINISTIC,
     "null": Determinism.DETERMINISTIC,
+    "power_automate": Determinism.EXTERNAL_CALL,
     "text": Determinism.IO_READ,
 }
 
@@ -188,6 +189,7 @@ EXPECTED_SINK_DETERMINISMS: dict[str, Determinism] = {
     "dataverse": Determinism.EXTERNAL_CALL,
     "document": Determinism.IO_WRITE,
     "json": Determinism.IO_WRITE,
+    "power_automate": Determinism.EXTERNAL_CALL,
     "text": Determinism.IO_WRITE,
 }
 
@@ -211,6 +213,7 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "batch_experiment_compare": Determinism.DETERMINISTIC,
     "batch_outlier_annotator": Determinism.DETERMINISTIC,
     "batch_paired_preference": Determinism.DETERMINISTIC,
+    "batch_rank": Determinism.DETERMINISTIC,
     "batch_replicate": Determinism.DETERMINISTIC,
     "batch_stats": Determinism.DETERMINISTIC,
     "batch_threshold_summary": Determinism.DETERMINISTIC,
@@ -223,6 +226,7 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "passthrough": Determinism.DETERMINISTIC,
     "pdf_rasterize": Determinism.IO_READ,
     "rag_retrieval": Determinism.EXTERNAL_CALL,
+    "azure_ai_search": Determinism.EXTERNAL_CALL,
     # DETERMINISTIC, not IO_READ: reference_join's table is materialized into its
     # config at load, so the transform opens nothing at row time.
     "reference_join": Determinism.DETERMINISTIC,

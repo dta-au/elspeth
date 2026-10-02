@@ -47,7 +47,8 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape import LandscapeDB
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.audit_hashing import fake_error_hash
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token, make_factory, make_landscape_db
 from tests.strategies.ids import multiple_branches
 from tests.strategies.json import row_data
 
@@ -92,6 +93,8 @@ class ModelToken:
     branch_name: str | None = None
     fork_group_id: str | None = None
     children: list[str] = field(default_factory=list)  # Child token IDs if forked
+    expected_child_count: int = 0  # Requested branch count, independent of returned children
+    coalesced_parent_ids: tuple[str, ...] = ()  # Consumed inputs, independent of persisted edges
     processed: bool = False  # Whether token has been processed by transform
 
 
@@ -191,9 +194,11 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
             canonical_version="1.0",
         )
 
+        self.authority = leader_coordination_token(self.factory, self.run.run_id)
+
         # Register nodes
         self.source_node = self.factory.data_flow.register_node(
-            run_id=self.run.run_id,
+            coordination_token=self.authority,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -202,7 +207,7 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
         )
 
         self.transform_node = self.factory.data_flow.register_node(
-            run_id=self.run.run_id,
+            coordination_token=self.authority,
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -212,7 +217,7 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
         )
 
         self.sink_node = self.factory.data_flow.register_node(
-            run_id=self.run.run_id,
+            coordination_token=self.authority,
             plugin_name="test_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0.0",
@@ -227,6 +232,15 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
         self.row_index = 0
         self.step_counter = 0
 
+    def _claim(self, token_id: str, *, node_id: str | None = None, step_index: int = 0):
+        return claim_test_work_item(
+            self.factory,
+            member_token=self.authority.membership,
+            token_id=token_id,
+            node_id=self.source_node.node_id if node_id is None else node_id,
+            step_index=step_index,
+        )
+
     def teardown(self) -> None:
         """Close the in-memory database between state machine runs."""
         self.db.close()
@@ -239,8 +253,8 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
     def create_token(self, data: dict[str, Any]) -> str:
         """Create a new token from a source row."""
         # Create row in database
-        row = self.factory.data_flow.create_row(
-            run_id=self.run.run_id,
+        row, token = self.factory.data_flow.create_row_with_token(
+            coordination_token=self.authority,
             source_node_id=self.source_node.node_id,
             row_index=self.row_index,
             data=data,
@@ -248,9 +262,6 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
             ingest_sequence=self.row_index,
         )
         self.row_index += 1
-
-        # Create token
-        token = self.factory.data_flow.create_token(row_id=row.row_id)
 
         # Update model
         self.model_tokens[token.token_id] = ModelToken(
@@ -284,12 +295,13 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
         state = self.factory.execution.begin_node_state(
             token_id=token_id,
             node_id=self.transform_node.node_id,
-            run_id=self.run.run_id,
+            member_token=self.authority.membership,
             step_index=self.step_counter,
             input_data=data,
         )
 
         self.factory.execution.complete_node_state(
+            member_token=self.authority.membership,
             state_id=state.state_id,
             status=NodeStateStatus.COMPLETED,
             output_data=data,
@@ -320,6 +332,8 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
 
         # Fork in database (this also records FORKED outcome for parent)
         children, fork_group_id = self.factory.data_flow.fork_token(
+            member_token=self.authority.membership,
+            work_item=self._claim(token_id),
             parent_ref=TokenRef(token_id=token_id, run_id=self.run.run_id),
             row_id=model.row_id,
             branches=branches,
@@ -329,6 +343,7 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
         # Update parent model state
         model.state = TokenState.FORKED
         model.children = [c.token_id for c in children]
+        model.expected_child_count = len(branches)
 
         # Create model entries for children
         child_ids = []
@@ -392,6 +407,7 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
 
         # Coalesce in database
         merged = self.factory.data_flow.coalesce_tokens(
+            coordination_token=self.authority,
             parent_refs=[TokenRef(token_id=sid, run_id=self.run.run_id) for sid in sibling_ids],
             row_id=model.row_id,
             merged_payload={"merged": True},
@@ -403,7 +419,8 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
         # retired from token_outcomes — it lives only on the merged TOKEN
         # (ruling 20), not the per-parent outcome record.
         for sib_id in sibling_ids:
-            self.factory.data_flow.record_token_outcome(
+            self.factory.data_flow.record_token_outcome_leader(
+                coordination_token=self.authority,
                 ref=TokenRef(token_id=sib_id, run_id=self.run.run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.COALESCED,
@@ -417,6 +434,7 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
             row_id=model.row_id,
             state=TokenState.CREATED,
             parent_token_id=None,  # Merged token has multiple parents (tracked in DB)
+            coalesced_parent_ids=tuple(sibling_ids),
         )
 
         return merged.token_id
@@ -436,6 +454,8 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
 
         # Record outcome in database
         self.factory.data_flow.record_token_outcome(
+            member_token=self.authority.membership,
+            work_item=self._claim(token_id),
             ref=TokenRef(token_id=token_id, run_id=self.run.run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
@@ -456,10 +476,12 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
 
         # Record outcome in database
         self.factory.data_flow.record_token_outcome(
+            member_token=self.authority.membership,
+            work_item=self._claim(token_id),
             ref=TokenRef(token_id=token_id, run_id=self.run.run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
-            error_hash="test_error_hash",
+            error_hash=fake_error_hash("test_error_hash"),
         )
 
         # Update model state
@@ -510,17 +532,28 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
 
     @invariant()
     def fork_creates_correct_number_of_children(self) -> None:
-        """Invariant: Forked parents have correct number of children in model."""
-        for token_id, model in self.model_tokens.items():
-            if model.state == TokenState.FORKED:
-                # Verify all expected children exist in database
-                for child_id in model.children:
-                    assert child_id in self.model_tokens, f"Child {child_id} of forked parent {token_id} missing from model"
-
-                    child_model = self.model_tokens[child_id]
-                    assert child_model.parent_token_id == token_id, (
-                        f"Child {child_id} has wrong parent: {child_model.parent_token_id} != {token_id}"
-                    )
+        """Invariant: Persisted direct children match the requested fork and returned IDs."""
+        with self.db.connection() as conn:
+            for token_id, model in self.model_tokens.items():
+                if model.state != TokenState.FORKED:
+                    continue
+                persisted_ids = list(
+                    conn.execute(
+                        text("""
+                            SELECT t.token_id
+                            FROM token_parents p
+                            JOIN tokens t ON t.token_id = p.token_id AND t.run_id = p.run_id
+                            WHERE p.parent_token_id = :parent_id AND p.run_id = :run_id
+                        """),
+                        {"parent_id": token_id, "run_id": self.run.run_id},
+                    ).scalars()
+                )
+                assert len(persisted_ids) == model.expected_child_count, (
+                    f"Persisted fork children for {token_id}: expected {model.expected_child_count}, got {len(persisted_ids)}"
+                )
+                assert set(persisted_ids) == set(model.children), (
+                    f"Persisted fork children for {token_id}: IDs {persisted_ids} differ from returned children {model.children}"
+                )
 
     @invariant()
     def terminal_states_have_outcomes(self) -> None:
@@ -569,25 +602,25 @@ class TokenLifecycleStateMachine(RuleBasedStateMachine):
         entry for each sibling that was consumed.
         """
         with self.db.connection() as conn:
-            for token_id, _model in self.model_tokens.items():
-                # Find tokens with join_group_id (they were created by coalesce)
+            for token_id, model in self.model_tokens.items():
+                if not model.coalesced_parent_ids:
+                    continue
                 result = conn.execute(
-                    text("SELECT join_group_id FROM tokens WHERE token_id = :token_id"),
-                    {"token_id": token_id},
+                    text("SELECT join_group_id FROM tokens WHERE token_id = :token_id AND run_id = :run_id"),
+                    {"token_id": token_id, "run_id": self.run.run_id},
                 ).fetchone()
 
-                if result is not None and result[0] is not None:
-                    # This is a merged token - verify it has parent links.
-                    # Query on the SAME connection: opening a second
-                    # db.connection() here would nest transactions on the
-                    # in-memory StaticPool under the write-intent begin
-                    # discipline (one DBAPI connection, explicit BEGINs).
-                    parent_rows = conn.execute(
-                        text("SELECT parent_token_id FROM token_parents WHERE token_id = :token_id"),
-                        {"token_id": token_id},
-                    ).fetchall()
-                    parent_ids = [r[0] for r in parent_rows]
-                    assert len(parent_ids) >= 2, f"Merged token {token_id} should have at least 2 parents, got {len(parent_ids)}"
+                assert result is not None, f"Persisted coalesce token {token_id} is missing"
+                assert result[0] is not None, f"Persisted coalesce token {token_id} has no join group"
+                parent_ids = list(
+                    conn.execute(
+                        text("SELECT parent_token_id FROM token_parents WHERE token_id = :token_id AND run_id = :run_id"),
+                        {"token_id": token_id, "run_id": self.run.run_id},
+                    ).scalars()
+                )
+                assert len(parent_ids) == len(model.coalesced_parent_ids) and set(parent_ids) == set(model.coalesced_parent_ids), (
+                    f"Persisted coalesce parents for {token_id}: expected {model.coalesced_parent_ids}, got {parent_ids}"
+                )
 
     @invariant()
     def model_count_matches_database(self) -> None:
@@ -611,6 +644,67 @@ TestTokenLifecycleStateMachine.settings = settings(max_examples=50, stateful_ste
 class TestTokenLifecycleInvariants:
     """Property tests for token lifecycle invariants using @given decorators."""
 
+    @pytest.mark.parametrize("corruption", ["missing", "extra", "replacement"])
+    def test_coalesce_invariant_detects_database_corruption(self, corruption: str) -> None:
+        machine = TokenLifecycleStateMachine()
+        try:
+            parent_id = machine.create_token({"value": 1})
+            machine.fork_token(parent_id, ["left", "middle", "right"])
+            children = machine.model_tokens[parent_id].children
+            merged_id = machine.coalesce_forked_siblings(children[0])
+            assert isinstance(merged_id, str)
+            machine.coalesce_merged_tokens_have_parent_links()
+            with machine.db.write_connection() as conn:
+                parameters = {"token_id": merged_id, "child_id": children[0], "parent_id": parent_id, "run_id": machine.run.run_id}
+                if corruption == "missing":
+                    conn.execute(text("DELETE FROM token_parents WHERE token_id = :token_id AND parent_token_id = :child_id"), parameters)
+                elif corruption == "extra":
+                    conn.execute(
+                        text(
+                            "INSERT INTO token_parents (run_id, token_id, parent_token_id, ordinal) VALUES (:run_id, :token_id, :parent_id, 3)"
+                        ),
+                        parameters,
+                    )
+                else:
+                    conn.execute(
+                        text(
+                            "UPDATE token_parents SET parent_token_id = :parent_id WHERE token_id = :token_id AND parent_token_id = :child_id"
+                        ),
+                        parameters,
+                    )
+            with pytest.raises(AssertionError, match="Persisted coalesce"):
+                machine.coalesce_merged_tokens_have_parent_links()
+        finally:
+            machine.teardown()
+
+    @pytest.mark.parametrize("corruption", ["missing", "extra", "replacement"])
+    def test_fork_child_invariant_detects_database_corruption(self, corruption: str) -> None:
+        """Changing persisted links must fail even while the model stays intact."""
+        machine = TokenLifecycleStateMachine()
+        try:
+            parent_id = machine.create_token({"value": 1})
+            machine.fork_token(parent_id, ["left", "right"])
+            machine.fork_creates_correct_number_of_children()
+            child_id = machine.model_tokens[parent_id].children[0]
+            extra_id = machine.create_token({"value": 2})
+            with machine.db.write_connection() as conn:
+                if corruption in {"missing", "replacement"}:
+                    conn.execute(
+                        text("DELETE FROM token_parents WHERE token_id = :child_id AND parent_token_id = :parent_id"),
+                        {"child_id": child_id, "parent_id": parent_id},
+                    )
+                if corruption in {"extra", "replacement"}:
+                    conn.execute(
+                        text(
+                            "INSERT INTO token_parents (run_id, token_id, parent_token_id, ordinal) VALUES (:run_id, :child_id, :parent_id, 0)"
+                        ),
+                        {"run_id": machine.run.run_id, "child_id": extra_id, "parent_id": parent_id},
+                    )
+            with pytest.raises(AssertionError, match="Persisted fork children"):
+                machine.fork_creates_correct_number_of_children()
+        finally:
+            machine.teardown()
+
     @given(token_count=st.integers(min_value=2, max_value=10))
     @settings(max_examples=20, deadline=None)
     def test_token_id_uniqueness(self, token_count: int) -> None:
@@ -624,7 +718,7 @@ class TestTokenLifecycleInvariants:
             )
 
             source_node = factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 plugin_name="test_source",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
@@ -632,8 +726,8 @@ class TestTokenLifecycleInvariants:
                 schema_config=create_dynamic_schema(),
             )
 
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row, token = factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 source_node_id=source_node.node_id,
                 row_index=0,
                 data={"value": 1},
@@ -642,9 +736,9 @@ class TestTokenLifecycleInvariants:
             )
 
             # Create multiple tokens for same row
-            token_ids = set()
-            for _ in range(token_count):
-                token = factory.data_flow.create_token(row_id=row.row_id)
+            token_ids = {token.token_id}
+            for _ in range(token_count - 1):
+                token = factory.data_flow.create_token(coordination_token=leader_coordination_token(factory, run.run_id), row_id=row.row_id)
                 assert token.token_id not in token_ids, f"Duplicate token ID: {token.token_id}"
                 token_ids.add(token.token_id)
 
@@ -661,7 +755,7 @@ class TestTokenLifecycleInvariants:
             )
 
             source_node = factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 plugin_name="test_source",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
@@ -669,8 +763,8 @@ class TestTokenLifecycleInvariants:
                 schema_config=create_dynamic_schema(),
             )
 
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row, token = factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 source_node_id=source_node.node_id,
                 row_index=0,
                 data={"value": 1},
@@ -678,13 +772,18 @@ class TestTokenLifecycleInvariants:
                 ingest_sequence=0,
             )
 
-            token = factory.data_flow.create_token(row_id=row.row_id)
-
             # Generate branch names based on count
             branches = [f"branch_{i}" for i in range(branch_count)]
 
             # Fork should record parent outcome atomically
             children, _fork_group_id = factory.data_flow.fork_token(
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                work_item=claim_test_work_item(
+                    factory,
+                    member_token=leader_coordination_token(factory, run.run_id).membership,
+                    token_id=token.token_id,
+                    node_id=source_node.node_id,
+                ),
                 parent_ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 row_id=row.row_id,
                 branches=branches,
@@ -721,7 +820,7 @@ class TestTokenLifecycleInvariants:
             )
 
             source_node = factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 plugin_name="test_source",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
@@ -729,8 +828,8 @@ class TestTokenLifecycleInvariants:
                 schema_config=create_dynamic_schema(),
             )
 
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 source_node_id=source_node.node_id,
                 row_index=0,
                 data=data,
@@ -738,10 +837,15 @@ class TestTokenLifecycleInvariants:
                 ingest_sequence=0,
             )
 
-            token = factory.data_flow.create_token(row_id=row.row_id)
-
             # Record COMPLETED outcome
             factory.data_flow.record_token_outcome(
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                work_item=claim_test_work_item(
+                    factory,
+                    member_token=leader_coordination_token(factory, run.run_id).membership,
+                    token_id=token.token_id,
+                    node_id=source_node.node_id,
+                ),
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
@@ -754,10 +858,17 @@ class TestTokenLifecycleInvariants:
 
             with pytest.raises(LandscapeRecordError) as exc_info:
                 factory.data_flow.record_token_outcome(
+                    member_token=leader_coordination_token(factory, run.run_id).membership,
+                    work_item=claim_test_work_item(
+                        factory,
+                        member_token=leader_coordination_token(factory, run.run_id).membership,
+                        token_id=token.token_id,
+                        node_id=source_node.node_id,
+                    ),
                     ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                     outcome=TerminalOutcome.FAILURE,
                     path=TerminalPath.QUARANTINED_AT_SOURCE,
-                    error_hash="test_error_hash",
+                    error_hash=fake_error_hash("test_error_hash"),
                 )
             assert isinstance(exc_info.value.__cause__, IntegrityError)
 
@@ -783,7 +894,7 @@ class TestTokenLifecycleInvariants:
             )
 
             source_node = factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 plugin_name="test_source",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
@@ -791,8 +902,8 @@ class TestTokenLifecycleInvariants:
                 schema_config=create_dynamic_schema(),
             )
 
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row, token = factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 source_node_id=source_node.node_id,
                 row_index=0,
                 data=data,
@@ -800,11 +911,17 @@ class TestTokenLifecycleInvariants:
                 ingest_sequence=0,
             )
 
-            token = factory.data_flow.create_token(row_id=row.row_id)
             original_row_id = row.row_id
 
             # Fork token
             children, _ = factory.data_flow.fork_token(
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                work_item=claim_test_work_item(
+                    factory,
+                    member_token=leader_coordination_token(factory, run.run_id).membership,
+                    token_id=token.token_id,
+                    node_id=source_node.node_id,
+                ),
                 parent_ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 row_id=row.row_id,
                 branches=["a", "b"],
@@ -834,7 +951,7 @@ class TestTokenLifecycleInvariants:
             )
 
             source_node = factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 plugin_name="test_source",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
@@ -842,8 +959,8 @@ class TestTokenLifecycleInvariants:
                 schema_config=create_dynamic_schema(),
             )
 
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row, token = factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 source_node_id=source_node.node_id,
                 row_index=0,
                 data={"value": 1},
@@ -853,8 +970,15 @@ class TestTokenLifecycleInvariants:
 
             # Create parent token and fork with variable number of branches
             branches = [chr(ord("a") + i) for i in range(parent_count)]
-            parent = factory.data_flow.create_token(row_id=row.row_id)
+            parent = token
             children, _ = factory.data_flow.fork_token(
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                work_item=claim_test_work_item(
+                    factory,
+                    member_token=leader_coordination_token(factory, run.run_id).membership,
+                    token_id=token.token_id,
+                    node_id=source_node.node_id,
+                ),
                 parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
                 row_id=row.row_id,
                 branches=branches,
@@ -863,6 +987,7 @@ class TestTokenLifecycleInvariants:
 
             # Coalesce the children
             merged = factory.data_flow.coalesce_tokens(
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 parent_refs=[TokenRef(token_id=c.token_id, run_id=run.run_id) for c in children],
                 row_id=row.row_id,
                 merged_payload={"merged": True},

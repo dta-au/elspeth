@@ -64,7 +64,7 @@
   per lane; every brief mandates an explicit `-n` (elspeth-xdist-auto defaults to `-n auto`).
 - Wave-end gates: two-lens control-location audit (wave-1 lens B mandated a repeat "esp. B38/B54"),
   range-wide frozen-narrowing sweep, full suite in a worktree (`-n 16`, background), close issues, PAUSE
-  before Wave 4. Filigree bucket issues are NOT created yet — create under epic elspeth-3ab6107b1f at
+  before Wave 4. legacy issue tracker bucket issues are NOT created yet — create under epic elspeth-3ab6107b1f at
   dispatch.
 - Still owed before the re-stage (NOT a Wave-3 gate): elspeth-23ee8e3440 (stage_status --lanes /
   --continue-on-block) and the operator's check-judge-quality re-run for the f0e38838d rotation.

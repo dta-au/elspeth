@@ -5,7 +5,9 @@ contract storage and validation.
 
 Fast path: Uses type() with frozenset membership for standard Python types (performance).
 Slow path: Uses isinstance() checks for numpy/pandas type hierarchies.
-Avoids string matching on __name__ per CLAUDE.md.
+Avoids string matching on __name__: type identity is decided nominally,
+against concrete classes, never by name (CONTRIBUTING.md §Convention:
+validate by trust domain).
 """
 
 from __future__ import annotations
@@ -50,15 +52,6 @@ class _UnsupportedContractTypeSignal:
 
 UNSUPPORTED_CONTRACT_TYPE: Final = _UnsupportedContractTypeSignal()
 NormalizedContractType = type | _UnsupportedContractTypeSignal
-
-
-def _unsupported_contract_type_message(value: Any) -> str:
-    final_type = type(value)
-    return (
-        f"Unsupported type '{final_type.__name__}' for schema contract. "
-        f"Allowed types: {', '.join(sorted(t.__name__ for t in ALLOWED_CONTRACT_TYPES))}. "
-        f"Use 'any' type declaration for fields with complex/dynamic types."
-    )
 
 
 def normalize_type_for_contract(value: Any) -> NormalizedContractType:
@@ -123,24 +116,41 @@ def normalize_type_for_contract(value: Any) -> NormalizedContractType:
     # silent misclassification of binary data as text in schema contracts.
 
     # Return an explicit unsupported signal instead of raising TypeError as a
-    # protocol value. Inference callers can map this to object/any, while
-    # fail-fast callers can opt in via require_supported_contract_type().
+    # protocol value. infer_field_type() maps it to object/any.
     final_type = type(value)
     if final_type not in ALLOWED_CONTRACT_TYPES:
         return UNSUPPORTED_CONTRACT_TYPE
     return final_type
 
 
-def require_supported_contract_type(value: Any) -> type:
-    """Normalize a value and raise TypeError when it cannot be checkpointed.
+def infer_field_type(value: Any) -> tuple[type, bool]:
+    """Infer a field's contract ``(python_type, nullable)`` from one observed value.
 
-    This keeps fail-fast callers explicit without requiring inference callers
-    to catch TypeError as a control-flow protocol.
+    The single inference rule for every contract field built from a value —
+    a source's first row (``ContractBuilder``), a transform's propagated or
+    narrowed output (``contract_propagation``) and a field a transform adds
+    or retypes one value at a time (``SchemaContract.with_field``,
+    value_transform):
+
+    * A value whose type has no contract type name — a nested object or an
+      array, whether a ``dict``/``list`` or its frozen ``MappingProxyType``/
+      ``tuple`` view — is typed ``object`` (``any``). The row still carries
+      the value, so the contract must describe it rather than refuse it.
+    * A null-like value (``None``, ``pd.NA``, ``pd.NaT``) is typed ``object``
+      and nullable: one null says the field may be null, not that it is
+      always ``NoneType``.
+
+    Non-finite floats propagate ``ValueError`` from
+    ``normalize_type_for_contract``: they are invalid audit material on every
+    path.
     """
     normalized_type = normalize_type_for_contract(value)
     if normalized_type is UNSUPPORTED_CONTRACT_TYPE:
-        raise TypeError(_unsupported_contract_type_message(value))
-    return cast(type, normalized_type)
+        return object, False
+    python_type = cast(type, normalized_type)
+    if python_type is type(None):
+        return object, True
+    return python_type, False
 
 
 @trust_boundary(

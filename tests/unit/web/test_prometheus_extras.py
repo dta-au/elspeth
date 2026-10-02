@@ -55,8 +55,8 @@ def test_prometheus_extras_are_importable() -> None:
 def test_app_imports_prometheus_extras_at_module_top() -> None:
     """Pin the import path itself — a refactor moving these imports into
     a lazy-import wrapper would silently mask the deployment dependency.
-    Use ``__dict__`` membership (not ``hasattr``) per CLAUDE.md's
-    unconditional ban on ``hasattr``.
+    Use ``__dict__`` membership (not ``hasattr``) per the unconditional ban in
+    the ``engine-patterns-reference`` skill §hasattr Alternatives.
     """
     import elspeth.web.app as app_module
 

@@ -18,20 +18,12 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import json
-from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, cast
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
-from elspeth.contracts.blobs import BlobNotFoundError, BlobRecord
-from elspeth.contracts.enums import CreationModality
-from elspeth.contracts.session_operation import SessionOperationContext
-from elspeth.web.composer import source_inspection
 from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
     _declared_field_is_required,
@@ -41,9 +33,7 @@ from elspeth.web.composer.source_inspection import (
     facts_to_dict,
     inspect_blob_content,
     inspect_csv_source_content,
-    inspect_selected_ready_session_blob,
 )
-from tests.helpers.session_fences import make_blob_read_context
 
 
 class TestDeclaredFieldIsRequiredBoundary:
@@ -647,263 +637,6 @@ class TestBoundedReads:
         assert int(f.redacted_identity["byte_size"]) == len(big)
 
 
-class TestSelectedBlobIdentity:
-    def test_explicit_selection_wins_over_newer_ready_blob(self) -> None:
-        earlier = uuid4()
-        newer = uuid4()
-
-        selected = source_inspection.resolve_source_inspection_blob_id(
-            selected_blob_id=earlier,
-            ready_blob_ids=(newer, earlier),
-        )
-
-        assert selected == earlier
-
-    def test_multiple_ready_blobs_without_selection_are_ambiguous(self) -> None:
-        assert (
-            source_inspection.resolve_source_inspection_blob_id(
-                selected_blob_id=None,
-                ready_blob_ids=(uuid4(), uuid4()),
-            )
-            is None
-        )
-
-    def test_one_ready_blob_resolves_without_temporal_choice(self) -> None:
-        only = uuid4()
-
-        assert (
-            source_inspection.resolve_source_inspection_blob_id(
-                selected_blob_id=None,
-                ready_blob_ids=(only,),
-            )
-            == only
-        )
-
-    def test_explicit_selection_must_name_a_ready_session_blob(self) -> None:
-        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
-            source_inspection.resolve_source_inspection_blob_id(
-                selected_blob_id=uuid4(),
-                ready_blob_ids=(uuid4(),),
-            )
-
-
-def _blob_record_stub(
-    *,
-    blob_id: UUID | None = None,
-    session_id: UUID | None = None,
-    filename: str = "blob.csv",
-    mime_type: str = "text/csv",
-    size_bytes: int = 0,
-    content_hash: str | None = None,
-    storage_path: str = "/tmp/data/blobs/blob.csv",
-    status: str = "ready",
-) -> BlobRecord:
-    return BlobRecord(
-        id=blob_id or uuid4(),
-        session_id=session_id or uuid4(),
-        filename=filename,
-        mime_type=cast(Any, mime_type),
-        size_bytes=size_bytes,
-        content_hash=content_hash,
-        storage_path=storage_path,
-        created_at=datetime.now(UTC),
-        created_by="user",
-        source_description=None,
-        status=cast(Any, status),
-        creation_modality=CreationModality.VERBATIM,
-        created_from_message_id=None,
-        creating_model_identifier=None,
-        creating_model_version=None,
-        creating_provider=None,
-        creating_composer_skill_hash=None,
-        creating_arguments_hash=None,
-    )
-
-
-class _NoListingBlobService:
-    """Spy blob service that fails the test if a full-session listing occurs.
-
-    Stands in for ``BlobServiceProtocol`` in a shape narrow enough for
-    ``inspect_selected_ready_session_blob``: an explicit ``selected_blob_id``
-    must resolve via ``get_blob`` (session-qualified single-row lookup), never
-    via ``list_blobs`` — a session can hold an unbounded number of blobs, and
-    materializing all of them just to find one explicitly-named blob is
-    exactly the cost Finding A flags.
-
-    Deliberately has **no** ``read_blob_content`` method: a large blob is
-    represented only through ``read_blob_content_prefix_verified``, so a
-    regression that reintroduces a full-content read (Finding B) fails loudly
-    with ``AttributeError`` instead of silently passing.
-    """
-
-    def __init__(self, record: BlobRecord, content: bytes) -> None:
-        self._record = record
-        self._content = content
-
-    async def get_blob(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
-        assert type(session_operation_context) is SessionOperationContext
-        if blob_id != self._record.id:
-            raise BlobNotFoundError(str(blob_id))
-        return self._record
-
-    async def list_blobs(self, session_id: UUID, limit: int | None = 50, offset: int = 0) -> list[BlobRecord]:
-        del session_id, limit, offset
-        raise AssertionError("explicit selection must not list session blobs")
-
-    async def read_blob_content_prefix_verified(
-        self,
-        blob_id: UUID,
-        *,
-        prefix_bytes: int,
-        session_operation_context: SessionOperationContext,
-    ) -> tuple[bytes, str, int]:
-        assert type(session_operation_context) is SessionOperationContext
-        assert blob_id == self._record.id
-        verified_hash = hashlib.sha256(self._content).hexdigest()
-        return self._content[:prefix_bytes], verified_hash, len(self._content)
-
-
-class TestExplicitSelectionResolvesDirectly:
-    """Finding A: an explicit ``selected_blob_id`` must resolve with a direct,
-    session-qualified ``get_blob`` lookup — not ``list_blobs(limit=None)`` +
-    a Python filter over every blob in the session.
-    """
-
-    def test_explicit_selection_never_lists_session_blobs(self) -> None:
-        session_id = uuid4()
-        content = b"id\n1\n"
-        record = _blob_record_stub(
-            session_id=session_id,
-            content_hash=hashlib.sha256(content).hexdigest(),
-            size_bytes=len(content),
-        )
-        service = _NoListingBlobService(record, content)
-
-        facts = asyncio.run(
-            inspect_selected_ready_session_blob(
-                cast(Any, service),
-                session_id,
-                selected_blob_id=record.id,
-                session_operation_context=make_blob_read_context(session_id),
-            )
-        )
-
-        assert facts is not None
-        assert facts.source_kind == "csv"
-
-    def test_explicit_selection_rejects_blob_from_other_session(self) -> None:
-        session_id = uuid4()
-        content = b"id\n1\n"
-        record = _blob_record_stub(
-            session_id=uuid4(),  # a different session
-            content_hash=hashlib.sha256(content).hexdigest(),
-        )
-        service = _NoListingBlobService(record, content)
-
-        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
-            asyncio.run(
-                inspect_selected_ready_session_blob(
-                    cast(Any, service),
-                    session_id,
-                    selected_blob_id=record.id,
-                    session_operation_context=make_blob_read_context(session_id),
-                )
-            )
-
-    def test_explicit_selection_rejects_non_ready_blob(self) -> None:
-        session_id = uuid4()
-        content = b"id\n1\n"
-        record = _blob_record_stub(
-            session_id=session_id,
-            content_hash=hashlib.sha256(content).hexdigest(),
-            status="pending",
-        )
-        service = _NoListingBlobService(record, content)
-
-        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
-            asyncio.run(
-                inspect_selected_ready_session_blob(
-                    cast(Any, service),
-                    session_id,
-                    selected_blob_id=record.id,
-                    session_operation_context=make_blob_read_context(session_id),
-                )
-            )
-
-    def test_explicit_selection_rejects_unknown_blob_id(self) -> None:
-        session_id = uuid4()
-        record = _blob_record_stub(session_id=session_id)
-        service = _NoListingBlobService(record, b"")
-
-        with pytest.raises(ValueError, match="selected source blob is not ready in this session"):
-            asyncio.run(
-                inspect_selected_ready_session_blob(
-                    cast(Any, service),
-                    session_id,
-                    selected_blob_id=uuid4(),
-                    session_operation_context=make_blob_read_context(session_id),
-                )
-            )
-
-    def test_large_blob_never_requires_full_content_bytes(self) -> None:
-        """Finding B (memory): the module must never need — or be handed —
-        a full-content bytes object for a large blob. It only ever accepts a
-        bounded prefix plus a size/hash the store already verified.
-
-        The fake blob service below declares a 100 MiB blob but never
-        constructs 100 MiB of Python bytes anywhere (here or in
-        ``inspect_selected_ready_session_blob``/``inspect_blob_content``) —
-        only an ``int`` size and a bounded prefix cross the boundary.
-        """
-        session_id = uuid4()
-        total_size = 100 * 1024 * 1024  # 100 MiB — never materialized.
-        prefix = b"id,name\n1,a\n"
-        verified_hash = "a" * 64  # opaque digest the fake store "verified"
-        record = _blob_record_stub(
-            session_id=session_id,
-            content_hash=verified_hash,
-            size_bytes=total_size,
-            filename="huge.csv",
-        )
-
-        class _HugeBlobService:
-            async def get_blob(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
-                assert type(session_operation_context) is SessionOperationContext
-                assert blob_id == record.id
-                return record
-
-            async def list_blobs(self, *args: object, **kwargs: object) -> list[BlobRecord]:
-                raise AssertionError("explicit selection must not list session blobs")
-
-            async def read_blob_content_prefix_verified(
-                self,
-                blob_id: UUID,
-                *,
-                prefix_bytes: int,
-                session_operation_context: SessionOperationContext,
-            ) -> tuple[bytes, str, int]:
-                assert type(session_operation_context) is SessionOperationContext
-                assert blob_id == record.id
-                # A real streaming store hashes chunk-by-chunk; this fake
-                # need only prove the module is satisfied by a small prefix
-                # + an already-verified hash + a total size — never the
-                # full 100 MiB.
-                return prefix[:prefix_bytes], verified_hash, total_size
-
-        facts = asyncio.run(
-            inspect_selected_ready_session_blob(
-                cast(Any, _HugeBlobService()),
-                session_id,
-                selected_blob_id=record.id,
-                session_operation_context=make_blob_read_context(session_id),
-            )
-        )
-
-        assert facts is not None
-        assert int(facts.redacted_identity["byte_size"]) == total_size
-        assert facts.byte_range_inspected[1] <= source_inspection._MAX_BYTES
-
-
 # --------------------------------------------------------------------------
 # Frozen / deep immutability
 # --------------------------------------------------------------------------
@@ -1114,6 +847,126 @@ class TestDeriveRequiredHeaderMismatchRisk:
 
 
 class TestFactsToDict:
+    def test_csv_runtime_names_skip_leading_blank_records(self) -> None:
+        facts = inspect_blob_content(content=b"\n\nCase Study_\nexample\n", filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers == ("case_study",)
+        assert facts.field_name_mapping == {"Case Study_": "case_study"}
+
+    def test_csv_runtime_mapping_retains_original_label_whitespace(self) -> None:
+        facts = inspect_blob_content(content=b" Case Study_ \nexample\n", filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers == ("case_study",)
+        assert facts.field_name_mapping == {" Case Study_ ": "case_study"}
+
+    def test_csv_invalid_quoted_header_has_no_runtime_projection(self) -> None:
+        facts = inspect_blob_content(content=b'"Case Study_\nexample\n', filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers is None
+        assert facts.field_name_mapping is None
+        assert any("csv_header_parse_failed" in warning for warning in facts.warnings)
+
+    def test_csv_truncated_quoted_data_preserves_complete_runtime_header(self) -> None:
+        facts = inspect_blob_content(content=b'Case Study_\n"' + b"x" * 9000 + b'"\n', filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers == ("case_study",)
+        assert facts.field_name_mapping == {"Case Study_": "case_study"}
+        assert not any("csv_header_parse_failed" in warning for warning in facts.warnings)
+
+    def test_csv_truncated_unquoted_header_does_not_claim_a_runtime_name(self) -> None:
+        facts = inspect_blob_content(content=b"Case Study_" + b"x" * 9000 + b"\nexample\n", filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers is None
+        assert facts.field_name_mapping is None
+        assert any("csv_header_sample_truncated" in warning for warning in facts.warnings)
+
+    def test_csv_complete_header_at_artifact_eof_is_still_projected(self) -> None:
+        facts = inspect_blob_content(content=b"Case Study_", filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers == ("case_study",)
+
+    def test_csv_undecodable_header_does_not_claim_a_runtime_name(self) -> None:
+        facts = inspect_blob_content(content=b"\xffCase Study_\nexample\n", filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers is None
+        assert facts.field_name_mapping is None
+        assert any("csv_header_decode_failed" in warning for warning in facts.warnings)
+
+    @pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-32"])
+    def test_csv_bom_projection_waits_for_an_explicit_runtime_encoding(self, encoding: str) -> None:
+        facts = inspect_blob_content(content="Case Study_\nexample\n".encode(encoding), filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers is None
+        assert facts.field_name_mapping is None
+        assert any("csv_encoding_bom_detected" in warning for warning in facts.warnings)
+
+    @pytest.mark.parametrize("newline", [b"\r", b"\r\n"])
+    def test_csv_runtime_projection_uses_csv_universal_newlines(self, newline: bytes) -> None:
+        facts = inspect_blob_content(content=newline.join((b"Case Study_", b"example", b"")), filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers == ("case_study",)
+
+    def test_csv_prefix_inspection_knows_full_artifact_is_larger(self) -> None:
+        facts = inspect_blob_content(
+            content=b"Case Study_" + b"x" * 100,
+            filename="cases.csv",
+            mime_type="text/csv",
+            total_size_bytes=10000,
+        )
+        assert facts.runtime_headers is None
+        assert any("csv_header_sample_truncated" in warning for warning in facts.warnings)
+
+    def test_csv_skip_rows_does_not_promote_a_truncated_header(self) -> None:
+        facts = inspect_csv_source_content(
+            content=b"preamble\nCase Study_" + b"x" * 9000 + b"\nexample\n",
+            filename="cases.csv",
+            mime_type="text/csv",
+            delimiter=",",
+            skip_rows=1,
+        )
+        assert facts.runtime_headers is None
+        assert any("csv_header_sample_truncated" in warning for warning in facts.warnings)
+
+    def test_csv_truncated_skipped_record_has_no_runtime_projection(self) -> None:
+        facts = inspect_csv_source_content(
+            content=b"preamble" + b"x" * 9000 + b"\nCase Study_\nexample\n",
+            filename="cases.csv",
+            mime_type="text/csv",
+            delimiter=",",
+            skip_rows=1,
+        )
+        assert facts.runtime_headers is None
+
+    def test_csv_exposes_runtime_names_without_replacing_original_labels(self) -> None:
+        facts = inspect_blob_content(
+            content=b"Case Study_,User ID\nSynthetic case,1\n",
+            filename="cases.csv",
+            mime_type="text/csv",
+        )
+        payload = facts_to_dict(facts)
+        assert payload["observed_headers"] == ["Case Study_", "User ID"]
+        assert payload["runtime_headers"] == ["case_study", "user_id"]
+        assert payload["field_name_mapping"] == {"Case Study_": "case_study", "User ID": "user_id"}
+        assert "Synthetic case" not in str(payload)
+
+    def test_csv_explicit_columns_remain_as_written(self) -> None:
+        facts = inspect_csv_source_content(
+            content=b"Synthetic case,1\n",
+            filename="cases.csv",
+            mime_type="text/csv",
+            delimiter=",",
+            skip_rows=0,
+            columns=("Case_", "ID"),
+        )
+        payload = facts_to_dict(facts)
+        assert payload["runtime_headers"] == ["Case_", "ID"]
+        assert payload["field_name_mapping"] == {"Case_": "Case_", "ID": "ID"}
+
+    @pytest.mark.parametrize("header", [b"Case Study,case_study", b"id,id", b",id", b"!!!,id"])
+    def test_csv_unresolvable_headers_do_not_fabricate_runtime_names(self, header: bytes) -> None:
+        facts = inspect_blob_content(content=header + b"\n1,2\n", filename="cases.csv", mime_type="text/csv")
+        payload = facts_to_dict(facts)
+        assert payload["runtime_headers"] is None
+        assert payload["field_name_mapping"] is None
+        assert any("csv_field_normalization_failed" in warning for warning in facts.warnings)
+
+    def test_text_has_no_tabular_runtime_names(self) -> None:
+        facts = inspect_blob_content(content=b"Synthetic instructions", filename="context.md", mime_type="text/markdown")
+        payload = facts_to_dict(facts)
+        assert payload["runtime_headers"] is None
+        assert payload["field_name_mapping"] is None
+
     def test_round_trip_shape(self) -> None:
         f = inspect_blob_content(
             content=b"id,name\n1,Alice\n",

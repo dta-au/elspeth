@@ -14,8 +14,6 @@ def test_user_preferences_table_columns() -> None:
     column_names = {c.name for c in table.columns}
     assert column_names == {
         "user_id",
-        "default_composer_mode",
-        "banner_dismissed_at",
         "freeform_intro_dismissed_at",
         "tutorial_completed_at",
         "tutorial_stage",
@@ -39,31 +37,9 @@ def test_user_preferences_user_id_is_primary_key() -> None:
     assert pk_columns == {"user_id"}
 
 
-def test_default_composer_mode_has_server_default_guided() -> None:
-    """The stored default for new rows is 'guided' even at the DB level."""
+def test_user_preferences_table_has_no_composer_mode_column() -> None:
     table = metadata.tables["user_preferences"]
-    column = table.c.default_composer_mode
-    # Server default's `.arg` is "guided" when set via `server_default="guided"`.
-    assert column.server_default is not None
-    assert "guided" in str(column.server_default.arg)
-
-
-def test_default_composer_mode_check_constraint_closes_the_enum() -> None:
-    """A DB-level CHECK rejects writes outside {'guided', 'freeform'}.
-
-    Defense in depth: the Pydantic boundary rejects bad input at the API
-    edge, and the service's Tier-1 read guard crashes on stored garbage —
-    this check also blocks direct-SQL writes from persisting an invalid
-    mode in the first place. Mirrors the codebase pattern across every
-    other closed-enum column in sessions/models.py (trust_mode,
-    density_default, blob status, run status, audit_access_log
-    writer_principal).
-    """
-    from sqlalchemy import CheckConstraint
-
-    table = metadata.tables["user_preferences"]
-    check_names = {c.name for c in table.constraints if isinstance(c, CheckConstraint)}
-    assert "ck_user_preferences_default_composer_mode" in check_names
+    assert "default_composer_mode" not in table.c
 
 
 def test_tutorial_completed_at_is_nullable_timestamp() -> None:

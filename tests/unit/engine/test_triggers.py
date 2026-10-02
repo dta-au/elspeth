@@ -569,7 +569,8 @@ class TestTriggerConditionLatching:
 class TestTriggerConditionBooleanValidation:
     """Tests for P2-2026-01-31: Trigger condition must return boolean.
 
-    Per CLAUDE.md Three-Tier Trust Model: trigger config is "our data" (Tier 1).
+    Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    Model: trigger config is "our data" (Tier 1).
     Non-boolean results should be rejected, not silently coerced with bool().
     """
 
@@ -1398,7 +1399,7 @@ class TestAnchorRewindRecompute:
     carry an EARLIER durable arrival than already-adopted members. The count
     and condition latches (and therefore the persisted checkpoint offsets)
     must be pure functions of the durable member set, invariant under
-    adoption order (filigree elspeth-eed319ed3d). Timeout already anchors at
+    adoption order (archived issue elspeth-eed319ed3d). Timeout already anchors at
     the min durable arrival; these tests pin count/condition parity.
     """
 

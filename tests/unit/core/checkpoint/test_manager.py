@@ -23,6 +23,7 @@ from elspeth.core.checkpoint.manager import CheckpointCorruptionError, Checkpoin
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import checkpoints_table, nodes_table, rows_table, run_coordination_table, runs_table, tokens_table
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 
@@ -50,7 +51,7 @@ def _insert_checkpoint_prereqs(
         runs_table.insert().values(
             run_id=run_id,
             started_at=now,
-            config_hash="cfg",
+            config_hash=fake_sha256("cfg"),
             settings_json="{}",
             canonical_version="sha256-rfc8785-v1",
             status=RunStatus.RUNNING,
@@ -66,7 +67,7 @@ def _insert_checkpoint_prereqs(
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
             determinism=Determinism.DETERMINISTIC,
-            config_hash="node_cfg",
+            config_hash=fake_sha256("node_cfg"),
             config_json="{}",
             registered_at=now,
         )
@@ -79,7 +80,7 @@ def _insert_checkpoint_prereqs(
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
-            source_data_hash="hash",
+            source_data_hash=fake_sha256("hash"),
             created_at=now,
         )
     )

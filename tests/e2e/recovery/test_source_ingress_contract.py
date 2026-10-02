@@ -16,6 +16,7 @@ import pytest
 
 from elspeth.contracts import NodeStateStatus, RunStatus, SourceRow, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import SourceGuaranteedFieldsViolation
+from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
@@ -224,7 +225,7 @@ def test_pre_row_source_failure_records_operation_without_row_token_or_scheduler
     assert image.tables["runs"][0]["status"] == RunStatus.FAILED.value
 
 
-def test_quarantined_source_row_records_diversion_and_never_enters_scheduler(tmp_path: Path) -> None:
+def test_quarantined_source_row_records_diversion_through_a_durable_sink_handoff(tmp_path: Path) -> None:
     source = _QuarantineSource()
     output_sink = CollectSink("output")
     quarantine_sink = CollectSink("quarantine")
@@ -237,7 +238,28 @@ def test_quarantined_source_row_records_diversion_and_never_enters_scheduler(tmp
     )
 
     _assert_complete_image(image)
-    _assert_no_scheduler_work(image)
+    # The quarantined row reaches its sink through the same durable handoff as
+    # every other sink-bound token: a born-parked PENDING_SINK item on the
+    # terminal lane (no producer node), written in the ingest transaction and
+    # terminalized after the sink write.
+    token_id = image.tables["tokens"][0]["token_id"]
+    assert [
+        (row["token_id"], row["node_id"], row["status"], row["pending_sink_name"], row["pending_outcome"], row["pending_path"])
+        for row in image.tables["token_work_items"]
+    ] == [
+        (
+            token_id,
+            None,
+            TokenWorkStatus.TERMINAL.value,
+            "quarantine",
+            TerminalOutcome.FAILURE.value,
+            TerminalPath.QUARANTINED_AT_SOURCE.value,
+        )
+    ]
+    assert [(row["event_type"], row["from_status"], row["to_status"]) for row in image.tables["scheduler_events"]] == [
+        (SchedulerEventType.MARK_PENDING_SINK.value, None, TokenWorkStatus.PENDING_SINK.value),
+        (SchedulerEventType.MARK_PENDING_SINK_TERMINAL.value, TokenWorkStatus.PENDING_SINK.value, TokenWorkStatus.TERMINAL.value),
+    ]
     assert status == RunStatus.COMPLETED_WITH_FAILURES
     assert output_sink.results == []
     assert quarantine_sink.results == [{"value": "not-an-integer"}]

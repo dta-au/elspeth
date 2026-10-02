@@ -22,13 +22,22 @@ format stability.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import json
 import math
+import re
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, Literal, Protocol, cast, get_args, runtime_checkable
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, require_int
+from elspeth.contracts.http_policy import HTTP_FAILURE_CODES, HTTPFailureCode
+from elspeth.contracts.payload_store import IntegrityError
 from elspeth.contracts.token_usage import TokenUsage
 
 # ---------------------------------------------------------------------------
@@ -69,9 +78,13 @@ class RawCallPayload:
 # LLM call data
 # ---------------------------------------------------------------------------
 
-_LLM_REQUEST_RESERVED_KEYS = frozenset(
-    {"model", "messages", "temperature", "provider", "max_tokens"},
-)
+# The output-budget parameter has two wire names: ``max_tokens`` and its
+# successor ``max_completion_tokens``, which reasoning deployments require and
+# which also counts reasoning tokens. The request records whichever name was
+# sent, so both are reserved.
+_LLM_MAX_TOKENS_PARAMS = frozenset({"max_tokens", "max_completion_tokens"})
+
+_LLM_REQUEST_RESERVED_KEYS = frozenset({"model", "messages", "temperature", "provider"}) | _LLM_MAX_TOKENS_PARAMS
 
 
 def _require_non_empty_str(value: object, field_name: str) -> str:
@@ -142,17 +155,25 @@ class LLMCallRequest:
 
     model: str
     messages: Sequence[Mapping[str, Any]]
-    temperature: float
+    # None = the request carried no temperature (provider default). Recorded
+    # as absent, never as 0.0: the audit trail must not claim a value that
+    # was not sent.
+    temperature: float | None
     provider: str
     max_tokens: int | None = None
+    # Wire name max_tokens was sent under (see _LLM_MAX_TOKENS_PARAMS).
+    max_tokens_param: str = "max_tokens"
     extra_kwargs: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.model, "model")
         _require_message_sequence(self.messages)
-        _require_finite_number(self.temperature, "temperature")
+        if self.temperature is not None:
+            _require_finite_number(self.temperature, "temperature")
         _require_non_empty_str(self.provider, "provider")
         require_int(self.max_tokens, "max_tokens", optional=True, min_value=0)
+        if self.max_tokens_param not in _LLM_MAX_TOKENS_PARAMS:
+            raise ValueError(f"max_tokens_param must be one of {sorted(_LLM_MAX_TOKENS_PARAMS)}, got {self.max_tokens_param!r}")
         # Always deep-freeze inner message dicts — a pre-built tuple may
         # still contain mutable inner dicts (e.g. tuple([{"role": "user"}])).
         object.__setattr__(
@@ -170,19 +191,38 @@ class LLMCallRequest:
     def to_dict(self) -> dict[str, Any]:
         """Serialize to audit-trail dict.
 
-        Conditionally omits ``max_tokens`` when None, spreads
-        ``extra_kwargs`` to match the old ``**kwargs`` pattern.
+        Conditionally omits ``temperature`` and ``max_tokens`` when None,
+        records ``max_tokens`` under the wire name it was sent with, and
+        spreads ``extra_kwargs`` to match the old ``**kwargs`` pattern.
         """
         d: dict[str, Any] = {
             "model": self.model,
             "messages": [deep_thaw(m) for m in self.messages],
-            "temperature": self.temperature,
-            "provider": self.provider,
-            **deep_thaw(self.extra_kwargs),
         }
+        if self.temperature is not None:
+            d["temperature"] = self.temperature
+        d["provider"] = self.provider
+        d.update(deep_thaw(self.extra_kwargs))
         if self.max_tokens is not None:
-            d["max_tokens"] = self.max_tokens
+            d[self.max_tokens_param] = self.max_tokens
         return d
+
+
+def _require_llm_pricing(
+    pricing_model: str | None, provider_cost: float | None, provider_cost_source: ComposerLLMProviderCostSource
+) -> None:
+    if pricing_model is not None:
+        _require_non_empty_str(pricing_model, "pricing_model")
+        if not pricing_model.strip():
+            raise ValueError("pricing_model must not be blank")
+    if provider_cost_source not in get_args(ComposerLLMProviderCostSource):
+        raise ValueError("provider_cost_source is not recognized")
+    if provider_cost is not None:
+        _require_finite_number(provider_cost, "provider_cost")
+        if provider_cost < 0:
+            raise ValueError("provider_cost must be nonnegative")
+    if (provider_cost is None) != (provider_cost_source == "not_available"):
+        raise ValueError("provider_cost and provider_cost_source must agree on availability")
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +233,9 @@ class LLMCallResponse:
     model: str
     usage: TokenUsage
     raw_response: Mapping[str, Any]
+    pricing_model: str | None = None
+    provider_cost: float | None = None
+    provider_cost_source: ComposerLLMProviderCostSource = "not_available"
 
     def __post_init__(self) -> None:
         freeze_fields(self, "raw_response")
@@ -201,6 +244,7 @@ class LLMCallResponse:
         if type(self.usage) is not TokenUsage:
             raise TypeError(f"usage must be TokenUsage, got {type(self.usage).__name__}: {self.usage!r}")
         _require_mapping(self.raw_response, "raw_response")
+        _require_llm_pricing(self.pricing_model, self.provider_cost, self.provider_cost_source)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to audit-trail dict.
@@ -212,7 +256,22 @@ class LLMCallResponse:
             "model": self.model,
             "usage": self.usage.to_dict(),
             "raw_response": deep_thaw(self.raw_response),
+            "pricing_model": self.pricing_model,
+            "provider_cost": self.provider_cost,
+            "provider_cost_source": self.provider_cost_source,
         }
+
+
+LLMErrorCategory = Literal[
+    "rate_limit",
+    "content_policy",
+    "context_length",
+    "server",
+    "network",
+    "client",
+    "unknown",
+    "response_processing",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,12 +281,19 @@ class LLMCallError:
     type: str
     message: str
     retryable: bool
+    pricing_model: str | None = None
+    provider_cost: float | None = None
+    provider_cost_source: ComposerLLMProviderCostSource = "not_available"
+    category: LLMErrorCategory | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.type, "LLMCallError.type")
         _require_non_empty_str(self.message, "LLMCallError.message")
         if type(self.retryable) is not bool:
             raise TypeError(f"LLMCallError.retryable must be bool, got {type(self.retryable).__name__}: {self.retryable!r}")
+        _require_llm_pricing(self.pricing_model, self.provider_cost, self.provider_cost_source)
+        if self.category is not None and self.category not in get_args(LLMErrorCategory):
+            raise ValueError(f"LLMCallError.category is not recognized: {self.category!r}")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to audit-trail dict.
@@ -238,12 +304,203 @@ class LLMCallError:
             "type": self.type,
             "message": self.message,
             "retryable": self.retryable,
+            "pricing_model": self.pricing_model,
+            "provider_cost": self.provider_cost,
+            "provider_cost_source": self.provider_cost_source,
+            **({"category": self.category} if self.category is not None else {}),
         }
 
 
 # ---------------------------------------------------------------------------
 # HTTP call data
 # ---------------------------------------------------------------------------
+
+
+def encode_urlencoded_form(form: Sequence[tuple[str, str]]) -> bytes:
+    """Encode ordered form fields for both the wire request and audit digest."""
+    if not form:
+        raise ValueError("form must contain at least one field")
+    for pair in form:
+        if type(pair) is not tuple or len(pair) != 2 or type(pair[0]) is not str or type(pair[1]) is not str or not pair[0]:
+            raise ValueError("form fields must be nonempty names paired with string values")
+    return urllib.parse.urlencode(form).encode("ascii")
+
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _multipart_header_text(value: str, *, field_name: str) -> str:
+    if type(value) is not str or not value or len(value) > 200 or any(ord(char) < 32 or ord(char) > 126 for char in value):
+        raise ValueError(f"multipart {field_name} must be 1-200 printable ASCII characters")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class MultipartPart:
+    """One ordered text field or one content-addressed file field."""
+
+    name: str
+    value: str | None = None
+    blob_ref: str | None = None
+    filename: str | None = None
+    content_type: str | None = None
+
+    def __post_init__(self) -> None:
+        _multipart_header_text(self.name, field_name="name")
+        if (self.value is None) == (self.blob_ref is None):
+            raise ValueError("multipart part needs exactly one of value or blob_ref")
+        if self.value is not None:
+            if type(self.value) is not str or self.filename is not None or self.content_type is not None:
+                raise ValueError("multipart text part must contain only a string value")
+            return
+        if type(self.blob_ref) is not str or _SHA256_HEX.fullmatch(self.blob_ref) is None:
+            raise ValueError("multipart blob_ref must be a lowercase SHA-256 hash")
+        if self.filename is None or self.content_type is None:
+            raise ValueError("multipart blob part requires filename and content_type")
+        _multipart_header_text(self.filename, field_name="filename")
+        if "/" in self.filename or "\\" in self.filename:
+            raise ValueError("multipart filename must not contain path separators")
+        _multipart_header_text(self.content_type, field_name="content_type")
+        if "/" not in self.content_type:
+            raise ValueError("multipart content_type must be a MIME type")
+
+    def to_dict(self) -> dict[str, str]:
+        if self.value is not None:
+            return {"name": self.name, "value": self.value}
+        if self.blob_ref is None or self.filename is None or self.content_type is None:
+            raise ValueError("multipart blob part is incomplete")
+        return {"name": self.name, "blob_ref": self.blob_ref, "filename": self.filename, "content_type": self.content_type}
+
+
+@dataclass(frozen=True, slots=True)
+class MultipartMetadata:
+    """Versioned manifest and digest for exact multipart wire bytes."""
+
+    parts: tuple[MultipartPart, ...]
+    boundary: str
+    body_sha256: str
+    body_size: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.parts) <= 256 or any(type(part) is not MultipartPart for part in self.parts):
+            raise ValueError("multipart metadata needs 1 to 256 typed parts")
+        if type(self.boundary) is not str or re.fullmatch(r"elspeth-[0-9a-f]{32}", self.boundary) is None:
+            raise ValueError("multipart metadata has invalid boundary")
+        if type(self.body_sha256) is not str or _SHA256_HEX.fullmatch(self.body_sha256) is None:
+            raise ValueError("multipart metadata has invalid body hash")
+        require_int(self.body_size, "body_size", min_value=1)
+        if sum(len(part.value) for part in self.parts if part.value is not None) > self.body_size:
+            raise ValueError("multipart text exceeds body size")
+
+    @property
+    def content_type(self) -> str:
+        return f"multipart/form-data; boundary={self.boundary}"
+
+
+def _multipart_boundary(parts: tuple[MultipartPart, ...]) -> str:
+    manifest = json.dumps([part.to_dict() for part in parts], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "elspeth-" + hashlib.sha256(manifest).hexdigest()[:32]
+
+
+def _multipart_prefix(part: MultipartPart, boundary: str) -> bytes:
+    name = part.name.replace("\\", "\\\\").replace('"', '\\"')
+    disposition = f'Content-Disposition: form-data; name="{name}"'
+    if part.blob_ref is not None:
+        if part.filename is None:
+            raise ValueError("multipart blob part is incomplete")
+        filename = part.filename.replace("\\", "\\\\").replace('"', '\\"')
+        disposition += f'; filename="{filename}"'
+    headers = f"--{boundary}\r\n{disposition}\r\n"
+    if part.content_type is not None:
+        headers += f"Content-Type: {part.content_type}\r\n"
+    return (headers + "\r\n").encode("ascii")
+
+
+def multipart_min_body_size(parts: tuple[MultipartPart, ...], *, max_body_bytes: int) -> int:
+    """Exact framing and text size, before any file part is read."""
+    if not 1 <= len(parts) <= 256 or any(type(part) is not MultipartPart for part in parts):
+        raise ValueError("multipart form needs 1 to 256 typed parts")
+    if max_body_bytes <= 0:
+        raise ValueError("max_body_bytes must be positive")
+    text_chars = sum(len(part.value) for part in parts if part.value is not None)
+    if text_chars > max_body_bytes:
+        raise ValueError("multipart text exceeds max_body_bytes")
+    boundary = _multipart_boundary(parts)
+    size = len(f"--{boundary}--\r\n".encode("ascii"))
+    for part in parts:
+        size += len(_multipart_prefix(part, boundary)) + 2
+        if part.value is not None:
+            size += len(part.value.encode("utf-8"))
+        if size > max_body_bytes:
+            raise ValueError("multipart body exceeds max_body_bytes")
+    return size
+
+
+def encode_multipart_form(
+    parts: tuple[MultipartPart, ...], blobs: Mapping[str, bytes], *, max_body_bytes: int
+) -> tuple[bytes, MultipartMetadata]:
+    """Encode ordered parts with a reproducible boundary and a hard byte cap."""
+    multipart_min_body_size(parts, max_body_bytes=max_body_bytes)
+    boundary = _multipart_boundary(parts)
+    boundary_bytes = boundary.encode("ascii")
+    body = bytearray()
+
+    def append(chunk: bytes) -> None:
+        if len(body) + len(chunk) > max_body_bytes:
+            raise ValueError("multipart body exceeds max_body_bytes")
+        body.extend(chunk)
+
+    for part in parts:
+        if part.value is not None:
+            content = part.value.encode("utf-8")
+        else:
+            if part.blob_ref is None or part.filename is None or part.content_type is None:
+                raise ValueError("multipart blob part is incomplete")
+            content = blobs[part.blob_ref]
+            if type(content) is not bytes or hashlib.sha256(content).hexdigest() != part.blob_ref:
+                raise IntegrityError("Multipart blob bytes do not match the declared reference")
+        if b"--" + boundary_bytes in content:
+            raise ValueError("multipart content contains the generated boundary")
+        append(_multipart_prefix(part, boundary))
+        append(content)
+        append(b"\r\n")
+    append(b"--" + boundary_bytes + b"--\r\n")
+    encoded = bytes(body)
+    return encoded, MultipartMetadata(
+        parts=parts, boundary=boundary, body_sha256=hashlib.sha256(encoded).hexdigest(), body_size=len(encoded)
+    )
+
+
+def validate_multipart_form(body: bytes, metadata: MultipartMetadata) -> None:
+    """Prove the audited manifest describes every byte sent by the HTTP client."""
+    if type(body) is not bytes or len(body) != metadata.body_size or hashlib.sha256(body).hexdigest() != metadata.body_sha256:
+        raise ValueError("multipart body size or hash does not match metadata")
+    if metadata.boundary != _multipart_boundary(metadata.parts):
+        raise ValueError("multipart boundary does not match manifest")
+    cursor = 0
+    marker = b"\r\n--" + metadata.boundary.encode("ascii")
+    for part in metadata.parts:
+        prefix = _multipart_prefix(part, metadata.boundary)
+        if not body.startswith(prefix, cursor):
+            raise ValueError("multipart body headers do not match manifest")
+        cursor += len(prefix)
+        if part.value is not None:
+            content = part.value.encode("utf-8")
+            if not body.startswith(content, cursor):
+                raise ValueError("multipart text value does not match manifest")
+            cursor += len(content)
+        else:
+            if part.blob_ref is None:
+                raise ValueError("multipart blob part is incomplete")
+            end = body.find(marker, cursor)
+            if end < 0 or hashlib.sha256(body[cursor:end]).hexdigest() != part.blob_ref:
+                raise ValueError("multipart file bytes do not match manifest")
+            cursor = end
+        if not body.startswith(b"\r\n", cursor):
+            raise ValueError("multipart part is missing its terminator")
+        cursor += 2
+    if body[cursor:] != f"--{metadata.boundary}--\r\n".encode("ascii"):
+        raise ValueError("multipart closing boundary does not match manifest")
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +522,8 @@ class HTTPCallRequest:
     url: str
     headers: Mapping[str, str]
     json: Mapping[str, Any] | None = None
+    form: tuple[tuple[str, str], ...] | None = None
+    multipart: MultipartMetadata | None = None
     params: Mapping[str, Any] | None = None
     audit_metadata: Mapping[str, Any] | None = None
     resolved_ip: str | None = None
@@ -272,12 +531,18 @@ class HTTPCallRequest:
     redirect_from: str | None = None
 
     def __post_init__(self) -> None:
-        freeze_fields(self, "headers", "json", "params", "audit_metadata")
+        freeze_fields(self, "headers", "json", "form", "params", "audit_metadata")
         method = _require_non_empty_str(self.method, "method")
         if method.upper() != method:
             raise ValueError(f"method must be uppercase, got {method!r}")
         _require_non_empty_str(self.url, "url")
         _require_string_mapping(self.headers, "headers")
+        if self.form is not None:
+            if method != "POST" or self.json is not None or self.multipart is not None:
+                raise ValueError("form requires POST without a JSON body")
+            encode_urlencoded_form(self.form)
+        if self.multipart is not None and (method != "POST" or self.json is not None or self.form is not None):
+            raise ValueError("multipart requires POST without another body")
         require_int(self.hop_number, "hop_number", optional=True, min_value=1)
         if self.resolved_ip is not None:
             _require_non_empty_str(self.resolved_ip, "resolved_ip")
@@ -312,11 +577,94 @@ class HTTPCallRequest:
         # All other methods emit json/params when non-None — no silent drops.
         if self.json is not None or self.method == "POST":
             d["json"] = deep_thaw(self.json) if self.json is not None else None
+        if self.form is not None:
+            d["form"] = deep_thaw(self.form)
+            d["body_encoding"] = "urlencoded-v1"
+            d["body_sha256"] = hashlib.sha256(encode_urlencoded_form(self.form)).hexdigest()
+        if self.multipart is not None:
+            d["multipart"] = [part.to_dict() for part in self.multipart.parts]
+            d["body_encoding"] = "multipart-v1"
+            d["body_sha256"] = self.multipart.body_sha256
+            d["body_size"] = self.multipart.body_size
+            d["body_boundary"] = self.multipart.boundary
         if self.params is not None or self.method == "GET":
             d["params"] = deep_thaw(self.params) if self.params is not None else None
         if self.audit_metadata is not None:
             d["audit_metadata"] = deep_thaw(self.audit_metadata)
         return d
+
+
+@dataclass(frozen=True, slots=True)
+class HTTPResponseTransport:
+    """Exact observable HTTP response needed to reconstruct an ``httpx.Response``.
+
+    This is present only when the response can be retained without bypassing
+    the audit redaction policy. An absent transport means replay must fail
+    closed, even when the parsed response body is available.
+    """
+
+    body_b64: str
+    headers: tuple[tuple[str, str], ...]
+    request_url: str
+    logical_url: str | None = None
+    redirect_hops: tuple[HTTPRedirectReplayHop, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_str(self.body_b64, "HTTPResponseTransport.body_b64")
+        _require_non_empty_str(self.request_url, "HTTPResponseTransport.request_url")
+        if self.logical_url is not None:
+            _require_non_empty_str(self.logical_url, "HTTPResponseTransport.logical_url")
+        if type(self.headers) is not tuple:
+            raise TypeError("HTTPResponseTransport.headers must be a tuple")
+        for name, value in self.headers:
+            _require_non_empty_str(name, "HTTPResponseTransport.header name")
+            _require_str(value, "HTTPResponseTransport.header value")
+        if type(self.redirect_hops) is not tuple or any(type(hop) is not HTTPRedirectReplayHop for hop in self.redirect_hops):
+            raise TypeError("HTTPResponseTransport.redirect_hops must contain HTTPRedirectReplayHop values")
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "body_b64": self.body_b64,
+            "headers": [[name, value] for name, value in self.headers],
+            "request_url": self.request_url,
+        }
+        if self.logical_url is not None:
+            result["logical_url"] = self.logical_url
+        if self.redirect_hops:
+            result["redirect_hops"] = [hop.to_dict() for hop in self.redirect_hops]
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class HTTPDecodedBodyEvidence:
+    """Exact bounded decoded bytes, independent of URL/header replay safety."""
+
+    body_b64: str
+    decoded_size: int
+    complete: bool
+    incomplete_reason: HTTPFailureCode | None = None
+
+    def __post_init__(self) -> None:
+        _require_str(self.body_b64, "HTTPDecodedBodyEvidence.body_b64")
+        require_int(self.decoded_size, "HTTPDecodedBodyEvidence.decoded_size", min_value=0)
+        if type(self.complete) is not bool:
+            raise TypeError("HTTPDecodedBodyEvidence.complete must be bool")
+        if self.complete and self.incomplete_reason is not None:
+            raise ValueError("Complete decoded evidence cannot have an incomplete reason")
+        if not self.complete and self.incomplete_reason not in HTTP_FAILURE_CODES:
+            raise ValueError("Incomplete decoded evidence requires a closed reason")
+        try:
+            decoded = base64.b64decode(self.body_b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("Decoded evidence has invalid base64") from None
+        if len(decoded) != self.decoded_size or base64.b64encode(decoded).decode("ascii") != self.body_b64:
+            raise ValueError("Decoded evidence has inconsistent bytes")
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"body_b64": self.body_b64, "decoded_size": self.decoded_size, "complete": self.complete}
+        if self.incomplete_reason is not None:
+            result["incomplete_reason"] = self.incomplete_reason
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +680,8 @@ class HTTPCallResponse:
     body_size: int | None = None
     body: Mapping[str, Any] | tuple[Any, ...] | str | None = None
     redirect_count: int = 0
+    transport: HTTPResponseTransport | None = None
+    decoded_body: HTTPDecodedBodyEvidence | None = None
 
     def __post_init__(self) -> None:
         _require_http_status_code(self.status_code, "status_code")
@@ -343,6 +693,10 @@ class HTTPCallResponse:
                 "to_dict() silently drops body from the audit record. "
                 "Set body_size=len(content) or omit body for redirect hops."
             )
+        if self.transport is not None and not isinstance(self.transport, HTTPResponseTransport):
+            raise TypeError("HTTPCallResponse.transport must be HTTPResponseTransport")
+        if self.decoded_body is not None and not isinstance(self.decoded_body, HTTPDecodedBodyEvidence):
+            raise TypeError("HTTPCallResponse.decoded_body must be HTTPDecodedBodyEvidence")
         freeze_fields(self, "headers", "body")
 
     def to_dict(self) -> dict[str, Any]:
@@ -357,13 +711,32 @@ class HTTPCallResponse:
         }
         if self.body_size is not None:
             d["body_size"] = self.body_size
-            if isinstance(self.body, (MappingProxyType, dict, tuple)):
+            if type(self.body) in (MappingProxyType, dict, tuple):
                 d["body"] = deep_thaw(self.body)
             else:
                 d["body"] = self.body
         if self.redirect_count > 0:
             d["redirect_count"] = self.redirect_count
+        if self.transport is not None:
+            d["transport"] = self.transport.to_dict()
+        if self.decoded_body is not None:
+            d["decoded_body"] = self.decoded_body.to_dict()
         return d
+
+
+@dataclass(frozen=True, slots=True)
+class HTTPRedirectReplayHop:
+    """A recorded redirect's complete request and response audit payloads."""
+
+    request: HTTPCallRequest
+    response: HTTPCallResponse
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, HTTPCallRequest) or not isinstance(self.response, HTTPCallResponse):
+            raise TypeError("HTTPRedirectReplayHop requires HTTP call payloads")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"request": self.request.to_dict(), "response": self.response.to_dict()}
 
 
 @dataclass(frozen=True, slots=True)

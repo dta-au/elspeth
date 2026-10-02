@@ -20,6 +20,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report
 from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.required_controls import (
@@ -47,10 +48,12 @@ from elspeth.web.sessions.models import (
 )
 from tests.helpers.session_fences import fenced_operation_context
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import (
+    _clean_advisor_checkpoint,
     _count_rows,
     _harness,
     _incremental_base_state,
     _persisted_tool_content,
+    _record_phase3_outcomes,
     _ScriptedLLM,
     _tool_turn,
 )
@@ -201,6 +204,7 @@ def _textract_llm_mapper_args(tmp_path: Path) -> dict[str, Any]:
                 "on_error": "discard",
                 "options": {
                     "profile": "sonnet",
+                    "system_prompt": "You summarise documents. Reply with a short summary only.",
                     "prompt_template": "Summarise this document: {{ row.document_text }}",
                     "required_input_fields": ["document_text"],
                     "response_field": "summary",
@@ -377,8 +381,8 @@ async def test_explicit_approval_seals_auto_wired_textract_candidate_and_hash(tm
     initial_state = _empty_state()
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
     ):
         result = await harness.service.compose(
             "Build a Textract to LLM pipeline and prepare it for review.",
@@ -394,7 +398,6 @@ async def test_explicit_approval_seals_auto_wired_textract_candidate_and_hash(tm
     authority = await harness.sessions.get_authoritative_composition_proposal(
         session_id=UUID(harness.session_id),
         proposal_id=proposals[0].id,
-        reviewed_facts=None,
     )
     assert authority.pipeline is not None
     assert proposals[0].pipeline_metadata is not None
@@ -402,27 +405,28 @@ async def test_explicit_approval_seals_auto_wired_textract_candidate_and_hash(tm
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.pipeline_commit import PipelineCommitConfig, prepare_pipeline_proposal_commit
 
-    prepared = await prepare_pipeline_proposal_commit(
-        authority=authority.pipeline,
-        reviewed_facts={},
-        current_state=initial_state,
-        current_state_id=None,
-        policy_catalog=view,
-        plugin_snapshot=snapshot,
-        config=PipelineCommitConfig(
-            data_dir=str(tmp_path),
-            session_engine=harness.engine,
-            secret_service=None,
-            user_id="proposal-prevalidation-user",
-            user_message_content="Build a Textract to LLM pipeline and prepare it for review.",
-            max_blob_storage_per_session_bytes=10_000_000,
-            runtime_preflight=None,
-            timeout_seconds=5.0,
-        ),
-        recorder=BufferingRecorder(),
-        actor="user:proposal-prevalidation-user",
-        settlement_surface="generic",
-    )
+    with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.PROPOSAL) as operation:
+        prepared = await prepare_pipeline_proposal_commit(
+            authority=authority.pipeline,
+            current_state=initial_state,
+            current_state_id=None,
+            policy_catalog=view,
+            plugin_snapshot=snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(tmp_path),
+                session_engine=harness.engine,
+                session_operation_context=operation,
+                session_operation_authority=harness.sessions.session_operation_authority,
+                secret_service=None,
+                user_id="proposal-prevalidation-user",
+                user_message_content="Build a Textract to LLM pipeline and prepare it for review.",
+                max_blob_storage_per_session_bytes=10_000_000,
+                runtime_preflight=None,
+                timeout_seconds=5.0,
+            ),
+            recorder=BufferingRecorder(),
+            actor="user:proposal-prevalidation-user",
+        )
     assert prepared.result.success is True
     assert prepared.result.validation.is_valid is True
     sealed = deep_thaw(proposals[0].arguments_json)
@@ -455,8 +459,8 @@ async def test_auto_commit_persists_auto_wired_textract_state_and_disclosure(tmp
     )
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
     ):
         result = await harness.service.compose(
             "Build and apply a Textract to LLM pipeline.",
@@ -474,7 +478,7 @@ async def test_auto_commit_persists_auto_wired_textract_state_and_disclosure(tmp
         "llm",
         "aws_bedrock_content_safety",
         "field_mapper",
-    ], (result.message, result.tool_invocations, harness.service._phase3_last_tool_outcomes)
+    ], (result.message, result.tool_invocations)
     _assert_required_control_disclosures(state_payload)
     report = build_implicit_decisions_report(result.state)
     policy_entries = [entry for entry in report["entries"] if entry["category"] == "policy_control"]
@@ -523,8 +527,8 @@ async def test_auto_commit_does_not_wire_an_incomplete_set_pipeline_candidate(tm
     llm = _ScriptedLLM(_tool_turn("call_incomplete", "set_pipeline", incomplete))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
         patch(
             "elspeth.web.composer.tool_batch.wire_required_controls",
             wraps=real_wire_required_controls,
@@ -566,8 +570,8 @@ async def test_auto_commit_does_not_duplicate_already_covered_controls(tmp_path:
     llm = _ScriptedLLM(_tool_turn("call_already_covered", "set_pipeline", covered))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
         patch(
             "elspeth.web.composer.tool_batch.wire_required_controls",
             wraps=real_wire_required_controls,
@@ -608,8 +612,8 @@ async def test_auto_commit_wires_controls_when_set_output_completes_incremental_
     llm = _ScriptedLLM(_tool_turn("call_complete_with_output", "set_output", output))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
     ):
         result = await harness.service.compose(
             "Add the final JSON output.",
@@ -656,8 +660,8 @@ async def test_explicit_incremental_completion_stages_one_canonical_wired_pipeli
     llm = _ScriptedLLM(_tool_turn("call_review_incremental_completion", "set_output", output))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
     ):
         result = await harness.service.compose(
             "Add the final JSON output and prepare the complete pipeline for review.",
@@ -676,7 +680,6 @@ async def test_explicit_incremental_completion_stages_one_canonical_wired_pipeli
     authority = await harness.sessions.get_authoritative_composition_proposal(
         session_id=UUID(harness.session_id),
         proposal_id=proposal.id,
-        reviewed_facts=None,
     )
     assert authority.pipeline is not None
     sealed = deep_thaw(authority.pipeline.proposal.pipeline)
@@ -688,7 +691,8 @@ async def test_explicit_incremental_completion_stages_one_canonical_wired_pipeli
         "field_mapper",
     ]
     _assert_required_control_disclosures(sealed)
-    assert proposal.tool_arguments_hash == stable_hash(sealed)
+    assert type(sealed["sources"]) is dict
+    assert proposal.tool_arguments_hash == composer_authority_hash(sealed)
     assert set(proposal.affects) >= {"graph", "validation"}
     assert result.state is initial_state
     invocation = next(item for item in result.tool_invocations if item.tool_call_id == "call_review_incremental_completion")
@@ -716,8 +720,8 @@ async def test_auto_commit_wires_incremental_named_blob_sources_without_public_r
     llm = _ScriptedLLM(_tool_turn("call_complete_named_sources", "set_output", output))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
     ):
         result = await harness.service.compose(
             "Add the final JSON output.",
@@ -751,7 +755,7 @@ async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_e
     from elspeth.web.composer.tools import execute_tool
     from elspeth.web.execution.schemas import ValidationResult
     from elspeth.web.sessions.converters import state_from_record
-    from elspeth.web.sessions.protocol import CompositionStateData
+    from elspeth.web.sessions.protocol import CompositionStateData, CompositionValidationError
     from tests.unit.web._sync_asgi_client import SyncASGITestClient
     from tests.unit.web.composer.conftest import _make_settings
     from tests.unit.web.sessions.test_routes import _async_return, _make_app
@@ -792,7 +796,10 @@ async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_e
             outputs=initial_payload["outputs"],
             metadata_=initial_payload["metadata"],
             is_valid=False,
-            validation_errors=[entry.message for entry in initial_state.validate().errors],
+            validation_errors=[
+                CompositionValidationError(message=entry.message, error_code=entry.error_code, component=entry.component)
+                for entry in initial_state.validate().errors
+            ],
         ),
         provenance="session_seed",
     )
@@ -817,9 +824,8 @@ async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_e
     assert expected is not preview.updated_state
     expected_plugins = _node_plugins(expected.to_dict())
 
-    with patch.object(
-        ComposerServiceImpl,
-        "_compute_availability",
+    with patch(
+        "elspeth.web.composer.service.compute_availability",
         return_value=ComposerAvailability(available=True, model="test-model", provider="test"),
     ):
         composer = ComposerServiceImpl.for_trained_operator(
@@ -831,8 +837,9 @@ async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_e
     app.state.composer_service = composer
     llm = _ScriptedLLM(_tool_turn(f"call_review_{source_count}_blob_sources", "set_output", output))
     with (
-        patch.object(composer, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(composer, "_call_llm", new=llm),
+        patch.object(composer._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(composer._provider_gateway, "_call_llm", new=llm),
+        patch.object(composer._advisor_checkpoint, "_run_advisor_checkpoint", new=_clean_advisor_checkpoint),
     ):
         result = await composer.compose(
             "Add the final JSON output and prepare the complete pipeline for review.",
@@ -907,8 +914,8 @@ async def test_auto_commit_does_not_wire_incremental_mutation_while_pipeline_is_
     llm = _ScriptedLLM(_tool_turn("call_still_incomplete", "set_metadata", {"patch": {"name": "Still incomplete"}}))
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
         patch(
             "elspeth.web.composer.tool_batch.wire_required_controls",
             wraps=real_wire_required_controls,
@@ -952,8 +959,9 @@ async def test_incremental_required_control_failure_does_not_publish_completed_g
     failure = RuntimeError("private incremental finalizer failure detail")
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as outcome_batches,
         patch("elspeth.web.composer.tool_batch.wire_required_controls_state", side_effect=failure) as finalizer,
         pytest.raises(ComposerPluginCrashError) as exc_info,
     ):
@@ -971,7 +979,7 @@ async def test_incremental_required_control_failure_does_not_publish_completed_g
     assert _count_rows(harness.engine, blobs_table) == 1
     assert _count_rows(harness.engine, composition_proposals_table) == 0
     assert _count_rows(harness.engine, composition_states_table) == 0
-    outcome = harness.service._phase3_last_tool_outcomes[-1]
+    outcome = outcome_batches[-1][-1]
     assert outcome.call.id == "call_incremental_finalizer_failure"
     assert outcome.error_class == "RuntimeError"
     persisted_feedback = _persisted_tool_content(harness, "call_incremental_finalizer_failure")
@@ -997,8 +1005,9 @@ async def test_incremental_owned_state_projection_failure_does_not_publish_propo
     failure = RuntimeError("private owned-state projection failure detail")
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as outcome_batches,
         patch("elspeth.web.composer.tool_batch.owned_composition_state_authority", side_effect=failure) as projector,
         pytest.raises(ComposerPluginCrashError) as exc_info,
     ):
@@ -1016,7 +1025,7 @@ async def test_incremental_owned_state_projection_failure_does_not_publish_propo
     assert _count_rows(harness.engine, blobs_table) == 2
     assert _count_rows(harness.engine, composition_proposals_table) == 0
     assert _count_rows(harness.engine, composition_states_table) == 0
-    outcome = harness.service._phase3_last_tool_outcomes[-1]
+    outcome = outcome_batches[-1][-1]
     assert outcome.call.id == "call_owned_state_projection_failure"
     assert outcome.error_class == "RuntimeError"
     persisted_feedback = _persisted_tool_content(harness, "call_owned_state_projection_failure")
@@ -1048,8 +1057,9 @@ async def test_required_control_finalizer_failure_is_audited_without_publication
     initial_state = _incremental_base_state(tmp_path)
 
     with (
-        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
-        patch.object(harness.service, "_call_llm", new=llm),
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as outcome_batches,
         patch("elspeth.web.composer.tool_batch.wire_required_controls", side_effect=failure) as finalizer,
         pytest.raises(ComposerPluginCrashError) as exc_info,
     ):
@@ -1068,7 +1078,7 @@ async def test_required_control_finalizer_failure_is_audited_without_publication
     assert _count_rows(harness.engine, blobs_table) == 0
     assert _count_rows(harness.engine, composition_proposals_table) == 0
     assert _count_rows(harness.engine, composition_states_table) == 0
-    outcome = harness.service._phase3_last_tool_outcomes[-1]
+    outcome = outcome_batches[-1][-1]
     assert outcome.call.id == f"call_finalizer_failure_{trust_mode}"
     assert outcome.error_class == "RuntimeError"
     persisted_feedback = _persisted_tool_content(harness, f"call_finalizer_failure_{trust_mode}")
@@ -1089,7 +1099,7 @@ def test_accept_incremental_proposal_wires_controls_before_state_publication(
     from elspeth.web.composer.redaction import redact_tool_call_arguments
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
     from elspeth.web.execution.schemas import ValidationResult
-    from elspeth.web.sessions.protocol import CompositionStateData
+    from elspeth.web.sessions.protocol import CompositionStateData, CompositionValidationError
     from tests.unit.web._sync_asgi_client import SyncASGITestClient
     from tests.unit.web.sessions.test_routes import _async_return, _make_app
 
@@ -1136,7 +1146,10 @@ def test_accept_incremental_proposal_wires_controls_before_state_publication(
                 outputs=state_payload["outputs"],
                 metadata_=state_payload["metadata"],
                 is_valid=False,
-                validation_errors=[entry.message for entry in initial_state.validate().errors],
+                validation_errors=[
+                    CompositionValidationError(message=entry.message, error_code=entry.error_code, component=entry.component)
+                    for entry in initial_state.validate().errors
+                ],
             ),
             provenance="session_seed",
         )
@@ -1181,7 +1194,6 @@ def test_accept_incremental_proposal_wires_controls_before_state_publication(
             service.get_authoritative_composition_proposal(
                 session_id=session_id,
                 proposal_id=proposal_id,
-                reviewed_facts=None,
             )
         )
         assert proposal.row.status == "pending"

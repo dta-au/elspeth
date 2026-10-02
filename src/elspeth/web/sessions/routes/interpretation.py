@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -33,7 +33,7 @@ from ._helpers import (
     _interpretation_event_response,
     _state_response,
     _verify_session_ownership,
-    get_current_user,
+    require_pipeline_user,
 )
 
 
@@ -67,7 +67,7 @@ def register_interpretation_routes(router: APIRouter) -> None:
         event_id: UUID,
         body: InterpretationResolveRequest,
         raw_request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> InterpretationResolveResponse:
         """User-driven resolve of a pending interpretation event.
 
@@ -211,12 +211,9 @@ def register_interpretation_routes(router: APIRouter) -> None:
                 },
             ) from exc
 
-        # ``new_state`` was persisted by resolve_interpretation_event through the
-        # gated composition_states insert, and the write gate admits exactly what
-        # the projection can serve (assert_guided_custody_persistable runs the
-        # same correlation), so this projection cannot raise a custody failure.
-        # A legacy unbindable tip surfaces earlier: the service's write refusal
-        # lands in the AuditIntegrityError arm above as a coded 500.
+        # ``new_state`` was persisted by resolve_interpretation_event through
+        # the gated composition_states insert; integrity failures surface in
+        # the AuditIntegrityError arm above as a coded 500.
         return InterpretationResolveResponse(
             event=_interpretation_event_response(event),
             new_state=_state_response(new_state),
@@ -229,7 +226,7 @@ def register_interpretation_routes(router: APIRouter) -> None:
     async def list_interpretations(
         session_id: UUID,
         raw_request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         status: Literal["pending", "all"] = "all",
     ) -> ListInterpretationEventsResponse:
         """List interpretation events for the session.
@@ -251,7 +248,7 @@ def register_interpretation_routes(router: APIRouter) -> None:
     async def opt_out_of_interpretations(
         session_id: UUID,
         raw_request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> InterpretationOptOutResponse:
         """Record the per-session 'stop asking about interpretations' decision.
 
@@ -308,7 +305,7 @@ def register_interpretation_routes(router: APIRouter) -> None:
     async def opt_out_summary(
         session_id: UUID,
         raw_request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> OptOutSummaryResponse:
         """Retroactive audit of auto-baked interpretations (F-22).
 

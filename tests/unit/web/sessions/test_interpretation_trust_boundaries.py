@@ -15,7 +15,7 @@ from uuid import uuid4
 
 import pytest
 
-from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSurfaceOrigin
 from elspeth.web.sessions.pending_interpretation import (
     _has_matching_vague_term_requirement,
     _matching_pending_requirement_index,
@@ -176,6 +176,7 @@ def test_pending_interpretation_plan_rejects_malformed_requirements() -> None:
         user_term="recent",
         kind=InterpretationKind.VAGUE_TERM,
         llm_draft="last 30 days",
+        surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
         model_identifier="composer-model",
         model_version="composer-model",
         provider="composer",

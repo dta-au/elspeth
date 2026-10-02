@@ -14,6 +14,12 @@ maintainer's own agent toolchain (issue tracker, code map, delegation
 conventions) is described in [docs/maintainer/toolchain.md](docs/maintainer/toolchain.md);
 none of it is required to contribute.
 
+# Operating Model
+
+You should infer the user's intent and task scope from the instructions and prior conversation context. Your job is to bias towards action and carry the user's intended task to completion.
+
+When the user expresses intent to perform new work or fix an existing issue, persist until the user's intended goal is complete. Progress autonomously towards the user's goal (e.g. creating isolated worktrees / checkouts if needed, resolving merge conflicts, read-only actions, creating draft PRs etc.) unless they are clearly destructive or irreversible.
+
 ## Working Directory Discipline
 
 - The Bash tool persists its working directory across calls. Begin any script,
@@ -29,6 +35,18 @@ none of it is required to contribute.
 - After any status claim ("fix landed", "ticket closed", "branch merged"),
   re-verify against the current HEAD before writing it into a checkpoint or
   handoff doc.
+- State no conclusion by inference — coverage gap, branch landed, root cause,
+  file size, row count. Run the measuring command first and show its raw
+  output beside the claim.
+- Control an ad-hoc instrument before you trust a number it produced: run it
+  against a known-positive case it must match and a known-negative case it
+  must not. A `grep`, `find -size`, glob or regex that silently matches
+  nothing returns exactly what a correct one returns when there is nothing
+  to find, so a clean answer is not evidence the instrument works.
+- A positive assertion over a filtered subset is still a negative claim, and
+  a partial capture (`.*?` under `re.S`, `git rev-parse` echoing a missing
+  path back) fails toward passing. When an instrument decides a gate, mutate
+  the thing it should catch and confirm it goes red.
 
 ## Quick reference
 
@@ -38,7 +56,7 @@ pytest tests/                  # default selection (~20 min at -n 12) = what CI'
 pytest tests/ -m testcontainer -n 0   # CI's required "Testcontainer" job (Docker, serial); never part of the default run
 pytest tests/path::test -n 0   # ONE test: -n 0 disables the default 12 workers (needed for pdb / -s)
 ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
-  elspeth-lints check --rules all --root src/elspeth   # static-analysis / trust-tier lint gate
+  elspeth-lints check --rules all --root src/elspeth   # keyless operator trust-tier diagnostic
 elspeth run --settings examples/<name>/settings.yaml --execute
 ```
 
@@ -88,17 +106,27 @@ working around it.
 - **STOP — read [CONTRIBUTING.md § Whole-tree gates](CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit)
   BEFORE writing code. This is not optional.** Whole-tree AST gates pin the
   EXACT set of dynamic-attribute sites, masquerade sites (tests included),
-  wire-shape templates, and output bytes; a locally green scoped run proves
-  nothing about them, and one careless `getattr` turns the branch red for
+  wire-shape templates, and output bytes; a locally green scoped run does not
+  cover them, and one careless `getattr` turns the branch red for
   every sibling (this has happened — 7201beeb7). Dated incident log:
   [docs/agents/recent-code-hints.md](docs/agents/recent-code-hints.md).
-- Scoped test runs miss cross-cutting gates — run the full `pytest tests/`
-  before merging. `addopts` carries `-n 12`, so the bare command IS the
-  parallel run: serial it is ~17 hours against 44,399 tests, which is why the
-  default is parallel rather than a flag you have to remember. Pass `-n 0` for
-  a single test or a debugger (`pdb` and `-s` do not work through xdist), and
-  note that xdist auto-disables `pytest-benchmark` — the `performance` marker
-  is deselected by default anyway.
+- Choose tests by the reach of the change. Run affected tests and every
+  whole-tree gate whose scanned inputs could change. Run the full
+  `pytest tests/` before merging changes whose effects cannot be bounded by
+  those checks, such as shared runtime behavior, contracts, schemas, plugin
+  registration, graph construction, or test/scan infrastructure. An isolated
+  test, fixture, documentation, or frontend change does not automatically
+  require the Python full suite. If the full suite already passed on the same
+  production tree, verify a subsequent isolated test repair with its focused
+  tests and relevant negative controls; do not rerun the full suite merely to
+  turn a diagnosed unrelated flaky failure green. State the scope and limits
+  of the checks you ran. `addopts` carries `-n 12`; pass `-n 0` for a single
+  test or debugger. Xdist disables `pytest-benchmark`, and the `performance`
+  marker is deselected by default.
+- Before starting a full suite on a shared host, establish who owns the test
+  capacity, check for active suites and host load, and run only one broad suite
+  at a time. Use 12 workers only when capacity permits; lower the count when
+  it does not. Do not launch parallel full suites from separate agent sessions.
 - The default selection also deselects the `testcontainer` marker, so a green
   `pytest tests/` says NOTHING about PostgreSQL. Two 0.8.0 defects passed it:
   a one-element `IN` CHECK that PostgreSQL reflects as `=` (elspeth-d0e62aea41)
@@ -124,11 +152,10 @@ working around it.
   prefix is what lets a keyless agent run it at all: verification otherwise
   demands `ELSPETH_JUDGE_METADATA_HMAC_KEY`, which agents must never hold
   ([O1]). Shape-only verification cannot detect forged judge metadata, so a
-  trusted context must re-verify before any merge is authoritative — the same
-  treatment CI gives fork PRs.
-- That gate currently exits 1 with a large finding corpus: the deliberate
-  fail-closed state described under "Judge-signature stage", not a regression
-  you introduced. Compare the corpus before and after your change, not to zero.
+  trusted operator context must re-verify before claiming signed allowlist
+  clearance. CI does not make that claim.
+- A keyless trust-tier scan currently exits 1 with a large finding corpus.
+  Compare the corpus before and after your change, not to zero.
 - Treat the trust-tier gate as a catch-obvious-bug-hiding check, not a death
   pact. Review every touched file in full; apply the trust-tier rules to
   production code and clean related tests, config, and docs to house style.
@@ -199,6 +226,23 @@ working around it.
   you (per-stage logs, recorded exit codes, a frozen-tree check); read its
   `summary.txt`, not its terminal output.
 
+## Subagent Reporting
+
+- Brief every subagent to write its findings to a file and return only the
+  path plus a short summary. The message channel truncates long reports, and
+  a truncated report is indistinguishable from a complete short one.
+- Coordination and lane state go under `.claude/lanes/<run>/` — the
+  `lane-manager` convention, already gitignored and already named in Commit
+  Hygiene as never-stage.
+- A durable deliverable (a review, an inventory, a design note, an evidence
+  bundle) goes to a tracked path under `docs/`. Confirm it with
+  `git check-ignore -v <path>` before writing: no output means the path is
+  safe. `scratch/` and `.scratch/` are ignored and have swallowed a finished
+  report before.
+- Dispatch to an agent type that can write. A read-only type must answer
+  inline, so either scope its brief narrow enough to survive the channel or
+  pick a different type.
+
 ## Editing Rules
 
 - Do not use `sed`, `awk`, or scripted line-number rewrites to resolve merge
@@ -216,6 +260,23 @@ working around it.
   before every commit, rebase or push.
 - Run the lint gate (ruff) locally before pushing; do not rely on CI to
   surface unused imports or formatting.
+
+## Scope Discipline
+
+- The reported defect is the deliverable. Do not ship a cosmetic or adjacent
+  change while deferring the actual fix into new tickets unless the developer
+  approved that split first.
+- If the smallest change that actually fixes the defect turns out to be out
+  of scope, stop and say so plainly. Filing follow-up tickets is not a
+  substitute for reporting that the fix did not land.
+- Confirm the target version and branch before editing docs, changelogs or
+  release notes. Which release a change belongs to is a decision to check,
+  not an inference from the current checkout.
+- This is not a budget cap. Wide dispatch and deep analysis are standing
+  policy for the maintainer's own agents
+  ([docs/maintainer/toolchain.md](docs/maintainer/toolchain.md) § Standing
+  authorization); this section constrains what you hand back, not what you
+  spend getting there.
 
 ## Project delivery posture
 
@@ -282,66 +343,23 @@ the first evaded detection for 26 days because the gate counted calls per
 walk. If the trivial case feels too slow, that is a planner-brief defect to
 fix (see elspeth-63cf3803e6), never a reason to route around the provider.
 
-The interim guided collector guard is LIFTED (WS6, ruling 7878 on
-elspeth-88bb77953c): the guided lane authors and projects collectors like any
-other node kind, `guided_collector_not_authorable` is retired, and every
-`node_type` dispatch site in the guided path and frontend carries a collector
-arm or a deliberate documented exclusion. A new node kind or behavior arm is
-a parity sweep across those same surfaces (binder, proposal projection +
-`validate_payload`, wire cardinality, frontend union/decoder/renderers,
-teaching skills) — never a lane-scoped schema narrowing, which stays
-unauthorized unless refusal telemetry shows a real tax.
+## Operator signature verification (tier-model allowlist signing)
 
-## Judge-signature stage (tier-model allowlist signing)
-
-The trust-tier CI failure is a deliberate fail-closed state: it prevents
-unauthorised merges while keeping the outstanding package-level signing work
-visible. **Do not attempt to resolve, re-sign, restage, or otherwise clear the
-trust-tier CI failure globally during ordinary feature work.** Fix tier-model
-defects as you find them, and never make the tier-model state worse. There is
-no global obligation for this gate to pass during feature delivery; the global
-obligation is to follow the trust-tier standards and avoid introducing new
-defects or drift. The operator signs once, at package completion, after churn
-has settled. Since 2026-09-05 the `test` and `testcontainer` jobs no longer
-wait on `static-analysis`, so the suites run and report while that job is red;
-`CI Success` still requires `static-analysis`, so the red still blocks merges.
+CI does not run the signed trust-tier check or the historical blanket ratchet.
+Its green result covers the checks that actually run, not operator signature
+clearance. Fix tier-model defects as you find them and do not add drift; compare
+keyless finding sets before and after a change. The operator verifies and signs
+the reviewed package in a trusted context after churn has settled. Keep the
+operator-held key out of CI and agent environments.
 
 The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `stage_annotate` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. All judging — including the final signature verdict — runs with read-only judge tool access (`--judge-tools readonly`) on whichever `--judge-transport` the operator selects: the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The full workflow lives in the `judge-signature-workflow` skill and [docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
 
-<!-- filigree:instructions:v3.1.0:c1c023c3 -->
-<!-- filigree:last-writer:filigree install -->
-## Filigree Issue Tracker
+## Shared issue tracking
 
-`filigree` tracks this project's work. Use it to find, claim, update and close
-issues: `filigree session-context` at session start, then
-`filigree start-next-work --assignee <name>`.
+GitHub Issues is the project's shared system of record. Use the repository's
+issues and pull requests to coordinate work; confirm the repository and issue
+number before updating a record. Local archives and legacy `elspeth-*`
+identifiers are historical evidence, not GitHub issue numbers.
 
-Full reference: the **filigree-workflow** skill (patterns, priorities,
-observations, error codes), `filigree --help`, and the `mcp__filigree__*` tool
-schemas. Prefer the MCP tools when available; fall back to the CLI.
-
-Two rules `--help` will not tell you:
-
-1. Claim atomically: `work_start` / `work_start_next` (MCP) or `start-work` /
-   `start-next-work` (CLI). Never chain a claim with a separate status update;
-   that two-step form races other agents.
-2. On `SCHEMA_MISMATCH` the installed filigree is older than the project
-   database. Surface it to the user; do not retry.
-<!-- /filigree:instructions -->
-
-<!-- loomweave:instructions:v1.6.0:39edbf6d -->
-<!-- loomweave:last-writer:loomweave install -->
-## Loomweave (code structure + SEI identity)
-
-Loomweave pre-extracts this repo into a queryable map — entities, their
-call/reference/import/relation edges, and subsystems — each carrying a Stable
-Entity Identity (SEI). Ask its `mcp__loomweave__*` tools, not grep, for "what
-calls X", "what subclasses X", "where is X defined", "find the thing that
-does Y".
-
-- Never hand-construct an entity id: take it from `entity_find` / `entity_at` /
-  `entity_resolve`, and bind cross-tool records on the `sei`, not the `id`.
-- If `project_status_get` reports stale, re-index before answering.
-
-Full reference: `loomweave-workflow` skill, `loomweave --help`, MCP schemas.
-<!-- /loomweave:instructions -->
+The maintainer is triaging the archived backlog and will upload it separately.
+Do not automatically import, publish, or close those records during tool cleanup.

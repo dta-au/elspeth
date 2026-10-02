@@ -20,9 +20,10 @@ class ValueSourceFinding:
     have produced ``ValidationError(component_id=None)`` records the
     composer UI cannot tie back to a specific node.
 
-    All fields are scalars (per CLAUDE.md "Scalar-Only Fields Need No
-    Guard"); ``frozen=True, slots=True`` is sufficient - no freeze guard
-    is required.
+    All fields are scalars, so ``frozen=True, slots=True`` is sufficient -
+    no freeze guard is required. ``frozen=True`` blocks rebinding but leaves
+    container contents mutable through the attribute reference, so only
+    records carrying containers need a deep-freeze in ``__post_init__``.
     """
 
     component_id: str

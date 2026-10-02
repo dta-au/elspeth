@@ -10,18 +10,128 @@ __all__ = ["TokenInfo", "TokenManager"]
 
 import copy
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts import AggregationParentDisposition, CoalesceParentCompletion, SourceRow, TokenInfo
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.enums import FrameKind, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.enums import FrameKind, RoutingMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import ExecutionError, OrchestrationInvariantError, SourceQuarantineReason
 from elspeth.contracts.identity import LineageFrame, innermost_own_frame, truncate_at_closer_frame
+from elspeth.contracts.results import RowResult
+from elspeth.contracts.scheduler import BarrierEmission, SourceIngestSpec, TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID, StepResolver
+from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
+from elspeth.core.ids import generate_id
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+from elspeth.engine._error_hash import compute_error_hash
+
+if TYPE_CHECKING:
+    from elspeth.core.landscape.execution_repository import ExecutionRepository
+    from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
+
+
+def quarantine_pipeline_row(row: object) -> PipelineRow:
+    """The audit row of a quarantined source row: the rejected data under an empty OBSERVED contract.
+
+    A quarantined row failed source validation, so it carries no contract and
+    may not even be a mapping. A mapping is normalised to a plain ``dict``
+    (``PipelineRow`` requires exactly ``dict``); anything else is wrapped as
+    ``{"_raw": row}``. The data is never validated or transformed. This exact
+    object is what the quarantine sink writes live AND what the durable
+    PENDING_SINK handoff serialises, so a resumed write rebuilds the same
+    member row (``payload_hash``) and reuses a reserved sink effect.
+    """
+    row_data: dict[str, Any]
+    if isinstance(row, dict):
+        row_data = dict(row) if type(row) is not dict else row
+    else:
+        row_data = {"_raw": row}
+    return PipelineRow(row_data, SchemaContract(mode="OBSERVED", fields=(), locked=False))
+
+
+def ingest_source_quarantine(
+    *,
+    scheduler: TokenSchedulerRepository,
+    data_flow: DataFlowRepository,
+    execution: ExecutionRepository,
+    coordination_token: CoordinationToken,
+    source_node_id: NodeID,
+    row_index: int,
+    source_row_index: int,
+    ingest_sequence: int,
+    row: object,
+    validation_error_id: str | None,
+    quarantine_sink: str,
+    quarantine_error: str,
+    quarantine_edge_id: str,
+    terminal_step_index: int,
+) -> RowResult:
+    """Record a source-quarantined row and park its quarantine-sink handoff, in ONE fenced transaction.
+
+    The single composition of the source-quarantine ingest (``RowProcessor.
+    ingest_quarantined_row`` supplies its repositories and the terminal-lane
+    step). ``row`` is the already-sanitised rejected data; ``quarantine_error``
+    the bounded, non-empty plugin error text — the ONE text behind the FAILED
+    state's error, the DIVERT reason, the pending-sink message and the error
+    hash. The returned result is the token's sink-bound ``(FAILURE,
+    QUARANTINED_AT_SOURCE)`` result, carrying the audited hash for the shared
+    accumulator; the outcome itself is recorded after sink durability.
+    """
+    pipeline_row = quarantine_pipeline_row(row)
+    token = TokenInfo(row_id=generate_id(), token_id=generate_id(), row_data=pipeline_row)
+    error_hash = compute_error_hash(quarantine_error)
+    source_state_id = generate_id()
+    divert_event = execution.node_states.prepare_routing_event_for_new_state(
+        source_state_id,
+        quarantine_edge_id,
+        RoutingMode.DIVERT,
+        SourceQuarantineReason(quarantine_error=quarantine_error),
+        run_id=coordination_token.run_id,
+        owner="ingest_source_quarantine",
+    )
+    scheduler.ingest_quarantine_row_with_pending_sink(
+        coordination_token=coordination_token,
+        source=SourceIngestSpec(
+            source_node_id=str(source_node_id),
+            row_index=row_index,
+            data=pipeline_row.to_dict(),
+            source_row_index=source_row_index,
+            ingest_sequence=ingest_sequence,
+            row_id=token.row_id,
+            token_id=token.token_id,
+        ),
+        data_flow=data_flow,
+        execution=execution,
+        validation_error_id=validation_error_id,
+        source_state_id=source_state_id,
+        failure=ExecutionError(exception=quarantine_error, exception_type="ValidationError"),
+        divert_event=divert_event,
+        pending_sink=BarrierEmission(
+            token_id=token.token_id,
+            row_payload_json=scheduler.serialize_row_payload(pipeline_row),
+            sink_name=quarantine_sink,
+            outcome=TerminalOutcome.FAILURE.value,
+            path=TerminalPath.QUARANTINED_AT_SOURCE.value,
+            error_hash=error_hash,
+            error_message=quarantine_error,
+            row_id=token.row_id,
+            node_id=None,
+            step_index=terminal_step_index,
+            ingest_sequence=ingest_sequence,
+        ),
+    )
+    return RowResult(
+        token=token,
+        final_data=pipeline_row,
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.QUARANTINED_AT_SOURCE,
+        sink_name=quarantine_sink,
+        scheduler_pending_sink=True,
+        authoritative_error_hash=error_hash,
+    )
 
 
 class TokenManager:
@@ -38,7 +148,7 @@ class TokenManager:
 
         # Create token for source row
         token = manager.create_initial_token(
-            run_id=run.run_id,
+            coordination_token=ctx.require_coordination_token(),
             source_node_id=source.node_id,
             row_index=0,
             source_row_index=0,
@@ -51,6 +161,8 @@ class TokenManager:
 
         # Fork to branches (node_id resolved to step internally)
         children = manager.fork_token(
+            member_token=ctx.require_member_token(),
+            work_item=ctx.require_work_item(),
             parent_token=token,
             branches=["stats", "classifier"],
             node_id=NodeID("gate_classifier_abc123"),
@@ -121,7 +233,6 @@ class TokenManager:
 
     def create_initial_token(
         self,
-        run_id: str,
         source_node_id: str,
         row_index: int,
         source_row: SourceRow,
@@ -130,12 +241,11 @@ class TokenManager:
         ingest_sequence: int,
         row_id: str | None = None,
         token_id: str | None = None,
-        coordination_token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
     ) -> TokenInfo:
         """Create a token for a source row.
 
         Args:
-            run_id: Run identifier
             source_node_id: Source node that loaded the row
             row_index: Position in source (0-indexed)
             source_row: SourceRow from source (must have contract)
@@ -172,12 +282,12 @@ class TokenManager:
         # Create row record and initial token atomically; the repository owns
         # run/source identity and payload persistence for both audit rows.
         row, token = self._data_flow.create_row_with_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=row_index,
             source_row_index=source_row_index,
             ingest_sequence=ingest_sequence,
             data=pipeline_row.to_dict(),
+            source_contract_json=checkpoint_dumps(source_row.contract.to_checkpoint_format()),
             row_id=row_id,
             token_id=token_id,
             coordination_token=coordination_token,
@@ -189,120 +299,15 @@ class TokenManager:
             row_data=pipeline_row,
         )
 
-    def create_quarantine_token(
-        self,
-        run_id: str,
-        source_node_id: str,
-        row_index: int,
-        source_row: SourceRow,
-        *,
-        source_row_index: int,
-        ingest_sequence: int,
-        validation_error_id: str | None = None,
-        coordination_token: CoordinationToken | None = None,
-    ) -> TokenInfo:
-        """Create a token for a quarantined row.
-
-        Quarantined rows are invalid data that failed source validation.
-        They don't have contracts (SourceRow.quarantined sets contract=None).
-        They are routed directly to a quarantine sink for investigation.
-
-        Creates a minimal PipelineRow with an empty OBSERVED contract for audit
-        trail consistency, but the data is not validated or transformed.
-
-        Args:
-            run_id: Run identifier
-            source_node_id: Source node that loaded the row
-            row_index: Position in source (0-indexed)
-            source_row: Quarantined SourceRow (contract=None is expected)
-
-        Returns:
-            TokenInfo with row and token IDs
-
-        Raises:
-            OrchestrationInvariantError: If source_row is not quarantined
-        """
-        if not source_row.is_quarantined:
-            raise OrchestrationInvariantError("create_quarantine_token requires a quarantined SourceRow")
-
-        # For quarantine rows, row may not be a dict (could be malformed external data).
-        # PipelineRow requires exactly builtin dict (type(data) is dict), so normalize
-        # dict subclasses (OrderedDict, etc.) to plain dict for the audit trail.
-        if isinstance(source_row.row, dict):
-            row_data: dict[str, Any] = dict(source_row.row) if type(source_row.row) is not dict else source_row.row
-        else:
-            row_data = {"_raw": source_row.row}
-
-        # Create minimal OBSERVED contract for audit consistency
-        # Quarantine rows don't go through transforms, but audit trail needs a contract
-        from elspeth.contracts.schema_contract import SchemaContract
-
-        quarantine_contract = SchemaContract(
-            mode="OBSERVED",
-            fields=(),  # Empty - no declared fields
-            locked=False,  # Not locked - quarantine doesn't validate types
-        )
-
-        # Create PipelineRow with minimal contract
-        pipeline_row = PipelineRow(row_data, quarantine_contract)
-
-        # Create the row record, initial token, and optional validation-error
-        # association in ONE transaction —
-        # epoch-fenced when a coordination token is threaded (ADR-030 §C.4
-        # row 9: the quarantine arm is an ingest-adjacent durable rows write
-        # at sequence N; historically this was TWO separate transactions).
-        # quarantined=True enables safe hashing for Tier-3 external data that
-        # may contain non-canonical values (NaN, Infinity).
-        row, token = self._data_flow.create_quarantine_row_with_token(
-            run_id=run_id,
-            source_node_id=source_node_id,
-            row_index=row_index,
-            source_row_index=source_row_index,
-            ingest_sequence=ingest_sequence,
-            data=pipeline_row.to_dict(),
-            validation_error_id=validation_error_id,
-            coordination_token=coordination_token,
-        )
-
-        return TokenInfo(
-            row_id=row.row_id,
-            token_id=token.token_id,
-            row_data=pipeline_row,
-        )
-
-    def create_token_for_existing_row(
-        self,
-        row_id: str,
-        row_data: PipelineRow,
-    ) -> TokenInfo:
-        """Create a token for a row that already exists in the database.
-
-        Used during resume when rows were created in the original run
-        but tokens need to be created for reprocessing.
-
-        Args:
-            row_id: Existing row ID in the database
-            row_data: Row data as PipelineRow (reconstructed from checkpoint)
-
-        Returns:
-            TokenInfo with row and token IDs
-        """
-        # Create token for existing row
-        token = self._data_flow.create_token(row_id=row_id)
-
-        return TokenInfo(
-            row_id=row_id,
-            token_id=token.token_id,
-            row_data=row_data,
-        )
-
     def fork_token(
         self,
         parent_token: TokenInfo,
         branches: list[str],
         node_id: NodeID,
-        run_id: str,
         row_data: PipelineRow | None = None,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> tuple[list[TokenInfo], str]:
         """Fork a token to multiple branches.
 
@@ -313,7 +318,8 @@ class TokenManager:
             branches: List of branch names
             node_id: NodeID of the gate/transform performing the fork (resolved to
                 audit step position internally via step_resolver)
-            run_id: Run ID (required for atomic outcome recording)
+            member_token: Registered worker that owns the claimed work item.
+            work_item: Actual scheduler claim authorizing the fork.
             row_data: Optional PipelineRow (defaults to parent's data)
 
         Returns:
@@ -327,7 +333,9 @@ class TokenManager:
         step = self._step_resolver(node_id)
 
         children, fork_group_id = self._data_flow.fork_token(
-            parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run_id),
+            parent_ref=TokenRef(token_id=parent_token.token_id, run_id=member_token.run_id),
+            member_token=member_token,
+            work_item=work_item,
             row_id=parent_token.row_id,
             branches=branches,
             step_in_pipeline=step,
@@ -367,8 +375,9 @@ class TokenManager:
         parents: list[TokenInfo],
         merged_data: PipelineRow,
         node_id: NodeID,
-        run_id: str,
         parent_completions: Sequence[CoalesceParentCompletion] = (),
+        *,
+        coordination_token: CoordinationToken,
     ) -> tuple[TokenInfo, str]:
         """Coalesce multiple tokens into one.
 
@@ -377,11 +386,12 @@ class TokenManager:
             merged_data: Merged row data as PipelineRow (with merged contract)
             node_id: NodeID of the coalesce node performing the merge (resolved to
                 audit step position internally via step_resolver)
-            run_id: Run ID for constructing TokenRefs
+            coordination_token: Leadership authority for the barrier merge.
 
         Returns:
             Tuple of (merged TokenInfo with PipelineRow row_data, join_group_id)
         """
+        run_id = coordination_token.run_id
         if not parents:
             raise OrchestrationInvariantError("coalesce_tokens requires at least one parent token")
 
@@ -434,6 +444,7 @@ class TokenManager:
         # merged_contract = merged_data.contract — the contract the PipelineRow carries
         # (set by the coalesce executor after merging the branch contracts).
         merged = self._data_flow.coalesce_tokens(
+            coordination_token=coordination_token,
             parent_refs=[TokenRef(token_id=p.token_id, run_id=run_id) for p in parents],
             row_id=row_id,
             coalesce_node_id=str(node_id),
@@ -445,6 +456,7 @@ class TokenManager:
         )
         if parent_completions:
             self._data_flow.finalize_coalesce_effect(
+                coordination_token=coordination_token,
                 merged=merged,
                 parent_completions=parent_completions,
             )
@@ -471,8 +483,9 @@ class TokenManager:
         members: Sequence[TokenInfo],
         output_rows: Sequence[PipelineRow],
         node_id: NodeID,
-        run_id: str,
         group_id: str,
+        *,
+        coordination_token: CoordinationToken,
     ) -> tuple[TokenInfo, ...]:
         """Close a bound EXPAND group: strict-pop the closer's frame, mint outputs.
 
@@ -492,6 +505,7 @@ class TokenManager:
         a durable, idempotent empty release group (fix-round ruling 1, spec
         §4.3/§5) — only the engine-visible return is trivially ``()``.
         """
+        run_id = coordination_token.run_id
         if not members:
             raise OrchestrationInvariantError("collect_tokens requires at least one member token")
         # truncate_at_closer_frame owns the frame validation (kind, group_id,
@@ -524,6 +538,7 @@ class TokenManager:
         # either way — ``committed.children`` is empty when output_rows is.
         step = self._step_resolver(node_id)
         committed = self._data_flow.collect_tokens(
+            coordination_token=coordination_token,
             member_refs=[TokenRef(token_id=m.token_id, run_id=run_id) for m in members],
             group_id=group_id,
             collector_node_id=str(node_id),
@@ -552,10 +567,11 @@ class TokenManager:
         expanded_rows: list[dict[str, Any]],
         output_contract: SchemaContract,
         node_id: NodeID,
-        run_id: str,
         parent_path: TerminalPath = TerminalPath.EXPAND_PARENT,
         parent_batch_id: str | None = None,
         aggregation_parent_dispositions: Sequence[AggregationParentDisposition] = (),
+        *,
+        member_token: WorkerMembershipToken,
     ) -> tuple[list[TokenInfo], str]:
         """Create child tokens for deaggregation (1 input -> N outputs).
 
@@ -572,7 +588,7 @@ class TokenManager:
             output_contract: Contract for output rows (from TransformResult.contract)
             node_id: NodeID of the transform performing the expansion (resolved to
                 audit step position internally via step_resolver)
-            run_id: Run ID (required for atomic outcome recording)
+            member_token: Registered worker authorizing the expansion.
             parent_path: EXPAND_PARENT for ordinary deaggregation or
                 BATCH_CONSUMED for transform-mode aggregation.
             parent_batch_id: Required for BATCH_CONSUMED and forbidden for
@@ -618,7 +634,8 @@ class TokenManager:
         # expanded_rows are already plain dicts (transform output) — no .to_dict() needed.
         step = self._step_resolver(node_id)
         db_children, expand_group_id = self._data_flow.expand_token(
-            parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run_id),
+            parent_ref=TokenRef(token_id=parent_token.token_id, run_id=member_token.run_id),
+            member_token=member_token,
             row_id=parent_token.row_id,
             child_payloads=expanded_rows,
             output_contract=output_contract,
@@ -666,7 +683,7 @@ class TokenManager:
         ]
         return child_infos, expand_group_id
 
-    def record_empty_expansion(self, parent_token: TokenInfo, run_id: str) -> str:
+    def record_empty_expansion(self, parent_token: TokenInfo, *, member_token: WorkerMembershipToken) -> str:
         """Durable member_count=0 group record for a zero-row expansion (spec §4.3).
 
         Deliberately does NOT call `register_expand_group`: a zero-row
@@ -674,7 +691,9 @@ class TokenManager:
         system can ever carry this group_id's EXPAND frame — nothing can
         call `binding_for` on it. Registering would be inert bookkeeping.
         """
-        return self._data_flow.record_empty_expansion(TokenRef(token_id=parent_token.token_id, run_id=run_id))
+        return self._data_flow.record_empty_expansion(
+            TokenRef(token_id=parent_token.token_id, run_id=member_token.run_id), member_token=member_token
+        )
 
     # NOTE: Step resolution is handled by the injected StepResolver, which
     # maps NodeID → 1-indexed audit step position. The canonical implementation

@@ -3,7 +3,7 @@
 **Date:** 2026-07-17
 **Status:** Approved design, pre-implementation
 **Branch context:** `codex/dag-scenario-corpus` from `release/0.7.1`
-**Filigree:** `elspeth-ef29ef6ba4`
+**legacy-tracker:** `elspeth-ef29ef6ba4`
 
 ## Purpose
 
@@ -56,7 +56,7 @@ describe different graphs or leave gaps invisible to CI.
    production-path cell pass.
 6. Current gaps are represented as `partial`, `fail`, or `unknown`, never
    `skip` or `xfail`. Every actionable non-pass cell carries a reason, a
-   Filigree owner, and an observable exit gate; `not_applicable` instead
+   legacy issue tracker owner, and an observable exit gate; `not_applicable` instead
    requires a narrow applicability reason.
 7. CI validates the complete manifest and executes every declared production
    harness case. It remains green while gaps are honestly represented, but the

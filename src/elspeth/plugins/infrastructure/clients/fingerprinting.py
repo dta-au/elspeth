@@ -73,6 +73,40 @@ MAX_AUDIT_QUERY_FINGERPRINTS = 64
 _QUERY_REDACTION_SENTINEL_KEY = "__elspeth_query_redacted"
 _QUERY_REDACTION_SENTINEL_VALUE = "too_many_fields"
 _URL_BEARING_RESPONSE_HEADERS = frozenset({"content-location", "location"})
+_LINK_CAPABILITY_QUERY_KEYS = frozenset({"cursor", "continuation", "next_token", "page_token", "session", "state"})
+_LINK_ITEM = r'<[^<>\r\n]+>\s*;\s*rel\s*=\s*(?:"[a-z ]+"|[a-z]+)'
+_SAFE_LINK_HEADER = re.compile(rf"{_LINK_ITEM}(?:\s*,\s*{_LINK_ITEM})*", re.IGNORECASE)
+_LINK_URL = re.compile(r"<([^<>\r\n]+)>")
+
+
+def safe_link_header_for_audit(value: str, *, honor_development_mode: bool = True) -> str:
+    """Keep only simple page links whose full value is safe to replay."""
+    if (
+        len(value) > MAX_AUDIT_QUERY_CHARS
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+        or _SAFE_LINK_HEADER.fullmatch(value) is None
+    ):
+        return "<redacted-http-link>"
+    try:
+        for match in _LINK_URL.finditer(value):
+            url = match.group(1)
+            parsed = urlsplit(url)
+            if fingerprint_url(url, honor_development_mode=honor_development_mode) != url:
+                return "<redacted-http-link>"
+            if len(parsed.query) > MAX_AUDIT_QUERY_CHARS:
+                return "<redacted-http-link>"
+            pairs = parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=MAX_AUDIT_QUERY_FIELDS)
+            if any(
+                not key
+                or is_sensitive_query_param(key)
+                or key.lower() in _LINK_CAPABILITY_QUERY_KEYS
+                or len(key) + len(val) > MAX_AUDIT_QUERY_CHARS
+                for key, val in pairs
+            ):
+                return "<redacted-http-link>"
+    except (ValueError, UnicodeError, FrameworkBugError):
+        return "<redacted-http-link>"
+    return value
 
 
 def _query_redaction_sentinel() -> dict[str, str | int | float]:
@@ -120,7 +154,12 @@ def is_sensitive_header(header_name: str) -> bool:
     return lower_name.startswith("x") and lower_name[1:] in SENSITIVE_HEADER_WORDS
 
 
-def fingerprint_headers(headers: dict[str, str]) -> dict[str, str]:
+def fingerprint_headers(
+    headers: dict[str, str],
+    *,
+    force_fingerprint_names: frozenset[str] = frozenset(),
+    honor_development_mode: bool = True,
+) -> dict[str, str]:
     """Fingerprint sensitive request headers for audit recording.
 
     Sensitive headers (auth, api keys, tokens) are replaced with HMAC
@@ -130,22 +169,27 @@ def fingerprint_headers(headers: dict[str, str]) -> dict[str, str]:
     3. Replay/verify can distinguish requests by credential identity
 
     In dev mode (ELSPETH_ALLOW_RAW_SECRETS=true), sensitive headers are
-    removed entirely (no fingerprint key required).
+    removed entirely (no fingerprint key required), except for caller-declared
+    forced headers, which require HMAC fingerprints in every mode to preserve
+    request identity without exposing low-entropy values.
 
     Args:
         headers: Full headers dict
+        force_fingerprint_names: Casefolded header names whose values must be
+            included as HMAC fingerprints, including in development mode.
 
     Returns:
         Headers dict with sensitive values fingerprinted (or removed in dev mode)
 
     Raises:
         FrameworkBugError: If sensitive header exists but no fingerprint key
-            is configured and dev mode is not enabled.
+            is configured and dev mode is not enabled, or a forced header exists
+            without a fingerprint key in any mode.
     """
     from elspeth.core.security import get_fingerprint_key, secret_fingerprint
 
     # Check if fingerprint key is available
-    allow_raw = os.environ.get("ELSPETH_ALLOW_RAW_SECRETS", "").lower() == "true"
+    allow_raw = honor_development_mode and os.environ.get("ELSPETH_ALLOW_RAW_SECRETS", "").lower() == "true"
 
     try:
         get_fingerprint_key()
@@ -156,7 +200,12 @@ def fingerprint_headers(headers: dict[str, str]) -> dict[str, str]:
     result: dict[str, str] = {}
 
     for k, v in headers.items():
-        if is_sensitive_header(k):
+        if k.casefold() in force_fingerprint_names:
+            if have_key:
+                result[k] = f"<fingerprint:{secret_fingerprint(v)}>"
+            else:
+                raise FrameworkBugError("Configured request headers require ELSPETH_FINGERPRINT_KEY")
+        elif is_sensitive_header(k):
             if allow_raw:
                 # Dev mode: remove header (don't store secrets, don't require key)
                 pass
@@ -179,7 +228,7 @@ def fingerprint_headers(headers: dict[str, str]) -> dict[str, str]:
     return result
 
 
-def filter_response_headers(headers: dict[str, str]) -> dict[str, str]:
+def filter_response_headers(headers: dict[str, str], *, honor_development_mode: bool = True) -> dict[str, str]:
     """Filter out sensitive response headers from audit recording.
 
     Response headers that may contain secrets (cookies, auth challenges)
@@ -196,9 +245,12 @@ def filter_response_headers(headers: dict[str, str]) -> dict[str, str]:
     for key, value in headers.items():
         if is_sensitive_header(key):
             continue
+        if key.lower() == "link":
+            result[key] = safe_link_header_for_audit(value, honor_development_mode=honor_development_mode)
+            continue
         if key.lower() in _URL_BEARING_RESPONSE_HEADERS:
             try:
-                result[key] = fingerprint_url(value)
+                result[key] = fingerprint_url(value, honor_development_mode=honor_development_mode)
             except (ValueError, UnicodeError, FrameworkBugError):
                 # A remote response cannot force raw URL material into audit
                 # evidence or mask the transport outcome when fingerprinting
@@ -222,6 +274,8 @@ def is_sensitive_query_param(param_name: str) -> bool:
 
 def fingerprint_params(
     params: Mapping[str, str | int | float] | None,
+    *,
+    honor_development_mode: bool = True,
 ) -> dict[str, str | int | float] | None:
     """Fingerprint sensitive query parameters for audit recording.
 
@@ -241,7 +295,7 @@ def fingerprint_params(
 
     from elspeth.core.security import get_fingerprint_key, secret_fingerprint
 
-    allow_raw = os.environ.get("ELSPETH_ALLOW_RAW_SECRETS", "").lower() == "true"
+    allow_raw = honor_development_mode and os.environ.get("ELSPETH_ALLOW_RAW_SECRETS", "").lower() == "true"
 
     try:
         get_fingerprint_key()
@@ -270,7 +324,7 @@ def fingerprint_params(
     return result
 
 
-def fingerprint_url(url: str) -> str:
+def fingerprint_url(url: str, *, honor_development_mode: bool = True) -> str:
     """Return a persistence-safe URL with sensitive query values fingerprinted.
 
     Userinfo and fragments are never required to identify an HTTP resource in
@@ -298,7 +352,7 @@ def fingerprint_url(url: str) -> str:
 
     from elspeth.core.security import get_fingerprint_key, secret_fingerprint
 
-    allow_raw = os.environ.get("ELSPETH_ALLOW_RAW_SECRETS", "").lower() == "true"
+    allow_raw = honor_development_mode and os.environ.get("ELSPETH_ALLOW_RAW_SECRETS", "").lower() == "true"
 
     try:
         get_fingerprint_key()

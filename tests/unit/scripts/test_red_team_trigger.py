@@ -1,39 +1,35 @@
 """Tests for the red-team trigger: seam classification, angle selection,
-finding parsing, and severity routing.
+finding parsing, and local report persistence.
 
 The trigger is the deterministic half of the adversarial review pipeline:
-everything an LLM agent produces flows through ``parse_findings`` and
-``route_finding``, so those two must fail closed — a malformed or
-under-specified finding may never auto-file a tracker issue.
+everything an LLM agent produces flows through ``parse_findings``.
+Automatic reviews persist local evidence and never publish issues.
 """
 
 from __future__ import annotations
+
+import json
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from scripts.red_team import trigger
 
 
 def _finding(**overrides: object) -> trigger.Finding:
-    base: dict[str, object] = {
-        "title": "Gate fails open on empty allowlist",
-        "severity": "high",
-        "confidence": "confirmed",
-        "angle": "escape-artist",
-        "commit": "abc1234",
-        "files": ("src/elspeth/web/auth/tokens.py",),
-        "repro": "pytest tests/unit/web/test_tokens.py -n 0",
-        "detail": "The allowlist loader returns [] on parse error.",
-    }
-    base.update(overrides)
-    return trigger.Finding(
-        title=str(base["title"]),
-        severity=str(base["severity"]),
-        confidence=str(base["confidence"]),
-        angle=str(base["angle"]),
-        commit=str(base["commit"]),
-        files=tuple(base["files"]),  # type: ignore[arg-type]
-        repro=str(base["repro"]),
-        detail=str(base["detail"]),
+    return replace(
+        trigger.Finding(
+            title="Gate fails open on empty allowlist",
+            severity="high",
+            confidence="confirmed",
+            angle="escape-artist",
+            commit="abc1234",
+            files=("src/elspeth/web/auth/tokens.py",),
+            repro="pytest tests/unit/web/test_tokens.py -n 0",
+            detail="The allowlist loader returns [] on parse error.",
+        ),
+        **overrides,
     )
 
 
@@ -86,30 +82,6 @@ class TestClassifyPaths:
 
 
 class TestSelectAttackAngles:
-    @pytest.mark.parametrize(
-        "category",
-        ["auth", "secrets", "security", "policy_gate", "state_machine", "cicd_gate"],
-    )
-    def test_every_seam_gets_two_to_three_distinct_angles(self, category: str) -> None:
-        angles = trigger.select_attack_angles({category})
-        names = [angle.name for angle in angles]
-        assert 2 <= len(names) <= 3
-        assert len(set(names)) == len(names)
-
-    def test_base_angles_always_present(self) -> None:
-        angles = trigger.select_attack_angles({"cicd_gate"})
-        names = {angle.name for angle in angles}
-        assert "wrong-reason-tests" in names
-        assert "reverted-guard" in names
-
-    def test_auth_seam_adds_escape_artist(self) -> None:
-        names = {angle.name for angle in trigger.select_attack_angles({"auth"})}
-        assert "escape-artist" in names
-
-    def test_state_machine_seam_adds_state_conflation(self) -> None:
-        names = {angle.name for angle in trigger.select_attack_angles({"state_machine"})}
-        assert "state-conflation" in names
-
     def test_no_categories_yields_no_angles(self) -> None:
         assert trigger.select_attack_angles(set()) == ()
 
@@ -117,7 +89,6 @@ class TestSelectAttackAngles:
         first = trigger.select_attack_angles({"auth", "state_machine"})
         second = trigger.select_attack_angles({"state_machine", "auth"})
         assert [angle.name for angle in first] == [angle.name for angle in second]
-        assert len(first) == 3
 
 
 class TestParseFindings:
@@ -160,59 +131,51 @@ class TestParseFindings:
         assert errors == []
 
 
-class TestRouteFinding:
-    def test_confirmed_high_files_an_issue(self) -> None:
-        assert trigger.route_finding(_finding(severity="high")) == "file"
-        assert trigger.route_finding(_finding(severity="critical")) == "file"
-
-    def test_speculative_critical_only_logs(self) -> None:
-        finding = _finding(severity="critical", confidence="speculative")
-        assert trigger.route_finding(finding) == "log"
-
-    def test_probable_high_only_logs(self) -> None:
-        finding = _finding(severity="high", confidence="probable")
-        assert trigger.route_finding(finding) == "log"
-
-    def test_confirmed_medium_only_logs(self) -> None:
-        finding = _finding(severity="medium")
-        assert trigger.route_finding(finding) == "log"
-
-    def test_unknown_severity_fails_closed_to_log(self) -> None:
-        finding = _finding(severity="catastrophic")
-        assert trigger.route_finding(finding) == "log"
-
-    def test_unknown_confidence_fails_closed_to_log(self) -> None:
-        finding = _finding(confidence="definitely")
-        assert trigger.route_finding(finding) == "log"
-
-
 class TestCommandConstruction:
-    def test_file_issue_argv_builds_filigree_create(self) -> None:
-        finding = _finding(severity="critical")
-        argv = trigger.file_issue_argv(finding)
-        assert argv[0] == "filigree"
-        assert argv[1] == "create"
-        assert finding.title in argv
-        assert "--type" in argv
-        assert argv[argv.index("--type") + 1] == "bug"
-        assert argv[argv.index("-p") + 1] == "0"
-        assert "red-team" in argv
-
-    def test_high_severity_maps_to_priority_one(self) -> None:
-        argv = trigger.file_issue_argv(_finding(severity="high"))
-        assert argv[argv.index("-p") + 1] == "1"
-
-    def test_agent_argv_targets_red_team_agent(self) -> None:
-        angle = trigger.select_attack_angles({"auth"})[0]
-        argv = trigger.build_agent_argv(angle, "the prompt")
-        assert argv[0] == "claude"
-        assert "--agent" in argv
-        assert argv[argv.index("--agent") + 1] == "red-team"
-        assert "-p" in argv
-        assert "the prompt" in argv
-
     def test_agent_prompt_names_commit_and_angle(self) -> None:
         angle = trigger.select_attack_angles({"auth"})[-1]
         prompt = trigger.build_agent_prompt("deadbeef", angle)
         assert "deadbeef" in prompt
         assert angle.name in prompt
+
+
+class TestLocalReports:
+    def test_report_preserves_findings_and_errors_across_runs(self, tmp_path: Path) -> None:
+        report = trigger.append_review_log(tmp_path, [_finding()], ["bad JSON"])
+        trigger.append_review_log(tmp_path, [_finding(title="Second finding", severity="low")], [])
+        text = report.read_text()
+        assert "Gate fails open on empty allowlist" in text
+        assert "[high/confirmed]" in text
+        assert "src/elspeth/web/auth/tokens.py" in text
+        assert "pytest tests/unit/web/test_tokens.py -n 0" in text
+        assert "The allowlist loader returns [] on parse error." in text
+        assert "parse error: bad JSON" in text
+        assert "Second finding" in text
+
+    def test_run_logs_confirmed_critical_findings_without_publishing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(trigger, "_git_output", lambda *args: "abc1234")
+        monkeypatch.setattr(trigger, "changed_paths", lambda *args: ["src/elspeth/web/auth/tokens.py"])
+        finding = {
+            "title": "Critical boundary escape",
+            "severity": "critical",
+            "confidence": "confirmed",
+            "files": ["src/elspeth/web/auth/tokens.py"],
+            "repro": "reproduce the escape",
+            "detail": "Evidence retained for operator triage.",
+        }
+        output = "```json\n" + json.dumps({"findings": [finding]}) + "\n```"
+        process = Mock(spec=trigger.subprocess.Popen, returncode=0)
+        process.communicate.return_value = (json.dumps({"result": output}), "")
+        popen = Mock(spec=trigger.subprocess.Popen, return_value=process)
+        monkeypatch.setattr(trigger.subprocess, "Popen", popen)
+        publish = Mock(spec=trigger.subprocess.run, side_effect=AssertionError("Unexpected external command"))
+        monkeypatch.setattr(trigger.subprocess, "run", publish)
+
+        assert trigger.run_red_team("HEAD", tmp_path, dry_run=False) == 0
+
+        report = tmp_path / ".claude/red-team/review-log.md"
+        assert "[critical/confirmed]" in report.read_text()
+        assert "Critical boundary escape" in report.read_text()
+        assert len(list((tmp_path / ".claude/red-team/runs").glob("*.json"))) == 3
+        assert all(call.args[0][0] == "claude" for call in popen.call_args_list)
+        publish.assert_not_called()

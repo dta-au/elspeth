@@ -7,6 +7,7 @@ Verifies that:
    CallType.HTTP_REDIRECT with correct lineage data.
 """
 
+import base64
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -17,9 +18,12 @@ import pytest
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import HTTPCallResponse
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients import http as http_client_module
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
+from tests.fixtures.mock_audit import mock_audit_authority
 
 
 @dataclass(frozen=True)
@@ -99,12 +103,12 @@ class FakeCallRecorder:
     calls: list[dict[str, Any]] = field(default_factory=list)
     next_call_index: int = 0
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         assert state_id == "test-state-001"
         self.next_call_index += 1
         return self.next_call_index
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         raise AssertionError(f"Unexpected operation call index allocation for {operation_id}")
 
     def record_call(self, **kwargs: Any) -> SimpleNamespace:
@@ -132,6 +136,7 @@ def http_client(monkeypatch):
     monkeypatch.setattr(http_client_module.httpx, "Client", client_factory)
 
     client = AuditedHTTPClient(
+        **mock_audit_authority(),
         execution=FakeCallRecorder(),
         state_id="test-state-001",
         run_id="test-run-001",
@@ -172,6 +177,32 @@ def _make_ssrf_request(url: str, ip: str = "93.184.216.34") -> SSRFSafeRequest:
         scheme=parsed.scheme,
         bare_hostname=parsed.host,
     )
+
+
+def test_successful_redirect_archives_complete_hop_for_replay(ssrf_validator, http_client):
+    initial_request = _make_ssrf_request("https://example.com/start")
+    redirect_response = _make_redirect_response("/end", url="https://93.184.216.34/start")
+    final_response = httpx.Response(
+        200,
+        content=b"final bytes",
+        headers={"content-type": "text/plain"},
+        request=httpx.Request("GET", "https://93.184.216.34/end"),
+    )
+    ssrf_validator.queue(_make_ssrf_request("https://example.com/end"))
+    http_client._test_ephemeral_client.queue_get(redirect_response, final_response)
+
+    response, final_url, _call = http_client.get_ssrf_safe(initial_request, follow_redirects=True)
+
+    assert response.content == b"final bytes"
+    assert final_url == "https://example.com/end"
+    parent = next(item for item in http_client._execution.calls if item["call_type"] is CallType.HTTP)
+    archive = parent["response_data"].to_dict()["transport"]
+    assert archive["request_url"] == "https://93.184.216.34/end"
+    assert archive["logical_url"] == "https://example.com/end"
+    assert archive["body_b64"] == base64.b64encode(b"final bytes").decode("ascii")
+    assert len(archive["redirect_hops"]) == 1
+    assert archive["redirect_hops"][0]["request"]["url"] == "https://example.com/end"
+    assert archive["redirect_hops"][0]["response"]["transport"]["body_b64"] == archive["body_b64"]
 
 
 class TestRelativeRedirectResolution:
@@ -601,7 +632,7 @@ class TestRedirectValidationFailuresPreserveEvidence:
             request=httpx.Request("GET", "http://93.184.216.34:80/start"),
         )
 
-        ssrf_validator.queue(SSRFBlockedError("blocked redirect"))
+        ssrf_validator.queue(SSRFBlockedError("blocked redirect", kind="blocked_range"))
         http_client._test_ephemeral_client.queue_get(redirect_response)
 
         with pytest.raises(SSRFBlockedError, match="blocked redirect"):

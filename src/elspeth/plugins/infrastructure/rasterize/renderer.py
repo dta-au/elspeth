@@ -2,7 +2,8 @@
 
 Owns process isolation, wall-clock timeout, and orphan-process cleanup for
 ``worker.rasterize_document``. Copies the timeout/orphan-kill sequence from
-``plugins/transforms/rag/query.py:143-167`` (load-bearing: without it a timed-out
+``plugins/transforms/rag/query.py`` (``QueryBuilder._build_regex``, the
+``FuturesTimeoutError`` arm) (load-bearing: without it a timed-out
 worker keeps burning CPU and the interpreter hangs at exit).
 """
 
@@ -34,6 +35,7 @@ class RenderLimits:
     max_pages: int
     max_page_pixels: int
     max_page_bytes: int
+    max_total_bytes: int
     render_timeout_seconds: int
     worker_memory_limit_bytes: int
     extract_text: bool
@@ -129,6 +131,7 @@ class PoolRenderer:
             max_pages=self._limits.max_pages,
             max_page_pixels=self._limits.max_page_pixels,
             max_page_bytes=self._limits.max_page_bytes,
+            max_total_bytes=self._limits.max_total_bytes,
             output_dir=output_dir,
             extract_text=self._limits.extract_text,
             max_page_text_bytes=self._limits.max_page_text_bytes,

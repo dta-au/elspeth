@@ -9,7 +9,7 @@ invariants for correctness: ``journal_mode=WAL`` (writer/reader concurrency),
 applies them per-connection and ``_verify_sqlite_pragmas`` probe-and-asserts
 at engine open; ``TokenSchedulerRepository.__init__`` re-probes as defence in
 depth.  These tests pin the discipline on the exact connection shapes the
-scheduler uses (filigree elspeth-8536552dcb, elspeth-97f8509b35,
+scheduler uses (archived issue elspeth-8536552dcb, elspeth-97f8509b35,
 elspeth-addd3dc41f):
 
 1. Every pooled connection — including concurrent ones and the
@@ -30,7 +30,7 @@ elspeth-addd3dc41f):
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -39,6 +39,7 @@ from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
@@ -47,11 +48,13 @@ from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     nodes_table,
     rows_table,
+    run_workers_table,
     runs_table,
     scheduler_events_table,
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import landscape_database_now
 
 RUN_ID = "run-pragma"
@@ -76,7 +79,7 @@ def _insert_run_node_row_token(db: LandscapeDB, *, now: datetime) -> None:
             insert(runs_table).values(
                 run_id=RUN_ID,
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -96,7 +99,7 @@ def _insert_run_node_row_token(db: LandscapeDB, *, now: datetime) -> None:
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -109,7 +112,7 @@ def _insert_run_node_row_token(db: LandscapeDB, *, now: datetime) -> None:
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="hash-row-1",
+                source_data_hash=fake_sha256("hash-row-1"),
                 created_at=now,
             )
         )
@@ -121,11 +124,22 @@ def _insert_run_node_row_token(db: LandscapeDB, *, now: datetime) -> None:
                 created_at=now,
             )
         )
+        for worker_id in ("owner-a", "owner-b", "owner-rival"):
+            conn.execute(
+                insert(run_workers_table).values(
+                    worker_id=worker_id,
+                    run_id=RUN_ID,
+                    role="follower",
+                    status="active",
+                    registered_at=now,
+                    heartbeat_expires_at=now + timedelta(hours=1),
+                )
+            )
 
 
 def _enqueue_one_ready(repo: TokenSchedulerRepository, *, now: datetime) -> TokenWorkItem:
     return repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="owner-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -256,7 +270,7 @@ class _RivalInterposingLeases(SchedulerLeaseRepository):
     ) -> RowMapping | None:
         try:
             self.rival_outcome = self._rival.claim_ready(
-                run_id=run_id,
+                member_token=WorkerMembershipToken(run_id=run_id, worker_id="owner-rival"),
                 lease_owner="owner-rival",
                 lease_seconds=300,
             )
@@ -277,7 +291,7 @@ class _RivalInterposingRepository(TokenSchedulerRepository):
     """Facade wired with the rival-interposing lease component.
 
     The claim seam lives on :class:`SchedulerLeaseRepository` since the god
-    -repository split (filigree elspeth-ef9c36d767); the queue component is
+    -repository split (archived issue elspeth-ef9c36d767); the queue component is
     re-wired too because it composes the same lease CAS.
     """
 
@@ -318,11 +332,15 @@ class TestClaimReadyUnderSecondWriterConnection:
             try:
                 repo_b = TokenSchedulerRepository(db_b.engine)
 
-                claimed_a = repo_a.claim_ready(run_id=RUN_ID, lease_owner="owner-a", lease_seconds=300)
+                claimed_a = repo_a.claim_ready(
+                    member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="owner-a"), lease_owner="owner-a", lease_seconds=300
+                )
                 assert claimed_a is not None
                 assert claimed_a.lease_owner == "owner-a"
 
-                claimed_b = repo_b.claim_ready(run_id=RUN_ID, lease_owner="owner-b", lease_seconds=300)
+                claimed_b = repo_b.claim_ready(
+                    member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="owner-b"), lease_owner="owner-b", lease_seconds=300
+                )
                 assert claimed_b is None
 
                 with db_a.engine.connect() as conn:
@@ -372,7 +390,9 @@ class TestClaimReadyUnderSecondWriterConnection:
                 finally:
                     raw.close()
 
-                claimed_a = repo_a.claim_ready(run_id=RUN_ID, lease_owner="owner-a", lease_seconds=300)
+                claimed_a = repo_a.claim_ready(
+                    member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="owner-a"), lease_owner="owner-a", lease_seconds=300
+                )
 
                 assert claimed_a is not None
                 assert claimed_a.lease_owner == "owner-a"
@@ -381,7 +401,14 @@ class TestClaimReadyUnderSecondWriterConnection:
 
                 # Serialized retry after the commit: refused via the READY
                 # filter — clean None, single owner.
-                assert rival.claim_ready(run_id=RUN_ID, lease_owner="owner-rival", lease_seconds=300) is None
+                assert (
+                    rival.claim_ready(
+                        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="owner-rival"),
+                        lease_owner="owner-rival",
+                        lease_seconds=300,
+                    )
+                    is None
+                )
 
                 with db_a.engine.connect() as conn:
                     item = conn.execute(select(token_work_items_table).where(token_work_items_table.c.run_id == RUN_ID)).mappings().one()

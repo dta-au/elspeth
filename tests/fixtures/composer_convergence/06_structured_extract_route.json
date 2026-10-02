@@ -1,0 +1,94 @@
+{
+  "id": "06_structured_extract_route",
+  "title": "Typed LLM extraction consumed by a gate",
+  "inputs": [
+    {
+      "filename": "order_notes.csv",
+      "media_type": "text/csv",
+      "content": "id,note\ne1,Order A17 contains 3 units and is urgent.\ne2,Order B04 contains 1 unit and is not urgent.\ne3,Order C99 contains 12 units and is urgent.\n"
+    }
+  ],
+  "turns": [
+    "Using the sonnet LLM profile, extract order_code as string, units as integer and urgent as boolean from each note in order_notes.csv using a declared structured-output schema. Preserve id. Use a gate that consumes the typed urgent boolean to route true to urgent.jsonl and false to normal.jsonl. Use field_mapper to retain exactly id,order_code,units,urgent. Do not replace LLM extraction with regex or hand-coded mappings. Validate and preview, and show any required interpretation reviews."
+  ],
+  "expected_plugins": {
+    "source": [
+      "csv"
+    ],
+    "transform": [
+      "llm",
+      "field_mapper"
+    ],
+    "sink": [
+      "json"
+    ]
+  },
+  "required_node_kinds": [
+    "gate"
+  ],
+  "outputs": [
+    {
+      "filename": "urgent.jsonl",
+      "format": "jsonl",
+      "columns": [
+        "id",
+        "order_code",
+        "units",
+        "urgent"
+      ],
+      "rows": [
+        {
+          "id": "e1",
+          "order_code": "A17",
+          "units": 3,
+          "urgent": true
+        },
+        {
+          "id": "e3",
+          "order_code": "C99",
+          "units": 12,
+          "urgent": true
+        }
+      ]
+    },
+    {
+      "filename": "normal.jsonl",
+      "format": "jsonl",
+      "columns": [
+        "id",
+        "order_code",
+        "units",
+        "urgent"
+      ],
+      "rows": [
+        {
+          "id": "e2",
+          "order_code": "B04",
+          "units": 1,
+          "urgent": false
+        }
+      ]
+    }
+  ],
+  "audit": {
+    "source_rows": 3,
+    "success_output_rows": 3,
+    "routed_error_rows": 0,
+    "discarded_rows": 0,
+    "shape": "linear",
+    "succeeded_tokens": 3,
+    "structural_tokens": 0
+  },
+  "review_policy": {
+    "allowed_types": [
+      "vague_term",
+      "invented_source",
+      "llm_prompt_template",
+      "pipeline_decision",
+      "llm_model_choice",
+      "source_data_contract"
+    ],
+    "constraints": "Inspect each presented draft against every explicit requirement in turns. Accept only matching meanings; never approve a changed output, dropped row, weaker type or unrelated requirement. Source data must match supplied input bytes; any model choice must retain the approved sonnet profile."
+  },
+  "max_user_turns": 5
+}

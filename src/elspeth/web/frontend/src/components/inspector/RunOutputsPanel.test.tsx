@@ -1279,4 +1279,146 @@ describe("RunOutputsPanel", () => {
 
     pending.resolve(csvPreview());
   });
+
+  // (#43) The run-outputs routes (execution/routes.py) raise these with a
+  // dict `detail` carrying only `error_type` — no human string — so
+  // `parseResponse` falls back to `response.statusText`. Model that real
+  // wire shape (a bare HTTP reason phrase in `detail`, the discriminator in
+  // `error_type`) rather than a fixture with a human `detail` the backend
+  // never sends.
+  it.each([
+    [
+      "run_outputs_audit_unavailable",
+      503,
+      "Service Unavailable",
+      /audit trail is unavailable/i,
+    ],
+    [
+      "output_path_outside_allowlist",
+      403,
+      "Forbidden",
+      /outside the deployment's allowed output directories/i,
+    ],
+    [
+      "artifact_not_found",
+      404,
+      "Not Found",
+      /no longer listed in the run's output manifest/i,
+    ],
+    [
+      "artifact_path_resolution_failed",
+      500,
+      "Internal Server Error",
+      /could not resolve this artifact's file path/i,
+    ],
+  ] as const)(
+    "maps manifest error_type %s to operator copy, not the bare '%s' reason phrase",
+    async (errorType, status, statusText, expectedCopy) => {
+      const apiError: ApiError = { status, detail: statusText, error_type: errorType };
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
+
+      render(<RunOutputsPanel runId={RUN_ID} />);
+
+      await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+      expect(screen.getByText(expectedCopy)).toBeInTheDocument();
+      expect(screen.queryByText(statusText)).not.toBeInTheDocument();
+    },
+  );
+
+  it("maps the object-store 415 to operator copy for a non-file download attempt", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    const apiError: ApiError = {
+      status: 415,
+      detail: "Unsupported Media Type",
+      error_type: "object_store_artifact_not_streamable",
+    };
+    (downloadRunOutputContent as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+    await waitFor(() => expect(screen.getByText("results.csv")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /Download/i }));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(
+      screen.getByText(/object store with no filesystem mirror and cannot be downloaded/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Unsupported Media Type")).not.toBeInTheDocument();
+  });
+
+  // (#43 follow-up) Three run-outputs /content error types the download
+  // path did not map: the 409 content-drift guard, the 410 purge/move race
+  // (a distinct copy from the preview row's per-artifact "purged" state —
+  // formatError is shared with the manifest-load and non-purge preview
+  // paths, so it must never echo the bare HTTP reason phrase either), and
+  // the 416 range-not-satisfiable guard on ranged downloads.
+  it.each([
+    [
+      "artifact_content_drift",
+      409,
+      "Conflict",
+      /no longer matches what the run recorded and cannot be downloaded/i,
+    ],
+    [
+      "artifact_purged_or_moved",
+      410,
+      "Gone",
+      /no longer exists at its recorded location.*cannot be downloaded/i,
+    ],
+    [
+      "range_not_satisfiable",
+      416,
+      "Range Not Satisfiable",
+      /requested portion of this artifact could not be read/i,
+    ],
+  ] as const)(
+    "maps download error_type %s to operator copy, not the bare '%s' reason phrase",
+    async (errorType, status, statusText, expectedCopy) => {
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+        manifest([fileArtifact()]),
+      );
+      const apiError: ApiError = { status, detail: statusText, error_type: errorType };
+      (downloadRunOutputContent as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
+
+      render(<RunOutputsPanel runId={RUN_ID} />);
+      await waitFor(() => expect(screen.getByText("results.csv")).toBeInTheDocument());
+      fireEvent.click(screen.getByRole("button", { name: /Download/i }));
+
+      const alert = await screen.findByRole("alert");
+      expect(alert).toHaveTextContent(expectedCopy);
+      expect(alert).not.toHaveTextContent(statusText);
+    },
+  );
+
+  // (#43 open item, low-severity attack) Pin the existing
+  // object_store_artifact_not_previewable mapping's KEY, not just its
+  // rendered copy: a typo in the allowlist key (e.g. a dropped letter)
+  // makes `RUN_OUTPUTS_ERROR_COPY[value.error_type]` miss and formatError
+  // silently falls through to the bare reason phrase this whole mapping
+  // exists to hide. The backend raises this exact error_type from the
+  // PREVIEW endpoint's object-store check (`_resolved_allowed_artifact_paths`
+  // called with `object_store_error_type="object_store_artifact_not_previewable"`
+  // from `_verified_artifact_preview_head_from_candidates`), reached here via
+  // the single-artifact auto-expand preview fetch — the same mechanism the
+  // artifact_purged_or_moved race test above uses.
+  it("maps object_store_artifact_not_previewable on the auto-expanded preview fetch", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    const apiError: ApiError = {
+      status: 415,
+      detail: "Unsupported Media Type",
+      error_type: "object_store_artifact_not_previewable",
+    };
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(
+      screen.getByText(/object store with no filesystem mirror and cannot be previewed/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Unsupported Media Type")).not.toBeInTheDocument();
+  });
 });

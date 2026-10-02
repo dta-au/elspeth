@@ -50,11 +50,20 @@ from elspeth.contracts.coordination import (
     WorkerMembershipToken,
 )
 from elspeth.contracts.errors import RunWorkerEvictedError
+from elspeth.core.landscape.lease_deadlines import LeaseDeadlineExpiredError
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 
 # ---------------------------------------------------------------------------
 # Stub repo — avoids MagicMock() to keep the unspecced-mock baseline clean
 # ---------------------------------------------------------------------------
+
+
+class _Psycopg2Error(Exception):
+    """Model pgcode populated by a server response, not a bare constructor."""
+
+    def __init__(self, pgcode: str) -> None:
+        super().__init__("driver diagnostic")
+        self.pgcode = pgcode
 
 
 class _StubRepo:
@@ -91,8 +100,8 @@ class _StubRepo:
             raise AssertionError("_StubRepo.snapshot must be set before calling worker_heartbeat")
         return self.snapshot
 
-    def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None:
-        self.record_heartbeat_degraded_calls.append({"run_id": run_id, "worker_id": worker_id, "failures": failures, "now": now})
+    def record_heartbeat_degraded(self, *, member_token: WorkerMembershipToken, failures: int, now: datetime) -> None:
+        self.record_heartbeat_degraded_calls.append({"member_token": member_token, "failures": failures, "now": now})
         if self.degraded_exception is not None:
             raise self.degraded_exception
 
@@ -125,6 +134,12 @@ _DEPOSED_SNAPSHOT = CoordinationSnapshot(
     seat_live=True,
     worker_active=True,
 )
+
+# The two latched reasons, mirroring the production strings verbatim. Both
+# coordination losses set the SAME Event and raise the SAME error class, so
+# these strings are the only thing that tells an operator which one happened.
+_DEPOSED_REASON = f"seat taken by {_DEPOSED_SNAPSHOT.leader_worker_id!r} (our worker_id={_WORKER_ID!r})"
+_MEMBERSHIP_LOST_REASON = "heartbeat refused by the membership fence: our run_workers row is no longer 'active' (no seat state observed)"
 
 
 def _busy_error(statement: str = "UPDATE run_workers SET heartbeat_expires_at=?") -> OperationalError:
@@ -324,6 +339,41 @@ class TestFatalIntegrityLatch:
 
 
 class TestBusyTolerated:
+    def test_deadline_guard_rejection_degrades_then_recovers_on_next_tick(self) -> None:
+        repo = _StubRepo()
+        repo.side_effects = [LeaseDeadlineExpiredError("heartbeat reserve exhausted"), _HEALTHY_SNAPSHOT]
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 1
+        assert len(repo.record_heartbeat_degraded_calls) == 1
+        assert not thread._coordination_lost_event.is_set()
+        assert not thread._fatal_event.is_set()
+        thread.check_and_raise()
+
+        thread._step_beat()
+
+        assert len(repo.worker_heartbeat_calls) == 2
+        assert thread._consecutive_busy == 0
+        assert not thread._coordination_lost_event.is_set()
+        assert not thread._fatal_event.is_set()
+        thread.check_and_raise()
+
+    def test_unrelated_timeout_still_fails_closed(self) -> None:
+        failure = TimeoutError("unexpected owned operation timeout")
+        repo = _StubRepo()
+        repo.side_effect = failure
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 0
+        assert repo.record_heartbeat_degraded_calls == []
+        with pytest.raises(TimeoutError) as raised:
+            thread.check_and_raise()
+        assert raised.value is failure
+
     def test_operational_error_does_not_set_latch(self) -> None:
         """SQLITE_BUSY does NOT set the coordination-lost latch."""
         repo = _StubRepo()
@@ -334,6 +384,45 @@ class TestBusyTolerated:
 
         assert not thread._coordination_lost_event.is_set()
         thread.check_and_raise()  # must not raise
+
+    def test_postgresql_lock_timeout_records_degradation(self) -> None:
+        postgres = pytest.importorskip("psycopg")
+        failure = OperationalError(
+            "SELECT run_coordination FOR UPDATE",
+            None,
+            postgres.errors.LockNotAvailable(
+                'canceling statement due to lock timeout\nCONTEXT:  while locking tuple (0,1) in relation "run_coordination"'
+            ),
+        )
+        repo = _StubRepo()
+        repo.side_effect = failure
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 1
+        assert len(repo.record_heartbeat_degraded_calls) == 1
+        assert not thread.coordination_lost
+        thread.check_and_raise()
+
+    @pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
+    @pytest.mark.parametrize("reason", ["statement timeout", "user request"])
+    def test_postgresql_non_lock_cancellation_remains_fatal(self, driver: str, reason: str) -> None:
+        postgres = pytest.importorskip(driver)
+        failure = OperationalError(
+            "SELECT run_coordination FOR UPDATE", None, postgres.errors.QueryCanceled(f"canceling statement due to {reason}")
+        )
+        repo = _StubRepo()
+        repo.side_effect = failure
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 0
+        assert repo.record_heartbeat_degraded_calls == []
+        with pytest.raises(OperationalError) as raised:
+            thread.check_and_raise()
+        assert raised.value is failure
 
     @pytest.mark.parametrize(
         "driver_message",
@@ -490,8 +579,7 @@ class TestHeartbeatDegraded:
         thread._step_beat()  # busy=3 — fires NOW
         assert len(repo.record_heartbeat_degraded_calls) == 1
         call_kwargs = repo.record_heartbeat_degraded_calls[0]
-        assert call_kwargs["run_id"] == _RUN_ID
-        assert call_kwargs["worker_id"] == _WORKER_ID
+        assert call_kwargs["member_token"] is _TOKEN
         assert call_kwargs["failures"] == 3
         assert isinstance(call_kwargs["now"], datetime)
 
@@ -563,8 +651,7 @@ class TestHeartbeatDegraded:
         thread._step_beat()
 
         call_kwargs = repo.record_heartbeat_degraded_calls[0]
-        assert call_kwargs["worker_id"] == _WORKER_ID
-        assert call_kwargs["run_id"] == _RUN_ID
+        assert call_kwargs["member_token"] is _TOKEN
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +683,31 @@ class TestFatalLatchForeignLeader:
 
         assert exc_info.value.worker_id == _WORKER_ID
         assert exc_info.value.run_id == _RUN_ID
+
+    def test_check_and_raise_carries_the_seat_taken_reason(self) -> None:
+        """The raised error names the SEAT-TAKEN loss specifically.
+
+        Both coordination losses set the same Event and raise the same error
+        class, so the latched reason is the only thing that tells an operator
+        which one happened. Asserting the exact deposition text (rather than
+        merely ``reason is not None``) is what makes this test go red if
+        ``check_and_raise`` stops threading the latched value through.
+        """
+        repo = _StubRepo()
+        repo.snapshot = _DEPOSED_SNAPSHOT
+
+        thread = _make_thread(repo)
+        # Absence is the only honest pre-beat value: nothing has been observed
+        # yet, so the thread must not be able to name a loss. A hardcoded
+        # constructor default would fail here.
+        assert thread._coordination_lost_reason is None
+        thread._step_beat()
+
+        with pytest.raises(RunWorkerEvictedError) as exc_info:
+            thread.check_and_raise()
+
+        assert exc_info.value.reason == _DEPOSED_REASON
+        assert _DEPOSED_REASON in str(exc_info.value)
 
     def test_healthy_then_deposed_sets_latch(self) -> None:
         """A previously healthy thread latches when it later observes deposition."""
@@ -656,10 +768,139 @@ class TestFatalLatchEvicted:
         with pytest.raises(RunWorkerEvictedError):
             thread.check_and_raise()
 
+    def test_check_and_raise_carries_the_membership_lost_reason(self) -> None:
+        """The raised error names the FENCE-REFUSAL loss specifically.
+
+        The reason must claim only what ``WorkerMembershipLost`` witnesses: the
+        fence refused this beat. That outcome carries a single field
+        (``member_token``) and no seat state, so it cannot tell eviction from
+        departure — and this test pins that the message does not pretend to.
+        """
+        repo = _StubRepo()
+        repo.snapshot = _EVICTED_OUTCOME
+
+        thread = _make_thread(repo)
+        assert thread._coordination_lost_reason is None  # before any beat
+        thread._step_beat()
+
+        with pytest.raises(RunWorkerEvictedError) as exc_info:
+            thread.check_and_raise()
+
+        assert exc_info.value.reason == _MEMBERSHIP_LOST_REASON
+        assert _MEMBERSHIP_LOST_REASON in str(exc_info.value)
+        # The outcome cannot witness WHEN or HOW the row left 'active'; the
+        # reason must not name a departure mechanism it never saw.
+        assert "at finalize" not in str(exc_info.value)
+
+    def test_the_two_coordination_losses_are_distinguishable(self) -> None:
+        """Eviction and deposition must not reach the operator as one message.
+
+        This is the diagnostic's whole purpose: same latch Event, same error
+        class, so only the reason discriminates them.
+        """
+        evicted_repo = _StubRepo()
+        evicted_repo.snapshot = _EVICTED_OUTCOME
+        evicted_thread = _make_thread(evicted_repo)
+        evicted_thread._step_beat()
+
+        deposed_repo = _StubRepo()
+        deposed_repo.snapshot = _DEPOSED_SNAPSHOT
+        deposed_thread = _make_thread(deposed_repo)
+        deposed_thread._step_beat()
+
+        with pytest.raises(RunWorkerEvictedError) as evicted_info:
+            evicted_thread.check_and_raise()
+        with pytest.raises(RunWorkerEvictedError) as deposed_info:
+            deposed_thread.check_and_raise()
+
+        assert evicted_info.value.reason != deposed_info.value.reason
+        assert str(evicted_info.value) != str(deposed_info.value)
+
     def test_check_and_raise_quiet_before_eviction(self) -> None:
         """check_and_raise() is a no-op before the latch is set."""
         thread = _make_thread(_StubRepo())  # no beats driven
         thread.check_and_raise()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# 5b. The coordination-lost latch is one-shot (first observation wins)
+# ---------------------------------------------------------------------------
+
+
+class TestCoordinationLostLatchIsOneShot:
+    """The latched reason is the loss that stopped this worker, not the last seen.
+
+    ``_run`` has no ``break`` on the coordination latch and ``_beat_once`` has
+    no early return, so the beat thread keeps beating after the Event is set.
+    Last-writer-wins would therefore (a) report a loss OTHER than the one that
+    latched, and (b) store into a value the drain thread may already be reading,
+    with no happens-before edge — the Event only orders the FIRST write.
+    ``_latch_coordination_lost`` closes both by publishing once.
+    """
+
+    def test_reason_is_available_at_event_publication(self) -> None:
+        """A drain observing the set event already receives the loss detail."""
+        repo = _StubRepo()
+        repo.snapshot = _DEPOSED_SNAPSHOT
+        thread = _make_thread(repo)
+        observed: list[str | None] = []
+
+        class ObservedEvent(threading.Event):
+            def set(self) -> None:
+                super().set()
+                with pytest.raises(RunWorkerEvictedError) as raised:
+                    thread.check_and_raise()
+                observed.append(raised.value.reason)
+
+        thread._coordination_lost_event = ObservedEvent()
+        thread._step_beat()
+
+        assert observed == [_DEPOSED_REASON]
+
+    @pytest.mark.parametrize(
+        ("first", "second", "expected_reason"),
+        [
+            pytest.param(_DEPOSED_SNAPSHOT, _EVICTED_OUTCOME, _DEPOSED_REASON, id="deposed-then-evicted"),
+            pytest.param(_EVICTED_OUTCOME, _DEPOSED_SNAPSHOT, _MEMBERSHIP_LOST_REASON, id="evicted-then-deposed"),
+        ],
+    )
+    def test_a_later_loss_cannot_overwrite_the_latched_reason(
+        self,
+        first: CoordinationSnapshot | WorkerMembershipLost,
+        second: CoordinationSnapshot | WorkerMembershipLost,
+        expected_reason: str,
+    ) -> None:
+        """The FIRST observed loss survives a second, different observation.
+
+        Both orders are SYNTHETIC stub sequences, asserted as a property of the
+        latch and NOT as a claim that either cascade occurs in production: what
+        is under test is that the one-shot guard is applied at BOTH latch sites,
+        since a guard applied to only one of them still passes in the other
+        direction. ``_step_beat`` drives ``_beat_once`` directly, so the call
+        count after the second one proves ``_beat_once`` still reaches the
+        repository once the latch is set — it does not exercise ``_run``'s
+        loop, which this test never starts.
+        """
+        repo = _StubRepo()
+        repo.side_effects = [first, second]
+
+        thread = _make_thread(repo)
+        thread._step_beat()
+        assert thread._coordination_lost_event.is_set()
+        assert thread._coordination_lost_reason == expected_reason
+
+        thread._step_beat()
+
+        # The second beat really ran: without this the test passes trivially if
+        # the loop ever stops at the latch.
+        assert len(repo.worker_heartbeat_calls) == 2
+        assert thread._coordination_lost_reason == expected_reason
+
+        with pytest.raises(RunWorkerEvictedError) as exc_info:
+            thread.check_and_raise()
+
+        assert exc_info.value.reason == expected_reason
+        assert expected_reason in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -916,3 +1157,65 @@ def test_heartbeat_and_window_constants_satisfy_sizing_rule() -> None:
     """window >= 4 * (beat + busy_timeout) by the §A.3 sizing rule."""
     busy_timeout_seconds = 5.0
     assert 4 * (DEFAULT_RUN_HEARTBEAT_SECONDS + busy_timeout_seconds) <= DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+
+
+def test_stop_timeout_reports_live_thread_and_skips_later_final_beat() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockedRepo(_StubRepo):
+        def worker_heartbeat(
+            self, *, member_token: WorkerMembershipToken, window_seconds: float
+        ) -> CoordinationSnapshot | WorkerMembershipLost:
+            entered.set()
+            assert release.wait(5), "test failed to release blocked heartbeat"
+            return super().worker_heartbeat(member_token=member_token, window_seconds=window_seconds)
+
+    repo = BlockedRepo()
+    repo.snapshot = _HEALTHY_SNAPSHOT
+    thread = RunHeartbeatThread(repo, member_token=_TOKEN, heartbeat_seconds=0.001, stop_timeout_seconds=0.05)
+    thread.start()
+    try:
+        assert entered.wait(2)
+        with pytest.raises(TimeoutError, match=r"heartbeat.*did not stop"):
+            thread.stop()
+    finally:
+        release.set()
+        thread._thread.join(2)
+    thread.stop()
+    assert len(repo.worker_heartbeat_calls) == 1
+
+
+def test_stop_before_start_is_safe() -> None:
+    thread = _make_thread(_StubRepo())
+    thread.stop()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_stop_timeout_requires_finite_positive_budget(timeout: float) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        RunHeartbeatThread(_StubRepo(), member_token=_TOKEN, stop_timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize("sqlstate", ["55P03", "40P01", "57014"])
+@pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
+def test_postgresql_sqlstate_distinguishes_contention_from_statement_cancellation(sqlstate: str, driver: str) -> None:
+    """Both driver fields classify by server SQLSTATE independently of text."""
+    from psycopg.errors import lookup
+
+    repo = _StubRepo()
+    origin = lookup(sqlstate)("driver diagnostic") if driver == "psycopg" else _Psycopg2Error(sqlstate)
+    failure = OperationalError("UPDATE run_workers", None, origin)
+    repo.side_effect = failure
+    thread = _make_thread(repo, degraded_threshold=1)
+    thread._step_beat()
+    if sqlstate in {"55P03", "40P01"}:
+        assert thread._consecutive_busy == 1
+        assert len(repo.record_heartbeat_degraded_calls) == 1
+        thread.check_and_raise()
+    else:
+        assert thread._consecutive_busy == 0
+        assert repo.record_heartbeat_degraded_calls == []
+        with pytest.raises(OperationalError) as raised:
+            thread.check_and_raise()
+        assert raised.value is failure

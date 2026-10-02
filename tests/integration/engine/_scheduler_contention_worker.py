@@ -17,16 +17,17 @@ Roles
 -----
 hammer
     Single-threaded loop: ``claim_ready`` every iteration with
-    ``--lease-seconds`` (default 0: every lease is aged into the database
-    clock's past right after the claim, so it is instantly expired, and
-    the PEER's sweep genuinely reaps it — the hammer is self-feeding);
+    ``--lease-seconds`` (default 30). With ``--expire-claims``, each committed
+    lease is aged into the database clock's past, so the PEER's sweep
+    genuinely reaps it and the hammer is self-feeding;
     ``recover_expired_leases`` every ``--sweep-every`` iterations (the
     self-steal guard means only the peer's leases are reaped — the exact
     multi-worker interleaving slice 1 must survive); plus a synthetic
     "heartbeat" every ``--beat-interval-ms``: the §A.3 beat shape — a
     single-row CAS UPDATE on the runs row in its own write-intent
     transaction — which is the direct latency proxy for the slice-4
-    heartbeat thread.
+    heartbeat thread. The configured claim and peer-recovery floors must
+    also complete before the worker exits.
 
 reader
     Dashboard-style read batches on a ``from_url(read_only=True)`` handle
@@ -68,15 +69,20 @@ import sys
 import time
 from collections.abc import Callable
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import event, update
 from sqlalchemy.engine import Connection
+from sqlalchemy.sql.dml import Insert
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB, begin_write
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import runs_table, token_work_items_table
 
@@ -87,11 +93,15 @@ ROLE_READER = "reader"
 VERB_CLAIM = "claim_ready"
 VERB_RECOVER = "recover_expired_leases"
 VERB_BEAT = "beat"
+VERB_EXPIRE = "expire_claim"
 
 # Poll interval while waiting for the parent's go-file (start barrier).
 _GO_POLL_SECONDS = 0.005
 # Reader pacing: dashboard-style polling, not a busy spin.
 _READER_PAUSE_SECONDS = 0.010
+# Once measurement finishes, waiting for peer progress must not remain a
+# zero-pause writer loop: SQLite's busy timeout provides no FIFO admission.
+_PROGRESS_PAUSE_SECONDS = 0.010
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -105,7 +115,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--duration-seconds", type=float, required=True)
     parser.add_argument("--metrics-out", required=True)
     parser.add_argument("--sweep-every", type=int, default=8)
-    parser.add_argument("--lease-seconds", type=int, default=0)
+    parser.add_argument("--lease-seconds", type=int, default=30)
+    parser.add_argument("--expire-claims", action="store_true")
     parser.add_argument("--beat-interval-ms", type=int, default=250)
     # The cross-owner reap the parent asserts per hammer (A9). The measurement
     # window is a floor: a hammer keeps going past it until it has reaped this
@@ -113,6 +124,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     # hammer's last sweep, and a lock-starved peer's first claim can land after
     # any fixed window. The parent's join timeout bounds the wait.
     parser.add_argument("--min-recovered", type=int, default=1)
+    parser.add_argument("--min-claims", type=int, default=0)
+    parser.add_argument("--peer-recovered-file", action="append", default=[])
     return parser.parse_args(argv)
 
 
@@ -163,6 +176,25 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
         pragmas = _read_pragmas(db)  # BEFORE instrumentation: keeps txn records verb-only
         engine = db.engine
         repo = TokenSchedulerRepository(engine)
+        coordination = RunCoordinationRepository(engine)
+        member = coordination.admit_follower(run_id=args.run_id, worker_id=args.owner, config_hash=stable_hash({}), window_seconds=80)
+        seat = coordination.live_leader(run_id=args.run_id)
+        assert seat is not None
+        # Both contention hammers hold the same real coordinator grant for
+        # maintenance. Their item claims use distinct admitted memberships.
+        leader = CoordinationToken(run_id=args.run_id, worker_id=seat.leader_worker_id, leader_epoch=seat.leader_epoch)
+        peer_recoveries: list[str] = []
+
+        def observe_recovery_events(_conn: Any, clause: Any, multiparams: Any, params: Any, _options: Any, _result: Any) -> None:
+            if not isinstance(clause, Insert) or clause.table.name != "scheduler_events":
+                return
+            if not multiparams and not params:
+                return
+            for values in multiparams or (params,):
+                if values["event_type"] == "recover_expired_lease" and values["from_lease_owner"] != args.owner:
+                    peer_recoveries.append(values["event_id"])
+
+        event.listen(engine, "after_execute", observe_recovery_events)
 
         txns: list[dict[str, Any]] = []
         _install_write_lock_instrumentation(engine, txns)
@@ -180,19 +212,33 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
             """Run one repository verb; finalize its write-transaction record."""
             idx = len(txns)
             t_start = time.perf_counter()
-            result = fn()
-            t_end = time.perf_counter()
-            record: dict[str, Any] = {"verb": verb, "round_trip_ms": (t_end - t_start) * 1000.0}
-            opened = txns[idx:]
-            # One verb call == one transaction; tolerate (and surface via the
-            # A12 self-check) anything else rather than crashing the child.
-            if len(opened) == 1 and "lock_acquired" in opened[0]:
-                rec = opened[0]
-                record["begin_stmt"] = rec["begin_stmt"]
-                record["lock_wait_ms"] = (rec["lock_acquired"] - rec["txn_started"]) * 1000.0
-                record["hold_ms"] = (t_end - rec["lock_acquired"]) * 1000.0
-            write_txns.append(record)
-            return result
+            try:
+                return fn()
+            finally:
+                # Failed BEGIN waits are latency evidence too; the outer loop
+                # records the error and the parent still rejects every error.
+                t_end = time.perf_counter()
+                record: dict[str, Any] = {"verb": verb, "round_trip_ms": (t_end - t_start) * 1000.0}
+                opened = txns[idx:]
+                # One verb call == one transaction; A12 checks this shape.
+                if len(opened) == 1:
+                    rec = opened[0]
+                    record["begin_stmt"] = rec["begin_stmt"]
+                    if "lock_acquired" in rec:
+                        record["lock_wait_ms"] = (rec["lock_acquired"] - rec["txn_started"]) * 1000.0
+                        record["hold_ms"] = (t_end - rec["lock_acquired"]) * 1000.0
+                    else:
+                        record["lock_wait_ms"] = (t_end - rec["txn_started"]) * 1000.0
+                write_txns.append(record)
+
+        def expire_claim(work_item_id: str) -> None:
+            with begin_write(engine) as conn:
+                conn.execute(
+                    update(token_work_items_table)
+                    .where(token_work_items_table.c.work_item_id == work_item_id)
+                    .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                    .values(lease_expires_at=read_landscape_transaction_time(conn) - timedelta(seconds=1))
+                )
 
         def beat() -> None:
             """§A.3 beat shape: single-row CAS UPDATE in its own write txn."""
@@ -210,49 +256,62 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
         deadline = start + args.duration_seconds
         next_beat = start  # first beat fires immediately
         iteration = 0
-        while time.monotonic() < deadline or recovered_total < args.min_recovered:
+        while (
+            time.monotonic() < deadline
+            or claims < args.min_claims
+            or recovered_total < args.min_recovered
+            or not all(Path(path).exists() for path in args.peer_recovered_file)
+        ):
+            if time.monotonic() >= deadline:
+                # Preserve the hot measurement window, then cooperate while
+                # proving the claim/recovery floors. Sleep outside all writes
+                # so a late peer can acquire the lock and supply its leases.
+                time.sleep(_PROGRESS_PAUSE_SECONDS)
             iteration += 1
             try:
                 item = timed(
                     VERB_CLAIM,
                     lambda: repo.claim_ready(
-                        run_id=args.run_id,
+                        member_token=member,
                         lease_owner=args.owner,
                         lease_seconds=args.lease_seconds,
                     ),
                 )
+            except Exception as exc:
+                errors.append({"where": VERB_CLAIM, "type": type(exc).__name__, "msg": str(exc)})
+            else:
                 if item is None:
                     claim_none += 1
                 else:
                     claims += 1
                     claimed_work_item_ids.append(item.work_item_id)
-                    if args.lease_seconds <= 0:
-                        # A zero-length lease is live for the rest of its whole
-                        # SQLite database second (expiry is strict, ADR-047), so
-                        # "instantly expired" is written explicitly: the lease is
-                        # aged one second into the database clock's past, and a
-                        # peer's next sweep finds it lapsed.
-                        with begin_write(engine) as conn:
-                            conn.execute(
-                                update(token_work_items_table)
-                                .where(token_work_items_table.c.work_item_id == item.work_item_id)
-                                .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
-                                .values(lease_expires_at=read_landscape_transaction_time(conn) - timedelta(seconds=1))
-                            )
-            except Exception as exc:
-                errors.append({"where": VERB_CLAIM, "type": type(exc).__name__, "msg": str(exc)})
+                    if args.expire_claims:
+                        # First commit a valid issued lease through the deadline
+                        # guard. Then model its expiry in a separate fixture
+                        # transaction so a peer must perform real recovery.
+                        try:
+                            timed(VERB_EXPIRE, partial(expire_claim, item.work_item_id))
+                        except Exception as exc:
+                            errors.append({"where": VERB_EXPIRE, "type": type(exc).__name__, "msg": str(exc)})
 
             if iteration % args.sweep_every == 0:
                 try:
-                    recovered = timed(
+                    peer_count_before = len(peer_recoveries)
+                    timed(
                         VERB_RECOVER,
-                        lambda: repo.recover_expired_leases_legacy_unfenced(
-                            run_id=args.run_id,
-                            caller_owner=args.owner,
+                        lambda: repo.recover_expired_leases(
+                            coordination_token=leader,
+                            stall_budget_seconds=0,
                         ),
                     )
                     sweeps += 1
-                    recovered_total += int(recovered)
+                    recovered_total += len(peer_recoveries) - peer_count_before
+                    if recovered_total >= args.min_recovered:
+                        # Continue providing peer leases until every hammer has
+                        # observed its own committed cross-owner recovery. A
+                        # coordinator sweep may also reclaim this worker's last
+                        # lease, so unilateral exit can strand its waiting peer.
+                        Path(args.ready_file + ".recovered").touch()
                 except Exception as exc:
                     errors.append({"where": VERB_RECOVER, "type": type(exc).__name__, "msg": str(exc)})
 

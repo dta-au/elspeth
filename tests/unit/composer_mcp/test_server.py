@@ -23,6 +23,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 
 
@@ -250,6 +251,17 @@ class TestBuildToolDefs:
         ):
             assert excluded not in names, f"Blob/secret tool '{excluded}' should be excluded"
 
+    def test_session_tool_definitions_have_closed_roots(self) -> None:
+        """The hand-written MCP session tools advertise a closed root object."""
+        from elspeth.composer_mcp.server import _SESSION_TOOL_DEFS
+
+        assert len(_SESSION_TOOL_DEFS) == 6
+        for definition in _SESSION_TOOL_DEFS:
+            parameters = definition["parameters"]
+            assert parameters["type"] == "object", definition["name"]
+            assert "additionalProperties" in parameters, definition["name"]
+            assert parameters["additionalProperties"] is False, definition["name"]
+
 
 class TestDispatchTool:
     @pytest.mark.asyncio
@@ -458,6 +470,41 @@ class TestDispatchTool:
         )
         assert result["success"] is True
 
+    def test_session_tool_arguments_use_the_shared_credential_guard(self, scratch_dir: Path) -> None:
+        candidate = "sk-" + "a" * 24
+        session_manager, session_checkout_ref = _session_authority(scratch_dir)
+
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            _dispatch_tool(
+                "new_session",
+                {"name": candidate},
+                _empty_state(),
+                _mock_catalog(),
+                scratch_dir,
+                session_manager=session_manager,
+                session_checkout_ref=session_checkout_ref,
+            )
+
+        assert caught.value.surface == "composer_mcp_tool_arguments"
+        assert candidate not in repr(caught.value.to_payload())
+
+    def test_legacy_state_is_refused_before_mcp_disclosure(self, scratch_dir: Path) -> None:
+        candidate = "sk-" + "b" * 24
+        contaminated = CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(name=candidate),
+            version=1,
+        )
+
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            _dispatch_tool("list_sources", {}, contaminated, _mock_catalog(), scratch_dir)
+
+        assert caught.value.surface == "composer_mcp_state"
+        assert candidate not in repr(caught.value.to_payload())
+
     def test_set_source_path_without_session_identity_fails_closed(self, scratch_dir: Path) -> None:
         # set_source is promoted to a type-driven manifest entry
         # (SetSourceArgumentsModel) with extra="forbid" — the LLM-supplied
@@ -477,8 +524,9 @@ class TestDispatchTool:
             scratch_dir,
         )
         assert result["success"] is False
-        assert "Path violation (S2)" in result["data"]["error"]
-        assert "data_dir" in result["data"]["error"]
+        assert "Path violation (S2)" in result["validation"]["errors"][0]["message"]
+        assert "data_dir" in result["validation"]["errors"][0]["message"]
+        assert "data" not in result
 
     def test_set_output_requires_explicit_collision_policy(self, scratch_dir: Path) -> None:
         result = _dispatch_tool(
@@ -698,6 +746,7 @@ class TestDispatchTool:
                     on_error="discard",
                     options={
                         "profile": "operator-owned-alias",
+                        "system_prompt": "You summarise records in one sentence.",
                         "prompt_template": "Summarise {{ row }}",
                         "schema": {"mode": "observed"},
                     },
@@ -848,6 +897,7 @@ class TestDispatchTool:
                     on_error="discard",
                     options={
                         "profile": "operator-owned-alias",
+                        "system_prompt": "You describe the looked-up file reference in one sentence.",
                         "prompt_template": "{{ lookup.path }} {{ lookup.file }} {{ lookup.mode }}",
                         "lookup": {
                             "path": "north",

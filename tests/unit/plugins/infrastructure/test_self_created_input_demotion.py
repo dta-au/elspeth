@@ -269,18 +269,24 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
         )
 
     def test_field_mapper_target_is_optional_on_input(self) -> None:
-        """field_mapper renames into a target; requiring the target on input is a trap."""
+        """field_mapper renames into a target; requiring the target on input is a trap.
+
+        The mapping requires ``source_id`` (the flexible-mode required field is
+        the same promise, elspeth-0d1da6dc44), so ``target_id`` is honestly
+        declared. Declaring it must not demand it on input: the transform
+        CREATES it, so requiring it is the elspeth-d6eeb3a71d trap — the same
+        shape the batch_stats sibling below pins.
+        """
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         transform = FieldMapper(
             {
                 "schema": {"mode": "flexible", "fields": ["source_id: str", "target_id: str"]},
                 "mapping": {"source_id": "target_id"},
-                "strict": True,
             }
         )
 
-        assert "target_id" in transform.declared_output_fields
+        assert transform.declared_output_fields == frozenset({"target_id"})
         assert "target_id" not in _required_input_fields(transform)
         transform.input_schema.model_validate({"source_id": "abc"}, strict=True)
 
@@ -423,31 +429,6 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
 
         assert checked > 0, "sweep exercised no plugin/knob pair — the probe shape changed"
         assert lost == {}, f"configured input columns silently demoted: {lost}"
-
-    def test_field_mapper_target_is_optional_on_input_without_strict(self) -> None:
-        """A declared rename target must still be optional on input.
-
-        Non-strict field_mapper guarantees a target when its source is
-        promised on every input row — here the flexible-mode required
-        ``source_id`` is exactly that promise (elspeth-0d1da6dc44), so
-        ``target_id`` is honestly declared. Declaring it must not demand it on
-        input: the transform CREATES it, so requiring it is the
-        elspeth-d6eeb3a71d trap — the same shape the batch_stats sibling
-        below pins.
-        """
-        from elspeth.plugins.transforms.field_mapper import FieldMapper
-
-        transform = FieldMapper(
-            {
-                "schema": {"mode": "flexible", "fields": ["source_id: str", "target_id: str"]},
-                "mapping": {"source_id": "target_id"},
-                "strict": False,
-            }
-        )
-
-        assert transform.declared_output_fields == frozenset({"target_id"})
-        assert "target_id" not in _required_input_fields(transform)
-        transform.input_schema.model_validate({"source_id": "abc"}, strict=True)
 
     def test_batch_stats_stat_fields_are_optional_on_input(self) -> None:
         """batch_stats emits mean/count/sum; declaring them must not demand them."""

@@ -31,7 +31,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -60,7 +60,21 @@
       },
       {
         "default": null,
-        "description": "Multi-query specs (None = single-query mode)",
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "item_schema": {
           "fields": [
             {
@@ -111,7 +125,7 @@
                     "tier": "common"
                   },
                   {
-                    "description": "Data type for schema enforcement",
+                    "description": "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 (5.5 fails the row), 7 under number as 7.0.",
                     "enum": [
                       "string",
                       "integer",
@@ -180,12 +194,13 @@
         }
       },
       {
-        "description": "Jinja2 prompt template",
+        "default": null,
+        "description": "Jinja2 fallback prompt template; required unless every query has a template",
         "kind": "text",
         "label": "Prompt Template",
         "name": "prompt_template",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common",
         "visible_when": {
           "equals": "azure",
@@ -207,12 +222,12 @@
         }
       },
       {
-        "default": 0.0,
-        "description": "Sampling temperature",
+        "default": null,
+        "description": "Sampling temperature. Omitted or null uses the deployment default; set explicitly for deployments supporting sampling.",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "advanced",
         "visible_when": {
@@ -310,7 +325,7 @@
       },
       {
         "default": 20,
-        "description": "Maximum resolved images per LLM call",
+        "description": "Maximum resolved images per LLM call (hard upper bound 20)",
         "kind": "number-int",
         "label": "Max Images Per Call",
         "name": "max_images_per_call",
@@ -545,7 +560,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -573,7 +588,21 @@
       },
       {
         "default": null,
-        "description": "Multi-query specs (None = single-query mode)",
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "item_schema": {
           "fields": [
             {
@@ -624,7 +653,7 @@
                     "tier": "common"
                   },
                   {
-                    "description": "Data type for schema enforcement",
+                    "description": "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 (5.5 fails the row), 7 under number as 7.0.",
                     "enum": [
                       "string",
                       "integer",
@@ -693,12 +722,13 @@
         }
       },
       {
-        "description": "Jinja2 prompt template",
+        "default": null,
+        "description": "Jinja2 fallback prompt template; required unless every query has a template",
         "kind": "text",
         "label": "Prompt Template",
         "name": "prompt_template",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common",
         "visible_when": {
           "equals": "openrouter",
@@ -721,11 +751,11 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "advanced",
         "visible_when": {
@@ -823,7 +853,7 @@
       },
       {
         "default": 20,
-        "description": "Maximum resolved images per LLM call",
+        "description": "Maximum resolved images per LLM call (hard upper bound 20)",
         "kind": "number-int",
         "label": "Max Images Per Call",
         "name": "max_images_per_call",
@@ -1046,7 +1076,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -1074,7 +1104,21 @@
       },
       {
         "default": null,
-        "description": "Multi-query specs (None = single-query mode)",
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "item_schema": {
           "fields": [
             {
@@ -1125,7 +1169,7 @@
                     "tier": "common"
                   },
                   {
-                    "description": "Data type for schema enforcement",
+                    "description": "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 (5.5 fails the row), 7 under number as 7.0.",
                     "enum": [
                       "string",
                       "integer",
@@ -1194,12 +1238,13 @@
         }
       },
       {
-        "description": "Jinja2 prompt template",
+        "default": null,
+        "description": "Jinja2 fallback prompt template; required unless every query has a template",
         "kind": "text",
         "label": "Prompt Template",
         "name": "prompt_template",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common",
         "visible_when": {
           "equals": "bedrock",
@@ -1222,11 +1267,11 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "advanced",
         "visible_when": {
@@ -1324,7 +1369,7 @@
       },
       {
         "default": 20,
-        "description": "Maximum resolved images per LLM call",
+        "description": "Maximum resolved images per LLM call (hard upper bound 20)",
         "kind": "number-int",
         "label": "Max Images Per Call",
         "name": "max_images_per_call",
@@ -1492,6 +1537,62 @@
       },
       {
         "default": null,
+        "description": "Optional resolved Amazon Bedrock API key (bearer token); mutually exclusive with the static AWS credential pair.",
+        "kind": "text",
+        "label": "API Key",
+        "name": "api_key",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional resolved AWS access-key identifier; required together with aws_secret_access_key.",
+        "kind": "text",
+        "label": "Aws Access Key ID",
+        "name": "aws_access_key_id",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional resolved AWS secret access key; required together with aws_access_key_id.",
+        "kind": "text",
+        "label": "Aws Secret Access Key",
+        "name": "aws_secret_access_key",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional resolved AWS session token for temporary static credentials.",
+        "kind": "text",
+        "label": "Aws Session Token",
+        "name": "aws_session_token",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
         "description": "Tier 2 tracing (langfuse only)",
         "kind": "json-object",
         "label": "Tracing",
@@ -1520,7 +1621,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -1548,7 +1649,21 @@
       },
       {
         "default": null,
-        "description": "Multi-query specs (None = single-query mode)",
+        "description": "LiteLLM catalog identity for audit costing; never changes endpoint routing",
+        "kind": "text",
+        "label": "Pricing Model",
+        "name": "pricing_model",
+        "nullable": true,
+        "required": false,
+        "tier": "common",
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "item_schema": {
           "fields": [
             {
@@ -1599,7 +1714,7 @@
                     "tier": "common"
                   },
                   {
-                    "description": "Data type for schema enforcement",
+                    "description": "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 (5.5 fails the row), 7 under number as 7.0.",
                     "enum": [
                       "string",
                       "integer",
@@ -1668,12 +1783,13 @@
         }
       },
       {
-        "description": "Jinja2 prompt template",
+        "default": null,
+        "description": "Jinja2 fallback prompt template; required unless every query has a template",
         "kind": "text",
         "label": "Prompt Template",
         "name": "prompt_template",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
         "tier": "common",
         "visible_when": {
           "equals": "gateway",
@@ -1696,11 +1812,11 @@
       },
       {
         "default": 0.0,
-        "description": "Sampling temperature",
+        "description": "Sampling temperature. Set to null to omit it from the request so the provider default applies \u2014 required for reasoning deployments, which reject any explicit temperature",
         "kind": "number-float",
         "label": "Temperature",
         "name": "temperature",
-        "nullable": false,
+        "nullable": true,
         "required": false,
         "tier": "advanced",
         "visible_when": {
@@ -1798,7 +1914,7 @@
       },
       {
         "default": 20,
-        "description": "Maximum resolved images per LLM call",
+        "description": "Maximum resolved images per LLM call (hard upper bound 20)",
         "kind": "number-int",
         "label": "Max Images Per Call",
         "name": "max_images_per_call",

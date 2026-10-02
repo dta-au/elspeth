@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { type JSX, useEffect, useId, useRef, useState } from "react";
 import { GraphView } from "@/components/inspector/GraphView";
 import { Button } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";

@@ -22,7 +22,7 @@ from typer.testing import CliRunner
 
 from elspeth.cli import _emit_leaderless_run_guidance, _emit_not_resumable_event, app
 from elspeth.contracts import NodeType, RunStatus
-from elspeth.contracts.checkpoint import CheckpointDraft, ResumeCheck
+from elspeth.contracts.checkpoint import CheckpointDraft, ResumeCheck, ResumeRefusalCause
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import IncompleteSourceResumeError
 from elspeth.core.checkpoint import CheckpointManager
@@ -97,12 +97,12 @@ def _seed_leaderless_run(
     token_ids: list[str] = []
     for index in range(token_count):
         _row, token = factory.data_flow.create_row_with_token(
-            RUN_ID,
             source_node_id,
             index,
             {"value": index},
             source_row_index=index,
             ingest_sequence=index,
+            coordination_token=leader_coordination_token(factory, RUN_ID),
         )
         token_ids.append(token.token_id)
     register_test_worker(db, run_id=RUN_ID, worker_id=FOLLOWER_WORKER_ID)
@@ -386,7 +386,9 @@ class TestResumePreflightAbandonHint:
         monkeypatch.setattr(
             RecoveryManager,
             "can_resume",
-            lambda self, run_id, graph: ResumeCheck(can_resume=False, reason="source lifecycle is incomplete (primary=loading)"),
+            lambda self, run_id, graph: ResumeCheck(
+                can_resume=False, reason="source lifecycle is incomplete (primary=loading)", cause=ResumeRefusalCause.SOURCE_NOT_EXHAUSTED
+            ),
         )
 
         result = runner.invoke(app, ["resume", RUN_ID, "--settings", str(settings_file)])
@@ -405,7 +407,9 @@ class TestResumePreflightAbandonHint:
         monkeypatch.setattr(
             RecoveryManager,
             "can_resume",
-            lambda self, run_id, graph: ResumeCheck(can_resume=False, reason="Run is in progress under live leader"),
+            lambda self, run_id, graph: ResumeCheck(
+                can_resume=False, reason="Run is in progress under live leader", cause=ResumeRefusalCause.LEADER_LIVE
+            ),
         )
 
         result = runner.invoke(app, ["resume", RUN_ID, "--settings", str(settings_file)])

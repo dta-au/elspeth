@@ -8,8 +8,9 @@ than calling ``typing.get_type_hints()`` or ``hasattr()``.
 TYPE_CHECKING blocks; ``typing.get_type_hints()`` would attempt to
 resolve every annotation at runtime and raise ``NameError`` on those
 forward references — the test would error rather than assert, and
-would never pass in green state. ``hasattr()`` is unconditionally
-banned (CLAUDE.md). ``SourceProtocol`` and ``SinkProtocol`` are not
+would never pass in green state. ``hasattr()`` is unconditionally banned
+(``engine-patterns-reference`` skill §hasattr Alternatives).
+``SourceProtocol`` and ``SinkProtocol`` are not
 ``@runtime_checkable``, ruling out ``isinstance()``.
 
 The MRO walk is the runtime-safe equivalent of structural inheritance:

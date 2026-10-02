@@ -303,6 +303,15 @@ class NodeDetailPanel:
         if detail_kind == "run":
             lines.append("Run:")
             lines.append(f"  Run ID: {detail['run_id']}")
+            if "verification_decisions" in detail and detail["verification_decisions"]:
+                lines.append("")
+                lines.append("Verification decisions:")
+                for decision in detail["verification_decisions"]:
+                    verdict = "UNAVAILABLE" if decision.is_match is None else "MATCH" if decision.is_match else "MISMATCH"
+                    lines.append(f"  {decision.current_call_id}: {verdict}")
+                    lines.append(f"    Source run: {decision.source_run_id}")
+                    lines.append(f"    Source call: {decision.source_call_id}")
+                    lines.append(f"    Differences: {decision.differences_json}")
         elif detail_kind == "token":
             lines.append("Token:")
             lines.append(f"  Token ID: {detail['token_id']}")

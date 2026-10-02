@@ -145,6 +145,16 @@ class TestImageInputsRejection:
                 max_images_per_call=0,
             )
 
+    def test_rejects_max_images_per_call_over_hard_cap(self) -> None:
+        with pytest.raises(ValidationError):
+            LLMConfig(
+                provider="azure",
+                prompt_template="Classify: {{ row.text }}",
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=["text"],
+                max_images_per_call=21,
+            )
+
     def test_rejects_unknown_keys_inside_entries(self) -> None:
         with pytest.raises(ValidationError):
             LLMConfig(
@@ -178,6 +188,27 @@ class TestImageInputsRejection:
                 required_input_fields=["text"],
                 image_inputs=[],
             )
+
+    def test_rejects_more_image_inputs_than_per_call_default(self) -> None:
+        with pytest.raises(ValidationError, match="List should have at most 20 items"):
+            LLMConfig(
+                provider="azure",
+                prompt_template="Classify: {{ row.text }}",
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=["text"],
+                image_inputs=[{"field": f"page_{index}_blob_ref", "format": "png"} for index in range(21)],
+            )
+
+    def test_accepts_image_inputs_at_per_call_default(self) -> None:
+        config = LLMConfig(
+            provider="azure",
+            prompt_template="Classify: {{ row.text }}",
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=["text"],
+            image_inputs=[{"field": f"page_{index}_blob_ref", "format": "png"} for index in range(20)],
+        )
+        assert config.image_inputs is not None
+        assert len(config.image_inputs) == 20
 
     def test_omitting_image_inputs_key_stays_legal(self) -> None:
         """The rejection is scoped to an explicit empty list — omitting the key
@@ -234,6 +265,24 @@ class TestLLMTransformDeclaredInputFields:
         )
         transform = LLMTransform(config)
         assert "text" in transform.declared_input_fields
+
+    def test_an_optional_image_input_is_not_a_declared_required_input(self) -> None:
+        """``required: false`` means an absent image is a valid row (resolve_image_parts skips it).
+
+        Declaring it made the engine refuse that valid row before process()
+        (elspeth-5887fb7928 R2 census). The column stays a consumed input, so
+        it is never demoted.
+        """
+        config = _make_config(
+            image_inputs=[
+                {"field": "page_blob_ref", "format_field": "page_mime_type"},
+                {"field": "cover_blob_ref", "format_field": "cover_mime_type", "required": False},
+            ],
+        )
+        transform = LLMTransform(config)
+
+        assert transform.declared_input_fields == frozenset({"text", "page_blob_ref", "page_mime_type"})
+        assert {"cover_blob_ref", "cover_mime_type"} <= transform.consumed_input_fields
 
     def test_declared_input_fields_unaffected_when_no_image_inputs(self) -> None:
         transform = LLMTransform(_make_config())

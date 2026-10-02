@@ -217,7 +217,7 @@ class TestSharedBatchAdapter:
         same typed exception the sync path uses (retry.py), and the PROCESSOR
         translates that into the shutdown_requested error result
         (_convert_retryable_to_error_result) — shutdown policy lives in one
-        layer (filigree elspeth-14571961a6). Entry cleanup still happens so a
+        layer (archived issue elspeth-14571961a6). Entry cleanup still happens so a
         late emit() cannot leak a result nobody will retrieve.
         """
         adapter = SharedBatchAdapter()

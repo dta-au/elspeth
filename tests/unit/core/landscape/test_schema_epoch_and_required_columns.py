@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from sqlalchemy import inspect, select, text
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.schema import CreateIndex, CreateTable
@@ -23,6 +24,7 @@ from elspeth.core.landscape.schema import (
     aggregation_results_table,
     artifacts_table,
     batches_table,
+    call_verifications_table,
     checkpoints_table,
     metadata,
     node_states_table,
@@ -33,10 +35,10 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_recorder_with_run
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 
-def test_epoch_is_thirty_eight() -> None:
+def test_epoch_is_forty_seven() -> None:
     # Epoch 37 (elspeth-07cd19ba73, pluggable SSO) widened the auth provider
     # CHECKs. Epoch 38 (elspeth-2d436dd6e8, elspeth-5d66fc5ed1): scheduler_events
     # gains an AUTOINCREMENT ``seq`` primary key that every reader orders by,
@@ -44,7 +46,56 @@ def test_epoch_is_thirty_eight() -> None:
     # Database time ties inside a SQLite second and inside a PostgreSQL
     # transaction, so (recorded_at, event_id) replayed in hash order and two
     # identical same-second transitions collided on the old primary key.
-    assert SQLITE_SCHEMA_EPOCH == 38
+    # Epoch 39 binds recoverable web starts to immutable permit subjects.
+    # Epoch 40 adds nullable call usage and persisted admission policy evidence.
+    # Epoch 41 renames the approved prompt artifact anchor.
+    # Epoch 42 rejects stored v1 admission evidence; the reader requires v2.
+    # Epoch 43 gives every digest column a shape CHECK (SQLite ignores VARCHAR width).
+    # Epoch 44 adds replay/verify evidence. Epoch 45 records collector-group failures.
+    # Epoch 46 stores each valid source row's exact contract.
+    # Epoch 47 gives verification reads indexed run ordering and parent checks.
+    # Epoch 48 gives source quarantine a durable PENDING_SINK handoff, deletes
+    # source-row replay, and admits the resume_refused coordination event.
+    # Epoch 49 adds the pending-identity purge event to the closed auth trail.
+    assert SQLITE_SCHEMA_EPOCH == 49
+    assert ("rows", "source_contract_json") in set(_REQUIRED_COLUMNS)
+    assert ("node_states", "ix_node_states_run") in set(_REQUIRED_INDEXES)
+    index = next(index for index in call_verifications_table.indexes if index.name == "ix_call_verifications_run")
+    assert [column.name for column in index.columns] == ["current_run_id", "recorded_at", "current_call_id"]
+
+
+def test_epoch_45_collector_group_failure_reason_is_the_closed_vocabulary() -> None:
+    """Folded into 45 (no bump): the verdict row's reason is a CollectorGroupFailureReason, enforced by a CHECK."""
+    from sqlalchemy.exc import IntegrityError
+
+    from elspeth.contracts.enums import CollectorGroupFailureReason
+    from elspeth.core.landscape.schema import collector_group_failures_table
+
+    [check] = [
+        constraint
+        for constraint in collector_group_failures_table.constraints
+        if constraint.name == "ck_collector_group_failures_failure_reason"
+    ]
+    ddl = str(CreateTable(collector_group_failures_table).compile(dialect=sqlite.dialect()))
+    for reason in CollectorGroupFailureReason:
+        assert f"'{reason.value}'" in ddl, ddl
+    assert check.name in ddl
+    assert ("collector_group_failures", "ck_collector_group_failures_failure_reason") in set(_REQUIRED_CHECK_CONSTRAINTS)
+
+    db = LandscapeDB.in_memory()
+    row = {"run_id": "r", "group_id": "g", "collector_node_id": "n", "recorded_at": datetime(2026, 9, 25, tzinfo=UTC)}
+    try:
+        with (
+            pytest.raises(IntegrityError, match="CHECK constraint failed: ck_collector_group_failures_failure_reason"),
+            db.write_connection() as conn,
+        ):
+            conn.execute(collector_group_failures_table.insert().values(**row, failure_reason="plugin said so"))
+        # Control: a vocabulary value passes the CHECK and stops only at the
+        # foreign keys this bare row does not satisfy.
+        with pytest.raises(IntegrityError, match="FOREIGN KEY constraint failed"), db.write_connection() as conn:
+            conn.execute(collector_group_failures_table.insert().values(**row, failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION))
+    finally:
+        db.close()
 
 
 def test_epoch_38_scheduler_events_seq_is_the_autoincrement_primary_key() -> None:
@@ -243,6 +294,8 @@ def test_epoch_23_web_plugin_policy_table_is_one_to_one_with_runs() -> None:
         "plugin_code_identities_json",
         "binding_generation_fingerprint",
         "decision_codes_json",
+        "admission_decision_json",
+        "admission_decision_hash",
     }
 
 
@@ -372,10 +425,16 @@ def test_begin_node_state_writes_resume_checkpoint_id() -> None:
     factory = setup.factory
 
     # Create a row and token so the FK chain for node_states is satisfied
-    row = factory.data_flow.create_row(
-        "provenance-run", "src-node", row_index=0, data={"x": 1}, row_id="prov-row-1", source_row_index=0, ingest_sequence=0
+    _row, token = factory.data_flow.create_row_with_token(
+        "src-node",
+        row_index=0,
+        data={"x": 1},
+        row_id="prov-row-1",
+        source_row_index=0,
+        ingest_sequence=0,
+        token_id="prov-tok-1",
+        coordination_token=leader_coordination_token(factory, "provenance-run"),
     )
-    token = factory.data_flow.create_token(row.row_id, token_id="prov-tok-1")
 
     # Insert a minimal checkpoint row directly
     ck_id = "ck-prov-1"
@@ -395,10 +454,10 @@ def test_begin_node_state_writes_resume_checkpoint_id() -> None:
     ns = factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id="src-node",
-        run_id="provenance-run",
         step_index=0,
         input_data={"x": 1},
         resume_checkpoint_id=ck_id,
+        member_token=leader_coordination_token(factory, "provenance-run").membership,
     )
 
     # Read the row back and verify the column was persisted
@@ -418,18 +477,23 @@ def test_begin_node_state_resume_checkpoint_id_defaults_to_none() -> None:
     db = setup.db
     factory = setup.factory
 
-    row = factory.data_flow.create_row(
-        "default-run", "src-node", row_index=0, data={"x": 1}, row_id="def-row-1", source_row_index=0, ingest_sequence=0
+    _row, token = factory.data_flow.create_row_with_token(
+        "src-node",
+        row_index=0,
+        data={"x": 1},
+        row_id="def-row-1",
+        source_row_index=0,
+        ingest_sequence=0,
+        coordination_token=leader_coordination_token(factory, "default-run"),
+        token_id="def-tok-1",
     )
-    token = factory.data_flow.create_token(row.row_id, token_id="def-tok-1")
 
     ns = factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id="src-node",
-        run_id="default-run",
         step_index=0,
         input_data={"x": 1},
-        # No resume_checkpoint_id — existing call-site shape
+        member_token=leader_coordination_token(factory, "default-run").membership,
     )
 
     with db.engine.connect() as conn:
@@ -451,10 +515,16 @@ def test_token_work_items_barrier_blocked_at_defaults_to_none() -> None:
     factory = setup.factory
 
     # Satisfy the (token_id, run_id) / (row_id, run_id) FK chain
-    row = factory.data_flow.create_row(
-        "barrier-run", "src-node", row_index=0, data={"x": 1}, row_id="bar-row-1", source_row_index=0, ingest_sequence=0
+    row, token = factory.data_flow.create_row_with_token(
+        "src-node",
+        row_index=0,
+        data={"x": 1},
+        row_id="bar-row-1",
+        source_row_index=0,
+        ingest_sequence=0,
+        token_id="bar-tok-1",
+        coordination_token=leader_coordination_token(factory, "barrier-run"),
     )
-    token = factory.data_flow.create_token(row.row_id, token_id="bar-tok-1")
 
     # Insert a minimal work item directly — existing call-site shape, no barrier_blocked_at
     now = datetime.now(UTC)

@@ -73,6 +73,15 @@ class PayloadStore(Protocol):
         """
         ...
 
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        """Retrieve and verify at most max_bytes; return None when larger.
+
+        Implementations must stop reading after max_bytes + 1 bytes when the
+        blob exceeds the cap. Missing and corrupt blobs retain retrieve()'s
+        exception behavior.
+        """
+        ...
+
     def exists(self, content_hash: str) -> bool:
         """Check if content exists.
 

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,13 +22,22 @@ from typer.testing import CliRunner
 from elspeth.cli import app
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import auth_events_table
+from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.models import AccessPending
+from elspeth.web.config import settings_from_env
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.unit.web.auth.conftest import build_local_auth_provider
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _restore_web_command_environment() -> Iterator[None]:
+    """The CLI bridges web options through process environment variables."""
+    with patch.dict(os.environ, os.environ.copy(), clear=True):
+        yield
 
 
 @dataclass(frozen=True)
@@ -145,6 +155,57 @@ class TestWebCommandAuthBridging:
     is tested in tests/unit/web/test_config.py at the WebSettings level.
     """
 
+    @pytest.mark.parametrize(
+        ("provider", "provider_settings"),
+        [
+            ("entra", {"ELSPETH_WEB__ENTRA_TENANT_ID": "00000000-0000-0000-0000-000000000001"}),
+            ("oidc", {"ELSPETH_WEB__SSO_ISSUER": "https://identity.example.test/tenant"}),
+        ],
+    )
+    def test_env_configured_sso_reaches_app_factory(self, provider: str, provider_settings: dict[str, str]) -> None:
+        """An SSO deployment without --auth must retain the provider from its environment."""
+        captured_auth: list[str] = []
+
+        def capture_settings(*args: object, **kwargs: object) -> None:
+            captured_auth.append(settings_from_env().auth_provider)
+
+        uvicorn = FakeUvicornModule(side_effect=capture_settings)
+        environment = {
+            "ELSPETH_WEB__AUTH_PROVIDER": provider,
+            "ELSPETH_WEB__SSO_CLIENT_ID": "test-client",
+            "ELSPETH_WEB__SSO_CLIENT_SECRET": "test-client-secret",
+            "ELSPETH_WEB__SSO_TRANSACTION_SECRET": "0" * 64,
+            "ELSPETH_WEB__PUBLIC_BASE_URL": "https://elspeth.example.test",
+            "ELSPETH_WEB__COMPARTMENT_ID": "test-compartment",
+            "ELSPETH_WEB__QUOTA_DEFAULT_TOKENS_PER_DAY": "1000",
+            "ELSPETH_WEB__QUOTA_DEFAULT_STORAGE_BYTES": "1048576",
+            "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "15",
+            "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
+            "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "85.0",
+            "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
+            "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": "0" * 64,
+            **provider_settings,
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.dict("sys.modules", {"uvicorn": uvicorn}):
+            result = runner.invoke(app, ["--no-dotenv", "web"])
+
+        assert result.exit_code == 0, result.output
+        assert captured_auth == [provider]
+
+    def test_explicit_auth_overrides_environment(self) -> None:
+        """The CLI flag retains precedence when an operator deliberately selects a provider."""
+        captured_auth: list[str] = []
+
+        def capture_env(*args: object, **kwargs: object) -> None:
+            captured_auth.append(os.environ["ELSPETH_WEB__AUTH_PROVIDER"])
+
+        uvicorn = FakeUvicornModule(side_effect=capture_env)
+        with patch.dict(os.environ, {"ELSPETH_WEB__AUTH_PROVIDER": "entra"}, clear=True), patch.dict("sys.modules", {"uvicorn": uvicorn}):
+            result = runner.invoke(app, ["--no-dotenv", "web", "--auth", "local"])
+
+        assert result.exit_code == 0, result.output
+        assert captured_auth == ["local"]
+
     def test_auth_provider_bridged_to_env_var(self) -> None:
         """--auth=oidc sets ELSPETH_WEB__AUTH_PROVIDER for create_app()."""
         import os
@@ -160,18 +221,26 @@ class TestWebCommandAuthBridging:
 
         assert captured_env["auth"] == "oidc"
 
-    def test_default_auth_bridged_as_local(self) -> None:
-        """Default --auth=local sets ELSPETH_WEB__AUTH_PROVIDER=local."""
+    def test_default_auth_is_owned_by_settings(self) -> None:
+        """The CLI leaves the default to the settings loader when auth is omitted."""
         import os
 
         captured_env: dict[str, str] = {}
 
         def capture_env(*args: object, **kwargs: object) -> None:
-            captured_env["auth"] = os.environ.get("ELSPETH_WEB__AUTH_PROVIDER", "")
+            assert "ELSPETH_WEB__AUTH_PROVIDER" not in os.environ
+            captured_env["auth"] = settings_from_env().auth_provider
 
         uvicorn = FakeUvicornModule(side_effect=capture_env)
-        with patch.dict("sys.modules", {"uvicorn": uvicorn}):
-            result = runner.invoke(app, ["web", "--auth", "local"])
+        environment = {
+            "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "15",
+            "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
+            "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "85.0",
+            "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
+            "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": "0" * 64,
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.dict("sys.modules", {"uvicorn": uvicorn}):
+            result = runner.invoke(app, ["--no-dotenv", "web"])
 
         assert result.exit_code == 0
         assert captured_env["auth"] == "local"
@@ -219,7 +288,18 @@ class TestComposerUsersCommand:
             1,
         )
 
-    def test_remove_user_deletes_local_auth_user(self, tmp_path: Path) -> None:
+    def test_remove_user_deletes_local_auth_user(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth import cli
+
+        recorders: list[AuthAuditRecorder] = []
+        original = cli._composer_auth_audit_recorder
+
+        def build(url: str) -> AuthAuditRecorder:
+            recorder = original(url)
+            recorders.append(recorder)
+            return recorder
+
+        monkeypatch.setattr(cli, "_composer_auth_audit_recorder", build)
         auth_db = tmp_path / "auth.db"
         add_result = runner.invoke(
             app,
@@ -245,6 +325,8 @@ class TestComposerUsersCommand:
                 "users",
                 "remove",
                 "alice",
+                "--reason",
+                "left the team",
                 "--data-dir",
                 str(tmp_path),
                 "--auth-db",
@@ -256,6 +338,31 @@ class TestComposerUsersCommand:
         assert result.exit_code == 0
         assert "Removed composer user alice" in result.output
         assert _auth_user_row(auth_db, "alice") is None
+        assert len(recorders) == 1
+        with pytest.raises(RuntimeError, match="closed"):
+            recorders[0].start()
+
+    def test_remove_refuses_a_concurrent_password_reset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth import cli
+
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        provider.create_user("alice", "password123", display_name="Alice")
+        original_retire = provider._retire_identity
+
+        def retire_after_password_reset(username, reason, credential_exists, delete_credential):
+            provider.set_password(username, "replacement-password")
+            return original_retire(username, reason, credential_exists, delete_credential)
+
+        monkeypatch.setattr(provider, "_retire_identity", retire_after_password_reset)
+        monkeypatch.setattr(cli, "_composer_auth_provider", lambda *_args, **_kwargs: provider)
+        result = runner.invoke(
+            app,
+            ["--no-dotenv", "composer", "users", "remove", "alice", "--reason", "left the team", "--data-dir", str(tmp_path), "--yes"],
+        )
+
+        assert result.exit_code == 1
+        assert "credential changed during removal" in result.output
+        assert _auth_user_row(tmp_path / "auth.db", "alice") is not None
 
     def test_remove_missing_auth_db_does_not_create_new_database(self, tmp_path: Path) -> None:
         auth_db = tmp_path / "missing" / "auth.db"
@@ -268,6 +375,8 @@ class TestComposerUsersCommand:
                 "users",
                 "remove",
                 "alice",
+                "--reason",
+                "left the team",
                 "--data-dir",
                 str(tmp_path),
                 "--auth-db",
@@ -303,6 +412,33 @@ class TestComposerUsersCommand:
         assert result.exit_code != 0
         assert not auth_db.exists()
 
+    @pytest.mark.parametrize(("reason_args", "exit_code"), [([], 2), (["--reason", "   "], 1)])
+    def test_remove_without_a_reason_is_refused_and_removes_nothing(self, tmp_path: Path, reason_args: list[str], exit_code: int) -> None:
+        """The CLI records the same reason People & access does; neither deletes without one."""
+        auth_db = tmp_path / "auth.db"
+        _cli_add(auth_db=auth_db, data_dir=tmp_path)
+
+        result = runner.invoke(
+            app,
+            [
+                "--no-dotenv",
+                "composer",
+                "users",
+                "remove",
+                "alice",
+                *reason_args,
+                "--data-dir",
+                str(tmp_path),
+                "--auth-db",
+                str(auth_db),
+                "--yes",
+            ],
+        )
+
+        assert result.exit_code == exit_code
+        with closing(sqlite3.connect(str(auth_db))) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM users WHERE user_id = 'alice'").fetchone() == (1,)
+
     def test_remove_retires_the_identity_so_the_recreated_username_is_fresh(self, tmp_path: Path) -> None:
         """A CLI-deleted username must not hand its admission to its next holder.
 
@@ -331,7 +467,20 @@ class TestComposerUsersCommand:
 
         result = runner.invoke(
             app,
-            ["--no-dotenv", "composer", "users", "remove", "alice", "--data-dir", str(tmp_path), "--auth-db", str(auth_db), "--yes"],
+            [
+                "--no-dotenv",
+                "composer",
+                "users",
+                "remove",
+                "alice",
+                "--reason",
+                "left the team",
+                "--data-dir",
+                str(tmp_path),
+                "--auth-db",
+                str(auth_db),
+                "--yes",
+            ],
         )
         assert result.exit_code == 0, result.output
         assert _auth_user_row(auth_db, "alice") is None
@@ -380,6 +529,8 @@ class TestComposerUsersCommand:
                 "users",
                 "remove",
                 "alice",
+                "--reason",
+                "left the team",
                 "--data-dir",
                 str(tmp_path),
                 "--auth-db",
@@ -412,7 +563,20 @@ class TestComposerUsersCommand:
 
         result = runner.invoke(
             app,
-            ["--no-dotenv", "composer", "users", "remove", "alice", "--data-dir", str(tmp_path), "--auth-db", str(auth_db), "--yes"],
+            [
+                "--no-dotenv",
+                "composer",
+                "users",
+                "remove",
+                "alice",
+                "--reason",
+                "left the team",
+                "--data-dir",
+                str(tmp_path),
+                "--auth-db",
+                str(auth_db),
+                "--yes",
+            ],
         )
 
         assert result.exit_code == 1
@@ -422,6 +586,48 @@ class TestComposerUsersCommand:
 
 class TestComposerUsersBootstrapAdmin:
     """``composer users bootstrap-admin``: the operator's lockout recovery (spec D20)."""
+
+    def test_remove_refuses_the_last_active_administrator_and_touches_neither_store(self, tmp_path: Path) -> None:
+        """One mistyped command must not leave a deployment nobody can administer.
+
+        ``bootstrap-admin`` is a way back from zero administrators, but only
+        for an operator with a shell on the container; the web surface has no
+        way back at all. So the CLI refuses exactly as the web route does,
+        before the credential is touched, and says what to do instead.
+        """
+        auth_db = tmp_path / "auth.db"
+        _cli_add(auth_db=auth_db, data_dir=tmp_path)
+        assert self._invoke(tmp_path, provider="local", subject="alice").exit_code == 0
+
+        result = runner.invoke(
+            app,
+            [
+                "--no-dotenv",
+                "composer",
+                "users",
+                "remove",
+                "alice",
+                "--reason",
+                "left the team",
+                "--data-dir",
+                str(tmp_path),
+                "--auth-db",
+                str(auth_db),
+                "--yes",
+            ],
+        )
+
+        assert result.exit_code == 1, result.output
+        assert "alice is the last active administrator" in result.output
+        assert "Nothing was removed." in result.output
+        assert "Give another person the admin role first" in result.output
+        assert "Traceback" not in result.output
+        assert _auth_user_row(auth_db, "alice") is not None
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        try:
+            assert [(row.subject, row.access_state) for row in _identity_rows(engine)] == [("alice", "active")]
+        finally:
+            engine.dispose()
 
     def _invoke(self, tmp_path: Path, *extra: str, provider: str = "oidc", subject: str = "ada") -> Any:
         return runner.invoke(
@@ -466,6 +672,41 @@ class TestComposerUsersBootstrapAdmin:
         assert (activated["on_behalf_of"], activated["console_request_id"]) == (None, None)
         assert events[0].request_id is None and events[0].client_host is None
 
+    def test_bootstrap_admin_preserves_operator_username_and_organisation(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, "--username", "Ada Operator", "--organisation-id", "agency-17")
+        assert result.exit_code == 0, result.output
+
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    select(
+                        identities_table.c.subject,
+                        identities_table.c.username,
+                        identities_table.c.organisation_id,
+                        identities_table.c.access_state,
+                    )
+                ).all()
+            assert [tuple(row) for row in rows] == [("ada", "Ada Operator", "agency-17", "active")]
+        finally:
+            engine.dispose()
+
+    def test_bootstrap_admin_stamps_configured_compartment(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__COMPARTMENT_ID", "alpha")
+        result = self._invoke(tmp_path)
+        assert result.exit_code == 0, result.output
+        events = _auth_event_rows(f"sqlite:///{tmp_path / 'runs' / 'audit.db'}")
+        assert [json.loads(row.metadata_json)["compartment_id"] for row in events] == ["alpha", "alpha"]
+
+    def test_bootstrap_admin_rejects_malformed_compartment_before_audit_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__COMPARTMENT_ID", "Alpha")
+        result = self._invoke(tmp_path)
+        assert result.exit_code == 1
+        assert "compartment_id" in result.output
+        assert not (tmp_path / "runs" / "audit.db").exists()
+
     def test_bootstrap_admin_is_refused_once_an_admin_exists(self, tmp_path: Path) -> None:
         assert self._invoke(tmp_path).exit_code == 0
         second = self._invoke(tmp_path, subject="bob")
@@ -477,6 +718,25 @@ class TestComposerUsersBootstrapAdmin:
         finally:
             engine.dispose()
         assert len(_auth_event_rows(f"sqlite:///{tmp_path / 'runs' / 'audit.db'}")) == 2
+
+    def test_bootstrap_owns_and_closes_audit_engine_on_success_and_refusal(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth import cli
+
+        recorders: list[AuthAuditRecorder] = []
+        original = cli._composer_auth_audit_recorder
+
+        def build(url: str) -> AuthAuditRecorder:
+            recorder = original(url)
+            recorders.append(recorder)
+            return recorder
+
+        monkeypatch.setattr(cli, "_composer_auth_audit_recorder", build)
+        assert self._invoke(tmp_path).exit_code == 0
+        assert self._invoke(tmp_path, subject="bob").exit_code == 1
+        assert len(recorders) == 2
+        for recorder in recorders:
+            with pytest.raises(RuntimeError, match="closed"):
+                recorder.start()
 
     def test_bootstrap_admin_refuses_an_unknown_provider_and_half_a_quota(self, tmp_path: Path) -> None:
         unknown = self._invoke(tmp_path, provider="ldap")

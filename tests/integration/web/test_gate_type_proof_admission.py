@@ -20,6 +20,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.helpers.session_fences import acquire_compose_context, acquire_operation_context
 
 
@@ -33,6 +34,7 @@ def _settings(tmp_path: Path) -> WebSettings:
         composer_max_composition_turns=15,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
+        composer_boot_probe_enabled=False,
         composer_rate_limit_per_minute=10,
         secret_key="x" * 32,
         shareable_link_signing_key=b"\x00" * 32,
@@ -153,6 +155,7 @@ async def test_validate_and_execute_block_observed_numeric_gate_before_run_creat
     """Real validate and execute surfaces must agree and create no run."""
     app = create_app(settings=_settings(tmp_path))
     app.state.auth_provider.create_user("proof-user", "proof-pass-123", display_name="Proof User")
+    wire_test_pipeline_user_authority(app, identity_id="proof-user", engine=app.state.session_engine)
 
     async with LifespanManager(app), AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         login = await client.post(
@@ -218,8 +221,8 @@ async def test_validate_and_execute_block_observed_numeric_gate_before_run_creat
     observed = (
         validation_response.status_code,
         validation["is_valid"],
-        validation["checks"][24]["name"],
-        validation["checks"][24]["passed"],
+        validation["checks"][23]["name"],
+        validation["checks"][23]["passed"],
         execution_response.status_code,
         len(runs),
     )

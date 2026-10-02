@@ -19,7 +19,7 @@
  * default).
  */
 
-import { createContext, useContext, type ReactNode } from "react";
+import { type JSX, createContext, useContext, type ReactNode } from "react";
 
 const ReadOnlyContext = createContext<boolean>(false);
 

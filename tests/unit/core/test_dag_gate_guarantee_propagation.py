@@ -21,12 +21,16 @@ exactly like a pass-through transform with no declared fields of its own.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.config import (
     CoalesceSettings,
     GateSettings,
@@ -45,6 +49,7 @@ class _SourceWithGuarantees:
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
     _on_validation_failure = "discard"
     on_success = "output"
 
@@ -60,6 +65,23 @@ class _PassThroughTransform:
     names ONLY the added field.
     """
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     input_schema = None
     output_schema = None
     on_error: str | None = None
@@ -72,6 +94,8 @@ class _PassThroughTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, added_field: str) -> None:
         self.name = name
@@ -86,6 +110,23 @@ class _PassThroughTransform:
 class _RequiringTransform:
     """Mock transform with explicit required_input_fields in its config."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     input_schema = None
     output_schema = None
     on_error: str | None = None
@@ -98,6 +139,8 @@ class _RequiringTransform:
     preserves_input_values = False
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, required: tuple[str, ...]) -> None:
         self.name = name
@@ -110,6 +153,12 @@ class _RequiringTransform:
 
 class _BuilderMockSink:
     name = "mock_sink"
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
     _on_write_failure: str = "discard"

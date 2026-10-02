@@ -200,7 +200,7 @@ describe("PipelineSpecView", () => {
             label: "DO_NOT_RENDER_EDGE",
           },
         ],
-        validation_errors: ["DO_NOT_RENDER_VALIDATION"],
+        validation_errors: [{ message: "DO_NOT_RENDER_VALIDATION", error_code: null, component: null }],
       }),
     });
 

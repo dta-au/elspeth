@@ -25,7 +25,10 @@ from httpx import ASGITransport, AsyncClient
 from starlette.requests import Request
 from starlette.routing import Route
 
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorSignoffGateFact
+from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.protocol import ComposerService
 from elspeth.web.execution.accounting import RunAccountingBatch
 from elspeth.web.execution.progress import ProgressBroadcaster
@@ -58,6 +61,7 @@ from elspeth.web.sessions.protocol import (
     SessionRecord,
     SessionServiceProtocol,
 )
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.helpers.session_fences import RecordingSessionOperationAuthority
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -233,11 +237,13 @@ def _create_test_app(
     app.state.session_service = mock_session_service
 
     # The validate backstop surfaces stranded interpretation reviews through
-    # the app-level composer service (elspeth-03f5728c33).
+    # the app-level owner (elspeth-03f5728c33).
     app.state.composer_service = create_autospec(ComposerService, instance=True, spec_set=True)
+    app.state.interpretation_surfacing = create_autospec(InterpretationSurfacing, instance=True, spec_set=True)
 
     # Mock settings for ownership checks
     app.state.settings = _FakeWebSettings()
+    wire_test_pipeline_user_authority(app, identity_id=_TEST_USER_ID)
 
     fake_user = UserIdentity(user_id=_TEST_USER_ID, username="testuser")
 
@@ -415,7 +421,7 @@ class TestValidateEndpoint:
         async def _record_surface(*args: Any, **kwargs: Any) -> None:
             call_order.append("surface")
 
-        surfacer = app.state.composer_service.surface_pending_interpretation_reviews
+        surfacer = app.state.interpretation_surfacing.surface_pending_interpretation_reviews
         surfacer.side_effect = _record_surface
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -444,7 +450,7 @@ class TestValidateEndpoint:
             resp = await client.post(f"/api/sessions/{uuid4()}/validate")
             assert resp.status_code == 200
 
-        app.state.composer_service.surface_pending_interpretation_reviews.assert_not_awaited()
+        app.state.interpretation_surfacing.surface_pending_interpretation_reviews.assert_not_awaited()
         svc.validate.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -470,7 +476,7 @@ class TestValidateEndpoint:
             )
             assert resp.status_code == 200
 
-        surfacer = app.state.composer_service.surface_pending_interpretation_reviews
+        surfacer = app.state.interpretation_surfacing.surface_pending_interpretation_reviews
         surfacer.assert_awaited_once()
         kwargs = surfacer.await_args.kwargs
         assert kwargs["session_id"] == str(session_id)
@@ -510,7 +516,7 @@ class TestValidateEndpoint:
     @pytest.mark.asyncio
     async def test_validate_state_id_passes_persisted_completion_gates(self) -> None:
         """The state_id branch parses the record's completion-gate envelope."""
-        from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+        from elspeth.web.execution.completion_gates import CompletionGateFacts
 
         session_id = uuid4()
         state_id = uuid4()
@@ -527,11 +533,18 @@ class TestValidateEndpoint:
                 state_id=state_id,
                 composer_meta={
                     "completion_gates": {
+                        "schema_version": 2,
                         "advisor_signoff": {
+                            "cause": "graph_rejected",
+                            "suggestion": None,
                             "status": "blocked",
                             "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
                             "for_graph": "0" * 64,
-                        }
+                            # elspeth-032ec69c41: the reviewer's note is part of
+                            # the persisted fact, so the /validate seam must
+                            # carry it to the service that merges it.
+                            "note": "choose per-branch sinks",
+                        },
                     }
                 },
             ),
@@ -546,8 +559,11 @@ class TestValidateEndpoint:
         svc.validate_state.assert_awaited_once()
         assert svc.validate_state.await_args.kwargs["completion_gates"] == CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
+                cause=AdvisorBlockCause.GRAPH_REJECTED,
+                suggestion=None,
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
                 for_graph="0" * 64,
+                note="choose per-branch sinks",
             )
         )
 
@@ -903,6 +919,8 @@ class TestExecuteEndpoint:
                 completion_ready=False,
                 blockers=[
                     ValidationReadinessBlocker(
+                        suggestion=None,
+                        note=None,
                         code="graph_structure",
                         component_id="rate",
                         component_type="transform",
@@ -931,6 +949,8 @@ class TestExecuteEndpoint:
         from elspeth.web.execution.schemas import ValidationReadinessBlocker
 
         blocker = ValidationReadinessBlocker(
+            suggestion=None,
+            note=None,
             code="runtime_admission",
             component_id="pipeline",
             component_type="pipeline",
@@ -955,6 +975,8 @@ class TestExecuteEndpoint:
                     "component_id": "pipeline",
                     "component_type": "pipeline",
                     "detail": "The selected runtime policy does not admit this pipeline.",
+                    "suggestion": None,
+                    "note": None,
                 }
             ],
         }
@@ -1337,7 +1359,15 @@ class TestRunDiagnosticsEndpoint:
         monkeypatch.setattr("elspeth.web.execution.routes.asyncio.to_thread", fake_to_thread)
 
         class ExplodingComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 raise AssertionError("LLM evaluation must not run when the audit store is unavailable")
 
         app = _create_test_app(execution_service=svc)
@@ -1401,7 +1431,15 @@ class TestRunDiagnosticsEndpoint:
         captured: dict[str, Any] = {}
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 captured.update(snapshot)
                 return (
                     '{"headline":"The run is processing data",'
@@ -1476,7 +1514,15 @@ class TestRunDiagnosticsEndpoint:
         calls = 0
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 nonlocal calls
                 calls += 1
                 return "provider must not be reached"
@@ -1528,7 +1574,7 @@ class TestRunDiagnosticsEndpoint:
         from elspeth.web.composer.audit import BufferingRecorder
         from elspeth.web.composer.llm_response_parsing import build_llm_call_record
         from elspeth.web.composer.protocol import ComposerServiceError
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 
         run_id = uuid4()
         session_id = uuid4()
@@ -1582,7 +1628,10 @@ class TestRunDiagnosticsEndpoint:
                 snapshot: dict[str, object],
                 *,
                 recorder: BufferingRecorder | None = None,
+                session_operation_context: SessionOperationContext | None = None,
             ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 assert recorder is not None
                 recorder.record_llm_call(
                     build_llm_call_record(
@@ -1672,7 +1721,7 @@ class TestRunDiagnosticsEndpoint:
     @pytest.mark.asyncio
     async def test_evaluate_diagnostics_persists_under_session_compose_lock(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """elspeth-0fcf68d50f: the diagnostics audit persist must hold the
-        same per-session compose lock the compose/guided routes serialize
+        same per-session compose lock the composer routes serialize
         on, so its ``role=audit`` rows cannot interleave inside an
         in-flight compose turn's sequence range."""
         import time
@@ -1726,7 +1775,10 @@ class TestRunDiagnosticsEndpoint:
                 snapshot: dict[str, object],
                 *,
                 recorder: BufferingRecorder | None = None,
+                session_operation_context: SessionOperationContext | None = None,
             ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 assert recorder is not None
                 recorder.record_llm_call(
                     build_llm_call_record(
@@ -1832,7 +1884,10 @@ class TestRunDiagnosticsEndpoint:
                 snapshot: dict[str, object],
                 *,
                 recorder: BufferingRecorder | None = None,
+                session_operation_context: SessionOperationContext | None = None,
             ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 assert recorder is not None
                 recorder.record_llm_call(
                     build_llm_call_record(
@@ -2007,7 +2062,15 @@ class TestRunDiagnosticsEndpoint:
         captured: dict[str, Any] = {}
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 captured.update(snapshot)
                 return (
                     '{"headline":"The run failed",'
@@ -2082,7 +2145,15 @@ class TestRunDiagnosticsEndpoint:
         monkeypatch.setattr("elspeth.web.execution.routes.asyncio.to_thread", fake_to_thread)
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 return "The run is still working through the data."
 
         app = _create_test_app(execution_service=svc)
@@ -2112,7 +2183,7 @@ class TestRunDiagnosticsEndpoint:
         """
         from fastapi import HTTPException
 
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 
         run_id = uuid4()
         svc = _execution_service()
@@ -2156,7 +2227,15 @@ class TestRunDiagnosticsEndpoint:
         monkeypatch.setattr("elspeth.web.execution.routes.asyncio.to_thread", fake_to_thread)
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 raise _BadRequestLLMError(
                     "LLM request rejected (BadRequestError)",
                     provider_detail="Model `gpt-foo` does not exist",
@@ -2194,7 +2273,7 @@ class TestRunDiagnosticsEndpoint:
         """
         from fastapi import HTTPException
 
-        from elspeth.web.composer.service import _BadRequestLLMError
+        from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 
         run_id = uuid4()
         svc = _execution_service()
@@ -2238,7 +2317,15 @@ class TestRunDiagnosticsEndpoint:
         monkeypatch.setattr("elspeth.web.execution.routes.asyncio.to_thread", fake_to_thread)
 
         class FakeComposer:
-            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: object | None = None,
+                session_operation_context: SessionOperationContext | None = None,
+            ) -> str:
+                assert session_operation_context is not None
+                assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
                 raise _BadRequestLLMError(
                     "LLM request rejected (BadRequestError)",
                     provider_detail="Model `gpt-foo` does not exist",

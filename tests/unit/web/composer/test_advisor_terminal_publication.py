@@ -33,8 +33,8 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import advisor_audit, no_tool_policy
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.advisor_audit import ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND, AdvisorTerminalPublication
+from elspeth.web.composer.composition_completion import _replace_advisor_repair_public_result
 from elspeth.web.composer.protocol import ComposerResult
-from elspeth.web.composer.service import _replace_advisor_repair_public_result
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -73,6 +73,8 @@ def _fenced_session(service: Any) -> tuple[str, SessionOperationContext]:
         service._sessions_service = MagicMock(
             spec=SessionServiceProtocol, add_message=AsyncMock(spec=SessionServiceProtocol.add_message, return_value=None)
         )
+        service._advisor_checkpoint._sessions_service = service._sessions_service
+        service._completion._sessions_service = service._sessions_service
     session_id = str(uuid.uuid4())
     context = SessionOperationContext(
         fence=SessionOperationFence(
@@ -104,7 +106,10 @@ def _publication_rows(service: Any) -> list[dict[str, Any]]:
 class TestWithheldProseDisclosure:
     """The disclosure is one fixed sentence, present on every cohort terminal.
 
-    The intermediate repair status line ("ELSPETH is applying a pipeline
+    Only the advisor-repair replacer (``_replace_advisor_repair_public_result``)
+    still withholds the model's prose: an END-gate block publishes it
+    (elspeth-032ec69c41), so the blocked notices carry no disclosure and are
+    not listed here. The intermediate repair status line ("ELSPETH is applying a pipeline
     correction.") is deliberately excluded: it is transient progress copy, and
     the turn always ends in one of the terminals below, which is where the
     user decides what the turn did.
@@ -118,13 +123,6 @@ class TestWithheldProseDisclosure:
         "message",
         [
             no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE,
-            no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER,
-            no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
-            no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
             no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
             no_tool_policy.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE,
             no_tool_policy.ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE,
@@ -133,13 +131,6 @@ class TestWithheldProseDisclosure:
         ],
         ids=[
             "signoff_pending_notice",
-            "signoff_unverified_notice",
-            "signoff_unrepairable_notice",
-            "signoff_unrepairable_unverified_notice",
-            "signoff_unrepairable_handoff_notice",
-            "signoff_unrepairable_red_footer",
-            "signoff_flagged_red_footer",
-            "signoff_unrendered_red_footer",
             "pending_handoff_notice",
             "repair_success",
             "repair_review",
@@ -154,11 +145,11 @@ class TestWithheldProseDisclosure:
         """The finalize suffixes derive from the same constants, so the
         recognizer must keep minting trusted chrome after the extension —
         a hand-copied suffix in the recognizer would fail here."""
-        bare = no_tool_policy.compose_advisor_pending_handoff_message("")
+        bare = no_tool_policy.compose_advisor_pending_handoff_message("", prose_withheld=True)
         segments = no_tool_policy.visible_message_segments(content=bare, raw_content="")
         assert segments == (no_tool_policy.TrustedSystemNoticeSegment(no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE),)
 
-        pending = no_tool_policy.compose_advisor_signoff_pending_message("")
+        pending = no_tool_policy.compose_advisor_signoff_pending_message("", prose_withheld=True)
         segments = no_tool_policy.visible_message_segments(content=pending, raw_content="")
         assert segments == (no_tool_policy.TrustedSystemNoticeSegment(no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE),)
 
@@ -237,12 +228,12 @@ class TestQualifiedReplacerPersistsThePublication:
         mirrored: list[dict[str, Any]] = []
         monkeypatch.setattr(advisor_audit, "record_advisor_terminal_publication", lambda **kw: mirrored.append(kw))
 
-        published = await service._qualified_advisor_repair_public_result(
+        published = await service._completion._qualified_advisor_repair_public_result(
             ComposerResult(message="prose", state=_empty_state(), runtime_preflight=_valid_result()),
             user_id="alice",
             session_id=session_id,
             session_operation_context=context,
-            cache=service._new_runtime_preflight_cache(),
+            cache=service._preflight.new_cache(),
             initial_version=0,
             session_scope="s1",
         )
@@ -260,12 +251,12 @@ class TestQualifiedReplacerPersistsThePublication:
         monkeypatch.setattr(advisor_audit, "record_advisor_terminal_publication", lambda **kw: mirrored.append(kw))
         blocked = _blocked_terminal(service, runtime_preflight=None)
 
-        published = await service._qualified_advisor_repair_public_result(
+        published = await service._completion._qualified_advisor_repair_public_result(
             blocked,
             user_id="alice",
             session_id=session_id,
             session_operation_context=context,
-            cache=service._new_runtime_preflight_cache(),
+            cache=service._preflight.new_cache(),
             initial_version=0,
             session_scope="s1",
         )
@@ -279,12 +270,12 @@ class TestQualifiedReplacerPersistsThePublication:
         service = _service()
         session_id, _context = _fenced_session(service)
         with pytest.raises(TypeError, match="requires the turn's session_operation_context"):
-            await service._qualified_advisor_repair_public_result(
+            await service._completion._qualified_advisor_repair_public_result(
                 ComposerResult(message="prose", state=_empty_state(), runtime_preflight=_valid_result()),
                 user_id="alice",
                 session_id=session_id,
                 session_operation_context=None,
-                cache=service._new_runtime_preflight_cache(),
+                cache=service._preflight.new_cache(),
                 initial_version=0,
                 session_scope="s1",
             )
@@ -298,7 +289,7 @@ def _blocked_terminal(
     findings_backend_authored: bool = False,
     reason: str = "flagged_final_pass",
 ) -> Any:
-    from elspeth.web.composer.service import AdvisorCheckpointVerdict
+    from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
     from elspeth.web.composer.tool_batch import BufferingRecorder
 
     # The verdict shape must match the reason the way the gate produces it:
@@ -319,7 +310,7 @@ def _blocked_terminal(
             findings_text="FLAGGED: still wrong",
             findings_backend_authored=findings_backend_authored,
         )
-    return service._advisor_blocked_result(
+    return service._advisor_checkpoint._advisor_blocked_result(
         reason=reason,
         verdict=verdict,
         state=_empty_state(),
@@ -687,6 +678,11 @@ class TestEmptyRawProducersPublishCanonicalShapes:
             # elspeth-b61894d93d: the unrendered-verdict red shapes.
             ("unavailable", "red"),
             ("malformed", "red"),
+            # Finding #4: the unrendered-verdict green and absent shapes.
+            ("unavailable", "valid"),
+            ("malformed", "valid"),
+            ("unavailable", None),
+            ("malformed", None),
         ],
         ids=[
             "absent",
@@ -699,6 +695,10 @@ class TestEmptyRawProducersPublishCanonicalShapes:
             "unrepairable_red",
             "unavailable_red",
             "malformed_red",
+            "unavailable_green",
+            "malformed_green",
+            "unavailable_absent",
+            "malformed_absent",
         ],
     )
     def test_blocked_terminal_site(self, reason: str, preflight: str | None) -> None:

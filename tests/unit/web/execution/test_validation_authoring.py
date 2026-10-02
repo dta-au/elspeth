@@ -235,6 +235,40 @@ def test_path_phase_returns_typed_failure_for_malformed_authored_paths(bad_path:
     assert result.errors[0].component_id == "source"
 
 
+@pytest.mark.parametrize(
+    ("source_name", "component_id"),
+    [("source", "source"), ("orders", "source:orders"), ("7", "source:7"), (7, "source:<invalid>"), (None, "source:<invalid>")],
+)
+@pytest.mark.parametrize("policy_case", ["path", "fabricated_secret", "unauthorized_secret_ref"])
+def test_authoring_policy_source_component_ids(source_name: object, component_id: str, policy_case: str) -> None:
+    options: dict[str, object]
+    if policy_case == "path":
+        options = {"path": 123}
+    elif policy_case == "fabricated_secret":
+        options = {"api_key": "literal-credential"}
+    else:
+        options = {"api_key": {"secret_ref": "API_KEY"}}
+    # The constructor admits malformed mapping keys; exercise the same state
+    # boundary as rehydrated authoring data, without mutating a frozen object.
+    state = CompositionState(
+        sources={cast(str, source_name): _source(options)},
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    if policy_case == "path":
+        result = validate_path_policy(_policy(state), data_dir=Path("/tmp/test_data"), session_id="test-session")
+    else:
+        result = validate_secret_evidence(_policy(state), secret_service=_SecretService(frozenset({"API_KEY"})), user_id="alice")
+
+    assert isinstance(result, PhaseFailure)
+    assert [(error.component_id, error.component_type, error.error_code) for error in result.errors] == [
+        (component_id, "source", None if policy_case == "path" else policy_case)
+    ]
+
+
 def test_policy_lowering_returns_typed_state_and_four_canonical_checks() -> None:
     state = _state(outputs=(_output(),))
 
@@ -426,6 +460,34 @@ def test_web_resource_phase_caps_web_scrape() -> None:
     assert all("web_scrape.http" in error.message for error in result.errors)
 
 
+@pytest.mark.parametrize(
+    ("raw_limit", "error_code"),
+    [
+        (10 * 1024 * 1024 + 1, "web_fetch_resource_limit_exceeded"),
+        ("not-an-int", "web_fetch_resource_config_invalid"),
+    ],
+)
+def test_web_resource_phase_caps_post_request_bytes_before_materialization(raw_limit: object, error_code: str) -> None:
+    state = _state(nodes=(_node(plugin="web_scrape", options={"http": {"max_request_body_bytes": raw_limit}}),))
+
+    result = validate_web_resource_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "web_fetch_resource_policy"
+    assert result.failed_check.affected_nodes == ("node",)
+    assert result.errors[0].error_code == error_code
+    assert "web_scrape.http.max_request_body_bytes" in result.errors[0].message
+
+
+def test_web_resource_phase_accepts_post_request_limit_at_cap() -> None:
+    state = _state(nodes=(_node(plugin="web_scrape", options={"http": {"max_request_body_bytes": 10 * 1024 * 1024}}),))
+
+    result = validate_web_resource_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseReport)
+    assert result.checks[0].passed is True
+
+
 def test_resource_limit_outcome_rejects_ambiguous_state() -> None:
     error = ValidationError(
         component_id="node",
@@ -540,6 +602,48 @@ def test_secret_phase_authorizes_exact_rules_across_all_components() -> None:
 
     assert isinstance(result, PhaseReport)
     assert result.checks[0].outcome_code == "secret_refs.resolved"
+
+
+def test_secret_phase_needs_no_wiring_rule_for_a_profile_injected_search_key() -> None:
+    """An azure_search_profiles ``credential_ref`` is server-authored end to end.
+
+    Wiring authorization walks the AUTHORED state, where a profiled node carries only
+    ``profile``; the marker appears in the lowered state. The same marker typed by an
+    author is still denied, so the operator needs no ``secret_wiring_allowlist`` rule
+    for a search profile and gains no loophole by omitting one.
+    """
+    authored_options: dict[str, object] = {"profile": "contracts", "index": "docs", "query_field": "q", "output_prefix": "p"}
+    lowered_options: dict[str, object] = {
+        "index": "docs",
+        "query_field": "q",
+        "output_prefix": "p",
+        "endpoint": "https://svc-b.search.windows.net",
+        "api_key": {"secret_ref": "SEARCH_B_KEY", "secret_scope": "server"},
+    }
+    authored = _state(nodes=(_node(plugin="azure_ai_search", options=authored_options),))
+    lowered = _state(nodes=(_node(plugin="azure_ai_search", options=lowered_options),))
+    secrets = _OwnedScopedSecretService(frozenset({"SEARCH_B_KEY"}))
+
+    profiled = validate_secret_evidence(
+        PolicyLoweredState(
+            authored_state=authored,
+            state=lowered,
+            profiled_s3_audit_identities=(),
+            profiled_textract_audit_identities=(),
+            operator_resolved_model_node_ids=frozenset(),
+        ),
+        secret_service=secrets,
+        user_id="alice",
+        secret_wiring_policy=SecretWiringPolicy(rules=()),
+    )
+    typed_by_the_author = validate_secret_evidence(
+        _policy(lowered), secret_service=secrets, user_id="alice", secret_wiring_policy=SecretWiringPolicy(rules=())
+    )
+
+    assert isinstance(profiled, PhaseReport)
+    assert profiled.artifact.all_secret_refs == (("SEARCH_B_KEY", "server"),)
+    assert isinstance(typed_by_the_author, PhaseFailure)
+    assert [error.error_code for error in typed_by_the_author.errors] == ["unauthorized_secret_ref"]
 
 
 def test_secret_phase_preserves_missing_reference_failure() -> None:
@@ -917,11 +1021,12 @@ def test_path_gate_admits_a_legitimate_in_subtree_path_on_every_kind(node_type: 
 def test_path_gate_still_skips_plugin_less_structural_nodes(tmp_path: Path) -> None:
     """The subject set is ``node.plugin is not None``, NOT every node.
 
-    gate/queue/coalesce can carry an inert ``provider_config`` through
-    composer validation today (only ``row_union`` rejects non-empty options),
-    and nothing reads it for a plugin-less kind. Gating it would newly reject
-    a nonsense-but-harmless composition that passes today — a behaviour
-    change with no security benefit, since no plugin can act on the value.
+    Composer validation already refuses a stray ``provider_config`` on every
+    plugin-less kind (``gate_config_invalid``, ``coalesce_config_invalid``,
+    the queue option allowlist and ``row_union``'s empty-options rule), and
+    nothing reads it for such a kind. This path gate is not the place to
+    restate that refusal: no plugin can act on the value, so gating it here
+    would add a second rejection with no security benefit.
     """
     gate_node = _node(node_id="g1", plugin=None, node_type="gate", options={"provider_config": {"persist_directory": _TRAVERSAL}})
 

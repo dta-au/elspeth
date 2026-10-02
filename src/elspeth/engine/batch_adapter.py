@@ -25,7 +25,8 @@ Retry Safety:
     waiter (which will be garbage collected), not to the retry's waiter.
 
 Exception Propagation:
-    Plugin bugs should crash the orchestrator (CLAUDE.md compliance). Worker threads
+    Plugin bugs should crash the orchestrator (see
+    docs/guides/data-trust-and-error-handling.md §Plugin Ownership). Worker threads
     wrap uncaught exceptions in ExceptionResult so they propagate through the async
     pattern. RowWaiter.wait() detects these and re-raises the original exception.
 """
@@ -122,7 +123,7 @@ class RowWaiter:
                 processor translates it into the row-scoped
                 ``shutdown_requested`` error result
                 (``_convert_retryable_to_error_result``), so shutdown policy
-                lives in one layer (filigree elspeth-14571961a6).
+                lives in one layer (archived issue elspeth-14571961a6).
             Exception: Re-raised from worker thread if plugin bug occurred
         """
         return self._wait_for(self._key, self._event, timeout, shutdown_event)

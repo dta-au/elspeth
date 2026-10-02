@@ -25,7 +25,7 @@ from opentelemetry.sdk.metrics.export import InMemoryMetricReader, MetricExporte
 from opentelemetry.sdk.resources import Resource
 from pydantic import SecretBytes, ValidationError
 from sqlalchemy import create_engine, inspect
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import CompileError, OperationalError, ProgrammingError
 from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse
@@ -44,6 +44,8 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
+from elspeth.plugins.infrastructure.templates import TemplateError
+from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.web import aws_rds_trust as aws_rds_trust_module
 from elspeth.web.app import (
     _BodySizeLimitMiddleware,
@@ -52,11 +54,12 @@ from elspeth.web.app import (
     create_app,
     lifespan,
 )
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.providers import get_profile
 from elspeth.web.auth.sso import SsoAuthProvider, SsoRuntime
 from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartupContractError
-from elspeth.web.composer.boot_probe import ComposerBootConfigError
+from elspeth.web.composer.boot_probe import ComposerBootConfigError, ComposerProbeRequest
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import _JSON_COLLECTION_FIELDS, WebSettings, settings_from_env
 from elspeth.web.coordination.membership_lifecycle import (
@@ -69,8 +72,8 @@ from elspeth.web.deployment_contract import DeploymentConfigurationError
 from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
 from elspeth.web.operator_telemetry import OperatorTelemetryFactories, OperatorTelemetryRuntime
 from elspeth.web.readiness import READINESS_CHECK_NAMES, ReadinessCache, ReadinessCheck, ReadinessProbeRunner, ReadinessReport
+from elspeth.web.sessions.models import identity_roles_table
 from elspeth.web.sessions.protocol import (
-    LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX,
     LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX,
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
     CompositionStateData,
@@ -80,6 +83,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
 from elspeth.web.sso_wiring import SsoWiring
+from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import expire_leader_seat
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
@@ -197,6 +201,19 @@ def _settings(tmp_path: Path, **overrides) -> WebSettings:
     }
     defaults.update(overrides)
     return WebSettings(**defaults)  # type: ignore[arg-type]
+
+
+def _ensure_test_user(conn: Connection, *, identity_id: str) -> None:
+    ensure_test_identity(conn, identity_id=identity_id)
+    conn.execute(
+        identity_roles_table.insert().values(
+            role_id=f"user-{identity_id}",
+            identity_id=identity_id,
+            role="user",
+            granted_by_identity_id=identity_id,
+            granted_at=datetime.now(UTC),
+        )
+    )
 
 
 async def _save_session_seed_state(
@@ -414,6 +431,13 @@ class TestCreateApp:
         assert app.state.settings is settings
         assert app.state.settings.port == 9999
 
+    def test_storage_quota_refusals_use_the_auth_audit_recorder(self, tmp_path) -> None:
+        app = create_app(_settings(tmp_path))
+        record = app.state.auth_audit_recorder.record_quota_exceeded
+        assert app.state.blob_service._quota_exceeded_recorder == record
+        assert app.state.blob_service._session_operation_authority._quota_exceeded_recorder == record
+        assert app.state.session_service.session_operation_authority is app.state.blob_service._session_operation_authority
+
     def test_blob_acquire_archive_race_maps_to_nonleaking_not_found(self, tmp_path, monkeypatch) -> None:
         """Archive may win after ownership verification but before lease acquire."""
         from elspeth.web.auth.middleware import get_current_user
@@ -421,6 +445,8 @@ class TestCreateApp:
         from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
 
         app = create_app(_settings(tmp_path))
+        with app.state.session_engine.begin() as conn:
+            _ensure_test_user(conn, identity_id="test-user")
 
         async def _mock_user() -> UserIdentity:
             return UserIdentity(user_id="test-user", username="test-user")
@@ -541,6 +567,31 @@ class TestHealthEndpoint:
         response = client.get("/api/health")
         assert response.json() == {"status": "ok"}
 
+    @pytest.mark.asyncio
+    async def test_health_responds_during_malicious_jinja_render(self, tmp_path) -> None:
+        app = create_app(_settings(tmp_path))
+        attempted = threading.Event()
+
+        def render_nested_loops() -> None:
+            attempted.set()
+            PromptTemplate("{% for a in range(100000) %}{% for b in range(100000) %}{% set x = a + b %}{% endfor %}{% endfor %}").render({})
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # State validation and review debt on the YAML route use this same
+            # bounded pool; the synchronous child-process wait runs off-loop.
+            task = asyncio.create_task(run_sync_in_worker(render_nested_loops))
+            await asyncio.sleep(0.3)
+            assert attempted.is_set()
+            assert not task.done()
+            started = asyncio.get_running_loop().time()
+            health = await client.get("/api/health")
+            assert asyncio.get_running_loop().time() - started < 0.5
+            assert health.status_code == 200
+            assert health.json() == {"status": "ok"}
+            with pytest.raises(TemplateError):
+                await task
+
     def test_health_stays_shallow_when_readiness_is_not_ready(self, tmp_path, monkeypatch) -> None:
         app = create_app(_settings(tmp_path))
 
@@ -583,6 +634,20 @@ class TestHealthEndpoint:
 
 
 class TestReadinessEndpoint:
+    def test_open_local_governance_returns_named_http_503(self, tmp_path: Path) -> None:
+        app = create_app(_settings(tmp_path, workflow_governance="on", compartment_id="compartment-a"))
+
+        response = TestClient(app).get("/api/ready")
+
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["ready"] is False
+        auth_mode = next(check for check in payload["checks"] if check["name"] == "auth_mode")
+        assert auth_mode["ok"] is False
+        assert "workflow_governance=on" in auth_mode["detail"]
+        assert "auth_provider=local" in auth_mode["detail"]
+        assert "registration_mode=open" in auth_mode["detail"]
+
     def test_ready_returns_200_with_exact_nine_check_json(self, tmp_path, monkeypatch) -> None:
         app = create_app(_settings(tmp_path))
         checks = tuple(ReadinessCheck(name, True, "ok") for name in READINESS_CHECK_NAMES)
@@ -727,6 +792,33 @@ class TestSystemStatusEndpoint:
         assert response.status_code == 200
         assert response.json()["composer_timeout_seconds"] == 300.0
 
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_reports_server_only_secret_mode_and_enforces_it(self, tmp_path, enabled: bool) -> None:
+        """The SPA hides the add-a-key form from this flag; the API enforces it."""
+        from elspeth.web.auth.middleware import get_current_user
+        from elspeth.web.auth.models import UserIdentity
+
+        app = create_app(_settings(tmp_path, user_secrets_enabled=enabled))
+        client = TestClient(app)
+
+        assert client.get("/api/system/status").json()["user_secrets_enabled"] is enabled
+        assert app.state.secret_service.user_secrets_enabled is enabled
+
+        if not enabled:
+            with app.state.session_engine.begin() as conn:
+                _ensure_test_user(conn, identity_id="alice")
+
+            # Through the REAL app: its StarletteHTTPException handler rewrites
+            # structured error bodies, so the typed discriminator must survive it.
+            async def _mock_user() -> UserIdentity:
+                return UserIdentity(user_id="alice", username="alice")
+
+            app.dependency_overrides[get_current_user] = _mock_user
+            refused = client.post("/api/secrets", json={"name": "MY_KEY", "value": "super-secret-value"})
+            assert refused.status_code == 403
+            assert refused.json()["detail"]["error_type"] == "user_secrets_disabled"
+            assert "super-secret-value" not in refused.text
+
     def test_classification_banner_defaults_to_null(self, tmp_path) -> None:
         """An undeclared deployment renders no protective-marking banner."""
         app = create_app(_settings(tmp_path))
@@ -844,6 +936,37 @@ class TestSystemStatusEndpoint:
         assert rows["local_capability_configuration"]["status"] == "ok"
         assert rows["local_capability_configuration"]["detail"] is None
 
+    def test_reports_the_default_advisor_model_when_unset(self, tmp_path) -> None:
+        """An operator who sets nothing sees the code default, not null.
+
+        ``WebSettings.composer_advisor_model`` is a non-null ``str`` with a code
+        default and WebSettings has no advisor-disabled setting, so there is no
+        disabled state for the payload to report as null: the field is the
+        model that gates completion for THIS deployment, whatever supplied it.
+        """
+        app = create_app(_settings(tmp_path))
+        response = TestClient(app).get("/api/system/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["composer_advisor_model"] == WebSettings.model_fields["composer_advisor_model"].default
+        assert body["composer_model"] == "gpt-5.5"
+
+    def test_reports_the_configured_advisor_model(self, tmp_path) -> None:
+        """A served override reaches the payload verbatim, beside the planner.
+
+        Live, the served env overrides the code default; without this field
+        the only way to learn which model gated completion was to read it
+        back out of ``llm_call_audit`` rows.
+        """
+        app = create_app(_settings(tmp_path, composer_advisor_model="anthropic/claude-opus-4-7"))
+        response = TestClient(app).get("/api/system/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["composer_advisor_model"] == "anthropic/claude-opus-4-7"
+        assert body["composer_model"] == "gpt-5.5"
+
 
 class TestMetricsEndpoint:
     """Tests for GET /metrics (Prometheus scrape endpoint)."""
@@ -915,7 +1038,8 @@ class TestMetricsEndpoint:
         """A third-party collector raising inside generate_latest() must not
         leak a traceback into the response and must not drop the error
         silently. The handler returns a fixed 503 and records *why* via slog
-        (sanctioned telemetry-system-failure logging per CLAUDE.md), carrying
+        (sanctioned telemetry-system-failure logging per the
+        ``logging-telemetry-policy`` skill §Logging Policy), carrying
         a bounded detail that identifies which collector broke.
         """
         client = self._authed_client(tmp_path)
@@ -1570,7 +1694,7 @@ class TestLifespanShutdown:
         async def _fail_sweep(**_kwargs: object) -> list[RunRecord]:
             raise OperationalError("UPDATE runs", {}, Exception("db unavailable"))
 
-        monkeypatch.setattr(app.state.session_service, "cancel_all_orphaned_run_records", _fail_sweep)
+        monkeypatch.setattr(app.state.session_service, "list_recoverable_run_records", _fail_sweep)
         with (
             patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
             pytest.raises(OperationalError),
@@ -1592,7 +1716,7 @@ class TestLifespanShutdown:
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
-        async def _reject_probe(**_kwargs: object) -> bool:
+        async def _reject_probe(_request: ComposerProbeRequest) -> bool:
             raise ComposerBootConfigError("composer sampling rejected")
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _reject_probe)
@@ -1609,6 +1733,7 @@ class TestLifespanShutdown:
         _, attributes = counter.calls[0]
         assert attributes["probe_status"] == "rejected"
         assert attributes["probed_model"] == "gpt-5.5"
+        assert attributes["probed_surface"] == "loop_tools"
         assert len(latency.calls) == 1
         assert finalizer_calls == 1
 
@@ -1617,7 +1742,7 @@ class TestLifespanShutdown:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
         called = False
 
-        async def _probe(**_kwargs: object) -> bool:
+        async def _probe(_request: ComposerProbeRequest) -> bool:
             nonlocal called
             called = True
             return True
@@ -1630,7 +1755,8 @@ class TestLifespanShutdown:
         assert called is False
 
     @pytest.mark.asyncio
-    async def test_lifespan_startup_orphan_cleanup_terminalizes_landscape_run(self, tmp_path) -> None:
+    @pytest.mark.parametrize("terminal", [False, True])
+    async def test_lifespan_recovers_terminal_truth_and_defers_live_landscape_leader(self, tmp_path, terminal) -> None:
         app = create_app(
             _settings(
                 tmp_path,
@@ -1639,9 +1765,10 @@ class TestLifespanShutdown:
             )
         )
         session_service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await session_service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(session_service, session.id)
-        landscape_run_id = "lscp-startup-orphan"
         authority = session_service.session_operation_authority
         execute_context = authority.acquire(
             session_id=session.id,
@@ -1655,6 +1782,7 @@ class TestLifespanShutdown:
                 state.id,
                 session_operation_context=execute_context,
             )
+            landscape_run_id = str(web_run.id)
             await session_service.update_run_status(
                 web_run.id,
                 "running",
@@ -1665,36 +1793,39 @@ class TestLifespanShutdown:
             authority.release(execute_context)
 
         with LandscapeDB.from_url(app.state.settings.get_landscape_url()) as db:
-            RecorderFactory(db).run_lifecycle.begin_run(
+            repositories = RecorderFactory(db)
+            repositories.run_lifecycle.begin_run(
                 config={},
                 canonical_version="v1",
                 run_id=landscape_run_id,
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
             )
-            # The dead leader's seat has lapsed: the orphan finaliser takes it
-            # through the takeover CAS before stamping INTERRUPTED (ADR-048 §4).
-            expire_leader_seat(db, landscape_run_id)
+            if terminal:
+                from tests.fixtures.landscape import leader_coordination_token
+
+                repositories.run_lifecycle.complete_run(
+                    RunStatus.EMPTY, coordination_token=leader_coordination_token(repositories, landscape_run_id)
+                )
 
         with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
                 pass
 
         updated_web_run = await session_service.get_run(web_run.id)
-        assert updated_web_run.status == "cancelled"
-        assert updated_web_run.finished_at is not None
-        assert updated_web_run.error is not None
-        assert updated_web_run.error.endswith(LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX)
+        assert updated_web_run.status == ("empty" if terminal else "running")
+        assert (updated_web_run.finished_at is not None) == terminal
+        assert updated_web_run.error is None
 
         with LandscapeDB.from_url(app.state.settings.get_landscape_url()) as db:
             landscape_run = RecorderFactory(db).run_lifecycle.get_run(landscape_run_id)
 
         assert landscape_run is not None
-        assert landscape_run.status == RunStatus.INTERRUPTED
-        assert landscape_run.completed_at is not None
+        assert landscape_run.status == (RunStatus.EMPTY if terminal else RunStatus.RUNNING)
+        assert (landscape_run.completed_at is not None) == terminal
 
     @pytest.mark.asyncio
-    async def test_lifespan_marks_missing_landscape_anchor_absent_and_emits_static_event(self, tmp_path) -> None:
+    async def test_lifespan_marks_legacy_missing_baseline_recovery_required(self, tmp_path) -> None:
         app = create_app(
             _settings(
                 tmp_path,
@@ -1703,6 +1834,8 @@ class TestLifespanShutdown:
             )
         )
         service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(service, session.id)
         authority = service.session_operation_authority
@@ -1732,22 +1865,15 @@ class TestLifespanShutdown:
                 pass
 
         updated = await service.get_run(web_run.id)
-        assert updated.error is not None
-        assert updated.error.endswith(LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX)
+        assert updated.status == "running"
+        assert updated.saga_state.value == "recovery_required"
+        assert updated.recovery_required_reason.value == "missing_baseline"
         events = [entry for entry in logs if entry.get("event") == "orphan_landscape_run_absent"]
-        assert events == [
-            {
-                "event": "orphan_landscape_run_absent",
-                "log_level": "error",
-                "outcome": "absent",
-                "count": 1,
-                "operator_action": "investigate audit-row absence",
-            }
-        ]
+        assert events == []
         assert "RAW_ABSENT_ANCHOR_SENTINEL" not in repr(events)
 
     @pytest.mark.asyncio
-    async def test_lifespan_null_anchor_receives_complete_marker_without_landscape_access(self, tmp_path, monkeypatch) -> None:
+    async def test_lifespan_legacy_pending_admission_requires_recovery_without_cancellation(self, tmp_path) -> None:
         app = create_app(
             _settings(
                 tmp_path,
@@ -1756,6 +1882,8 @@ class TestLifespanShutdown:
             )
         )
         service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(service, session.id)
         authority = service.session_operation_authority
@@ -1774,24 +1902,20 @@ class TestLifespanShutdown:
         finally:
             authority.release(execute_context)
 
-        real_finalize = app_module._finalize_orphaned_landscape_runs
-
-        def finalize(url: str, runs: list[RunRecord], *, create_tables: bool = True):
-            assert all(run.landscape_run_id is None for run in runs)
-            return real_finalize("sqlite:////definitely/not/accessed.db", runs, create_tables=create_tables)
-
-        monkeypatch.setattr(app_module, "_finalize_orphaned_landscape_runs", finalize)
         with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
                 pass
         updated = await service.get_run(web_run.id)
-        assert updated.error is not None
-        assert updated.error.endswith(LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX)
+        assert updated.status == "pending"
+        assert updated.saga_state.value == "recovery_required"
+        assert updated.recovery_required_reason.value == "missing_baseline"
 
     @pytest.mark.asyncio
     async def test_marker_failure_after_landscape_completion_retries_idempotently(self, tmp_path, monkeypatch) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
         service = app.state.session_service
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id="alice")
         session = await service.create_session("alice", "Pipeline", "local")
         state = await _save_session_seed_state(service, session.id)
         landscape_run_id = "landscape-marker-retry"
@@ -1868,8 +1992,8 @@ class TestLifespanShutdown:
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
-        async def _probe(**kwargs: object) -> bool:
-            probed_models.append(str(kwargs["model"]))
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            probed_models.append(request.model)
             return True
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
@@ -1880,11 +2004,14 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        assert probed_models == ["gpt-5.5", "anthropic/claude-sonnet-4-6"]
-        assert len(counter.calls) == 2
-        assert len(latency.calls) == 2
+        assert probed_models == ["gpt-5.5", "gpt-5.5", "anthropic/claude-sonnet-4-6"]
+        assert len(counter.calls) == 3
+        assert len(latency.calls) == 3
         counter_attributes = [attributes for _amount, attributes in counter.calls]
         assert [attrs["probed_model"] for attrs in counter_attributes] == probed_models
+        assert [attrs["probed_role"] for attrs in counter_attributes] == ["planner", "planner", "advisor"]
+        assert [attrs["probed_surface"] for attrs in counter_attributes] == ["loop_tools", "planner_tools", "advisor"]
+        assert [attrs["structured_output"] for attrs in counter_attributes] == [False, False, True]
         for attributes in counter_attributes:
             assert attributes["composer_model"] == "gpt-5.5"
             assert attributes["composer_temperature"] == "0.0"
@@ -1906,19 +2033,22 @@ class TestLifespanShutdown:
             _settings(
                 tmp_path,
                 composer_boot_probe_enabled=True,
-                composer_advisor_model="anthropic/claude-sonnet-4-6",
                 composer_endpoint_base_url="https://primary-gateway.example.test/v1",
                 composer_endpoint_api_key="primary-bearer-token",  # secret-scan: allow-this-line
                 composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
                 composer_advisor_endpoint_api_key="advisor-bearer-token",  # secret-scan: allow-this-line
+                composer_advisor_model="gpt-5.5",
+                composer_allow_same_advisor_model=True,
+                composer_advisor_max_completion_tokens=8192,
+                composer_advisor_reasoning_effort="low",
             )
         )
-        probed: list[dict[str, object]] = []
+        probed: list[ComposerProbeRequest] = []
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
-        async def _probe(**kwargs: object) -> bool:
-            probed.append(kwargs)
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            probed.append(request)
             return True
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
@@ -1929,14 +2059,18 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        assert len(probed) == 2
-        primary_call, advisor_call = probed
-        assert primary_call["model"] == "gpt-5.5"
-        assert primary_call["api_base"] == "https://primary-gateway.example.test/v1"
-        assert primary_call["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
-        assert advisor_call["model"] == "anthropic/claude-sonnet-4-6"
-        assert advisor_call["api_base"] == "https://advisor-gateway.example.test/v1"
-        assert advisor_call["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
+        assert [request.surface for request in probed] == ["loop_tools", "planner_tools", "advisor"]
+        loop_request, planner_request, advisor_request = probed
+        for primary_request in (loop_request, planner_request):
+            assert primary_request.role == "planner"
+            assert primary_request.kwargs["model"] == "gpt-5.5"
+            assert primary_request.kwargs["api_base"] == "https://primary-gateway.example.test/v1"
+            assert primary_request.kwargs["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
+        assert advisor_request.role == "advisor"
+        assert advisor_request.kwargs["model"] == "gpt-5.5"
+        assert advisor_request.kwargs["max_tokens"] == 8192
+        assert advisor_request.kwargs["api_base"] == "https://advisor-gateway.example.test/v1"
+        assert advisor_request.kwargs["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
 
     @pytest.mark.asyncio
     async def test_lifespan_probe_omits_endpoint_kwargs_when_unset(self, monkeypatch, tmp_path) -> None:
@@ -1947,12 +2081,12 @@ class TestLifespanShutdown:
                 composer_advisor_model="anthropic/claude-sonnet-4-6",
             )
         )
-        probed: list[dict[str, object]] = []
+        probed: list[ComposerProbeRequest] = []
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
-        async def _probe(**kwargs: object) -> bool:
-            probed.append(kwargs)
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            probed.append(request)
             return True
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
@@ -1963,48 +2097,277 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        assert len(probed) == 2
-        for call in probed:
-            assert call["api_base"] is None
-            assert call["api_key"] is None
+        assert len(probed) == 3
+        for request in probed:
+            assert "api_base" not in request.kwargs
+            assert "api_key" not in request.kwargs
+
+    @pytest.mark.asyncio
+    async def test_lifespan_caps_planner_probes_inside_one_shared_deadline(self, monkeypatch, tmp_path) -> None:
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
+        surfaces: list[str] = []
+
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            surfaces.append(request.surface)
+            return True
+
+        real_wait_for = asyncio.wait_for
+        timeouts: list[float] = []
+
+        async def _wait_with_delay(awaitable: Awaitable[bool], *, timeout: float) -> bool:
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                await asyncio.sleep(0.1)
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        with (
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+            patch("elspeth.web.app.asyncio.wait_for", new=_wait_with_delay),
+        ):
+            async with lifespan(app):
+                pass
+
+        assert surfaces == ["loop_tools", "planner_tools", "advisor"]
+        assert timeouts[:2] == [5.0, 5.0]
+        # The first probe consumed at least 0.1 seconds of the shared deadline.
+        # A fresh 45-second advisor timeout would fail this control.
+        assert len(timeouts) == 3
+        assert 0 < timeouts[2] < 44.95
+
+    @pytest.mark.asyncio
+    async def test_lifespan_caps_three_planner_role_probes_on_a_forwarding_hatch(self, monkeypatch, tmp_path) -> None:
+        """S1 T8 / D9: an OpenRouter advisor adds ``hatch_terminal``, a planner-role probe with the 5 s cap.
+
+        Control: order the hatch after the advisor and the surface order goes red.
+        """
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True, composer_advisor_model="openrouter/z-ai/glm-5.3"))
+        surfaces: list[str] = []
+
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            surfaces.append(request.surface)
+            return True
+
+        real_wait_for = asyncio.wait_for
+        timeouts: list[float] = []
+
+        async def _wait_with_delay(awaitable: Awaitable[bool], *, timeout: float) -> bool:
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                await asyncio.sleep(0.1)
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        with (
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+            patch("elspeth.web.app.asyncio.wait_for", new=_wait_with_delay),
+        ):
+            async with lifespan(app):
+                pass
+
+        assert surfaces == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
+        # Every planner-role probe is capped at min(remaining, 5 s); the
+        # advisor gets what is left after the first probe's controlled delay.
+        assert timeouts[:3] == [5.0, 5.0, 5.0]
+        assert len(timeouts) == 4
+        assert 0 < timeouts[3] < 44.95
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rejected_surface", ["hatch_terminal", "planner_tools", "loop_tools", "advisor"])
+    async def test_hatch_terminal_rejection_is_nonfatal(self, monkeypatch, tmp_path, rejected_surface: str) -> None:
+        """Ruling 8 (b): a ``hatch_terminal`` 400 is logged and boot continues; every other surface's 400 stays fatal.
+
+        Control: drop the surface check so every 400 is non-fatal, and the
+        ``planner_tools`` case goes red.
+        """
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True, composer_advisor_model="openrouter/z-ai/glm-5.3"))
+        counter = _RecordingCounter()
+        latency = _RecordingHistogram()
+        sent: list[str] = []
+
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            sent.append(request.surface)
+            if request.surface == rejected_surface:
+                raise ComposerBootConfigError(
+                    f"composer {request.role} boot request rejected by {request.model}: surface={request.surface}"
+                )
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
+
+        if rejected_surface == "hatch_terminal":
+            with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+                async with lifespan(app):
+                    pass
+            assert sent == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
+            statuses = {attributes["probed_surface"]: attributes["probe_status"] for _amount, attributes in counter.calls}
+            assert statuses == {"loop_tools": "success", "planner_tools": "success", "hatch_terminal": "rejected", "advisor": "success"}
+            [event] = [entry for entry in logs if entry["event"] == "composer_boot_probe_rejected_nonfatal"]
+            assert event["probed_surface"] == "hatch_terminal"
+            assert event["probed_role"] == "planner"
+            assert event["model"] == "openrouter/z-ai/glm-5.3"
+            assert (event["tool_count"], event["strict_true_count"], event["strict_false_count"], event["strict_key_omitted"]) == (
+                1,
+                0,
+                1,
+                0,
+            )
+            assert "hatch" in event["action"]
+            assert "rejected by" not in repr(event)
+        else:
+            with (
+                patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+                pytest.raises(ComposerBootConfigError, match=f"surface={rejected_surface}"),
+            ):
+                async with lifespan(app):
+                    pass
+            assert sent[-1] == rejected_surface
+            assert [attributes["probe_status"] for _amount, attributes in counter.calls][-1] == "rejected"
+
+    def test_composer_boot_probe_deadline_fits_the_startup_contract(self) -> None:
+        """The probes run before uvicorn binds, so they spend the 150 s startup contract.
+
+        The contract is read from its sources, so a shrunken startup window
+        turns this red. The control shows the same check rejects a deadline
+        past the budget.
+        """
+        import re
+
+        import elspeth.web.app as app_module
+
+        root = Path(__file__).resolve().parents[3]
+        bicep = (root / "deploy/azure-container-apps/workload.bicep").read_text(encoding="utf-8")
+        startup = re.search(r"type: 'Startup'.*?periodSeconds: (\d+).*?failureThreshold: (\d+)", bicep, re.S)
+        assert startup is not None
+        aca_startup_seconds = int(startup.group(1)) * int(startup.group(2))
+        runbook = (root / "docs/runbooks/aws-ecs-deployment.md").read_text(encoding="utf-8")
+        ecs_start_period = re.search(r'"startPeriod": (\d+)', runbook)
+        assert ecs_start_period is not None
+        assert aca_startup_seconds == int(ecs_start_period.group(1)) == 150
+        assert "approximately 90-second" in runbook
+        assert app_module._BOOT_PROVIDER_PROBE_BUDGET_SECONDS == 150 - 90
+
+        # The catalog prime runs first, bounded by its own total deadline
+        # (httpx's connect/read timeouts are per operation, so they do not
+        # bound a trickling response; see the slow-drip test).
+        catalog_prime = app_module._OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS
+        assert catalog_prime == 10.0
+
+        def fits(deadline: float) -> bool:
+            return deadline + catalog_prime <= app_module._BOOT_PROVIDER_PROBE_BUDGET_SECONDS
+
+        assert app_module._COMPOSER_BOOT_PROBE_DEADLINE_SECONDS == 45.0
+        assert app_module._COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS == 5.0
+        assert fits(app_module._COMPOSER_BOOT_PROBE_DEADLINE_SECONDS)
+        # Control: today's pre-S0 worst case (planner 5 s + advisor 60 s) does not fit.
+        assert not fits(5.0 + 60.0)
+        assert not fits(app_module._BOOT_PROVIDER_PROBE_BUDGET_SECONDS)
 
     @pytest.mark.asyncio
     async def test_lifespan_records_transient_failure_when_composer_probe_times_out(self, monkeypatch, tmp_path) -> None:
+        """Hanging probes time out as nonfatal transient failures, inside one shared deadline.
+
+        Worst-case probe time is the shared deadline, not a sum of per-request
+        timeouts.
+        """
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
-        cancelled = False
+        cancelled: list[str] = []
 
-        async def _hanging_probe(**_kwargs: object) -> bool:
-            nonlocal cancelled
+        async def _hanging_probe(request: ComposerProbeRequest) -> bool:
             try:
                 await asyncio.Event().wait()
             finally:
-                cancelled = True
+                cancelled.append(request.surface)
             return True
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _hanging_probe)
         monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
         monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
-        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_PROBE_DEADLINE_SECONDS", 0.3)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS", 0.1)
 
         async def _enter_and_exit_lifespan() -> None:
             async with lifespan(app):
                 pass
 
-        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
-            await asyncio.wait_for(_enter_and_exit_lifespan(), timeout=1.0)
+        with (
+            capture_logs() as logs,
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+            patch("elspeth.web.app.asyncio.wait_for", wraps=asyncio.wait_for) as wait_for,
+        ):
+            await asyncio.wait_for(_enter_and_exit_lifespan(), timeout=5.0)
 
-        # Advisor is mandatory, so both the primary and advisor models are
-        # probed. Both hang and time out as transient_failure; the loop does
-        # not break on a transient failure.
-        assert len(counter.calls) == 2
-        probed = [attributes["probed_model"] for _amount, attributes in counter.calls]
-        assert probed[0] == "gpt-5.5"
-        for _amount, attributes in counter.calls:
-            assert attributes["probe_status"] == "transient_failure"
-        assert len(latency.calls) == 2
-        assert cancelled is True
+        timeouts = [call.kwargs["timeout"] for call in wait_for.call_args_list if call.kwargs["timeout"] != 5.0]
+        assert timeouts[:2] == [0.1, 0.1]
+        assert len(timeouts) == 3
+        # Every probe request fits inside the one deadline.
+        assert sum(timeouts) <= 0.3 + 0.01
+        assert 0.05 < timeouts[2] <= 0.1 + 0.01
+        assert cancelled == ["loop_tools", "planner_tools", "advisor"]
+        assert [attributes["probe_status"] for _amount, attributes in counter.calls] == ["transient_failure"] * 3
+        assert len(latency.calls) == 3
+        warnings = [entry for entry in logs if entry["event"] == "composer_boot_probe_transient_failure"]
+        assert [warning["probed_surface"] for warning in warnings] == ["loop_tools", "planner_tools", "advisor"]
+        assert [warning["failure_class"] for warning in warnings] == ["TimeoutError"] * 3
+        for warning in warnings[:2]:
+            assert "structured_output_conformance_verified" not in warning
+            assert "tool schemas unverified at boot" in warning["action"]
+        assert warnings[2].get("structured_output_conformance_verified") is False
+        assert "structured-output conformance was not verified this boot" in warnings[2]["action"]
+
+    @pytest.mark.asyncio
+    async def test_lifespan_sends_nothing_once_the_shared_deadline_is_spent(self, monkeypatch, tmp_path) -> None:
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
+        counter = _RecordingCounter()
+        latency = _RecordingHistogram()
+        sent: list[str] = []
+
+        async def _probe(request: ComposerProbeRequest) -> bool:
+            sent.append(request.surface)
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_PROBE_DEADLINE_SECONDS", 0.0)
+
+        with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                pass
+
+        assert sent == []
+        assert [attributes["probe_status"] for _amount, attributes in counter.calls] == ["transient_failure"] * 3
+        assert len(latency.calls) == 3
+        warnings = [entry for entry in logs if entry["event"] == "composer_boot_probe_transient_failure"]
+        assert [warning["failure_class"] for warning in warnings] == ["SharedDeadlineExhausted"] * 3
+        assert [warning["probed_surface"] for warning in warnings] == ["loop_tools", "planner_tools", "advisor"]
+
+    @pytest.mark.asyncio
+    async def test_lifespan_logs_an_unproven_thinking_route_on_success(self, monkeypatch, tmp_path) -> None:
+        app = create_app(
+            _settings(
+                tmp_path,
+                composer_boot_probe_enabled=True,
+                composer_model="anthropic/claude-opus-4-6",
+                composer_discovery_reasoning_effort="low",
+            )
+        )
+
+        async def _probe(_request: ComposerProbeRequest) -> bool:
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                pass
+
+        unproven = [entry for entry in logs if entry["event"] == "composer_boot_probe_thinking_route_unproven"]
+        assert [entry["probed_surface"] for entry in unproven] == ["loop_tools"]
+        assert unproven[0]["max_tokens"] == 16
 
     @pytest.mark.asyncio
     async def test_lifespan_records_local_error_when_composer_probe_raises_programmer_error(self, monkeypatch, tmp_path) -> None:
@@ -2012,7 +2375,7 @@ class TestLifespanShutdown:
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
 
-        async def _buggy_probe(**_kwargs: object) -> bool:
+        async def _buggy_probe(_request: ComposerProbeRequest) -> bool:
             raise TypeError("signature drift")
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _buggy_probe)
@@ -2078,7 +2441,7 @@ class TestLifespanShutdown:
         assert fake_operator_telemetry.shutdown_calls == 1
 
     @pytest.mark.asyncio
-    async def test_fatal_periodic_cleanup_failure_stops_lifespan_and_preserves_shutdown(
+    async def test_fatal_periodic_cleanup_requests_recovery_and_preserves_shutdown(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path,
@@ -2099,23 +2462,17 @@ class TestLifespanShutdown:
 
         monkeypatch.setattr(app_module, "_periodic_orphan_cleanup", fatal_cleanup)
         monkeypatch.setattr("elspeth.web.async_workers.shutdown_async_workers", shutdown_workers)
-
-        async def serve_until_stopped() -> None:
+        recovery_requested = asyncio.Event()
+        monkeypatch.setattr("elspeth.web.process_recovery.os.kill", lambda _pid, _signal: recovery_requested.set())
+        with (
+            patch("elspeth.web.app.ExecutionServiceImpl", return_value=fake_execution_service),
+            pytest.raises(OSError, match="orphan cleanup storage unavailable"),
+        ):
             async with lifespan(app):
-                await asyncio.Event().wait()
-
-        with patch("elspeth.web.app.ExecutionServiceImpl", return_value=fake_execution_service):
-            lifespan_task = asyncio.create_task(serve_until_stopped())
-            await asyncio.wait_for(cleanup_failed.wait(), timeout=5.0)
-            done, _pending = await asyncio.wait({lifespan_task}, timeout=0.2)
-            if lifespan_task not in done:
-                lifespan_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, OSError):
-                    await lifespan_task
-
-        assert lifespan_task in done, "fatal orphan cleanup left the service lifespan running"
-        with pytest.raises(OSError, match="orphan cleanup storage unavailable"):
-            await lifespan_task
+                await asyncio.wait_for(cleanup_failed.wait(), timeout=5.0)
+                await asyncio.wait_for(recovery_requested.wait(), timeout=5.0)
+                assert app.state.instance_draining.is_set()
+                assert fake_execution_service.shutdown_calls == 0
         assert fake_execution_service.shutdown_calls == 1
         assert fake_operator_telemetry.shutdown_calls == 1
 
@@ -2163,21 +2520,18 @@ class TestLifespanShutdown:
         periodic_calls: list[bool] = []
         periodic_started = asyncio.Event()
 
-        def finalize(
-            _url: str,
-            _runs: list[RunRecord],
-            *,
-            create_tables: bool,
-        ) -> tuple[frozenset[object], frozenset[object]]:
+        coordinator_type = app_module.RunRecoveryCoordinator
+
+        def coordinator(*args, create_tables: bool, **kwargs):
             one_shot_calls.append(create_tables)
-            return frozenset(), frozenset()
+            return coordinator_type(*args, create_tables=create_tables, **kwargs)
 
         async def periodic(*_args: object, create_tables: bool, **_kwargs: object) -> None:
             periodic_calls.append(create_tables)
             periodic_started.set()
             await asyncio.Event().wait()
 
-        monkeypatch.setattr(app_module, "_finalize_orphaned_landscape_runs", finalize)
+        monkeypatch.setattr(app_module, "RunRecoveryCoordinator", coordinator)
         monkeypatch.setattr(app_module, "_periodic_orphan_cleanup", periodic)
 
         with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
@@ -2252,6 +2606,13 @@ class TestSettingsFromEnv:
         settings = settings_from_env()
         assert settings.port == 9090
         assert isinstance(settings.port, int)
+
+    @pytest.mark.parametrize(("raw", "expected"), [("false", False), ("true", True)])
+    def test_user_secrets_enabled_from_env(self, monkeypatch, raw: str, expected: bool) -> None:
+        """The operator's lockdown switch is ELSPETH_WEB__USER_SECRETS_ENABLED=false."""
+        monkeypatch.setenv("ELSPETH_WEB__USER_SECRETS_ENABLED", raw)
+
+        assert settings_from_env().user_secrets_enabled is expected
 
     def test_server_secret_allowlist_from_json(self, monkeypatch) -> None:
         monkeypatch.setenv("ELSPETH_WEB__SERVER_SECRET_ALLOWLIST", '["MY_KEY"]')
@@ -3019,6 +3380,8 @@ class TestValidationErrorRedaction:
         from elspeth.web.auth.models import UserIdentity
 
         app = create_app(_settings(tmp_path))
+        with app.state.session_engine.begin() as conn:
+            _ensure_test_user(conn, identity_id="test-user")
 
         identity = UserIdentity(user_id="test-user", username="test-user")
 
@@ -3057,6 +3420,51 @@ class TestValidationErrorRedaction:
         for error in body["detail"]:
             assert set(error.keys()) <= self._SAFE_KEYS
 
+    def test_unknown_credential_shaped_request_key_is_redacted_from_location(self, tmp_path) -> None:
+        from elspeth.web.auth.models import UserIdentity
+
+        client = self._authed_client(tmp_path)
+        candidate = "ghp_" + "a" * 36
+        identity = UserIdentity(user_id="test-user", username="test-user")
+
+        with (
+            patch("elspeth.web.auth.admin_routes.get_current_user", autospec=True, return_value=identity),
+            patch("elspeth.web.auth.admin_routes.can_manage_local_accounts", autospec=True, return_value=True),
+        ):
+            resp = client.request(
+                "DELETE",
+                "/api/auth/admin/users/another-user",
+                json={"reason": "ordinary", candidate: "ordinary"},
+            )
+
+        assert resp.status_code == 422
+        assert candidate not in resp.text
+        assert "<redacted-secret>" in resp.text
+
+    def test_malformed_url_in_request_is_a_fixed_value_free_refusal(self, tmp_path) -> None:
+        from elspeth.web.auth.models import UserIdentity
+
+        client = self._authed_client(tmp_path)
+        candidate = "http://["
+        identity = UserIdentity(user_id="test-user", username="test-user")
+
+        with (
+            patch("elspeth.web.auth.admin_routes.get_current_user", autospec=True, return_value=identity),
+            patch("elspeth.web.auth.admin_routes.can_manage_local_accounts", autospec=True, return_value=True),
+            capture_logs() as logs,
+        ):
+            resp = client.request(
+                "DELETE",
+                "/api/auth/admin/users/another-user",
+                headers={"X-Request-ID": "malformed-url-refusal"},
+                json={"reason": candidate},
+            )
+
+        assert resp.status_code == 422
+        assert candidate not in resp.text
+        assert candidate not in repr(logs)
+        assert "credential" in resp.text
+
     def test_validation_response_survives_a_warning_sink_failure(self, tmp_path: Path) -> None:
         """Operational correlation logging cannot replace the primary 422."""
         with patch("elspeth.web.app.structlog.get_logger") as get_logger:
@@ -3065,6 +3473,9 @@ class TestValidationErrorRedaction:
 
         from elspeth.web.auth.middleware import get_current_user
         from elspeth.web.auth.models import UserIdentity
+
+        with app.state.session_engine.begin() as conn:
+            _ensure_test_user(conn, identity_id="test-user")
 
         async def _mock_user() -> UserIdentity:
             return UserIdentity(user_id="test-user", username="test-user")
@@ -3147,10 +3558,13 @@ class TestValidationErrorRedaction:
     def test_sessions_message_route_redacts_input(self, tmp_path) -> None:
         """POST to a session message route with invalid body must not echo content."""
         client = self._authed_client(tmp_path)
+        created = client.post("/api/sessions", json={"title": "Validation redaction"})
+        assert created.status_code == 201
+        session_id = created.json()["id"]
         # Send a message with state_id as a non-UUID string — triggers 422
         resp = client.post(
-            "/api/sessions/00000000-0000-0000-0000-000000000000/messages",
-            json={"content": "leaked-password-value", "state_id": "not-a-uuid"},
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "leaked-password-value", "state_id": "not-a-uuid", "client_request_id": str(uuid4())},
         )
         assert resp.status_code == 422
         body_text = resp.text
@@ -3166,7 +3580,7 @@ class TestSecretsExceptionHandlers:
 
     * ``FingerprintKeyMissingError`` → 503 (deployment misconfigured)
     * ``SecretDecryptionError``     → 409 (re-save required)
-    * ``SQLAlchemyError``            → 503 (database unavailable)
+    * ``OperationalError``           → 503 (database unavailable)
     * ``OSError``                    → 503 (SQLite / filesystem level)
 
     Redaction invariants (from the canonical SQLAlchemy-redaction pattern):
@@ -3181,6 +3595,8 @@ class TestSecretsExceptionHandlers:
         from elspeth.web.auth.models import UserIdentity
 
         app = create_app(_settings(tmp_path))
+        with app.state.session_engine.begin() as conn:
+            _ensure_test_user(conn, identity_id="test-user")
         identity = UserIdentity(user_id="test-user", username="test-user")
 
         async def _mock_user() -> UserIdentity:
@@ -3272,7 +3688,7 @@ class TestSecretsExceptionHandlers:
         assert "re-save" in body["detail"].lower()
         assert body["request_id"]
 
-    # -- SQLAlchemyError → 503 ------------------------------------------------
+    # -- OperationalError → 503 -----------------------------------------------
 
     def test_sqlalchemy_error_on_list_returns_503(self, tmp_path, monkeypatch) -> None:
         """Underlying ``OperationalError`` on list must surface as 503 with a redacted body.
@@ -3321,6 +3737,71 @@ class TestSecretsExceptionHandlers:
         resp = client.get("/api/secrets")
         assert resp.status_code == 500
         assert "database_unavailable" not in resp.text
+
+    @pytest.mark.parametrize("sqlstate", ["53300", "40P01", "08006", "SECRET_SQLSTATE", "40p01", 53300, None])
+    def test_database_failure_logs_only_safe_driver_and_pool_diagnostics(self, tmp_path, monkeypatch, sqlstate) -> None:
+        from sqlalchemy.pool import QueuePool
+
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "fp-k")
+        client = self._authed_client(tmp_path)
+
+        class DriverFailure(Exception):
+            def __init__(self, code: object) -> None:
+                super().__init__("SECRET_DRIVER_MESSAGE")
+                self.sqlstate = code
+
+        failure = DriverFailure(sqlstate)
+
+        def fail(*args, **kwargs):
+            raise OperationalError("SECRET_SQL", {"value": "SECRET_PARAM"}, failure, connection_invalidated=True)
+
+        monkeypatch.setattr(client.app.state.secret_service, "list_refs", fail)
+        pool = client.app.state.session_engine.pool
+        assert isinstance(pool, QueuePool)
+        with client.app.state.session_engine.connect(), capture_logs() as logs:
+            expected_checked_out = pool.checkedout()
+            response = client.get("/api/secrets")
+        assert response.status_code == 503
+        event = next(item for item in logs if item["event"] == "http_database_unavailable")
+        assert event["db_sqlstate"] == (sqlstate if sqlstate in ("53300", "40P01", "08006") else None)
+        assert event["db_driver_error_class"] == "DriverFailure"
+        assert event["db_connection_invalidated"] is True
+        assert event["session_pool_size"] == pool.size()
+        assert event["session_pool_checked_out"] == expected_checked_out
+        assert event["session_pool_overflow"] == pool.overflow()
+        assert "SECRET_" not in str(event)
+        assert "SECRET_" not in response.text
+
+    def test_database_diagnostics_reject_driver_class_text_and_support_nonqueue_pool(self, tmp_path, monkeypatch) -> None:
+        from sqlalchemy.pool import NullPool
+
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "fp-k")
+        client = self._authed_client(tmp_path)
+
+        class DriverFailure(Exception):
+            pgcode = "53300"
+
+        DriverFailure.__name__ = "SECRET_CLASS\nforged event"
+
+        def fail(*args, **kwargs):
+            monkeypatch.setattr(client.app.state.session_engine, "pool", NullPool(unexpected_checkout))
+            raise OperationalError("SECRET_SQL", {}, DriverFailure("SECRET_MESSAGE"))
+
+        def unexpected_checkout():
+            pytest.fail("diagnostics must never open a database connection")
+
+        monkeypatch.setattr(client.app.state.secret_service, "list_refs", fail)
+        with capture_logs() as logs:
+            response = client.get("/api/secrets")
+        assert response.status_code == 503
+        event = next(item for item in logs if item["event"] == "http_database_unavailable")
+        assert event["db_sqlstate"] == "53300"
+        assert event["db_driver_error_class"] is None
+        assert event["db_connection_invalidated"] is False
+        assert event["session_pool_size"] is None
+        assert event["session_pool_checked_out"] is None
+        assert event["session_pool_overflow"] is None
+        assert "SECRET_" not in str(event)
 
     # -- OSError → 503 --------------------------------------------------------
 
@@ -3398,9 +3879,7 @@ class TestSecretsExceptionHandlers:
         @given(name=name_strategy, value=value_strategy)
         def _prop(name: str, value: str) -> None:
             create = client.post("/api/secrets", json={"name": name, "value": value})
-            if create.status_code != 201:
-                # Schema validators may reject some generated names; skip.
-                return
+            assert create.status_code == 201, create.text
             assert "available" not in create.json()
             validate = client.post(f"/api/secrets/{name}/validate")
             assert validate.status_code == 200
@@ -3735,6 +4214,14 @@ class TestDeploymentStateModeStartup:
         monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
         app = create_app(settings)
 
+        # The audit engine now starts before services. Model the externally
+        # provisioned Landscape alongside the provisioned Sessions stand-in;
+        # the recorder still validates it with create_tables=False.
+        audit_url = f"sqlite:///{tmp_path / 'external-audit.db'}"
+        with LandscapeDB.from_url(audit_url):
+            pass
+        monkeypatch.setattr(app.state.auth_audit_recorder, "landscape_url", audit_url)
+
         with (
             patch("elspeth.web.app.ExecutionServiceImpl", return_value=_RecordingExecutionService()),
             patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
@@ -4024,13 +4511,16 @@ class TestAwsEcsValidateOnlyStartup:
             )
         ]
         assert app.state.session_engine is engine
-        assert len(finalizers) == 2
+        assert len(finalizers) == 3
         assert finalizers[0][0] is app
         assert finalizers[0][1] is app_module._dispose_session_engine
         assert finalizers[0][2] == (engine,)
         assert finalizers[1][0] is app
-        assert finalizers[1][1] is app_module._close_readiness_runner
-        assert finalizers[1][2] == (app.state.readiness_probe_runner,)
+        assert finalizers[1][1] == app.state.auth_audit_recorder.close
+        assert finalizers[1][2] == ()
+        assert finalizers[2][0] is app
+        assert finalizers[2][1] is app_module._close_readiness_runner
+        assert finalizers[2][2] == (app.state.readiness_probe_runner,)
         assert settings.data_dir not in mkdir_calls
         assert settings.data_dir / "runs" not in mkdir_calls
         engine.dispose()
@@ -4181,6 +4671,42 @@ class TestBootPrimeOpenRouterCatalogGate:
         assert prime_calls == 1
         failed = self._event(logs, "openrouter_catalog_boot_prime_failed")
         assert failed["log_level"] == "warning"
+
+    def test_slow_drip_prime_is_bounded_by_a_total_deadline(self, tmp_path, monkeypatch) -> None:
+        """A response that never stalls long enough for httpx's per-read timeout still ends at the deadline.
+
+        httpx's read timeout bounds each wait for a chunk, not the whole
+        response, so a trickling body is bounded only by the prime's own
+        total deadline. The fake prime keeps making progress for 2 s; the
+        deadline is shrunk to 0.1 s.
+        """
+        settings = _settings(
+            tmp_path,
+            llm_profiles={"tutorial": dict(self._OPENROUTER_PROFILE)},
+            default_llm_profile="tutorial",
+        )
+        finished: list[bool] = []
+
+        async def _dripping_prime(*, http_get: object) -> bool:
+            for _ in range(40):
+                await asyncio.sleep(0.05)
+            finished.append(True)
+            return True
+
+        monkeypatch.setattr(app_module, "prime_openrouter_catalog_from_live", _dripping_prime)
+        monkeypatch.setattr(app_module, "_OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS", 0.1)
+        started = time.monotonic()
+        with capture_logs() as logs:
+            asyncio.run(app_module._boot_prime_openrouter_catalog(settings))
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0
+        assert finished == []
+        failed = self._event(logs, "openrouter_catalog_boot_prime_failed")
+        assert failed["log_level"] == "warning"
+        assert failed["failure_class"] == "PrimeDeadlineExceeded"
+        assert failed["deadline_seconds"] == 0.1
+        assert not any(entry["event"] == "openrouter_catalog_boot_prime_complete" for entry in logs)
 
 
 class TestWebInstanceMembershipWiring:

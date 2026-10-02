@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from elspeth.contracts import Checkpoint, NodeType
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.core.canonical import compute_full_topology_hash
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 from elspeth.core.dag import ExecutionGraph
@@ -39,16 +40,17 @@ def _checkpoint_for_graph(graph: ExecutionGraph) -> Checkpoint:
 
 
 @pytest.mark.parametrize(
-    ("format_version", "reason_fragment"),
+    ("format_version", "reason_fragment", "cause"),
     [
-        (None, "missing format_version"),
-        (Checkpoint.CURRENT_FORMAT_VERSION - 1, "incompatible format version"),
-        (Checkpoint.CURRENT_FORMAT_VERSION + 1, "incompatible format version"),
+        (None, "missing format_version", ResumeRefusalCause.CHECKPOINT_FORMAT_MISSING),
+        (Checkpoint.CURRENT_FORMAT_VERSION - 1, "incompatible format version", ResumeRefusalCause.CHECKPOINT_FORMAT_INCOMPATIBLE),
+        (Checkpoint.CURRENT_FORMAT_VERSION + 1, "incompatible format version", ResumeRefusalCause.CHECKPOINT_FORMAT_INCOMPATIBLE),
     ],
 )
 def test_validate_rejects_incompatible_format_versions_before_topology(
     format_version: int | None,
     reason_fragment: str,
+    cause: ResumeRefusalCause,
 ) -> None:
     graph = _graph(checkpoint_config={"version": 1})
     checkpoint = Checkpoint(
@@ -65,6 +67,7 @@ def test_validate_rejects_incompatible_format_versions_before_topology(
     assert result.can_resume is False
     assert result.reason is not None
     assert reason_fragment in result.reason
+    assert result.cause is cause
 
 
 def test_validate_rejects_node_removal_via_topology_hash() -> None:
@@ -120,6 +123,7 @@ def test_validate_rejects_topology_hash_mismatch() -> None:
     assert result.reason is not None
     assert "Pipeline configuration changed since checkpoint was created." in result.reason
     assert "Expected topology hash" in result.reason
+    assert result.cause is ResumeRefusalCause.CHECKPOINT_TOPOLOGY_CHANGED
 
 
 def test_checkpoint_exposes_full_topology_hash_accessor() -> None:

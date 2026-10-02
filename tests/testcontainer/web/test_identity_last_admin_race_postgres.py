@@ -32,6 +32,7 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import Barrier, Event
 from typing import Any
 
@@ -39,16 +40,24 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Engine, make_url
 
+from elspeth.web.auth.local import LocalAuthProvider, LocalUserDeletion
 from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.auth.session_token import LOCAL_AUDIENCE, SessionTokenIssuer
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
+    AdminBootstrapMode,
     IdentityActivated,
     IdentityAdminActor,
+    IdentityDirectoryQuery,
     IdentityDisabled,
+    IdentityRetired,
     LastActiveAdminProtected,
     RepositoryIdentityAuthority,
+    local_identity_retirer,
 )
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
 from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
@@ -119,10 +128,10 @@ def _lock_waiters_on_the_admin_population(observer: Engine) -> int:
         )
 
 
-def _rendezvous(observer: Engine, arrived: tuple[Event, Event], index: int) -> Callable[[IdentityDisabled], None]:
+def _rendezvous(observer: Engine, arrived: tuple[Event, Event], index: int) -> Callable[[IdentityDisabled | IdentityRetired], None]:
     mine, other = arrived[index], arrived[1 - index]
 
-    def record(_outcome: IdentityDisabled) -> None:
+    def record(_outcome: IdentityDisabled | IdentityRetired) -> None:
         mine.set()
         deadline = time.monotonic() + _RENDEZVOUS_DEADLINE_SECONDS
         while not other.is_set():
@@ -150,8 +159,8 @@ def test_two_replicas_disabling_the_last_two_admins_leave_exactly_one(external_d
     observer = create_session_engine(race_url)
     try:
         initialize_session_schema(first_engine)
-        first = RepositoryIdentityAuthority(first_engine)
-        second = RepositoryIdentityAuthority(second_engine)
+        first = RepositoryIdentityAuthority(first_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+        second = RepositoryIdentityAuthority(second_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
         root = first.bootstrap_admin(
             claims=_claims("root"),
@@ -185,7 +194,7 @@ def test_two_replicas_disabling_the_last_two_admins_leave_exactly_one(external_d
             barrier.wait(timeout=10)
             try:
                 authority.disable_identity(
-                    actor=_actor(actor_id),
+                    actor=IdentityAdminActor(identity_id=actor_id, on_behalf_of="ops@example.com", console_request_id="req-race"),
                     identity_id=target_id,
                     reason="race",
                     record=_rendezvous(observer, arrived, index),
@@ -218,6 +227,381 @@ def test_two_replicas_disabling_the_last_two_admins_leave_exactly_one(external_d
         control.dispose()
 
 
+def test_a_disable_racing_an_account_deletion_leaves_exactly_one_admin(external_deployment_postgres_url: str) -> None:
+    """R5 across the TWO paths that lower its count.
+
+    Deleting a local account retires its identity without passing through
+    ``disable_identity``, so before ``retire_identity`` took the admin row
+    set lock the two could each read a count of 2 and both commit.  One
+    replica disables an administrator while the other deletes the last other
+    administrator's account: exactly one may proceed, and the refused
+    deletion must not have removed its credential.
+    """
+    admin_url = make_url(external_deployment_postgres_url)
+    database = f"last_admin_retire_race_{uuid.uuid4().hex}"
+    control = create_session_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    with control.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{database}"')
+    race_url = admin_url.set(database=database).render_as_string(hide_password=False)
+
+    first_engine = create_session_engine(race_url)
+    second_engine = create_session_engine(race_url)
+    observer = create_session_engine(race_url)
+    try:
+        initialize_session_schema(first_engine)
+        first = RepositoryIdentityAuthority(first_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+        second = RepositoryIdentityAuthority(second_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+
+        root = first.bootstrap_admin(
+            claims=_claims("root"), note="first admin", quota_tokens_per_day=None, quota_storage_bytes=None, record=_noop
+        )
+        root_id = root.record.identity_id
+        other = first.pre_provision_identity(
+            actor=_actor(root_id),
+            provider="local",
+            subject="second",
+            username=None,
+            organisation_id=None,
+            role="none",
+            note="second admin",
+            quota_tokens_per_day=None,
+            quota_storage_bytes=None,
+            record=_noop,
+        )
+        other_id = other.record.identity_id
+        first.grant_role(actor=_actor(root_id), identity_id=other_id, role="admin", scope=None, expires_at=None, note=None, record=_noop)
+        service = _seed_service_admin(first_engine, root_id, first)
+        assert first.count_active_human_admins() == 2
+
+        arrived = (Event(), Event())
+        barrier = Barrier(2)
+        credential_deletions: list[str] = []
+
+        def disable() -> str:
+            barrier.wait(timeout=10)
+            try:
+                first.disable_identity(
+                    actor=IdentityAdminActor(identity_id=service, on_behalf_of="ops@example.com", console_request_id="req-race"),
+                    identity_id=other_id,
+                    reason="race",
+                    record=_rendezvous(observer, arrived, 0),
+                )
+            except LastActiveAdminProtected:
+                return "refused"
+            return "proceeded"
+
+        def delete_account() -> str:
+            barrier.wait(timeout=10)
+            try:
+                second.retire_identity(
+                    provider="local",
+                    subject="root",
+                    reason="local credential deleted",
+                    record=_rendezvous(observer, arrived, 1),
+                    credential_exists=lambda: True,
+                    delete_credential=lambda: credential_deletions.append("root"),
+                )
+            except LastActiveAdminProtected:
+                return "refused"
+            return "proceeded"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = (pool.submit(disable), pool.submit(delete_account))
+            disabled, deleted = (future.result(timeout=60) for future in futures)
+
+        assert sorted((disabled, deleted)) == ["proceeded", "refused"]
+        assert first.count_active_human_admins() == 1
+        # The credential goes exactly when the retirement does: a refused
+        # deletion that had already removed the password is the defect.
+        assert credential_deletions == (["root"] if deleted == "proceeded" else [])
+    finally:
+        first_engine.dispose()
+        second_engine.dispose()
+        observer.dispose()
+        with control.connect() as conn:
+            conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+        control.dispose()
+
+
+def test_a_last_admin_whose_credential_is_already_gone_is_retired_on_postgres(external_deployment_postgres_url: str) -> None:
+    """The failed-retirement recovery, under PostgreSQL's row locks rather than SQLite's one writer.
+
+    The probe runs while R5's population is locked FOR UPDATE, so it must not
+    need that lock itself, and the retirement it permits must leave the zero
+    administrators that operator recovery can then repair.
+    """
+    admin_url = make_url(external_deployment_postgres_url)
+    database = f"last_admin_recovery_{uuid.uuid4().hex}"
+    control = create_session_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    with control.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{database}"')
+    engine = create_session_engine(admin_url.set(database=database).render_as_string(hide_password=False))
+    try:
+        initialize_session_schema(engine)
+        authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+        root_id = authority.bootstrap_admin(
+            claims=_claims("root"), note="first admin", quota_tokens_per_day=None, quota_storage_bytes=None, record=_noop
+        ).record.identity_id
+        deletions: list[str] = []
+
+        with pytest.raises(LastActiveAdminProtected):
+            authority.retire_identity(
+                provider="local",
+                subject="root",
+                reason="local credential deleted",
+                record=_noop,
+                credential_exists=lambda: True,
+                delete_credential=lambda: deletions.append("refused"),
+            )
+        assert deletions == []
+        assert authority.count_active_human_admins() == 1
+
+        retired = authority.retire_identity(
+            provider="local",
+            subject="root",
+            reason="local credential deleted",
+            record=_noop,
+            credential_exists=lambda: False,
+            delete_credential=lambda: deletions.append("recovered"),
+        )
+        assert retired is not None and retired.identity_id == root_id
+        assert deletions == ["recovered"]
+        assert authority.count_active_human_admins() == 0
+        authority.bootstrap_admin(
+            claims=_claims("recovery"), note="recovery", quota_tokens_per_day=None, quota_storage_bytes=None, record=_noop
+        )
+        assert authority.count_active_human_admins() == 1
+    finally:
+        engine.dispose()
+        with control.connect() as conn:
+            conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+        control.dispose()
+
+
+def test_retirement_retry_preserves_a_replacement_registration_on_postgres(external_deployment_postgres_url: str, tmp_path: Path) -> None:
+    """A missing-credential retry must not delete a registration waiting on its identity lock."""
+    admin_url = make_url(external_deployment_postgres_url)
+    database = f"retirement_registration_{uuid.uuid4().hex}"
+    control = create_session_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    with control.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{database}"')
+    url = admin_url.set(database=database).render_as_string(hide_password=False)
+    engine = create_session_engine(url)
+    registration_engine = create_session_engine(url)
+    observer = create_session_engine(url)
+    observed_absent = Event()
+    replacement_committed = Event()
+    try:
+        initialize_session_schema(engine)
+        authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+        registration_authority = RepositoryIdentityAuthority(
+            registration_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply
+        )
+        original = authority.bootstrap_admin(
+            claims=_claims("root"), note="original admin", quota_tokens_per_day=None, quota_storage_bytes=None, record=_noop
+        ).record
+        # No credential is seeded: this is the documented recovery state after
+        # credential deletion committed but identity retirement rolled back.
+        retire = local_identity_retirer(authority, _noop)
+
+        def retire_after_replacement_commits(
+            username: str,
+            reason: str,
+            credential_exists: Callable[[], bool],
+            delete_credential: Callable[[], None],
+        ) -> bool:
+            def probe_then_wait() -> bool:
+                exists = credential_exists()
+                assert exists is False
+                observed_absent.set()
+                assert replacement_committed.wait(_RENDEZVOUS_DEADLINE_SECONDS), "replacement credential never committed"
+                deadline = time.monotonic() + _RENDEZVOUS_DEADLINE_SECONDS
+                while time.monotonic() < deadline:
+                    with observer.connect() as conn:
+                        blocked = conn.execute(
+                            text(
+                                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                                "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                                "AND query ILIKE '%identities%' AND pid <> pg_backend_pid())"
+                            )
+                        ).scalar_one()
+                    if blocked:
+                        return exists
+                    time.sleep(_POLL_SECONDS)
+                pytest.fail("replacement admission never blocked on retirement's identity lock")
+
+            def delete_and_check_replacement() -> None:
+                delete_credential()
+                with provider._connect() as conn:
+                    assert conn.execute("SELECT display_name FROM users WHERE user_id = 'root'").fetchone() == ("Replacement",), (
+                        "retirement retry deleted the replacement credential"
+                    )
+                    assert conn.execute("SELECT issuance_path FROM token_audit_intents WHERE user_id = 'root'").fetchall() == [
+                        ("register",)
+                    ], "retirement retry deleted the replacement's audit intent"
+
+            return retire(username, reason, probe_then_wait, delete_and_check_replacement)
+
+        def admit_replacement(claims: IdentityClaims) -> EnsureIdentityOutcome:
+            # Production invokes admission only after committing the SQLite
+            # credential and audit intent. The PostgreSQL read then waits on
+            # retirement's lock, which the probe observes before it continues.
+            replacement_committed.set()
+            return registration_authority.ensure_identity(
+                claims=claims,
+                activate=True,
+                quota_tokens_per_day=None,
+                quota_storage_bytes=None,
+                identity_dormancy_days=90,
+                record_admission=_noop,
+                record_rebound=_noop,
+                record_dormant=_noop,
+            )
+
+        def principal_is_active(identity_id: str) -> bool:
+            identity = registration_authority.read_identity(identity_id=identity_id)
+            return identity is not None and identity.is_active
+
+        issuer = SessionTokenIssuer(
+            signing_key=b"registration-retirement-test-key-32",
+            provider="local",
+            audience=LOCAL_AUDIENCE,
+            token_expiry_hours=24,
+            max_refresh_chain_hours=168,
+            principal_is_active=principal_is_active,
+        )
+        provider = LocalAuthProvider(
+            tmp_path / "auth.db",
+            token_issuer=issuer,
+            admit_identity=admit_replacement,
+            retire_identity=retire_after_replacement_commits,
+        )
+        audited_tokens: list[str] = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            removal = pool.submit(provider.delete_user, "root", reason="finish failed retirement")
+            assert observed_absent.wait(_RENDEZVOUS_DEADLINE_SECONDS), "retry never observed the absent credential"
+            registration = pool.submit(
+                provider.register_open_user_with_audit,
+                "root",
+                "replacement-password",
+                "Replacement",
+                None,
+                record_token_issued=audited_tokens.append,
+            )
+            assert removal.result(timeout=60) == LocalUserDeletion(credential_deleted=False, identity_retired=True)
+            token = registration.result(timeout=60)
+
+        claims = issuer.authenticate(token)
+        assert claims.identity_id != original.identity_id
+        assert claims.username == "root"
+        assert provider._authenticate_sync(token).user_id == claims.identity_id
+        assert audited_tokens == [token]
+        retired = authority.read_identity(identity_id=original.identity_id)
+        assert retired is not None and retired.access_state == "disabled"
+        assert retired.subject == f"root#retired-{original.identity_id}"
+        assert authority.count_active_human_admins() == 0
+        assert [account.display_name for account in provider.list_users()] == ["Replacement"]
+        with provider._connect() as conn:
+            assert conn.execute("SELECT intent_id FROM token_audit_intents").fetchall() == []
+    finally:
+        engine.dispose()
+        registration_engine.dispose()
+        observer.dispose()
+        with control.connect() as conn:
+            conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+        control.dispose()
+
+
+def test_directory_search_is_literal_and_redaction_safe_on_postgres(external_deployment_postgres_url: str) -> None:
+    """``LIKE ... ESCAPE`` and the never-admitted predicate, on the dialect production runs.
+
+    SQLite and PostgreSQL disagree about ``LIKE`` case-folding and escape
+    handling, so the unit suite's green says nothing about either here.
+    """
+    admin_url = make_url(external_deployment_postgres_url)
+    database = f"people_directory_{uuid.uuid4().hex}"
+    control = create_session_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    with control.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{database}"')
+    engine = create_session_engine(admin_url.set(database=database).render_as_string(hide_password=False))
+    try:
+        initialize_session_schema(engine)
+        authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+
+        def login(subject: str, display_name: str, *, activate: bool) -> None:
+            authority.ensure_identity(
+                claims=IdentityClaims(
+                    provider="oidc",
+                    subject=subject,
+                    username=subject,
+                    display_name=display_name,
+                    email=f"{subject}@corp.example",
+                    organisation_id=None,
+                ),
+                activate=activate,
+                quota_tokens_per_day=None,
+                quota_storage_bytes=None,
+                identity_dormancy_days=90,
+                record_admission=_noop,
+                record_rebound=_noop,
+                record_dormant=_noop,
+            )
+
+        login("a_b", "Percent %100", activate=True)
+        login("axb", "Plain Person", activate=True)
+        login("sub-771", "Sam Secret", activate=False)
+
+        def subjects(text_value: str) -> list[str]:
+            query = IdentityDirectoryQuery(text=text_value, access_state=None, provider=None, kind=None)
+            return [row.subject for row in authority.search_identities(query=query, limit=50, offset=0)]
+
+        assert subjects("a_b") == ["a_b"]
+        assert subjects("%") == ["a_b"]
+        assert subjects("\\") == []
+        assert subjects("PLAIN per") == ["axb"]
+        # Never admitted: found by what the queue shows, never by what it withholds.
+        assert subjects("Sam Secret") == []
+        assert subjects("sub-77") == ["sub-771"]
+        everyone = [
+            row.subject
+            for row in authority.search_identities(
+                query=IdentityDirectoryQuery(text=None, access_state=None, provider=None, kind=None), limit=50, offset=0
+            )
+        ]
+        assert everyone == ["a_b", "axb", "sub-771"]
+
+        # The fold beyond ASCII. SQLite needed its own function for this; here
+        # it is the server's ``lower``, which must agree with it.
+        login("elodie", "Élodie Martin", activate=True)
+        assert subjects("Élodie Martin") == ["elodie"]
+        assert subjects("élodie") == ["elodie"]
+        assert subjects("ÉLODIE") == ["elodie"]
+
+        # Linked local accounts named by the caller: exact provider, never a
+        # never-admitted row, and an empty tuple adds no predicate at all.
+        for local_subject, activate in (("jane", True), ("pat", False)):
+            authority.ensure_identity(
+                claims=IdentityClaims(provider="local", subject=local_subject, username=local_subject),
+                activate=activate,
+                quota_tokens_per_day=None,
+                quota_storage_bytes=None,
+                identity_dormancy_days=90,
+                record_admission=_noop,
+                record_rebound=_noop,
+                record_dormant=_noop,
+            )
+        linked = IdentityDirectoryQuery(
+            text="Doe", access_state=None, provider=None, kind=None, linked_local_subjects=("jane", "pat", "elodie")
+        )
+        assert [row.subject for row in authority.search_identities(query=linked, limit=50, offset=0)] == ["jane"]
+        assert subjects("Doe") == []
+    finally:
+        engine.dispose()
+        with control.connect() as conn:
+            conn.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+        control.dispose()
+
+
 def _bootstrap_rendezvous(observer: Engine, arrived: tuple[Event, Event], index: int) -> Callable[[IdentityActivated], None]:
     mine, other = arrived[index], arrived[1 - index]
 
@@ -234,7 +618,15 @@ def _bootstrap_rendezvous(observer: Engine, arrived: tuple[Event, Event], index:
     return record
 
 
-def test_two_replicas_bootstrapping_at_once_mint_exactly_one_admin(external_deployment_postgres_url: str) -> None:
+class _SeedAuditFailed(Exception):
+    pass
+
+
+@pytest.mark.parametrize("mode", list(AdminBootstrapMode))
+@pytest.mark.parametrize("rollback_first", [False, True])
+def test_two_replicas_bootstrapping_at_once_mint_exactly_one_admin(
+    external_deployment_postgres_url: str, mode: AdminBootstrapMode, rollback_first: bool
+) -> None:
     """D20 across replicas: the population the inert check counts is EMPTY, so no row lock can serialise it.
 
     Two replicas bootstrap different subjects at the same moment.  With only
@@ -258,8 +650,8 @@ def test_two_replicas_bootstrapping_at_once_mint_exactly_one_admin(external_depl
     observer = create_session_engine(race_url)
     try:
         initialize_session_schema(first_engine)
-        first = RepositoryIdentityAuthority(first_engine)
-        second = RepositoryIdentityAuthority(second_engine)
+        first = RepositoryIdentityAuthority(first_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+        second = RepositoryIdentityAuthority(second_engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
         assert first.count_active_human_admins() == 0
 
         arrived = (Event(), Event())
@@ -267,16 +659,25 @@ def test_two_replicas_bootstrapping_at_once_mint_exactly_one_admin(external_depl
 
         def bootstrap(authority: RepositoryIdentityAuthority, subject: str, index: int) -> str:
             barrier.wait(timeout=10)
+
+            def record(outcome: IdentityActivated) -> None:
+                _bootstrap_rendezvous(observer, arrived, index)(outcome)
+                if rollback_first and not arrived[1 - index].is_set():
+                    raise _SeedAuditFailed()
+
             try:
                 authority.bootstrap_admin(
                     claims=_claims(subject),
                     note="first admin",
                     quota_tokens_per_day=None,
                     quota_storage_bytes=None,
-                    record=_bootstrap_rendezvous(observer, arrived, index),
+                    record=record,
+                    mode=mode,
                 )
             except AdminAlreadyBootstrapped:
                 return "refused"
+            except _SeedAuditFailed:
+                return "audit_failed"
             return "bootstrapped"
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -286,7 +687,7 @@ def test_two_replicas_bootstrapping_at_once_mint_exactly_one_admin(external_depl
             )
             outcomes = sorted(future.result(timeout=60) for future in futures)
 
-        assert outcomes == ["bootstrapped", "refused"]
+        assert outcomes == (["audit_failed", "bootstrapped"] if rollback_first else ["bootstrapped", "refused"])
         assert first.count_active_human_admins() == 1
         # The loser wrote nothing: its subject never became an identity.
         minted = [

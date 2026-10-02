@@ -28,11 +28,12 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Final, NotRequired, TypedDict, cast
 
-from pydantic import BaseModel, JsonValue
+from pydantic import BaseModel, ConfigDict, JsonValue
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -40,6 +41,7 @@ from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_protocols import PluginConfigProtocol
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.sink import FILE_SINK_PLUGINS, FILE_SINK_REPAIR_EXTENSIONS
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.config import TriggerConfig
@@ -94,6 +96,7 @@ from elspeth.web.interpretation_state import (
     composer_pipeline_decision_user_term_error,
     parse_interpretation_requirements,
     project_planner_context_interpretation_requirement,
+    prompt_review_draft_from_options,
     resolved_review_evidence_is_coherent,
     serialize_authoring_review_options,
     source_name_from_component_id,
@@ -110,20 +113,27 @@ from elspeth.web.paths import (
 )
 from elspeth.web.plugin_policy.coverage import transform_plugin_has_capability
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
-from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error, web_rag_provider_config_policy_error
+from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error
 from elspeth.web.secrets.ref_policy import (
     allowed_secret_ref_fields,
     allowed_secret_ref_fields_text,
 )
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
+from elspeth.web.sessions.protocol import SessionOperationAuthority
 from elspeth.web.validation import (
     INTERPRETATION_PLACEHOLDER_RE,
 )
 
+
+class EmptyToolArgumentsModel(BaseModel):
+    """Complete public admission for tools with no advertised arguments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 _FULL_STATE_COMPONENT_ALIASES: Final[tuple[str, ...]] = ("", "full", "all", "pipeline")
 _FULL_STATE_COMPONENT_ALIAS_SET: Final[frozenset[str]] = frozenset(_FULL_STATE_COMPONENT_ALIASES)
-_DATA_ERROR_KEY: Final[str] = "error"
-_RUNTIME_OWNED_LLM_OPTION_KEYS: Final[frozenset[str]] = frozenset({"resolved_prompt_template_hash"})
+_RUNTIME_OWNED_LLM_OPTION_KEYS: Final[frozenset[str]] = frozenset({"approved_prompt_artifact_hash"})
 _SOURCE_BLOB_REF_OPTION_KEY: Final[str] = "blob_ref"
 _SOURCE_BLOBS_OPTION_KEY: Final[str] = "blobs"
 _SERVER_OWNED_SOURCE_OPTION_KEYS: Final[frozenset[str]] = frozenset(
@@ -149,11 +159,14 @@ _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER: Final[tuple[str, ...]] = (
     "draft",
 )
 _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS: Final[frozenset[str]] = frozenset(_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER)
-_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT: Final[str] = ", ".join(
-    (
-        *_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[:-1],
-        f"and {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[-1]}",
+_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT: Final[str] = (
+    ", ".join(
+        (
+            *_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[:-1],
+            f"and {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELD_ORDER[-1]}",
+        )
     )
+    + ", with optional display_title (a non-empty string of at most 200 characters)"
 )
 _INTERPRETATION_REVIEW_FOLLOWUP: Final[str] = (
     "Then call request_interpretation_review for an authorable staged site; "
@@ -161,7 +174,9 @@ _INTERPRETATION_REVIEW_FOLLOWUP: Final[str] = (
     "the card and ELSPETH writes resolved review metadata."
 )
 _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
-    " Inside interpretation_requirements, only " + _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT + " are authorable. "
+    " Inside interpretation_requirements, only "
+    + _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT
+    + " are authorable. display_title is a concise human-readable approval name. "
     "Resolver-owned fields are not settable: "
     + ", ".join(sorted(_RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS))
     + ". Omit those fields. Persist an authorable pending review with the current mutation tool, then call "
@@ -239,6 +254,7 @@ def _pending_interpretation_requirement(
     kind: InterpretationKind,
     user_term: str,
     draft: str,
+    display_title: str | None = None,
 ) -> InterpretationRequirement:
     """Return a pending interpretation-review requirement row."""
     requirement: InterpretationRequirement = {
@@ -252,6 +268,8 @@ def _pending_interpretation_requirement(
         "accepted_artifact_hash": None,
         "resolved_prompt_template_hash": None,
     }
+    if display_title is not None:
+        requirement["display_title"] = display_title
     return requirement
 
 
@@ -353,13 +371,16 @@ def _options_with_pending_requirement(
 
 @observation_boundary(
     tier=3,
-    source="composer/LLM-authored node options mapping (Tier-3) whose prompt_template value is "
+    source="composer/LLM-authored node options mapping (Tier-3) whose prompt values are "
     "untyped: an untrusted upsert_node / patch_node_options payload, a YAML import, or a "
     "sessions.db round-trip",
     source_param="options",
     suppresses=("R1", "R5"),
-    invariant="returns options unchanged when the node is not an llm node or carries no non-empty "
-    "string prompt_template, otherwise a copy with the review requirement staged; never raises",
+    invariant="returns options unchanged when the node is not an llm node or carries no reviewable "
+    "prompt surface, otherwise a copy with the review requirement staged whose draft is the "
+    "prompt_template, shortened to PROMPT_SURFACE_REVIEW_MAX_CHARS with an inline marker when longer, "
+    "for a single-prompt node and the rendered multi-query prompt surface "
+    "(per-query templates, system prompt, node-level template) for a multi-query node; never raises",
 )
 def _options_with_default_prompt_template_review(
     *,
@@ -368,23 +389,36 @@ def _options_with_default_prompt_template_review(
     options: Mapping[str, Any],
     existing_options: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
-    """Ensure LLM-authored prompt templates carry a Class 3 review gate."""
+    """Ensure LLM-authored prompt templates carry a Class 3 review gate.
+
+    The reviewed text is what the model will actually receive: the
+    ``prompt_template`` for a single-prompt node, shortened to
+    ``PROMPT_SURFACE_REVIEW_MAX_CHARS`` with an inline marker when longer, and for a multi-query node
+    the rendered prompt SURFACE — every query's template override, the shared
+    ``system_prompt`` and the node-level template with its in-use status
+    (:func:`prompt_review_draft_from_options`). Using that same text as the
+    idempotency key means an edit to a query template or the system prompt
+    re-stages the review, while re-issuing an identical mutation does not
+    churn it (session 94f6f00c: the card attested a node-level prompt that
+    every query overrode, and a repair to the live per-query prompt was
+    never re-reviewed).
+    """
     if plugin != "llm":
         return options
-    prompt_template = options["prompt_template"] if "prompt_template" in options else None
-    if not isinstance(prompt_template, str) or not prompt_template:
+    draft = prompt_review_draft_from_options(options)
+    if draft is None:
         return options
     requirement = _pending_interpretation_requirement(
         requirement_id=_prompt_template_review_requirement_id(node_id),
         kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
         user_term=f"llm_prompt_template:{node_id}",
-        draft=prompt_template,
+        draft=draft,
     )
     return _options_with_pending_requirement(
         options,
         requirement=requirement,
         replace_kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-        current_field_value=prompt_template,
+        current_field_value=draft,
         existing_options=existing_options,
     )
 
@@ -631,9 +665,8 @@ def _semantic_contracts_payload(
 ) -> list[_SemanticEdgeContractPayload]:
     """Serialize a SemanticEdgeContract tuple to JSON-friendly dicts.
 
-    Centralized so ToolResult.to_dict and the guided stage emitter
-    (guided/emitters.py) emit identical shapes — and so adding a field
-    updates both surfaces in one place. (preview_pipeline no longer
+    Centralized so ToolResult.to_dict emits one consistent shape.
+    (preview_pipeline no longer
     co-emits it: its data stopped carrying a copy of the envelope's
     validation in elspeth-e405ad7cd2 R4.)
 
@@ -820,7 +853,13 @@ def _duplicate_consumer_repair_suggestions(
                 # Widened deliberately: this is a repair-call argument the loop
                 # below re-keys, not the node payload the census reports, so it
                 # must not borrow ``_SetPipelineNodePayload``'s closed key set.
-                patched_consumers[node.id] = dict(_serialize_node(node))
+                # Built from the AUTHORING projection, not the diagnostic
+                # ``_serialize_node``: every call here is replayed through
+                # upsert_node, which refuses runtime-owned options (a resolved
+                # LLM prompt's node-level approved_prompt_artifact_hash) and
+                # resolver-owned review linkage, so the diagnostic shape made
+                # the first call fail and the rest half-apply.
+                patched_consumers[node.id] = dict(_serialize_set_pipeline_node(node))
             patched_consumer = patched_consumers[node.id]
             if consumer_branch_alias is None:
                 patched_consumer["input"] = branch_name
@@ -1029,7 +1068,7 @@ class ToolResult:
         if self.applied_component is not None:
             freeze_fields(self, "applied_component")
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_data: bool = True) -> dict[str, Any]:
         """Serialize to a dict suitable for LLM tool response.
 
         Validation entries are serialized as structured dicts with
@@ -1059,7 +1098,7 @@ class ToolResult:
             "affected_nodes": list(self.affected_nodes),
             "version": self.updated_state.version,
         }
-        if self.data is not None:
+        if include_data and self.data is not None:
             result["data"] = deep_thaw(self.data)
 
         if self.runtime_preflight is not None:
@@ -1184,7 +1223,7 @@ def diff_states(
     return changes
 
 
-def _validate_mutation_arguments(model: type[BaseModel], arguments: object, argument_name: str) -> BaseModel:
+def _validate_mutation_arguments[ModelT: BaseModel](model: type[ModelT], arguments: object, argument_name: str) -> ModelT:
     try:
         return model.model_validate(arguments)
     except PydanticValidationError as exc:
@@ -1192,6 +1231,7 @@ def _validate_mutation_arguments(model: type[BaseModel], arguments: object, argu
             argument=argument_name,
             expected=f"object conforming to {model.__name__}",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
 
 
@@ -1229,7 +1269,7 @@ def _attach_post_call_hints(
 
 
 def _discovery_result(state: CompositionState, data: Any) -> ToolResult:
-    """Build a ToolResult for a discovery (read-only) tool."""
+    """Build a result with unchanged composition state, including blob-only writes."""
     validation = state.validate()
     return ToolResult(
         success=True,
@@ -1288,15 +1328,11 @@ def _failure_result(
             plugin_identity=plugin_identity,
             rejected_component=rejected_component,
         )
-    data = {_DATA_ERROR_KEY: error_msg}
-    if error_code is not None:
-        data["error_code"] = error_code
     return ToolResult(
         success=False,
         updated_state=state,
         validation=validation,
         affected_nodes=(),
-        data=data,
         _state_validation_withheld=not with_state_validation,
     )
 
@@ -1521,19 +1557,17 @@ def _merged_component_rejection_result(
     The FIRST failing component's envelope is the base — its ``data`` payload
     (including the credential-rejection repair block) and its leading entry
     stay exactly what a single-component rejection would have produced, so
-    ordering is stable and no response shape moves. This is also the one
-    place where ``data["error_code"]`` agreeing with ``errors[0].error_code``
-    is NOT structural: ``data`` comes from ``results[0]`` while ``errors``
-    concatenates every result's entries. Agreement therefore rests on an
-    unstated precondition — ``results[0]`` must carry a leading
-    ``rejected_mutation`` entry. Every current feeder satisfies it because
-    all of them construct through ``_failure_result`` /
-    ``_plugin_policy_failure``; a future feeder that does not would publish
-    two disagreeing codes in one envelope. Later components
+    ordering is stable. Each feeder must be failed and lead with a
+    ``rejected_mutation`` entry. Later components
     contribute their rejection entries only. ``components_withheld`` records
     the components the caller's reporting cap dropped; truncation is never
     silent.
     """
+    if not results:
+        raise AssertionError("Component rejection merge requires at least one result")
+    for result in results:
+        if result.success or not result.validation.errors or result.validation.errors[0].component != "rejected_mutation":
+            raise AssertionError("Component rejection feeder must fail with a leading rejected_mutation entry")
     base = results[0]
     entries = tuple(entry for result in results for entry in result.validation.errors if entry.component == "rejected_mutation")
     data = base.data
@@ -1543,7 +1577,7 @@ def _merged_component_rejection_result(
         # `freeze_fields(self, "data")`, so `base.data` is a MappingProxyType,
         # never an exact dict. Converging this on the house `type(x) is dict`
         # scalar idiom makes the test permanently False, sends every merge to
-        # the else branch, and drops `error_code` and every detail from the
+        # the else branch, and drops independent repair details from the
         # rejection envelope the model receives. Pinned by
         # tests/unit/web/composer/test_frozen_state_nominal_type_guards.py::
         # test_merged_component_rejection_keeps_the_whole_data_payload_of_a_frozen_result
@@ -1598,32 +1632,6 @@ def _mutation_result(
         post_call_hints=post_call_hints,
         applied_component=None if full_replacement else _applied_component_echo(new_state, affected),
     )
-
-
-def _vf_destination_note(
-    state: CompositionState,
-    on_vf: str,
-) -> dict[str, str] | None:
-    """Advisory note when on_validation_failure references an unknown output.
-
-    Returns a dict with a ``note`` key suitable for ``ToolResult.data``,
-    or ``None`` when no advisory is needed (destination is ``"discard"``
-    or matches a configured output).
-    """
-    if on_vf == "discard":
-        return None
-    output_names = {o.name for o in state.outputs}
-    if on_vf not in output_names:
-        current = sorted(output_names) if output_names else "(none)"
-        return {
-            "note": (
-                f"on_validation_failure='{on_vf}' does not match any configured output. "
-                "Use 'discard' to drop invalid rows without routing, or "
-                f"add an output named '{on_vf}' before running the pipeline. "
-                f"Current outputs: {current}."
-            ),
-        }
-    return None
 
 
 def _apply_merge_patch(
@@ -1792,9 +1800,8 @@ def canonicalize_source_validation_failure(value: str | None) -> str:
     "", ``set_source``/``set_source_from_blob`` passed it through to the
     engine plugin-config rejection, and the auto-wire pass refused the whole
     candidate as non-discard — an accepted-then-wedged repair defect. The
-    guided surface's hard reject of "" (``guided/resolved.py``
-    ``SourceResolved``) stays as an internal invariant, not a second owner:
-    with boundary canonicalization "" can no longer lawfully reach it. The
+    boundary canonicalization ensures "" cannot lawfully reach persisted
+    composer state. The
     engine-side plugin-config validator
     (``plugins/infrastructure/config_base.py``) still rejects "" for
     non-composer-authored configs; composer-persisted state is always
@@ -1888,7 +1895,6 @@ def _credential_wiring_contract_failure(
         affected_nodes=(),
         _state_validation_withheld=not with_state_validation,
         data={
-            _DATA_ERROR_KEY: error_msg,
             "credential_fields": credential_fields,
             "components": (
                 {
@@ -1970,8 +1976,10 @@ _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
         "'coalesce' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "
         "node with node_type='coalesce', plugin=null, branches mapping each branch name to its "
         "incoming connection, policy (e.g. 'require_all') and merge (e.g. 'union'); downstream nodes "
-        "read the coalesce node id as their input. For running several LLM assessments per row, "
-        "prefer ONE llm transform with a `queries` map instead of fork/coalesce."
+        "read the coalesce node id as their input. SHAPE SELECTION: several assessments of the SAME "
+        "input field belong on a SINGLE llm node's `queries` map (multi_query) instead of "
+        "fork/coalesce; use fork/coalesce only when the branches take genuinely INDEPENDENT inputs "
+        "or independent per-branch processing chains."
     ),
     "gate": (
         "'gate' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a node "
@@ -2185,9 +2193,6 @@ def _validate_transform_provider_config_path(
 
 def _validate_transform_provider_config_policy(options: Mapping[str, Any], *, plugin: str | None = None) -> str | None:
     """Validate non-path web transform configuration policy constraints."""
-    provider_policy_error = web_rag_provider_config_policy_error(options)
-    if provider_policy_error is not None:
-        return provider_policy_error
     if transform_plugin_has_capability(plugin, PluginCapability.LLM):
         return web_llm_retry_budget_policy_error(options)
     return None
@@ -2433,7 +2438,7 @@ def _mask_pending_interpretation_placeholders_for_authoring_validation(
     prompts validate through the normal LLM config path.
     """
 
-    if "resolved_prompt_template_hash" in options:
+    if "approved_prompt_artifact_hash" in options:
         return
     prompt_template = options.get("prompt_template")
     if not isinstance(prompt_template, str):
@@ -2451,7 +2456,7 @@ _ECHOED_REVIEW_METADATA_NOTE: Final[str] = (
     "interpretation_requirements rows matching the server's stored review state "
     "were accepted as an echo; resolver-owned review metadata is re-derived "
     "server-side and does not need to be sent back. Omit those rows (or send "
-    "only pending {kind, user_term, draft} shells) on future writes."
+    "only pending {kind, user_term, draft} shells with optional display_title) on future writes."
 )
 _ECHOED_SOURCE_AUTHORING_NOTE: Final[str] = (
     "source_authoring matched the server's stored provenance block exactly and "
@@ -2497,7 +2502,7 @@ def _normalize_echoed_interpretation_requirements(
     (elspeth-c67fbbbd83). An echoed row that EXACTLY matches a stored row
     (``stable_hash``-equal to the deep-thawed canonical row or to its
     planner-context projection) is therefore reduced to its author-owned
-    pending shell ``{kind, user_term, draft}``: the shell passes admission,
+    pending shell ``{kind, user_term, draft}`` with optional ``display_title``: the shell passes admission,
     canonicalization re-keys it to the stored id, and
     ``reconcile_authoritative_reviews`` restores the resolved server row —
     the same round trip a well-behaved planner performs by hand. Any row that
@@ -2530,6 +2535,8 @@ def _normalize_echoed_interpretation_requirements(
         if user_term == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM:
             continue
         shell = {"kind": kind, "user_term": user_term, "draft": draft}
+        if "display_title" in stored:
+            shell["display_title"] = stored["display_title"]
         shells_by_echo_hash[stable_hash(deep_thaw(stored))] = shell
         shells_by_echo_hash[stable_hash(project_planner_context_interpretation_requirement(stored))] = shell
     if not shells_by_echo_hash:
@@ -2570,7 +2577,7 @@ def _resolver_owned_interpretation_requirement_error(
     """Validate the complete authoring shape for ``interpretation_requirements``.
 
     Composer input may supply only the compact unresolved shell
-    ``{kind, user_term, draft}``. Identity, status, event linkage, accepted
+    ``{kind, user_term, draft}`` with optional ``display_title``. Identity, status, event linkage, accepted
     values, and artifact hashes are all resolver-owned even when the supplied
     value is null. Presence is therefore the authority violation; inspecting
     or reflecting the untrusted value would create a tool-error leak channel.
@@ -2633,8 +2640,12 @@ def _resolver_owned_interpretation_requirement_error(
                 f"only {_AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT}. Omit resolver-owned "
                 f"fields and retry {tool_name}. {_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
-        if set(requirement) != _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS:
+        if set(requirement) - {"display_title"} != _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS:
             return malformed_error
+        if "display_title" in requirement:
+            display_title = requirement["display_title"]
+            if type(display_title) is not str or not display_title.strip() or len(display_title) > 200:
+                return malformed_error
         kind = requirement["kind"]
         user_term = requirement["user_term"]
         draft = requirement["draft"]
@@ -2721,7 +2732,7 @@ def _canonical_interpretation_requirement_error(
     for requirement in requirements_value:
         if not isinstance(requirement, Mapping):
             return error
-        if set(requirement) != _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS:
+        if set(requirement) - {"display_title"} != _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS:
             return error
         if type(requirement["id"]) is not str or not requirement["id"].strip():
             return error
@@ -2841,7 +2852,7 @@ def _normalize_trusted_legacy_interpretation_requirements(
         if not isinstance(requirement, Mapping):
             return options
         fields = set(requirement)
-        if not required_legacy_fields <= fields or not fields <= _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS:
+        if not required_legacy_fields <= fields or not fields <= _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS | {"display_title"}:
             return options
         needs_normalization = needs_normalization or fields != _CANONICAL_INTERPRETATION_REQUIREMENT_FIELDS
     if not needs_normalization:
@@ -2939,12 +2950,16 @@ def _canonicalize_authored_interpretation_requirements(
         draft = requirement["draft"]
         if type(draft) is not str:
             raise AssertionError("interpretation requirement draft must be admitted before canonicalization")
+        display_title = requirement["display_title"] if "display_title" in requirement else None
+        if display_title is not None and type(display_title) is not str:
+            raise AssertionError("interpretation requirement display_title must be admitted before canonicalization")
         canonical_requirements.append(
             _pending_interpretation_requirement(
                 requirement_id=requirement_id,
                 kind=InterpretationKind(kind),
                 user_term=persisted_user_term,
                 draft=draft,
+                display_title=display_title,
             )
         )
     canonical_options = dict(options)
@@ -2963,7 +2978,7 @@ def _runtime_owned_llm_option_error(
     """Reject composer-authored writes to runtime-owned LLM audit fields.
 
     Two checks: (1) the LLM-only runtime-owned option keys
-    (``_RUNTIME_OWNED_LLM_OPTION_KEYS``, e.g. ``resolved_prompt_template_hash``
+    (``_RUNTIME_OWNED_LLM_OPTION_KEYS``, e.g. ``approved_prompt_artifact_hash``
     at the top level), gated on ``plugin_name == "llm"``; and (2) the
     plugin-agnostic resolver-owned interpretation-requirement check, which also
     guards source write paths via
@@ -3358,7 +3373,7 @@ class ReviewedSourceAuthority:
     """Session-bound private authority for reusing already-reviewed sources.
 
     This object is deliberately not a serialisable planner or event payload.
-    Only the guided settlement path constructs it, and the candidate boundary
+    The owned-state commit path constructs it, and the candidate boundary
     accepts it only for the same session and an exact reviewed source record.
     """
 
@@ -3386,61 +3401,6 @@ class ReviewedSourceAuthority:
         ):
             raise TypeError("ReviewedSourceAuthority.verified_blob_paths is malformed")
         freeze_fields(self, "reviewed_sources", "verified_blob_paths")
-
-
-@dataclass(frozen=True, slots=True)
-class PendingCustodyBlobView:
-    """One deferred inline-custody blob, resolvable before it is settled.
-
-    Guided-full defers inline-custody finalization into the atomic staging
-    settlement (elspeth-1e3ad83d89), so at custody-safe revalidation time the
-    proposal's ``source.blob_id`` names a blob with no row and no storage
-    file yet. This view carries the settlement-equivalent row fields plus the
-    content bytes so ``_resolve_source_blob`` can resolve exactly that one
-    blob (elspeth-282f392fae). Every field is derived server-side from the
-    planner's own ``PipelineCustodyPreparation`` — never from tool arguments —
-    and resolution requires an exact ``blob_id`` AND ``session_id`` match; any
-    other reference falls through to the normal fail-closed database path.
-    """
-
-    blob_id: str
-    session_id: str
-    filename: str
-    mime_type: str
-    size_bytes: int
-    content_hash: str
-    storage_path: str
-    source_description: str | None
-    creation_modality: str
-    created_from_message_id: str
-    creating_model_identifier: str | None
-    creating_model_version: str | None
-    creating_provider: str | None
-    creating_composer_skill_hash: str | None
-    creating_arguments_hash: str | None
-    content: bytes
-
-    def __post_init__(self) -> None:
-        if type(self.blob_id) is not str or not self.blob_id:
-            raise TypeError("PendingCustodyBlobView.blob_id must be a non-empty exact string")
-        if type(self.session_id) is not str or not self.session_id:
-            raise TypeError("PendingCustodyBlobView.session_id must be a non-empty exact string")
-        if type(self.filename) is not str or not self.filename:
-            raise TypeError("PendingCustodyBlobView.filename must be a non-empty exact string")
-        if type(self.mime_type) is not str or not self.mime_type:
-            raise TypeError("PendingCustodyBlobView.mime_type must be a non-empty exact string")
-        if type(self.content_hash) is not str or not self.content_hash:
-            raise TypeError("PendingCustodyBlobView.content_hash must be a non-empty exact string")
-        if type(self.storage_path) is not str or not self.storage_path:
-            raise TypeError("PendingCustodyBlobView.storage_path must be a non-empty exact string")
-        if type(self.creation_modality) is not str or not self.creation_modality:
-            raise TypeError("PendingCustodyBlobView.creation_modality must be a non-empty exact string")
-        if type(self.size_bytes) is not int or self.size_bytes < 0:
-            raise TypeError("PendingCustodyBlobView.size_bytes must be a non-negative exact integer")
-        if type(self.content) is not bytes:
-            raise TypeError("PendingCustodyBlobView.content must be exact bytes")
-        if len(self.content) != self.size_bytes:
-            raise ValueError("PendingCustodyBlobView.size_bytes must equal len(content)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -3538,6 +3498,8 @@ class ToolContext:
     require_data_dir_for_paths: bool = False
     session_engine: Engine | None = None
     session_id: str | None = None
+    session_operation_context: SessionOperationContext | None = None
+    session_operation_authority: SessionOperationAuthority | None = None
     secret_service: WebSecretResolver | None = None
     secret_wiring_policy: SecretWiringPolicy | None = None
     user_id: str | None = None
@@ -3556,12 +3518,6 @@ class ToolContext:
     reviewed_source_authority: ReviewedSourceAuthority | None = None
     executing_proposal_id: str | None = None
     _interpretation_requirements_are_internal: bool = False
-    # Private server-owned field, set ONLY by the planner's deferred
-    # custody-safe revalidation (elspeth-282f392fae): the one inline-custody
-    # blob this plan will settle atomically at staging. _resolve_source_blob
-    # may resolve exactly this blob_id/session_id pair from the view; every
-    # other blob reference keeps the fail-closed database path.
-    _pending_custody: PendingCustodyBlobView | None = None
 
 
 ToolHandler = Callable[
@@ -3645,6 +3601,7 @@ def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonVa
                 "kind": requirement["kind"],
                 "user_term": requirement["user_term"],
                 "draft": requirement["draft"],
+                **({"display_title": requirement["display_title"]} if "display_title" in requirement else {}),
             }
             for requirement in requirements
         ]
@@ -3680,6 +3637,10 @@ _MUTATION_BLOCKING_INVARIANT_CODES: Final[frozenset[str]] = _ROW_UNION_INTRINSIC
     # lowering; rejecting the mutation prevents misleading state from ever
     # persisting through either upsert_node or set_pipeline.
     "coalesce_config_invalid",
+    # Same for gate options outside the web-only authoring metadata set:
+    # GateSettings has no options field, so upsert_node, set_pipeline and
+    # patch_node_options must refuse them rather than persist inert config.
+    "gate_config_invalid",
     "node_timeout_unsupported",
     # A plugin on a gate or coalesce must never persist: upsert_node's
     # post-call hint lookup would resolve the authored token against the

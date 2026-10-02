@@ -17,21 +17,27 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, BinaryIO, Final, Literal, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, BinaryIO, Final, Literal, Protocol, TypedDict, cast, runtime_checkable
 
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.hashing import canonical_json, canonical_json_loads
 from elspeth.contracts.sink_effects import AuditExportFormat, AuditExportSigningMode
 
 if TYPE_CHECKING:
     from elspeth.contracts.sink_effects import AuditExportSignedManifestInput
 
 AUDIT_EXPORT_DERIVATION_VERSION: Final = "audit-export-derivation-v1"
-AUDIT_EXPORT_SERIALIZATION_VERSION: Final = "audit-export-v2"
+AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION: Final = "landscape-exporter-auth-v2"
+AUDIT_EXPORT_SERIALIZATION_VERSION: Final = "audit-export-v3"
 AUDIT_EXPORT_MANIFEST_SCHEMA: Final = "elspeth.audit-export-manifest.v2"
+AUDIT_EXPORT_DIRECTORY_BUNDLE_SCHEMA: Final = "elspeth.audit-export-directory-bundle.v1"
+AUDIT_EXPORT_DELIVERED_MANIFEST_NAME: Final = "audit_manifest.v2.json"
+AUDIT_EXPORT_PORTABLE_RECORDS_NAME: Final = "audit_records.v3.jsonl"
+AUDIT_EXPORT_MAX_DELIVERED_FILES: Final = 96
+AUDIT_EXPORT_MAX_DELIVERED_BYTES: Final = 1024 * 1024 * 1024 * 1024
 AUDIT_EXPORT_MAX_CHUNKS: Final = 100_000
 AUDIT_EXPORT_MAX_CHUNK_BYTES: Final = 64 * 1024 * 1024
 AUDIT_EXPORT_MAX_CHUNK_RECORDS: Final = 1_000_000
@@ -43,10 +49,47 @@ AUDIT_EXPORT_SAFE_INTEGER_MAX: Final = 9_007_199_254_740_991
 type ClosedAuditExportScalar = str | bool | int | None
 type ClosedAuditExportJSON = ClosedAuditExportScalar | list[ClosedAuditExportJSON] | dict[str, ClosedAuditExportJSON]
 type AuditExportObjectKind = Literal["data_chunk", "final_manifest"]
+type AuditExportDirectoryFileEvidence = tuple[str, str, int]
+
+
+class AuditExportDirectoryBundleFile(TypedDict):
+    content_hash: str
+    relative_path: str
+    size_bytes: int
+
+
+class AuditExportDirectoryBundleManifest(TypedDict):
+    files: list[AuditExportDirectoryBundleFile]
+    schema: str
+
+
+def audit_export_directory_bundle_manifest(
+    files: Iterable[AuditExportDirectoryFileEvidence],
+) -> AuditExportDirectoryBundleManifest:
+    """Return the canonical exact-file manifest shared by producer and verifier."""
+    return {
+        "files": [
+            {
+                "content_hash": content_hash,
+                "relative_path": relative_path,
+                "size_bytes": size_bytes,
+            }
+            for relative_path, content_hash, size_bytes in files
+        ],
+        "schema": AUDIT_EXPORT_DIRECTORY_BUNDLE_SCHEMA,
+    }
+
+
+def audit_export_directory_bundle_hash(files: Iterable[AuditExportDirectoryFileEvidence]) -> str:
+    """Bind one portable CSV delivery's names, hashes, sizes, order and schema."""
+    manifest = audit_export_directory_bundle_manifest(files)
+    return hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest()
+
 
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _UTC_MICROSECOND_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_COMPARTMENT_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 _NAMESPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
 _EXPORT_TERMINAL_STATUSES: Final = frozenset({"completed", "completed_with_failures", "empty"})
 _EXPORT_TERMINAL: Final = frozenset({RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_FAILURES, RunStatus.EMPTY})
@@ -128,6 +171,10 @@ class AuditExportSnapshotRegistryKey:
         ):
             if type(value) is not str or not value:
                 raise ValueError(f"{field_name} must be a non-empty exact string")
+        if self.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        if self.serialization_version != AUDIT_EXPORT_SERIALIZATION_VERSION:
+            raise ValueError(f"serialization_version must equal {AUDIT_EXPORT_SERIALIZATION_VERSION!r}")
         if type(self.export_format) is not AuditExportFormat:
             raise TypeError("export_format must be exact AuditExportFormat")
         if type(self.signing_mode) is not AuditExportSigningMode:
@@ -163,6 +210,10 @@ class AuditExportSnapshotRegistryKey:
 def _validate_snapshot_bundle(snapshot: AuditExportSnapshot, chunks: tuple[AuditExportSnapshotChunk, ...]) -> None:
     if type(snapshot) is not AuditExportSnapshot:
         raise TypeError("snapshot must be exact AuditExportSnapshot")
+    if snapshot.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+        raise AuditIntegrityError("audit-export snapshot exporter_version must be landscape-exporter-auth-v2")
+    if snapshot.serialization_version != AUDIT_EXPORT_SERIALIZATION_VERSION:
+        raise AuditIntegrityError(f"audit-export snapshot serialization_version must equal {AUDIT_EXPORT_SERIALIZATION_VERSION!r}")
     if not chunks or any(type(chunk) is not AuditExportSnapshotChunk for chunk in chunks):
         raise ValueError("chunks must be a non-empty exact AuditExportSnapshotChunk tuple")
     if len(chunks) != snapshot.chunk_count:
@@ -313,6 +364,11 @@ def _timestamp(value: object, path: str) -> str:
 
 
 def _validate_public_config(payload: object) -> None:
+    if type(payload) is not dict:
+        raise TypeError("public config must be an exact dict")
+    if "exporter_version" not in payload:
+        raise ValueError("public config is missing exporter_version")
+    _string(payload["exporter_version"], "exporter_version", allowed=frozenset({AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION}))
     fields = frozenset(
         {
             "chunking_algorithm_version",
@@ -324,12 +380,15 @@ def _validate_public_config(payload: object) -> None:
             "serialization_version",
             "signer_key_id",
             "signing_mode",
+            "auth_events",
+            "compartment_id",
         }
     )
     obj = _object(payload, fields=fields, path="public config")
+    _string(obj["auth_events"], "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
+    validate_compartment_id(obj["compartment_id"])
     _string(obj["chunking_algorithm_version"], "chunking_algorithm_version")
     _string(obj["export_format"], "export_format", allowed=frozenset({"json", "csv"}))
-    _string(obj["exporter_version"], "exporter_version")
     _boolean(obj["include_raw_error_rows"], "include_raw_error_rows")
     _integer(obj["per_chunk_byte_limit"], "per_chunk_byte_limit", minimum=1, maximum=AUDIT_EXPORT_MAX_CHUNK_BYTES)
     _integer(
@@ -338,7 +397,7 @@ def _validate_public_config(payload: object) -> None:
         minimum=1,
         maximum=AUDIT_EXPORT_MAX_CHUNK_RECORDS,
     )
-    _string(obj["serialization_version"], "serialization_version")
+    _string(obj["serialization_version"], "serialization_version", allowed=frozenset({AUDIT_EXPORT_SERIALIZATION_VERSION}))
     signer = _string(obj["signer_key_id"], "signer_key_id")
     mode = _string(obj["signing_mode"], "signing_mode", allowed=frozenset({"unsigned", "hmac_sha256"}))
     _validate_signer(mode, signer, None, allow_signature_none=True)
@@ -358,9 +417,9 @@ def _validate_registry_key(payload: object) -> None:
     )
     obj = _object(payload, fields=fields, path="registry key")
     _string(obj["export_format"], "export_format", allowed=frozenset({"json", "csv"}))
-    _string(obj["exporter_version"], "exporter_version")
+    _string(obj["exporter_version"], "exporter_version", allowed=frozenset({AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION}))
     _hash(obj["public_export_config_hash"], "public_export_config_hash")
-    _string(obj["serialization_version"], "serialization_version")
+    _string(obj["serialization_version"], "serialization_version", allowed=frozenset({AUDIT_EXPORT_SERIALIZATION_VERSION}))
     signer = _string(obj["signer_key_id"], "signer_key_id")
     mode = _string(obj["signing_mode"], "signing_mode", allowed=frozenset({"unsigned", "hmac_sha256"}))
     _validate_signer(mode, signer, None, allow_signature_none=True)
@@ -385,7 +444,7 @@ def _validate_snapshot_content(payload: object) -> None:
             _integer(chunk[field], f"chunks[{index}].{field}", minimum=1)
         _integer(chunk["ordinal"], f"chunks[{index}].ordinal")
     _integer(obj["record_count"], "record_count", minimum=1)
-    _string(obj["serialization_version"], "serialization_version")
+    _string(obj["serialization_version"], "serialization_version", allowed=frozenset({AUDIT_EXPORT_SERIALIZATION_VERSION}))
     _integer(obj["total_bytes"], "total_bytes", minimum=1)
 
 
@@ -432,7 +491,7 @@ def _validate_chunk_seal(payload: object) -> None:
         pred = _object(predecessor, fields=frozenset({"hash", "kind"}), path="predecessor")
         _string(pred["kind"], "predecessor.kind", allowed=frozenset({"chunk_seal"}))
         _hash(pred["hash"], "predecessor.hash")
-    _string(obj["serialization_version"], "serialization_version")
+    _string(obj["serialization_version"], "serialization_version", allowed=frozenset({AUDIT_EXPORT_SERIALIZATION_VERSION}))
     _hash(obj["snapshot_id"], "snapshot_id")
 
 
@@ -592,7 +651,7 @@ def _validate_effect_identity(payload: object) -> None:
     _string(obj["input_kind"], "input_kind", allowed=frozenset({"audit_export_snapshot"}))
     _string(obj["protocol_version"], "protocol_version", allowed=frozenset({"sink-effect-v1"}))
     _string(obj["role"], "role", allowed=frozenset({"primary", "failsink"}))
-    _string(obj["serialization_version"], "serialization_version")
+    _string(obj["serialization_version"], "serialization_version", allowed=frozenset({AUDIT_EXPORT_SERIALIZATION_VERSION}))
     signer = _string(obj["signer_key_id"], "signer_key_id")
     mode = _string(obj["signing_mode"], "signing_mode", allowed=frozenset({"unsigned", "hmac_sha256"}))
     _validate_signer(mode, signer, None, allow_signature_none=True)
@@ -728,6 +787,13 @@ def validate_credential_free_identifier(value: str, field_name: str) -> str:
     return value
 
 
+def validate_compartment_id(value: object) -> str:
+    """Validate the bounded identifier carried in signed public markings."""
+    if type(value) is not str or _COMPARTMENT_ID.fullmatch(value) is None:
+        raise ValueError("compartment_id must match [a-z0-9][a-z0-9-]{0,62}")
+    return value
+
+
 def validate_content_namespace(value: str) -> str:
     if type(value) is not str or _NAMESPACE.fullmatch(value) is None or ".." in value.split("/"):
         raise ValueError("namespace must be a bounded credential-free relative namespace")
@@ -858,6 +924,8 @@ class AuditExportDerivationConfig:
     signing_mode: Literal["unsigned", "hmac_sha256"]
     signer_key_id: str
     signing_key: bytes | None
+    auth_events: Literal["omitted", "deployment_snapshot"] = "omitted"
+    compartment_id: str | None = None
 
     def __post_init__(self) -> None:
         _string(self.source_run_id, "source_run_id")
@@ -865,6 +933,10 @@ class AuditExportDerivationConfig:
         _timestamp(self.source_completed_at, "source_completed_at")
         _string(self.export_format, "export_format", allowed=frozenset({"json", "csv"}))
         _string(self.exporter_version, "exporter_version")
+        _string(self.auth_events, "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
+        if self.exporter_version != AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION:
+            raise ValueError("exporter_version must be landscape-exporter-auth-v2")
+        validate_compartment_id(self.compartment_id)
         if self.serialization_version != AUDIT_EXPORT_SERIALIZATION_VERSION:
             raise ValueError(f"serialization_version must equal {AUDIT_EXPORT_SERIALIZATION_VERSION!r}")
         _string(self.chunking_algorithm_version, "chunking_algorithm_version")
@@ -887,6 +959,23 @@ class AuditExportDerivationConfig:
     @property
     def exported_at(self) -> str:
         return self.source_completed_at
+
+    def public_snapshot_config(self) -> dict[str, ClosedAuditExportJSON]:
+        """Exact versioned config carried in the authenticated record stream."""
+        payload: dict[str, ClosedAuditExportJSON] = {
+            "chunking_algorithm_version": self.chunking_algorithm_version,
+            "export_format": self.export_format,
+            "exporter_version": self.exporter_version,
+            "include_raw_error_rows": self.include_raw_error_rows,
+            "per_chunk_byte_limit": self.per_chunk_byte_limit,
+            "per_chunk_record_limit": self.per_chunk_record_limit,
+            "serialization_version": self.serialization_version,
+            "signer_key_id": self.signer_key_id,
+            "signing_mode": self.signing_mode,
+        }
+        payload["auth_events"] = self.auth_events
+        payload["compartment_id"] = self.compartment_id
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -1012,14 +1101,108 @@ def _detached_record(record: Mapping[str, object]) -> dict[str, ClosedAuditExpor
         raise ValueError("audit export input records must not contain a manifest")
     # Round-tripping through the committed canonical encoder proves the value
     # tree is detached JSON data and rejects datetimes/bytes/custom authority.
+    # The decoder is the encoder's inverse: an integral double beyond 2**53 is
+    # printed in integer notation and must come back as that double, not as
+    # an int the encoder refuses when the record is signed and framed.
     try:
         encoded = canonical_json(record)
-        value = json.loads(encoded)
+        value = canonical_json_loads(encoded)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise TypeError("audit export record is not closed canonical JSON") from exc
     if type(value) is not dict:
         raise TypeError("audit export record must canonicalize to an object")
     return value
+
+
+@dataclass(slots=True)
+class AuditExportAuthEventCoverageValidator:
+    """Bounded semantic validation shared by producer and registered-byte reader."""
+
+    source_completed_at: str
+    expected_policy: Literal["omitted", "deployment_snapshot"] | None = None
+    config_count: int = 0
+    public_config_hash: str | None = None
+    config_policy: str | None = None
+    coverage_count: int = 0
+    event_count: int = 0
+    selected_count: int | None = None
+    policy: str | None = None
+
+    def observe(self, record: Mapping[str, object]) -> None:
+        kind = record["record_type"]
+        if kind == "audit_export_config":
+            self.config_count += 1
+            config_record = _object(dict(record), fields=frozenset({"record_type", "public_config"}), path="audit export config")
+            public_config = config_record["public_config"]
+            _validate_public_config(public_config)
+            assert isinstance(public_config, dict)
+            self.config_policy = _string(public_config["auth_events"], "auth_events", allowed=frozenset({"omitted", "deployment_snapshot"}))
+            self.public_config_hash = H(C("audit-export-public-config-v1", cast(ClosedAuditExportJSON, public_config)))
+        elif kind == "auth_event_coverage":
+            self.coverage_count += 1
+            coverage = _object(
+                dict(record),
+                fields=frozenset(
+                    {
+                        "record_type",
+                        "policy",
+                        "selection_cutoff",
+                        "selected_count",
+                        "reason",
+                        "selection_basis",
+                    }
+                ),
+                path="auth event coverage",
+            )
+            self.policy = _string(coverage["policy"], "coverage policy", allowed=frozenset({"omitted", "deployment_snapshot"}))
+            if self.expected_policy is not None and self.policy != self.expected_policy:
+                raise ValueError("auth event coverage policy differs from public config")
+            if self.policy == "omitted":
+                if (
+                    coverage["selection_cutoff"] is not None
+                    or coverage["selected_count"] is not None
+                    or coverage["selection_basis"] is not None
+                    or coverage["reason"] != "not_requested"
+                ):
+                    raise ValueError("omitted auth event coverage must disclose no selection")
+            else:
+                if (
+                    coverage["selection_cutoff"] != self.source_completed_at
+                    or coverage["selection_basis"] != "visible_rows_at_or_before_run_completion"
+                    or coverage["reason"] != "deployment_snapshot"
+                ):
+                    raise ValueError("auth event coverage selection scope is inconsistent")
+                self.selected_count = _integer(coverage["selected_count"], "coverage selected_count")
+        elif kind == "auth_event":
+            self.event_count += 1
+            if _timestamp(record["occurred_at"], "auth event occurred_at") > self.source_completed_at:
+                raise ValueError("auth event exceeds coverage selection cutoff")
+
+    def finish(self) -> None:
+        if self.config_count != 1:
+            raise ValueError("auth event coverage requires exactly one audit_export_config record")
+        if self.coverage_count != 1:
+            raise ValueError("auth event coverage must appear exactly once")
+        if self.policy != self.config_policy:
+            raise ValueError("auth event coverage policy differs from declared public config")
+        if self.policy == "omitted" and self.event_count:
+            raise ValueError("omitted auth event coverage forbids auth events")
+        if self.policy == "deployment_snapshot" and self.selected_count != self.event_count:
+            raise ValueError("auth event coverage selected_count differs from emitted auth events")
+
+
+def _coverage_checked_records(
+    records: Iterable[Mapping[str, object]],
+    config: AuditExportDerivationConfig,
+) -> Iterator[Mapping[str, object]]:
+    """Check signed coverage against the actual emitted stream in bounded memory."""
+    validator = AuditExportAuthEventCoverageValidator(config.source_completed_at, config.auth_events)
+    for record in records:
+        validator.observe(record)
+        yield record
+    validator.finish()
+    if validator.public_config_hash != H(C("audit-export-public-config-v1", config.public_snapshot_config())):
+        raise ValueError("auth event coverage declared public config differs from derivation config")
 
 
 def derive_audit_export_bundle(
@@ -1031,22 +1214,13 @@ def derive_audit_export_bundle(
     This pure boundary is intentionally target/store independent. Persistence
     code may spool the returned complete-frame chunks before registering the
     immutable winner; no formula here includes a target, effect, or store ID.
+    All derivations use the compartment-marked auth-v2 public config.
     """
     if type(config) is not AuditExportDerivationConfig:
         raise TypeError("config must be exact AuditExportDerivationConfig")
     from elspeth.contracts.sink_effects import AuditExportSignedManifestInput
 
-    public_config: dict[str, ClosedAuditExportJSON] = {
-        "chunking_algorithm_version": config.chunking_algorithm_version,
-        "export_format": config.export_format,
-        "exporter_version": config.exporter_version,
-        "include_raw_error_rows": config.include_raw_error_rows,
-        "per_chunk_byte_limit": config.per_chunk_byte_limit,
-        "per_chunk_record_limit": config.per_chunk_record_limit,
-        "serialization_version": config.serialization_version,
-        "signer_key_id": config.signer_key_id,
-        "signing_mode": config.signing_mode,
-    }
+    public_config = config.public_snapshot_config()
     public_export_config_bytes = C("audit-export-public-config-v1", public_config)
     public_export_config_hash = H(public_export_config_bytes)
     registry_key: dict[str, ClosedAuditExportJSON] = {
@@ -1065,7 +1239,7 @@ def derive_audit_export_bundle(
     unsigned_record_bytes: list[bytes] = []
     record_frames: list[bytes] = []
     chain = hashlib.sha256()
-    for raw in records:
+    for raw in _coverage_checked_records(records, config):
         unsigned = _detached_record(raw)
         unsigned_bytes = canonical_json(unsigned).encode("utf-8")
         emitted = dict(unsigned)
@@ -1386,17 +1560,7 @@ def _stream_audit_export_bundle_to_spool(
     """Generator body for :func:`stream_audit_export_bundle_to_spool`."""
     from elspeth.contracts.sink_effects import AuditExportSignedManifestInput, AuditExportSigningMode
 
-    public_config: dict[str, ClosedAuditExportJSON] = {
-        "chunking_algorithm_version": config.chunking_algorithm_version,
-        "export_format": config.export_format,
-        "exporter_version": config.exporter_version,
-        "include_raw_error_rows": config.include_raw_error_rows,
-        "per_chunk_byte_limit": config.per_chunk_byte_limit,
-        "per_chunk_record_limit": config.per_chunk_record_limit,
-        "serialization_version": config.serialization_version,
-        "signer_key_id": config.signer_key_id,
-        "signing_mode": config.signing_mode,
-    }
+    public_config = config.public_snapshot_config()
     public_export_config_bytes = C("audit-export-public-config-v1", public_config)
     public_export_config_hash = H(public_export_config_bytes)
     registry_key: dict[str, ClosedAuditExportJSON] = {
@@ -1441,7 +1605,7 @@ def _stream_audit_export_bundle_to_spool(
         current = bytearray()
         current_records = 0
 
-    for raw in records:
+    for raw in _coverage_checked_records(records, config):
         unsigned = _detached_record(raw)
         unsigned_bytes = canonical_json(unsigned).encode("utf-8")
         emitted = dict(unsigned)

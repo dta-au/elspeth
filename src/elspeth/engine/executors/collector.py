@@ -12,15 +12,26 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import structlog
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import BatchTransformProtocol, PipelineRow, TokenInfo
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import (
+    CollectorGroupFailureReason,
+    FrameKind,
+    GroupSettlementReason,
+    NodeStateStatus,
+    TerminalOutcome,
+    TerminalPath,
+)
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    BatchDeclaredInputFieldsViolation,
     ExecutionError,
     OrchestrationInvariantError,
     PluginContractViolation,
@@ -28,14 +39,23 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.identity import innermost_own_frame
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.secret_scrub import scrub_text_for_audit, scrub_transform_error_reason
 from elspeth.contracts.types import NodeID, StepResolver
+from elspeth.core.canonical import stable_hash
 from elspeth.core.config import CollectorSettings, ScopeSettings
+from elspeth.core.landscape.collector_group_failure_holds import collector_group_failure_hold_error
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.aggregation_result import validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
-from elspeth.engine.executors.batch_contract_validation import validate_batch_inputs, validate_success_outputs
+from elspeth.engine.executors.batch_contract_validation import (
+    batch_declared_input_proof,
+    validate_batch_inputs,
+    validate_success_outputs,
+)
+from elspeth.engine.executors.batch_violation_outcomes import record_batch_violation_failures
+from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.journal_restore import CollectorJournalRestorer
 from elspeth.engine.spans import SpanFactory
@@ -61,8 +81,7 @@ class CollectorOutcome:
     consumed_tokens: tuple[TokenInfo, ...] = ()
     collector_name: str | None = None
     group_id: str | None = None
-    # "collector_missing_members" | "collector_transform_error" | GroupSettlementReason.EMPTY_EXPANSION | None
-    failure_reason: str | None = None
+    failure_reason: CollectorGroupFailureReason | None = None
     # GroupSettlementReason.ALL_MEMBERS_LOST | GroupSettlementReason.EMPTY_EXPANSION | None (ADR-042 closed vocabulary)
     closed_without_plugin: str | None = None
 
@@ -128,6 +147,7 @@ class CollectorExecutor:
         clock: Clock | None = None,
         max_completed_keys: int = 10000,
         barrier_restore_reads: BarrierRestoreReadModel | None = None,
+        declared_input_proof: Mapping[NodeID, frozenset[str]] = MappingProxyType({}),
     ) -> None:
         if max_completed_keys <= 0:
             raise OrchestrationInvariantError(f"max_completed_keys must be > 0, got {max_completed_keys}")
@@ -135,6 +155,9 @@ class CollectorExecutor:
             raise OrchestrationInvariantError("barrier_restore_reads is required for collector roster/restore reads")
         self._execution = execution
         self._barrier_restore_reads = barrier_restore_reads
+        # The build's declared-input proof (ADR-013 Amendment 2026-09-27): the
+        # flush's input check classifies a required-field miss by this node's entry.
+        self._declared_input_proof = declared_input_proof
         self._data_flow = data_flow
         self._spans = span_factory
         self._token_manager = token_manager
@@ -342,7 +365,7 @@ class CollectorExecutor:
         state = self._execution.begin_node_state(
             token_id=token.token_id,
             node_id=node_id,
-            run_id=self._run_id,
+            member_token=ctx.require_member_token(),
             step_index=step,
             input_data=token.row_data.to_dict(),
             attempt=token.resume_attempt_offset,
@@ -515,7 +538,7 @@ class CollectorExecutor:
             return self._close_group(collector_name, key, pending, ctx)
         return None
 
-    def notify_empty_group(self, collector_name: str, group_id: str) -> CollectorOutcome:
+    def notify_empty_group(self, collector_name: str, group_id: str, ctx: PluginContext) -> CollectorOutcome:
         """Close a member_count=0 group (spec §6.4): no plugin, ever.
 
         require_all -> group failure 'empty_expansion'; best_effort -> silent
@@ -535,18 +558,34 @@ class CollectorExecutor:
         # _execute_flush) — an M=0 group has an empty roster so nothing
         # should ever populate self._pending[key] for it, but a stray entry
         # from a future code path must not be left behind silently.
-        if key in self._pending:
-            del self._pending[key]
-        self._mark_completed(key)
         scope = self._scopes[collector_name]
         if scope.policy == "require_all":
+            self._execution.complete_collector_failure(
+                coordination_token=ctx.require_coordination_token(),
+                group_id=group_id,
+                collector_node_id=str(self._node_ids[collector_name]),
+                failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION,
+                flush_state_id=None,
+                flush_error=None,
+                flush_duration_ms=None,
+                member_holds=(),
+                hold_error=collector_group_failure_hold_error(
+                    group_id=group_id, failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION, lost_members=()
+                ),
+            )
+            if key in self._pending:
+                del self._pending[key]
+            self._mark_completed(key)
             return CollectorOutcome(
                 held=False,
                 collector_name=collector_name,
                 group_id=group_id,
-                failure_reason=GroupSettlementReason.EMPTY_EXPANSION.value,
+                failure_reason=CollectorGroupFailureReason.EMPTY_EXPANSION,
                 closed_without_plugin=GroupSettlementReason.EMPTY_EXPANSION.value,
             )
+        if key in self._pending:
+            del self._pending[key]
+        self._mark_completed(key)
         return CollectorOutcome(
             held=False,
             collector_name=collector_name,
@@ -652,6 +691,45 @@ class CollectorExecutor:
         for key, settled_token_ids in restored.completed_groups:
             self._mark_completed(key, settled_token_ids=settled_token_ids)
 
+        # A RECORDED failure verdict (``complete_collector_failure`` committed,
+        # its disposition did not) is completed, never re-flushed: its outcome
+        # is handed to the post-restore sweep exactly as a group the sweep
+        # closed durably but could not yet deliver, so the settle seam
+        # disposes of its members with the recorded reason and the plugin is
+        # not invoked again (the C4 ruling's collector twin: crash timing must
+        # not change the outcome).
+        recorded_outcomes: list[CollectorOutcome] = []
+        for failure in restored.recorded_failures:
+            collector_name, group_id = failure.key
+            record = self._barrier_restore_reads.get_group_record(run_id=self._run_id, group_id=group_id)
+            if record is None:
+                raise AuditIntegrityError(
+                    f"Recorded failure verdict of collector group {group_id!r} at {collector_name!r} has no group_records row."
+                )
+            ordinals = self._barrier_restore_reads.get_group_member_ordinals(run_id=self._run_id, opener_token_id=record.opener_token_id)
+            member_keys = {
+                token.token_id: innermost_own_frame(token.lineage_path, is_release_group=self.is_release_group) for token in failure.members
+            }
+            ordered: list[tuple[int, TokenInfo]] = []
+            for token in failure.members:
+                own = member_keys[token.token_id]
+                if own is None or own[1].member_key not in ordinals:
+                    raise AuditIntegrityError(
+                        f"Recorded failure verdict member {token.token_id!r} of group {group_id!r} has no token_parents ordinal "
+                        f"under opener {record.opener_token_id!r} — expansion audit inconsistency."
+                    )
+                ordered.append((ordinals[own[1].member_key], token))
+            consumed = tuple(token for _ordinal, token in sorted(ordered, key=lambda pair: pair[0]))
+            recorded_outcomes.append(
+                CollectorOutcome(
+                    held=False,
+                    consumed_tokens=consumed,
+                    collector_name=collector_name,
+                    group_id=group_id,
+                    failure_reason=failure.failure_reason,
+                )
+            )
+
         restore_now = self._clock.monotonic()
         built_groups: list[tuple[tuple[str, str], _PendingGroup]] = []
         complete_keys: list[tuple[str, str]] = []
@@ -716,11 +794,13 @@ class CollectorExecutor:
         for key, pending in built_groups:
             self._pending[key] = pending
         self._restored_complete_keys = complete_keys
+        self._undelivered_sweep_outcomes = recorded_outcomes
 
         slog.info(
             "collector_journal_restored",
             pending_groups=len(built_groups),
             complete_pending_flush=len(complete_keys),
+            recorded_failures=len(recorded_outcomes),
             completed_groups=len(restored.completed_groups),
             token_count=restored.token_count,
             run_id=self._run_id,
@@ -809,7 +889,13 @@ class CollectorExecutor:
         scope = self._scopes[collector_name]
         group_id = key[1]
         if pending.lost and scope.policy == "require_all":
-            return self._fail_group(collector_name, key, pending, failure_reason="collector_missing_members")
+            return self._fail_group(
+                collector_name,
+                key,
+                pending,
+                failure_reason=CollectorGroupFailureReason.COLLECTOR_MISSING_MEMBERS,
+                coordination_token=ctx.require_coordination_token(),
+            )
         if not pending.arrived:
             # best_effort, every member lost: engine closes WITHOUT the plugin
             # (spec §6.4 'all_members_lost'; not a failure under best_effort).
@@ -823,52 +909,116 @@ class CollectorExecutor:
             )
         return self._execute_flush(collector_name, key, pending, ctx)
 
-    def _fail_group(self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, *, failure_reason: str) -> CollectorOutcome:
-        """require_all group failure: engine-performed, plugin never invoked (spec §6.4)."""
-        group_id = key[1]
-        consumed = tuple(entry.token for entry in sorted(pending.arrived.values(), key=lambda e: e.ordinal))
+    def _fail_group(
+        self,
+        collector_name: str,
+        key: tuple[str, str],
+        pending: _PendingGroup,
+        *,
+        failure_reason: CollectorGroupFailureReason,
+        coordination_token: CoordinationToken,
+    ) -> CollectorOutcome:
+        """Fail the group as a whole without a flush: the ``collector_missing_members`` arm.
+
+        ``_close_group``: a ``require_all`` roster closed with members lost.
+        The plugin is never invoked (spec §6.4), so no flush state exists.
+        The verdict atomically marks every arrived member's hold FAILED and
+        records one group failure row. With every member lost, that row still
+        records the failed group despite there being no hold. The plugin arms
+        go through :meth:`_fail_group_after_flush`.
+        """
+        member_holds, hold_error = self._group_failure_verdict(collector_name, key, pending, failure_reason=failure_reason)
+        self._execution.complete_collector_failure(
+            coordination_token=coordination_token,
+            group_id=key[1],
+            collector_node_id=str(self._node_ids[collector_name]),
+            failure_reason=failure_reason,
+            flush_state_id=None,
+            flush_error=None,
+            flush_duration_ms=None,
+            member_holds=member_holds,
+            hold_error=hold_error,
+        )
+        return self._close_failed_group(collector_name, key, pending, failure_reason=failure_reason)
+
+    def _fail_group_after_flush(
+        self,
+        collector_name: str,
+        key: tuple[str, str],
+        pending: _PendingGroup,
+        *,
+        failure_reason: CollectorGroupFailureReason,
+        coordination_token: CoordinationToken,
+        guard: NodeStateGuard,
+        flush_error: ExecutionError,
+        flush_duration_ms: float,
+    ) -> CollectorOutcome:
+        """Fail the group as a whole after its flush: the two plugin arms.
+
+        * ``collector_transform_error``: the plugin ran and returned
+          ``TransformResult.error``.
+        * ``collector_contract_violation``: a Tier-2
+          ``PluginContractViolation``, raised by the plugin itself or by the
+          engine's pre/postflight checks on the members or on the output it
+          returned.
+
+        The verdict is ONE transaction (``guard.complete_collector_failure``):
+        the still-OPEN flush state FAILED with ``flush_error``, and every
+        arrived member's hold FAILED with the group failure. A crash before it
+        commits leaves every hold OPEN, and the group is re-flushed on resume.
+        After it commits, resume completes this verdict without the plugin
+        (``CollectorJournalRestorer``).
+        """
+        member_holds, hold_error = self._group_failure_verdict(collector_name, key, pending, failure_reason=failure_reason)
+        guard.complete_collector_failure(
+            coordination_token=coordination_token,
+            group_id=key[1],
+            collector_node_id=str(self._node_ids[collector_name]),
+            failure_reason=failure_reason,
+            flush_error=flush_error,
+            duration_ms=flush_duration_ms,
+            member_holds=member_holds,
+            hold_error=hold_error,
+        )
+        return self._close_failed_group(collector_name, key, pending, failure_reason=failure_reason)
+
+    def _group_failure_verdict(
+        self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, *, failure_reason: CollectorGroupFailureReason
+    ) -> tuple[tuple[tuple[TokenRef, str, float], ...], ExecutionError]:
+        """The member holds a group failure closes, and the one error every one of them records."""
         now = self._clock.monotonic()
-        # I-2 (fix round 2): this method is BOTH the require_all-loss arm
-        # (_close_group, pending.lost always non-empty there) AND the
-        # collector_transform_error arm (_execute_flush, pending.lost is
-        # typically empty and the scope may be best_effort) — the message
-        # must not hardcode "under require_all" for a call it also serves
-        # on a different failure_reason and policy.
-        if pending.lost:
-            exception_text = f"Collector group {group_id!r} failed ({failure_reason}): lost members {sorted(pending.lost)!r}"
-        else:
-            exception_text = f"Collector group {group_id!r} failed ({failure_reason})"
+        # I-2 (fix round 2): this serves three arms. Only the require_all-loss
+        # arm guarantees a non-empty pending.lost; the two flush arms usually
+        # have none and the scope may be best_effort — so the message never
+        # hardcodes "under require_all".
         # META-40: every arrived member is a SURVIVOR of the failing group —
-        # its hold carries the group-level CAUSE (failure_reason, lost
-        # members) STRUCTURALLY beside its own settlement disposition
+        # its hold carries the group-level CAUSE (group_id, failure_reason,
+        # lost members) STRUCTURALLY beside its own settlement disposition
         # (scope_group_failed, spec §6.3), not only in the message text; the
         # settle seam writes the same disposition on the survivor's terminal.
-        error = ExecutionError(
-            exception=exception_text,
-            exception_type="CollectorGroupFailure",
-            phase="collector_flush",
-            context={
-                "failure_reason": failure_reason,
-                "lost_members": sorted(pending.lost),
-                "member_disposition": GroupSettlementReason.SCOPE_GROUP_FAILED.value,
-            },
+        # The counting readers and resume parse it back with the one parser
+        # beside this builder (collector_group_failure_holds).
+        hold_error = collector_group_failure_hold_error(group_id=key[1], failure_reason=failure_reason, lost_members=pending.lost)
+        # Every member's own accept()-time hold (canon item 11) closes FAILED
+        # in the verdict — an audit-trail bookkeeping concern, not a
+        # terminal-disposition write; the terminals are the settle seam's.
+        member_holds = tuple(
+            (TokenRef(token_id=entry.token.token_id, run_id=self._run_id), entry.state_id, (now - entry.arrival_time) * 1000)
+            for entry in sorted(pending.arrived.values(), key=lambda e: e.ordinal)
         )
-        for entry in pending.arrived.values():
-            # Close out THIS token's own accept()-time hold (canon item 11) —
-            # an audit-trail bookkeeping concern, not a terminal-disposition
-            # write, so it stays here regardless of who writes the outcome.
-            self._execution.complete_node_state(
-                state_id=entry.state_id,
-                status=NodeStateStatus.FAILED,
-                error=error,
-                duration_ms=(now - entry.arrival_time) * 1000,
-            )
+        return member_holds, hold_error
+
+    def _close_failed_group(
+        self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, *, failure_reason: CollectorGroupFailureReason
+    ) -> CollectorOutcome:
+        """Retire a group whose failure verdict is durable and hand its members to the settle seam."""
+        consumed = tuple(entry.token for entry in sorted(pending.arrived.values(), key=lambda e: e.ordinal))
         del self._pending[key]
         self._mark_completed(key, settled_token_ids=frozenset(entry.token.token_id for entry in pending.arrived.values()))
         return CollectorOutcome(
             held=False,
             collector_name=collector_name,
-            group_id=group_id,
+            group_id=key[1],
             consumed_tokens=consumed,
             failure_reason=failure_reason,
         )
@@ -899,6 +1049,12 @@ class CollectorExecutor:
     # the executor renders, WS3 settles. Do not add escalation logic here, do
     # not reintroduce a direct `record_token_outcome` call for arrived
     # members in this method, and do not resurrect `outcomes_recorded`.
+    # The one carve-out is not a group failure at all: a Tier-1
+    # BatchDeclaredInputFieldsViolation in `_execute_flush` ends the run, so
+    # no CollectorOutcome ever reaches the settle seam; that arm closes the
+    # member holds and records each member FAILED itself
+    # (record_batch_violation_failures, shared with the aggregation seam)
+    # before the violation propagates.
 
     def _execute_flush(self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, ctx: PluginContext) -> CollectorOutcome:
         """end_of_group flush: opener-ordinal order, transform-only, audit-guarded."""
@@ -952,7 +1108,7 @@ class CollectorExecutor:
             self._execution,
             token_id=pending.opener_token_id,
             node_id=node_id,
-            run_id=self._run_id,
+            member_token=ctx.require_member_token(),
             step_index=step,
             input_data=batch_input,
             # C-1 (Task 7, META-14.1): was a literal attempt=0/
@@ -972,29 +1128,132 @@ class CollectorExecutor:
             # over it, where the identical plugin under `aggregations:` raised.
             # Shared with AggregationExecutor rather than copied — both run the
             # same batch-transform contract (`NESTED_CONTRACT_OPTIONS_NODE_TYPES`).
-            validate_batch_inputs(transform, pipeline_rows, node_kind="Collector")
-            result = transform.process(pipeline_rows, ctx)
-            if result.status != "success":
-                guard.complete(
-                    NodeStateStatus.FAILED,
-                    duration_ms=(self._clock.monotonic() - now) * 1000,
-                    error=ExecutionError(
-                        exception=str(result.reason) if result.reason else "Collector transform returned error",
-                        exception_type="TransformError",
+            #
+            # A Tier-2 ``PluginContractViolation`` from that preflight, from the
+            # plugin, or from the success result's output checks (output schema,
+            # canonical hashing of the rows to release) fails the WHOLE group,
+            # as a returned error does (operator ruling 2026-09-23,
+            # elspeth-5887fb7928 B2): a wrongly-typed row under a typed
+            # collector schema is a fact about that row, so it must not end the
+            # run. Nothing is minted before these checks; the Tier-1 subclasses
+            # still abort.
+            try:
+                validate_batch_inputs(
+                    transform,
+                    pipeline_rows,
+                    node_kind="Collector",
+                    proven=batch_declared_input_proof(
+                        self._declared_input_proof, node_id=node_id, transform=transform, node_kind="Collector"
                     ),
                 )
-                return self._fail_group(collector_name, key, pending, failure_reason="collector_transform_error")
-
-            if result.row is None and result.rows is None:
-                raise PluginContractViolation(
-                    f"Collector transform '{transform.name}' returned success status but "
-                    f"neither row nor rows contains data. Batch-aware transforms must return "
-                    f"output via TransformResult.success(row) or TransformResult.success_multi(rows)."
+                result = transform.process(pipeline_rows, ctx)
+                if result.status == "success":
+                    if result.row is None and result.rows is None:
+                        raise PluginContractViolation(
+                            f"Collector transform '{transform.name}' returned success status but "
+                            f"neither row nor rows contains data. Batch-aware transforms must return "
+                            f"output via TransformResult.success(row) or TransformResult.success_multi(rows)."
+                        )
+                    # Postflight, before the rows are released downstream — the
+                    # other half of the aggregation parity restored here.
+                    validate_success_outputs(transform, result, node_kind="Collector")
+                    # The released rows must canonicalize, as the aggregation
+                    # flush and the per-row seam require of theirs: an emitted
+                    # value outside canonical JSON (an int beyond 2**53, a
+                    # non-finite float) would otherwise be released and end
+                    # the run at the next node's input hash. The violation
+                    # names no emitted value.
+                    try:
+                        result.output_hash = stable_hash(result.row) if result.row is not None else stable_hash(result.rows)
+                    except (TypeError, ValueError) as exc:
+                        raise non_canonical_output_violation(
+                            producer=f"Collector transform '{transform.name}'",
+                            output_schema=transform.output_schema,
+                            result=result,
+                            exc=exc,
+                        ) from exc
+            except BatchDeclaredInputFieldsViolation as input_violation:
+                # Tier 1 (a required field the build proved present is missing,
+                # or a contract lost a field its payload carries): the run ends,
+                # but every member is recorded FAILED first, as at the
+                # aggregation seam, so no member is left without a terminal
+                # outcome (ADR-013 Amendment 2026-09-27). The WS3 settle seam
+                # never runs on this path — the run dies before this group's
+                # CollectorOutcome exists — so these writes are the only ones.
+                # Each member's accept()-time hold closes FAILED with the
+                # violation's value-free error first, as every other closure
+                # of a group closes it (success, quarantine, group verdict): a
+                # member recorded FAILED must not keep an open hold here.
+                hold_duration_ms = (self._clock.monotonic() - now) * 1000
+                hold_error = ExecutionError(
+                    exception=scrub_text_for_audit(str(input_violation)),
+                    exception_type=type(input_violation).__name__,
+                    phase="collector_flush",
+                    context=input_violation.to_audit_dict(),
                 )
+                for entry in entries:
+                    self._execution.complete_node_state(
+                        member_token=ctx.require_member_token(),
+                        state_id=entry.state_id,
+                        status=NodeStateStatus.FAILED,
+                        error=hold_error,
+                        duration_ms=hold_duration_ms,
+                    )
+                record_batch_violation_failures(
+                    self._data_flow,
+                    coordination_token=ctx.require_coordination_token(),
+                    run_id=self._run_id,
+                    tokens=members,
+                    violation=input_violation,
+                    transform_name=transform.name,
+                    node_id=node_id,
+                    triggering_token_id=None,
+                )
+                raise
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except PluginContractViolation as violation:
+                return self._fail_group_after_flush(
+                    collector_name,
+                    key,
+                    pending,
+                    failure_reason=CollectorGroupFailureReason.COLLECTOR_CONTRACT_VIOLATION,
+                    coordination_token=ctx.require_coordination_token(),
+                    guard=guard,
+                    flush_error=ExecutionError(
+                        exception=scrub_text_for_audit(str(violation)),
+                        exception_type=type(violation).__name__,
+                        phase="collector_flush",
+                        context=violation.to_audit_dict(),
+                    ),
+                    flush_duration_ms=(self._clock.monotonic() - now) * 1000,
+                )
+            if result.status != "success":
+                if result.reason is None:
+                    raise OrchestrationInvariantError(
+                        f"Collector transform '{transform.name}' returned error but reason is None. "
+                        'Use TransformResult.error({"reason": "...", ...}) to create error results.'
+                    )
+                return self._fail_group_after_flush(
+                    collector_name,
+                    key,
+                    pending,
+                    failure_reason=CollectorGroupFailureReason.COLLECTOR_TRANSFORM_ERROR,
+                    coordination_token=ctx.require_coordination_token(),
+                    guard=guard,
+                    # The returned reason passes the same scrub as the per-row
+                    # and aggregation seams (scrub_transform_error_reason) and is
+                    # stored structurally, never flattened into the message.
+                    flush_error=ExecutionError(
+                        exception=f"Collector transform {transform.name!r} returned an error",
+                        exception_type="TransformError",
+                        phase="collector_flush",
+                        context=scrub_transform_error_reason(result.reason),
+                    ),
+                    flush_duration_ms=(self._clock.monotonic() - now) * 1000,
+                )
+
             output_rows: tuple[PipelineRow, ...] = (result.row,) if result.row is not None else tuple(result.rows or ())
-            # Postflight, before the rows are released downstream — the other
-            # half of the aggregation parity restored here.
-            validate_success_outputs(transform, result, node_kind="Collector")
             quarantined = validated_quarantined_indices(result, buffered_token_count=len(members), aggregation_name=collector_name)
             surviving = tuple(entry for index, entry in enumerate(entries) if index not in quarantined)
             if not surviving:
@@ -1017,7 +1276,7 @@ class CollectorExecutor:
                 members=tuple(entry.token for entry in surviving),
                 output_rows=output_rows,
                 node_id=node_id,
-                run_id=self._run_id,
+                coordination_token=ctx.require_coordination_token(),
                 group_id=group_id,
             )
 
@@ -1037,6 +1296,7 @@ class CollectorExecutor:
                     # it is the executor's own permanent responsibility, same class
                     # as Ruling 36's kept exceptions.
                     self._execution.complete_node_state(
+                        member_token=ctx.require_member_token(),
                         state_id=entry.state_id,
                         status=NodeStateStatus.FAILED,
                         error=ExecutionError(
@@ -1046,7 +1306,8 @@ class CollectorExecutor:
                         ),
                         duration_ms=duration_ms,
                     )
-                    self._data_flow.record_token_outcome(
+                    self._data_flow.record_token_outcome_leader(
+                        coordination_token=ctx.require_coordination_token(),
                         ref=TokenRef(token_id=entry.token.token_id, run_id=self._run_id),
                         outcome=TerminalOutcome.FAILURE,
                         path=TerminalPath.QUARANTINED_AT_SOURCE,
@@ -1054,6 +1315,7 @@ class CollectorExecutor:
                     )
                 else:
                     self._execution.complete_node_state(
+                        member_token=ctx.require_member_token(),
                         state_id=entry.state_id,
                         status=NodeStateStatus.COMPLETED,
                         output_data={},

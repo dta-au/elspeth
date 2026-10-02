@@ -20,6 +20,7 @@ out of the token row.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from typing import Any
@@ -51,6 +52,7 @@ from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.sso_handoff_repository import SsoHandoffRepository
 from tests.helpers.fake_idp import FakeIdP
+from tests.unit.web.auth.conftest import saturated_worker_pool
 
 PUBLIC_BASE = "https://elspeth.example.gov.au"
 REDIRECT_URI = f"{PUBLIC_BASE}/api/auth/sso/callback"
@@ -67,6 +69,10 @@ class _RecordingRecorder:
 
     def __init__(self) -> None:
         self.rows: list[tuple[str, dict[str, Any]]] = []
+        # Which THREAD each row was written on. An audit write is a database
+        # write, so it must not happen on the event loop — pinned by
+        # ``test_complete_never_runs_its_database_work_on_the_event_loop``.
+        self.threads: list[tuple[str, int]] = []
 
     def record_login_success_and_token_issued(self, *args: Any, **kwargs: Any) -> None:
         self.rows.append(("login_success_and_token_issued", kwargs))
@@ -78,6 +84,7 @@ class _RecordingRecorder:
         self.rows.append(("login_failure", kwargs))
 
     def record_token_issued(self, *args: Any, **kwargs: Any) -> None:
+        self.threads.append(("token_issued", threading.get_ident()))
         self.rows.append(("token_issued", kwargs))
 
     def record_auth_failure(self, *args: Any, **kwargs: Any) -> None:
@@ -105,8 +112,12 @@ class _Substrate:
         self.handoffs = SsoHandoffRepository(engine)
         self.access_state = access_state
         self.identities: dict[str, _Identity] = {}
+        # Which THREAD each substrate call ran on; see
+        # ``test_complete_never_runs_its_database_work_on_the_event_loop``.
+        self.threads: list[tuple[str, int]] = []
 
     def upsert(self, claims: IdentityClaims) -> _Identity:
+        self.threads.append(("upsert", threading.get_ident()))
         identity = _Identity(f"id-{claims.subject}", claims.username, self.access_state)
         if identity.identity_id not in self.identities:
             # The handoff row's identity_id is a foreign key; give it a target.
@@ -124,6 +135,7 @@ class _Substrate:
         return identity
 
     def read(self, identity_id: str) -> _Identity | None:
+        self.threads.append(("read", threading.get_ident()))
         return self.identities.get(identity_id)
 
 
@@ -453,6 +465,80 @@ class TestTheWalk:
         assert len(recorder.of("token_issued")) == 1
 
     @pytest.mark.asyncio
+    async def test_complete_never_runs_its_database_work_on_the_event_loop(self, idp: FakeIdP) -> None:
+        """``complete_login`` is a plain ``def`` that consumes, reads and audits.
+
+        Three synchronous database round trips — the conditional UPDATE that
+        claims the handoff, the identity read, the ``token_issued`` write —
+        called from an ``async def`` route. Inline they hold the loop for the
+        whole of all three, so one lock wait on ``sso_handoffs`` stalls every
+        unrelated request on that worker.
+
+        The thread ident is the instrument, on both the substrate seams and
+        the audit write: nothing about the response distinguishes work that
+        ran on the loop from work that did not.
+        """
+        loop_thread = threading.get_ident()
+        substrate = _Substrate(_engine())
+        recorder = _RecordingRecorder()
+        async with _client(_app(sso=_runtime(idp, substrate), recorder=recorder)) as client:
+            started = await _start(client)
+            _present_cookie(client, started.cookie_value)
+            code = idp.authorize(nonce=started.nonce, subject="ada")
+            callback = await client.get("/api/auth/sso/callback", params={"code": code, "state": started.state})
+            (handoff,) = _fragment_params(callback.headers["location"])["code"]
+            complete = await client.post("/api/auth/sso/complete", json={"code": handoff})
+
+        assert complete.status_code == 200, complete.text
+        assert [name for name, _ in substrate.threads] == ["upsert", "read"]
+        assert [name for name, _ in recorder.threads] == ["token_issued"]
+        off_the_loop = substrate.threads + recorder.threads
+        assert all(thread != loop_thread for _, thread in off_the_loop), (
+            "a database seam ran on the event loop's thread: the offload is not in the path"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_saturated_worker_pool_at_complete_is_an_audited_503(self, idp: FakeIdP) -> None:
+        """Offloading introduces a refusal this route did not previously have.
+
+        ``run_sync_in_worker`` refuses admission when the process-wide pool is
+        saturated, and ``AsyncWorkerAdmissionTimeoutError`` is not an
+        ``SsoLoginError`` — so the handler that audits every other outcome of
+        this route would let it past as an UNAUDITED 500. It is answered the
+        way this router already answers "the backend cannot serve you right
+        now" at ``/me``: a ``provider_unavailable`` audit row and a 503, whose
+        remedy is to wait rather than to start the login again.
+
+        The handoff is spent regardless — ``complete_login`` claims it before
+        anything else — but the pool refusal lands BEFORE that call, so this
+        one is not: the code is still redeemable once the pool drains.
+
+        Costs about one second: ``ADMISSION_WAIT_SECONDS`` is the shipped bound
+        and shortening it would test something other than what ships.
+        """
+        recorder = _RecordingRecorder()
+        async with _client(_app(sso=_runtime(idp, _Substrate(_engine())), recorder=recorder)) as client:
+            started = await _start(client)
+            _present_cookie(client, started.cookie_value)
+            code = idp.authorize(nonce=started.nonce, subject="ada")
+            callback = await client.get("/api/auth/sso/callback", params={"code": code, "state": started.state})
+            (handoff,) = _fragment_params(callback.headers["location"])["code"]
+            async with saturated_worker_pool():
+                refused = await client.post("/api/auth/sso/complete", json={"code": handoff})
+            # The pool has drained; the code was never claimed, so it still works.
+            retried = await client.post("/api/auth/sso/complete", json={"code": handoff})
+
+        assert refused.status_code == 503, refused.text
+        assert retried.status_code == 200, retried.text
+        (row,) = recorder.of("auth_failure")
+        assert (row["failure_category"], row["failure_stage"], row["exception_class"]) == (
+            "provider_unavailable",
+            "sso_complete",
+            "AsyncWorkerAdmissionTimeoutError",
+        )
+        assert len(recorder.of("token_issued")) == 1, "the refused attempt issued nothing"
+
+    @pytest.mark.asyncio
     async def test_a_pending_identity_gets_a_login_row_and_a_handoff_but_no_token(self, idp: FakeIdP) -> None:
         """R6: the refusal is complete's, and the callback still records the login."""
         recorder = _RecordingRecorder()
@@ -553,6 +639,39 @@ class TestCallbackRefusals:
         assert _fragment_params(response.headers["location"]) == {"error": ["provider_unavailable"]}
         (row,) = recorder.of("auth_failure")
         assert (row["failure_category"], row["exception_class"]) == ("provider_unavailable", "AuthProviderUnavailable")
+
+    @pytest.mark.asyncio
+    async def test_a_saturated_worker_pool_redirects_with_provider_unavailable(self, idp: FakeIdP) -> None:
+        """The callback's offload must not become an unaudited 500.
+
+        ``login_callback`` runs the upsert, the ``login`` write and the handoff
+        insert on the worker pool, and a saturated pool refuses admission. The
+        service translates that into ``AuthProviderUnavailable``, so it arrives
+        at this handler as a category it already knows how to redirect and
+        audit — nothing about the route had to learn a new exception.
+
+        Nothing is written: the refusal lands at the upsert, before the
+        ``login`` row and long before the handoff, so the invariant that no
+        handoff exists for an unrecorded login holds under saturation too.
+
+        Costs about one second, the shipped ``ADMISSION_WAIT_SECONDS``.
+        """
+        recorder = _RecordingRecorder()
+        async with _client(_app(sso=_runtime(idp, _Substrate(_engine())), recorder=recorder)) as client:
+            started = await _start(client)
+            _present_cookie(client, started.cookie_value)
+            code = idp.authorize(nonce=started.nonce, subject="ada")
+            async with saturated_worker_pool():
+                response = await self._refused(client, params={"code": code, "state": started.state})
+
+        assert _fragment_params(response.headers["location"]) == {"error": ["provider_unavailable"]}
+        (row,) = recorder.of("auth_failure")
+        assert (row["failure_category"], row["failure_stage"], row["exception_class"]) == (
+            "provider_unavailable",
+            "sso_callback",
+            "AuthProviderUnavailable",
+        )
+        assert recorder.of("login_success") == [], "no login row for a walk that never reached the upsert"
 
 
 class TestCompleteShape:

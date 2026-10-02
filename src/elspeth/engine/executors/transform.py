@@ -1,8 +1,10 @@
 """TransformExecutor - wraps transform.process() with audit recording."""
 
 import time
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -31,15 +33,21 @@ from elspeth.contracts.enums import (
 )
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    DeclaredInputFieldAbsentViolation,
+    HeaderSpelledDeclarationViolation,
     OrchestrationInvariantError,
     PassThroughContractViolation,
     PluginContractViolation,
+    RunLeadershipLostError,
+    RunMembershipLostError,
     RunWorkerEvictedError,
     SchedulerLeaseLostError,
     ZeroEmissionSuccessContractViolation,
 )
+from elspeth.contracts.field_spelling import DeclaredSpellings
 from elspeth.contracts.plugin_context import PluginContext, plugin_context_scope
-from elspeth.contracts.secret_scrub import scrub_payload_for_audit
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
+from elspeth.contracts.secret_scrub import scrub_transform_error_reason
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -50,6 +58,9 @@ from elspeth.engine.executors.declaration_dispatch import (
     run_post_emission_checks,
     run_pre_emission_checks,
 )
+from elspeth.engine.executors.declared_input_miss import classify_declared_input_miss, declared_input_proof_entry
+from elspeth.engine.executors.declared_output_types import verify_produced_output_types
+from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation, output_validation_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.spans import SpanFactory
 
@@ -59,16 +70,23 @@ if TYPE_CHECKING:
     from elspeth.engine.batch_adapter import SharedBatchAdapter
 
 
-def _scrub_transform_error_details(error_details: "TransformErrorReason") -> "TransformErrorReason":
-    """Scrub freeform transform error payload while preserving category fields."""
-    scrubbed = scrub_payload_for_audit(error_details)
-    if scrubbed == error_details:
-        return error_details
-    return cast("TransformErrorReason", scrubbed)
-
-
 class TransformResultError(Exception):
     """Marker for a handled TransformResult.error operation outcome."""
+
+
+@dataclass(frozen=True, slots=True)
+class _NodeSpellingSurface:
+    """One transform's field-name spelling surface, as the preflight checks it per row.
+
+    ``spellings`` holds the node's declarations, each reduced once from config;
+    ``forwards_input`` is ``can_overwrite_input_fields`` (a created name can
+    shadow only a field the node carries forward) and ``removed_input_fields``
+    what it removes from that.
+    """
+
+    spellings: DeclaredSpellings
+    forwards_input: bool
+    removed_input_fields: frozenset[str]
 
 
 def record_transform_error_with_routing(
@@ -100,7 +118,7 @@ def record_transform_error_with_routing(
     if node_id is None:
         raise OrchestrationInvariantError(f"Transform '{transform.name}' executed without node_id - orchestrator bug")
 
-    scrubbed_error_details = _scrub_transform_error_details(error_details)
+    scrubbed_error_details = scrub_transform_error_reason(error_details)
 
     # Validate the complete DIVERT envelope before writing either half. A
     # transform_error without its required routing_event is contradictory
@@ -139,6 +157,7 @@ def record_transform_error_with_routing(
     if divert is not None:
         divert_state_id, error_edge_id = divert
         execution.record_routing_event(
+            member_token=ctx.require_member_token(),
             state_id=divert_state_id,
             edge_id=error_edge_id,
             mode=RoutingMode.DIVERT,
@@ -180,6 +199,7 @@ class TransformExecutor:
         max_workers: int | None = None,
         error_edge_ids: dict[NodeID, str] | None = None,
         before_terminal_audit: Callable[[], None] | None = None,
+        declared_input_proof: Mapping[NodeID, frozenset[str]] = MappingProxyType({}),
     ) -> None:
         """Initialize executor.
 
@@ -192,6 +212,14 @@ class TransformExecutor:
             error_edge_ids: Map of transform node_id -> DIVERT edge_id for error routing.
                            Built by the processor from the edge_map using error_edge_label().
                            Only populated for transforms with on_error pointing to a real sink.
+            declared_input_proof: The build's declared-input proof
+                (``ExecutionGraph.get_declared_input_proof``, carried on the
+                processor's ``DAGTraversalContext``): node_id -> the declared
+                input fields every arriving row provably carries. The preflight
+                classifies a declared-input miss by it. The empty default serves
+                executors built for transforms that declare no input; a
+                transform that declares one and has no entry is refused on its
+                first row (``OrchestrationInvariantError``).
         """
         self._execution = execution
         self._data_flow = data_flow
@@ -204,6 +232,15 @@ class TransformExecutor:
         # row-pipelined batch transform, owned by the executor (not monkey-patched
         # onto the transform instance).
         self._batch_adapters: dict[str, "SharedBatchAdapter"] = {}  # noqa: UP037 — forward ref, no __future__ annotations
+        # The field-name spelling rule's per-node surface, keyed by node_id and
+        # computed on a node's first row: its declarations are a pure function
+        # of the transform's config, fixed once construction finishes, so the
+        # preflight pays only the predicate's membership legs per row.
+        self._spelling_surfaces: dict[str, _NodeSpellingSurface] = {}
+        # The build's declared-input proof, and each node's verified entry,
+        # resolved on the node's first row (a pure function of the build).
+        self._declared_input_proof = declared_input_proof
+        self._declared_input_proven: dict[str, frozenset[str]] = {}
         # OpenTelemetry counter for pass-through cross-check violations now lives
         # at module scope in engine.executors.pass_through (ADR-009 §Clause 2).
         # Both this executor and the processor's batch-flush cross-check share
@@ -224,7 +261,7 @@ class TransformExecutor:
         *,
         transform: TransformProtocol,
         token: TokenInfo,
-        run_id: str,
+        ctx: PluginContext,
         violation: DeclarationContractViolation | AggregateDeclarationContractViolation,
     ) -> None:
         """Persist the matching FAILED token_outcome for a run-ending violation.
@@ -279,7 +316,9 @@ class TransformExecutor:
 
         try:
             self._data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token.token_id, run_id=run_id),
+                ref=TokenRef(token_id=token.token_id, run_id=ctx.run_id),
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
                 error_hash=error_hash,
@@ -336,7 +375,7 @@ class TransformExecutor:
         transform: TransformProtocol,
         token: TokenInfo,
         input_dict: dict[str, Any],
-        run_id: str,
+        ctx: PluginContext,
         node_id: str,
     ) -> tuple[frozenset[str], frozenset[str]]:
         """Run pre-invocation checks before the transform executes.
@@ -378,6 +417,47 @@ class TransformExecutor:
                 f"before any process() invocation."
             )
 
+        # --- FIELD-NAME SPELLING (pre-execution) ---
+        # The runtime residual of the field-name spelling rule (operator ruling
+        # 2026-09-25): a name this transform DECLARES — a read (schema field,
+        # required or column option) or a created target — that is the header
+        # spelling of a field the arriving row carries. The build refused every
+        # case a participating upstream proves (validate_declared_field_spellings);
+        # an abstaining or open upstream is settled here, on the row, with the
+        # same predicate. It runs BEFORE the pre-emission dispatch on purpose:
+        # a header-spelled declared input would otherwise reach
+        # DeclaredRequiredFieldsContract as a MISSING field — a Tier-1 abort for
+        # what is an operator configuration error — and a header-spelled target
+        # would reach process() and write a second key beside the field it
+        # names. Raised as a Tier-2 PluginContractViolation, so it routes via
+        # on_error with one stable, value-free reason.
+        from elspeth.contracts.field_collision import can_overwrite_input_fields
+
+        if node_id not in self._spelling_surfaces:
+            self._spelling_surfaces[node_id] = _NodeSpellingSurface(
+                spellings=DeclaredSpellings.of(reads=transform.declared_read_fields, creates=transform.declared_created_fields),
+                forwards_input=can_overwrite_input_fields(
+                    passes_through_input=transform.passes_through_input,
+                    forwards_input_fields=transform.forwards_input_fields,
+                ),
+                removed_input_fields=transform.removed_input_fields,
+            )
+        surface = self._spelling_surfaces[node_id]
+        # A node that declares nothing pays nothing here; otherwise a declared
+        # read the row carries costs one set test, and only a name it does not
+        # carry is resolved — through the row's own contract, the resolution
+        # its lookups use, so ``Name`` under a source ``field_mapping`` names
+        # the renamed field exactly as ``row['Name']`` would read it.
+        if not surface.spellings.is_empty:
+            row_keys = frozenset(input_dict)
+            spellings = surface.spellings.in_row(
+                row_keys=row_keys,
+                forwarded_keys=row_keys - surface.removed_input_fields if surface.forwards_input else frozenset(),
+                contract=token.row_data.contract,
+            )
+            if spellings:
+                raise HeaderSpelledDeclarationViolation(component=f"Transform '{transform.name}'", spellings=spellings)
+
         # --- FIELD COLLISION ENFORCEMENT (pre-execution) ---
         # Centralized check: if this transform declares output fields AND its
         # write path preserves the input row, verify none collide with input
@@ -388,8 +468,6 @@ class TransformExecutor:
         # dict (select_only field_mapper) consumes-and-replaces rather than
         # overwrites — arming on the declaration alone was a 100% row-loss
         # false positive (elspeth-6ea3619737). See can_overwrite_input_fields.
-        from elspeth.contracts.field_collision import can_overwrite_input_fields
-
         if transform.declared_output_fields and can_overwrite_input_fields(
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,
@@ -416,13 +494,50 @@ class TransformExecutor:
         # It also runs BEFORE transform.process() so a missing-field crash in
         # the plugin body cannot steal attribution from the declaration surface.
         effective_input_fields = derive_effective_input_fields(token.row_data)
+
+        # --- DECLARED-INPUT MISS ROUTER (pre-execution; ADR-013 Amendment 2026-09-27) ---
+        # A declared input field the row does not carry, where the build never
+        # proved it present (an observed or open upstream) and the payload does
+        # not carry it either, is a fact about this row: refused here, before
+        # process(), and routed via on_error with a value-free, row-invariant
+        # reason. A miss that touches a PROVEN field, or a field the payload
+        # carries while the contract lost it, is our bug: it falls through to
+        # the UNCHANGED DeclaredRequiredFieldsContract below, which aborts on
+        # the full missing set. This is engine row validation, not an ADR-010
+        # adopter — the dispatcher routes nothing, and the contract keeps its
+        # one Tier-1 violation class.
+        declared_input = transform.declared_input_fields
+        if declared_input:
+            # Resolved on the node's first row, miss or not: a node the proof
+            # does not cover is a wiring defect of every run, not only of the
+            # runs whose data happens to be sparse.
+            if node_id not in self._declared_input_proven:
+                self._declared_input_proven[node_id] = declared_input_proof_entry(
+                    self._declared_input_proof,
+                    node_id=NodeID(node_id),
+                    declared=declared_input,
+                    component=f"Transform '{transform.name}'",
+                )
+            missing_input = declared_input - effective_input_fields
+            if missing_input:
+                miss_kind = classify_declared_input_miss(
+                    missing=missing_input,
+                    proven=self._declared_input_proven[node_id],
+                    payload_keys=frozenset(token.row_data.keys()),
+                )
+                if miss_kind == "absent":
+                    raise DeclaredInputFieldAbsentViolation(
+                        component=f"Transform '{transform.name}'",
+                        fields=tuple(sorted(missing_input)),
+                    )
+
         static_contract = transform.effective_static_contract()
         try:
             run_pre_emission_checks(
                 inputs=PreEmissionInputs(
                     plugin=transform,
                     node_id=node_id,
-                    run_id=run_id,
+                    run_id=ctx.run_id,
                     row_id=token.row_id,
                     token_id=token.token_id,
                     input_row=token.row_data,
@@ -434,7 +549,7 @@ class TransformExecutor:
             self._record_terminal_contract_failure(
                 transform=transform,
                 token=token,
-                run_id=run_id,
+                ctx=ctx,
                 violation=violation,
             )
             raise
@@ -449,7 +564,8 @@ class TransformExecutor:
             transform.input_schema.model_validate(input_dict, strict=True)
         except ValidationError as e:
             input_violation = PluginContractViolation(
-                f"Transform '{transform.name}' input validation failed: {e}. This indicates an upstream transform/source schema bug."
+                f"Transform '{transform.name}' input validation failed: {safe_validation_error_text(e, transform.input_schema)}. "
+                "This indicates an upstream transform/source schema bug."
             )
             raise input_violation from e
 
@@ -483,8 +599,9 @@ class TransformExecutor:
             # stale results from the previous attempt.
             waiter = adapter.register(token.token_id, state_id)
 
-            # Submit work - this returns immediately
-            batch_runtime.accept(token.row_data, ctx)
+            # Snapshot claim authority: a timed-out worker can finish after the
+            # scheduler restores this context or starts another claim.
+            batch_runtime.accept(token.row_data, ctx.for_contract(ctx.contract))
 
             # Block until THIS row's result arrives.
             #
@@ -516,7 +633,7 @@ class TransformExecutor:
         result: TransformResult,
         transform: TransformProtocol,
         token: TokenInfo,
-        run_id: str,
+        ctx: PluginContext,
         node_id: str,
         static_contract: frozenset[str],
         effective_input_fields: frozenset[str],
@@ -545,7 +662,7 @@ class TransformExecutor:
                 inputs=PostEmissionInputs(
                     plugin=transform,
                     node_id=node_id,
-                    run_id=run_id,
+                    run_id=ctx.run_id,
                     row_id=token.row_id,
                     token_id=token.token_id,
                     input_row=token.row_data,
@@ -569,7 +686,7 @@ class TransformExecutor:
             self._record_terminal_contract_failure(
                 transform=transform,
                 token=token,
-                run_id=run_id,
+                ctx=ctx,
                 violation=violation,
             )
             raise
@@ -578,11 +695,19 @@ class TransformExecutor:
             try:
                 transform.output_schema.model_validate(emitted_row.to_dict(), strict=True)
             except ValidationError as e:
-                output_violation = PluginContractViolation(
-                    f"Transform '{transform.name}' output validation failed for emitted row {idx}: {e}. "
-                    "This indicates a transform schema bug."
-                )
-                raise output_violation from e
+                raise output_validation_violation(
+                    producer=f"Transform '{transform.name}'",
+                    emitted_row_index=idx,
+                    output_schema=transform.output_schema,
+                    exc=e,
+                ) from e
+
+        # ADR-050, Tier 2: the declared concrete types against the values the
+        # transform PRODUCED (created, or rewrote from the input row); a
+        # DeclaredOutputTypeViolation is routed by the processor like every
+        # PluginContractViolation. Runs after the dispatched declaration
+        # contracts, so completeness (every created field stamped) has passed.
+        verify_produced_output_types(transform=transform, input_row=token.row_data, emitted_rows=emitted_rows)
 
     def _populate_result_audit_fields(
         self,
@@ -615,12 +740,12 @@ class TransformExecutor:
             else:
                 result.output_hash = None
         except (TypeError, ValueError) as e:
-            canonicalization_violation = PluginContractViolation(
-                f"Transform '{transform.name}' emitted non-canonical data: {e}. "
-                f"Ensure output contains only JSON-serializable types. "
-                f"Use None instead of NaN for missing values."
-            )
-            raise canonicalization_violation from e
+            raise non_canonical_output_violation(
+                producer=f"Transform '{transform.name}'",
+                output_schema=transform.output_schema,
+                result=result,
+                exc=e,
+            ) from e
         result.duration_ms = duration_ms
 
     def _prepare_success_completion(
@@ -629,7 +754,7 @@ class TransformExecutor:
         result: TransformResult,
         transform: TransformProtocol,
         token: TokenInfo,
-        run_id: str,
+        ctx: PluginContext,
         node_id: str,
     ) -> dict[str, Any] | list[dict[str, Any]]:
         """Extract output data + record contract evolution (success-audit phase, part 2).
@@ -676,7 +801,7 @@ class TransformExecutor:
             if self._data_flow is None:
                 raise OrchestrationInvariantError("TransformExecutor.data_flow is None but contract evolution requires DataFlowRepository")
             self._data_flow.update_node_output_contract(
-                run_id=run_id,
+                member_token=ctx.require_member_token(),
                 node_id=node_id,
                 contract=output_contract,
             )
@@ -688,7 +813,8 @@ class TransformExecutor:
         transform: TransformProtocol,
         token: TokenInfo,
         ctx: PluginContext,
-        attempt: int = 0,
+        *,
+        attempt: int,
     ) -> tuple[TransformResult, TokenInfo, str | None]:
         """Execute a transform with full audit recording and error routing.
 
@@ -706,7 +832,13 @@ class TransformExecutor:
         - TransformResult.error() is a LEGITIMATE processing failure
         - Routes to configured sink via transform.on_error
         - RuntimeError if transform errors without on_error config
-        - Exceptions are BUGS and propagate (not routed)
+        - A raised ``PluginContractViolation`` that is not registered Tier 1 —
+          the preflight collision and input-schema checks, the output checks
+          including the ADR-050 declared-type check, a plugin's own raise — is
+          converted by the processor into a routed transform error
+          (elspeth-181db83da7); a Tier-1 declaration violation records the
+          token's terminal and ends the run; any other exception is a bug
+          and propagates (not routed)
 
         The step position in the DAG is resolved internally via StepResolver
         using transform.node_id, rather than being passed as a parameter.
@@ -772,7 +904,7 @@ class TransformExecutor:
                 self._execution,
                 token_id=token.token_id,
                 node_id=node_id,
-                run_id=ctx.run_id,
+                member_token=ctx.require_member_token(),
                 step_index=step,
                 input_data=input_dict,
                 # resume_attempt_offset is the generation base (run-1 max+1 for a re-driven token;
@@ -790,7 +922,7 @@ class TransformExecutor:
                 transform=transform,
                 token=token,
                 input_dict=input_dict,
-                run_id=ctx.run_id,
+                ctx=ctx,
                 node_id=node_id,
             )
 
@@ -818,6 +950,8 @@ class TransformExecutor:
                         state_id=guard.state_id,
                     )
                     duration_ms = (time.perf_counter() - start) * 1000
+                except (RunLeadershipLostError, RunMembershipLostError):
+                    raise
                 except contract_errors.TIER_1_ERRORS:
                     self._verify_ownership_before_terminal_audit(guard)
                     raise  # Tier 1 errors must crash — never record as row FAILED
@@ -865,7 +999,7 @@ class TransformExecutor:
                         result=result,
                         transform=transform,
                         token=token,
-                        run_id=ctx.run_id,
+                        ctx=ctx,
                         node_id=node_id,
                         static_contract=static_contract,
                         effective_input_fields=effective_input_fields,
@@ -892,7 +1026,7 @@ class TransformExecutor:
                         result=result,
                         transform=transform,
                         token=token,
-                        run_id=ctx.run_id,
+                        ctx=ctx,
                         node_id=node_id,
                     )
 
@@ -936,7 +1070,7 @@ class TransformExecutor:
                             f"Transform '{transform.name}' returned error but reason is None. "
                             'Use TransformResult.error({{"reason": "...", ...}}) to create error results.'
                         )
-                    sanitized_reason = _scrub_transform_error_details(result.reason)
+                    sanitized_reason = scrub_transform_error_reason(result.reason)
                     result.reason = sanitized_reason
 
                     # Record transform_error + DIVERT routing_event BEFORE terminal

@@ -53,7 +53,7 @@ from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_row
 from tests.fixtures.factories import make_context
 from tests.fixtures.group_lineage import ensure_fork_group_record
-from tests.fixtures.landscape import age_barrier_hold, on_fresh_database_second
+from tests.fixtures.landscape import age_barrier_hold, leader_token_for, on_fresh_database_second
 from tests.unit.engine.test_adr030_slice3_intake import (
     AGG_NODE,
     _agg_processor,
@@ -155,7 +155,10 @@ class TestAggregationTimeoutInvariance:
         db, factory = _make_factory()
         transform = _passthrough_flush_transform()
         processor_a = _agg_processor(factory, trigger={"timeout_seconds": TIMEOUT_SECONDS}, transform=transform, clock=clock)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_token_for(factory._db, RUN_ID),
+        )
 
         # T_b: leader A blocks two rows; the SAME process_row calls run the
         # journal-first intake, so adoption happens on the live path.
@@ -250,7 +253,10 @@ class TestCoalesceTimeoutInvariance:
             node_step_map={COALESCE_NODE: 2},
             clock=clock,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_token_for(factory._db, RUN_ID),
+        )
 
         # T_b: branch-a's BLOCKED row is deposited (live hold stashed exactly
         # as the drain would) and adopted by leader A's intake in the same
@@ -282,7 +288,7 @@ class TestCoalesceTimeoutInvariance:
 
         # (2) Frame A at T_b+timeout-ε: no timeout fire (pure when not firing).
         clock.advance(TIMEOUT_SECONDS - 0.5)
-        assert executor_a.check_timeouts("merge") == []
+        assert executor_a.check_timeouts("merge", coordination_token=leader_token_for(db, RUN_ID)) == []
 
         # ── Takeover mid-window. ────────────────────────────────────────────
         # The restored hold's age is measured on the Landscape database clock
@@ -314,7 +320,7 @@ class TestCoalesceTimeoutInvariance:
         assert set(pending_b.branches) == {"a"}
 
         # (2) Frame B at the SAME instant: no fire.
-        assert executor_b.check_timeouts("merge") == []
+        assert executor_b.check_timeouts("merge", coordination_token=leader_token_for(db, RUN_ID)) == []
 
         # (4) T_b+timeout+ε: frame B fires — best_effort merges the arrived
         # branch. Frame A's fire predicate (now - first_arrival ≥ timeout)
@@ -322,7 +328,7 @@ class TestCoalesceTimeoutInvariance:
         # firing BOTH executors would double-record the consumed branch's
         # terminal outcomes.
         clock.advance(1.0)
-        fired = executor_b.check_timeouts("merge")
+        fired = executor_b.check_timeouts("merge", coordination_token=leader_token_for(db, RUN_ID))
         assert len(fired) == 1
         assert fired[0].merged_token is not None
         assert {token.token_id for token in fired[0].consumed_tokens} == {"tok-branch-a"}

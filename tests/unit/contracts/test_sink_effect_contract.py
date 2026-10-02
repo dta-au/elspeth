@@ -13,6 +13,7 @@ from types import MappingProxyType
 import pytest
 
 import elspeth.contracts as contracts
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.plugin_protocols import SinkEffectProtocol
 from elspeth.contracts.results import ArtifactDescriptor
@@ -180,7 +181,7 @@ def _export_input(
         "signer_key_id": signer_key_id,
         "record_count": chunk_record_count,
         "total_bytes": len(chunk_bytes),
-        "serialization_version": "audit-export-v2",
+        "serialization_version": "audit-export-v3",
         "exported_at": "2026-07-16T01:02:03.456789Z",
         "source_completed_at": "2026-07-16T01:02:03.456789Z",
         "source_status": "completed",
@@ -207,7 +208,7 @@ def _export_input(
         registry_key_hash=registry_key_hash,
         manifest_hash=manifest_hash,
         snapshot_hash=snapshot_hash,
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         export_format=AuditExportFormat.JSON,
         signing_mode=signing_mode,
         signer_key_id=signer_key_id,
@@ -404,7 +405,7 @@ def test_sink_effect_protocol_has_independent_kind_capability_and_exact_methods(
         ),
         (SinkEffectCommitResult, ("descriptor", "evidence", "accepted_ordinals", "diverted_ordinals")),
         (SinkEffectReconcileResult, ("kind", "descriptor", "evidence", "accepted_ordinals", "diverted_ordinals")),
-        (RestrictedSinkEffectContext, ("run_id", "run_started_at", "operation_id", "sink_node_id")),
+        (RestrictedSinkEffectContext, ("run_id", "run_started_at", "operation_id", "sink_node_id", "http_post")),
     ],
 )
 def test_public_value_objects_have_exact_field_shapes(record_type: type[object], expected_fields: tuple[str, ...]) -> None:
@@ -509,6 +510,22 @@ def test_freeze_bounded_evidence_rejects_non_mapping() -> None:
         _freeze_bounded_evidence(object(), "evidence")  # type: ignore[arg-type]
 
 
+def test_freeze_bounded_evidence_scans_complete_large_ordinal_lists() -> None:
+    accepted_ordinals = list(range(1_000))
+
+    frozen = _freeze_bounded_evidence({"accepted_ordinals": accepted_ordinals}, "evidence")
+
+    assert deep_thaw(frozen) == {"accepted_ordinals": accepted_ordinals}
+
+
+def test_freeze_bounded_evidence_detects_a_credential_after_legacy_scrub_width() -> None:
+    candidate = "sk-" + "a" * 24
+    evidence = {"items": ["ordinary"] * 999 + [candidate]}
+
+    with pytest.raises(ValueError, match="must be credential-free"):
+        _freeze_bounded_evidence(evidence, "evidence")
+
+
 def test_verify_content_bytes_rejects_non_bytes_content() -> None:
     """Direct trust-boundary characterization for ``_verify_content_bytes``."""
     with pytest.raises(TypeError, match="resolver must return bytes"):
@@ -528,7 +545,7 @@ def test_verify_signed_manifest_bytes_rejects_non_dict_json() -> None:
         signer_key_id="UNSIGNED",
         record_count=1,
         total_bytes=10,
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         exported_at="2026-07-16T01:02:03.456789Z",
         source_completed_at="2026-07-16T01:02:03.456789Z",
         source_status="completed",
@@ -870,9 +887,9 @@ def test_export_input_is_dense_bounded_exact_and_has_no_pipeline_fields() -> Non
 def test_audit_export_reader_binds_exact_serialization_version() -> None:
     export_input = _export_input()
 
-    assert replace(export_input, serialization_version="audit-export-v2").serialization_version == "audit-export-v2"
+    assert replace(export_input, serialization_version="audit-export-v3").serialization_version == "audit-export-v3"
     with pytest.raises(ValueError, match=r"serialization_version|reader binding"):
-        replace(export_input, serialization_version="audit-export-v3")
+        replace(export_input, serialization_version="audit-export-v2")
 
 
 def test_chunk_and_manifest_references_must_match_exact_lowercase_hashes() -> None:

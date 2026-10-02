@@ -27,13 +27,17 @@ Three coordinated pieces under test here:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
 
 from elspeth.contracts import PluginSchema
 from elspeth.contracts.enums import NodeType, RoutingMode
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
 from elspeth.core.dag.models import GraphValidationError
@@ -491,6 +495,7 @@ class _ThreadingFakeSource:
     output_schema = None
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_validation_failure = "discard"
     on_success = "rows"
@@ -498,6 +503,12 @@ class _ThreadingFakeSource:
 
 class _ThreadingFakeSink:
     name = "mock_sink"
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
     _on_write_failure = "discard"
@@ -509,6 +520,27 @@ class _ThreadingFakeSink:
 
 class _ThreadingFakeBatchTransform:
     """Batch-aware pass-through fake declaring the value-preservation promise."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        # BatchTransformProtocol presence requirement: this fake requires no field.
+        return frozenset()
 
     input_schema = None
     output_schema = None
@@ -522,6 +554,8 @@ class _ThreadingFakeBatchTransform:
     passes_through_input = True
     forwards_input_fields = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, preserves_input_values: bool) -> None:
         self.name = name
@@ -532,6 +566,23 @@ class _ThreadingFakeBatchTransform:
 
 class _ThreadingFakeOpenerTransform:
     """Multi-row opener fake for the collector build (scope opener)."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
 
     input_schema = None
     output_schema = None
@@ -546,6 +597,8 @@ class _ThreadingFakeOpenerTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields: frozenset[str] = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         self.name = "json_explode"

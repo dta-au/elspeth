@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.web.composer._compose_loop_carriers import (
     _CallModelOutcome,
@@ -19,10 +20,12 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolOutcomeResponse,
 )
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.service import ComposerServiceImpl, _MalformedLLMResponseError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, _MalformedLLMResponseError, composer_loop_tool_definitions
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ToolResult
 from tests.unit.web.composer._helpers import (
+    _composer_service_with_session,
     _empty_state,
     _make_llm_response,
     _make_settings,
@@ -128,6 +131,7 @@ def test_tool_outcome_freezes_mapping_response() -> None:
         call={"id": "tc_x", "function": {"name": "request_advisor_hint"}},
         response=response_dict,
         error_class=None,
+        error_category=None,
         error_message=None,
         pre_version=1,
         post_version=1,
@@ -165,6 +169,9 @@ def test_persist_outcome_rejects_current_dispatch_identity_without_committed_row
             persisted_assistant_matches_current_dispatch=True,
             unwind_audit_failed=False,
             failed_turn=None,
+            redacted_assistant_tool_calls=(),
+            redacted_tool_rows=(),
+            audit_outcome=None,
         )
 
 
@@ -203,12 +210,12 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
         return _mutating_set_source_tool(tool_name, *args, **kwargs)
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", return_value=provider_response),
+        patch("elspeth.web.composer.provider_gateway._litellm_acompletion", return_value=provider_response),
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=_execute_admitted_tool),
     ):
         outcome = await service._call_model_turn(
             llm_messages=[{"role": "user", "content": "build it"}],
-            tools=[],
+            tools=composer_loop_tool_definitions(ToolContractDialect.NONE),
             state=state,
             initial_version=state.version,
             deadline=asyncio.get_event_loop().time() + 60.0,
@@ -230,7 +237,7 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
         assert outcome.completion.message.content == "admitted content"
         assert [call.id for call in outcome.completion.tool_batch.calls] == ["call-admitted"]
 
-        plugin_snapshot, policy_catalog = service._plugin_policy_context(None)
+        plugin_snapshot, policy_catalog = service._policy_context.build(None)
         llm_messages: list[dict[str, Any]] = []
         dispatch, _advisor_calls_used = await service._dispatch_tool_batch(
             call_model=outcome,
@@ -253,6 +260,9 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
             progress=None,
             session_scope="test",
             advisor_calls_used=0,
+            composition_turns_used=0,
+            discovery_turns_used=0,
+            failed_turn=None,
             cancellation_requested=asyncio.Event(),
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
@@ -285,7 +295,7 @@ async def test_malformed_model_turn_retains_only_admitted_provider_facts() -> No
     recorder = BufferingRecorder()
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", return_value=provider_response),
+        patch("elspeth.web.composer.provider_gateway._litellm_acompletion", return_value=provider_response),
         pytest.raises(_MalformedLLMResponseError) as exc_info,
     ):
         await service._call_model_turn(
@@ -375,7 +385,7 @@ async def test_provider_timeout_carries_caller_turn_context() -> None:
         raise TimeoutError
 
     with (
-        patch.object(service, "_call_llm_with_audit", new=_time_out),
+        patch.object(service._provider_gateway, "_call_llm_with_audit", new=_time_out),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
         await service._call_llm_before_deadline(
@@ -423,7 +433,7 @@ def _mutating_set_source_tool(
     )
 
 
-async def _run_mutate_then_timeout(service: ComposerServiceImpl) -> tuple[ComposerConvergenceError, int]:
+async def _run_mutate_then_timeout(service: ComposerServiceImpl, session_id: str) -> tuple[ComposerConvergenceError, int]:
     """Drive a real ``_compose_loop``: one mutating turn, then a timeout.
 
     The fake raises ``TimeoutError`` from inside ``_call_llm``, which
@@ -438,17 +448,17 @@ async def _run_mutate_then_timeout(service: ComposerServiceImpl) -> tuple[Compos
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            return _make_llm_response(
-                tool_calls=[{"id": "c1", "name": "set_source", "arguments": _SET_SOURCE_ARGUMENTS}],
+            return _admit_composer_llm_completion(
+                _make_llm_response(tool_calls=[{"id": "c1", "name": "set_source", "arguments": _SET_SOURCE_ARGUMENTS}])
             )
         raise TimeoutError
 
     with (
-        patch.object(service, "_call_llm", new=_first_tool_then_timeout),
+        patch.object(service._provider_gateway, "_call_llm", new=_first_tool_then_timeout),
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=_mutating_set_source_tool),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
-        await service.compose("Build pipeline", [], _empty_state())
+        await service.compose("Build pipeline", [], _empty_state(), session_id=session_id)
     return exc_info.value, call_count
 
 
@@ -463,9 +473,9 @@ async def test_compose_loop_timeout_reports_the_turns_already_spent() -> None:
     which is precisely what a wiring test has to exclude.
     """
 
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
 
-    exc, call_count = await _run_mutate_then_timeout(service)
+    exc, call_count = await _run_mutate_then_timeout(service, session_id)
 
     assert exc.budget_exhausted == "timeout"
     assert call_count == 2
@@ -490,12 +500,12 @@ async def test_bonus_call_timeout_reports_the_charged_composition_turn() -> None
     ``"timeout"`` proves the raise came from inside the bonus call.
     """
 
-    service = ComposerServiceImpl.for_trained_operator(
+    service, session_id = _composer_service_with_session(
         catalog=_mock_catalog(),
         settings=_make_settings(composer_max_composition_turns=1),
     )
 
-    exc, call_count = await _run_mutate_then_timeout(service)
+    exc, call_count = await _run_mutate_then_timeout(service, session_id)
 
     assert exc.budget_exhausted == "timeout"
     assert call_count == 2

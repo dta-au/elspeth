@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.plugin_protocols import SinkProtocol, SourceProtocol
@@ -39,9 +41,14 @@ from elspeth.engine.orchestrator.types import AggregationFlushResult, ExecutionC
 from elspeth.engine.processor import RowProcessor
 from elspeth.engine.row_union_executor import RowUnionExecutor
 from elspeth.engine.spans import SpanFactory
-from elspeth.testing import make_source_row, make_source_row_quarantined
+from elspeth.testing import make_source_quarantine_result, make_source_row, make_source_row_quarantined
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
-_TOKEN = CoordinationToken(run_id="run-quarantine-sweep", worker_id="worker:run-quarantine-sweep:test", leader_epoch=1)
+
+@pytest.fixture
+def authority() -> CoordinationToken:
+    setup = make_recorder_with_run(run_id="run-quarantine-sweep", leader_worker_id="worker:run-quarantine-sweep:test")
+    return leader_coordination_token(setup.factory, setup.run_id)
 
 
 @contextmanager
@@ -50,6 +57,7 @@ def _null_track_operation(**_kwargs: Any):
 
 
 def _drive_quarantined_stream(
+    authority: CoordinationToken,
     *,
     row_union_executor: MagicMock | None = None,
     coalesce_executor: MagicMock | None = None,
@@ -71,6 +79,7 @@ def _drive_quarantined_stream(
         ceremony=MagicMock(spec=RunCeremony),
     )
     driver._quarantine_router = MagicMock(spec=QuarantineRouter)
+    driver._quarantine_router.route.side_effect = lambda *a, **kw: make_source_quarantine_result(sink_name="default")
     lifecycle = MagicMock(spec=SourceLifecycleRecorder)
     lifecycle.record_field_resolution.return_value = ({}, None)
     driver._lifecycle_recorder = lifecycle
@@ -81,6 +90,7 @@ def _drive_quarantined_stream(
 
     source = MagicMock(spec=SourceProtocol)
     source.name = "fake"
+    source.config = {}
     source.on_success = "default"
     sink = MagicMock(spec=SinkProtocol)
     sink.name = "default"
@@ -93,11 +103,13 @@ def _drive_quarantined_stream(
     driver.load_source_with_events = lambda run_id, ctx, active_source: iter(rows)  # type: ignore[method-assign]
 
     config = PipelineConfig(sources={"fake": source}, transforms=(), sinks={"default": sink})
+    ctx = MagicMock(spec=PluginContext)
+    ctx.require_coordination_token.return_value = authority
     loop_ctx = LoopContext(
         counters=ExecutionCounters(),
         pending_tokens={"default": []},
         processor=processor,
-        ctx=MagicMock(spec=PluginContext),
+        ctx=ctx,
         config=config,
         agg_transform_lookup={},
         coalesce_executor=coalesce_executor,
@@ -117,34 +129,35 @@ def _drive_quarantined_stream(
             active_source_name="fake",
             active_source=source,
             flush_end_of_input=False,
-            coordination_token=_TOKEN,
+            coordination_token=authority,
         )
 
     return driver
 
 
-def test_quarantined_row_boundaries_sweep_row_union_timeouts() -> None:
+def test_quarantined_row_boundaries_sweep_row_union_timeouts(authority: CoordinationToken) -> None:
     row_union_executor = MagicMock(spec=RowUnionExecutor)
     row_union_executor.get_registered_names.return_value = ["variant_union"]
     row_union_executor.check_timeouts.return_value = []
     row_union_executor.has_timeout_configured.return_value = False
 
-    driver = _drive_quarantined_stream(row_union_executor=row_union_executor)
+    driver = _drive_quarantined_stream(authority, row_union_executor=row_union_executor)
 
     assert driver._quarantine_router.route.call_count == 2
     # One sweep per ROW BOUNDARY: the valid row's normal-path sweep plus one
     # at EACH quarantined-row boundary. Before elspeth-c6d083d150 the
     # quarantine branch continued the loop without sweeping (count == 1).
     assert row_union_executor.check_timeouts.call_count == 3
-    row_union_executor.check_timeouts.assert_called_with("variant_union")
+    row_union_executor.check_timeouts.assert_called_with("variant_union", coordination_token=authority)
 
 
-def test_quarantined_row_boundaries_sweep_coalesce_timeouts() -> None:
+def test_quarantined_row_boundaries_sweep_coalesce_timeouts(authority: CoordinationToken) -> None:
     coalesce_executor = MagicMock(spec=CoalesceExecutor)
     coalesce_executor.get_registered_names.return_value = ["merge"]
     coalesce_executor.check_timeouts.return_value = []
 
     driver = _drive_quarantined_stream(
+        authority,
         coalesce_executor=coalesce_executor,
         coalesce_node_map={CoalesceName("merge"): NodeID("coalesce-node")},
     )
@@ -154,15 +167,15 @@ def test_quarantined_row_boundaries_sweep_coalesce_timeouts() -> None:
     # the valid row's normal-path sweep plus one at EACH quarantined-row
     # boundary. Before the fix the quarantine branch swept row_union only.
     assert coalesce_executor.check_timeouts.call_count == 3
-    coalesce_executor.check_timeouts.assert_called_with(coalesce_name="merge")
+    coalesce_executor.check_timeouts.assert_called_with(coalesce_name="merge", coordination_token=authority)
 
 
-def test_quarantined_row_boundaries_check_aggregation_timeouts() -> None:
+def test_quarantined_row_boundaries_check_aggregation_timeouts(authority: CoordinationToken) -> None:
     with patch(
         "elspeth.engine.orchestrator.source_iteration.check_aggregation_timeouts",
         return_value=AggregationFlushResult(),
     ) as check_timeouts:
-        driver = _drive_quarantined_stream()
+        driver = _drive_quarantined_stream(authority)
 
     assert driver._quarantine_router.route.call_count == 2
     # The valid row's BEFORE-processing check plus one at EACH quarantined-row
@@ -171,7 +184,7 @@ def test_quarantined_row_boundaries_check_aggregation_timeouts() -> None:
     assert check_timeouts.call_count == 3
 
 
-def test_shutdown_set_during_empty_first_fetch_records_interrupted_without_eof_flush() -> None:
+def test_shutdown_set_during_empty_first_fetch_records_interrupted_without_eof_flush(authority: CoordinationToken) -> None:
     driver = SourceIterationDriver(
         events=MagicMock(spec=EventBusProtocol),
         span_factory=MagicMock(spec=SpanFactory),
@@ -186,6 +199,7 @@ def test_shutdown_set_during_empty_first_fetch_records_interrupted_without_eof_f
     processor.collector_executor = None
     source = MagicMock(spec=SourceProtocol)
     source.name = "llm"
+    source.config = {}
     source.on_success = "default"
     sink = MagicMock(spec=SinkProtocol)
     sink.name = "default"
@@ -216,14 +230,14 @@ def test_shutdown_set_during_empty_first_fetch_records_interrupted_without_eof_f
         result = driver.run_main_processing_loop(
             loop_ctx,
             factory=MagicMock(spec=RecorderFactory),
-            run_id="run-pre-egress-shutdown",
+            run_id=authority.run_id,
             source_id=NodeID("src"),
             edge_map={},
             active_source_name="llm",
             active_source=source,
             shutdown_event=shutdown_event,
             flush_end_of_input=True,
-            coordination_token=_TOKEN,
+            coordination_token=authority,
         )
 
     assert result.interrupted is True

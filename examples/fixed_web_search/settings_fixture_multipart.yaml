@@ -1,0 +1,67 @@
+sources:
+  primary:
+    plugin: json
+    on_success: searches
+    options:
+      path: examples/fixed_web_search/runs_multipart/input.jsonl
+      format: jsonl
+      schema:
+        mode: fixed
+        fields:
+          - 'id: int'
+          - 'fixture_id: str'
+          - 'search_text: str'
+          - 'search_parts: any'
+      on_validation_failure: discard
+transforms:
+  - name: search_page
+    plugin: web_scrape
+    input: searches
+    on_success: results
+    on_error: search_failures
+    options:
+      url: http://127.0.0.1:8213/multipart-search
+      method: POST
+      request_multipart_field: search_parts
+      query_fields:
+        fixture_id: fixture_id
+      content_field: result_html
+      fingerprint_field: result_fingerprint
+      format: raw
+      records:
+        field: candidates
+        selector: main li
+        max_records: 10
+        columns:
+          - field: name
+            required: true
+      http:
+        abuse_contact: examples@example.com
+        scraping_reason: Local multipart search fixture
+        timeout: 5
+        allowed_hosts:
+          - 127.0.0.0/8
+        allowed_origins:
+          - http://127.0.0.1:8213
+      schema: {mode: observed}
+sinks:
+  results:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/fixed_web_search/output_multipart/results.jsonl
+      schema: {mode: observed}
+      format: jsonl
+  search_failures:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/fixed_web_search/output_multipart/failures.jsonl
+      schema: {mode: observed}
+      format: jsonl
+landscape:
+  url: sqlite:///examples/fixed_web_search/runs_multipart/audit.db
+payload_store:
+  base_path: examples/fixed_web_search/runs_multipart/payloads
+concurrency:
+  max_workers: 1

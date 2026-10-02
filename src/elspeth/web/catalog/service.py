@@ -35,6 +35,7 @@ from elspeth.web.catalog.schema_parse import (
     required_secret_fields_from_json_schema,
 )
 from elspeth.web.catalog.schemas import (
+    AggregationOutputMode,
     ConfigFieldSummary,
     PluginKind,
     PluginSchemaInfo,
@@ -301,7 +302,19 @@ class CatalogServiceImpl:
             secret_requirements=self._secret_requirements(plugin_cls, schema=json_schema),
             web_config_authority=plugin_cls.web_config_authority,
             policy_capabilities=tuple(sorted(plugin_cls.policy_capabilities)),
+            aggregation_output_modes=self._aggregation_output_modes(plugin_cls, plugin_type),
         )
+
+    @staticmethod
+    def _aggregation_output_modes(plugin_cls: PluginClass, plugin_type: PluginKind) -> tuple[AggregationOutputMode, ...]:
+        if plugin_type != "transform":
+            return ()
+        transform_cls = cast(type[TransformProtocol], plugin_cls)
+        if not transform_cls.is_batch_aware:
+            return ()
+        if transform_cls.flush_emits_one_row_per_buffered_row:
+            return ("transform", "passthrough")
+        return ("transform",)
 
     def _discovery_composer_hints(self, plugin_cls: PluginClass) -> tuple[str, ...]:
         """Pull discovery-time composer_hints from a plugin's assistance hook.
@@ -406,6 +419,7 @@ class CatalogServiceImpl:
             usage_when_not_to_use=usage_when_not_to_use,
             example_use=example_use,
             capability_tags=capability_tags,
+            aggregation_output_modes=self._aggregation_output_modes(plugin_cls, plugin_type),
             web_config_authority=plugin_cls.web_config_authority,
             policy_capabilities=tuple(sorted(plugin_cls.policy_capabilities)),
             audit_characteristics=audit_characteristics,

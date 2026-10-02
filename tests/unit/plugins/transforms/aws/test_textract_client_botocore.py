@@ -18,9 +18,12 @@ from typing import Any, cast
 
 import pytest
 from botocore.stub import Stubber
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 from elspeth.contracts import CallStatus
 from elspeth.contracts.audit_protocols import CallRecorder
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.transforms.aws.textract_client import (
     TextractClient,
     TextractIdempotencyInvariantError,
@@ -38,7 +41,7 @@ class RecordingExecution:
 
     calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         assert state_id == "state-1"
         return len(self.calls)
 
@@ -61,6 +64,7 @@ def _client(sdk: Any) -> tuple[TextractClient, RecordingExecution, list[Any]]:
     execution = RecordingExecution()
     events: list[Any] = []
     client = TextractClient(
+        **mock_item_audit_authority("run-1"),
         execution=cast("CallRecorder", execution),
         state_id="state-1",
         run_id="run-1",

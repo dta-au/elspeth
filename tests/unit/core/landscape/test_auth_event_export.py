@@ -1,0 +1,197 @@
+"""Auth history must be explicitly covered by signed run exports."""
+
+import hashlib
+import hmac
+from datetime import timedelta
+
+import pytest
+from sqlalchemy import select
+
+from elspeth.contracts.audit_export import derive_public_export_config_hash
+from elspeth.contracts.hashing import canonical_json
+from elspeth.core.landscape.auth_audit_repository import AuthAuditRepository
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.exporter import LandscapeExporter
+from elspeth.core.landscape.schema import auth_events_table
+from tests.unit.core.landscape.test_audit_export_read_model import COMPLETED_AT, _insert_run
+
+
+def _event(db: LandscapeDB, event_id: str, *, after: bool = False, metadata: dict[str, object] | None = None) -> None:
+    _, values = AuthAuditRepository._auth_event_values(
+        event_type="role_granted",
+        outcome="success",
+        provider="vanguard",
+        user_id="subject",
+        username="Person",
+        failure_category=None,
+        request_id=None,
+        client_host=None,
+        user_agent=None,
+        metadata={"role": "admin"} if metadata is None else metadata,
+        identity_id="target-identity",
+    )
+    values["event_id"] = event_id
+    values["occurred_at"] = COMPLETED_AT + timedelta(seconds=1 if after else -1)
+    with db.engine.begin() as conn:
+        conn.execute(auth_events_table.insert().values(values))
+
+
+def test_default_export_declares_auth_history_omitted() -> None:
+    with LandscapeDB.in_memory() as db:
+        _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
+        _event(db, "event")
+        records = list(LandscapeExporter(db, compartment_id="research-a").export_run("run", sign=False))
+        public_config = next(row["public_config"] for row in records if row["record_type"] == "audit_export_config")
+        assert public_config["compartment_id"] == "research-a"
+        coverage = [row for row in records if row["record_type"] == "auth_event_coverage"]
+        assert len(coverage) == 1
+        assert coverage[0]["policy"] == "omitted"
+        assert coverage[0]["selected_count"] is None
+
+
+@pytest.mark.parametrize("signed", [False, True])
+def test_both_export_signing_modes_bind_compartment_in_public_config(signed: bool) -> None:
+    with LandscapeDB.in_memory() as db:
+        _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
+        exporter = LandscapeExporter(
+            db,
+            signing_key=b"test-compartment-export-key" if signed else None,
+            signer_key_id="test" if signed else None,
+            compartment_id="research-a",
+        )
+        records = list(exporter.export_run("run", sign=signed))
+        config_record = next(row for row in records if row["record_type"] == "audit_export_config")
+        public_config = config_record["public_config"]
+        assert public_config["exporter_version"] == "landscape-exporter-auth-v2"
+        assert public_config["compartment_id"] == "research-a"
+        assert public_config["signing_mode"] == ("hmac_sha256" if signed else "unsigned")
+        bundle = exporter.derive_run_bundle("run", sign=signed)
+        assert bundle.public_export_config_hash == derive_public_export_config_hash(public_config)
+        assert ("signature" in config_record) is signed
+
+
+def test_signed_deployment_export_includes_stored_history_and_empty_coverage() -> None:
+    with LandscapeDB.in_memory() as db:
+        _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
+        exporter = LandscapeExporter(
+            db,
+            signing_key=b"test-auth-export-key",
+            signer_key_id="test",
+            auth_events="deployment_snapshot",
+            row_batch_size=1,
+            compartment_id="research-a",
+        )
+        empty = list(exporter.export_run("run", sign=True))
+        assert next(row for row in empty if row["record_type"] == "auth_event_coverage")["selected_count"] == 0
+        for name in ("c", "a", "b"):
+            _event(db, name)
+        _event(db, "future", after=True)
+        with db.engine.connect() as conn:
+            assert len(conn.execute(select(auth_events_table)).all()) == 4
+        records = list(exporter.export_run("run", sign=True))
+        events = [row for row in records if row["record_type"] == "auth_event"]
+        assert [row["event_id"] for row in events] == ["a", "b", "c"]
+        assert events[0]["metadata"] == {"role": "admin"}
+        assert events[0]["identity_id"] == "target-identity"
+        assert "organisation_id" not in events[0]
+        coverage = next(row for row in records if row["record_type"] == "auth_event_coverage")
+        assert coverage["selected_count"] == 3
+        assert all("signature" in row for row in records)
+
+
+def test_signed_export_reads_auth_metadata_double_beyond_2_53_as_the_stored_double() -> None:
+    """Stored canonical metadata prints 1e17 as ``100000000000000000``; export reads the double back."""
+    with LandscapeDB.in_memory() as db:
+        _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
+        _event(db, "big", metadata={"quota": 1e17})
+        exporter = LandscapeExporter(
+            db,
+            signing_key=b"test-auth-export-key",
+            signer_key_id="test",
+            auth_events="deployment_snapshot",
+            compartment_id="research-a",
+        )
+        records = list(exporter.export_run("run", sign=True))
+        event = next(row for row in records if row["record_type"] == "auth_event")
+        assert type(event["metadata"]["quota"]) is float
+        assert event["metadata"]["quota"] == 1e17
+        assert all("signature" in row for row in records)
+
+
+def test_signed_compartment_export_binds_marking_in_verifiable_public_config() -> None:
+    key = b"test-compartment-export-key"
+    with LandscapeDB.in_memory() as db:
+        _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
+        exporter = LandscapeExporter(
+            db,
+            signing_key=key,
+            signer_key_id="test",
+            compartment_id="research-a",
+            exporter_version="landscape-exporter-auth-v2",
+        )
+        records = list(exporter.export_run("run", sign=True))
+        config_record = next(row for row in records if row["record_type"] == "audit_export_config")
+        public_config = config_record["public_config"]
+        assert public_config["compartment_id"] == "research-a"
+        assert derive_public_export_config_hash(public_config)
+        unsigned = dict(config_record)
+        signature = unsigned.pop("signature")
+        assert signature == hmac.new(key, canonical_json(unsigned).encode("utf-8"), hashlib.sha256).hexdigest()
+
+        tampered = dict(public_config)
+        tampered["compartment_id"] = "research-b"
+        assert derive_public_export_config_hash(tampered) != derive_public_export_config_hash(public_config)
+        tampered_record = {**unsigned, "public_config": tampered}
+        assert signature != hmac.new(key, canonical_json(tampered_record).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+@pytest.mark.parametrize("signed", [False, True])
+def test_compartment_export_refuses_missing_marking(signed: bool) -> None:
+    with LandscapeDB.in_memory() as db:
+        _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
+        with pytest.raises(ValueError, match="compartment_id"):
+            exporter = LandscapeExporter(
+                db,
+                signing_key=b"test-compartment-export-key" if signed else None,
+                signer_key_id="test" if signed else None,
+            )
+            list(exporter.export_run("run", sign=signed))
+
+
+@pytest.mark.parametrize("legacy_version", ["landscape-exporter-v1", "landscape-exporter-auth-v1"])
+@pytest.mark.parametrize("signed", [False, True])
+def test_export_refuses_explicit_legacy_version(legacy_version: str, signed: bool) -> None:
+    with LandscapeDB.in_memory() as db:
+        _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
+        with pytest.raises(ValueError, match="exporter_version"):
+            exporter = LandscapeExporter(
+                db,
+                signing_key=b"test-compartment-export-key" if signed else None,
+                signer_key_id="test" if signed else None,
+                exporter_version=legacy_version,
+                compartment_id="research-a",
+            )
+            list(exporter.export_run("run", sign=signed))
+
+
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("export_format", ["json", "csv"])
+def test_auth_history_pure_and_spooled_derivation_are_identical(signed: bool, export_format: str) -> None:
+    with LandscapeDB.in_memory() as db:
+        _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
+        _event(db, "first")
+        _event(db, "second")
+        exporter = LandscapeExporter(
+            db,
+            signing_key=b"test-auth-export-key" if signed else None,
+            signer_key_id="test" if signed else None,
+            auth_events="deployment_snapshot",
+            exporter_version="landscape-exporter-auth-v2",
+            compartment_id="research-a",
+            export_format=export_format,
+            per_chunk_record_limit=1,
+        )
+        streamed = list(exporter.export_run("run", sign=signed))
+        derived = exporter.derive_run_bundle("run", sign=signed)
+        assert streamed == [*derived.record_objects, derived.final_manifest]
+        assert len(derived.chunks) == len(derived.record_objects)

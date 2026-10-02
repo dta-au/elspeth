@@ -28,14 +28,19 @@ from elspeth.contracts import (
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.config.runtime import RuntimeTelemetryConfig
-from elspeth.contracts.coordination import CoordinationToken, mint_worker_id
-from elspeth.contracts.errors import ExecutionError
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken, mint_worker_id
+from elspeth.contracts.errors import ExecutionError, FrameworkBugError
+from elspeth.contracts.events import ExternalCallCompleted, TelemetryEvent
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.scheduler.payload_codec import serialize_row_payload
+from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.orchestrator import prepare_for_run
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.plugins.transforms.aws.guardrails_live_check import run_guardrail_live_check
@@ -43,7 +48,7 @@ from elspeth.plugins.transforms.llm.model_catalog import read_openrouter_catalog
 from elspeth.telemetry import create_telemetry_manager
 from elspeth.web.audit_readiness.service import build_plugin_policy_readiness
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
-from elspeth.web.composer.service import _litellm_acompletion
+from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.config import settings_from_env
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.service import _build_web_plugin_policy_evidence
@@ -220,6 +225,7 @@ def _bedrock_receipt_projection(
             temperature=None,
             seed=None,
             response=response,
+            credential_surface="aws_ecs_bedrock_response",
         )
     except Exception:
         raise AcceptanceCheckError("bedrock_metadata") from None
@@ -229,6 +235,7 @@ def _bedrock_receipt_projection(
         "not_available": "unavailable",
         "response_usage.cost": "provider_reported",
         "_hidden_params.response_cost": "litellm_calculated",
+        "litellm.cost_per_token": "litellm_calculated",
     }
     cost_source = cost_sources[record.provider_cost_source]
     return {
@@ -599,9 +606,10 @@ def verify_bedrock_guardrails(
     settings_loader: Callable[[], Any] = settings_from_env,
     registry_factory: Callable[[Any], Any] = _build_operator_profile_registry,
     execution: Any,
+    member_token: WorkerMembershipToken,
+    work_item: TokenWorkItem,
     checker: Callable[..., Any] = run_guardrail_live_check,
-    telemetry_emit: Callable[[Any], None] = lambda _event: None,
-    run_id: str = "guardrail-acceptance-run",
+    telemetry_emit: Callable[[TelemetryEvent], None] = lambda _event: None,
     state_id: str = "guardrail-acceptance-state",
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> dict[str, object]:
@@ -635,8 +643,10 @@ def verify_bedrock_guardrails(
                 safe_text=safe_text,
                 blocked_text=blocked_text,
                 execution=execution,
+                member_token=member_token,
+                work_item=work_item,
                 state_id=state_id,
-                run_id=run_id,
+                run_id=member_token.run_id,
                 telemetry_emit=telemetry_emit,
             )
         except Exception:
@@ -730,33 +740,52 @@ def run_bedrock_guardrails_live(
                 # The epoch-1 seat begin_run minted for this worker (ADR-030
                 # uniformity rule); every Landscape write below presents it.
                 coordination_token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=1)
+                member_token = coordination_token.membership
                 node = repositories.data_flow.register_node(
-                    run.run_id,
                     "aws_bedrock_guardrails_acceptance",
                     NodeType.TRANSFORM,
                     "1.0.0",
                     {},
+                    coordination_token=coordination_token,
                     determinism=Determinism.EXTERNAL_CALL,
                     schema_config=SchemaConfig.from_dict({"mode": "observed"}),
                 )
-                _row, token = repositories.data_flow.create_row_with_token(
-                    run.run_id,
+                row, token = repositories.data_flow.create_row_with_token(
                     node.node_id,
                     0,
                     {"check": "bedrock-guardrails"},
+                    coordination_token=coordination_token,
                     source_row_index=0,
                     ingest_sequence=0,
+                )
+                work_item = repositories.scheduler.enqueue_ready_claimed(
+                    member_token=member_token,
+                    token_id=token.token_id,
+                    row_id=row.row_id,
+                    node_id=node.node_id,
+                    step_index=0,
+                    ingest_sequence=0,
+                    row_payload_json=serialize_row_payload(
+                        PipelineRow(
+                            {"check": "bedrock-guardrails"},
+                            SchemaContract(mode="OBSERVED", fields=(), locked=True),
+                        )
+                    ),
+                    lease_owner=worker_id,
+                    lease_seconds=300,
                 )
                 state = repositories.execution.begin_node_state(
                     token.token_id,
                     node.node_id,
-                    run.run_id,
                     0,
                     {"check": "bedrock-guardrails"},
+                    member_token=member_token,
                 )
                 audit_proofs: list[bool] = []
 
-                def emit_after_persisted_audit(event: Any) -> None:
+                def emit_after_persisted_audit(event: TelemetryEvent) -> None:
+                    if not isinstance(event, ExternalCallCompleted):
+                        raise FrameworkBugError("Guardrail audit forwarding requires ExternalCallCompleted")
                     calls = repositories.query.get_calls(state.state_id)
                     latest = calls[-1] if calls else None
                     expected_index = len(audit_proofs)
@@ -780,10 +809,14 @@ def run_bedrock_guardrails_live(
 
                 def record_guardrails_failure() -> None:
                     duration_ms = max(0.0, (time.monotonic() - started) * 1000)
-                    error_hash = _sha256(b"bedrock-guardrails-acceptance-failed")
+                    # The engine's 16-character error fingerprint of the message
+                    # recorded on the node state below, not a full digest of an
+                    # unrelated label: ``token_outcomes.error_hash`` is 16 hex.
+                    error_hash = compute_error_hash("acceptance check failed", exception_type="AcceptanceCheckError")
                     repositories.execution.complete_node_state(
                         state.state_id,
                         NodeStateStatus.FAILED,
+                        member_token=member_token,
                         error=ExecutionError(
                             exception="acceptance check failed",
                             exception_type="AcceptanceCheckError",
@@ -794,7 +827,14 @@ def run_bedrock_guardrails_live(
                         token_ref,
                         TerminalOutcome.FAILURE,
                         TerminalPath.UNROUTED,
+                        member_token=member_token,
+                        work_item=work_item,
                         error_hash=error_hash,
+                    )
+                    repositories.scheduler.mark_failed(
+                        member_token=member_token,
+                        work_item_id=work_item.work_item_id,
+                        expected_lease_owner=worker_id,
                     )
                     repositories.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=coordination_token)
 
@@ -804,9 +844,10 @@ def run_bedrock_guardrails_live(
                         settings_loader=lambda: settings,
                         registry_factory=registry_factory,
                         execution=repositories.execution,
+                        member_token=member_token,
+                        work_item=work_item,
                         checker=checker,
                         telemetry_emit=emit_after_persisted_audit,
-                        run_id=run.run_id,
                         state_id=state.state_id,
                         now=now,
                     )
@@ -838,6 +879,7 @@ def run_bedrock_guardrails_live(
                 repositories.execution.complete_node_state(
                     state.state_id,
                     NodeStateStatus.COMPLETED,
+                    member_token=member_token,
                     output_data={"check": "bedrock-guardrails", "ok": True},
                     duration_ms=duration_ms,
                 )
@@ -845,7 +887,14 @@ def run_bedrock_guardrails_live(
                     token_ref,
                     TerminalOutcome.SUCCESS,
                     TerminalPath.DEFAULT_FLOW,
+                    member_token=member_token,
+                    work_item=work_item,
                     sink_name="acceptance",
+                )
+                repositories.scheduler.mark_terminal(
+                    member_token=member_token,
+                    work_item_id=work_item.work_item_id,
+                    expected_lease_owner=worker_id,
                 )
                 repositories.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=coordination_token)
         except AcceptanceCheckError:

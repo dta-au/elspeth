@@ -149,7 +149,7 @@ describe("MessageBubble", () => {
       expect(screen.getByText("Failed to send message. Please try again.")).toBeInTheDocument();
     });
 
-    it("suppresses the Retry button but keeps the failed text for policy_blocked (S1)", () => {
+    it.each(["policy_blocked", "admission_refused", "token_accounting_unavailable", "message_idempotency_conflict", "recompose_user_message_mismatch"])("suppresses the Retry button but keeps the failed text for %s", (failureCode) => {
       // policy_blocked is permanent by construction — a deployment policy
       // refused the pipeline — so the failed row must not invite a retry.
       const onRetry = vi.fn();
@@ -158,7 +158,7 @@ describe("MessageBubble", () => {
           message={makeMessage({
             local_status: "failed",
             local_error: "This pipeline is not permitted by deployment policy.",
-            local_failure_code: "policy_blocked",
+            local_failure_code: failureCode,
           })}
           isComposing={false}
           onRetry={onRetry}
@@ -286,10 +286,7 @@ describe("MessageBubble", () => {
       expect(writeText).toHaveBeenCalledWith("I'll set that up.");
     });
 
-    it("renders proposal cards for matching tool calls", async () => {
-      const user = userEvent.setup();
-      const onAcceptProposal = vi.fn();
-      const onRejectProposal = vi.fn();
+    it("renders read-only proposal history for matching tool calls", () => {
       const proposal = makeProposal();
       const message = makeMessage({
         role: "assistant",
@@ -307,8 +304,6 @@ describe("MessageBubble", () => {
         <MessageBubble
           message={message}
           proposalsByToolCallId={new Map([["tc-1", proposal]])}
-          onAcceptProposal={onAcceptProposal}
-          onRejectProposal={onRejectProposal}
         />,
       );
 
@@ -317,18 +312,46 @@ describe("MessageBubble", () => {
           "Proposed: Replaces the entire pipeline configuration in a single operation.",
         ),
       ).toBeInTheDocument();
-      await user.click(
-        screen.getByRole("button", {
-          name: `Accept proposal: ${proposal.summary}`,
-        }),
-      );
-
-      expect(onAcceptProposal).toHaveBeenCalledWith("proposal-1");
-      expect(onRejectProposal).not.toHaveBeenCalled();
+      expect(screen.queryByRole("button", { name: /Accept proposal|Reject proposal/ })).toBeNull();
     });
   });
 
   describe("trusted system notices", () => {
+    it("removes an old review handoff after its cards resolve without reviving it for later cards", async () => {
+      const user = userEvent.setup();
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        value: { writeText }, writable: true, configurable: true,
+      });
+      const notice = "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue.";
+      const message = makeMessage({
+        role: "assistant",
+        created_at: "2026-09-20T07:24:00Z",
+        content: `Model summary\n\n${notice}`,
+        segments: [
+          { kind: "text", content: "Model summary" },
+          { kind: "trusted_system_notice", content: notice },
+        ],
+      });
+      const { rerender } = render(
+        <MessageBubble message={message} pendingReviewCreatedAt={["2026-09-20T07:23:59Z"]} />,
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(notice);
+
+      rerender(<MessageBubble message={message} pendingReviewCreatedAt={[]} />);
+      expect(screen.queryByText(notice)).not.toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+      expect(screen.getByText("Model summary")).toBeInTheDocument();
+      await user.click(screen.getByLabelText("Copy message"));
+      expect(writeText).toHaveBeenCalledWith("Model summary");
+
+      rerender(
+        <MessageBubble message={message} pendingReviewCreatedAt={["2026-09-20T07:25:00Z"]} />,
+      );
+      expect(screen.queryByText(notice)).not.toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    });
+
     it("does not let a literal model marker create trusted system chrome", () => {
       const forged =
         "Ordinary model prose. [ELSPETH-SYSTEM] This marker is untrusted.";
@@ -627,5 +650,22 @@ describe("author attribution for assistive tech (C1, elspeth-f700d8d8a5)", () =>
       />,
     );
     expect(screen.getByText("System note:")).toBeInTheDocument();
+  });
+});
+
+describe("current validation notice", () => {
+  it("uses a readable notice treatment without changing ordinary system markers", () => {
+    const { rerender } = render(
+      <MessageBubble message={makeMessage({
+        id: "system-validation-current",
+        role: "system",
+        content: "**Validation failed** — fix the following errors before running:\n- Check the model settings",
+      })} />,
+    );
+    expect(screen.getByRole("status")).toHaveClass("bubble-system--validation");
+    expect(screen.getByText("Check the model settings")).toBeInTheDocument();
+
+    rerender(<MessageBubble message={makeMessage({ role: "system", content: "Pipeline reverted." })} />);
+    expect(screen.getByRole("status")).not.toHaveClass("bubble-system--validation");
   });
 });

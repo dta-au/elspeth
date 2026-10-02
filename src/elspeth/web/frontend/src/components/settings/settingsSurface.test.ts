@@ -178,7 +178,9 @@ describe("bordered settings cards are not sharper than the dialog framing them (
     for (const selector of [
       ".secrets-list-item",
       ".user-admin-password-banner",
-      ".user-admin-create-form",
+      // The bordered form card of People & access, which took over from the
+      // User management dialog's create form.
+      ".identity-admin-form",
     ]) {
       const radius = px(declaredValue(selector, "border-radius"));
       expect(radius, `${selector} still carries the badge radius`).toBe(
@@ -229,7 +231,7 @@ describe("the composer-preferences fieldsets carry real chrome (elspeth-03f43bde
   it("labels its groups the way the sibling form in this dialog family does", () => {
     for (const property of ["font-size", "font-weight", "text-transform"]) {
       expect(declaredValue(".composer-preferences-legend", property)).toBe(
-        declaredValue(".user-admin-create-form legend", property),
+        declaredValue(".people-direction legend", property),
       );
     }
   });
@@ -293,8 +295,8 @@ describe("the settings forms compose the shared input primitive (elspeth-2580a7b
   });
 
   it("keeps the create row's field and its button on one control rung", () => {
-    // .user-admin-create-fields is align-items: flex-end, so a button shorter
-    // than the fields shows the difference as a step at the top edge.
+    // .people-filters and .identity-admin-toolbar are align-items: end, so a
+    // button shorter than the fields shows the difference as a step at the top edge.
     expect(px(declaredValue(".input", "min-height"))).toBe(
       px(declaredValue(".btn", "min-height")),
     );

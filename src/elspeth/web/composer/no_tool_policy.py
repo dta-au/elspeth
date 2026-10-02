@@ -78,6 +78,15 @@ def _bare_trusted_suffix(notice: str) -> str:
     return _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + notice
 
 
+_REVIEW_REPLY_UNAVAILABLE_NOTICE: Final = "The model's final reply is unavailable. Please retry your question."
+_REVIEW_REPLY_UNAVAILABLE_SUFFIX = _bare_trusted_suffix(_REVIEW_REPLY_UNAVAILABLE_NOTICE)
+
+
+def compose_review_reply_unavailable_message(content: str) -> str:
+    """Keep a missing provider reply distinct from model-authored prose."""
+    return content + _REVIEW_REPLY_UNAVAILABLE_SUFFIX
+
+
 _EMPTY_STATE_NOTICE_HEADER: Final = "The pipeline is still empty — the composer did not complete a valid build this turn."
 _EMPTY_STATE_NOTICE_NEXT_STEP: Final = (
     "To continue: refine your request with more specifics, or reply telling the composer to retry with the plan it described above."
@@ -120,12 +129,21 @@ ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE: Final = (
     "ELSPETH withheld the composer's own summary of this exchange; verify the pipeline before assuming every requested change was applied."
 )
 
-_ADVISOR_SIGNOFF_PENDING_NOTICE: Final = (
+# The END-gate blocked notices below are ``_PUBLISHED_``: a blocked turn
+# publishes the composer's reply beside the notice (ruling 2026-09-22,
+# elspeth-032ec69c41), so none of them may claim the reply was withheld. Only
+# the advisor-repair replacer (``service._replace_advisor_repair_public_result``)
+# still replaces the model's prose, and two of its branches reuse a blocked
+# notice: sign-off pending and pending handoff. Those two alone also exist in a
+# withheld form, DEFINED as the published notice + the withheld-prose
+# disclosure so the pair cannot drift.
+_ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE: Final = (
     "Completion advisory review did not clear after the available attempts. "
-    "Composer completion is withheld. Review the pipeline; validation and the advisory review run again on your next message. "
-    + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+    "Composer completion is withheld. Review the pipeline; validation and the advisory review run again after your next pipeline change."
 )
+_ADVISOR_SIGNOFF_PENDING_NOTICE: Final = _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE + " " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_PENDING_NOTICE)
+_ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE)
 
 # elspeth-2ae50afcd1 facet B (operator-adjudicated 2026-09-02): the FOURTH
 # preflight shape the END advisor gate can hold — ``runtime_preflight is
@@ -138,12 +156,76 @@ _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF
 # (``ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE``, elspeth-88592f5be7) already
 # states it plainly. Fail-closed STRUCTURE is unchanged (every readiness axis
 # stays withheld); only the wording stops claiming a preflight ran.
-_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE: Final = (
+#
+# Ruling 2026-09-22 (elspeth-032ec69c41): the END gate stands aside for an
+# unchanged graph whose prior state row carries a GRAPH REJECTION, so that
+# block is re-reviewed only after the next pipeline change — every rendered-
+# flag notice says so, this ABSENT one included. The ABSENT shape arises only
+# on an unchanged turn, but since 41aeaeac0 an advisor decision is persisted
+# even when the graph did not move, so the next unchanged message meets the
+# skip. (Unrendered verdicts and message rejections are re-reviewed on the
+# next message; they carry their own notices.)
+_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE: Final = (
     "Completion advisory review did not clear after the available attempts. "
     "Composer completion is withheld. Pipeline readiness was not re-verified this turn; "
-    "validation and the advisory review run again on your next message. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+    "validation and the advisory review run again after your next pipeline change."
 )
-_ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE)
+_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE)
+
+# The two notices above say the review "did not clear", which is true only
+# when the advisor RENDERED a verdict (a FLAG). The red shape already splits
+# its footer by verdict class (elspeth-b61894d93d); the green and absent
+# shapes did not, so an advisor outage on a validated build told the user the
+# review did not clear and to "Review the pipeline" — a pipeline with nothing
+# wrong — while the real remedy reached no published surface on green. These
+# are the unrendered-verdict (unavailable / malformed) counterparts. Fixed
+# operator-authored prose: no advisor output is interpolated (R2-F13), and the
+# absent variants keep the facet B discipline of making no readiness claim.
+_ADVISOR_SIGNOFF_UNAVAILABLE_CAUSE: Final = (
+    "Completion advisory review could not be obtained: the advisor model was unavailable after retry. Composer completion is withheld."
+)
+_ADVISOR_SIGNOFF_MALFORMED_CAUSE: Final = (
+    "Completion advisory review could not be obtained: the advisor returned no usable verdict after a format retry. "
+    "Composer completion is withheld."
+)
+# Provider failures are retried on a later turn even when the graph is unchanged.
+_ADVISOR_SIGNOFF_UNRENDERED_VERIFIED_NEXT_STEP: Final = (
+    "Retry the request, or check the advisor model configuration; validation and the advisory review run again on your next message."
+)
+_ADVISOR_SIGNOFF_UNRENDERED_UNVERIFIED_NEXT_STEP: Final = (
+    "Retry the request, or check the advisor model configuration; validation and the advisory review run again on your next message."
+)
+_ADVISOR_SIGNOFF_READINESS_NOT_REVERIFIED_CLAUSE: Final = "Pipeline readiness was not re-verified this turn."
+# GREEN shape (the preflight ran and passed).
+_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE: Final = (
+    _ADVISOR_SIGNOFF_UNAVAILABLE_CAUSE + " " + _ADVISOR_SIGNOFF_UNRENDERED_VERIFIED_NEXT_STEP
+)
+_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE)
+_ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE: Final = (
+    _ADVISOR_SIGNOFF_MALFORMED_CAUSE + " " + _ADVISOR_SIGNOFF_UNRENDERED_VERIFIED_NEXT_STEP
+)
+_ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE)
+# ABSENT shape (no preflight ran this turn).
+_ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE: Final = (
+    _ADVISOR_SIGNOFF_UNAVAILABLE_CAUSE
+    + " "
+    + _ADVISOR_SIGNOFF_READINESS_NOT_REVERIFIED_CLAUSE
+    + " "
+    + _ADVISOR_SIGNOFF_UNRENDERED_UNVERIFIED_NEXT_STEP
+)
+_ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(
+    _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE
+)
+_ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE: Final = (
+    _ADVISOR_SIGNOFF_MALFORMED_CAUSE
+    + " "
+    + _ADVISOR_SIGNOFF_READINESS_NOT_REVERIFIED_CLAUSE
+    + " "
+    + _ADVISOR_SIGNOFF_UNRENDERED_UNVERIFIED_NEXT_STEP
+)
+_ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(
+    _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE
+)
 
 # elspeth-25f7b757e7 (A1, budget displacement): published when the END gate's
 # deterministic pre-scan FLAGGED the USER'S OWN chat message — the one
@@ -168,44 +250,45 @@ _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER: Final = (
     "is withheld."
 )
 # GREEN — the only shape where the affirmative pipeline claim is true.
-_ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE: Final = (
-    _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER
-    + " No pipeline change is needed — reword your message and resend. "
-    + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+_ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_NOTICE: Final = (
+    _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER + " No pipeline change is needed — reword your message and resend."
 )
-_ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE)
+_ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_NOTICE)
 # ABSENT — no preflight ran this turn, so no pipeline claim at all (the
 # facet B discipline: unknown readiness is stated as unknown).
-_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE: Final = (
+_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_NOTICE: Final = (
     _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER
     + " Pipeline readiness was not re-verified this turn. Reword your message and resend; validation and "
-    "the advisory review run again on your next message. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+    "the advisory review run again on your next message."
 )
-_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE)
+_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(
+    _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_NOTICE
+)
 # PENDING HANDOFF — a required interpretation review is still outstanding,
 # so rewording is never the only remaining step (the ac85b0ab0e class).
-_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE: Final = (
+_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_PUBLISHED_NOTICE: Final = (
     _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER
     + " A required interpretation review is also pending, so rewording is not the only remaining step: "
-    "reword your message and resend, then resolve the pending review cards. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+    "reword your message and resend, then resolve the pending review cards."
 )
-_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE)
+_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(
+    _ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_PUBLISHED_NOTICE
+)
 # RED — the validator's leading objection rides the untrusted ``Cause:``
 # region (same trust class and treatment as the preflight wrapper's
 # interpolation): rewording a chat message cannot fix a broken pipeline, so
 # hiding the objection would tell the user with a broken pipeline there is
 # nothing to fix.
-_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER: Final = (
-    "Rewording alone will not make this pipeline runnable — fix the validation failure above as well. "
-    + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_FOOTER: Final = (
+    "Rewording alone will not make this pipeline runnable — fix the validation failure above as well."
 )
-_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
     _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER,
-    _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER,
+    _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_FOOTER,
     diagnostic_slots="{detail}{suggestion_block}",
 )
-_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE = _bare_trusted_suffix(
-    _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER
+_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_BARE = _bare_trusted_suffix(
+    _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_FOOTER
 )
 
 # elspeth-b61894d93d: the advisor-blocked RED terminals for the OTHER three
@@ -220,29 +303,31 @@ _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE = _bare_trusted_suffix(
 # advisory situation rides a per-reason-class footer — the flagged footer
 # keeps the did-not-clear framing, the unrendered footer keeps the
 # could-not-be-obtained framing, because each is true only for its class.
-_ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER: Final = (
+_ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER: Final = (
     "The completion advisory review also did not clear after the available attempts, so composer "
     "completion is withheld. Fix the validation failure above; validation and the advisory review run "
-    "again on your next message. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+    "again after your next pipeline change."
 )
-_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+_ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
     _PREFLIGHT_NOTICE_HEADER,
-    _ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
+    _ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER,
     diagnostic_slots="{detail}{suggestion_block}",
 )
-_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE = _bare_trusted_suffix(_PREFLIGHT_NOTICE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER)
-_ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER: Final = (
+_ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_BARE = _bare_trusted_suffix(
+    _PREFLIGHT_NOTICE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER
+)
+_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER: Final = (
     "The evidence-scoped completion advisory review could also not be obtained, so the Composer cannot "
     "mark this turn complete. Fix the validation failure above; validation and the advisory review run "
-    "again on your next message. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+    "again on your next message."
 )
-_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
     _PREFLIGHT_NOTICE_HEADER,
-    _ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
+    _ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER,
     diagnostic_slots="{detail}{suggestion_block}",
 )
-_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE = _bare_trusted_suffix(
-    _PREFLIGHT_NOTICE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER
+_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_SUFFIX_BARE = _bare_trusted_suffix(
+    _PREFLIGHT_NOTICE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER
 )
 
 # elspeth-66717f0c99: the third preflight shape the END advisor gate can hold —
@@ -256,12 +341,16 @@ _ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE = _bare_trusted_suffix(
 # (elspeth-5a372d3267) has established that the review is NOT the only
 # remaining step, the qualified wrapped shape below names the outstanding
 # validator objection alongside it (elspeth-ac85b0ab0e).
-_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE: Final = (
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE: Final = (
     "A required interpretation review is pending, and the completion advisory review did not clear "
     "after the available attempts. Resolve the pending review cards; validation and the advisory "
-    "review both run again on the next request. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+    "review both run again on the next request."
+)
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE: Final = (
+    _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE + " " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 )
 _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE)
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE)
 
 # elspeth-ac85b0ab0e: the qualified variant of the pending-handoff notice.
 # Battery round 7 (g03, run 700e19d5) terminated on the bare notice above
@@ -280,6 +369,10 @@ _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER: Final = (
 )
 _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
+    _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
+)
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINDINGS_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+    _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE,
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
 )
 
@@ -311,12 +404,11 @@ _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER: Final = (
 _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
     _INTERPRETATION_REVIEW_HANDOFF_NOTICE,
     _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER,
-    # Same slot pair as the preflight wrapper, and for the same reason: when
-    # this shape carries a red RUNTIME PREFLIGHT (the staged-review branch's
-    # cross-turn arm) the prose is the operator's ONLY sight of the repair
-    # suggestion. ``_composer_persisted_validation`` projects preflight errors
-    # to ``[error.message]`` alone, so ``ValidationError.suggestion`` reaches
-    # no structured surface — dropping it here would discard it outright.
+    # Keep the preflight wrapper's detail/suggestion pair when the staged-review
+    # branch replaces that wrapper on its cross-turn red arm. Persisted runtime
+    # errors omit ValidationError.suggestion. Reload backfills the decision
+    # panel's separate Stage-1 suggestions; it does not restore this runtime
+    # suggestion, so the handoff notice must retain it.
     diagnostic_slots="{detail}{suggestion_block}",
 )
 
@@ -656,8 +748,54 @@ def _split_grounding_correction(suffix: str) -> tuple[VisibleMessageSegment, ...
     )
 
 
+# Recognizer registration for the ``_PUBLISHED_`` END-gate blocked notices:
+# (bare suffix, trusted notice) and (header, footer) of each wrapped shape.
+# The pending-handoff findings shape also exists withheld, differing only by
+# the disclosure sentence at the end of its HEADER. ``_split_wrapped_diagnostic``
+# requires the header to be followed directly by ``"\n\nCause: "``, so neither
+# arm can claim the other's suffix (pinned by
+# ``test_the_recognizer_attributes_every_wrapped_suffix_to_its_own_shape``).
+_ADVISOR_PUBLISHED_BARE_SUFFIXES: Final[tuple[tuple[str, str], ...]] = (
+    (_ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE),
+    (_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE),
+    (_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE),
+    (_ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE),
+    (_ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE),
+    (_ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE),
+    (_ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_NOTICE),
+    (_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_NOTICE),
+    (_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_PUBLISHED_NOTICE),
+    (
+        _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_BARE,
+        f"{_ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER}\n\n{_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_FOOTER}",
+    ),
+    (_ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_BARE, f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER}"),
+    (
+        _ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_SUFFIX_BARE,
+        f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER}",
+    ),
+    (_ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE),
+)
+_ADVISOR_PUBLISHED_WRAPPED_SHAPES: Final[tuple[tuple[str, str], ...]] = (
+    (_ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER, _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_FOOTER),
+    (_PREFLIGHT_NOTICE_HEADER, _ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_FOOTER),
+    (_PREFLIGHT_NOTICE_HEADER, _ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_FOOTER),
+    (_ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_NOTICE, _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER),
+)
+
+
 def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
     """Recognize the closed set of canonical composer synthesis suffixes."""
+    if suffix == _REVIEW_REPLY_UNAVAILABLE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_REVIEW_REPLY_UNAVAILABLE_NOTICE),)
+    if suffix.endswith(_REVIEW_REPLY_UNAVAILABLE_SUFFIX):
+        preceding = suffix[: -len(_REVIEW_REPLY_UNAVAILABLE_SUFFIX)]
+        if _REVIEW_REPLY_UNAVAILABLE_SUFFIX in preceding:
+            return None
+        segments = _canonical_trusted_suffix_segments(preceding)
+        if segments is not None:
+            return (*segments, TrustedSystemNoticeSegment(_REVIEW_REPLY_UNAVAILABLE_NOTICE))
+        return None
     if suffix == _EMPTY_STATE_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_EMPTY_STATE_NOTICE_BODY),)
     empty_with_blocker = _split_wrapped_diagnostic(
@@ -669,41 +807,6 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
         return empty_with_blocker
     if suffix == _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_NOTICE),)
-    if suffix == _ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX:
-        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE),)
-    if suffix == _ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX:
-        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE),)
-    if suffix == _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX:
-        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE),)
-    if suffix == _ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX:
-        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE),)
-    if suffix == _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE:
-        return (TrustedSystemNoticeSegment(f"{_ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER}\n\n{_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER}"),)
-    unrepairable_red_with_detail = _split_wrapped_diagnostic(
-        suffix,
-        header=_ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER,
-        footer=_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER,
-    )
-    if unrepairable_red_with_detail is not None:
-        return unrepairable_red_with_detail
-    if suffix == _ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE:
-        return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER}"),)
-    flagged_red_with_detail = _split_wrapped_diagnostic(
-        suffix,
-        header=_PREFLIGHT_NOTICE_HEADER,
-        footer=_ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
-    )
-    if flagged_red_with_detail is not None:
-        return flagged_red_with_detail
-    if suffix == _ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE:
-        return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER}"),)
-    unrendered_red_with_detail = _split_wrapped_diagnostic(
-        suffix,
-        header=_PREFLIGHT_NOTICE_HEADER,
-        footer=_ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
-    )
-    if unrendered_red_with_detail is not None:
-        return unrendered_red_with_detail
     if suffix == _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE),)
     handoff_with_findings = _split_wrapped_diagnostic(
@@ -713,6 +816,13 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
     )
     if handoff_with_findings is not None:
         return handoff_with_findings
+    for published_suffix, published_notice in _ADVISOR_PUBLISHED_BARE_SUFFIXES:
+        if suffix == published_suffix:
+            return (TrustedSystemNoticeSegment(published_notice),)
+    for published_header, published_footer in _ADVISOR_PUBLISHED_WRAPPED_SHAPES:
+        published_with_detail = _split_wrapped_diagnostic(suffix, header=published_header, footer=published_footer)
+        if published_with_detail is not None:
+            return published_with_detail
     if suffix == _INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_NOTICE),)
     review_handoff_with_findings = _split_wrapped_diagnostic(
@@ -848,6 +958,22 @@ def compose_preflight_failure_message(content: str, *, runtime_result: Validatio
     return content + suffix
 
 
+def _append_advisor_suffix(content: str, suffix: str) -> str:
+    if not content:
+        return suffix.lstrip("\n").lstrip("-").lstrip()
+    return content + suffix
+
+
+# The END-gate blocked composers below publish the model's reply beside the
+# notice (ruling 2026-09-22, elspeth-032ec69c41), so they emit only the
+# ``_PUBLISHED_`` notices. Two of them — ``compose_advisor_signoff_pending_message``
+# and ``compose_advisor_pending_handoff_message`` — also serve the advisor-repair
+# replacer, which DOES withhold, so they alone take ``prose_withheld``
+# (required, no default): True selects the notice carrying the withheld-prose
+# disclosure and is the only honest choice when ``content`` is the empty string
+# the caller substituted for prose it withheld; False selects the published
+# notice. A default would let a new caller publish the disclosure over prose it
+# did not withhold, or omit it over prose it did.
 def compose_advisor_signoff_flagged_red_message(content: str, *, runtime_result: ValidationResult) -> str:
     """RED preflight + a FLAGGED advisory verdict (elspeth-b61894d93d).
 
@@ -858,12 +984,10 @@ def compose_advisor_signoff_flagged_red_message(content: str, *, runtime_result:
     """
     suffix = _red_diagnostic_suffix(
         runtime_result,
-        with_detail_template=_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL,
-        bare_suffix=_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE,
+        with_detail_template=_ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_WITH_DETAIL,
+        bare_suffix=_ADVISOR_SIGNOFF_FLAGGED_RED_PUBLISHED_SUFFIX_BARE,
     )
-    if not content:
-        return suffix.lstrip("\n").lstrip("-").lstrip()
-    return content + suffix
+    return _append_advisor_suffix(content, suffix)
 
 
 def compose_advisor_signoff_unrendered_red_message(content: str, *, runtime_result: ValidationResult) -> str:
@@ -875,15 +999,13 @@ def compose_advisor_signoff_unrendered_red_message(content: str, *, runtime_resu
     """
     suffix = _red_diagnostic_suffix(
         runtime_result,
-        with_detail_template=_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL,
-        bare_suffix=_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE,
+        with_detail_template=_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_SUFFIX_WITH_DETAIL,
+        bare_suffix=_ADVISOR_SIGNOFF_UNRENDERED_RED_PUBLISHED_SUFFIX_BARE,
     )
-    if not content:
-        return suffix.lstrip("\n").lstrip("-").lstrip()
-    return content + suffix
+    return _append_advisor_suffix(content, suffix)
 
 
-def compose_advisor_signoff_pending_message(content: str) -> str:
+def compose_advisor_signoff_pending_message(content: str, *, prose_withheld: bool) -> str:
     """Build the user-facing message for a validated-but-unsigned build.
 
     Deliberately NOT ``compose_preflight_failure_message``: the runtime
@@ -892,9 +1014,10 @@ def compose_advisor_signoff_pending_message(content: str) -> str:
     suffix is entirely fixed prose — no validator detail is interpolated,
     because there is no validator objection to report.
     """
-    if not content:
-        return _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
-    return content + _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX
+    return _append_advisor_suffix(
+        content,
+        _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX if prose_withheld else _ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX,
+    )
 
 
 def compose_advisor_signoff_unverified_message(content: str) -> str:
@@ -910,9 +1033,36 @@ def compose_advisor_signoff_unverified_message(content: str) -> str:
     prose — there is no validator objection to interpolate, because no
     validator ran.
     """
-    if not content:
-        return _ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
-    return content + _ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX
+    return _append_advisor_suffix(content, _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX)
+
+
+def compose_advisor_signoff_unrendered_pending_message(content: str, *, failure_class: Literal["unavailable", "malformed"]) -> str:
+    """GREEN preflight + an UNRENDERED advisory verdict (unavailable/malformed).
+
+    Sibling of :func:`compose_advisor_signoff_pending_message`, which keeps the
+    did-not-clear framing that is true only for a rendered FLAG. The copy names
+    the verdict class and its remedy (retry, or check the advisor model
+    configuration). Fixed prose; nothing from the advisor is interpolated.
+    """
+    if failure_class == "unavailable":
+        suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX
+    else:
+        suffix = _ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_FINALIZE_SUFFIX
+    return _append_advisor_suffix(content, suffix)
+
+
+def compose_advisor_signoff_unrendered_unverified_message(content: str, *, failure_class: Literal["unavailable", "malformed"]) -> str:
+    """ABSENT preflight + an UNRENDERED advisory verdict (unavailable/malformed).
+
+    Sibling of :func:`compose_advisor_signoff_unverified_message`: the same
+    facet B readiness disclosure (no preflight ran, so no pipeline claim), with
+    the could-not-be-obtained framing and remedy for the verdict class.
+    """
+    if failure_class == "unavailable":
+        suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+    else:
+        suffix = _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+    return _append_advisor_suffix(content, suffix)
 
 
 def compose_advisor_signoff_unrepairable_message(content: str) -> str:
@@ -924,9 +1074,7 @@ def compose_advisor_signoff_unrepairable_message(content: str) -> str:
     suffix is entirely fixed prose; the flagged message itself is never
     interpolated.
     """
-    if not content:
-        return _ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
-    return content + _ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX
+    return _append_advisor_suffix(content, _ADVISOR_SIGNOFF_UNREPAIRABLE_PUBLISHED_FINALIZE_SUFFIX)
 
 
 def compose_advisor_signoff_unrepairable_unverified_message(content: str) -> str:
@@ -935,9 +1083,7 @@ def compose_advisor_signoff_unrepairable_unverified_message(content: str) -> str
     No validation ran this turn, so the copy makes no pipeline claim at all —
     the facet B discipline applied to the unrepairable reason.
     """
-    if not content:
-        return _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
-    return content + _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX
+    return _append_advisor_suffix(content, _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX)
 
 
 def compose_advisor_signoff_unrepairable_handoff_message(content: str) -> str:
@@ -946,9 +1092,7 @@ def compose_advisor_signoff_unrepairable_handoff_message(content: str) -> str:
     Names the still-pending interpretation review: rewording is not the only
     remaining step (the ac85b0ab0e class).
     """
-    if not content:
-        return _ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
-    return content + _ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX
+    return _append_advisor_suffix(content, _ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_PUBLISHED_FINALIZE_SUFFIX)
 
 
 def compose_advisor_signoff_unrepairable_red_message(content: str, *, runtime_result: ValidationResult) -> str:
@@ -961,15 +1105,13 @@ def compose_advisor_signoff_unrepairable_red_message(content: str, *, runtime_re
     """
     suffix = _red_diagnostic_suffix(
         runtime_result,
-        with_detail_template=_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL,
-        bare_suffix=_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE,
+        with_detail_template=_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_WITH_DETAIL,
+        bare_suffix=_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_PUBLISHED_SUFFIX_BARE,
     )
-    if not content:
-        return suffix.lstrip("\n").lstrip("-").lstrip()
-    return content + suffix
+    return _append_advisor_suffix(content, suffix)
 
 
-def compose_advisor_pending_handoff_message(content: str, *, outstanding_findings_detail: str | None = None) -> str:
+def compose_advisor_pending_handoff_message(content: str, *, prose_withheld: bool, outstanding_findings_detail: str | None = None) -> str:
     """Build the user-facing message for a pending handoff the advisor did not clear.
 
     Neither sibling wording fits: the preflight header would claim validation
@@ -989,12 +1131,19 @@ def compose_advisor_pending_handoff_message(content: str, *, outstanding_finding
     between the trusted notice and a trusted footer.
     """
     if outstanding_findings_detail is None:
-        suffix = _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX
+        suffix = (
+            _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX
+            if prose_withheld
+            else _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINALIZE_SUFFIX
+        )
     else:
-        suffix = _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL.format(detail=outstanding_findings_detail)
-    if not content:
-        return suffix.lstrip("\n").lstrip("-").lstrip()
-    return content + suffix
+        template = (
+            _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL
+            if prose_withheld
+            else _ADVISOR_SIGNOFF_PENDING_HANDOFF_PUBLISHED_FINDINGS_SUFFIX_WITH_DETAIL
+        )
+        suffix = template.format(detail=outstanding_findings_detail)
+    return _append_advisor_suffix(content, suffix)
 
 
 def compose_interpretation_review_handoff_message(
@@ -1244,8 +1393,6 @@ def is_referential_pipeline_mutation_intent(message: str) -> bool:
 def _tool_failure_detail(payload: Mapping[str, Any]) -> str:
     """Extract a concise semantic failure detail from a ToolResult payload."""
     match payload:
-        case {"data": {"error": error}}:
-            return f": {error}"
         case {"validation": {"errors": [first_error, *_]}}:
             match first_error:
                 case {"message": message}:
@@ -1277,6 +1424,12 @@ def last_mutation_was_pending_proposal(tool_invocations: tuple[ComposerToolInvoc
 def blocking_result_from_tool_invocations(tool_invocations: tuple[ComposerToolInvocation, ...]) -> str:
     """Name the most recent failed build/edit tool result, if one exists."""
     for invocation in reversed(tool_invocations):
+        # Discovery (read-only) calls cannot be why a build left the state
+        # empty, in ANY outcome arm: a trailing discovery ARG_ERROR,
+        # PLUGIN_CRASH or ``success=false`` used to become the user-facing
+        # Cause and mask the failed build/edit call before it.
+        if is_discovery_tool(invocation.tool_name):
+            continue
         if invocation.status is ComposerToolStatus.ARG_ERROR:
             return f"{invocation.tool_name} failed before mutation ({invocation.error_class}: {invocation.error_message})."
         if invocation.status is ComposerToolStatus.PLUGIN_CRASH:
@@ -1292,7 +1445,6 @@ def blocking_result_from_tool_invocations(tool_invocations: tuple[ComposerToolIn
                 and "success" in payload
                 and payload["success"] is True
                 and invocation.version_after == invocation.version_before
-                and not is_discovery_tool(invocation.tool_name)
             ):
                 return f"{invocation.tool_name} succeeded without mutating CompositionState (version stayed {invocation.version_before})."
     return "the model ended the turn without calling any build/edit tool."
@@ -1335,6 +1487,8 @@ def no_mutation_empty_state_validation(blocker: str) -> ValidationResult:
             blockers=[
                 ValidationReadinessBlocker(
                     code="state_exists",
+                    suggestion=None,
+                    note=None,
                     component_id=None,
                     component_type=None,
                     detail=detail,

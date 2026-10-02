@@ -54,6 +54,7 @@ REPOSITORY_AUDIT_TESTS = frozenset(
         "test_source_guaranteed_fields_serialization_roundtrip.py",
         "test_sqlcipher_pipeline.py",
         "test_tier1_integrity.py",
+        "test_verification_visibility.py",
     }
 )
 

@@ -41,6 +41,10 @@ interface ComposingIndicatorProps {
    * "Tool calls (N)" disclosure).
    */
   liveToolCalls?: ToolCall[];
+  /** Recompose the correlated, settled user request without sending it twice. */
+  onRetryInterruptedRequest?: () => void;
+  retryDisabledReason?: string | null;
+  lastRejection?: ToolCall["rejection"];
 }
 
 interface RequestFocus {
@@ -193,23 +197,11 @@ export function formatElapsed(totalSeconds: number): string {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-/**
- * Elapsed-time readout for the in-flight compose card (elspeth-b189b5b3b8
- * part a): a slow turn must not read identically to a stalled request.
- * Counts from the moment the indicator becomes active (non-terminal) and
- * stops when a terminal phase lands.
- *
- * The ticking readout is aria-hidden: the indicator sits in a role="status"
- * live region and a once-per-second text mutation would spam screen readers
- * with announcements. Sighted users get the timer; AT users get the phase
- * headline changes, which already convey progress.
- *
- * Exported for the guided pending strip (GuidedPendingStrip.tsx), which
- * shares the same aria-hidden/mount-reset semantics.
- */
-export function ElapsedReadout() {
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const startRef = useRef<number>(Date.now());
+export function ElapsedReadout({ startedAt }: { startedAt?: string } = {}) {
+  const startRef = useRef<number>(startedAt === undefined ? Date.now() : Date.parse(startedAt));
+  const [elapsedSeconds, setElapsedSeconds] = useState(
+    () => Math.floor((Date.now() - startRef.current) / 1000),
+  );
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -241,6 +233,9 @@ export function ComposingIndicator({
   composerProgress = null,
   completionOutcome = null,
   liveToolCalls = [],
+  onRetryInterruptedRequest,
+  retryDisabledReason = null,
+  lastRejection,
 }: ComposingIndicatorProps) {
   const workingView =
     backendWorkingView(composerProgress) ??
@@ -249,6 +244,7 @@ export function ComposingIndicator({
   const isEstimated = workingView.source === "estimated";
   const progressKey = latestRequest ?? composerProgress?.request_id ?? "idle";
   const toolLogCaptionId = `${useId()}-tool-log`;
+  const retryReasonId = `${useId()}-retry-reason`;
   const [detailsOpen, setDetailsOpen] = useState(isTerminal);
 
   useEffect(() => {
@@ -280,11 +276,17 @@ export function ComposingIndicator({
                 "Last composer update"
               ) : (
                 <>
-                  Working on...
-                  {/* Mount lifecycle doubles as the reset: the readout only
-                      renders while non-terminal, so a terminal phase unmounts
-                      it and the next compose remounts it from 00:00. */}
-                  <ElapsedReadout />
+                  {composerProgress?.phase === "calling_model"
+                    ? "Waiting for model response"
+                    : "Working on..."}
+                  <ElapsedReadout
+                    key={composerProgress?.phase === "calling_model"
+                      ? `${composerProgress.request_id}:${composerProgress.updated_at}`
+                      : progressKey}
+                    startedAt={composerProgress?.phase === "calling_model"
+                      ? composerProgress.updated_at
+                      : undefined}
+                  />
                 </>
               )}
             </div>
@@ -294,7 +296,39 @@ export function ComposingIndicator({
                 <span className="composing-estimated-tag"> (estimated)</span>
               )}
             </div>
+            {composerProgress?.phase === "cancelled" && (
+              <div className="composing-text">
+                {compositionState !== null
+                  ? "This request did not finish. The saved pipeline remains a draft for this request."
+                  : "This request did not finish."}
+              </div>
+            )}
           </div>
+          {onRetryInterruptedRequest !== undefined && (
+            <>
+              <Button
+                compact
+                onClick={onRetryInterruptedRequest}
+                disabled={retryDisabledReason !== null}
+                aria-describedby={retryDisabledReason === null ? undefined : retryReasonId}
+              >
+                Retry interrupted request
+              </Button>
+              {retryDisabledReason !== null && (
+                <div id={retryReasonId} className="composing-text">
+                  {retryDisabledReason}
+                </div>
+              )}
+            </>
+          )}
+          {composerProgress?.phase === "cancelled" && lastRejection !== undefined && (
+            <div className="composing-section">
+              <div className="composing-label">Last validation issue</div>
+              <ul className="composing-evidence">
+                {lastRejection.guidance.map((guidance) => <li key={guidance}>{guidance}</li>)}
+              </ul>
+            </div>
+          )}
 
           {/* Live tool-call log: always visible (not behind Show details) and
               deliberately a SIBLING of the role="status" summary above — an

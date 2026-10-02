@@ -1,3 +1,4 @@
+import type { JSX } from "react";
 /**
  * SharedAuditReadinessPanel — read-only six-row audit panel for the
  * shared-inspect view.

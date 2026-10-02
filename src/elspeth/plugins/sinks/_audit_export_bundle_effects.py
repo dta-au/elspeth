@@ -24,9 +24,18 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 from tempfile import TemporaryFile
-from typing import IO, Final, cast
+from typing import IO, BinaryIO, Final, cast
 from uuid import uuid4
 
+from elspeth.contracts.audit_export import (
+    AUDIT_EXPORT_DELIVERED_MANIFEST_NAME,
+    AUDIT_EXPORT_DIRECTORY_BUNDLE_SCHEMA,
+    AUDIT_EXPORT_MAX_DELIVERED_BYTES,
+    AUDIT_EXPORT_MAX_DELIVERED_FILES,
+    AUDIT_EXPORT_PORTABLE_RECORDS_NAME,
+    audit_export_directory_bundle_hash,
+    audit_export_directory_bundle_manifest,
+)
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
@@ -46,13 +55,14 @@ from elspeth.contracts.sink_effects import (
 )
 from elspeth.core.landscape.formatters import CSVFormatter
 
-AUDIT_MANIFEST_NAME: Final = "audit_manifest.v2.json"
-BUNDLE_MANIFEST_SCHEMA: Final = "elspeth.audit-export-directory-bundle.v1"
+AUDIT_MANIFEST_NAME: Final = AUDIT_EXPORT_DELIVERED_MANIFEST_NAME
+AUDIT_RECORDS_NAME: Final = AUDIT_EXPORT_PORTABLE_RECORDS_NAME
+BUNDLE_MANIFEST_SCHEMA: Final = AUDIT_EXPORT_DIRECTORY_BUNDLE_SCHEMA
 BUNDLE_EVIDENCE_SCHEMA: Final = "audit-export-directory-bundle-plan-v1"
 INSPECTION_SCHEMA: Final = "audit-export-directory-bundle-inspection-v1"
-MAX_BUNDLE_FILES: Final = 96
+MAX_BUNDLE_FILES: Final = AUDIT_EXPORT_MAX_DELIVERED_FILES
 MAX_RECORD_TYPE_BYTES: Final = 192
-MAX_BUNDLE_BYTES: Final = 1024 * 1024 * 1024 * 1024
+MAX_BUNDLE_BYTES: Final = AUDIT_EXPORT_MAX_DELIVERED_BYTES
 _COPY_CHUNK_BYTES: Final = 64 * 1024
 _AT_FDCWD: Final = -100
 _RENAME_NOREPLACE: Final = 1
@@ -282,14 +292,13 @@ def _staging_path(target: Path, effect_id: str) -> Path:
 
 
 def _bundle_manifest(files: Sequence[BundleFileEntry]) -> dict[str, object]:
-    return {
-        "files": [entry.as_mapping() for entry in files],
-        "schema": BUNDLE_MANIFEST_SCHEMA,
-    }
+    evidence = ((entry.relative_path, entry.content_hash, entry.size_bytes) for entry in files)
+    return dict(audit_export_directory_bundle_manifest(evidence))
 
 
 def _bundle_hash(files: Sequence[BundleFileEntry]) -> str:
-    return hashlib.sha256(canonical_json(_bundle_manifest(files)).encode("utf-8")).hexdigest()
+    evidence = ((entry.relative_path, entry.content_hash, entry.size_bytes) for entry in files)
+    return audit_export_directory_bundle_hash(evidence)
 
 
 def _plan_hash(
@@ -408,7 +417,8 @@ def _neutralize_csv_formula(value: object) -> object:
 
 def _parse_verified_records(
     effect_input: SinkEffectAuditExportSnapshotInput,
-) -> tuple[dict[str, _RecordSpool], bytes]:
+    portable_records: BinaryIO,
+) -> tuple[dict[str, _RecordSpool], bytes, BinaryIO]:
     formatter = CSVFormatter()
     spools: dict[str, _RecordSpool] = {}
     seen_names: dict[str, str] = {}
@@ -418,6 +428,7 @@ def _parse_verified_records(
         for chunk in effect_input.reader.iter_verified_chunks():
             if type(chunk) is not bytes or not chunk.endswith(b"\n"):
                 raise AuditExportBundleInputError("verified data chunks must contain complete newline-framed records")
+            portable_records.write(chunk)
             frames = chunk.split(b"\n")
             if frames[-1] != b"":
                 raise AuditExportBundleInputError("verified data chunk has a non-final record frame")
@@ -438,7 +449,7 @@ def _parse_verified_records(
                 if relative_path in spools:
                     spool = spools[relative_path]
                 if spool is None:
-                    if len(spools) >= MAX_BUNDLE_FILES - 1:
+                    if len(spools) >= MAX_BUNDLE_FILES - 2:
                         raise AuditExportBundleInputError("CSV record types exceed the bounded bundle-file limit")
                     # The bundle owns this spool across the complete verified
                     # reader pass and closes it in the outer finally block.
@@ -467,8 +478,11 @@ def _parse_verified_records(
             or canonical_json(manifest).encode("utf-8") != manifest_bytes
         ):
             raise AuditExportBundleInputError("final audit manifest is non-final or non-canonical")
+        portable_records.write(manifest_bytes)
+        portable_records.flush()
+        portable_records.seek(0)
         completed = True
-        return spools, manifest_bytes
+        return spools, manifest_bytes, portable_records
     finally:
         if not completed:
             for spool in spools.values():
@@ -554,6 +568,26 @@ def _write_exact_file_at(
         written = stream.write(content)
         if written != len(content):
             raise AuditExportBundlePreconditionError("bundle output accepted a partial write")
+        stream.flush()
+        os.fsync(stream.fileno())
+    content_hash, size_bytes = _hash_regular_file_at(directory_fd, name, identity)
+    return BundleFileEntry(name, content_hash, size_bytes)
+
+
+def _write_spooled_file_at(
+    directory_fd: int,
+    name: str,
+    source: BinaryIO,
+    owned_names: list[str],
+) -> BundleFileEntry:
+    descriptor = _open_owned_output(directory_fd, name, owned_names)
+    identity = os.fstat(descriptor)
+    source.seek(0)
+    with os.fdopen(descriptor, "wb") as stream:
+        while content := source.read(_COPY_CHUNK_BYTES):
+            written = stream.write(content)
+            if written != len(content):
+                raise AuditExportBundlePreconditionError("bundle output accepted a partial write")
         stream.flush()
         os.fsync(stream.fileno())
     content_hash, size_bytes = _hash_regular_file_at(directory_fd, name, identity)
@@ -789,12 +823,13 @@ def _before_prepare_install(_building: Path, _staging: Path) -> None:
     """Race-test seam after building fsync and before effect-stage install."""
 
 
-def prepare_audit_export_bundle(
+def _prepare_audit_export_bundle_with_portable_records(
     *,
     target_path: Path,
     request: SinkEffectPrepareRequest,
+    portable_records: BinaryIO,
 ) -> SinkEffectPlan:
-    """Build and fsync one exact private CSV directory bundle."""
+    """Build a CSV directory while the caller owns the portable-record spool."""
     _validate_effect_id(request.effect_id)
     if type(request.effect_input) is not SinkEffectAuditExportSnapshotInput:
         raise TypeError("CSV audit-export bundle requires exact audit snapshot input")
@@ -825,7 +860,7 @@ def prepare_audit_export_bundle(
             request.effect_id,
         )
         building = target.parent / building_name
-        spools, manifest_bytes = _parse_verified_records(effect_input)
+        spools, manifest_bytes, portable_records = _parse_verified_records(effect_input, portable_records)
         entries: list[BundleFileEntry] = []
         for relative_path in sorted(spools):
             entries.append(_write_csv_file_at(building_descriptor, relative_path, spools[relative_path], written_names))
@@ -841,6 +876,14 @@ def prepare_audit_export_bundle(
         ):
             raise AuditExportBundleInputError("written final manifest differs from its registered descriptor")
         entries.append(manifest_entry)
+        entries.append(
+            _write_spooled_file_at(
+                building_descriptor,
+                AUDIT_RECORDS_NAME,
+                portable_records,
+                written_names,
+            )
+        )
         files = tuple(sorted(entries, key=lambda entry: entry.relative_path))
         os.fsync(building_descriptor)
         _before_prepare_install(building, staging)
@@ -911,6 +954,21 @@ def prepare_audit_export_bundle(
         for spool in spools.values():
             spool.stream.close()
         parent.close()
+
+
+def prepare_audit_export_bundle(
+    *,
+    target_path: Path,
+    request: SinkEffectPrepareRequest,
+) -> SinkEffectPlan:
+    """Build and fsync one exact private CSV directory bundle."""
+
+    with TemporaryFile("w+b") as portable_records:
+        return _prepare_audit_export_bundle_with_portable_records(
+            target_path=target_path,
+            request=request,
+            portable_records=portable_records,
+        )
 
 
 def _parse_plan(plan: SinkEffectPlan) -> tuple[BundlePlanEvidence, Path, Path, ArtifactDescriptor]:
@@ -1313,6 +1371,7 @@ def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflig
 
 __all__ = [
     "AUDIT_MANIFEST_NAME",
+    "AUDIT_RECORDS_NAME",
     "BUNDLE_MANIFEST_SCHEMA",
     "SUPPORTED_LOCAL_FILESYSTEM_MAGIC",
     "AuditExportBundleCollisionError",

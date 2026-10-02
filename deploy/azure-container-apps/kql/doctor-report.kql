@@ -4,7 +4,8 @@
 // the __TOKENS__ before submission.
 ContainerAppConsoleLogs_CL
 | where TimeGenerated between (datetime(__WINDOW_START__) .. datetime(__WINDOW_END__))
-| where ContainerAppName_s == "__JOB_NAME__"
+| where ContainerJobName_s == "__JOB_NAME__"
+| where ContainerGroupName_s startswith "__EXECUTION_NAME__"
 | where Log_s startswith "[" or Log_s startswith "{"
-| project TimeGenerated, RevisionName_s, ContainerGroupName_g, Log_s
+| project TimeGenerated, ContainerJobName_s, ContainerGroupName_s, Log_s
 | order by TimeGenerated asc

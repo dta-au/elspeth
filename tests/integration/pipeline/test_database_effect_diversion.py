@@ -58,15 +58,14 @@ def _sink_config(url: str) -> dict[str, object]:
 def _make_tokens(factory, run_id: str, source_id: str, rows: list[dict[str, object]]) -> list[TokenInfo]:
     tokens: list[TokenInfo] = []
     for index, row_data in enumerate(rows):
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        row, durable_token = factory.data_flow.create_row_with_token(
             source_node_id=source_id,
             row_index=index,
             data=row_data,
             source_row_index=index,
             ingest_sequence=index,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
-        durable_token = factory.data_flow.create_token(row.row_id)
         tokens.append(
             TokenInfo(
                 row_id=row.row_id,

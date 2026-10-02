@@ -19,22 +19,27 @@ actually statically decidable rather than value-dependent.
 
 For the repository governance posture that makes these analyzer results part of
 single-maintainer delivery evidence, read
-[ADR-024](../architecture/adr/024-delivery-governance-for-single-maintainer-mode.md).
-That ADR records why ELSPETH currently uses automated gates instead of
-non-meaningful self-approval, and how the project steps up to two-person review
-when a second maintainer is assigned.
+[GOVERNANCE.md](../../GOVERNANCE.md) § Maintainer Continuity. It records why
+ELSPETH currently uses automated gates instead of non-meaningful
+self-approval, and how the project steps up to two-person review when a second
+maintainer is assigned. (That posture was previously recorded in
+[ADR-024](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/architecture/adr/024-delivery-governance-for-single-maintainer-mode.md),
+retired 2026-09-13 as not being an architecture decision.)
 
 ## Rule Taxonomy
 
 ### Trust Tier
 
-The trust-tier rules enforce the data manifesto and the layer model described
-in [CLAUDE.md](../../CLAUDE.md). They catch defensive access patterns such as
-silent `.get()` fallbacks on data ELSPETH owns, plus imports that flow upward
-through the L0-L3 architecture. A missed violation can turn a corruption bug
-into quiet behavior: a missing Tier-1 field becomes `None`, an invalid external
-value travels too far before validation, or a lower layer learns about a higher
-layer that should have depended on it instead.
+The trust-tier rules enforce the three-tier trust model described in
+[Data Trust and Error Handling](../guides/data-trust-and-error-handling.md)
+and the layer model in the `engine-patterns-reference` skill §Layer
+Architecture & Dependency Analysis. They catch defensive access patterns such
+as silent `.get()` fallbacks on data ELSPETH owns, plus imports that flow
+upward through the L0-L3 architecture. A missed violation can turn a
+corruption bug into quiet behavior: a missing Tier-1 field becomes
+`None`, an invalid external value travels too far before validation, or
+a lower layer learns about a higher layer that should have depended on
+it instead.
 
 This family came from repeated boundary bugs where the type system expressed an
 invariant but runtime code still treated the value as untrusted. The rule is
@@ -83,7 +88,7 @@ is a user-visible contract failure.
 
 ### Composer
 
-Composer rules enforce error-routing contracts around guided composition:
+Composer rules enforce error-routing contracts around Composer authoring:
 domain-specific exceptions must be caught before their supertypes, and
 LLM-argument failures must travel through `ToolArgumentError`. A missed
 violation can turn an actionable composer repair into a generic failure, or

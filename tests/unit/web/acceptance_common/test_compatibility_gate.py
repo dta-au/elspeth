@@ -61,6 +61,7 @@ def _mutations(scenario_id: str) -> list[tuple[str, dict[str, object]]]:
     mutate("rollback_permitted_null", lambda r: r.__setitem__("rollback_permitted", None))
     mutate("rollback_permitted_missing", lambda r: r.pop("rollback_permitted"))
     mutate("candidate_epoch_plus_one", lambda r: r["schema_facts"]["candidate"].__setitem__("landscape_epoch", SQLITE_SCHEMA_EPOCH + 1))
+    mutate("candidate_epoch_previous", lambda r: r["schema_facts"]["candidate"].__setitem__("landscape_epoch", SQLITE_SCHEMA_EPOCH - 1))
     mutate("candidate_epoch_as_float", lambda r: r["schema_facts"]["candidate"].__setitem__("landscape_epoch", float(SQLITE_SCHEMA_EPOCH)))
     mutate("candidate_epoch_as_string", lambda r: r["schema_facts"]["candidate"].__setitem__("landscape_epoch", str(SQLITE_SCHEMA_EPOCH)))
     mutate("candidate_epoch_as_bool", lambda r: r["schema_facts"]["candidate"].__setitem__("landscape_epoch", True))

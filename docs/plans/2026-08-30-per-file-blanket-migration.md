@@ -161,7 +161,7 @@ Expected: exit 0, `head_blanket_count` 82 (deletion is monotonic cleanup).
 
 ## Lane contract (every bucket task below inherits this verbatim)
 
-Deliverable = commit(s) on the lane branch + sidecar + a Filigree comment on the bucket issue listing `fixed`, `decorated`, `justified` keys with counts that sum to the bucket's findings. A lane is not done until its blanket's `by_blanket` list would be empty.
+Deliverable = commit(s) on the lane branch + sidecar + a legacy issue tracker comment on the bucket issue listing `fixed`, `decorated`, `justified` keys with counts that sum to the bucket's findings. A lane is not done until its blanket's `by_blanket` list would be empty.
 
 - [ ] Worktree: `git worktree add .claude/worktrees/tier-<bucket> -b tier-<bucket> feature/unified-lineage`; `ln -s "$(git rev-parse --show-toplevel)/.venv" .venv`; export `PYTHONPATH=<wt>/src:<wt>/elspeth-lints/src`; verify both `__file__`s.
 - [ ] Read first: `docs/agents/recent-code-hints.md` (esp. 2026-08-29 entries on `@trust_boundary` fingerprints and per-file ceilings), ADR-032, `src/elspeth/contracts/trust_boundary.py` docstring, `CONTRIBUTING.md § Whole-tree gates`.

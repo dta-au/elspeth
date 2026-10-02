@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from elspeth.core.landscape.factory import RecorderFactory
 
 from elspeth.contracts import Determinism
+from elspeth.contracts.checkpoint import ResumeCheck, ResumeRefusalCause
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.engine.orchestrator.schema_reconstruction import (
     _create_schema_model as _create_schema_model,
@@ -63,6 +64,9 @@ def prepare_audit_export_binding(
     sink_name = settings.landscape.export.sink
     if sink_name is None:
         raise ValueError("Export sink name is None")
+    # This precedes sink admission and snapshot I/O. Fresh CLI runs validate
+    # earlier, before run start; direct and resume callers still fail closed.
+    settings.landscape.export.public_snapshot_config()
     binding = sink_factory(sink_name)
     sink_name, sink, modes = _validate_audit_export_binding_provenance(settings, binding)
     admission = validate_pipeline_sink_effect_capabilities(
@@ -165,6 +169,9 @@ def export_landscape(
     from elspeth.engine.orchestrator.audit_export_effects import execute_audit_export_effect, prepare_audit_export_snapshot
 
     export_config = settings.landscape.export
+    if not export_config.enabled:
+        raise ValueError("audit export is not enabled in settings")
+    export_config.public_snapshot_config()
 
     if type(worker_id) is not str or not worker_id.strip():
         raise ValueError("audit export worker_id must be a non-empty exact string")
@@ -254,7 +261,7 @@ def export_landscape(
         existing_node = factory.data_flow.get_node(sink.node_id, run_id)
         if existing_node is None:
             factory.data_flow.register_node(
-                run_id=run_id,
+                coordination_token=coordination_token,
                 node_id=sink.node_id,
                 plugin_name=sink.name,
                 node_type=NodeType.SINK,
@@ -274,7 +281,6 @@ def export_landscape(
                 ("config_hash", existing_node.config_hash, stable_hash(audit_safe_config)),
                 ("config_json", existing_node.config_json, canonical_json(audit_safe_config)),
                 ("source_file_hash", existing_node.source_file_hash, sink.source_file_hash),
-                ("schema_hash", existing_node.schema_hash, None),
                 ("sequence_in_pipeline", existing_node.sequence_in_pipeline, None),
                 ("schema_mode", existing_node.schema_mode, "observed"),
                 ("schema_fields", existing_node.schema_fields, None),
@@ -298,8 +304,8 @@ def export_landscape(
         sink.close()
 
 
-def audit_export_resume_refusal(run: object | None, run_id: str) -> str | None:
-    """Return why ``run`` cannot have its audit export resumed, or None if it can.
+def audit_export_resume_refusal(run: Run | None, run_id: str) -> ResumeCheck:
+    """Return the observed admission verdict for resuming this run's audit export.
 
     Fail-closed eligibility gate shared by :func:`resume_audit_export` and its
     production drivers (elspeth-8fd1f415b9): resume applies only to runs that
@@ -309,13 +315,21 @@ def audit_export_resume_refusal(run: object | None, run_id: str) -> str | None:
     from elspeth.core.landscape.export_read_model import _EXPORT_TERMINAL
 
     if run is None:
-        return f"run {run_id!r} not found in the audit database"
-    status = run.status  # type: ignore[attr-defined]
+        return ResumeCheck(False, f"run {run_id!r} not found in the audit database", ResumeRefusalCause.RUN_NOT_FOUND)
+    status = run.status
     if status not in _EXPORT_TERMINAL:
-        return f"run {run_id!r} has status {status.value!r}, which is not export-terminal; audit export resume requires a finalized run"
-    if run.export_status is ExportStatus.COMPLETED:  # type: ignore[attr-defined]
-        return f"run {run_id!r} audit export already completed; refusing to re-run publication"
-    return None
+        return ResumeCheck(
+            False,
+            f"run {run_id!r} has status {status.value!r}, which is not export-terminal; audit export resume requires a finalized run",
+            ResumeRefusalCause.RUN_NOT_FINALIZED,
+        )
+    if run.export_status is ExportStatus.COMPLETED:
+        return ResumeCheck(
+            False,
+            f"run {run_id!r} audit export already completed; refusing to re-run publication",
+            ResumeRefusalCause.EXPORT_ALREADY_COMPLETED,
+        )
+    return ResumeCheck(True)
 
 
 def _audit_export_resume_target_refusal(
@@ -373,8 +387,9 @@ def resume_audit_export(
     PENDING -> FAILED (with the error recorded) on failure.
 
     Raises:
-        ValueError: If export is not enabled, the run does not exist, the run
-            is not export-terminal, or its export already completed.
+        ValueError: If export is disabled or its target identity is incompatible.
+        NonResumableRunError: If the run is missing, is not export-terminal,
+            its export already completed, or export leadership is refused.
         Exception: Re-raises any export failure after recording FAILED status.
     """
     from elspeth.core.landscape.factory import RecorderFactory
@@ -383,20 +398,29 @@ def resume_audit_export(
     export_config = settings.landscape.export
     if not export_config.enabled:
         raise ValueError("audit export is not enabled in settings; nothing to resume")
+    export_config.public_snapshot_config()
 
     factory = RecorderFactory(db, payload_store=payload_store)
     run = factory.run_lifecycle.get_run(run_id)
     refusal = audit_export_resume_refusal(run, run_id)
-    if refusal is not None:
-        raise ValueError(refusal)
+    if not refusal.can_resume:
+        from elspeth.core.checkpoint.recovery import NonResumableRunError
+
+        assert refusal.reason is not None and refusal.cause is not None
+        raise NonResumableRunError(run_id, refusal.reason, cause=refusal.cause)
     assert run is not None
-    refusal = _audit_export_resume_target_refusal(
+    from elspeth.core.landscape.execution.audit_export_snapshots import AuditExportSnapshotRepository
+
+    with db.read_only_connection() as connection:
+        if AuditExportSnapshotRepository.has_unsupported_version_for_run(connection, run_id):
+            raise ValueError("audit-export lineage contains unsupported exporter_version")
+    target_refusal = _audit_export_resume_target_refusal(
         run,
         settings,
         factory.execution.sink_effects.get_effects_for_run(run_id),
     )
-    if refusal is not None:
-        raise ValueError(refusal)
+    if target_refusal is not None:
+        raise ValueError(target_refusal)
 
     # ADR-048 §4: an operator action that cannot take the seat must not write
     # the row. The export seat is a leader seat on a finalized run — no status

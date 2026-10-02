@@ -39,7 +39,6 @@ any ``__all__`` entry becomes dead.
 """
 
 from elspeth.web.composer.tools._common import (
-    _DATA_ERROR_KEY,
     RuntimePreflight,
     ToolContext,
     ToolResult,
@@ -79,7 +78,6 @@ from elspeth.web.composer.tools.blobs import (
     _execute_update_blob,
     _persist_prepared_blob_create,
     _prepare_blob_create,
-    _session_blob_lock,
     _sync_list_blobs,
 )
 from elspeth.web.composer.tools.discovery import (
@@ -102,7 +100,6 @@ from elspeth.web.composer.tools.sessions import (
     _SESSION_AWARE_TOOL_HANDLERS,
     ADVISOR_TRIGGER_DETERMINISTIC_EARLY,
     ADVISOR_TRIGGER_DETERMINISTIC_END,
-    ADVISOR_TRIGGER_VALUES,
     RATE_CAP_CODE_TO_TELEMETRY_CAP_TYPE,
     RATE_CAP_PER_SESSION_DAY_CODE,
     RATE_CAP_PER_TERM_CODE,
@@ -126,7 +123,6 @@ from elspeth.web.composer.tools.transforms import (
 __all__ = [
     "ADVISOR_TRIGGER_DETERMINISTIC_EARLY",
     "ADVISOR_TRIGGER_DETERMINISTIC_END",
-    "ADVISOR_TRIGGER_VALUES",
     "RATE_CAP_CODE_TO_TELEMETRY_CAP_TYPE",
     "RATE_CAP_PER_SESSION_DAY_CODE",
     "RATE_CAP_PER_TERM_CODE",
@@ -135,7 +131,6 @@ __all__ = [
     "_BLOB_MUTATION_TOOLS",
     "_BLOCKING_DIAGNOSTIC_CODES",
     "_CACHEABLE_DISCOVERY_TOOL_NAMES",
-    "_DATA_ERROR_KEY",
     "_DISCOVERY_TOOLS",
     "_MUTATION_TOOLS",
     "_SECRET_DISCOVERY_TOOLS",
@@ -168,7 +163,6 @@ __all__ = [
     "_persist_prepared_blob_create",
     "_prepare_blob_create",
     "_prevalidate_plugin_options",
-    "_session_blob_lock",
     "_sync_list_blobs",
     "_utc_day_start",
     "build_set_pipeline_candidate",

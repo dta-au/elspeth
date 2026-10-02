@@ -41,9 +41,11 @@ from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
 from elspeth.web.catalog.schemas import PluginSummary
-from elspeth.web.composer import service as service_module
+from elspeth.web.composer import composer_preflight as preflight_module
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.no_tool_policy import _PREFLIGHT_NOTICE_HEADER, is_pending_interpretation_handoff
-from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import (
@@ -60,7 +62,7 @@ from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 from ._helpers import (
     _mock_catalog,
@@ -94,6 +96,8 @@ def _handoff_result() -> ValidationResult:
             completion_ready=True,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
+                    note=None,
                     code=INTERPRETATION_REVIEW_PENDING_CODE,
                     component_id="map_node",
                     component_type="transform",
@@ -124,6 +128,8 @@ def _structural_failure_result() -> ValidationResult:
             completion_ready=False,
             blockers=[
                 ValidationReadinessBlocker(
+                    suggestion=None,
+                    note=None,
                     code="graph_structure",
                     component_id="map_node",
                     component_type="transform",
@@ -233,8 +239,8 @@ class _ScriptedLLM:
 
     async def __call__(self, _messages: list[dict[str, Any]], _tools: Any) -> Any:
         if not self._responses:
-            return _fake_text_response("Done.")
-        return self._responses.pop(0)
+            return _admit_composer_llm_completion(_fake_text_response("Done."))
+        return _admit_composer_llm_completion(self._responses.pop(0))
 
 
 class _RecordingAdvisor:
@@ -338,7 +344,7 @@ def engine():
 
 @pytest.fixture
 def sessions_service(engine) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.sessions"),
@@ -380,6 +386,9 @@ def _build_composer(
 async def _seed_session(sessions_service: SessionServiceImpl) -> str:
     session_id = uuid4()
     with sessions_service._engine.begin() as conn:
+        from tests.fixtures.identities import ensure_test_identity
+
+        ensure_test_identity(conn, identity_id="alice")
         conn.execute(
             insert(sessions_table).values(
                 id=str(session_id),
@@ -414,9 +423,9 @@ async def _run_no_tool_turn(
     """
     composer = _build_composer(tmp_path, sessions_service, max_composition_turns=max_composition_turns)
     if advisor is not None:
-        composer._run_advisor_checkpoint = advisor
+        composer._advisor_checkpoint._run_advisor_checkpoint = advisor
     session_id = await _seed_session(sessions_service)
-    monkeypatch.setattr(service_module, "validate_pipeline", fake)
+    monkeypatch.setattr(preflight_module, "validate_pipeline", fake)
     llm = _ScriptedLLM(
         [
             _fake_response_with_tool_call(

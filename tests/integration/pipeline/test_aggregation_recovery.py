@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from elspeth.contracts import (
     Determinism,
@@ -44,11 +44,14 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import AggregationName, NodeID
+from elspeth.core.canonical import canonical_json
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import AggregationSettings, CheckpointSettings, SourceSettings, TriggerConfig
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
     aggregation_result_members_table,
     aggregation_result_outputs_table,
@@ -64,9 +67,10 @@ from elspeth.core.landscape.schema import (
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.base_classes import _TestSchema, _TestSourceBase, as_sink, as_source, as_transform
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import age_barrier_hold, leader_coordination_token, make_factory
+from tests.fixtures.landscape import age_barrier_hold, leader_coordination_token, leader_token_for, make_factory, member_token_for
 from tests.fixtures.plugins import CollectSink, ListSource
 from tests.helpers.checkpoint import create_checkpoint
 
@@ -263,21 +267,29 @@ class _CountingPassTransform(BaseTransform):
 
 def _build_eof_aggregation_pipeline(
     source: Any,
-    transform: _SumBatchTransform,
+    transform: BaseTransform,
     output_sink: CollectSink,
     downstream: _CountingPassTransform | None = None,
     *,
     output_mode: str = "transform",
+    error_sink: CollectSink | None = None,
 ) -> tuple[PipelineConfig, ExecutionGraph]:
-    """Count-triggered transform-mode aggregation whose flush only fires at EOF."""
+    """Count-triggered transform-mode aggregation whose flush only fires at EOF.
+
+    ``error_sink`` names the aggregation's on_error sink; without it failed
+    batches are discarded.
+    """
     aggregation_output = "aggregate_ready" if downstream is not None else "output"
     transform.on_success = aggregation_output
+    sinks = {"output": as_sink(output_sink)}
+    if error_sink is not None:
+        sinks[error_sink.name] = as_sink(error_sink)
     agg_settings = AggregationSettings(
         name="eof_sum",
         plugin=transform.name,
         input="batch_in",
         on_success=aggregation_output,
-        on_error="discard",
+        on_error=error_sink.name if error_sink is not None else "discard",
         trigger=TriggerConfig(count=100, timeout_seconds=3600),
         output_mode=output_mode,
     )
@@ -296,7 +308,7 @@ def _build_eof_aggregation_pipeline(
         sources={"primary": as_source(source)},
         source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="batch_in", options={})},
         transforms=wired_transforms,
-        sinks={"output": as_sink(output_sink)},
+        sinks=sinks,
         aggregations={"eof_sum": (as_transform(transform), agg_settings)},
         gates=[],
     )
@@ -308,7 +320,7 @@ def _build_eof_aggregation_pipeline(
         # Regular transforms must retain their graph sequence before the
         # graph-confirmed aggregation plugin, whose node_id is pre-assigned.
         transforms=([as_transform(downstream)] if downstream is not None else []) + [as_transform(transform)],
-        sinks={"output": as_sink(output_sink)},
+        sinks=sinks,
         aggregation_settings={agg_node_id: agg_settings},
     )
     return config, graph
@@ -603,9 +615,9 @@ class TestFlushOutputJournalDurability:
             child_items: list[Any],
             *,
             batch_id: str,
-            output_was_empty: bool,
+            members_terminate: bool,
         ) -> tuple[tuple[Any, ...], frozenset[str]]:
-            del self, node_id, results, buffered_tokens, child_items, batch_id, output_was_empty
+            del self, node_id, results, buffered_tokens, child_items, batch_id, members_terminate
             raise RuntimeError("injected crash before aggregation barrier completion")
 
         monkeypatch.setattr(RowProcessor, "_complete_aggregation_flush", crash_before_barrier_completion)
@@ -918,15 +930,171 @@ class TestFlushOutputJournalDurability:
         assert sink_token_ids == tuple(sorted(input_token_ids))
 
 
+class _QuarantiningCopyBatchTransform(_SumBatchTransform):
+    """Pass-through TRANSFORM-mode batch: copies each row, quarantines rows with ``n == 0``.
+
+    ``drop_field`` makes it strip that field from every copy — a plugin bug the
+    flush cross-check must catch when every emitting input carried the field.
+    """
+
+    name = "quarantining_copy_batch"
+    determinism = Determinism.DETERMINISTIC
+    passes_through_input = True
+
+    def __init__(self, *, drop_field: str | None = None) -> None:
+        super().__init__()
+        self._drop_field = drop_field
+
+    def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
+        if isinstance(row, list):
+            self.batch_calls += 1
+            quarantined = [index for index, item in enumerate(row) if item.get("n") == 0]
+            contract = SchemaContract(
+                mode="OBSERVED",
+                fields=tuple(
+                    FieldContract(normalized_name=name, original_name=name, python_type=object, required=False, source="inferred")
+                    for name in ("id", "tag")
+                ),
+                locked=True,
+            )
+            copies = tuple(
+                PipelineRow({key: value for key, value in item.to_dict().items() if key != self._drop_field}, contract)
+                for index, item in enumerate(row)
+                if index not in quarantined
+            )
+            return TransformResult.success_multi(
+                copies,
+                success_reason={"action": "copy_batch", "metadata": {"quarantined_indices": quarantined}},
+            )
+        return TransformResult.success(row, success_reason={"action": "buffer"})
+
+
+@pytest.mark.timeout(120)
+class TestCommittedOutputResumeExcludesInBatchQuarantine:
+    """The resume re-check of a committed aggregation output applies the live rule.
+
+    ``_prepare_committed_aggregation_output`` rebuilds the result's
+    ``quarantined_indices`` from the receipt's QUARANTINE members and re-runs
+    ``_cross_check_flush_output``: the TRANSFORM intersection excludes inputs
+    quarantined in-batch, so a quarantined row lacking ``tag`` neither excuses a
+    receipt whose outputs dropped ``tag`` nor trips an honest one (ADR-009
+    2026-09-26 note).
+    """
+
+    def _crash_after_committed_output(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        transform: _QuarantiningCopyBatchTransform,
+        *,
+        bypass_live_check: bool,
+    ) -> tuple[LandscapeDB, CheckpointManager, Orchestrator, PipelineConfig, ExecutionGraph, CollectSink, Any, str]:
+        from elspeth.core.payload_store import FilesystemPayloadStore
+        from elspeth.engine.executors.aggregation import AggregationExecutor
+        from elspeth.engine.processor import RowProcessor
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        # Row 3 is quarantined in-batch (n == 0) and lacks 'tag'.
+        source = _LoadCountingSource([{"id": 1, "tag": "x"}, {"id": 2, "tag": "y"}, {"id": 3, "n": 0}], on_success="batch_in")
+        output_sink = CollectSink("output")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink)
+        orchestrator = Orchestrator(
+            db=db,
+            checkpoint_manager=checkpoint_mgr,
+            checkpoint_config=RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row")),
+        )
+        real_execute_flush = AggregationExecutor.execute_flush
+        real_cross_check = RowProcessor._cross_check_flush_output
+
+        def crash_before_output_routing(self: AggregationExecutor, *args: Any, **kwargs: Any) -> None:
+            real_execute_flush(self, *args, **kwargs)
+            raise RuntimeError("injected crash before aggregation output routing")
+
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", crash_before_output_routing)
+        if bypass_live_check:
+            # Simulates a receipt the live check did not refuse — e.g. one
+            # committed by the pre-fix engine, whose all-token intersection
+            # ({id}) accepted the dropped 'tag'. The run crashes before routing,
+            # so the returned set is never consumed.
+            monkeypatch.setattr(RowProcessor, "_cross_check_flush_output", lambda self, fctx, result, **kwargs: frozenset())
+        with pytest.raises(RuntimeError, match="injected crash before aggregation output routing"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", real_execute_flush)
+        monkeypatch.setattr(RowProcessor, "_cross_check_flush_output", real_cross_check)
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().one())
+            member_actions = tuple(
+                conn.execute(
+                    select(aggregation_result_members_table.c.action).order_by(aggregation_result_members_table.c.ordinal)
+                ).scalars()
+            )
+        assert member_actions == ("consume_batch", "consume_batch", "quarantine")
+        return db, checkpoint_mgr, orchestrator, config, graph, output_sink, payload_store, run_id
+
+    def test_honest_committed_output_with_a_quarantined_non_carrier_resumes(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        transform = _QuarantiningCopyBatchTransform()
+        db, checkpoint_mgr, orchestrator, config, graph, output_sink, payload_store, run_id = self._crash_after_committed_output(
+            tmp_path, monkeypatch, transform, bypass_live_check=False
+        )
+
+        resume_point = RecoveryManager(db, checkpoint_mgr).get_resume_point(run_id, graph)
+        assert resume_point is not None
+        resumed = orchestrator.resume(resume_point=resume_point, config=config, graph=graph, payload_store=payload_store)
+
+        assert resumed.status is RunStatus.COMPLETED_WITH_FAILURES
+        assert output_sink.results == [{"id": 1, "tag": "x"}, {"id": 2, "tag": "y"}]
+        assert transform.batch_calls == 1
+        with db.connection() as conn:
+            terminal_counts = dict(
+                conn.execute(
+                    select(token_outcomes_table.c.path, func.count())
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.completed == 1)
+                    .group_by(token_outcomes_table.c.path)
+                ).all()
+            )
+            token_ids = set(conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == run_id)).scalars())
+            terminal_token_ids = list(
+                conn.execute(
+                    select(token_outcomes_table.c.token_id)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.completed == 1)
+                ).scalars()
+            )
+        assert terminal_counts == {"quarantined_at_source": 1, "batch_consumed": 2, "default_flow": 2}
+        assert sorted(terminal_token_ids) == sorted(token_ids), "every token reaches exactly one terminal outcome"
+
+    def test_committed_output_that_dropped_a_field_every_emitting_input_carried_is_refused_on_resume(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from elspeth.contracts.errors import PassThroughContractViolation
+
+        transform = _QuarantiningCopyBatchTransform(drop_field="tag")
+        db, checkpoint_mgr, orchestrator, config, graph, output_sink, payload_store, run_id = self._crash_after_committed_output(
+            tmp_path, monkeypatch, transform, bypass_live_check=True
+        )
+
+        resume_point = RecoveryManager(db, checkpoint_mgr).get_resume_point(run_id, graph)
+        assert resume_point is not None
+        with pytest.raises(PassThroughContractViolation) as exc_info:
+            orchestrator.resume(resume_point=resume_point, config=config, graph=graph, payload_store=payload_store)
+
+        assert exc_info.value.divergence_set == frozenset({"tag"})
+        assert output_sink.results == []
+        assert transform.batch_calls == 1, "resume re-checks the committed output; it never replays the plugin"
+
+
 class _FailBatchTransform(BaseTransform):
     """Batch transform that FAILS its EOF flush by returning an error-status result.
 
     Returning (not raising) an error TransformResult drives the failure arm of
     ``handle_timeout_flush`` (processor.py: ``result.status != "success"``),
-    which records terminal FAILURE/UNROUTED token_outcomes via
-    ``_handle_flush_error`` and then releases the BLOCKED scheduler rows via
-    ``_mark_buffered_scheduler_work_terminal`` — the two-transaction split this
-    test crashes between.
+    which applies the aggregation's on_error: every member discarded
+    (QUARANTINED_AT_SOURCE, written inside ``complete_barrier``) or handed to
+    the named sink (PENDING_SINK, same transaction).
     """
 
     name = "fail_batch"
@@ -944,69 +1112,54 @@ class _FailBatchTransform(BaseTransform):
     def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
         if isinstance(row, list):
             self.batch_calls += 1
-            return TransformResult.error({"reason": "injected batch flush failure"})
+            return TransformResult.error({"reason": "batch_failed", "error": "injected batch flush failure"})
         return TransformResult.success(row, success_reason={"action": "buffer"})
 
 
 @pytest.mark.timeout(120)
 class TestFailedFlushReconcile:
-    """ADR-030 §E.3a (aggregation mirror): a FAILED out-of-claim flush that
-    crashes between the terminal-outcome write and the BLOCKED-row release must
-    not brick resume (elspeth-55546a6fd6)."""
+    """ADR-030 §E.3a (aggregation mirror, elspeth-55546a6fd6), re-derived for
+    operator ruling B3.
 
-    def test_failed_flush_crash_between_terminal_write_and_release_resumes(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Crash in the FAILED-flush two-transaction window is reconciled at restore.
+    A flush can leave durable BLOCKED rows behind tokens that already hold a
+    terminal (FAILURE, UNROUTED) outcome in exactly one way now: a Tier-1
+    declaration-contract violation caught by the flush cross-check.
+    ``_record_flush_violation`` writes the per-member terminals and the
+    violation is re-raised, so the run dies before any journal release. The
+    restore reconcile must journal-release those rows rather than brick every
+    resume.
 
-        Reproduces the brick: ``_handle_flush_error`` commits terminal
-        FAILURE/UNROUTED token_outcomes (completed=1) for every buffered token,
-        then a crash strikes before ``_mark_buffered_scheduler_work_terminal``
-        releases the durable BLOCKED scheduler rows. On resume the orphaned
-        BLOCKED rows partition to the aggregation node, but
-        ``list_live_buffered_outcomes`` excludes completed-witness tokens, so
-        ``_derive_restored_batch_id`` historically raised
-        ``AuditIntegrityError('...no matching BUFFERED token_outcome...')`` on
-        EVERY attempt — the run was permanently unresumable.
+    The failed-flush arm no longer has such a window: a discarded batch's
+    terminals ride the SAME ``complete_barrier`` transaction that consumes its
+    BLOCKED rows (proved below), and a routed batch writes no processor-side
+    terminal at all. That is why the reconcile stays scoped to (FAILURE,
+    UNROUTED) and never needs the discard pair.
+    """
 
-        The restore-side aggregation reconcile (mirror of the coalesce §E.3a
-        holdless path) must instead journal-release the orphaned BLOCKED rows
-        (their tokens are already terminal) and let the run complete.
-        """
+    def test_failed_flush_crash_between_terminal_write_and_release_resumes(self, tmp_path: Any) -> None:
+        """The surviving producer: terminals committed, BLOCKED rows leaked, run
+        crashed. Resume reconciles instead of refusing, and completes."""
+        from elspeth.contracts.errors import PassThroughContractViolation
         from elspeth.core.landscape.schema import token_outcomes_table
         from elspeth.core.payload_store import FilesystemPayloadStore
-        from elspeth.engine.processor import RowProcessor
+        from tests.integration.pipeline.orchestrator.test_pass_through_flush import _MisannotatedBatchDropper
 
         db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
         payload_store = FilesystemPayloadStore(tmp_path / "payloads")
         checkpoint_mgr = CheckpointManager(db)
         checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
 
-        source = _LoadCountingSource([{"value": 10}, {"value": 20}, {"value": 30}], on_success="batch_in")
-        transform = _FailBatchTransform()
+        source = _LoadCountingSource(
+            [{"value": 10, "to_drop": 1}, {"value": 20, "to_drop": 2}, {"value": 30, "to_drop": 3}], on_success="batch_in"
+        )
+        transform = _MisannotatedBatchDropper()
         output_sink = CollectSink("output")
         config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink)
+        orchestrator = Orchestrator(db=db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
 
-        # Crash injection: replace the BLOCKED-row release with a raise. By the
-        # time it runs, _handle_flush_error has already committed the terminal
-        # FAILURE outcomes — landing the crash squarely in the two-transaction
-        # window.
-        def _crash_before_release(self: RowProcessor, node_id: Any, tokens: Any) -> None:
-            raise RuntimeError("injected crash before BLOCKED-row release")
-
-        monkeypatch.setattr(RowProcessor, "_mark_buffered_scheduler_work_terminal", _crash_before_release)
-
-        orchestrator = Orchestrator(
-            db=db,
-            checkpoint_manager=checkpoint_mgr,
-            checkpoint_config=checkpoint_config,
-        )
-
-        with pytest.raises(RuntimeError, match="injected crash before BLOCKED-row release"):
+        with pytest.raises(PassThroughContractViolation):
             orchestrator.run(config, graph=graph, payload_store=payload_store)
 
-        assert transform.batch_calls == 1
-
-        # ── Confirm the reproduction: terminal FAILURE outcomes are durable AND
-        # the BLOCKED scheduler rows leaked (the crash-window signature).
         with db.connection() as conn:
             run_id = str(conn.execute(select(token_outcomes_table.c.run_id)).scalars().first())
             terminal_failures = (
@@ -1029,40 +1182,284 @@ class TestFailedFlushReconcile:
                 .all()
             )
 
-        assert len(terminal_failures) == 3, "all three buffered tokens must be terminally FAILED before the crash"
-        assert set(blocked_tokens) == set(terminal_failures), "the FAILED tokens' BLOCKED scheduler rows must have leaked"
+        assert len(terminal_failures) == 3, "the violation must terminally fail every buffered token before the crash"
+        assert set(blocked_tokens) == set(terminal_failures), "the failed tokens' BLOCKED scheduler rows must have leaked"
 
-        # ── Resume must NOT brick. The reconcile journal-releases the orphaned
-        # BLOCKED rows and the run completes.
         recovery = RecoveryManager(db, checkpoint_mgr)
         check = recovery.can_resume(run_id, graph)
         assert check.can_resume, f"Expected resumable run, got: {check.reason}"
         resume_point = recovery.get_resume_point(run_id, graph)
         assert resume_point is not None
 
-        result = orchestrator.resume(
-            resume_point=resume_point,
-            config=config,
-            graph=graph,
-            payload_store=payload_store,
-        )
+        result = orchestrator.resume(resume_point=resume_point, config=config, graph=graph, payload_store=payload_store)
 
-        # The run is no longer bricked: resume finalizes to its truthful,
-        # audit-derived terminal status. All three rows genuinely FAILED in the
-        # flush ((FAILURE, UNROUTED) → rows_failed), so the honest status is
-        # FAILED — the point is that resume COMPLETES instead of raising
-        # AuditIntegrityError on every attempt.
         assert result.status == RunStatus.FAILED
         assert result.rows_failed == 3
-        # The failed flush produced no output; the sink stays empty.
         assert output_sink.results == []
-        # No BLOCKED rows survive the resume — every work item is terminal.
         with db.connection() as conn:
             work_statuses = (
                 conn.execute(select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == run_id)).scalars().all()
             )
         assert work_statuses
         assert set(work_statuses) <= {"terminal"}, f"expected all-terminal journal, got {set(work_statuses)!r}"
+
+    def test_discarded_batch_terminals_and_release_are_one_transaction(self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        """B3: a failure INSIDE ``complete_barrier`` while it writes the discard
+        terminals rolls back the BLOCKED-row release with them — there is no
+        state where a member is terminal but still BLOCKED (the window the
+        reconcile above exists for). The batch's FAILED verdict had already
+        committed, so resume completes it without re-running the batch, and
+        every member is quarantined exactly once."""
+        import elspeth.core.landscape.scheduler.barrier as barrier_module
+        from elspeth.core.landscape.schema import token_outcomes_table
+        from elspeth.core.payload_store import FilesystemPayloadStore
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+        source = _LoadCountingSource([{"value": 10}, {"value": 20}, {"value": 30}], on_success="batch_in")
+        transform = _FailBatchTransform()
+        output_sink = CollectSink("output")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink)
+        orchestrator = Orchestrator(db=db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+
+        real_record = barrier_module.record_terminal_outcomes_guarded
+        crashed: list[bool] = []
+
+        def _crash_once(*args: Any, **kwargs: Any) -> Any:
+            if kwargs["outcomes"] and not crashed:
+                crashed.append(True)
+                raise RuntimeError("injected crash while writing discard terminals")
+            return real_record(*args, **kwargs)
+
+        monkeypatch.setattr(barrier_module, "record_terminal_outcomes_guarded", _crash_once)
+
+        with pytest.raises(RuntimeError, match="injected crash while writing discard terminals"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().first())
+            terminals = conn.execute(
+                select(token_outcomes_table.c.token_id)
+                .where(token_outcomes_table.c.run_id == run_id)
+                .where(token_outcomes_table.c.completed == 1)
+            ).all()
+            statuses = set(conn.execute(select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == run_id)).scalars())
+        assert terminals == [], "the rolled-back barrier must leave no terminal behind"
+        assert statuses == {"blocked"}, "the rolled-back barrier must leave every member BLOCKED"
+
+        recovery = RecoveryManager(db, checkpoint_mgr)
+        resume_point = recovery.get_resume_point(run_id, graph)
+        assert resume_point is not None
+        result = orchestrator.resume(resume_point=resume_point, config=config, graph=graph, payload_store=payload_store)
+
+        assert result.status == RunStatus.COMPLETED_WITH_FAILURES
+        assert (result.rows_failed, result.rows_quarantined) == (3, 3)
+        assert transform.batch_calls == 1, "the recorded verdict is completed, never re-run"
+        with db.connection() as conn:
+            assert list(conn.execute(select(batches_table.c.status).where(batches_table.c.run_id == run_id)).scalars()) == ["failed"]
+            quarantined = conn.execute(
+                select(token_outcomes_table.c.token_id, token_outcomes_table.c.path)
+                .where(token_outcomes_table.c.run_id == run_id)
+                .where(token_outcomes_table.c.completed == 1)
+            ).all()
+            final_statuses = set(
+                conn.execute(select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == run_id)).scalars()
+            )
+        assert len(quarantined) == len({token_id for token_id, _path in quarantined}) == 3
+        assert {path for _token_id, path in quarantined} == {"quarantined_at_source"}
+        assert final_statuses == {"terminal"}
+
+
+@pytest.mark.timeout(120)
+class TestFailedFlushRoutedToErrorSinkResume:
+    """elspeth-d2e3f29d10: a failed batch routed to its on_error sink survives
+    a crash in either window without routing any member twice.
+
+    The routed arm writes (1) the batch's FAILED verdict in ONE transaction —
+    per-member transform_errors, ONE DIVERT routing_event, node_state FAILED,
+    batch FAILED — then (2) ONE ``complete_barrier`` handing every member
+    BLOCKED -> PENDING_SINK, then (3) the sink write, which records each
+    member's single terminal. The verdict is final once (1) commits: resume
+    completes it and never re-runs the batch (operator ruling 2026-09-23).
+    """
+
+    @staticmethod
+    def _run_until_crash(tmp_path: Any, error_sink: CollectSink) -> tuple[Any, ...]:
+        from elspeth.core.payload_store import FilesystemPayloadStore
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+        source = _LoadCountingSource([{"value": 10}, {"value": 20}, {"value": 30}], on_success="batch_in")
+        transform = _FailBatchTransform()
+        output_sink = CollectSink("output")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink, error_sink=error_sink)
+        orchestrator = Orchestrator(db=db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+        return db, payload_store, checkpoint_mgr, source, transform, output_sink, config, graph, orchestrator
+
+    @staticmethod
+    def _resume(db: LandscapeDB, checkpoint_mgr: CheckpointManager, orchestrator: Orchestrator, run_id: str, **kwargs: Any) -> Any:
+        recovery = RecoveryManager(db, checkpoint_mgr)
+        check = recovery.can_resume(run_id, kwargs["graph"])
+        assert check.can_resume, f"Expected resumable run, got: {check.reason}"
+        resume_point = recovery.get_resume_point(run_id, kwargs["graph"])
+        assert resume_point is not None
+        return orchestrator.resume(resume_point=resume_point, **kwargs)
+
+    @staticmethod
+    def _routed_audit(db: LandscapeDB, run_id: str) -> dict[str, Any]:
+        from elspeth.core.landscape.schema import node_states_table, routing_events_table, transform_errors_table
+
+        with db.connection() as conn:
+            return {
+                "terminals": conn.execute(
+                    select(token_outcomes_table.c.token_id, token_outcomes_table.c.path, token_outcomes_table.c.sink_name)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.completed == 1)
+                ).all(),
+                "failed_flush_states": set(
+                    conn.execute(
+                        select(node_states_table.c.state_id)
+                        .where(node_states_table.c.run_id == run_id)
+                        .where(node_states_table.c.status == "failed")
+                    ).scalars()
+                ),
+                "routing_state_ids": list(
+                    conn.execute(select(routing_events_table.c.state_id).where(routing_events_table.c.run_id == run_id)).scalars()
+                ),
+                "transform_error_count": len(
+                    conn.execute(select(transform_errors_table.c.error_id).where(transform_errors_table.c.run_id == run_id)).all()
+                ),
+                "batches": conn.execute(
+                    select(batches_table.c.batch_id, batches_table.c.status).where(batches_table.c.run_id == run_id)
+                ).all(),
+                "work_statuses": set(
+                    conn.execute(select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == run_id)).scalars()
+                ),
+            }
+
+    def test_crash_before_the_barrier_handoff_resumes_and_routes_each_member_once(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Crash after the executor recorded the FAILED verdict, before
+        ``complete_barrier``: the members are still BLOCKED with live BUFFERED
+        outcomes and no terminal. Resume completes the recorded verdict — no
+        second flush, no second DIVERT, no second transform_errors row, no
+        retry batch — and every member reaches the sink exactly once."""
+        from elspeth.engine.processor import RowProcessor
+
+        error_sink = CollectSink("quarantine")
+        db, payload_store, checkpoint_mgr, _source, transform, output_sink, config, graph, orchestrator = self._run_until_crash(
+            tmp_path, error_sink
+        )
+        real_complete = RowProcessor._complete_aggregation_flush
+        crashed: list[bool] = []
+
+        def _crash_once(self: RowProcessor, *args: Any, **kwargs: Any) -> Any:
+            if not crashed:
+                crashed.append(True)
+                raise RuntimeError("injected crash before barrier handoff")
+            return real_complete(self, *args, **kwargs)
+
+        monkeypatch.setattr(RowProcessor, "_complete_aggregation_flush", _crash_once)
+
+        with pytest.raises(RuntimeError, match="injected crash before barrier handoff"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().first())
+        before = self._routed_audit(db, run_id)
+        assert before["terminals"] == []
+        assert before["work_statuses"] == {"blocked"}
+        assert len(before["routing_state_ids"]) == 1
+        assert before["transform_error_count"] == 3
+        assert error_sink.results == []
+
+        result = self._resume(db, checkpoint_mgr, orchestrator, run_id, config=config, graph=graph, payload_store=payload_store)
+
+        assert result.status == RunStatus.FAILED
+        assert result.rows_routed_failure == 3
+        assert transform.batch_calls == 1, "the recorded verdict is completed, never re-run"
+        assert error_sink.results == [{"value": 10}, {"value": 20}, {"value": 30}], "every member written exactly once"
+        assert output_sink.results == []
+        after = self._routed_audit(db, run_id)
+        assert sorted(after["terminals"]) == sorted((token_id, "on_error_routed", "quarantine") for token_id, _p, _s in after["terminals"])
+        assert len(after["terminals"]) == len({token_id for token_id, _p, _s in after["terminals"]}) == 3
+        # The one verdict's one DIVERT, on its flush state.
+        assert after["routing_state_ids"] == before["routing_state_ids"]
+        assert set(after["routing_state_ids"]) <= after["failed_flush_states"]
+        # The verdict is final: no retry batch was ever minted for it.
+        assert [status for _batch_id, status in after["batches"]] == ["failed"]
+        assert after["transform_error_count"] == 3
+        assert after["work_statuses"] == {"terminal"}
+
+    def test_crash_after_the_barrier_handoff_delivers_the_pending_rows_without_replay(self, tmp_path: Any) -> None:
+        """Crash in the sink write after ``complete_barrier``: every member is a
+        durable PENDING_SINK handoff carrying the batch reason's hash. Resume
+        delivers them from the journal with the ORIGINAL error hash, never
+        re-runs the flush, and the FAILED batch's resume retry stays inert."""
+        from elspeth.engine._error_hash import compute_error_hash
+
+        error_sink = _FailOnceSink("quarantine")
+        db, payload_store, checkpoint_mgr, _source, transform, output_sink, config, graph, orchestrator = self._run_until_crash(
+            tmp_path, error_sink
+        )
+
+        with pytest.raises(RuntimeError, match="injected sink write crash"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().first())
+            pending = conn.execute(
+                select(token_work_items_table.c.pending_path, token_work_items_table.c.pending_error_hash)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.status == "pending_sink")
+            ).all()
+        expected_hash = compute_error_hash(
+            canonical_json({"reason": "batch_failed", "error": "injected batch flush failure"}), exception_type="TransformError"
+        )
+        assert pending == [("on_error_routed", expected_hash)] * 3
+        assert transform.batch_calls == 1
+
+        expired_at = datetime.now(UTC) - timedelta(seconds=1)
+        with db.write_connection() as conn:
+            expired = conn.execute(
+                update(sink_effects_table)
+                .where(sink_effects_table.c.run_id == run_id, sink_effects_table.c.state == "in_flight")
+                .values(lease_heartbeat_at=expired_at - timedelta(seconds=1), lease_expires_at=expired_at)
+            )
+        assert expired.rowcount == 1
+
+        result = self._resume(db, checkpoint_mgr, orchestrator, run_id, config=config, graph=graph, payload_store=payload_store)
+
+        assert result.status == RunStatus.FAILED
+        assert transform.batch_calls == 1, "resume must deliver the journal-durable handoffs, not re-run the flush"
+        assert error_sink.results == [{"value": 10}, {"value": 20}, {"value": 30}]
+        assert output_sink.results == []
+        after = self._routed_audit(db, run_id)
+        assert len(after["terminals"]) == len({token_id for token_id, _p, _s in after["terminals"]}) == 3
+        assert {(path, sink) for _t, path, sink in after["terminals"]} == {("on_error_routed", "quarantine")}
+        # A recorded FAILED verdict is final, so handle_incomplete_batches never
+        # retries it: no inert DRAFT retry batch is minted on resume (it was,
+        # before the C4 unit of elspeth-5887fb7928; that DRAFT was once
+        # attributed here to elspeth-35d03f1f28, whose subject is instead a
+        # copied-membership mismatch after a partial failed terminalisation).
+        assert [status for _batch_id, status in after["batches"]] == ["failed"]
+        assert len(after["routing_state_ids"]) == 1, "no second flush attempt, so no second DIVERT"
+        assert after["transform_error_count"] == 3
+        assert after["work_statuses"] == {"terminal"}
+        with db.connection() as conn:
+            outcome_hashes = set(
+                conn.execute(
+                    select(token_outcomes_table.c.error_hash)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.completed == 1)
+                ).scalars()
+            )
+        assert outcome_hashes == {expected_hash}
 
 
 # =============================================================================
@@ -1132,24 +1529,25 @@ class TestAggregationRecoveryIntegration:
         # Record source rows and create tokens
         tokens = []
         for i in range(3):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
                 source_node_id="source",
                 row_index=i,
                 data={"id": i, "value": i * 100},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             tokens.append(token)
 
         # Create batch and add members
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="sum_aggregator",
+            aggregation_node_id="sum_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
         for i, token in enumerate(tokens):
-            factory.execution.add_batch_member(batch.batch_id, token.token_id, ordinal=i)
+            with fenced_leader_transaction(
+                db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+            ) as conn:
+                add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token.token_id, ordinal=i, expected_run_id=run.run_id)
 
         # Checkpoint before flush — journal era: scalar-only checkpoint row
         # (buffered payloads live in journal BLOCKED rows, not in a blob).
@@ -1162,7 +1560,9 @@ class TestAggregationRecoveryIntegration:
         )
 
         # Simulate crash during flush
-        factory.execution.update_batch_status(batch.batch_id, BatchStatus.EXECUTING)
+        factory.execution.update_batch_status(
+            batch.batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
         factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # === PHASE 2: Verify recovery is possible ===
@@ -1183,10 +1583,14 @@ class TestAggregationRecoveryIntegration:
         assert incomplete[0].status == BatchStatus.EXECUTING
 
         # Mark executing as failed (crash interrupted)
-        factory.execution.complete_batch(batch.batch_id, BatchStatus.FAILED)
+        factory.execution.complete_batch(
+            batch.batch_id,
+            BatchStatus.FAILED,
+            coordination_token=leader_token_for(factory._db, run.run_id),
+        )
 
         # Retry the batch
-        retry_batch = factory.execution.retry_batch(batch.batch_id)
+        retry_batch = factory.execution.retry_batch(batch.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
         assert retry_batch.attempt == 1
         assert retry_batch.status == BatchStatus.DRAFT
 
@@ -1233,34 +1637,45 @@ class TestAggregationRecoveryIntegration:
         # Create rows and tokens
         tokens = []
         for i in range(4):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
                 source_node_id="source",
                 row_index=i,
                 data={"id": i, "value": i * 10},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             tokens.append(token)
 
         # Create batch for sum_aggregator (completed successfully)
         sum_batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="sum_aggregator",
+            aggregation_node_id="sum_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
         for i, token in enumerate(tokens[:2]):
-            factory.execution.add_batch_member(sum_batch.batch_id, token.token_id, ordinal=i)
-        factory.execution.complete_batch(sum_batch.batch_id, BatchStatus.COMPLETED)
+            with fenced_leader_transaction(
+                db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+            ) as conn:
+                add_batch_member_guarded(conn, batch_id=sum_batch.batch_id, token_id=token.token_id, ordinal=i, expected_run_id=run.run_id)
+        factory.execution.complete_batch(
+            sum_batch.batch_id,
+            BatchStatus.COMPLETED,
+            coordination_token=leader_token_for(factory._db, run.run_id),
+        )
 
         # Create batch for count_aggregator (crashed during execution)
         count_batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="count_aggregator",
+            aggregation_node_id="count_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
         for i, token in enumerate(tokens[2:]):
-            factory.execution.add_batch_member(count_batch.batch_id, token.token_id, ordinal=i)
-        factory.execution.update_batch_status(count_batch.batch_id, BatchStatus.EXECUTING)
+            with fenced_leader_transaction(
+                db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+            ) as conn:
+                add_batch_member_guarded(
+                    conn, batch_id=count_batch.batch_id, token_id=token.token_id, ordinal=i, expected_run_id=run.run_id
+                )
+        factory.execution.update_batch_status(
+            count_batch.batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         # Checkpoint at last processed token — journal era: scalar-only row.
         create_checkpoint(
@@ -1299,28 +1714,33 @@ class TestAggregationRecoveryIntegration:
         # Create 5 rows with specific order
         tokens = []
         for i in range(5):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
                 source_node_id="source",
                 row_index=i,
                 data={"seq": i, "data": f"item_{i}"},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             tokens.append(token)
 
         # Create batch with specific member ordering
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="sum_aggregator",
+            aggregation_node_id="sum_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
         # Add in reverse order to test ordinal preservation
         for i, token in enumerate(reversed(tokens)):
-            factory.execution.add_batch_member(batch.batch_id, token.token_id, ordinal=i)
+            with fenced_leader_transaction(
+                db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+            ) as conn:
+                add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token.token_id, ordinal=i, expected_run_id=run.run_id)
 
         # Mark as failed for retry
-        factory.execution.complete_batch(batch.batch_id, BatchStatus.FAILED)
+        factory.execution.complete_batch(
+            batch.batch_id,
+            BatchStatus.FAILED,
+            coordination_token=leader_token_for(factory._db, run.run_id),
+        )
 
         # Checkpoint (journal era: scalar-only row)
         create_checkpoint(
@@ -1332,7 +1752,7 @@ class TestAggregationRecoveryIntegration:
         )
 
         # Retry
-        retry_batch = factory.execution.retry_batch(batch.batch_id)
+        retry_batch = factory.execution.retry_batch(batch.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Verify member order is preserved
         original_members = factory.execution.get_batch_members(batch.batch_id)
@@ -1355,35 +1775,42 @@ class TestAggregationRecoveryIntegration:
 
         self._register_nodes_raw(db, run.run_id)
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id="source",
             row_index=0,
             data={"id": 0},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="sum_aggregator",
+            aggregation_node_id="sum_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
-        factory.execution.add_batch_member(batch.batch_id, token.token_id, ordinal=0)
+        with fenced_leader_transaction(
+            db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+        ) as conn:
+            add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token.token_id, ordinal=0, expected_run_id=run.run_id)
 
         # Test with draft status
         with pytest.raises(AuditIntegrityError, match="can only retry failed batches"):
-            factory.execution.retry_batch(batch.batch_id)
+            factory.execution.retry_batch(batch.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Test with executing status
-        factory.execution.update_batch_status(batch.batch_id, BatchStatus.EXECUTING)
+        factory.execution.update_batch_status(
+            batch.batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
         with pytest.raises(AuditIntegrityError, match="can only retry failed batches"):
-            factory.execution.retry_batch(batch.batch_id)
+            factory.execution.retry_batch(batch.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Test with completed status
-        factory.execution.complete_batch(batch.batch_id, BatchStatus.COMPLETED)
+        factory.execution.complete_batch(
+            batch.batch_id,
+            BatchStatus.COMPLETED,
+            coordination_token=leader_token_for(factory._db, run.run_id),
+        )
         with pytest.raises(AuditIntegrityError, match="can only retry failed batches"):
-            factory.execution.retry_batch(batch.batch_id)
+            factory.execution.retry_batch(batch.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
     def _register_nodes_raw(
         self,
@@ -1414,7 +1841,7 @@ class TestAggregationRecoveryIntegration:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -1431,7 +1858,7 @@ class TestAggregationRecoveryIntegration:
                     source_name="source",
                     plugin_name="test_source",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json="{}",
                     schema_contract_json=audit_record.to_json(),
                     schema_contract_hash=contract.version_hash(),
@@ -1449,7 +1876,7 @@ class TestAggregationRecoveryIntegration:
                     node_type=NodeType.AGGREGATION,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -1466,7 +1893,7 @@ class TestAggregationRecoveryIntegration:
                             node_type=node_type,
                             plugin_version="1.0",
                             determinism=Determinism.DETERMINISTIC,
-                            config_hash="test",
+                            config_hash=fake_sha256("test"),
                             config_json="{}",
                             registered_at=now,
                         )
@@ -1518,38 +1945,45 @@ class TestAggregationRecoveryIntegration:
         # database's past rather than handed to the verb).
         tokens = []
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="sum_aggregator",
+            aggregation_node_id="sum_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
         for i in range(3):
-            row_obj = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row_obj, token = factory.data_flow.create_row_with_token(
                 source_node_id="source",
                 row_index=i,
                 data={"id": i, "value": i * 100},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
-            token = factory.data_flow.create_token(row_id=row_obj.row_id)
             tokens.append(token)
-            factory.execution.add_batch_member(batch.batch_id, token.token_id, ordinal=i)
+            with fenced_leader_transaction(
+                db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+            ) as conn:
+                add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token.token_id, ordinal=i, expected_run_id=run.run_id)
             payload = PipelineRow({"id": i, "value": i * 100}, _create_test_schema_contract())
             factory.scheduler.enqueue_ready(
-                run_id=run.run_id,
                 token_id=token.token_id,
                 row_id=token.row_id,
                 node_id="sum_aggregator",
                 step_index=1,
                 ingest_sequence=i,
                 row_payload_json=factory.scheduler.serialize_row_payload(payload),
+                member_token=leader_token_for(factory._db, run.run_id).membership,
             )
-            claimed = factory.scheduler.claim_ready(run_id=run.run_id, lease_owner="seeder", lease_seconds=60)
+            claimed = factory.scheduler.claim_ready(
+                lease_owner="seeder",
+                lease_seconds=60,
+                member_token=member_token_for(factory._db.engine, run_id=run.run_id, worker_id="seeder"),
+            )
             assert claimed is not None and claimed.token_id == token.token_id
             factory.scheduler.mark_blocked(
                 work_item_id=claimed.work_item_id,
+                row_payload_json=claimed.row_payload_json,
                 queue_key=None,
                 barrier_key="sum_aggregator",
                 expected_lease_owner="seeder",
+                member_token=member_token_for(factory._db.engine, run_id=run.run_id, worker_id="seeder"),
             )
             age_barrier_hold(db.engine, claimed.work_item_id, seconds_ago=30.0 - i)  # oldest row anchors the age
         factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))

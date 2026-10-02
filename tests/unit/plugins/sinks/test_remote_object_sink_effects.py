@@ -207,6 +207,7 @@ class _AzureBlob:
 
 class _AzureStore:
     def __init__(self) -> None:
+        self.account_name = "test"
         self.value: _Object | None = None
         self.requests: list[dict[str, object]] = []
         self.response_loss = False
@@ -265,6 +266,38 @@ def test_remote_sinks_declare_recoverable_pipeline_effects(factory: Any) -> None
     store = _S3Store() if factory is _s3 else _AzureStore()
     sink = factory(store)
     validate_sink_effect_capability(sink, "write", SinkEffectInputKind.PIPELINE_MEMBERS)
+
+
+def test_azure_target_identifies_storage_account() -> None:
+    first_store = _AzureStore()
+    second_store = _AzureStore()
+    first_store.account_name = "account-a"
+    second_store.account_name = "account-b"
+    first = _azure(first_store, blob_path="out.csv", format="csv")
+    second = _azure(second_store, blob_path="out.csv", format="csv")
+    request = SinkEffectInspectionRequest(effect_id="a" * 64, target="{}", predecessor_descriptor=None)
+
+    first_target = first.inspect_effect(request, _CTX).reference
+    second_target = second.inspect_effect(request, _CTX).reference
+
+    assert first_target == "azure://account-a/container/out.csv"
+    assert second_target == "azure://account-b/container/out.csv"
+
+
+def test_azure_csv_stage_limit_applies_before_aggregate_serialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    sink = _azure(_AzureStore(), blob_path="out.csv", format="csv", max_blob_bytes=8)
+    original = sink._serialize_rows
+
+    def per_member_only(rows: list[dict[str, Any]]) -> bytes:
+        if len(rows) != 1:
+            raise AssertionError("cumulative CSV must be streamed into the bounded stage")
+        return original(rows)
+
+    monkeypatch.setattr(sink, "_serialize_rows", per_member_only)
+    first = _member(0, {"id": 1})
+    second = _member(1, {"id": 2})
+    with pytest.raises(remote_effects.RemoteObjectEffectLimitError, match="byte limit exceeded"):
+        _prepare(sink, effect_id="b" * 64, current=(first, second), target_snapshot=(first, second))
 
 
 @pytest.mark.parametrize("factory", [_s3, _azure])
@@ -670,6 +703,40 @@ def test_azure_effect_diverts_fixed_schema_extra_and_publishes_good_rows() -> No
     assert reconciled.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR
     assert reconciled.accepted_ordinals is None
     assert reconciled.diverted_ordinals is None
+
+
+@pytest.mark.parametrize(
+    ("factory", "expected_reason"),
+    [
+        (_azure, "CSV encoding (ascii) failed: UnicodeEncodeError"),
+        (_s3, "CSV record could not be encoded safely"),
+    ],
+    ids=["azure_blob", "aws_s3"],
+)
+def test_remote_csv_encoding_diversion_reason_is_value_free(factory: Any, expected_reason: str) -> None:
+    """The recorded diversion reason names the codec and failure kind, never a fragment of the value.
+
+    ``UnicodeEncodeError``'s own text quotes the character it could not
+    encode ("can't encode character '\\xe9' in position 9"), a piece of the
+    row's value; the reason must not carry it.
+    """
+    store = _AzureStore() if factory is _azure else _S3Store()
+    good = _member(0, {"id": 1, "name": "Ada"})
+    bad = _member(1, {"id": 2, "name": "SNTL_RMT_é_7731"})
+    options: dict[str, object] = {"format": "csv", "schema": {"mode": "fixed", "fields": ["id: int", "name: str"]}}
+    if factory is _azure:
+        options.update(blob_path="out.csv", csv_options={"encoding": "ascii"})
+    else:
+        options.update(key="out.csv", csv_options={"encoding": "ascii"})
+    sink = factory(store, **options)
+
+    plan = _prepare(sink, effect_id="5" * 64, current=(good, bad), target_snapshot=(good, bad))
+
+    assert plan.safe_evidence["diverted_ordinals"] == (1,)
+    reason = sink._get_diversions()[0].reason
+    assert reason == expected_reason
+    for fragment in ("SNTL_RMT", "é", "\\xe9", "position"):
+        assert fragment not in reason
 
 
 def test_s3_csv_effect_applies_display_headers_before_serialization() -> None:

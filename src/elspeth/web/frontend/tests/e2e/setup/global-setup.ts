@@ -21,6 +21,8 @@ const FRONTEND_ORIGIN =
 const BACKEND_BASE_URL =
   process.env.PLAYWRIGHT_BACKEND_BASE_URL ?? `http://127.0.0.1:${BACKEND_PORT}`;
 const TOKEN_KEY = "auth_token";
+const ROLE_ADMIN_USERNAME = process.env.PLAYWRIGHT_ROLE_ADMIN_USERNAME;
+const ROLE_ADMIN_PASSWORD = process.env.PLAYWRIGHT_ROLE_ADMIN_PASSWORD;
 
 async function obtainToken(apiBaseURL: string): Promise<string> {
   const ctx = await request.newContext({ baseURL: apiBaseURL });
@@ -57,6 +59,80 @@ async function obtainToken(apiBaseURL: string): Promise<string> {
   }
 }
 
+async function login(apiBaseURL: string, username: string, password: string): Promise<string> {
+  const ctx = await request.newContext({ baseURL: apiBaseURL });
+  try {
+    const resp = await ctx.post("/api/auth/login", {
+      data: { username, password },
+    });
+    if (!resp.ok()) {
+      const detail = await resp.text();
+      throw new Error(
+        `role-admin login failed (${resp.status()}): ${detail.slice(0, 500)}`,
+      );
+    }
+    const body = (await resp.json()) as { access_token: string };
+    return body.access_token;
+  } finally {
+    await ctx.dispose();
+  }
+}
+
+async function grantPipelineUserRole(
+  apiBaseURL: string,
+  userToken: string,
+): Promise<void> {
+  if (!ROLE_ADMIN_USERNAME || !ROLE_ADMIN_PASSWORD) {
+    throw new Error("Playwright role-admin credentials were not configured");
+  }
+
+  const userCtx = await request.newContext({
+    baseURL: apiBaseURL,
+    extraHTTPHeaders: { Authorization: `Bearer ${userToken}` },
+  });
+  let identityId: string;
+  try {
+    const resp = await userCtx.get("/api/auth/me");
+    if (!resp.ok()) {
+      const detail = await resp.text();
+      throw new Error(
+        `read E2E identity failed (${resp.status()}): ${detail.slice(0, 500)}`,
+      );
+    }
+    const body = (await resp.json()) as { user_id: string };
+    identityId = body.user_id;
+  } finally {
+    await userCtx.dispose();
+  }
+
+  const adminToken = await login(
+    apiBaseURL,
+    ROLE_ADMIN_USERNAME,
+    ROLE_ADMIN_PASSWORD,
+  );
+  const adminCtx = await request.newContext({
+    baseURL: apiBaseURL,
+    extraHTTPHeaders: { Authorization: `Bearer ${adminToken}` },
+  });
+  try {
+    const resp = await adminCtx.post("/api/auth/admin/roles", {
+      data: {
+        identity_id: identityId,
+        role: "user",
+        note: "Playwright shared workload account",
+      },
+    });
+    if (!resp.ok()) {
+      const detail = await resp.text();
+      throw new Error(
+        `grant E2E user role failed (${resp.status()}): ${detail.slice(0, 500)}`,
+      );
+    }
+  } finally {
+    await adminCtx.dispose();
+  }
+}
+
 async function markTutorialCompleted(apiBaseURL: string, token: string): Promise<void> {
   const ctx = await request.newContext({
     baseURL: apiBaseURL,
@@ -65,8 +141,8 @@ async function markTutorialCompleted(apiBaseURL: string, token: string): Promise
   try {
     const resp = await ctx.patch("/api/composer-preferences", {
       data: {
-        default_mode: "guided",
         tutorial_completed_at: new Date().toISOString(),
+        tutorial_completed_via: "skip",
       },
     });
     if (!resp.ok()) {
@@ -102,6 +178,11 @@ const STORAGE_STATE_PATH = resolve(HERE, "..", ".auth", "user.json");
 
 export default async function globalSetup(): Promise<void> {
   const token = await obtainToken(BACKEND_BASE_URL);
+  // Registration authenticates and activates the local identity, but the
+  // workload boundary separately requires a live deployment-wide user role.
+  // Exercise the same audited admin API an operator uses rather than weakening
+  // that production boundary for the test deployment.
+  await grantPipelineUserRole(BACKEND_BASE_URL, token);
   // Most E2E specs predate the first-run tutorial and assert on the normal
   // composer shell. Keep the baseline tester out of tutorial mode; specs that
   // exercise the tutorial explicitly reset the preference in their own setup.

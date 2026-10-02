@@ -1,14 +1,6 @@
-// The coupled triple: prompt + assumption rubric (dim c) + judge rubric (dim d).
-// If the prompt changes, BOTH rubrics must change in lockstep (spec §11).
-
-export const HARNESS_VERSION = "2.0.0";
-
-// Semantically equal to CANONICAL_TUTORIAL_PROMPT (the synthetic-scrape SUMMARY
-// task) but a DIFFERENT string, so SHA-256(prompt+model_id) misses the tutorial
-// cache (is_canonical_prompt=false in tutorial_service.py) -> fresh live
-// composition every run.
-//
-// SUMMARISATION — one value per page (NOT multi-field extraction): the composer
+// Interpretation and output rubrics for the current fixed freeform tutorial
+// brief in tutorialMachine.ts. If that brief changes, revalidate both rubrics.
+// Summarisation is one value per page: the composer
 // builds source(url rows) -> web_scrape -> llm(single response_field) ->
 // field_mapper(drop raw HTML) -> json. One value per row, no structured
 // multi-query, no joining. The always-on prompt-shield (p3) fires every run
@@ -16,24 +8,9 @@ export const HARNESS_VERSION = "2.0.0";
 // expected. "Summarise" is mildly subjective, so a vague_term review MAY fire —
 // it is tolerated (neither expected nor an over-flag).
 //
-// The prompt MUST carry the 3 concrete scrape targets: driveGuidedWalk seeds
-// FIXED_PROMPT as the sole driving message (:106/:115), and the Tier-1
-// no-fabrication source driver (p1, contract §2.2) builds rows ONLY from
-// concrete URLs present IN the message — it never invents them. A URL-less
-// prompt yields zero scrape targets, so the run produces no rows and
-// JUDGE_RUBRIC.minReachableSources:3 / minSubstantiveRows:3 become
-// UNSATISFIABLE (dim-c/dim-d permanently fail). These are the canonical public
-// GitHub Pages URLs the tutorial resolves to by default (TUTORIAL_SAMPLE_PAGES_BASE_URL);
-// the backend no longer derives the base from the request origin. If a deployment
-// overrides ELSPETH_WEB__TUTORIAL_SAMPLE_BASE_URL, change these three literals to
-// that origin.
-export const FIXED_PROMPT =
-  "Fetch each of these three synthetic project-brief pages and have an LLM " +
-  "write a short summary of each page. Drop the raw HTML and write the rows " +
-  "to a JSON file.\n" +
-  "https://dta-au.github.io/elspeth/tutorial-site/project-1.html\n" +
-  "https://dta-au.github.io/elspeth/tutorial-site/project-2.html\n" +
-  "https://dta-au.github.io/elspeth/tutorial-site/project-3.html";
+// The tutorial resolves its three synthetic URLs at runtime and includes
+// them in one ordinary freeform Composer message. The source/reachability
+// checks below must see all three, rather than trusting a cached run.
 
 // Dimension (c): which interpretation kinds the composer SHOULD raise vs NOT.
 // Graded on kind, not exact wording. InterpretationKind values come from the

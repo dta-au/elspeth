@@ -14,9 +14,11 @@ from unittest.mock import Mock
 import pytest
 
 from elspeth.contracts import TokenInfo, TransformProtocol, TransformResult
-from elspeth.contracts.declaration_contracts import AggregateDeclarationContractViolation
+from elspeth.contracts.declaration_contracts import AggregateDeclarationContractViolation, derive_effective_input_fields
 from elspeth.contracts.enums import OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
+    BatchQuarantineContradictionError,
+    OrchestrationInvariantError,
     PassThroughContractViolation,
     UnexpectedEmptyEmissionViolation,
     ZeroEmissionSuccessContractViolation,
@@ -26,7 +28,7 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.config import AggregationSettings, TriggerConfig
 from elspeth.engine.processor import _FlushContext
 from elspeth.testing import make_contract, make_token_info
-from tests.fixtures.landscape import make_recorder_with_run
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 
 def _make_contract(fields: dict[str, type]) -> SchemaContract:
@@ -92,7 +94,6 @@ def _make_fctx(
         settings=settings,
         buffered_tokens=tuple(tokens),
         batch_id="batch-1",
-        error_msg="batch failed",
         expand_parent_token=tokens[0],
         triggering_token=triggering_token or tokens[-1],
         coalesce_node_id=None,
@@ -126,6 +127,7 @@ def _make_processor() -> Any:
         source_on_success="default",
         traversal=traversal,
         scheduler=setup.factory.scheduler,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
     )
 
 
@@ -139,18 +141,15 @@ def _register_tokens(processor: Any, tokens: list[TokenInfo]) -> None:
     error_hash is present for FAILED.
     """
     for idx, token in enumerate(tokens):
-        processor._data_flow.create_row(
-            run_id="test-run",
+        processor._data_flow.create_row_with_token(
+            coordination_token=processor.coordination_token,
             source_node_id="source-0",
             row_index=idx,
             data=token.row_data.to_dict(),
             row_id=token.row_id,
+            token_id=token.token_id,
             source_row_index=idx,
             ingest_sequence=idx,
-        )
-        processor._data_flow.create_token(
-            row_id=token.row_id,
-            token_id=token.token_id,
         )
 
 
@@ -254,6 +253,319 @@ class TestTransformModeIntersection:
         with pytest.raises(PassThroughContractViolation) as exc_info:
             processor._cross_check_flush_output(fctx, result)
         assert "x" in exc_info.value.divergence_set
+
+
+class TestOptionalFieldAbsentFromPayload:
+    """A buffered token's input fields are the contract fields its payload carries.
+
+    An observed source records every field ``required: false``, and a row that
+    lacks one still carries the source's contract. The flush cross-check must
+    derive input fields as the single-token path does
+    (``derive_effective_input_fields``): an optional field the row does not
+    carry is not an input the transform can drop. A dropped field is still a
+    violation, required or not, when every buffered row carried it (TRANSFORM
+    mode) or when the paired row carried it (PASSTHROUGH mode). TRANSFORM mode
+    does not attribute outputs to inputs, so a field only some emitting
+    buffered rows carried is outside the intersection it checks (ADR-009
+    2026-09-26 note).
+    """
+
+    def test_transform_mode_mixed_batch_without_optional_field_is_honest(self) -> None:
+        processor = _make_processor()
+        # The source's contract: both fields optional (``required=False``).
+        contract = make_contract({"id": 1, "n": 2})
+        tokens = [
+            _make_token("t0", {"id": 1, "n": 2}, contract),
+            _make_token("t1", {"id": 2}, contract),
+        ]
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        # Each emitted row is a copy of its own input: t1's copy has no 'n'.
+        rows = [
+            PipelineRow({"id": 1, "n": 2}, contract),
+            PipelineRow({"id": 1, "n": 2}, contract),
+            PipelineRow({"id": 2}, contract),
+        ]
+        result = TransformResult.success_multi(rows, success_reason={"action": "replicate"})
+        processor._cross_check_flush_output(fctx, result)
+
+    def test_transform_mode_dropping_a_carried_optional_field_still_fires(self) -> None:
+        processor = _make_processor()
+        contract = make_contract({"id": 1, "n": 2})
+        tokens = [
+            _make_token("t0", {"id": 1, "n": 2}, contract),
+            _make_token("t1", {"id": 2, "n": 1}, contract),
+        ]
+        _register_tokens(processor, tokens)
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        # Every input carried 'n'; the output drops it from payload and contract.
+        reduced = make_contract({"id": 1})
+        rows = [PipelineRow({"id": 1}, reduced), PipelineRow({"id": 2}, reduced)]
+        result = TransformResult.success_multi(rows, success_reason={"action": "drop-carried-optional"})
+        with pytest.raises(PassThroughContractViolation) as exc_info:
+            processor._cross_check_flush_output(fctx, result)
+        assert exc_info.value.divergence_set == frozenset({"n"})
+
+    def test_transform_mode_dropping_a_required_field_from_the_payload_still_fires(self) -> None:
+        processor = _make_processor()
+        contract = _make_contract({"id": int, "n": int})
+        tokens = [
+            _make_token("t0", {"id": 1, "n": 2}, contract),
+            _make_token("t1", {"id": 2, "n": 1}, contract),
+        ]
+        _register_tokens(processor, tokens)
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        # The payload-side vector: the contract still names 'n', the payload lost it.
+        rows = [PipelineRow({"id": 1}, contract), PipelineRow({"id": 2}, contract)]
+        result = TransformResult.success_multi(rows, success_reason={"action": "drop-required-payload"})
+        with pytest.raises(PassThroughContractViolation) as exc_info:
+            processor._cross_check_flush_output(fctx, result)
+        assert exc_info.value.divergence_set == frozenset({"n"})
+
+    def test_passthrough_mode_row_without_optional_field_is_honest(self) -> None:
+        processor = _make_processor()
+        contract = make_contract({"id": 1, "n": 2})
+        tokens = [
+            _make_token("t0", {"id": 1, "n": 2}, contract),
+            _make_token("t1", {"id": 2}, contract),
+        ]
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.PASSTHROUGH)
+        rows = [PipelineRow({"id": 1, "n": 2}, contract), PipelineRow({"id": 2}, contract)]
+        result = TransformResult.success_multi(rows, success_reason={"action": "annotate"})
+        processor._cross_check_flush_output(fctx, result)
+
+    def test_passthrough_mode_dropping_a_carried_optional_field_still_fires(self) -> None:
+        processor = _make_processor()
+        contract = make_contract({"id": 1, "n": 2})
+        tokens = [
+            _make_token("t0", {"id": 1}, contract),
+            _make_token("t1", {"id": 2, "n": 1}, contract),
+        ]
+        _register_tokens(processor, tokens)
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.PASSTHROUGH)
+        # t1 carried 'n'; its paired output lost it.
+        rows = [PipelineRow({"id": 1}, contract), PipelineRow({"id": 2}, contract)]
+        result = TransformResult.success_multi(rows, success_reason={"action": "drop-paired-optional"})
+        with pytest.raises(PassThroughContractViolation) as exc_info:
+            processor._cross_check_flush_output(fctx, result)
+        assert exc_info.value.divergence_set == frozenset({"n"})
+        assert exc_info.value.token_id == "t1"
+
+    def test_transform_mode_payload_key_outside_the_contract_is_not_an_input(self) -> None:
+        """The flush site uses the shared helper, not the payload's keys (panel F1).
+
+        ``derive_effective_input_fields`` counts only the contract fields the
+        payload carries, so a payload key the contract does not name is not an
+        input on the single-token path. The flush site must agree. A
+        ``PipelineRow`` with such a key constructs; whether a live pipeline
+        delivers one to an aggregation has not been shown.
+        """
+        processor = _make_processor()
+        contract = make_contract({"id": 1})
+        tokens = [
+            _make_token("t0", {"id": 1, "extra": 2}, contract),
+            _make_token("t1", {"id": 2, "extra": 3}, contract),
+        ]
+        assert all(derive_effective_input_fields(token.row_data) == frozenset({"id"}) for token in tokens)
+        transform = _make_flush_transform()
+        fctx = _make_fctx(transform=transform, tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        rows = [PipelineRow({"id": 1}, contract), PipelineRow({"id": 2}, contract)]
+        result = TransformResult.success_multi(rows, success_reason={"action": "copy-contract-fields"})
+        processor._cross_check_flush_output(fctx, result)
+
+
+def _quarantine_reason(*indices: int) -> Any:
+    return {"action": "replicate", "metadata": {"quarantined_indices": list(indices)}}
+
+
+class TestTransformModeExcludesInBatchQuarantinedInputs:
+    """TRANSFORM mode intersects only over the inputs that produced output.
+
+    An input the plugin quarantined in-batch emits nothing and is recorded
+    FAILURE / QUARANTINED_AT_SOURCE; routing expands the outputs from the
+    non-quarantined tokens only. If its (smaller) field set entered the
+    intersection, a plugin could strip a field every emitting input carried
+    and pass (the quarantine-dilution shape, ADR-009 2026-09-26 note). The
+    quarantined set is the engine-validated one the cross-check returns and
+    routing consumes.
+    """
+
+    def _diluted_tokens(self) -> tuple[SchemaContract, list[TokenInfo]]:
+        contract = make_contract({"id": 1, "tag": "x", "n": 0})
+        return contract, [
+            _make_token("t0", {"id": 1, "tag": "x"}, contract),
+            _make_token("t1", {"id": 2, "tag": "y"}, contract),
+            _make_token("t2", {"id": 3, "n": 0}, contract),  # quarantined in-batch, lacks 'tag'
+        ]
+
+    def test_dropping_a_field_every_emitting_input_carried_fires_despite_a_quarantined_non_carrier(self) -> None:
+        processor = _make_processor()
+        contract, tokens = self._diluted_tokens()
+        _register_tokens(processor, tokens)
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        rows = [PipelineRow({"id": 1}, contract), PipelineRow({"id": 2}, contract)]
+        result = TransformResult.success_multi(rows, success_reason=_quarantine_reason(2))
+        with pytest.raises(PassThroughContractViolation) as exc_info:
+            processor._cross_check_flush_output(fctx, result)
+        assert exc_info.value.divergence_set == frozenset({"tag"})
+
+    def test_honest_emission_with_a_quarantined_non_carrier_passes_and_returns_the_validated_set(self) -> None:
+        processor = _make_processor()
+        contract, tokens = self._diluted_tokens()
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        rows = [PipelineRow({"id": 1, "tag": "x"}, contract), PipelineRow({"id": 2, "tag": "y"}, contract)]
+        result = TransformResult.success_multi(rows, success_reason=_quarantine_reason(2))
+        assert processor._cross_check_flush_output(fctx, result) == frozenset({2})
+
+    def test_non_empty_emission_with_every_input_quarantined_is_an_invariant_violation(self) -> None:
+        processor = _make_processor()
+        contract, tokens = self._diluted_tokens()
+        _register_tokens(processor, tokens)
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        rows = [PipelineRow({"id": 1, "tag": "x"}, contract)]
+        result = TransformResult.success_multi(rows, success_reason=_quarantine_reason(0, 1, 2))
+        with pytest.raises(OrchestrationInvariantError, match="all 3 buffered token"):
+            processor._cross_check_flush_output(fctx, result)
+
+    def test_zero_emission_with_every_input_quarantined_keeps_the_all_token_branch(self) -> None:
+        """The zero-emission branch is unchanged: can_drop_rows governs it, not the quarantine set."""
+        processor = _make_processor()
+        _contract, tokens = self._diluted_tokens()
+        fctx = _make_fctx(
+            transform=_make_flush_transform(can_drop_rows=True),
+            tokens=tokens,
+            output_mode=OutputMode.TRANSFORM,
+        )
+        result = TransformResult.success_empty(success_reason=_quarantine_reason(0, 1, 2))
+        assert processor._cross_check_flush_output(fctx, result) == frozenset({0, 1, 2})
+
+
+def _completed_outcomes(processor: Any) -> list[Any]:
+    import sqlalchemy as sa
+
+    return processor._data_flow._ops.execute_fetchall(
+        sa.text("SELECT token_id, outcome, path, error_hash, context_json FROM token_outcomes WHERE completed = 1 ORDER BY token_id")
+    )
+
+
+class TestQuarantineContradictionRecordsEveryToken:
+    """A plugin's self-contradicting quarantine record fails every buffered token.
+
+    The quarantine set is validated before the declaration dispatch, because
+    the TRANSFORM intersection is computed over it. Its two contradictions are
+    malformed metadata and a non-empty emission with every input quarantined.
+    Each one still ends in a Tier-1 ``OrchestrationInvariantError``
+    (``BatchQuarantineContradictionError``), but first every buffered token
+    reaches a recorded FAILURE / UNROUTED terminal. This matches what a
+    batch-flush declaration violation records.
+
+    Before E4, a plugin with both defects (every input claimed quarantined
+    AND an emitted row violating a declaration contract) left every token
+    without an outcome. The invariant pre-empted the dispatch, and nothing
+    recorded the tokens.
+    """
+
+    def _tokens(self) -> tuple[SchemaContract, list[TokenInfo]]:
+        contract = make_contract({"id": 1, "tag": "x", "n": 0})
+        return contract, [
+            _make_token("t0", {"id": 1, "tag": "x"}, contract),
+            _make_token("t1", {"id": 2, "tag": "y"}, contract),
+            _make_token("t2", {"id": 3, "n": 0}, contract),
+        ]
+
+    def _assert_every_token_failed(self, processor: Any, tokens: list[TokenInfo], *, failure_kind: str) -> list[dict[str, Any]]:
+        import json as _json
+
+        rows = _completed_outcomes(processor)
+        assert [row.token_id for row in rows] == sorted(token.token_id for token in tokens)
+        contexts = []
+        for row in rows:
+            assert (row.outcome, row.path) == (TerminalOutcome.FAILURE.value, TerminalPath.UNROUTED.value)
+            assert row.error_hash is not None
+            ctx = _json.loads(row.context_json)
+            assert ctx["token_id"] == row.token_id
+            assert ctx["exception_type"] == "BatchQuarantineContradictionError"
+            assert ctx["failure_kind"] == failure_kind
+            assert ctx["buffered_token_count"] == len(tokens)
+            # Value-free: the invariant's message (which may quote the plugin's
+            # metadata) is never recorded.
+            assert "message" not in ctx
+            contexts.append(ctx)
+        assert len({row.error_hash for row in rows}) == 1
+        return contexts
+
+    @pytest.mark.parametrize(
+        "emitted_payload",
+        [
+            pytest.param({"id": 1}, id="emission-also-drops-a-field"),
+            pytest.param({"id": 1, "tag": "x"}, id="emission-otherwise-honest"),
+        ],
+    )
+    def test_every_input_quarantined_with_emission_records_every_token_failed_then_raises(
+        self,
+        emitted_payload: dict[str, Any],
+    ) -> None:
+        processor = _make_processor()
+        contract, tokens = self._tokens()
+        _register_tokens(processor, tokens)
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        result = TransformResult.success_multi(
+            [PipelineRow(emitted_payload, contract)],
+            success_reason=_quarantine_reason(0, 1, 2),
+        )
+
+        with pytest.raises(BatchQuarantineContradictionError, match="all 3 buffered token"):
+            processor._cross_check_flush_output(fctx, result)
+
+        contexts = self._assert_every_token_failed(processor, tokens, failure_kind="every_input_quarantined_with_emission")
+        assert {ctx["emitted_row_count"] for ctx in contexts} == {1}
+
+    @pytest.mark.parametrize("output_mode", [OutputMode.TRANSFORM, OutputMode.PASSTHROUGH])
+    def test_malformed_quarantine_metadata_records_every_token_failed_value_free_then_raises(
+        self,
+        output_mode: OutputMode,
+    ) -> None:
+        processor = _make_processor()
+        contract, tokens = self._tokens()
+        _register_tokens(processor, tokens)
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=output_mode)
+        sentinel = "E4-SENTINEL-METADATA-VALUE"
+        rows = [PipelineRow({"id": 1}, contract)] * (len(tokens) if output_mode is OutputMode.PASSTHROUGH else 1)
+        result = TransformResult.success_multi(
+            rows,
+            success_reason={"action": "replicate", "metadata": {"quarantined_indices": [sentinel]}},
+        )
+
+        with pytest.raises(BatchQuarantineContradictionError, match="expected int"):
+            processor._cross_check_flush_output(fctx, result)
+
+        contexts = self._assert_every_token_failed(processor, tokens, failure_kind="quarantine_metadata_invalid")
+        assert {ctx["emitted_row_count"] for ctx in contexts} == {len(rows)}
+        assert all(sentinel not in row.context_json for row in _completed_outcomes(processor))
+
+    @pytest.mark.parametrize(
+        "success_reason",
+        [
+            pytest.param(_quarantine_reason(0, 1, 2), id="every-input-quarantined"),
+            pytest.param({"action": "replicate", "metadata": {"quarantined_indices": [7]}}, id="malformed-metadata"),
+        ],
+    )
+    def test_resume_recheck_records_nothing(self, success_reason: Any) -> None:
+        """``record_violation=False`` (the resume re-check) raises without writing outcomes."""
+        processor = _make_processor()
+        contract, tokens = self._tokens()
+        _register_tokens(processor, tokens)
+        fctx = _make_fctx(transform=_make_flush_transform(), tokens=tokens, output_mode=OutputMode.TRANSFORM)
+        result = TransformResult.success_multi([PipelineRow({"id": 1}, contract)], success_reason=success_reason)
+
+        with pytest.raises(BatchQuarantineContradictionError):
+            processor._cross_check_flush_output(fctx, result, record_violation=False)
+
+        assert _completed_outcomes(processor) == []
 
 
 class TestEmptyEmissionGovernance:

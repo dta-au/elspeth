@@ -12,14 +12,16 @@ against the sessions store on EVERY request and never cached: a revoked
 admin's next request is refused. There is no configuration shortcut. The
 first admin comes from the D20 bootstrap (the ``sso_admin_subjects`` seed at
 first login, or ``elspeth composer users bootstrap-admin``); after that the
-admin API is the only path. A caller without the role sees 404, the same as
-the dev-admin surface: hidden, not forbidden, so the surface does not
-confirm its own existence to a probe.
+admin API is the usual path. A live approver can also appoint a curator over
+a direct report through ``POST /roles`` while workflow governance is on. A
+caller holding neither role sees 404, so the surface does not confirm its
+own existence to a probe.
 
 The authority is the arbiter
 ----------------------------
 Every rule with teeth lives in ``RepositoryIdentityAuthority`` and is
-enforced inside its transaction: the actor's admin role is re-proved there,
+enforced inside its transaction: the actor's admin or delegated approver
+authority is re-proved there,
 ``on_behalf_of`` / ``console_request_id`` are accepted only from a
 ``service`` identity (checked against the actor's STORED kind, never the
 request), self-disable and last-admin protection, R8's admin/workload
@@ -29,19 +31,26 @@ set into status codes. They add no rule of their own.
 
 What a pending row shows
 ------------------------
-A ``pending`` identity has not been admitted; until it is, the list exposes
-its subject and organisation and nothing else (spec rev2.2), so the queue an
-administrator reviews does not become a directory of everyone who ever
-tried to log in. ``raw_claims_json`` is never returned for any state.
+A ``pending`` identity that has NEVER been admitted has no standing here;
+until it is admitted, the list exposes its subject and organisation and
+nothing else (spec rev2.2), so the queue an administrator reviews does not
+become a directory of everyone who ever tried to log in.
+
+A pending row with an ``activated_at`` is a different thing and is shown in
+full: R9's dormancy re-pend returns a person the container already admitted
+to the queue, and their profile is one this deployment has legitimately held
+since their first login. Withholding it would only hide who the
+administrator is being asked to re-admit. ``raw_claims_json`` is never
+returned for any state.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from elspeth.contracts.auth import (
     ActivationRole,
@@ -65,6 +74,7 @@ from elspeth.web.coordination.identity_authority import (
     IdentityEnabled,
     IdentityNotFound,
     IdentitySummary,
+    PendingIdentitiesPurged,
     RelationshipChanged,
     RelationshipEdge,
     RelationshipNotFound,
@@ -73,12 +83,35 @@ from elspeth.web.coordination.identity_authority import (
     RoleGrant,
     RoleNotFound,
 )
+from elspeth.web.validation import reject_credential_material
 
 MAX_PAGE_SIZE = 200
 """Upper bound on one page of identities, roles or relationships."""
 
 
 # ── Wire shapes ──────────────────────────────────────────────────────────
+
+
+_FIRST_UTC_INSTANT = datetime.min.replace(tzinfo=UTC)
+_LAST_UTC_INSTANT = datetime.max.replace(tzinfo=UTC)
+
+
+def _utc_instant(value: datetime) -> datetime:
+    """Admit an aware body timestamp as the UTC instant the authority stores.
+
+    An offset can carry a representable wall-clock value past the last, or
+    before the first, instant a datetime holds (``9999-12-31T23:00-05:00``).
+    That instant has no UTC form, so converting it for storage raised
+    ``OverflowError`` and the request failed as a 500. Comparing aware
+    datetimes never builds the out-of-range value, so the range is checked
+    first and the body refused as invalid input.
+    """
+    if not _FIRST_UTC_INSTANT <= value <= _LAST_UTC_INSTANT:
+        raise ValueError("timestamp is outside the range a UTC datetime can represent")
+    return value.astimezone(UTC)
+
+
+_UtcInstant = Annotated[AwareDatetime, AfterValidator(_utc_instant)]
 
 
 class _StrictModel(BaseModel):
@@ -98,6 +131,11 @@ class _Provenance(_StrictModel):
 
     on_behalf_of: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
     console_request_id: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
+
+    @model_validator(mode="after")
+    def _reject_credential_material(self) -> _Provenance:
+        reject_credential_material(self.model_dump(mode="json"))
+        return self
 
 
 class ActivateIdentityRequest(_Provenance):
@@ -131,8 +169,9 @@ class GrantRoleRequest(_Provenance):
     role: IdentityRole
     scope: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
     # The one field family parsed from a string: strict mode would refuse an
-    # ISO-8601 body value, and an aware instant is the only shape accepted.
-    expires_at: AwareDatetime | None = Field(default=None, strict=False)
+    # ISO-8601 body value, and an aware instant that exists in UTC is the
+    # only shape accepted.
+    expires_at: _UtcInstant | None = Field(default=None, strict=False)
     note: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
 
 
@@ -146,16 +185,30 @@ class AssertRelationshipRequest(_Provenance):
     from_identity_id: str = Field(min_length=1, max_length=64)
     to_identity_id: str = Field(min_length=1, max_length=64)
     relationship_type: RelationshipType
-    effective_from: AwareDatetime | None = Field(default=None, strict=False)
-    effective_until: AwareDatetime | None = Field(default=None, strict=False)
+    effective_from: _UtcInstant | None = Field(default=None, strict=False)
+    effective_until: _UtcInstant | None = Field(default=None, strict=False)
     note: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
+
+    @model_validator(mode="after")
+    def _window_opens_before_it_closes(self) -> AssertRelationshipRequest:
+        """A fact about the body alone, so it is invalid input here; the authority keeps the same check as its guard."""
+        if self.effective_from is not None and self.effective_until is not None and self.effective_from >= self.effective_until:
+            raise ValueError("effective_from must precede effective_until")
+        return self
+
+
+class PurgePendingIdentitiesRequest(_Provenance):
+    """The retention window is deployment configuration, never request input."""
 
 
 class IdentityView(_StrictModel):
     """One identity as an administrator sees it. Never ``raw_claims_json``.
 
-    For a ``pending`` row every field after ``organisation_id`` that would
-    identify the person beyond their subject is ``None`` (spec rev2.2).
+    For a NEVER-ADMITTED ``pending`` row -- ``access_state='pending'`` with
+    no ``activated_at`` -- every field after ``organisation_id`` that would
+    identify the person beyond their subject is ``None`` (spec rev2.2). A row
+    R9 re-pended for dormancy has an ``activated_at`` and is shown in full;
+    see the module docstring.
     """
 
     identity_id: str
@@ -237,11 +290,32 @@ class DisableResponse(_StrictModel):
     revoked_relationship_ids: list[str]
 
 
+class PurgePendingIdentitiesResponse(_StrictModel):
+    batch_id: str
+    retention_days: int
+    deleted_identity_ids: list[str]
+    deleted_count: int
+    has_more: bool
+
+
 # ── Projections ──────────────────────────────────────────────────────────
 
 
 def _identity_view(summary: IdentitySummary) -> IdentityView:
-    pending = summary.access_state == "pending"
+    # NEVER-ADMITTED pending rows are the ones blanked, not every pending row,
+    # and the second term is what R9 made necessary.  The rev2.2 rule exists
+    # so the queue does not become a directory of everyone who ever TRIED to
+    # log in; a dormancy re-pend puts a person the container ALREADY admitted
+    # back into that queue, with an ``activated_at``, a profile it has held
+    # since their first login and a ``last_login_at`` that is the very reason
+    # the row is pending.  Blanking them costs the administrator the identity
+    # of the person they are being asked to re-admit, and positively asserts
+    # ``last_login_at`` is NULL -- which everywhere else in this system,
+    # R9's own NULL exemption included, means "has never logged in".
+    #
+    # The same predicate, for the same reason, as the ``activated_at IS NULL``
+    # term ``_PENDING_ROWS`` takes for the lazy purge.
+    pending = summary.access_state == "pending" and summary.activated_at is None
     return IdentityView(
         identity_id=summary.identity_id,
         provider=summary.provider,
@@ -328,6 +402,17 @@ async def _require_identity_admin(request: Request) -> UserIdentity:
     return user
 
 
+async def _require_identity_admin_or_approver(request: Request) -> UserIdentity:
+    """Hide the role-grant route from callers holding neither live role."""
+    user = await get_current_user(request)
+    authority = _authority(request)
+    if await run_sync_in_worker(authority.holds_active_role, identity_id=user.user_id, role="admin"):
+        return user
+    if await run_sync_in_worker(authority.holds_active_role, identity_id=user.user_id, role="approver"):
+        return user
+    raise _hidden()
+
+
 def _actor(user: UserIdentity, provenance: _Provenance) -> IdentityAdminActor:
     return IdentityAdminActor(
         identity_id=user.user_id,
@@ -353,7 +438,7 @@ def _refused(exc: IdentityAuthorityRefusal) -> HTTPException:
     silently promoted to "not found".
     """
     if type(exc) is AdminAuthorityRequired:
-        # The actor lost admin between the dependency and the transaction,
+        # The actor lost a required role between dependency and transaction,
         # or a human sent console provenance. Hidden, like the dependency.
         return _hidden()
     if type(exc) in _NOT_FOUND_REFUSALS:
@@ -380,7 +465,7 @@ def create_identity_admin_router() -> APIRouter:
     async def list_identities(
         request: Request,
         response: Response,
-        admin: UserIdentity = Depends(_require_identity_admin),  # noqa: B008
+        admin: Annotated[UserIdentity, Depends(_require_identity_admin)],
         access_state: Annotated[IdentityAccessState, Query()] = "pending",
         limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -430,6 +515,39 @@ def create_identity_admin_router() -> APIRouter:
             raise _refused(exc) from exc
         _uncacheable(response)
         return await _activation_response(request, event)
+
+    @router.post("/identities/purge-pending", response_model=PurgePendingIdentitiesResponse)
+    async def purge_pending_identities(
+        request: Request,
+        response: Response,
+        body: PurgePendingIdentitiesRequest,
+        admin: Annotated[UserIdentity, Depends(_require_identity_admin)],
+    ) -> PurgePendingIdentitiesResponse:
+        """Delete one bounded batch of never-activated identities past configured retention."""
+        settings: WebSettings = request.app.state.settings
+        provider = _provider(request)
+        recorder = _recorder(request)
+
+        def record(outcome: PendingIdentitiesPurged) -> None:
+            recorder.record_pending_identities_purged(request, provider=provider, outcome=outcome)
+
+        try:
+            outcome = await run_sync_in_worker(
+                _authority(request).purge_stale_pending_identities,
+                actor=_actor(admin, body),
+                retention_days=settings.identity_pending_retention_days,
+                record=record,
+            )
+        except IdentityAuthorityRefusal as exc:
+            raise _refused(exc) from exc
+        _uncacheable(response)
+        return PurgePendingIdentitiesResponse(
+            batch_id=outcome.batch_id,
+            retention_days=outcome.retention_days,
+            deleted_identity_ids=list(outcome.identity_ids),
+            deleted_count=len(outcome.identity_ids),
+            has_more=outcome.has_more,
+        )
 
     @router.post("/identities/{identity_id}/activate", response_model=ActivationResponse)
     async def activate_identity(
@@ -567,21 +685,48 @@ def create_identity_admin_router() -> APIRouter:
         request: Request,
         response: Response,
         body: GrantRoleRequest,
-        admin: UserIdentity = Depends(_require_identity_admin),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(_require_identity_admin_or_approver)],
     ) -> RoleView:
+        authority = _authority(request)
         provider = _provider(request)
         recorder = _recorder(request)
 
         def record(event: RoleChanged) -> None:
             _record_role_change(recorder, request, provider, event, change="granted")
 
+        if await run_sync_in_worker(authority.holds_active_role, identity_id=user.user_id, role="admin"):
+            try:
+                grant = await run_sync_in_worker(
+                    authority.grant_role,
+                    actor=_actor(user, body),
+                    identity_id=body.identity_id,
+                    role=body.role,
+                    scope=body.scope,
+                    expires_at=body.expires_at,
+                    note=body.note,
+                    record=record,
+                )
+            except IdentityAuthorityRefusal as exc:
+                raise _refused(exc) from exc
+            _uncacheable(response)
+            return _role_view(grant)
+
+        if body.role != "curator" or body.scope is not None or body.on_behalf_of is not None or body.console_request_id is not None:
+            raise _hidden()
+        settings: WebSettings = request.app.state.settings
+        if settings.workflow_governance != "on":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "refusal": "workflow_governance_off",
+                    "detail": "workflow governance is off on this deployment (set ELSPETH_WEB__WORKFLOW_GOVERNANCE=on)",
+                },
+            )
         try:
             grant = await run_sync_in_worker(
-                _authority(request).grant_role,
-                actor=_actor(admin, body),
+                authority.grant_curator_as_approver,
+                actor_identity_id=user.user_id,
                 identity_id=body.identity_id,
-                role=body.role,
-                scope=body.scope,
                 expires_at=body.expires_at,
                 note=body.note,
                 record=record,
@@ -728,6 +873,11 @@ def _record_activation(
         note=event.note,
         role=None if event.role is None else event.role.role,
         role_id=None if event.role is None else event.role.role_id,
+        # The grants the identity was ALREADY holding. Since R9 an activation
+        # can grant nothing and still return someone to deployment ``admin``:
+        # a re-pended identity keeps its role rows, so ``role=None`` here no
+        # longer means the person came back with no authority.
+        retained_roles=tuple((grant.role, grant.scope) for grant in event.retained_roles),
         tokens_per_day=settings.quota_default_tokens_per_day if event.quota_written else None,
         storage_bytes=settings.quota_default_storage_bytes if event.quota_written else None,
         on_behalf_of=event.on_behalf_of,

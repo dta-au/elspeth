@@ -3,7 +3,7 @@
 
 Pins the CURRENT observable behavior of ``_process_single_token`` and its
 ``_handle_*`` handler family at the RowProcessor surface BEFORE the
-TokenTraversalEngine extraction (filigree elspeth-c49f33d6e4, component 4).
+TokenTraversalEngine extraction (archived issue elspeth-c49f33d6e4, component 4).
 Every test here must pass unchanged against both the pre-move and post-move
 trees.
 
@@ -45,10 +45,12 @@ from elspeth.contracts import FailureInfo, RowResult, TokenInfo, TransformResult
 from elspeth.contracts.enums import FrameKind, RoutingMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import MaxRetriesExceeded, OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import GateResult
 from elspeth.contracts.routing import RoutingAction
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID
 from elspeth.core.config import GateSettings
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.executors import GateOutcome
 from elspeth.engine.processor import (
     _TransformContinue,
@@ -56,6 +58,7 @@ from elspeth.engine.processor import (
 )
 from elspeth.testing import make_row, make_token_info
 from tests.fixtures.factories import make_context
+from tests.fixtures.landscape import leader_coordination_token
 from tests.unit.engine.test_processor import (
     _make_contract,
     _make_factory,
@@ -69,31 +72,54 @@ from tests.unit.engine.test_processor import (
 # =============================================================================
 
 
+def _claimed_context(factory: RecorderFactory, token: TokenInfo) -> PluginContext:
+    """Use the durable source identity and a real terminal-work claim."""
+    _persist_token_for_scheduler(factory, token)
+    leader = leader_coordination_token(factory, "test-run")
+    item = factory.scheduler.enqueue_ready_claimed(
+        member_token=leader.membership,
+        token_id=token.token_id,
+        row_id=token.row_id,
+        node_id=None,
+        step_index=0,
+        ingest_sequence=0,
+        row_payload_json=factory.scheduler.serialize_row_payload(token.row_data),
+        lineage_path=token.lineage_path,
+        lease_owner=leader.worker_id,
+        lease_seconds=60,
+    )
+    return make_context(
+        landscape=factory.plugin_audit_writer(),
+        token=token,
+        coordination_token=leader,
+        work_item=item,
+    )
+
+
 class TestProcessSingleTokenOrchestration:
     """Characterize the traversal loop's branch structure and invariant raises."""
 
     def test_null_current_node_without_sink_context_raises(self) -> None:
         """current_node_id=None with no inherited/branch sink is an invariant violation."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         processor = _make_processor(factory, source_on_success="source_sink")
         token = make_token_info(data={"value": 1})
 
         with pytest.raises(OrchestrationInvariantError, match="current_node_id=None"):
-            processor._process_single_token(token=token, ctx=ctx, current_node_id=None)
+            processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=None, attempt_offset=0)
 
     def test_null_current_node_with_inherited_sink_completes_default_flow(self) -> None:
         """Explicit on_success_sink lets a nodeless terminal token complete."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         processor = _make_processor(factory, source_on_success="source_sink")
         token = make_token_info(data={"value": 1})
 
         result, child_items = processor._process_single_token(
             token=token,
-            ctx=ctx,
+            ctx=_claimed_context(factory, token),
             current_node_id=None,
             on_success_sink="terminal_sink",
+            attempt_offset=0,
         )
 
         assert isinstance(result, RowResult)
@@ -104,7 +130,6 @@ class TestProcessSingleTokenOrchestration:
     def test_null_current_node_with_branch_sink_completes_via_branch_map(self) -> None:
         """branch_to_sink takes precedence over inherited sink for terminal routing."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         processor = _make_processor(
             factory,
             source_on_success="source_sink",
@@ -119,9 +144,10 @@ class TestProcessSingleTokenOrchestration:
 
         result, _child_items = processor._process_single_token(
             token=token,
-            ctx=ctx,
+            ctx=_claimed_context(factory, token),
             current_node_id=None,
             on_success_sink="ignored_sink",
+            attempt_offset=0,
         )
 
         assert isinstance(result, RowResult)
@@ -131,7 +157,6 @@ class TestProcessSingleTokenOrchestration:
     def test_structural_node_is_traversed_but_not_executed(self) -> None:
         """A node with no plugin (structural) advances to the next node without executing."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         source_node = NodeID("source-0")
         structural = NodeID("structural-1")
         processor = _make_processor(
@@ -146,8 +171,9 @@ class TestProcessSingleTokenOrchestration:
 
         result, child_items = processor._process_single_token(
             token=token,
-            ctx=ctx,
+            ctx=_claimed_context(factory, token),
             current_node_id=structural,
+            attempt_offset=0,
         )
 
         assert isinstance(result, RowResult)
@@ -158,7 +184,6 @@ class TestProcessSingleTokenOrchestration:
     def test_inner_cycle_guard_raises_on_node_to_next_loop(self) -> None:
         """A self-referential node_to_next trips the inner-iteration cycle guard."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         source_node = NodeID("source-0")
         looping = NodeID("loop-1")
         processor = _make_processor(
@@ -171,7 +196,7 @@ class TestProcessSingleTokenOrchestration:
         token = make_token_info(data={"value": 1})
 
         with pytest.raises(OrchestrationInvariantError, match="Inner traversal exceeded"):
-            processor._process_single_token(token=token, ctx=ctx, current_node_id=looping)
+            processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=looping, attempt_offset=0)
 
     def test_non_gate_plugin_dispatches_as_transform(self) -> None:
         """Every non-GateSettings plugin takes the transform arm (negative nominal dispatch).
@@ -187,7 +212,6 @@ class TestProcessSingleTokenOrchestration:
         from tests.fixtures.nonconforming_transform import NonConformingTransform
 
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         source_node = NodeID("source-0")
         node = NodeID("nonconforming-1")
         transform = NonConformingTransform(node_id=str(node), on_success="terminal_sink")
@@ -208,7 +232,9 @@ class TestProcessSingleTokenOrchestration:
             return success, token, None
 
         processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]
-        result, _child_items = processor._process_single_token(token=token, ctx=ctx, current_node_id=node)
+        result, _child_items = processor._process_single_token(
+            token=token, ctx=_claimed_context(factory, token), current_node_id=node, attempt_offset=0
+        )
 
         assert dispatched == [transform], "dispatch must hand the non-conforming plugin to the transform arm"
         assert isinstance(result, RowResult)
@@ -217,7 +243,6 @@ class TestProcessSingleTokenOrchestration:
     def test_gate_route_to_sink_returns_gate_routed_terminal(self) -> None:
         """A gate that routes to a sink terminates the token with GATE_ROUTED."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
         gate_config = GateSettings(name="router", input="default", condition="True", routes={"true": "error_sink", "false": "default"})
@@ -234,11 +259,13 @@ class TestProcessSingleTokenOrchestration:
             sink_name="error_sink",
         )
 
-        def _route(gate_config, node_id, token, ctx, token_manager=None):
+        def _route(gate_config, node_id, token, ctx, token_manager=None, *, attempt_offset=0):
             return sink_outcome
 
         processor._gate_executor.execute_config_gate = _route  # type: ignore[method-assign]
-        result, _child_items = processor._process_single_token(token=token, ctx=ctx, current_node_id=gate_node)
+        result, _child_items = processor._process_single_token(
+            token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node, attempt_offset=0
+        )
 
         assert isinstance(result, RowResult)
         assert (result.outcome, result.path) == (TerminalOutcome.SUCCESS, TerminalPath.GATE_ROUTED)
@@ -247,7 +274,6 @@ class TestProcessSingleTokenOrchestration:
     def test_gate_continue_advances_to_terminal(self) -> None:
         """A CONTINUE gate outcome advances the token to the next node then terminates."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
         gate_config = GateSettings(name="passgate", input="default", condition="True", routes={"true": "default", "false": "default"})
@@ -264,11 +290,13 @@ class TestProcessSingleTokenOrchestration:
             updated_token=token,
         )
 
-        def _continue(gate_config, node_id, token, ctx, token_manager=None):
+        def _continue(gate_config, node_id, token, ctx, token_manager=None, *, attempt_offset=0):
             return continue_outcome
 
         processor._gate_executor.execute_config_gate = _continue  # type: ignore[method-assign]
-        result, _child_items = processor._process_single_token(token=token, ctx=ctx, current_node_id=gate_node)
+        result, _child_items = processor._process_single_token(
+            token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node, attempt_offset=0
+        )
 
         assert isinstance(result, RowResult)
         assert (result.outcome, result.path) == (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW)
@@ -277,7 +305,6 @@ class TestProcessSingleTokenOrchestration:
     def test_gate_error_discard_records_and_emits_gate_specific_failure_path(self) -> None:
         """A gate-error discard owns a distinct audit and telemetry provenance path."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
         gate_config = GateSettings(
@@ -316,7 +343,7 @@ class TestProcessSingleTokenOrchestration:
         recorded: list[dict[str, object]] = []
         emitted: list[tuple[TerminalOutcome, TerminalPath]] = []
 
-        def _discard(gate_config, node_id, token, ctx, token_manager=None):
+        def _discard(gate_config, node_id, token, ctx, token_manager=None, *, attempt_offset=0):
             return gate_outcome
 
         processor._gate_executor.execute_config_gate = _discard  # type: ignore[method-assign]
@@ -325,7 +352,9 @@ class TestProcessSingleTokenOrchestration:
             lambda _token, *, outcome, path: emitted.append((outcome, path))
         )
 
-        result, _child_items = processor._process_single_token(token=token, ctx=ctx, current_node_id=gate_node)
+        result, _child_items = processor._process_single_token(
+            token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node, attempt_offset=0
+        )
 
         assert isinstance(result, RowResult)
         assert (result.outcome, result.path) == (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED)
@@ -366,7 +395,7 @@ class TestProcessSingleTokenOrchestration:
 
         processor._emit_token_completed = _telemetry_failure  # type: ignore[method-assign]
 
-        terminal = processor._token_traversal.handle_gate_error_outcome(gate_outcome, token, [])
+        terminal = processor._token_traversal.handle_gate_error_outcome(gate_outcome, token, [], ctx=_claimed_context(factory, token))
 
         assert isinstance(terminal.result, RowResult)
         assert (terminal.result.outcome, terminal.result.path) == (
@@ -391,7 +420,6 @@ class TestProcessSingleTokenOrchestration:
     ) -> None:
         """GateEvaluated export cannot replace either handled row-error outcome."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
         gate_config = GateSettings(
@@ -433,7 +461,7 @@ class TestProcessSingleTokenOrchestration:
         )
         recorded: list[dict[str, object]] = []
 
-        def _gate_error(gate_config, node_id, token, ctx, token_manager=None):
+        def _gate_error(gate_config, node_id, token, ctx, token_manager=None, *, attempt_offset=0):
             return gate_outcome
 
         def _telemetry_failure(*_args: object, **_kwargs: object) -> None:
@@ -443,7 +471,9 @@ class TestProcessSingleTokenOrchestration:
         processor._emit_gate_evaluated = _telemetry_failure  # type: ignore[method-assign]
         processor._data_flow.record_token_outcome = lambda **kwargs: recorded.append(kwargs)  # type: ignore[method-assign, assignment]
 
-        result, child_items = processor._process_single_token(token=token, ctx=ctx, current_node_id=gate_node)
+        result, child_items = processor._process_single_token(
+            token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node, attempt_offset=0
+        )
 
         assert isinstance(result, RowResult)
         assert (result.outcome, result.path) == (TerminalOutcome.FAILURE, expected_path)
@@ -455,7 +485,6 @@ class TestProcessSingleTokenOrchestration:
     def test_gate_jump_to_node_absent_from_step_map_raises(self) -> None:
         """A gate jump to a node not in the DAG step map is an invariant violation."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
         gate_config = GateSettings(name="jumper", input="default", condition="True", routes={"true": "default", "false": "default"})
@@ -472,12 +501,12 @@ class TestProcessSingleTokenOrchestration:
             next_node_id=NodeID("ghost-node"),
         )
 
-        def _jump(gate_config, node_id, token, ctx, token_manager=None):
+        def _jump(gate_config, node_id, token, ctx, token_manager=None, *, attempt_offset=0):
             return jump_outcome
 
         processor._gate_executor.execute_config_gate = _jump  # type: ignore[method-assign]
         with pytest.raises(OrchestrationInvariantError, match="not in the DAG step map"):
-            processor._process_single_token(token=token, ctx=ctx, current_node_id=gate_node)
+            processor._process_single_token(token=token, ctx=_claimed_context(factory, token), current_node_id=gate_node, attempt_offset=0)
 
 
 # =============================================================================
@@ -491,7 +520,6 @@ class TestHandleTransformNode:
     def test_single_row_success_returns_continue_with_on_success_sink(self) -> None:
         """A single-row success advances (Continue) and adopts transform.on_success as the sink."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         processor = _make_processor(factory)
         transform = _make_mock_transform(node_id="t-1", name="mapper", on_success="next_sink")
         token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
@@ -504,12 +532,13 @@ class TestHandleTransformNode:
         outcome = processor._handle_transform_node(
             transform=transform,
             current_token=token,
-            ctx=ctx,
+            ctx=_claimed_context(factory, token),
             node_id=NodeID("t-1"),
             child_items=[],
             coalesce_node_id=None,
             coalesce_name=None,
             current_on_success_sink="default",
+            attempt_offset=0,
         )
 
         assert isinstance(outcome, _TransformContinue)
@@ -518,7 +547,6 @@ class TestHandleTransformNode:
     def test_multi_row_without_creates_tokens_raises(self) -> None:
         """A multi-row emission from a transform declaring creates_tokens=False is a config bug."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         processor = _make_processor(factory)
         transform = _make_mock_transform(node_id="t-1", name="splitter", creates_tokens=False)
         token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
@@ -536,18 +564,18 @@ class TestHandleTransformNode:
             processor._handle_transform_node(
                 transform=transform,
                 current_token=token,
-                ctx=ctx,
+                ctx=_claimed_context(factory, token),
                 node_id=NodeID("t-1"),
                 child_items=[],
                 coalesce_node_id=None,
                 coalesce_name=None,
                 current_on_success_sink="default",
+                attempt_offset=0,
             )
 
     def test_multi_row_empty_returns_filter_dropped_terminal(self) -> None:
         """An explicit zero-row emission terminates the token as FILTER_DROPPED."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         processor = _make_processor(factory)
         transform = _make_mock_transform(node_id="t-1", name="filter")
         token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
@@ -562,12 +590,13 @@ class TestHandleTransformNode:
         outcome = processor._handle_transform_node(
             transform=transform,
             current_token=token,
-            ctx=ctx,
+            ctx=_claimed_context(factory, token),
             node_id=NodeID("t-1"),
             child_items=[],
             coalesce_node_id=None,
             coalesce_name=None,
             current_on_success_sink="default",
+            attempt_offset=0,
         )
 
         assert isinstance(outcome, _TransformTerminal)
@@ -594,9 +623,6 @@ class TestHandleTransformNode:
         test_multi_row_empty_returns_filter_dropped_terminal's creates_tokens=False
         no-mint assertion above."""
         db, factory = _make_factory()
-        factory.data_flow.create_row("test-run", "source-0", 0, {"value": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         processor = _make_processor(factory)
         transform = _make_mock_transform(node_id="t-1", name="multi-row-filter", creates_tokens=True)
         token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
@@ -609,12 +635,13 @@ class TestHandleTransformNode:
         outcome = processor._handle_transform_node(
             transform=transform,
             current_token=token,
-            ctx=ctx,
+            ctx=_claimed_context(factory, token),
             node_id=NodeID("t-1"),
             child_items=[],
             coalesce_node_id=None,
             coalesce_name=None,
             current_on_success_sink="default",
+            attempt_offset=0,
         )
 
         assert isinstance(outcome, _TransformTerminal)
@@ -636,7 +663,6 @@ class TestHandleTransformNode:
     def test_max_retries_exceeded_returns_unrouted_failure(self) -> None:
         """Exhausted retries terminate the token as an UNROUTED FAILURE."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         processor = _make_processor(factory)
         transform = _make_mock_transform(node_id="t-1", name="flaky")
         token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
@@ -650,12 +676,13 @@ class TestHandleTransformNode:
         outcome = processor._handle_transform_node(
             transform=transform,
             current_token=token,
-            ctx=ctx,
+            ctx=_claimed_context(factory, token),
             node_id=NodeID("t-1"),
             child_items=[],
             coalesce_node_id=None,
             coalesce_name=None,
             current_on_success_sink="default",
+            attempt_offset=0,
         )
 
         assert isinstance(outcome, _TransformTerminal)
@@ -687,7 +714,6 @@ class TestHandleTransformNode:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
         _persist_token_for_scheduler(factory, token)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
         raw_secret = "https://blob.example/path?sig=ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
 
         def _exec(transform, token, ctx, attempt_offset=0):
@@ -697,12 +723,13 @@ class TestHandleTransformNode:
         outcome = processor._handle_transform_node(
             transform=transform,
             current_token=token,
-            ctx=ctx,
+            ctx=_claimed_context(factory, token),
             node_id=NodeID("t-1"),
             child_items=[],
             coalesce_node_id=NodeID("coalesce::merge"),
             coalesce_name=coalesce_name,
             current_on_success_sink="default",
+            attempt_offset=0,
         )
 
         assert isinstance(outcome, _TransformTerminal)
@@ -754,6 +781,7 @@ class TestHandleTransformErrorStatus:
         processor._data_flow.record_token_outcome = lambda **kwargs: recorded.append(kwargs)  # type: ignore[method-assign, assignment]
 
         outcome = processor._handle_transform_error_status(
+            ctx=_claimed_context(factory, token),
             transform_result=transform_result,
             current_token=token,
             error_sink="discard",
@@ -776,6 +804,7 @@ class TestHandleTransformErrorStatus:
         transform_result = TransformResult.error(reason={"reason": "validation_failed"})
 
         outcome = processor._handle_transform_error_status(
+            ctx=_claimed_context(factory, token),
             transform_result=transform_result,
             current_token=token,
             error_sink="error_sink",
@@ -830,6 +859,7 @@ class TestHandleTransformErrorStatus:
         transform_result = TransformResult.error(reason=battery_reason)
 
         outcome = processor._handle_transform_error_status(
+            ctx=_claimed_context(factory, token),
             transform_result=transform_result,
             current_token=token,
             error_sink="discard",
@@ -882,6 +912,7 @@ class TestHandleTransformErrorStatus:
         transform_result = TransformResult.error(reason=battery_reason)
 
         outcome = processor._handle_transform_error_status(
+            ctx=_claimed_context(factory, token),
             transform_result=transform_result,
             current_token=token,
             error_sink="error_sink",
@@ -905,6 +936,7 @@ class TestHandleTransformErrorStatus:
 
         with pytest.raises(OrchestrationInvariantError, match="ROUTED_ON_ERROR requires transform_result"):
             processor._handle_transform_error_status(
+                ctx=_claimed_context(factory, token),
                 transform_result=transform_result,  # type: ignore[arg-type]
                 current_token=token,
                 error_sink="error_sink",

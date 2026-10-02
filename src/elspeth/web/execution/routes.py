@@ -21,7 +21,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 from urllib.parse import quote
 from uuid import UUID
 
@@ -29,21 +29,25 @@ import structlog
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.types import Receive, Scope, Send
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import BlobNotFoundError
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.protocol import ComposerService, ComposerServiceError
-from elspeth.web.composer.service import _BadRequestLLMError
+from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerService, ComposerServiceError
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.completion_gates import parse_completion_gates
 from elspeth.web.execution.diagnostics import (
@@ -55,6 +59,7 @@ from elspeth.web.execution.errors import (
     BlobSourcePathMismatchError,
     CompletionGateIntegrityError,
     ExecuteRequestValidationError,
+    ExecutionApprovalRequired,
     ExecutionReadinessError,
     PipelineValidationError,
     RunSessionIntegrityError,
@@ -70,6 +75,7 @@ from elspeth.web.execution.outputs import (
 from elspeth.web.execution.preview import DEFAULT_ARTIFACT_PREVIEW_BYTE_CAP, build_artifact_preview_from_head
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService, StateAccessError
+from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
 from elspeth.web.execution.schemas import (
     RUN_STATUS_NON_TERMINAL_VALUES,
     RUN_STATUS_TERMINAL_VALUES,
@@ -92,7 +98,9 @@ from elspeth.web.execution.schemas import (
     revalidated_with_discard_summary,
 )
 from elspeth.web.execution.secret_guard import SECRET_GUARD_ERROR_TYPE, ExecutionSecretApprovalRequired
+from elspeth.web.execution.websocket_close import TRANSIENT_BACKEND_FAILURES, RunStreamCloseCode
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
+from elspeth.web.interpretation_state import InterpretationReviewIntegrityError
 from elspeth.web.middleware.rate_limit import get_rate_limiter
 from elspeth.web.paths import allowed_sink_directories
 from elspeth.web.sessions.converters import state_from_record
@@ -126,8 +134,11 @@ async def _get_session_service(request: Request) -> SessionServiceProtocol:
     return cast(SessionServiceProtocol, request.app.state.session_service)
 
 
-def _get_websocket_ticket_store(app: Any) -> WebSocketTicketStore:
-    return cast(WebSocketTicketStore, app.state.websocket_ticket_store)
+def _get_websocket_ticket_store(app: Any) -> WebSocketTicketStore | RepositorySessionWebsocketTicketAuthority:
+    store = app.state.websocket_ticket_store
+    if not isinstance(store, (WebSocketTicketStore, RepositorySessionWebsocketTicketAuthority)):
+        raise TypeError("WebSocket ticket authority is not configured")
+    return store
 
 
 async def _close_execute_lease_before_transfer(
@@ -927,8 +938,8 @@ def create_execution_router() -> APIRouter:
     async def validate_session_pipeline(
         session_id: UUID,
         request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         state_id: UUID | None = None,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
         session_service: SessionServiceProtocol = Depends(_get_session_service),  # noqa: B008
     ) -> ValidationResult:
@@ -946,7 +957,7 @@ def create_execution_router() -> APIRouter:
         finalize already surfaced.
         """
         await verify_session_ownership(session_id, user, request)
-        composer: ComposerService = request.app.state.composer_service
+        interpretation_surfacing = request.app.state.interpretation_surfacing
         lease = await SessionOperationLease.acquire(
             session_service.session_operation_authority,
             session_id=session_id,
@@ -958,7 +969,7 @@ def create_execution_router() -> APIRouter:
             if state_id is None:
                 current_record = await session_service.get_current_state(session_id)
                 if current_record is not None:
-                    await composer.surface_pending_interpretation_reviews(
+                    await interpretation_surfacing.surface_pending_interpretation_reviews(
                         state_from_record(current_record),
                         session_id=str(session_id),
                         current_state_id=str(current_record.id),
@@ -980,7 +991,7 @@ def create_execution_router() -> APIRouter:
             # passes the loaded head), so the requested snapshot gets the same
             # repair pass as the None arm above, under the same BLOB_READ lease.
             composition_state = state_from_record(state_record)
-            await composer.surface_pending_interpretation_reviews(
+            await interpretation_surfacing.surface_pending_interpretation_reviews(
                 composition_state,
                 session_id=str(session_id),
                 current_state_id=str(state_record.id),
@@ -1004,9 +1015,9 @@ def create_execution_router() -> APIRouter:
     async def execute_pipeline(
         session_id: UUID,
         request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         state_id: UUID | None = None,
         execute_request: ExecuteRequest | None = Body(default=None),  # noqa: B008
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
         session_service: SessionServiceProtocol = Depends(_get_session_service),  # noqa: B008
     ) -> dict[str, str]:
@@ -1056,6 +1067,15 @@ def create_execution_router() -> APIRouter:
             # server-side audit/telemetry, never through the HTTP
             # response body.
             raise HTTPException(status_code=404, detail="State not found") from None
+        except ExecutionApprovalRequired as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_type": exc.reason.value,
+                    "detail": f"Run admission refused: {exc.reason.value}",
+                    "binding": exc.binding.as_json(),
+                },
+            ) from exc
         except BlobNotFoundError:
             # IDOR contract (mirrors StateAccessError above): the
             # nonexistent-blob and cross-session-blob branches MUST
@@ -1072,8 +1092,8 @@ def create_execution_router() -> APIRouter:
             # because the path discloses internal storage layout to any
             # caller (including the LLM agent driving the composer in
             # an MCP context).
-            # Per CLAUDE.md logging policy, slog is permitted for
-            # audit-system failures.  Tier 1 corruption of
+            # Per the logging-telemetry-policy skill §Logging Policy, slog is
+            # permitted for audit-system failures.  Tier 1 corruption of
             # composition_states.source.options.path qualifies: the
             # audit row exists but its content is structurally invalid,
             # so neither audit (Landscape — not yet open for this run)
@@ -1247,6 +1267,31 @@ def create_execution_router() -> APIRouter:
                     "blockers": [blocker.model_dump() for blocker in exc.blockers],
                 },
             ) from exc
+        except InterpretationReviewIntegrityError as exc:
+            # A resolved interpretation review no longer matches the artifact
+            # it attested (the strict materializer's drift guards). This is a
+            # conflict between stored review evidence and the current
+            # composition, NOT a missing state, so it must not fall into the
+            # bare ``except ValueError`` 404 below. The class subclasses
+            # ValueError, so this handler MUST sit above that arm. The detail is
+            # fixed copy naming the component: the raw integrity message names
+            # hash domains and never reaches the response body.
+            public_detail = (
+                f"The approved {exc.kind.value} review for {exc.component_type} {exc.component_id!r} "
+                "no longer matches the current pipeline, so the run was not started."
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_type": "interpretation_review_drift",
+                    "kind": "interpretation_review_drift",
+                    "detail": public_detail,
+                    "message": public_detail,
+                    "component_id": exc.component_id,
+                    "component_type": exc.component_type,
+                    "review_kind": exc.kind.value,
+                },
+            ) from exc
         except ExecuteRequestValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
         except ValueError as exc:
@@ -1270,7 +1315,7 @@ def create_execution_router() -> APIRouter:
     async def get_run_status(
         run_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunStatusResponse:
         """Return current run status."""
@@ -1306,8 +1351,8 @@ def create_execution_router() -> APIRouter:
     async def get_run_diagnostics(
         run_id: UUID,
         request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(50, ge=1, le=100),
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunDiagnosticsResponse:
         """Return a bounded Landscape diagnostics snapshot for a run."""
@@ -1350,8 +1395,8 @@ def create_execution_router() -> APIRouter:
     async def evaluate_run_diagnostics(
         run_id: UUID,
         request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(50, ge=1, le=100),
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunDiagnosticsEvaluationResponse:
         """Ask the configured LLM to explain the current diagnostics snapshot."""
@@ -1402,7 +1447,7 @@ def create_execution_router() -> APIRouter:
             # elspeth-0fcf68d50f: diagnostics audit rows land in the same
             # per-session ``chat_messages`` sequence the compose loop
             # writes, so serialize on the same per-session compose lock the
-            # compose/guided routes hold. The lock wraps ONLY this persist
+            # freeform route holds. The lock wraps ONLY this persist
             # step — never the LLM call above — so a slow diagnostics
             # evaluation cannot starve an in-flight compose turn, and the
             # lock order (compose lock, then the service's internal
@@ -1420,10 +1465,19 @@ def create_execution_router() -> APIRouter:
                 )
 
         try:
-            explanation = await composer.explain_run_diagnostics(
-                llm_safe_diagnostics_snapshot(diagnostics),
-                recorder=recorder,
-            )
+            session_service: SessionServiceProtocol = request.app.state.session_service
+            async with await SessionOperationLease.acquire(
+                session_service.session_operation_authority,
+                session_id=run.session_id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=session_service.session_operation_owner_instance_id,
+                lease_seconds=session_service.session_operation_lease_seconds,
+            ) as diagnostics_lease:
+                explanation = await composer.explain_run_diagnostics(
+                    llm_safe_diagnostics_snapshot(diagnostics),
+                    recorder=recorder,
+                    session_operation_context=diagnostics_lease.context,
+                )
         except _BadRequestLLMError as exc:
             await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
             # Provider rejected the request (400-class). Carrier exposes
@@ -1438,6 +1492,13 @@ def create_execution_router() -> APIRouter:
                     exc,
                     expose_provider_error=settings.composer_expose_provider_errors,
                 ),
+            ) from exc
+        except ComposerAdmissionRefused as exc:
+            if isinstance(exc, CredentialMaterialRefused):
+                raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
+            raise HTTPException(
+                status_code=403,
+                detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},
             ) from exc
         except ComposerServiceError as exc:
             await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
@@ -1477,13 +1538,13 @@ def create_execution_router() -> APIRouter:
     async def cancel_run(
         run_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> dict[str, str | bool]:
         """Cancel a run. Idempotent on terminal runs."""
         await _verify_run_ownership(run_id, user, request)
         try:
-            await service.cancel(run_id)
+            await service.cancel(run_id, user=user)
             status = await _load_run_status_with_accounting(run_id, app=request.app, service=service)
         except _RunStatusNotFoundError:
             raise _run_not_found_http() from None
@@ -1498,7 +1559,7 @@ def create_execution_router() -> APIRouter:
     async def get_run_results(
         run_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunResultsResponse:
         """Return final run results. 409 if run is not terminal."""
@@ -1557,6 +1618,7 @@ def create_execution_router() -> APIRouter:
         run_id: str,
         ticket: str | None = None,
         token: str | None = None,
+        after_sequence: int = 0,
     ) -> None:
         """Stream RunEvent JSON payloads for a specific run.
 
@@ -1570,23 +1632,45 @@ def create_execution_router() -> APIRouter:
         service: ExecutionService = websocket.app.state.execution_service
 
         if token is not None:
-            await websocket.close(code=4001, reason="Use a WebSocket ticket, not a session token")
+            await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Use a WebSocket ticket, not a session token")
             return
         if ticket is None:
-            await websocket.close(code=4001, reason="Missing WebSocket ticket")
+            await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Missing WebSocket ticket")
             return
-        user = _get_websocket_ticket_store(websocket.app).consume(ticket=ticket, run_id=run_id)
+        store = _get_websocket_ticket_store(websocket.app)
+        user = await run_sync_in_worker(store.consume, ticket=ticket, run_id=run_id)
         if user is None:
-            await websocket.close(code=4001, reason="Invalid or expired WebSocket ticket")
+            await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Invalid or expired WebSocket ticket")
+            return
+        identity_authority = cast(RepositoryIdentityAuthority, websocket.app.state.identity_authority)
+        settings: WebSettings = websocket.app.state.settings
+        user_authorized = await run_sync_in_worker(
+            identity_authority.holds_active_human_role,
+            identity_id=user.user_id,
+            provider=settings.auth_provider,
+            role="user",
+        )
+        if not user_authorized:
+            await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="User role is no longer active")
             return
 
         await websocket.accept()
+        if type(after_sequence) is not int or after_sequence < 0:
+            await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Invalid run event cursor")
+            return
+
+        reader = websocket.app.state.run_progress_reader
+        if reader is not None:
+            if not isinstance(reader, RepositoryRunProgressReader):
+                raise TypeError("Run progress reader is not configured")
+            await _stream_durable_run_progress(websocket, run_id, user, service, reader, after_sequence)
+            return
 
         # IDOR protection: verify authenticated user owns this run's session
         try:
             run_ownership = await service.verify_run_ownership(user, run_id)
             if not run_ownership:
-                await websocket.close(code=4004, reason="Run not found")
+                await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Run not found")
                 return
         except RunSessionIntegrityError as integrity_exc:
             # Tier-1 sessions-DB corruption: an existing run references a
@@ -1594,9 +1678,9 @@ def create_execution_router() -> APIRouter:
             # case — surfacing it as 4004 would launder internal referential
             # corruption into a benign client response. Landscape carries the
             # run audit, not this sessions-DB invariant breach, so slog is the
-            # operator channel (CLAUDE.md logging policy: audit-system
-            # failure). Close 1011 (internal error), mirroring the seed-snapshot
-            # integrity handling below.
+            # operator channel (the logging-telemetry-policy skill §Logging
+            # Policy: audit-system failure). Close 1011 (internal error),
+            # mirroring the seed-snapshot integrity handling below.
             try:
                 slog.error(
                     "websocket_run_ownership_session_integrity_error",
@@ -1606,11 +1690,13 @@ def create_execution_router() -> APIRouter:
                 )
             finally:
                 try:
-                    await websocket.close(code=1011, reason="Run ownership check failed internal integrity validation")
+                    await websocket.close(
+                        code=RunStreamCloseCode.INTERNAL_ERROR, reason="Run ownership check failed internal integrity validation"
+                    )
                 finally:
                     raise integrity_exc
         except ValueError:
-            await websocket.close(code=4004, reason="Run not found")
+            await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Run not found")
             return
 
         # Subscribe BEFORE checking terminal status to close the race
@@ -1625,7 +1711,7 @@ def create_execution_router() -> APIRouter:
             try:
                 current_snapshot = await _load_run_status_snapshot_with_accounting(UUID(run_id), app=websocket.app, service=service)
             except _RunStatusNotFoundError:
-                await websocket.close(code=4004, reason="Run not found")
+                await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Run not found")
                 return
             except (ValidationError, _RunStatusIntegrityError) as integrity_exc:
                 # Tier-1 accounting projection failed integrity validation on
@@ -1633,7 +1719,8 @@ def create_execution_router() -> APIRouter:
                 # the external client, but the operator needs the detail to
                 # diagnose the divergence — Landscape carries the run audit,
                 # not this projection failure, so slog is the only channel
-                # (CLAUDE.md logging policy: audit-system failure).
+                # (the logging-telemetry-policy skill §Logging Policy:
+                # audit-system failure).
                 try:
                     slog.error(
                         "websocket_run_status_integrity_error",
@@ -1643,25 +1730,29 @@ def create_execution_router() -> APIRouter:
                     )
                 finally:
                     try:
-                        await websocket.close(code=1011, reason="Run status failed internal accounting validation")
+                        await websocket.close(
+                            code=RunStreamCloseCode.INTERNAL_ERROR, reason="Run status failed internal accounting validation"
+                        )
                     finally:
                         raise integrity_exc
             current = current_snapshot.response
-            max_replayed_sequence = 0
+            max_replayed_sequence = after_sequence
             replayed_terminal = False
             for persisted in await websocket.app.state.session_service.list_run_events(UUID(run_id)):
+                if persisted.sequence <= max_replayed_sequence:
+                    continue
                 replay_event = _run_event_from_record(persisted)
                 await websocket.send_json(replay_event.model_dump(mode="json"))
                 max_replayed_sequence = max(max_replayed_sequence, persisted.sequence)
                 if replay_event.event_type in ("completed", "cancelled", "failed"):
                     replayed_terminal = True
             if replayed_terminal:
-                await websocket.close(code=1000)
+                await websocket.close(code=RunStreamCloseCode.NORMAL)
                 return
             if current.status in RUN_STATUS_TERMINAL_VALUES:
                 event = _build_terminal_run_event(current, cancelled_run_record=current_snapshot.record)
                 await websocket.send_json(event.model_dump(mode="json"))
-                await websocket.close(code=1000)
+                await websocket.close(code=RunStreamCloseCode.NORMAL)
                 return
             while True:
                 try:
@@ -1706,34 +1797,45 @@ def create_execution_router() -> APIRouter:
                             )
                         finally:
                             try:
-                                await websocket.close(code=1011, reason="Run status failed internal accounting validation")
+                                await websocket.close(
+                                    code=RunStreamCloseCode.INTERNAL_ERROR, reason="Run status failed internal accounting validation"
+                                )
                             finally:
                                 raise integrity_exc
                     current = current_snapshot.response
                     if current.status in RUN_STATUS_TERMINAL_VALUES:
                         terminal_event = _build_terminal_run_event(current, cancelled_run_record=current_snapshot.record)
                         await websocket.send_json(terminal_event.model_dump(mode="json"))
-                        await websocket.close(code=1000)
+                        await websocket.close(code=RunStreamCloseCode.NORMAL)
                         break
                     continue
                 if event.event_sequence is not None and event.event_sequence <= max_replayed_sequence:
                     continue
                 await websocket.send_json(event.model_dump(mode="json"))
+                if event.event_sequence is not None:
+                    max_replayed_sequence = event.event_sequence
                 # "error" events are non-terminal (per-row exceptions).
                 # "completed", "cancelled", and "failed" are terminal.
                 if event.event_type in ("completed", "cancelled", "failed"):
-                    await websocket.close(code=1000)
+                    await websocket.close(code=RunStreamCloseCode.NORMAL)
                     break
         except WebSocketDisconnect:
             pass  # Client disconnected — fall through to finally
         except (ConnectionError, OSError) as exc:
+            # Not split into BACKEND_UNAVAILABLE. This arm cannot see a backend
+            # outage: the only database read in the loop above is
+            # `_load_run_status_snapshot_with_accounting`, which raises
+            # SQLAlchemyError and so escapes past here entirely. What lands
+            # here is `send_json` to a socket the client has already dropped,
+            # which is why the close below is itself wrapped -- there is
+            # usually no longer a peer to receive any code at all.
             slog.error(
                 "websocket_handler_error",
                 run_id=run_id,
                 error=str(exc),
             )
             try:
-                await websocket.close(code=1011, reason="Internal server error")
+                await websocket.close(code=RunStreamCloseCode.INTERNAL_ERROR, reason="Internal server error")
             except (WebSocketDisconnect, ConnectionError, OSError) as close_err:
                 slog.error("websocket_close_failed", run_id=run_id, error=str(close_err))
         finally:
@@ -1755,7 +1857,7 @@ def create_execution_router() -> APIRouter:
     async def get_run_outputs(
         run_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunOutputsResponse:
         """Return the FULL manifest of sink-write artefacts for a run.
@@ -1797,7 +1899,7 @@ def create_execution_router() -> APIRouter:
         run_id: UUID,
         artifact_id: str,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> Any:
         """Stream the bytes of one artefact written by a run.
@@ -1900,7 +2002,7 @@ def create_execution_router() -> APIRouter:
         run_id: UUID,
         artifact_id: str,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunOutputArtifactPreview:
         """Return a bounded head-of-file preview of one sink-write artefact.
@@ -1978,11 +2080,121 @@ def create_execution_router() -> APIRouter:
     async def create_run_websocket_ticket(
         run_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> WebSocketTicketResponse:
         """Issue a short-lived one-use credential for the progress WebSocket."""
         await _verify_run_ownership(run_id, user, request)
-        ticket = _get_websocket_ticket_store(request.app).issue(run_id=run_id, user=user)
+        ticket = await run_sync_in_worker(_get_websocket_ticket_store(request.app).issue, run_id=run_id, user=user)
         return WebSocketTicketResponse(ticket=ticket.ticket, expires_at=ticket.expires_at)
 
     return router
+
+
+async def _stream_durable_run_progress(
+    websocket: WebSocket,
+    run_id: str,
+    user: UserIdentity,
+    service: ExecutionService,
+    reader: RepositoryRunProgressReader,
+    after_sequence: int,
+) -> None:
+    """Join the database poller when either peer or producer closes."""
+
+    async def watch_disconnect() -> None:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+
+    disconnect = asyncio.create_task(watch_disconnect(), name="run-progress-disconnect")
+    poller = asyncio.create_task(
+        _poll_durable_run_progress(websocket, run_id, user, service, reader, after_sequence), name="run-progress-poll"
+    )
+    try:
+        done, _ = await asyncio.wait((disconnect, poller), return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    finally:
+        disconnect.cancel()
+        poller.cancel()
+        await asyncio.gather(disconnect, poller, return_exceptions=True)
+
+
+async def _poll_durable_run_progress(
+    websocket: WebSocket,
+    run_id: str,
+    user: UserIdentity,
+    service: ExecutionService,
+    reader: RepositoryRunProgressReader,
+    after_sequence: int,
+) -> None:
+    """Poll bounded committed pages; local queues cannot supply peer events."""
+    try:
+        parsed_run_id = UUID(run_id)
+        while True:
+            records = await run_sync_in_worker(
+                reader.read_after, identity_id=user.user_id, run_id=parsed_run_id, after_sequence=after_sequence
+            )
+            if records is None:
+                await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Run not found")
+                return
+            for record in records:
+                event = _run_event_from_record(record)
+                await websocket.send_json(event.model_dump(mode="json"))
+                after_sequence = record.sequence
+                if event.event_type in ("completed", "cancelled", "failed"):
+                    await websocket.close(code=RunStreamCloseCode.NORMAL)
+                    return
+            if records:
+                # Drain all committed pages before considering a fallback.
+                continue
+            try:
+                snapshot = await _load_run_status_snapshot_with_accounting(parsed_run_id, app=websocket.app, service=service)
+            except _RunStatusNotFoundError as exc:
+                raise _RunStatusIntegrityError("Run row vanished after the authorized event read") from exc
+            if snapshot.response.status in RUN_STATUS_TERMINAL_VALUES:
+                # Recheck after status: a terminal event may have committed
+                # between the first page read and the terminal snapshot.
+                final_records = await run_sync_in_worker(
+                    reader.read_after, identity_id=user.user_id, run_id=parsed_run_id, after_sequence=after_sequence
+                )
+                if final_records is None:
+                    await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Run not found")
+                    return
+                if final_records:
+                    continue
+                terminal = _build_terminal_run_event(snapshot.response, cancelled_run_record=snapshot.record)
+                await websocket.send_json(terminal.model_dump(mode="json"))
+                await websocket.close(code=RunStreamCloseCode.NORMAL)
+                return
+            await asyncio.sleep(0.25)
+    except WebSocketDisconnect:
+        return
+    except (ValidationError, contract_errors.AuditIntegrityError, _RunStatusIntegrityError, RunSessionIntegrityError) as exc:
+        try:
+            slog.error("websocket_run_status_integrity_error", run_id=run_id, phase="durable_poll", exc_class=type(exc).__name__)
+        finally:
+            try:
+                await websocket.close(code=RunStreamCloseCode.INTERNAL_ERROR, reason="Run progress failed internal integrity validation")
+            finally:
+                raise
+    except ValueError:
+        await websocket.close(code=RunStreamCloseCode.RUN_UNAVAILABLE, reason="Invalid run event cursor")
+    except TRANSIENT_BACKEND_FAILURES as exc:
+        # MUST stay above the broad arm below, which would otherwise shadow it:
+        # every member of this tuple is a SQLAlchemyError subclass, so writing
+        # the arms the other way round leaves this one permanently unreachable
+        # while the code still compiles and still closes the socket -- just
+        # with the wrong code, and with no client able to tell. The ordering is
+        # pinned behaviourally in tests/unit/web/execution/test_websocket.py.
+        try:
+            slog.error("websocket_run_progress_backend_unavailable", run_id=run_id, exc_class=type(exc).__name__)
+        finally:
+            await websocket.close(code=RunStreamCloseCode.BACKEND_UNAVAILABLE, reason="Run progress temporarily unavailable")
+        raise
+    except (SQLAlchemyError, ConnectionError, OSError) as exc:
+        try:
+            slog.error("websocket_handler_error", run_id=run_id, exc_class=type(exc).__name__)
+        finally:
+            await websocket.close(code=RunStreamCloseCode.INTERNAL_ERROR, reason="Run progress unavailable")
+        raise

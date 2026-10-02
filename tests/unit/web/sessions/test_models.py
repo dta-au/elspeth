@@ -15,14 +15,15 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     chat_messages_table,
     composition_states_table,
-    guided_operations_table,
     run_events_table,
     runs_table,
+    session_operation_receipts_table,
     sessions_table,
     user_secrets_table,
 )
-from elspeth.web.sessions.protocol import GUIDED_OPERATION_FAILURE_CODE_VALUES, GuidedOperationFailureCode
+from elspeth.web.sessions.protocol import OperationReceiptFailureCode
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.fixture
@@ -30,6 +31,8 @@ def engine():
     """Create an in-memory SQLite engine migrated to head."""
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     return eng
 
 
@@ -247,8 +250,8 @@ class TestSessionForeignKeys:
 class TestCheckConstraints:
     """Verify CHECK constraints reject invalid values."""
 
-    def test_guided_operation_failure_code_check_mirrors_the_python_literal(self) -> None:
-        """``GuidedOperationFailureCode`` and its CHECK are ONE paired contract.
+    def test_operation_receipt_failure_code_check_mirrors_the_python_literal(self) -> None:
+        """``OperationReceiptFailureCode`` and its CHECK are one paired contract.
 
         Extending either side alone is silently half-broken in opposite
         directions: a Python-only addition passes every writer guard and then
@@ -264,17 +267,13 @@ class TestCheckConstraints:
         """
         constraint = next(
             item
-            for item in guided_operations_table.constraints
-            if isinstance(item, CheckConstraint) and item.name == "ck_guided_operations_failure_code"
+            for item in session_operation_receipts_table.constraints
+            if isinstance(item, CheckConstraint) and item.name == "ck_session_operation_receipts_failure_code"
         )
         declared = re.findall(r"'([a-z_]+)'", str(constraint.sqltext))
 
-        assert declared == list(get_args(GuidedOperationFailureCode))
-        assert set(declared) == GUIDED_OPERATION_FAILURE_CODE_VALUES
-        # The permanent-refusal member the split introduced: pinned explicitly so
-        # a revert of either side fails loudly rather than shrinking a vocabulary
-        # that persisted rows already use.
-        assert "policy_blocked" in declared
+        assert declared == list(get_args(OperationReceiptFailureCode))
+        assert "request_cancelled" in declared
 
     def test_auth_provider_type_constraints_exist(self, engine) -> None:
         inspector = inspect(engine)

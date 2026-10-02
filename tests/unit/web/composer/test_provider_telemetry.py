@@ -85,7 +85,7 @@ def test_metric_recorder_failure_cannot_replace_settled_outcome(monkeypatch) -> 
     monkeypatch.setattr(module, "_PROVIDER_CALL_COUNTER", _FailingInstrument())
     monkeypatch.setattr(module, "_PROVIDER_CALL_DURATION", _FailingInstrument())
 
-    assert module.record_settled_composer_provider_calls((_call(),), surface="guided") is None
+    assert module.record_settled_composer_provider_calls((_call(),), surface="freeform") is None
 
 
 @pytest.mark.parametrize("error_class", [FrameworkBugError, AuditIntegrityError])
@@ -107,10 +107,10 @@ def test_metric_boundaries_propagate_integrity_failures(monkeypatch, error_class
     with pytest.raises(error_class) as caught:
         if site == "provider":
             monkeypatch.setattr(module, "_PROVIDER_CALL_COUNTER", FailingBoundary())
-            module.record_settled_composer_provider_calls((_call(),), surface="guided")
+            module.record_settled_composer_provider_calls((_call(),), surface="freeform")
         elif site == "request":
             monkeypatch.setattr(module, "_REQUEST_DURATION", FailingBoundary())
-            token = module.begin_composer_request_metrics(surface="guided")
+            token = module.begin_composer_request_metrics(surface="freeform")
             module.finish_composer_request_metrics(token, status="completed")
         else:
             monkeypatch.setattr(module, "_log", FailingBoundary())
@@ -175,17 +175,17 @@ def test_request_projection_records_duration_and_settled_provider_call_count(mon
     moments = iter((100.0, 103.5))
     monkeypatch.setattr(module.time, "monotonic", lambda: next(moments))
 
-    token = module.begin_composer_request_metrics(surface="guided")
+    token = module.begin_composer_request_metrics(surface="freeform")
     module.record_settled_composer_provider_calls(
         (
             _call(status=ComposerLLMCallStatus.TIMEOUT, latency_ms=1200),
             _call(status=ComposerLLMCallStatus.CANCELLED, latency_ms=7),
         ),
-        surface="guided",
+        surface="freeform",
     )
     module.finish_composer_request_metrics(token, status="timed_out")
 
-    attributes = {"surface": "guided", "status": "timed_out"}
+    attributes = {"surface": "freeform", "status": "timed_out"}
     assert request_duration.points == [(3.5, attributes)]
     assert request_calls.points == [(2, attributes)]
 
@@ -198,26 +198,26 @@ def test_request_projection_uses_final_durable_provider_outcome(monkeypatch) -> 
     monkeypatch.setattr(module, "_REQUEST_PROVIDER_CALLS", request_calls)
     monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
 
-    timed_out = module.begin_composer_request_metrics(surface="guided")
+    timed_out = module.begin_composer_request_metrics(surface="freeform")
     module.record_settled_composer_provider_calls(
         (_call(status=ComposerLLMCallStatus.TIMEOUT),),
-        surface="guided",
+        surface="freeform",
     )
     module.finish_composer_request_metrics(timed_out, status="completed")
 
-    recovered = module.begin_composer_request_metrics(surface="guided")
+    recovered = module.begin_composer_request_metrics(surface="freeform")
     module.record_settled_composer_provider_calls(
         (
             _call(status=ComposerLLMCallStatus.API_ERROR),
             _call(status=ComposerLLMCallStatus.SUCCESS),
         ),
-        surface="guided",
+        surface="freeform",
     )
     module.finish_composer_request_metrics(recovered, status="completed")
 
     assert request_duration.points == [
-        (0.0, {"surface": "guided", "status": "timed_out"}),
-        (0.0, {"surface": "guided", "status": "completed"}),
+        (0.0, {"surface": "freeform", "status": "timed_out"}),
+        (0.0, {"surface": "freeform", "status": "completed"}),
     ]
 
 
@@ -234,26 +234,6 @@ def test_explicit_route_terminal_status_overrides_provider_recovery(monkeypatch)
     module.finish_composer_request_metrics(token, status="completed")
 
     assert request_duration.points == [(0.0, {"surface": "freeform", "status": "timed_out"})]
-
-
-def test_request_aggregate_ignores_mismatched_surface_calls(monkeypatch) -> None:
-    module = importlib.import_module("elspeth.web.composer.provider_telemetry")
-    request_duration = _Instrument()
-    request_calls = _Instrument()
-    monkeypatch.setattr(module, "_REQUEST_DURATION", request_duration)
-    monkeypatch.setattr(module, "_REQUEST_PROVIDER_CALLS", request_calls)
-    monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
-
-    token = module.begin_composer_request_metrics(surface="guided")
-    module.record_settled_composer_provider_calls(
-        (_call(status=ComposerLLMCallStatus.TIMEOUT),),
-        surface="freeform",
-    )
-    module.finish_composer_request_metrics(token, status="completed")
-
-    attributes = {"surface": "guided", "status": "completed"}
-    assert request_duration.points == [(0.0, attributes)]
-    assert request_calls.points == [(0, attributes)]
 
 
 def test_later_settled_success_clears_prior_provider_failure(monkeypatch) -> None:
@@ -284,14 +264,14 @@ def test_zero_call_replay_does_not_reuse_prior_request_count(monkeypatch) -> Non
     monkeypatch.setattr(module, "_REQUEST_PROVIDER_CALLS", request_calls)
     monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
 
-    first = module.begin_composer_request_metrics(surface="guided")
-    module.record_settled_composer_provider_calls((_call(),), surface="guided")
+    first = module.begin_composer_request_metrics(surface="freeform")
+    module.record_settled_composer_provider_calls((_call(),), surface="freeform")
     module.finish_composer_request_metrics(first, status="completed")
 
-    replay = module.begin_composer_request_metrics(surface="guided")
+    replay = module.begin_composer_request_metrics(surface="freeform")
     module.finish_composer_request_metrics(replay, status="completed")
 
-    attributes = {"surface": "guided", "status": "completed"}
+    attributes = {"surface": "freeform", "status": "completed"}
     assert request_calls.points == [(1, attributes), (0, attributes)]
 
 

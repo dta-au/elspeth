@@ -13,6 +13,7 @@ from typing import Any
 from hypothesis import given
 from hypothesis import strategies as st
 
+from elspeth.contracts.enums import RunMode
 from elspeth.plugins.sources.field_normalization import normalize_field_name
 from tests.strategies.settings import SLOW_SETTINGS
 
@@ -64,6 +65,8 @@ class _Client:
 
 @dataclass
 class _Context:
+    run_mode: RunMode = RunMode.LIVE
+    call_mode_session: None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
     validation_errors: list[dict[str, Any]] = field(default_factory=list)
 

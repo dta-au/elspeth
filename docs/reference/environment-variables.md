@@ -42,7 +42,7 @@ ELSPETH automatically loads environment variables from a `.env` file when you ru
 | Variable | Purpose | When Required |
 |----------|---------|---------------|
 | `ELSPETH_FINGERPRINT_KEY` | Secret fingerprinting | Config contains API keys or passwords |
-| `ELSPETH_SIGNING_KEY` | Signed audit exports | `landscape.export.sign: true` |
+| `ELSPETH_SIGNING_KEY` | Example signed audit-export key | Named by `landscape.export.signing_secret_ref` when `signing_mode: hmac_sha256` |
 
 ### ELSPETH_FINGERPRINT_KEY
 
@@ -69,11 +69,16 @@ Used to HMAC-sign exported audit records for integrity verification. Only requir
 | `ELSPETH_KEYVAULT_ALLOWED_VAULT_URLS` | Pin `secrets.vault_url` to exact vaults | unset (approved-suffix check only) |
 | `DATABASE_URL` | CLI/MCP audit database connection | `sqlite:///./data/audit.db` |
 | `ELSPETH_WEB__REGISTRATION_MODE` | Local-auth registration mode: `open`, `email_verified`, or `closed` | `open` |
+| `ELSPETH_WEB__WORKFLOW_GOVERNANCE` | Workflow-governance mode and readiness prerequisites: `off` or `on` | `off` |
 | `ELSPETH_WEB__PUBLIC_BASE_URL` | Public origin used to generate email-verification links on non-local hosts | unset |
 
 ### ELSPETH_ALLOW_RAW_SECRETS
 
 **Development only.** When set to `true`, allows running pipelines without `ELSPETH_FINGERPRINT_KEY` even when configs contain secrets. Secrets will be stored in plain text in the audit trail.
+
+Configured `web_scrape` request headers still require `ELSPETH_FINGERPRINT_KEY`
+in this mode. Their HMAC fingerprints preserve request identity for replay and
+verify without exposing header values through an unkeyed digest.
 
 **Never use in production.** This is intended only for local development and testing.
 
@@ -98,6 +103,18 @@ Non-local `email_verified` deployments must also set
 `ELSPETH_WEB__PUBLIC_BASE_URL` to a public origin, for example
 `https://elspeth.example.gov.au`. The value must be an origin only: no path,
 query, or fragment.
+
+### ELSPETH_WEB__WORKFLOW_GOVERNANCE
+
+Set to `on` to request workflow governance. This setting currently checks
+readiness prerequisites; the approval, review, and library authorities consume
+it when those workflow tasks land. Under local authentication, set
+`ELSPETH_WEB__REGISTRATION_MODE=closed` or `email_verified`; open local
+registration with governance on fails `/api/ready` because one person can
+create multiple identities and defeat author-is-not-approver checks. Also set
+`ELSPETH_WEB__COMPARTMENT_ID` to a non-blank container marking. Readiness
+names an absent marking or unsafe registration while the configured value
+stays `on`; a supplied blank marking is rejected during settings validation.
 
 ---
 
@@ -188,12 +205,51 @@ unavailable with a provider-inference error.
 The defaults (`gpt-5.5` primary, `anthropic/claude-sonnet-4-6` advisor) are
 development conveniences. Production deployments should set both explicitly.
 
-**The two models must differ.** The advisor is the independent reviewer of
+Custom endpoints may route on an operator-defined deployment alias that is
+absent from the pricing catalogue. Set `ELSPETH_WEB__COMPOSER_PRICING_MODEL`
+and `ELSPETH_WEB__COMPOSER_ADVISOR_PRICING_MODEL` independently to the matching
+LiteLLM catalogue identities. These optional settings affect fallback cost
+calculation only; routing names and requested/returned model audit fields are
+preserved, and `pricing_model` records the effective billing identity. Each
+role uses its routing identity when its pricing override is
+unset. A missing catalogue price remains unavailable, never zero.
+
+For example, when both roles use the approved Azure deployment through a
+configured OpenAI-compatible endpoint:
+
+```bash
+ELSPETH_WEB__COMPOSER_MODEL=openai/gpt-5.6-sol-datazone
+ELSPETH_WEB__COMPOSER_PRICING_MODEL=azure/gpt-5.6-sol
+ELSPETH_WEB__COMPOSER_ADVISOR_MODEL=openai/gpt-5.6-sol-datazone
+ELSPETH_WEB__COMPOSER_ADVISOR_PRICING_MODEL=azure/gpt-5.6-sol
+ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL=true
+```
+
+The operator must select the catalogue entry matching the actual deployment's
+model and billing terms. An alias containing a region or date does not create
+a catalogue entry.
+
+**The two models must differ by default.** The advisor is the independent reviewer of
 the primary Composer's work, so the service refuses to start when both
 resolve to the same canonical model id. Distinctness is checked on the final
 path segment, so a provider prefix cannot mask a same-model pairing:
-`bedrock/anthropic.claude-x` and `openrouter/anthropic/claude-x` count as the
+`openai/gpt-5.5` and `openrouter/openai/gpt-5.5` count as the
 same model.
+
+To explicitly allow the same model for both roles, set
+`ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL=true` (default: `false`),
+or `composer_allow_same_advisor_model=True` when constructing `WebSettings`.
+This accepts the shared model's correlated blind spots. The advisor remains
+mandatory and still makes its own provider calls; endpoint and credential
+settings remain separate for each role. For example:
+
+```bash
+ELSPETH_WEB__COMPOSER_MODEL=openai/gpt-5.5
+ELSPETH_WEB__COMPOSER_ADVISOR_MODEL=openai/gpt-5.5
+ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL=true
+```
+
+Restart the web service after changing these settings.
 
 Composer credentials come from the web process environment, keyed by the
 inferred provider. Both the primary and the advisor contract must be
@@ -205,20 +261,77 @@ satisfied:
 | `openrouter` | `OPENROUTER_API_KEY` |
 | `openai` | `OPENAI_API_KEY` |
 | `anthropic` | `ANTHROPIC_API_KEY` |
-| `azure` / `azure_ai` | `AZURE_API_KEY` |
+| `azure` | One of `AZURE_API_KEY`, `AZURE_OPENAI_API_KEY`, or `AZURE_AD_TOKEN` |
+| `azure_ai` | `AZURE_AI_API_KEY` |
 
 A missing or empty required key does not stop the service: the Composer is
 reported unavailable, with the missing variable named, through the sanitized
 `GET /api/system/status` surface, and compose requests fail until the key is
 provided.
 
-At startup the service also sends one trivial probe request to each Composer
-model (`ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED`, default `true`). A
-provider *bad request* — for example a model that rejects the configured
-`ELSPETH_WEB__COMPOSER_TEMPERATURE` or `ELSPETH_WEB__COMPOSER_SEED` — fails
-startup, because that is a fixable operator configuration error. Transient
-provider, auth, or network failures do not block boot; the Composer is
-exercised again at first use.
+At startup the service also sends short probe requests to the Composer
+models (`ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED`, default `true`), built
+exactly as production builds them: the planner model receives the compose
+loop's full tool list and, separately, the pipeline planner's tool list, each
+stamped with the strict tool contracts its route sends (see
+`ELSPETH_WEB__COMPOSER_STRICT_TOOLS` below), and the advisor model receives
+its structured-output request. When the advisor's route sends strict
+contracts, the advisor model also receives the pipeline planner's
+escape-hatch request (`hatch_terminal`): the proposal tool alone, as a
+16-token check that the request is accepted. A provider *bad request* — for
+example a model that rejects the configured
+`ELSPETH_WEB__COMPOSER_TEMPERATURE` or `ELSPETH_WEB__COMPOSER_SEED`, or a
+tool schema — fails startup, because that is a fixable operator
+configuration error. The one exception is a rejected `hatch_terminal`
+request: it is logged as `composer_boot_probe_rejected_nonfatal` and boot
+continues, and escape-hatch turns on that route fail until the route or
+`ELSPETH_WEB__COMPOSER_STRICT_TOOLS` is changed. All probe requests share one
+45-second deadline, and each planner-model request (including
+`hatch_terminal`) is also capped at 5 seconds. Timeouts and transient
+provider, auth, or network failures do not block boot; they are logged as
+`composer_boot_probe_transient_failure` (tool schemas or structured-output
+conformance unverified at boot), and the Composer is exercised again at
+first use. The routes each Composer role resolved to are logged once at
+startup as `composer_tool_contract_resolved`.
+
+### Strict tool contracts (`ELSPETH_WEB__COMPOSER_STRICT_TOOLS`)
+
+On routes that can carry it, the Composer can send its tool list with OpenAI
+*strict* tool contracts (`"strict": true`), so the provider constrains the
+model's tool arguments to each tool's schema. Where it does, a field the tool
+treats as optional is sent as required and nullable, and the model's `null`
+is read back as "omitted" before the tool's own argument rules run. Those
+rules still decide whether a call is accepted. The setting chooses which
+routes send `strict`:
+
+| Value | Behaviour |
+| --- | --- |
+| `preferred` (default) | Only OpenRouter routes send `strict` (an `openrouter/` model on OpenRouter's own host, or an OpenAI-shaped model pointed at `https://openrouter.ai/...`). Custom endpoints, hosted OpenAI and Azure OpenAI send the same tool bytes as before this setting existed. Anthropic-family models never send `strict` on any setting. |
+| `forward_to_endpoint` | As `preferred`, and also sends `strict` to custom OpenAI-compatible endpoints and OpenRouter proxies, to hosted OpenAI, and to Azure OpenAI when its api-version (`AZURE_API_VERSION`, else LiteLLM's default) is `preview`, `latest`, `v1` or dated `2024-08-01` or later. Use it only for gateways you have verified accept the `strict` key, or as the opt-in for hosted OpenAI and Azure. ELSPETH's own LLM compatibility gateway rejects any `strict` key, `false` included. |
+| `off` | No route sends `strict`. Every route sends the tool bytes it sent before this setting existed. This is the remedy if a route rejects `strict`. |
+
+`off` restores the tool bytes and turns off the `null`-to-omitted read-back.
+It does not remove the `validation_errors` list that a Composer tool result
+carries when a call breaks its tool's schema (the field, as a declared name
+or a generic `field`/`item`/`index` token, and a fixed kind such as
+`missing` or `out_of_bounds`, never the rejected value or an unexpected
+key's name). That list does not depend on this setting.
+
+The route is decided per Composer role from its model, its configured
+endpoint, and the base-URL environment variables LiteLLM reads
+(`OPENAI_BASE_URL`, `OPENAI_API_BASE`, `OPENROUTER_API_BASE`). If one of
+those variables holds a base URL that cannot be parsed, that route sends the
+tool bytes it sent before this setting existed, whatever the setting says.
+
+Under `forward_to_endpoint`, hosted OpenAI (a bare model such as `gpt-5.5`
+with no endpoint, which is the Azure Container Apps bicep default) and Azure
+OpenAI routes with an api-version of at least `2024-08-01` send `strict`
+straight to the provider, and no live endpoint has yet been shown to accept
+it from ELSPETH. The startup probe sends that request, and a rejection on the
+planner route stops the app, so the first boot after opting in is that
+route's live acceptance test; `preferred` or `off` is the remedy. A rejection
+of the advisor-model `hatch_terminal` request is logged and does not stop
+boot.
 
 ### Pointing Composer at your own OpenAI-compatible endpoint
 
@@ -304,8 +417,10 @@ with `-` or `_`).
 | --- | --- | --- |
 | `provider` | all | `bedrock`, `openrouter`, or `azure` |
 | `model` | all | Bedrock: LiteLLM `bedrock/<model-id>` form. Azure: must equal `deployment_name`. |
+| `pricing_model` | all | Optional LiteLLM catalogue identity for cost calculation, separate from the routed deployment/model. Operator-owned; an authored node cannot override it. |
 | `credential_scope` | openrouter, azure | `server` or `user`. Required for these providers; forbidden for Bedrock. |
 | `credential_ref` | openrouter, azure | Uppercase secret name (for example `OPENROUTER_API_KEY`). Required for these providers; forbidden for Bedrock. |
+| `base_url` | openrouter | Optional OpenAI-compatible API base URL. HTTPS is required except for an explicit loopback HTTP endpoint such as `http://127.0.0.1:8199/v1`. |
 | `region_name` | bedrock | Optional; the ambient AWS region applies when omitted. Forbidden for OpenRouter and Azure. |
 | `endpoint`, `deployment_name`, `api_version` | azure | `endpoint` (HTTPS, credential-free) and `deployment_name` are required for Azure; all three are forbidden for other providers. |
 | `timeout_seconds` | openrouter | Only OpenRouter profiles accept an explicit timeout (default 60, max 300 seconds). |
@@ -313,19 +428,39 @@ with `-` or `_`).
 
 Credential rules:
 
-- **Bedrock profiles are keyless.** They authenticate through the AWS default
-  credential chain of the web process (the ECS task role on AWS). Setting
-  `credential_scope` or `credential_ref` on a Bedrock profile is a startup
-  error.
+- **Bedrock profiles are keyless by default.** With no credential they
+  authenticate through the AWS default credential chain of the web process
+  (the ECS task role on AWS). A Bedrock profile may instead name an Amazon
+  Bedrock API key: set `credential_scope` and `credential_ref` together
+  (conventionally `AWS_BEARER_TOKEN_BEDROCK`) and the key is sent as a bearer
+  token. Setting only one of the two is a startup error. A profile carries a
+  single reference, so the static IAM credentials (`aws_access_key_id`,
+  `aws_secret_access_key`, optional `aws_session_token`) are available only
+  as explicit `llm` node options, each wired through
+  `ELSPETH_WEB__SECRET_WIRING_ALLOWLIST`; the API key and the IAM pair are
+  mutually exclusive. Note that LiteLLM prefers a process-level
+  `AWS_BEARER_TOKEN_BEDROCK` environment variable over SigV4 signing, so do
+  not set it on a deployment that should authenticate with IAM credentials
+  or a task role.
 - **OpenRouter and Azure profiles are credentialed.** With
   `credential_scope: server`, the `credential_ref` name resolves as an
   environment variable of the web process; the name must appear in
   `ELSPETH_WEB__SERVER_SECRET_ALLOWLIST` (JSON array; default
   `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-  `AZURE_API_KEY`), the variable must be set and non-empty, and
-  `ELSPETH_FINGERPRINT_KEY` must be set because secret use is fingerprinted
-  into the audit trail. With `credential_scope: user`, the reference resolves
-  through the signed-in user's own uploaded secret store instead.
+  `AZURE_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`, `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`), the variable must be set and
+  non-empty, and `ELSPETH_FINGERPRINT_KEY` must be set because secret use is
+  fingerprinted into the audit trail. With `credential_scope: user`, the
+  reference resolves through the signed-in user's own uploaded secret store
+  instead.
+- **Server-only mode.** `ELSPETH_WEB__USER_SECRETS_ENABLED=false` (default
+  `true`) disables user-scoped secrets end to end: `POST` and `DELETE
+  /api/secrets` return 403 (`user_secrets_disabled`), previously stored user
+  secrets are neither listed nor resolved and no longer shadow a server
+  secret of the same name, the "API keys & secrets" panel renders read-only,
+  and any profile with `credential_scope: user` becomes unusable. Only names
+  in `ELSPETH_WEB__SERVER_SECRET_ALLOWLIST` remain available. Stored rows are
+  left in place, so re-enabling restores them.
 
 A profile whose credential cannot be resolved for a given user is unusable
 for that user. When a user has no usable profile at all, the `llm` transform
@@ -338,7 +473,8 @@ profile (collapse each value to a single line in an environment file):
 ```bash
 ELSPETH_WEB__LLM_PROFILES='{
   "bedrock-haiku": {"provider": "bedrock", "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0", "region_name": "ap-southeast-2"},
-  "sonnet": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6", "credential_scope": "server", "credential_ref": "OPENROUTER_API_KEY"}
+  "sonnet": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6", "credential_scope": "server", "credential_ref": "OPENROUTER_API_KEY"},
+  "chaosllm": {"provider": "openrouter", "model": "chaosllm/fake-gpt-4", "base_url": "http://127.0.0.1:8199/v1", "credential_scope": "server", "credential_ref": "CHAOSLLM_API_KEY"}
 }'
 ELSPETH_WEB__DEFAULT_LLM_PROFILE=sonnet
 ```
@@ -720,6 +856,52 @@ variables. In a container deployment that means the task role; locally it means
 whatever `AWS_PROFILE` / `AWS_REGION` and the usual `AWS_*` variables resolve
 to. Do not place access keys in plugin options.
 
+### Azure AI Search
+
+On the CLI and YAML authoring surface the `azure_ai_search` transform (Azure
+RAG retrieval) has **no environment variables**: `endpoint`, `index` and either
+`api_key` or `use_managed_identity` (with `client_id` for a user-assigned
+identity) are node options.
+
+The web surface is profile-only. `ELSPETH_WEB__AZURE_SEARCH_PROFILES` is a JSON
+array of operator-owned search-service profiles. Each entry carries:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `alias` | yes | the opaque name a web author selects as `profile`; unique across the array |
+| `endpoint` | yes | `https://<service>.search.windows.net`; never authored or offered on the authoring surface. It is not a secret: recorded search calls and authentication-failure messages name it |
+| `auth` | yes | `managed_identity` or `api_key` |
+| `client_id` | no | user-assigned identity client id; only with `managed_identity` |
+| `credential_ref` | with `api_key` | name of the server-scoped secret holding the query key; refused with `managed_identity` |
+| `indexes` | yes | a non-empty array of index names web authors may query, or the string `"any"` |
+| `api_version` | no | overrides the transform's default REST API version |
+
+`indexes` has no default. Pinning is the safe form; `"any"` opens every index
+on the service to every web author and has to be written out to take effect.
+Unknown fields, an empty `indexes` array and a binding the transform itself
+would refuse (a non-HTTPS endpoint, for example) fail web start-up, and the
+error names the failing field without echoing its value.
+
+Under a profile a web author writes `profile: <alias>`, an `index` the profile
+admits, and the ordinary retrieval options. `endpoint`, `api_key`,
+`use_managed_identity`, `client_id` and `api_version` are operator-owned
+bindings lowered only for execution and are refused in a web-authored pipeline.
+An `api_key` profile injects its server secret itself, so it needs no
+`ELSPETH_WEB__SECRET_WIRING_ALLOWLIST` rule. The secret still has to resolve:
+`credential_ref` must be listed in `ELSPETH_WEB__SERVER_SECRET_ALLOWLIST`, the
+variable it names must be set, and `ELSPETH_FINGERPRINT_KEY` must be present.
+None of these is checked at start-up; a profile whose secret does not resolve
+simply reads as unavailable.
+
+Two other things gate it:
+
+- **The allowlist.** `ELSPETH_WEB__PLUGIN_ALLOWLIST` must include
+  `"transform:azure_ai_search"`. With the plugin allowed and no usable profile,
+  the web surfaces report it as unavailable rather than offering raw options.
+- **The role.** A managed-identity profile needs `Search Index Data Reader` on
+  the search service and role-based access enabled there; see
+  [the Container Apps runbook](../runbooks/azure-container-apps-cold-install.md#10-optional-grant-azure-ai-search-access-for-rag-retrieval).
+
 ---
 
 ## Azure Service Variables
@@ -826,8 +1008,9 @@ Create a `.env` file in your project root:
 # and keep the resulting value stable for audit correlation.
 ELSPETH_FINGERPRINT_KEY=fake_fingerprint_key_for_docs_only
 
-# Signing key for audit exports (optional)
-# Enables HMAC signatures on exported audit records
+# Example signing key for audit exports. The export's signing_secret_ref must
+# name this variable; deployments requiring authentication also set
+# authentication_policy: required and signing_mode: hmac_sha256.
 ELSPETH_SIGNING_KEY=fake_signing_key_for_docs_only
 
 # =====================================================================

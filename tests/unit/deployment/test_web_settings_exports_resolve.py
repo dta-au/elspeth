@@ -33,6 +33,7 @@ from pathlib import Path
 
 import pytest
 
+from elspeth.web.compartments import compartment_ingress_record, compartment_marking_header
 from elspeth.web.config import WebSettings
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -140,3 +141,40 @@ def test_an_untracked_or_ignored_env_file_is_not_scanned(tmp_path: Path) -> None
     names = _exported_names(root)
 
     assert names == {"AUTH_PROVIDER": ["deploy/tracked.tfvars"]}
+
+
+def _scenario_compartment_expression(text: str) -> str:
+    entries = re.findall(r'\{\s*name\s*=\s*"ELSPETH_WEB__COMPARTMENT_ID"\s*,\s*value\s*=\s*([^}\n]+)\}', text)
+    assert len(entries) == 1, "the scenario must export exactly one compartment setting"
+    return entries[0].strip()
+
+
+def test_scenario_compartment_probe_detects_an_uppercase_source() -> None:
+    good = '{ name = "ELSPETH_WEB__COMPARTMENT_ID", value = local.scenario_id_lower }'
+    bad = good.replace("local.scenario_id_lower", "var.scenario_id")
+    assert _scenario_compartment_expression(good) == "local.scenario_id_lower"
+    assert _scenario_compartment_expression(bad) == "var.scenario_id"
+
+
+def test_aws_scenario_exports_a_valid_marking_and_foreign_ingress() -> None:
+    locals_text = (REPO_ROOT / "deploy/aws-ecs/terraform/modules/scenario/locals.tf").read_text(encoding="utf-8")
+    variables_text = (REPO_ROOT / "deploy/aws-ecs/terraform/modules/scenario/variables.tf").read_text(encoding="utf-8")
+    assert re.search(r"scenario_id_lower\s*=\s*lower\(var\.scenario_id\)", locals_text)
+    assert _scenario_compartment_expression(locals_text) == "local.scenario_id_lower"
+    assert 'contains(["A", "B", "C"], var.scenario_id)' in variables_text
+
+    for scenario_id in ("A", "B", "C"):
+        configured = scenario_id.lower()
+        settings = WebSettings(
+            compartment_id=configured,
+            composer_max_composition_turns=15,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"x" * 32,
+        )
+        assert settings.compartment_id == configured
+        artifact = compartment_marking_header(configured) + "sources: {}\n"
+        assert artifact.startswith(f"# compartment_id: {configured}\n")
+        assert compartment_ingress_record(artifact, own_compartment_id="another")["foreign_compartment_ids"] == [configured]
+        assert compartment_ingress_record(artifact, own_compartment_id=configured)["foreign_compartment_ids"] == []

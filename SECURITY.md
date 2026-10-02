@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-ELSPETH is currently on the `0.8.0` release line. Security
+ELSPETH is currently on the `0.8.1` release line. Security
 fixes are prioritised against the current release branch and `main`.
 Older release snapshots are retained for provenance, but are not
 maintained as separately supported long-term release lines.
@@ -14,24 +14,16 @@ data, proof-of-compromise material, or instructions that would help a third
 party reproduce a vulnerability before maintainers have acknowledged a safe
 disclosure path.
 
-Preferred disclosure path:
+Report a vulnerability through either private channel:
 
-1. Use GitHub private vulnerability reporting for this repository if it is
-   enabled.
-2. If private vulnerability reporting is not enabled or is temporarily
-   unavailable, contact the repository maintainer through an existing trusted
-   project channel and request a temporary private disclosure path.
-3. If no private route is available, open a public issue that says only
-   "Security disclosure path requested" and includes no exploit detail.
-
-As of 0.8.0, a dedicated public security mailbox has not yet been published in
-this repository. GitHub private vulnerability reporting is enabled for this
-repository, so a permanent private disclosure channel is available; publishing
-a dedicated security mailbox remains a public-release readiness item.
+1. GitHub private vulnerability reporting for this repository: on the
+   **Security** tab, choose **Report a vulnerability**.
+2. Email the security contact at
+   [cloudengineering@dta.gov.au](mailto:cloudengineering@dta.gov.au).
 
 ## What To Include
 
-When a private channel is available, include:
+Include:
 
 - affected version, commit, branch, or container digest;
 - affected component or endpoint;
@@ -73,7 +65,7 @@ Out of scope:
 
 - third-party provider infrastructure such as Azure OpenAI, OpenRouter,
   Microsoft Entra, ChromaDB, Dataverse, and GitHub;
-- denial-of-service testing against any live government or staging system
+- denial-of-service testing against any live or shared system
   without explicit written authorisation;
 - social engineering or physical access attempts.
 

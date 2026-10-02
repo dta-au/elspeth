@@ -9,22 +9,22 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 import pytest
-from sqlalchemy import func, insert, update
+from sqlalchemy import insert, select, update
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
-from tests.fixtures.landscape import make_factory, register_test_node, stamp_inside_next_transaction
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.core.checkpoint.recovery import RecoveryManager
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -69,7 +69,7 @@ def _begin_run(factory: RecorderFactory, run_id: str, leader: str) -> None:
         openrouter_catalog_source="bundled",
     )
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -82,7 +82,7 @@ def _begin_run(factory: RecorderFactory, run_id: str, leader: str) -> None:
 
 def _enqueue(factory: RecorderFactory, run_id: str, name: str, sequence: int) -> str:
     row, token = factory.data_flow.create_row_with_token(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         source_node_id=f"source-{run_id}",
         row_index=sequence,
         data={"name": name},
@@ -92,7 +92,7 @@ def _enqueue(factory: RecorderFactory, run_id: str, name: str, sequence: int) ->
         token_id=f"token-{name}",
     )
     item = factory.scheduler.enqueue_ready(
-        run_id=run_id,
+        member_token=leader_coordination_token(factory, run_id).membership,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=NODE_ID,
@@ -264,28 +264,7 @@ def test_postgresql_rm01_through_rm06_and_rm09_through_rm13(postgres_db: Landsca
     # RM-06: duplicate owners collapse and exact expiry equality is inactive.
     assert repository.peer_active_leases(run_id=RUN_ID, caller_owner=LEADER) == (PEER_A, PEER_B)
 
-    # RM-09..RM-13: active identities, barrier subtype partition, and order.
-    assert repository.active_row_ids(run_id=RUN_ID) == frozenset(
-        {
-            f"row-{name}"
-            for name in (
-                "ready",
-                "leased-self",
-                "leased-peer-a",
-                "leased-peer-b",
-                "leased-peer-equality",
-                "leased-sink-redrive",
-                "blocked-queue",
-                "blocked-barrier-pending-z",
-                "blocked-barrier-adopted-a",
-                "pending-sink-peer",
-                "pending-sink-empty-owner",
-            )
-        }
-    )
-    assert repository.blocked_barrier_token_ids(run_id=RUN_ID) == frozenset(
-        {"token-blocked-barrier-pending-z", "token-blocked-barrier-adopted-a"}
-    )
+    # RM-11..RM-13: barrier subtype partition and order.
     assert repository.count_blocked_barrier_items(run_id=RUN_ID) == 2
     assert tuple(item.barrier_key for item in repository.list_blocked_barrier_items(run_id=RUN_ID)) == (
         "a-barrier",
@@ -295,10 +274,11 @@ def test_postgresql_rm01_through_rm06_and_rm09_through_rm13(postgres_db: Landsca
 
     # Foreign-run rows never leak into any RM selector.
     assert repository.count_active_work(run_id=OTHER_RUN_ID) == 1
-    assert repository.blocked_barrier_token_ids(run_id=OTHER_RUN_ID) == frozenset()
+    assert repository.count_blocked_barrier_items(run_id=OTHER_RUN_ID) == 0
 
 
 def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: LandscapeDB) -> None:
+    """Pin exact SQL boundary operands; this is not a timing or lock-wait proof."""
     factory = make_factory(postgres_db)
     run_id = "rm-postgresql-coordination"
     leader = f"worker:{run_id}:leader"
@@ -309,21 +289,28 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
     assert occupied is not None
     assert occupied.leader_worker_id == leader
     assert occupied.seat_live is True
-    # Liveness is judged against the reading transaction's own database time
-    # (ADR-047): a deadline stamped EQUAL to it inside that transaction is live.
-    seat_at_equality = (
-        update(run_coordination_table)
-        .where(run_coordination_table.c.run_id == run_id)
-        .values(leader_heartbeat_expires_at=func.current_timestamp())
-    )
-    with stamp_inside_next_transaction(postgres_db.engine, seat_at_equality):
+    # This advisory read takes no authority locks. Stamp exactly its fresh
+    # database sample through the owned internal reader; the public API still
+    # accepts no clock, and the SELECT must treat exact equality as live.
+    seat_samples: list[datetime] = []
+
+    def seat_equality_clock(conn: Connection) -> datetime:
+        sampled = read_landscape_decision_time(conn)
+        conn.execute(
+            update(run_coordination_table).where(run_coordination_table.c.run_id == run_id).values(leader_heartbeat_expires_at=sampled)
+        )
+        seat_samples.append(sampled)
+        return sampled
+
+    with patch("elspeth.core.landscape.run_coordination_repository.read_landscape_decision_time", side_effect=seat_equality_clock):
         equality = coordination.live_leader(run_id=run_id)
     assert equality is not None
+    assert seat_samples == [equality.leader_heartbeat_expires_at]
     assert equality.seat_live is True
     assert coordination.live_leader(run_id="rm-postgresql-missing") is None
 
     # NOW is in the database clock's past: these deadlines are all beyond the
-    # grace threshold; "equality" is re-stamped inside the sweep's transaction.
+    # grace threshold; "equality" is re-stamped at the sweep's fresh sample.
     registered_at = NOW - timedelta(minutes=2)
     workers = (
         ("dead-z", "follower", "active", NOW - timedelta(seconds=11), registered_at),
@@ -344,17 +331,28 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
                     departed_at=NOW if status == "departed" else None,
                 )
             )
-    member_at_threshold = (
-        update(run_workers_table)
-        .where(run_workers_table.c.worker_id == "equality")
-        .values(heartbeat_expires_at=func.current_timestamp() - timedelta(seconds=10))
-    )
-    with stamp_inside_next_transaction(postgres_db.engine, member_at_threshold):
+    member_samples: list[datetime] = []
+
+    def member_equality_clock(conn: Connection) -> datetime:
+        sampled = read_landscape_decision_time(conn)
+        conn.execute(
+            update(run_workers_table)
+            .where(run_workers_table.c.worker_id == "equality", run_workers_table.c.run_id == run_id)
+            .values(heartbeat_expires_at=sampled - timedelta(seconds=10))
+        )
+        assert conn.execute(
+            select(run_workers_table.c.heartbeat_expires_at).where(run_workers_table.c.worker_id == "equality")
+        ).scalar_one() == sampled - timedelta(seconds=10)
+        member_samples.append(sampled)
+        return sampled
+
+    with patch("elspeth.core.landscape.run_coordination_repository.read_landscape_decision_time", side_effect=member_equality_clock):
         dead = coordination.dead_non_leader_workers(
             run_id=run_id,
             leader_worker_id=leader,
             grace_seconds=10,
         )
+    assert len(member_samples) == 1
     assert dead == ("dead-a", "dead-z")
 
     with postgres_db.engine.begin() as conn:
@@ -380,7 +378,7 @@ def test_postgresql_rm14_accounting_census_and_abandoned_resume_refusal(
     for index, run_id in enumerate(run_ids):
         _begin_run(factory, run_id, f"worker:{run_id}:leader")
         factory.data_flow.create_row_with_token(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             source_node_id=f"source-{run_id}",
             row_index=index,
             data={"run": run_id},
@@ -391,7 +389,8 @@ def test_postgresql_rm14_accounting_census_and_abandoned_resume_refusal(
         )
 
     for run_id in (run_ids[0], run_ids[3]):
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(factory, run_id),
             ref=TokenRef(token_id=f"token-{run_id}", run_id=run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
@@ -420,17 +419,6 @@ def test_postgresql_rm14_accounting_census_and_abandoned_resume_refusal(
     assert batch.accounting[run_ids[2]].tokens.abandoned == 1
     assert run_ids[3] not in batch.accounting
     assert "both terminally decided and marked ABANDONED" in batch.corrupt[run_ids[3]].violations[0]
-
-    recovery = RecoveryManager(postgres_db, checkpoint_manager=object())  # type: ignore[arg-type]
-    for checkpoint in (None, object()):
-        monkeypatch.setattr(
-            recovery,
-            "_get_latest_checkpoint_for_resume_workset",
-            lambda _run_id, checkpoint=checkpoint: checkpoint,
-        )
-        for run_id in (run_ids[2], run_ids[3]):
-            with pytest.raises(AuditIntegrityError, match="ABANDONED"):
-                recovery.get_resume_workset(run_id)
 
 
 def test_postgresql_token_work_status_check_rejects_unknown_state(postgres_db: LandscapeDB) -> None:

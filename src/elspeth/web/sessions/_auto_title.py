@@ -16,11 +16,11 @@ its minted default title. The outbound naming call likewise never ships
 raw first-message content: credential/PII-shaped substrings are redacted
 and only a fenced, truncated excerpt leaves the process. No
 Landscape audit entry is emitted — this is UI metadata, not a pipeline
-decision. See CLAUDE.md "Three-Tier Trust Model" for the rationale.
+decision. See docs/guides/data-trust-and-error-handling.md §The Three-Tier
+Trust Model for the rationale.
 
-Known gap: each first-message call is paid LLM traffic that bypasses
-``composer_rate_limit_per_minute``. For demo-scale traffic this is
-noise; production deployments should add a per-user-per-day cap.
+Every dispatched call is included in the identity's daily token ledger;
+missing usage remains unknown and subsequent admission fails closed.
 """
 
 from __future__ import annotations
@@ -28,15 +28,24 @@ from __future__ import annotations
 import asyncio
 import unicodedata
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from litellm.exceptions import APIError as LiteLLMAPIError
+import httpx
+from openai import OpenAIError
 from opentelemetry import metrics
 
+from elspeth.contracts import errors as contract_errors
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
-from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
-from elspeth.web.validation import _redact_sensitive_content, reject_credential_shaped_content
+from elspeth.web.composer import provider_gateway
+from elspeth.web.composer.llm_response_parsing import safe_response_model, token_usage_from_response
+from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_gateway import _apply_endpoint_kwargs
+from elspeth.web.coordination.quota_authority import TokenUsageEntry
+from elspeth.web.validation import _redact_sensitive_content, _warn_pii_shaped_content, reject_credential_shaped_content
 
 if TYPE_CHECKING:
     from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -72,6 +81,7 @@ _AUTO_TITLE_EXCERPT_CHAR_LIMIT = 800
 _AUTO_TITLE_EXCERPT_FENCE = "EXCERPT-8f2c"
 _AUTO_TITLE_FAILED_COUNTER = metrics.get_meter(__name__).create_counter("composer.auto_title.failed")
 _AUTO_TITLE_REJECTED_COUNTER = metrics.get_meter(__name__).create_counter("composer.auto_title.rejected")
+_AUTO_TITLE_ADMISSION_REFUSED_COUNTER = metrics.get_meter(__name__).create_counter("composer.auto_title.admission_refused")
 # Characters a title may contain besides Unicode letters/numbers (category
 # L/N) and U+0020. Deliberately excludes "." and ":" — they are what list
 # markers ("1. Title") and conversational preambles ("Here's a title: …")
@@ -96,6 +106,10 @@ _MISSING_PROVIDER_FIELD = object()
 
 class _MalformedAutoTitleResponseError(Exception):
     """Owned classification for an unusable external completion shape."""
+
+
+class _AutoTitleProviderTransportError(Exception):
+    """The physical auto-title LLM call failed in its HTTP transport."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,8 +140,10 @@ def _auto_title_exception_class(exc: BaseException) -> str:
         return "TimeoutError"
     if isinstance(exc, asyncio.CancelledError):
         return "CancelledError"
-    if isinstance(exc, LiteLLMAPIError):
-        return "LiteLLMAPIError"
+    if isinstance(exc, _AutoTitleProviderTransportError):
+        return "TransportError"
+    if classify_provider_failure(exc) is not None:
+        return type(exc).__name__
     if isinstance(exc, _MalformedAutoTitleResponseError):
         return "MalformedResponseError"
     return "other"
@@ -235,6 +251,11 @@ def _admit_title_candidate(raw: str) -> str | _RejectedTitle:
         # reaches document.title — browser history, window managers,
         # screen shares — so it must never carry a pasted secret.
         return _RejectedTitle(rejection_class="credential")
+    if any(_warn_pii_shaped_content(title)):
+        # Title metadata has a narrower UI privacy policy than the shared
+        # credential detector. Keep PII handling separate from the product's
+        # credential-material claim.
+        return _RejectedTitle(rejection_class="credential")
     return title
 
 
@@ -257,6 +278,87 @@ def _admit_auto_title_completion(response: object) -> _AdmittedAutoTitleCompleti
     else:
         raise _MalformedAutoTitleResponseError from None
     return _AdmittedAutoTitleCompletion(content=content, finish_reason=admitted_finish_reason)
+
+
+async def _charge_auto_title_response(
+    service: SessionServiceProtocol,
+    session_operation_context: SessionOperationContext,
+    *,
+    model: str,
+    response: object,
+    attempt_id: str,
+    recorded_at: datetime,
+    primary_cancellation: asyncio.CancelledError | None = None,
+) -> None:
+    """Charge one returned auto-title completion to the token ledger (R14, Task I1).
+
+    A returned completion is spend whether or not it makes a usable title, and
+    unreported usage is charged as unknown, never as zero. A timeout or malformed
+    response does not prove that the provider did not perform billable work.
+    """
+    usage = token_usage_from_response(response)
+    returned_model = safe_response_model(response)
+    entry = TokenUsageEntry(
+        model=model if returned_model is None else returned_model,
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        cached_prompt_tokens=usage.cached_prompt_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+        recorded_at=recorded_at,
+        call_id=attempt_id,
+    )
+
+    async def settle_required_attempt() -> None:
+        try:
+            await service.settle_provider_attempt(
+                session_operation_context=session_operation_context,
+                attempt_id=attempt_id,
+                entry=entry,
+            )
+        except AuditIntegrityError:
+            raise
+        except Exception as exc:
+            raise AuditIntegrityError("Auto-title provider attempt could not be settled") from exc
+
+    settlement = asyncio.create_task(settle_required_attempt())
+    _, interrupted = await _join_auto_title_custody_task(
+        settlement,
+        primary_cancellation=primary_cancellation,
+        child_cancel_message="Auto-title provider settlement was cancelled before durable completion",
+    )
+    if interrupted is not None and primary_cancellation is None:
+        raise interrupted
+
+
+async def _join_auto_title_custody_task[T](
+    task: asyncio.Task[T],
+    *,
+    child_cancel_message: str,
+    primary_cancellation: asyncio.CancelledError | None = None,
+) -> tuple[T, asyncio.CancelledError | None]:
+    """Join owned custody work, preserving primary cancellation and integrity faults."""
+    interrupted = primary_cancellation
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if interrupted is None:
+                interrupted = exc
+        except Exception:
+            break
+    if task.cancelled():
+        try:
+            task.result()
+        except asyncio.CancelledError as child_cancel:
+            raise AuditIntegrityError(child_cancel_message) from (interrupted or child_cancel)
+    try:
+        return task.result(), interrupted
+    except Exception as failure:
+        if interrupted is not None:
+            if isinstance(failure, contract_errors.TIER_1_ERRORS):
+                raise failure from interrupted
+            raise interrupted from failure
+        raise
 
 
 async def maybe_auto_title_session(
@@ -286,6 +388,8 @@ async def maybe_auto_title_session(
     """
     if not user_message.strip():
         return
+    if session_operation_context.fence.session_id != str(session_id):
+        raise AuditIntegrityError("Auto-title session authority targets a different session")
     kwargs: dict[str, object] = {
         "model": model,
         "messages": [
@@ -299,19 +403,83 @@ async def maybe_auto_title_session(
     if seed is not None:
         kwargs["seed"] = seed
     _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
+    admission = asyncio.create_task(
+        service.begin_provider_attempt(session_operation_context=session_operation_context, source="auto_title")
+    )
     try:
-        response = await _litellm_acompletion(**kwargs)
+        attempt, interrupted = await _join_auto_title_custody_task(
+            admission,
+            child_cancel_message="Auto-title provider admission was cancelled before its outcome was known",
+        )
+    except ChargeableAdmissionRefused as exc:
+        if exc.decision.refusal_reason is None:
+            raise AuditIntegrityError("Refused auto-title admission has no refusal reason") from exc
+        _AUTO_TITLE_ADMISSION_REFUSED_COUNTER.add(1, {"reason": exc.decision.refusal_reason.value})
+        return
+    if interrupted is not None:
+        closure = asyncio.create_task(
+            service.cancel_undispatched_provider_attempt(
+                session_operation_context=session_operation_context,
+                attempt_id=attempt.attempt_id,
+                requested_model=model,
+            )
+        )
+        await _join_auto_title_custody_task(
+            closure,
+            primary_cancellation=interrupted,
+            child_cancel_message="Auto-title undispatched attempt closure was cancelled before durable completion",
+        )
+        raise interrupted
+    response: object | None = None
+    try:
+        try:
+            response = await provider_gateway._litellm_acompletion(on_provider_dispatch=None, **kwargs)
+        except httpx.TransportError as exc:
+            raise _AutoTitleProviderTransportError("Auto-title provider transport failed") from exc
         admitted = _admit_auto_title_completion(response)
     except asyncio.CancelledError as exc:
+        await _charge_auto_title_response(
+            service,
+            session_operation_context,
+            model=model,
+            response=exc,
+            attempt_id=attempt.attempt_id,
+            recorded_at=datetime.now(UTC),
+            primary_cancellation=exc,
+        )
         _record_auto_title_failure(exc)
         raise
-    except (LiteLLMAPIError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
+    except (OpenAIError, _AutoTitleProviderTransportError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
         # Auto-titling is best-effort UI metadata for expected provider/
         # scheduling failures, but those failures still need an operational
         # signal so "provider declined" does not look identical to "feature
         # silently broke."
+        await _charge_auto_title_response(
+            service,
+            session_operation_context,
+            model=model,
+            response=exc if response is None else response,
+            attempt_id=attempt.attempt_id,
+            recorded_at=datetime.now(UTC),
+        )
         _record_auto_title_failure(exc)
         return
+    except Exception as exc:
+        # A dispatched call remains chargeable even if our own parsing or
+        # provider adapter fails unexpectedly. Keep the original first-party
+        # failure visible after accounting, without calling it provider weather.
+        await _charge_auto_title_response(
+            service,
+            session_operation_context,
+            model=model,
+            response=exc if response is None else response,
+            attempt_id=attempt.attempt_id,
+            recorded_at=datetime.now(UTC),
+        )
+        raise
+    await _charge_auto_title_response(
+        service, session_operation_context, model=model, response=response, attempt_id=attempt.attempt_id, recorded_at=datetime.now(UTC)
+    )
     if admitted.content is None:
         return
     candidate = _admit_title_candidate(admitted.content)

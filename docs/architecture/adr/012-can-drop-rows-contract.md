@@ -7,6 +7,19 @@
 **Supersedes:** None
 **Depends on:** [ADR-010](010-declaration-trust-framework.md)
 
+> **Amended by [ADR-019](019-two-axis-terminal-model.md) on 2026-05-04.**
+> §Terminal state below records the legitimate zero-emission outcome as
+> `RowOutcome.DROPPED_BY_FILTER`. ADR-019 replaced the single-axis `RowOutcome`
+> enum with the two-axis terminal model, and its normative mapping table
+> carries `DROPPED_BY_FILTER` to `(TerminalOutcome.SUCCESS,
+> TerminalPath.FILTER_DROPPED)`. Measured 2026-09-11 with `grep -rn <symbol>
+> src/`: `RowOutcome` returns 0 hits, while the positive control
+> `TerminalPath.FILTER_DROPPED` returns 8. The two surviving `DROPPED_BY_FILTER`
+> hits are prose — a docstring and an error-message string in
+> `src/elspeth/engine/processor.py` — not an enum member. The decision below is
+> otherwise unchanged: the outcome is still terminal, still queryable in
+> Landscape, and still distinct from a failure outcome; only the spelling moved.
+
 ## Context
 
 ADR-009 Clause 3 left pass-through runtime verification with an explicit

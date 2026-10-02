@@ -140,7 +140,11 @@ class TestBackdatedAcceptTiming:
                 batch_id_remap={},
             ),
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
 
         # T0: a prior leader deposited the BLOCKED row and crashed before
         # adoption (barrier_adopted_epoch stays NULL).
@@ -176,7 +180,11 @@ class TestBackdatedAcceptTiming:
         _db, factory = _make_factory()
         transform = _passthrough_flush_transform()
         processor = _agg_processor(factory, trigger={"count": 5}, transform=transform, clock=clock)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
 
         results = processor.process_row(
             row_index=0,
@@ -222,7 +230,11 @@ class TestLateArrivalRelease:
             coalesce_node_ids={CoalesceName("merge"): NodeID("coalesce::merge")},
             node_step_map={NodeID("coalesce::merge"): 2},
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
         _persist_blocked_scheduler_work(
             factory, processor, late_token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False
         )
@@ -290,7 +302,11 @@ class TestGroupLossHandOff:
         )
         db, factory = _make_factory()
         processor = self._forked_processor(factory, coalesce)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
         # Sibling A is durably held (post-adoption image).
         _persist_blocked_scheduler_work(
             factory, processor, held_token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=True
@@ -321,20 +337,22 @@ class TestGroupLossHandOff:
         from tests.unit.engine.test_processor import _persist_token_for_scheduler
 
         _persist_token_for_scheduler(factory, losing_token, ingest_sequence=0)
-        item = factory.scheduler.enqueue_ready_claimed_legacy_unfenced(
-            run_id=processor.run_id,
+        member_token = processor._require_member_token()
+        item = factory.scheduler.enqueue_ready_claimed(
+            member_token=member_token,
             token_id="tok-lost",
             row_id="row-1",
             node_id="coalesce::merge",
             step_index=2,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(losing_token.row_data),
-            lease_owner="test-harness",
+            lease_owner=member_token.worker_id,
             lease_seconds=60,
         )
         factory.scheduler.mark_failed(
             work_item_id=item.work_item_id,
-            expected_lease_owner="test-harness",
+            expected_lease_owner=member_token.worker_id,
+            member_token=member_token,
             group_losses=losses,
         )
         with db.connection() as conn:
@@ -346,7 +364,7 @@ class TestGroupLossHandOff:
         # BranchLossSpec): the disposition layer stamps the lease owner it
         # already holds — the attribution invariant moves to this durable
         # ledger row.
-        assert loss_rows[0]["recorded_by"] == "test-harness"
+        assert loss_rows[0]["recorded_by"] == member_token.worker_id
 
         # The next intake marks the loss adopted; the in-memory replay dedups
         # via has_recorded_branch_loss (record-then-notify already ran).
@@ -380,7 +398,7 @@ class TestGroupLossHandOff:
         factory.execution.begin_node_state(
             token_id="tok-held",
             node_id="coalesce::merge",
-            run_id="test-run",
+            member_token=bootstrap._require_member_token(),
             step_index=2,
             input_data={},
             attempt=0,
@@ -395,22 +413,24 @@ class TestGroupLossHandOff:
         from tests.unit.engine.test_processor import _persist_token_for_scheduler
 
         _persist_token_for_scheduler(factory, losing_token, ingest_sequence=0)
-        item = factory.scheduler.enqueue_ready_claimed_legacy_unfenced(
-            run_id=bootstrap.run_id,
+        member_token = bootstrap._require_member_token()
+        item = factory.scheduler.enqueue_ready_claimed(
+            member_token=member_token,
             token_id="tok-lost",
             row_id="row-1",
             node_id="coalesce::merge",
             step_index=2,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(losing_token.row_data),
-            lease_owner="dead-leader",
+            lease_owner=member_token.worker_id,
             lease_seconds=60,
         )
         from elspeth.core.landscape.scheduler_repository import GroupLossSpec
 
         factory.scheduler.mark_failed(
             work_item_id=item.work_item_id,
-            expected_lease_owner="dead-leader",
+            expected_lease_owner=member_token.worker_id,
+            member_token=member_token,
             group_losses=(
                 GroupLossSpec(
                     closer_name="merge",
@@ -451,7 +471,11 @@ class TestEofGating:
         _db, factory = _make_factory()
         transform = _passthrough_flush_transform()
         processor = _agg_processor(factory, trigger={"count": 50}, transform=transform)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
 
         # A slow worker's in-flight row: deposited READY, never claimed.
         slow_token = make_token_info(row_id="row-slow", token_id="tok-slow", data={"value": 9})
@@ -459,7 +483,7 @@ class TestEofGating:
 
         _persist_token_for_scheduler(factory, slow_token, ingest_sequence=3)
         factory.scheduler.enqueue_ready(
-            run_id=processor.run_id,
+            member_token=processor._require_member_token(),
             token_id="tok-slow",
             row_id="row-slow",
             node_id=str(AGG_NODE),
@@ -487,7 +511,11 @@ class TestEofGating:
         _db, factory = _make_factory()
         transform = _passthrough_flush_transform()
         processor = _agg_processor(factory, trigger={"count": 50}, transform=transform)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
 
         for index in range(2):
             results = processor.process_row(
@@ -529,7 +557,11 @@ class TestIntakeFiredCountFlush:
         _db, factory = _make_factory()
         transform = _passthrough_flush_transform()
         processor = _agg_processor(factory, trigger={"count": 2}, transform=transform)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
 
         first = processor.process_row(
             row_index=0,

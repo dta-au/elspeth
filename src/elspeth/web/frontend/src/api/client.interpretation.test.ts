@@ -1,11 +1,3 @@
-/**
- * Tests for the Phase 5b interpretation-event client surface.
- *
- * Strategy mirrors client.guided.test.ts: spy on globalThis.fetch (NOT
- * vi.mock("./client")) so the real `parseResponse<T>()` + `authHeaders()`
- * code paths execute.  Consumer tests (stores/components) mock the
- * client module; producer tests exercise it.
- */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
@@ -13,6 +5,7 @@ import {
   resolveInterpretation,
   optOutOfInterpretations,
   getInterpretationOptOutSummary,
+  validatePipeline,
 } from "./client";
 import type {
   InterpretationEvent,
@@ -23,6 +16,7 @@ import type {
 } from "@/types/interpretation";
 import type { CompositionState } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { advanceAuthGeneration } from "./authSession";
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -51,7 +45,7 @@ function makePendingEvent(overrides: Partial<InterpretationEvent> = {}): Interpr
     hash_domain_version: null,
     runtime_model_identifier_at_resolve: null,
     runtime_model_version_at_resolve: null,
-    resolved_prompt_template_hash: null,
+    approved_prompt_artifact_hash: null,
     ...overrides,
   };
 }
@@ -146,6 +140,178 @@ describe("api/client interpretation functions", () => {
   });
 
   describe("resolveInterpretation", () => {
+    it("serializes review and validation mutations for one session", async () => {
+      const response = (body: unknown) => ({
+        ok: true,
+        status: 200,
+        json: async () => body,
+      }) as Response;
+      const resolved: InterpretationResolveResponse = {
+        event: makePendingEvent({ choice: "accepted_as_drafted" }),
+        new_state: makeCompositionState(),
+      };
+      const validation = {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: true,
+          completion_ready: true,
+          blockers: [],
+        },
+      };
+      const releases: Array<(value: Response) => void> = [];
+      fetchSpy.mockImplementation(() => new Promise<Response>((resolve) => {
+        releases.push(resolve);
+      }));
+
+      const first = resolveInterpretation("sess-1", "evt-1", { choice: "accepted_as_drafted" });
+      const second = resolveInterpretation("sess-1", "evt-2", { choice: "accepted_as_drafted" });
+      const validate = validatePipeline("sess-1", "state-2");
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+      expect(fetchSpy.mock.calls[0][0]).toContain("/evt-1/resolve");
+
+      releases[0](response(resolved));
+      await first;
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
+      expect(fetchSpy.mock.calls[1][0]).toContain("/evt-2/resolve");
+
+      releases[1](response(resolved));
+      await second;
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(3));
+      expect(fetchSpy.mock.calls[2][0]).toBe("/api/sessions/sess-1/validate?state_id=state-2");
+
+      releases[2](response(validation));
+      await expect(validate).resolves.toMatchObject({ is_valid: true });
+    });
+
+    it("keeps other sessions independent and drains after a failed review", async () => {
+      let releaseFirst: ((value: Response) => void) | undefined;
+      const resolved: InterpretationResolveResponse = {
+        event: makePendingEvent({ choice: "accepted_as_drafted" }),
+        new_state: makeCompositionState(),
+      };
+      fetchSpy.mockImplementation((url: string) => {
+        if (url.includes("/sess-1/") && url.includes("/evt-1/")) {
+          return new Promise<Response>((resolve) => { releaseFirst = resolve; });
+        }
+        return Promise.resolve(new Response(JSON.stringify(resolved), { status: 200 }));
+      });
+
+      const first = resolveInterpretation("sess-1", "evt-1", { choice: "accepted_as_drafted" });
+      const firstFailure = expect(first).rejects.toMatchObject({ status: 422 });
+      const queued = resolveInterpretation("sess-1", "evt-2", { choice: "accepted_as_drafted" });
+      const independent = resolveInterpretation("sess-2", "evt-3", { choice: "accepted_as_drafted" });
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
+      expect(fetchSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+        "/api/sessions/sess-1/interpretations/evt-1/resolve",
+        "/api/sessions/sess-2/interpretations/evt-3/resolve",
+      ]);
+      await independent;
+
+      releaseFirst?.(new Response(JSON.stringify({ detail: "Invalid amendment" }), { status: 422 }));
+      await firstFailure;
+      await expect(queued).resolves.toMatchObject({ new_state: { id: "state-2" } });
+      expect(fetchSpy.mock.calls[2][0]).toContain("/evt-2/resolve");
+    });
+
+    it("queues opt-out behind a pending review decision", async () => {
+      let releaseFirst: ((value: Response) => void) | undefined;
+      const resolved: InterpretationResolveResponse = {
+        event: makePendingEvent({ choice: "accepted_as_drafted" }),
+        new_state: makeCompositionState(),
+      };
+      const optedOut: InterpretationOptOutResponse = {
+        session_id: "sess-1",
+        interpretation_review_disabled: true,
+        opted_out_at: "2026-05-18T00:05:00Z",
+      };
+      fetchSpy.mockImplementationOnce(() => new Promise<Response>((resolve) => { releaseFirst = resolve; }));
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify(optedOut), { status: 200 }));
+
+      const review = resolveInterpretation("sess-1", "evt-1", { choice: "accepted_as_drafted" });
+      const optOut = optOutOfInterpretations("sess-1");
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+      releaseFirst?.(new Response(JSON.stringify(resolved), { status: 200 }));
+      await review;
+      await expect(optOut).resolves.toEqual(optedOut);
+      expect(fetchSpy.mock.calls[1][0]).toBe("/api/sessions/sess-1/interpretations/opt_out");
+    });
+
+    it("does not dispatch a queued decision after the auth identity changes", async () => {
+      let releaseFirst: ((value: Response) => void) | undefined;
+      const resolved: InterpretationResolveResponse = {
+        event: makePendingEvent({ choice: "accepted_as_drafted" }),
+        new_state: makeCompositionState(),
+      };
+      fetchSpy.mockImplementationOnce(() => new Promise<Response>((resolve) => { releaseFirst = resolve; }));
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify(resolved), { status: 200 }));
+
+      const first = resolveInterpretation("sess-1", "evt-1", { choice: "accepted_as_drafted" });
+      const queued = resolveInterpretation("sess-1", "evt-2", { choice: "accepted_as_drafted" });
+      const queuedOutcome = expect(queued).rejects.toMatchObject({ detail: "Authentication changed before request dispatch" });
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+      advanceAuthGeneration();
+      releaseFirst?.(new Response(JSON.stringify(resolved), { status: 200 }));
+      await first;
+      await queuedOutcome;
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("fails closed rather than blocking or dispatching more decisions after a hung request", async () => {
+      vi.useFakeTimers();
+      try {
+        fetchSpy.mockImplementation((_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        }));
+        const first = resolveInterpretation("sess-timeout", "evt-1", { choice: "accepted_as_drafted" });
+        const queued = resolveInterpretation("sess-timeout", "evt-2", { choice: "accepted_as_drafted" });
+        const firstFailure = expect(first).rejects.toMatchObject({ status: 504 });
+        const queuedFailure = expect(queued).rejects.toMatchObject({ status: 504 });
+        await Promise.resolve();
+        const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+        expect(init.signal).toBeInstanceOf(AbortSignal);
+
+        await vi.advanceTimersByTimeAsync(370_000);
+        await firstFailure;
+        await queuedFailure;
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("requires a refresh before queued decisions after an ambiguous gateway response", async () => {
+      let releaseFirst: ((value: Response) => void) | undefined;
+      fetchSpy.mockImplementationOnce(() => new Promise<Response>((resolve) => { releaseFirst = resolve; }));
+      const first = resolveInterpretation("sess-gateway", "evt-1", { choice: "accepted_as_drafted" });
+      const queued = resolveInterpretation("sess-gateway", "evt-2", { choice: "accepted_as_drafted" });
+      const firstFailure = expect(first).rejects.toMatchObject({ status: 504 });
+      const queuedFailure = expect(queued).rejects.toMatchObject({ status: 504 });
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+      releaseFirst?.(new Response(JSON.stringify({ detail: "Gateway unavailable" }), { status: 503 }));
+      await firstFailure;
+      await queuedFailure;
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      { label: "server error after dispatch", status: 500, body: "{\"detail\":\"Internal error\"}" },
+      { label: "malformed successful response", status: 200, body: "{" },
+    ])("fails closed after $label", async ({ status, body }) => {
+      const sessionId = `sess-ambiguous-${status}`;
+      fetchSpy.mockResolvedValueOnce(new Response(body, { status }));
+      const first = resolveInterpretation(sessionId, "evt-1", { choice: "accepted_as_drafted" });
+      const queued = resolveInterpretation(sessionId, "evt-2", { choice: "accepted_as_drafted" });
+      const firstFailure = expect(first).rejects.toMatchObject({ status: 504 });
+      const queuedFailure = expect(queued).rejects.toMatchObject({ status: 504 });
+      await firstFailure;
+      await queuedFailure;
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
     it("calls POST /api/sessions/:id/interpretations/:event_id/resolve with the body", async () => {
       const resolved = makePendingEvent({
         choice: "accepted_as_drafted",
@@ -153,7 +319,7 @@ describe("api/client interpretation functions", () => {
         resolved_at: "2026-05-18T00:01:00Z",
         arguments_hash: "abc123",
         hash_domain_version: "v1",
-        resolved_prompt_template_hash: "fedcba",
+        approved_prompt_artifact_hash: "fedcba",
       });
       const body: InterpretationResolveResponse = {
         event: resolved,

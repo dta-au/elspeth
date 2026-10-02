@@ -3,7 +3,7 @@
 Coverage includes the interpretation-event table,
 ``composition_states.provenance`` closed-enum extension,
 ``sessions.interpretation_review_disabled`` column, append-only UPDATE and
-DELETE triggers, ``calls.resolved_prompt_template_hash`` in the L1 Landscape,
+DELETE triggers, ``calls.approved_prompt_artifact_hash`` in the L1 Landscape,
 the partial unique index on pending tool calls, and the lookup index on
 ``composition_state_id``.
 
@@ -14,6 +14,7 @@ Step "Test shape"). Test numbering mirrors the spec for traceability.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -21,6 +22,7 @@ import pytest
 from sqlalchemy import insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
+from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     SESSION_SCHEMA_EPOCH,
@@ -33,6 +35,7 @@ from elspeth.web.sessions.models import (
     skill_markdown_history_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.fixture
@@ -44,6 +47,7 @@ def engine():
 
 
 def _insert_session(conn, session_id: str) -> None:
+    ensure_test_identity(conn, identity_id="alice")
     conn.execute(
         insert(sessions_table).values(
             id=session_id,
@@ -81,10 +85,14 @@ def _user_approved_row(
     accepted_value: str | None = None,
     hash_domain_version: str | None = None,
     arguments_hash: str | None = None,
-    resolved_prompt_template_hash: str | None = None,
+    approved_prompt_artifact_hash: str | None = None,
     runtime_model_identifier_at_resolve: str | None = None,
     runtime_model_version_at_resolve: str | None = None,
+    surface_origin: str | None = "composer_llm",
 ) -> dict:
+    # LLM provenance follows the origin, as the writers produce it: present for
+    # a composer_llm surface, absent for a server-route surface.
+    llm_raised = surface_origin in (None, "composer_llm")
     return {
         "id": row_id,
         "session_id": session_id,
@@ -99,16 +107,17 @@ def _user_approved_row(
         "created_at": datetime.now(UTC),
         "resolved_at": resolved_at,
         "actor": "alice",
-        "model_identifier": "anthropic/claude-opus-4-7",
-        "model_version": "2026-05-01",
-        "provider": "anthropic",
-        "composer_skill_hash": "0" * 64,
+        "model_identifier": "anthropic/claude-opus-4-7" if llm_raised else None,
+        "model_version": "2026-05-01" if llm_raised else None,
+        "provider": "anthropic" if llm_raised else None,
+        "composer_skill_hash": "0" * 64 if llm_raised else None,
         "arguments_hash": arguments_hash,
         "hash_domain_version": hash_domain_version,
         "interpretation_source": "user_approved",
+        "surface_origin": surface_origin,
         "runtime_model_identifier_at_resolve": runtime_model_identifier_at_resolve,
         "runtime_model_version_at_resolve": runtime_model_version_at_resolve,
-        "resolved_prompt_template_hash": resolved_prompt_template_hash,
+        "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
     }
 
 
@@ -136,7 +145,7 @@ def _opt_out_row(*, row_id: str, session_id: str, tool_call_id: str | None = Non
         "interpretation_source": "auto_interpreted_opt_out",
         "runtime_model_identifier_at_resolve": None,
         "runtime_model_version_at_resolve": None,
-        "resolved_prompt_template_hash": None,
+        "approved_prompt_artifact_hash": None,
     }
 
 
@@ -172,7 +181,7 @@ def _no_surfaces_row(
         "interpretation_source": "auto_interpreted_no_surfaces",
         "runtime_model_identifier_at_resolve": None,
         "runtime_model_version_at_resolve": None,
-        "resolved_prompt_template_hash": None,
+        "approved_prompt_artifact_hash": None,
     }
 
 
@@ -196,7 +205,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_52() -> None:
+def test_current_session_schema_epoch_is_71() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -220,7 +229,25 @@ def test_current_session_schema_epoch_is_52() -> None:
     # 53: per-admission read records (session_read_admissions,
     # elspeth-f98e0ae8b2) so a released or expired BLOB_READ context is
     # refused on its next proof.
-    assert SESSION_SCHEMA_EPOCH == 53
+    # 54: durable Composer progress and inflight request records.
+    # 55: ownership FKs, revocation provenance and permit admission evidence;
+    # paired with Landscape40 in the identity residual schema window.
+    # 56: sparse proposal arguments and structured validation errors.
+    # 57: approved prompt artifact replaces the unused fallback hash anchor;
+    # paired with Landscape41. Existing approvals are not reinterpreted.
+    # 58: 64-bit quota limits and nullable token-ledger usage measures.
+    # 59: timestamp-leading indexes for container quota scans.
+    # 63: blob_inline_resolutions.content_hash CHECK carries the lowercase-hex
+    # class as well as the length (elspeth-f99b16fc2f).
+    # 65: completion_gates.advisor_signoff.note became a required key
+    # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
+    # 66: control-message v2 binds provenance alongside content. No v1 replay.
+    # 67: composer authority hashes and the advisor fingerprint bind coalesce
+    # mapping-branch order and multi-source sources order. Stores recreated.
+    # 68: ordinary proposal checkpoint rebase reasons are persisted.
+    # 69: freeform message ingress receipts bind retry UUIDs to accepted user rows.
+    # 71: ordinary fork/revert receipts move to a mode-neutral durable ledger.
+    assert SESSION_SCHEMA_EPOCH == 71
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:
@@ -438,7 +465,8 @@ class TestSchema:
             "interpretation_source",
             "runtime_model_identifier_at_resolve",
             "runtime_model_version_at_resolve",
-            "resolved_prompt_template_hash",
+            "approved_prompt_artifact_hash",
+            "surface_origin",
         }
 
     def test_skill_markdown_history_columns(self, engine) -> None:
@@ -503,7 +531,7 @@ class TestStatusConsistencyCheck:
                             accepted_value=None,
                             hash_domain_version="v2",
                             arguments_hash="a" * 64,
-                            resolved_prompt_template_hash="b" * 64,
+                            approved_prompt_artifact_hash="b" * 64,
                             runtime_model_identifier_at_resolve="anthropic/claude-opus-4-7",
                             runtime_model_version_at_resolve="2026-05-01",
                         )
@@ -757,6 +785,78 @@ class TestSourceNullability:
             )
             with pytest.raises(IntegrityError):
                 conn.execute(insert(interpretation_events_table).values(row))
+
+
+class TestSurfaceOrigin:
+    """LLM provenance is present exactly when an LLM raised the surface."""
+
+    @staticmethod
+    def _seeded(conn) -> tuple[str, str]:
+        session_id = str(uuid.uuid4())
+        state_id = str(uuid.uuid4())
+        _insert_session(conn, session_id)
+        _seed_composition_state(conn, state_id=state_id, session_id=session_id)
+        return session_id, state_id
+
+    @pytest.mark.parametrize("origin", ["state_revert", "yaml_import", "e2e_seed"])
+    def test_server_route_surface_carries_no_llm_provenance(self, engine, origin: str) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id, surface_origin=origin)
+            assert row["composer_skill_hash"] is None
+            conn.execute(insert(interpretation_events_table).values(row))
+
+    @pytest.mark.parametrize("origin", ["state_revert", "yaml_import", "e2e_seed"])
+    def test_server_route_surface_claiming_llm_provenance_raises(self, engine, origin: str) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id) | {"surface_origin": origin}
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_surface_origin_provenance"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_composer_llm_surface_without_provenance_raises(self, engine) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id, surface_origin="yaml_import") | {
+                "surface_origin": "composer_llm"
+            }
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_surface_origin_provenance"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    @pytest.mark.parametrize("dropped", ["model_identifier", "model_version", "provider", "composer_skill_hash"])
+    def test_partial_llm_provenance_raises(self, engine, dropped: str) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id) | {dropped: None}
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_user_approved_without_surface_origin_raises(self, engine) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id, surface_origin=None)
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_user_approved_required"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_unknown_surface_origin_raises(self, engine) -> None:
+        with engine.begin() as conn:
+            session_id, state_id = self._seeded(conn)
+            row = _user_approved_row(row_id=str(uuid.uuid4()), session_id=session_id, state_id=state_id) | {"surface_origin": "server"}
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_surface_origin"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_no_surfaces_row_with_a_surface_origin_raises(self, engine) -> None:
+        with engine.begin() as conn:
+            session_id = str(uuid.uuid4())
+            _insert_session(conn, session_id)
+            row = _no_surfaces_row(row_id=str(uuid.uuid4()), session_id=session_id) | {"surface_origin": "composer_llm"}
+            with pytest.raises(IntegrityError, match="ck_interpretation_events_no_surfaces_shape"):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_check_value_set_matches_the_contract_enum(self) -> None:
+        check = next(c for c in interpretation_events_table.constraints if c.name == "ck_interpretation_events_surface_origin")
+        listed = set(re.findall(r"'([a-z0-9_]+)'", str(check.sqltext)))
+        assert listed == {origin.value for origin in InterpretationSurfaceOrigin}
 
 
 # Tests 5 / 5a / 6 — partial unique index on pending tool calls ----------------
@@ -1110,9 +1210,11 @@ class TestSchemaValidatorCatchesMissingTrigger:
             "trg_interpretation_events_no_delete_resolved",
             "trg_chat_messages_immutable_content",
             "trg_chat_messages_no_delete",
-            "trg_guided_operations_terminal_immutable",
-            "trg_guided_operation_events_no_update",
-            "trg_guided_operation_events_no_delete",
+            "trg_message_ingress_receipts_no_update",
+            "trg_message_ingress_receipts_no_delete",
+            "trg_session_operation_receipts_terminal_immutable",
+            "trg_session_operation_receipt_events_no_update",
+            "trg_session_operation_receipt_events_no_delete",
         ],
     )
     def test_validator_raises_when_trigger_dropped(self, trigger_name: str, tmp_path) -> None:
@@ -1128,23 +1230,26 @@ class TestSchemaValidatorCatchesMissingTrigger:
             initialize_session_schema(eng)
 
 
-# Cross-DB — Landscape calls.resolved_prompt_template_hash --------------------
+# Cross-DB — Landscape calls.approved_prompt_artifact_hash --------------------
 class TestLandscapeCallsColumn:
-    def test_resolved_prompt_template_hash_column_exists(self) -> None:
+    def test_approved_prompt_artifact_hash_column_exists(self) -> None:
         from elspeth.core.landscape.schema import calls_table
 
-        assert "resolved_prompt_template_hash" in calls_table.c
-        col = calls_table.c.resolved_prompt_template_hash
+        assert "approved_prompt_artifact_hash" in calls_table.c
+        assert "resolved_prompt_template_hash" not in calls_table.c
+        assert "approved_prompt_artifact_hash" in interpretation_events_table.c
+        assert "resolved_prompt_template_hash" not in interpretation_events_table.c
+        col = calls_table.c.approved_prompt_artifact_hash
         assert col.nullable is True
 
-    def test_index_on_resolved_prompt_template_hash_exists(self) -> None:
+    def test_index_on_approved_prompt_artifact_hash_exists(self) -> None:
         from elspeth.core.landscape.schema import calls_table
 
         index_names = {idx.name for idx in calls_table.indexes}
         # Sanity check via metadata.indexes too — Index() declared at module
         # scope is attached to the table.
-        assert any(name == "ix_calls_resolved_prompt_template_hash" for name in index_names) or _index_exists_in_metadata(
-            "ix_calls_resolved_prompt_template_hash"
+        assert any(name == "ix_calls_approved_prompt_artifact_hash" for name in index_names) or _index_exists_in_metadata(
+            "ix_calls_approved_prompt_artifact_hash"
         )
 
 

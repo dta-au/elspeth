@@ -1,22 +1,16 @@
-import { useCallback, useEffect, useRef } from "react";
+import { type JSX, useCallback, useEffect, useRef } from "react";
 import { usePreferencesStore } from "@/stores/preferencesStore";
-import { useSessionStore } from "@/stores/sessionStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { useTheme, type Theme } from "@/hooks/useTheme";
 import { Button, Input } from "@/components/ui";
-import type { ComposerMode } from "@/types/api";
 
 /**
- * Inner radio-group form. Exported standalone so component tests can render
+ * Inner preferences form. Exported standalone so component tests can render
  * it without the modal chrome; the full panel embeds it.
- *
- * Returns null before bootstrap completes — defaultMode is null until then.
  *
  * Surfaces a role="alert" region (Panel a11y F2) for failed PATCH results
  * so the write failure is announced rather than silently logging to
- * console only. Also forwards activeSessionId to setDefaultMode so the
- * banner's timing watermark is set if the user opts out from settings
- * while a session is active.
+ * console only.
  */
 interface ComposerPreferencesFormProps {
   onClose?: () => void;
@@ -27,11 +21,9 @@ export function ComposerPreferencesForm({
   onClose,
   onResetTutorialComplete,
 }: ComposerPreferencesFormProps = {}): JSX.Element | null {
-  const defaultMode = usePreferencesStore((s) => s.defaultMode);
   const loaded = usePreferencesStore((s) => s.loaded);
   const writing = usePreferencesStore((s) => s.writing);
   const writeError = usePreferencesStore((s) => s.writeError);
-  const setDefaultMode = usePreferencesStore((s) => s.setDefaultMode);
   const resetTutorial = usePreferencesStore((s) => s.resetTutorial);
   const showAdvanced = usePreferencesStore((s) => s.showAdvanced);
   const setShowAdvanced = usePreferencesStore((s) => s.setShowAdvanced);
@@ -41,21 +33,6 @@ export function ComposerPreferencesForm({
   // (run-bearing sessions archived from the switcher). The session switcher
   // can hide/show archived rows locally, but settings should become the
   // durable management surface for review/restore/delete policy.
-
-  // useCallback must be unconditional (React rules of hooks); the early-return
-  // for !loaded sits after the hook calls.
-  const onChange = useCallback(
-    async (mode: ComposerMode) => {
-      const activeSessionId = useSessionStore.getState().activeSessionId;
-      try {
-        await setDefaultMode(mode, activeSessionId);
-      } catch (err) {
-        // Surfaced via writeError -> role="alert" region below.
-        console.error("[preferences] setDefaultMode failed:", err);
-      }
-    },
-    [setDefaultMode],
-  );
 
   const onResetTutorial = useCallback(async () => {
     try {
@@ -85,41 +62,10 @@ export function ComposerPreferencesForm({
     [setShowAdvanced],
   );
 
-  if (!loaded || defaultMode === null) return null;
+  if (!loaded) return null;
 
   return (
     <>
-      <fieldset
-        disabled={writing}
-        aria-busy={writing}
-        className="composer-preferences-fieldset"
-      >
-        <legend className="composer-preferences-legend">
-          Default mode for new sessions
-        </legend>
-        <label className="composer-preferences-option">
-          <Input
-            type="radio"
-            name="composer-default-mode"
-            value="guided"
-            checked={defaultMode === "guided"}
-            disabled={writing}
-            onChange={() => void onChange("guided")}
-          />
-          <span>Guided (recommended)</span>
-        </label>
-        <label className="composer-preferences-option">
-          <Input
-            type="radio"
-            name="composer-default-mode"
-            value="freeform"
-            checked={defaultMode === "freeform"}
-            disabled={writing}
-            onChange={() => void onChange("freeform")}
-          />
-          <span>Freeform</span>
-        </label>
-      </fieldset>
       <fieldset className="composer-preferences-fieldset">
         <legend className="composer-preferences-legend">Theme</legend>
         <label className="composer-preferences-option">
@@ -235,7 +181,7 @@ export function ComposerPreferencesPanel({
   useFocusTrap(
     modalRef,
     true,
-    "input[name='composer-default-mode'][value='guided']",
+    "input[name='composer-theme']",
   );
 
   useEffect(() => {

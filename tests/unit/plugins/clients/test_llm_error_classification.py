@@ -22,6 +22,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     ServerError,
     _classify_llm_error,
 )
+from tests.fixtures.mock_audit import mock_audit_authority
 
 _RETRYABLE_CLASSES = {"rate_limit", "server", "network"}
 
@@ -172,6 +173,7 @@ class TestLLMClientExceptionTypes:
         mock_openai_client.chat.completions.create.side_effect = Exception("429 Rate limit exceeded")
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=mock_execution,
             state_id="test-state",
             run_id="run_abc",
@@ -198,6 +200,7 @@ class TestLLMClientExceptionTypes:
         mock_openai_client.chat.completions.create.side_effect = Exception("400 Bad Request: enumerate at least one item")
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=mock_execution,
             state_id="test-state",
             run_id="run_abc",
@@ -230,6 +233,7 @@ class TestLLMClientExceptionTypes:
         mock_openai_client.chat.completions.create.side_effect = Exception("503 Service Unavailable")
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=mock_execution,
             state_id="test-state",
             run_id="run_abc",
@@ -256,6 +260,7 @@ class TestLLMClientExceptionTypes:
         mock_openai_client.chat.completions.create.side_effect = Exception("Connection timeout")
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=mock_execution,
             state_id="test-state",
             run_id="run_abc",
@@ -282,6 +287,7 @@ class TestLLMClientExceptionTypes:
         mock_openai_client.chat.completions.create.side_effect = Exception("Your request was rejected by our safety system")
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=mock_execution,
             state_id="test-state",
             run_id="run_abc",
@@ -308,6 +314,7 @@ class TestLLMClientExceptionTypes:
         mock_openai_client.chat.completions.create.side_effect = Exception("This model's maximum context length is 8192 tokens")
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=mock_execution,
             state_id="test-state",
             run_id="run_abc",
@@ -334,6 +341,7 @@ class TestLLMClientExceptionTypes:
         mock_openai_client.chat.completions.create.side_effect = Exception("401 Unauthorized: Invalid API key")
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=mock_execution,
             state_id="test-state",
             run_id="run_abc",
@@ -361,6 +369,7 @@ class TestLLMClientExceptionTypes:
         mock_openai_client.chat.completions.create.side_effect = Exception("503 Service Unavailable")
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=mock_execution,
             state_id="test-state",
             run_id="run_abc",
@@ -399,6 +408,17 @@ class TestLLMClientExceptionTypes:
 
 class TestAzureSpecificCodes:
     """Test Azure-specific error codes."""
+
+    @pytest.mark.parametrize(
+        "status_code,message,expected",
+        [
+            (429, "Capacity unavailable", "rate_limit"),
+            (401, "Credential rejected; reference 503", "client"),
+            (400, "content_filter", "content_policy"),
+        ],
+    )
+    def test_azure_status_and_filter_codes(self, status_code: int, message: str, expected: str) -> None:
+        assert _classify_llm_error(_StatusCodeError(message, status_code)) == expected
 
     def test_azure_529_model_overloaded_is_retryable(self) -> None:
         """Azure 529 (model overloaded) should be retryable."""

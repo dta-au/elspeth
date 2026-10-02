@@ -48,6 +48,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any, Final
 
 import rfc8785
@@ -57,10 +58,9 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolRecorder,
     ComposerToolStatus,
+    ToolArgumentErrorCategory,
 )
 from elspeth.contracts.composer_llm_audit import (
-    ComposerChatTurn,
-    ComposerChatTurnRecorder,
     ComposerLLMCall,
     ComposerLLMCallRecorder,
     ComposerLLMCallStatus,
@@ -69,7 +69,8 @@ from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt, Com
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import SchemaViolation, ToolArgumentError
+from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin
 
 __all__ = [
     "BufferingRecorder",
@@ -80,6 +81,7 @@ __all__ = [
     "begin_dispatch_or_arg_error",
     "build_canonicalization_sentinel",
     "canonicalize_pydantic_cause",
+    "canonicalize_schema_violations",
     "dispatch_with_audit",
     "finish_arg_error",
     "finish_cancelled",
@@ -171,15 +173,20 @@ def build_canonicalization_sentinel(
 
     - ``_canonicalization_error`` — exception class name (status quo).
     - ``_canonicalization_detail`` — exception ``str(exc)`` only when
-      ``exc`` is an :class:`rfc8785.CanonicalizationError`. By spec
-      (verified empirically on rfc8785) those messages are
-      type-name or JCS-rule strings such as ``"unsupported type:
-      <class 'X'>"`` or ``"inf is not representable in JCS"`` — they
-      never echo payload values. Other ``ValueError`` / ``TypeError``
-      paths can echo Tier-3 data (e.g. ``core/canonical.py``'s Decimal
-      check interpolates the offending value into its message); for
-      those the detail field is omitted to prevent a Tier-3 leak into
-      the Tier-1 audit row.
+      ``exc`` is exactly the base :class:`rfc8785.CanonicalizationError`,
+      whose three messages are type-name or JCS-rule strings
+      (``"unsupported type: <class 'X'>"``, ``"object keys must be
+      strings"``, ``"input contains non-UTF-8 codepoints"``). Its two
+      subclasses echo the offending value, measured on rfc8785:
+      ``IntegerDomainError`` is ``"<the integer> exceeds safe integer
+      domain for JSON floats"`` and ``FloatDomainError`` is ``"<the
+      float> is not representable in JCS"`` — so for them, as for every
+      other ``ValueError`` / ``TypeError`` (``core/canonical.py``'s
+      Decimal check interpolates the value too), the detail is omitted
+      and the class name in ``_canonicalization_error`` says which rule
+      failed. The payload is the planner's tool arguments or a tool
+      result, which can carry values the planner copied from a user's
+      data, and the sentinel is persisted in the Tier-1 audit row.
     - ``_payload_keys`` — sorted top-level keys of the failed payload
       when it is a Mapping. Keys are schema metadata (names like
       "data", "validation", "version"); values are NOT captured. This
@@ -192,10 +199,11 @@ def build_canonicalization_sentinel(
     structures.
     """
     sentinel: dict[str, object] = {"_canonicalization_error": type(exc).__name__}
-    if isinstance(exc, rfc8785.CanonicalizationError):
-        # Bounded by spec: rfc8785 messages are short and value-free.
-        # The 512-char cap is belt-and-braces against future rfc8785
-        # changes that might inline a longer schema fragment.
+    if type(exc) is rfc8785.CanonicalizationError:
+        # Exactly the base class: its messages are type/rule strings. The
+        # domain subclasses carry the value (see above). The 512-char cap
+        # is belt-and-braces against a future rfc8785 inlining a longer
+        # schema fragment.
         sentinel["_canonicalization_detail"] = str(exc)[:512]
     if isinstance(payload, Mapping):
         sentinel["_payload_keys"] = sorted(str(k) for k in payload)
@@ -205,7 +213,6 @@ def build_canonicalization_sentinel(
 class BufferingRecorder(
     ComposerToolRecorder,
     ComposerLLMCallRecorder,
-    ComposerChatTurnRecorder,
     ComposerPlannerAttemptRecorder,
 ):
     """Append-only in-memory buffer for composer audit records.
@@ -215,7 +222,7 @@ class BufferingRecorder(
     ``SessionServiceProtocol.persist_compose_turn_async`` inside the loop;
     the route-layer ``tool_invocations`` drain is retained only for older
     non-loop carriers. LLM calls, their exact-once semantic planner attempts,
-    and guided chat-turn sidecars still use this buffer as their
+    and withheld replies still use this buffer as their
     route-persisted staging area. All four channels use the same locking
     discipline, and each exposed tuple is an immutable point-in-time snapshot.
 
@@ -228,8 +235,8 @@ class BufferingRecorder(
     def __init__(self) -> None:
         self._invocations: list[ComposerToolInvocation] = []
         self._llm_calls: list[ComposerLLMCall] = []
-        self._chat_turns: list[ComposerChatTurn] = []
         self._planner_attempts: list[ComposerPlannerAttempt] = []
+        self._withheld_replies: list[WithheldReply] = []
         self._lock = threading.Lock()
 
     def record(self, invocation: ComposerToolInvocation) -> None:
@@ -237,23 +244,36 @@ class BufferingRecorder(
             self._invocations.append(invocation)
 
     def record_llm_call(self, call: ComposerLLMCall) -> None:
+        from elspeth.web.composer.provider_quota import retain_provider_audit
+
+        if not retain_provider_audit(call):
+            return
         with self._lock:
             self._llm_calls.append(call)
-
-    def record_chat_turn(self, turn: ComposerChatTurn) -> None:
-        """Append a :class:`ComposerChatTurn` record (Phase A slice 5).
-
-        Persistence to the audit DB is wired by the route handler via
-        the future ``_persist_chat_turns`` helper; this buffer is the
-        in-memory staging area for the request's per-turn records.
-        """
-        with self._lock:
-            self._chat_turns.append(turn)
 
     def record_planner_attempt(self, attempt: ComposerPlannerAttempt) -> None:
         """Append one semantic planner response disposition."""
         with self._lock:
             self._planner_attempts.append(attempt)
+
+    def record_withheld_reply(self, origin: WithheldReplyOrigin, content: str) -> None:
+        """Stage a model reply its producer will not publish.
+
+        For a producer that holds no session write context (the pipeline
+        planner). A blank reply has no words to keep and is not staged; the
+        caller that holds the session persists the rest as
+        ``composer_withheld_reply`` audit rows.
+        """
+        if not content.strip():
+            return
+        with self._lock:
+            self._withheld_replies.append(WithheldReply(origin=origin, content=content))
+
+    @property
+    def withheld_replies(self) -> tuple[WithheldReply, ...]:
+        """Snapshot staged unpublished replies as an immutable tuple."""
+        with self._lock:
+            return tuple(self._withheld_replies)
 
     @property
     def invocations(self) -> tuple[ComposerToolInvocation, ...]:
@@ -266,12 +286,6 @@ class BufferingRecorder(
         """Snapshot the current LLM-call buffer as an immutable tuple."""
         with self._lock:
             return tuple(self._llm_calls)
-
-    @property
-    def chat_turns(self) -> tuple[ComposerChatTurn, ...]:
-        """Snapshot the current chat-turn buffer as an immutable tuple."""
-        with self._lock:
-            return tuple(self._chat_turns)
 
     @property
     def planner_attempts(self) -> tuple[ComposerPlannerAttempt, ...]:
@@ -314,6 +328,7 @@ def audit_envelope(invocation: ComposerToolInvocation) -> dict[str, object]:
 
 
 _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
+    "call_id",
     "model_requested",
     "model_returned",
     "status",
@@ -338,9 +353,13 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "seed",
     "provider_cost",
     "provider_cost_source",
+    "pricing_model",
     "max_completion_tokens_requested",
     "planner_policy_hash",
     "planner_call_ordinal",
+    "provider_served",
+    "tool_contract_dialect",
+    "strict_tool_count",
 )
 
 
@@ -456,11 +475,9 @@ def llm_call_audit_summary(call: ComposerLLMCall) -> str:
     without digging.
 
     Every drain site that persists an LLM-call audit row
-    (``sessions/routes/_helpers._persist_llm_calls``,
-    ``composer/service._persist_pipeline_planner_audit``,
-    ``sessions/guided_audit.prepare_guided_audit_rows``) builds its
-    ``content`` here, so the three rows are the same projection by
-    construction rather than by three hand-copies staying in sync.
+    (``sessions/routes/_helpers._persist_llm_calls`` and
+    ``composer/service._persist_pipeline_planner_audit``) builds its
+    ``content`` here, so both rows are the same projection.
 
     Abnormal finish reasons
     -----------------------
@@ -505,19 +522,6 @@ def llm_call_audit_summary(call: ComposerLLMCall) -> str:
     return json.dumps(summary)
 
 
-def chat_turn_audit_envelope(turn: ComposerChatTurn) -> dict[str, object]:
-    """Wrap a chat turn in the canonical ``tool_calls`` JSON envelope.
-
-    Sibling of :func:`llm_call_audit_envelope`.  The ``_kind`` discriminator
-    distinguishes this from LLM-call audit payloads so a reader of
-    ``chat_messages`` can dispatch on the field without inspecting the body.
-
-    ``turn.to_dict()`` already serialises the enum + datetimes; the envelope
-    just adds the kind tag.
-    """
-    return {"_kind": "chat_turn_audit", "turn": turn.to_dict()}
-
-
 # ---------------------------------------------------------------------------
 # Per-dispatch audit envelope.
 # Hoisted from web/composer/service.py so the helper :func:`dispatch_with_audit`
@@ -540,6 +544,11 @@ class DispatchAudit:
     ``version_before`` regardless of which path the call ultimately
     follows. The branch-specific finalizers (``finish_*``) read fields
     from here to construct the final :class:`ComposerToolInvocation`.
+
+    ``strict_sent`` and ``wire_conformant`` are the wire facts the caller
+    knew before dispatch (see :class:`ComposerToolInvocation`); every
+    finalizer copies them onto the invocation. ``None`` means unknown or not
+    applicable.
     """
 
     tool_call_id: str
@@ -552,6 +561,8 @@ class DispatchAudit:
     actor: str
     authority_arguments_canonical: str | None = None
     authority_arguments_hash: str | None = None
+    strict_sent: bool | None = None
+    wire_conformant: bool | None = None
 
     @property
     def binding_arguments_hash(self) -> str:
@@ -566,6 +577,8 @@ def begin_dispatch(
     *,
     version_before: int,
     actor: str,
+    strict_sent: bool | None = None,
+    wire_conformant: bool | None = None,
 ) -> DispatchAudit:
     """Open a per-call audit envelope.
 
@@ -575,6 +588,10 @@ def begin_dispatch(
     object so the audit trail still records what the LLM tried even
     when it wasn't valid JSON. Truncation guards against unbounded
     audit-row sizes for pathological LLM output.
+
+    ``strict_sent`` / ``wire_conformant`` are the caller's wire facts for
+    this call. Callers that sent no wire schema leave the ``None`` defaults;
+    the compose loop passes them.
     """
     if isinstance(arguments, str):
         # 4 KiB is the same boundary as POSIX PIPE_BUF — a sane upper
@@ -603,6 +620,8 @@ def begin_dispatch(
         actor=actor,
         authority_arguments_canonical=authority_canon,
         authority_arguments_hash=authority_hash,
+        strict_sent=strict_sent,
+        wire_conformant=wire_conformant,
     )
 
 
@@ -613,6 +632,8 @@ def begin_dispatch_or_arg_error(
     *,
     version_before: int,
     actor: str,
+    strict_sent: bool | None = None,
+    wire_conformant: bool | None = None,
 ) -> tuple[DispatchAudit, BaseException | None]:
     """Open an audit envelope without letting malformed args bypass audit.
 
@@ -631,6 +652,8 @@ def begin_dispatch_or_arg_error(
                 arguments,
                 version_before=version_before,
                 actor=actor,
+                strict_sent=strict_sent,
+                wire_conformant=wire_conformant,
             ),
             None,
         )
@@ -654,6 +677,8 @@ def begin_dispatch_or_arg_error(
                 started_at=datetime.now(UTC),
                 started_ns=time.monotonic_ns(),
                 actor=actor,
+                strict_sent=strict_sent,
+                wire_conformant=wire_conformant,
             ),
             exc,
         )
@@ -756,6 +781,8 @@ def finish_success(
         cache_hit=cache_hit,
         authority_arguments_canonical=audit.authority_arguments_canonical,
         authority_arguments_hash=audit.authority_arguments_hash,
+        strict_sent=audit.strict_sent,
+        wire_conformant=audit.wire_conformant,
     )
 
 
@@ -763,10 +790,15 @@ def finish_arg_error(
     audit: DispatchAudit,
     *,
     error_class: str,
+    error_category: ToolArgumentErrorCategory,
     error_message: str,
     error_payload: Mapping[str, Any] | None = None,
 ) -> ComposerToolInvocation:
     """Build an ARG_ERROR invocation record.
+
+    ``error_class`` is the name of the exception class raised (or
+    constructed) at the calling site; ``error_category`` is its closed
+    :class:`ToolArgumentErrorCategory`.
 
     ``error_message`` is already-redacted at the dispatch boundary —
     callers MUST pass safe-by-construction text (``ToolArgumentError.args[0]``,
@@ -802,6 +834,9 @@ def finish_arg_error(
         actor=audit.actor,
         authority_arguments_canonical=audit.authority_arguments_canonical,
         authority_arguments_hash=audit.authority_arguments_hash,
+        strict_sent=audit.strict_sent,
+        wire_conformant=audit.wire_conformant,
+        error_category=error_category,
     )
 
 
@@ -838,6 +873,8 @@ def finish_cancelled(
         actor=audit.actor,
         authority_arguments_canonical=audit.authority_arguments_canonical,
         authority_arguments_hash=audit.authority_arguments_hash,
+        strict_sent=audit.strict_sent,
+        wire_conformant=audit.wire_conformant,
     )
 
 
@@ -882,6 +919,8 @@ def finish_plugin_crash(
         actor=audit.actor,
         authority_arguments_canonical=audit.authority_arguments_canonical,
         authority_arguments_hash=audit.authority_arguments_hash,
+        strict_sent=audit.strict_sent,
+        wire_conformant=audit.wire_conformant,
     )
 
 
@@ -1118,7 +1157,8 @@ async def dispatch_with_audit(
             recorder.record(
                 finish_arg_error(
                     audit,
-                    error_class="ToolArgumentError",
+                    error_class=type(arg_error_exc).__name__,
+                    error_category=arg_error_exc.category,
                     error_message=str(safe_message),
                     error_payload=arg_error_payload,
                 )
@@ -1213,6 +1253,20 @@ _SAFE_PYDANTIC_CAUSE_LOC_FIELDS = frozenset(
         "user_term",
     }
 )
+# The fixed message per closed validation code. Shared by the pydantic
+# canonicaliser below and the S-gate violation renderer, so the model reads
+# one vocabulary whichever gate rejected the call.
+VALIDATION_ERROR_MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "invalid": "Validation failed",
+        "invalid_choice": "Value is not an allowed choice",
+        "invalid_type": "Value has invalid type",
+        "invalid_value": "Value is invalid",
+        "missing": "Required value is missing",
+        "out_of_bounds": "Value is outside allowed bounds",
+        "unexpected": "Unexpected value",
+    }
+)
 
 
 def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any]] | None:
@@ -1277,15 +1331,6 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
     raw_errors = exc.errors()
     if not raw_errors:
         return None
-    type_messages = {
-        "invalid": "Validation failed",
-        "invalid_choice": "Value is not an allowed choice",
-        "invalid_type": "Value has invalid type",
-        "invalid_value": "Value is invalid",
-        "missing": "Required value is missing",
-        "out_of_bounds": "Value is outside allowed bounds",
-        "unexpected": "Unexpected value",
-    }
 
     def error_code(raw_type: object) -> str:
         value = raw_type if type(raw_type) is str and len(raw_type) <= 128 else ""
@@ -1321,8 +1366,36 @@ def canonicalize_pydantic_cause(exc: BaseException | None) -> list[dict[str, Any
         canonicalized.append(
             {
                 "loc": loc,
-                "msg": type_messages[code],
+                "msg": VALIDATION_ERROR_MESSAGES[code],
                 "type": code,
             }
         )
     return canonicalized
+
+
+def canonicalize_schema_violations(violations: tuple[SchemaViolation, ...]) -> list[dict[str, Any]] | None:
+    """Render S-gate violations in the pydantic canonicaliser's shape (S1 T9).
+
+    The violations are already closed (owned ``SchemaViolation``: declared
+    names or generic tokens, a closed code), so this only applies the same
+    eight-error cap and fixed messages as :func:`canonicalize_pydantic_cause`.
+    ``()`` → ``None``: the absence of ``validation_errors`` is the signal.
+    """
+    if not violations:
+        return None
+    if len(violations) > _MAX_PYDANTIC_CAUSE_ERRORS:
+        return [
+            {
+                "loc": [],
+                "msg": f"Validation produced more than {_MAX_PYDANTIC_CAUSE_ERRORS} errors",
+                "type": "truncated",
+            }
+        ]
+    return [
+        {
+            "loc": list(violation.loc),
+            "msg": VALIDATION_ERROR_MESSAGES[violation.code.value],
+            "type": violation.code.value,
+        }
+        for violation in violations
+    ]

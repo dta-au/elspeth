@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import time
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -10,17 +12,21 @@ import httpx
 import pytest
 import respx
 
+import elspeth.plugins.transforms.azure.document_intelligence as document_intelligence_module
 from elspeth.contracts import CallType, Determinism
 from elspeth.contracts.call_data import HTTPCallResponse
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.engine.executors.declared_output_types import verify_produced_output_types
 from elspeth.plugins.infrastructure.clients.http import HTTPResponseBodyTooLargeError
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms.azure.document_intelligence import (
     AzureDocumentIntelligence,
     AzureDocumentIntelligenceConfig,
 )
+from tests.fixtures.factories import make_context
 
 _ENDPOINT = "https://test.cognitiveservices.azure.com"
 OP = f"{_ENDPOINT}/documentintelligence/documentModels/prebuilt-layout/analyzeResults/abc?api-version=2024-11-30"
@@ -300,7 +306,7 @@ def test_get_http_client_builds_real_client_with_header_and_cap() -> None:
     t = _transform()
     t._recorder = Mock(spec_set=ExecutionRepository)
     t._run_id = "run-1"
-    client = t._get_http_client("state-1")
+    client = t._get_http_client("state-1", ctx=make_context(run_id="run-1"))
     try:
         assert client._default_headers["Ocp-Apim-Subscription-Key"] == "k"
         assert client._max_response_body_bytes == 50_000_000
@@ -376,7 +382,7 @@ def _run_with_fake(t: AzureDocumentIntelligence, fake: _FakeClient, row: Pipelin
     with t._http_clients_lock:
         t._http_clients["s1"] = fake
     try:
-        return t._process_single_with_state(row, "s1", token_id=None)
+        return t._process_single_with_state(row, "s1", ctx=make_context(), token_id=None)
     finally:
         with t._http_clients_lock:
             t._http_clients.pop("s1", None)
@@ -405,6 +411,15 @@ def test_lro_happy_path_enriches() -> None:
     assert out["di_tables"] == [{"rowCount": 2}]
     assert out["di_pages"] == 2
     assert out["doc_url"] == "https://x/y.pdf"
+    # ADR-050: the content and page count carry the plugin's concrete types and
+    # the engine's value check passes on the real emission; a facet list is ``any``.
+    declared = {name: contract.python_type for name, contract in t._stamped_output_field_contracts().items()}
+    assert {name: declared[name] for name in ("di_content", "di_pages", "di_tables")} == {
+        "di_content": str,
+        "di_pages": int,
+        "di_tables": object,
+    }
+    verify_produced_output_types(transform=t, input_row=_row(), emitted_rows=[result.row])
 
 
 def test_success_reason_metadata() -> None:
@@ -527,7 +542,86 @@ def test_poll_timeout() -> None:
     t = _t_for_lro()
     t._poll_timeout_seconds = -1.0  # force immediate timeout on first running poll
     result = _run_with_fake(t, _FakeClient(_post_202(), [_Resp(200, body={"status": "running"})]))
+    assert isinstance(result, TransformResult)
     assert result.reason["reason"] == "poll_timeout"
+
+
+def test_poll_deadline_expired_before_get_does_not_accept_success() -> None:
+    t = _t_for_lro(poll_timeout_seconds=1.0)
+    fake = _FakeClient(_post_202(), [_Resp(200, body={"status": "succeeded", "analyzeResult": {"content": "late"}})])
+    with t._http_clients_lock:
+        t._http_clients["s1"] = fake
+    try:
+        result = t._poll(
+            OP,
+            "s1",
+            token_id=None,
+            ctx=make_context(),
+            retry_after=None,
+            capacity_deadline=time.monotonic() + 10,
+            started_at=time.monotonic() - 2,
+        )
+    finally:
+        with t._http_clients_lock:
+            t._http_clients.pop("s1", None)
+
+    assert isinstance(result, TransformResult)
+    assert result.reason["reason"] == "poll_timeout"
+    assert fake.get_calls == 0
+
+
+def test_poll_deadline_expired_during_get_does_not_accept_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    t = _t_for_lro(poll_timeout_seconds=1.0)
+    clock = [0.0]
+
+    class _SlowGetClient(_FakeClient):
+        def get(self, url: str, *, timeout: float | None = None) -> Any:
+            clock[0] = 2.0
+            return super().get(url, timeout=timeout)
+
+    fake = _SlowGetClient(_post_202(), [_Resp(200, body={"status": "succeeded", "analyzeResult": {"content": "late"}})])
+    with t._http_clients_lock:
+        t._http_clients["s1"] = fake
+    ctx = make_context()
+    monkeypatch.setattr(document_intelligence_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    try:
+        result = t._poll(OP, "s1", token_id=None, ctx=ctx, retry_after=None, capacity_deadline=10.0, started_at=0.0)
+    finally:
+        with t._http_clients_lock:
+            t._http_clients.pop("s1", None)
+
+    assert isinstance(result, TransformResult)
+    assert result.reason["reason"] == "poll_timeout"
+    assert fake.get_calls == 1
+
+
+@pytest.mark.parametrize(("retry_after", "expected_wait"), [(None, 1.0), (3.0, 3.0), (20.0, 20.0)])
+def test_first_poll_waits_for_interval_or_retry_after(
+    monkeypatch: pytest.MonkeyPatch, retry_after: float | None, expected_wait: float
+) -> None:
+    t = _t_for_lro(poll_interval_seconds=1.0, poll_timeout_seconds=30.0)
+    fake = _FakeClient(_post_202(), [_Resp(200, body={"status": "succeeded", "analyzeResult": {"content": "ok"}})])
+    with t._http_clients_lock:
+        t._http_clients["s1"] = fake
+    clock = [0.0]
+    waits: list[float] = []
+
+    def wait(timeout: float) -> bool:
+        waits.append(timeout)
+        clock[0] += timeout
+        return False
+
+    monkeypatch.setattr(document_intelligence_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(t._shutdown, "wait", wait)
+    try:
+        result = t._poll(OP, "s1", token_id=None, ctx=make_context(), retry_after=retry_after, capacity_deadline=30.0, started_at=0.0)
+    finally:
+        with t._http_clients_lock:
+            t._http_clients.pop("s1", None)
+
+    assert result == {"content": "ok"}
+    assert waits == [expected_wait]
+    assert fake.get_calls == 1
 
 
 def test_malformed_unknown_status() -> None:
@@ -695,7 +789,7 @@ def test_real_client_streaming_lro_sends_apikey_and_overload() -> None:
         return_value=httpx.Response(200, json={"status": "succeeded", "analyzeResult": {"content": "# Real", "tables": [{"rowCount": 1}]}})
     )
 
-    result = t._process_single_with_state(_row(), "s-real", token_id=None)
+    result = t._process_single_with_state(_row(), "s-real", ctx=make_context(run_id="run-1"), token_id=None)
     try:
         assert result.status == "success"
         out = result.row.to_dict()

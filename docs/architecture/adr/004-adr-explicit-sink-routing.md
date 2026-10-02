@@ -26,7 +26,7 @@ Transforms can explicitly route errors but have no mechanism to explicitly route
 
 2. **Four special-case wiring blocks in dag.py.** The DAG construction has separate code paths for: last-gate continue route (lines 772-778), no-gates final edge (784-785), and coalesce terminal (828-834, duplicated). Each is a special case because the system can't express "where does this transform's output go?"
 
-3. **~40 references across 6 core files** with fallback chains like `result.token.branch_name or default_sink_name` and `if sink_name not in pending_tokens: sink_name = default_sink_name`.
+3. **~40 references across 6 core files** with fallback chains like `result.token.branch_name or default_sink_name` and `if sink_name not in pending_tokens: sink_name = default_sink_name`. As worded, that figure describes the references that sit in fallback chains; the `default_sink` Refs column in §Quantified Blast Radius counts every `default_sink` reference in the same six files (see the note there).
 
 4. **`branch_name` conflation.** The fallback `result.token.branch_name or default_sink_name` in `aggregation.py` confuses lineage identity ("which fork path did this token traverse?") with routing destination ("where should this token go?"). A fork branch named "analytics" silently routes to a sink named "analytics" if one exists — even if that wasn't intended. This is an implicit name-coupling bug.
 
@@ -176,6 +176,18 @@ transforms:
 
 ### Quantified Blast Radius
 
+**Note on the two source-code figures (recorded 2026-09-11):** the
+`default_sink` Refs column below counts every `default_sink` reference, while
+the "~40 references across 6 core files" in §Problems with default_sink item 3
+describes only the fallback-chain subset of those. Both figures were written
+into this ADR by commit `0769a69c6` (2026-02-09) and neither is re-derived
+here. A control on the total: at the parent of that commit, `default_sink`
+appears 66 times — occurrences, not matching lines — across exactly those 6
+source files, which is consistent with this column's reading. The
+fallback-chain subset was not reproduced, so the ~40 stands as the author
+recorded it, and the reading above is a reading of the wording, not a
+re-measurement.
+
 | Area | Files | `default_sink` Refs | Mechanical? |
 |------|-------|---------------------|-------------|
 | Source code | 6 | 63 | Mostly — `aggregation.py` (14 refs with branch_name fallback) needs manual review |
@@ -253,7 +265,7 @@ The P2-2026-01-21 `exponential_base` bug showed the risk: a Settings field added
 
 ### Atomic Change (No Phased Rollout)
 
-Per CLAUDE.md's No Legacy Code Policy: "WE HAVE NO USERS YET." A phased rollout triples implementation effort and introduces a dual-path routing period (Phase 2) that recreates the exact Shifting the Burden pattern this ADR eliminates. The phased rollout's fallback logic is the most bug-prone part of the entire change.
+Per the No Legacy Code Policy (CONTRIBUTING.md §Code Standards), whose compensating control at the time was "we have no users": a phased rollout triples implementation effort and introduces a dual-path routing period (Phase 2) that recreates the exact Shifting the Burden pattern this ADR eliminates. The phased rollout's fallback logic is the most bug-prone part of the entire change.
 
 **Do it atomically in one commit.** Add `on_success`, remove `default_sink`, update all tests and examples.
 

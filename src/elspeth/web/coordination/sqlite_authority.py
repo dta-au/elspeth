@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Connection, Engine
 
+from elspeth.web.coordination.approval_authority import ApprovalSupersession, refuse_unrecorded_approval_supersession
+from elspeth.web.coordination.quota_authority import QuotaExceeded, refuse_unrecorded_quota_exceeded
 from elspeth.web.coordination.repository import _SessionOperationAuthorityRepository
 from elspeth.web.sessions.locking import locked_session_transaction
 
@@ -24,10 +27,20 @@ class SQLiteLocalSessionOperationAuthority(_SessionOperationAuthorityRepository)
     owner identity.
     """
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+        approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
+    ) -> None:
         if engine.dialect.name != "sqlite":
             raise ValueError("SQLiteLocalSessionOperationAuthority requires SQLite")
-        super().__init__(engine)
+        super().__init__(
+            engine,
+            quota_exceeded_recorder=quota_exceeded_recorder,
+            approval_supersession_recorder=approval_supersession_recorder,
+        )
 
     @contextmanager
     def _locked_transaction(self, session_id: str) -> Iterator[Connection]:

@@ -83,10 +83,26 @@ def rasterize_document(request: RasterizeRequest) -> RasterizeOutcome:
         scale = request.dpi / _POINTS_PER_INCH
         rendered: list[RenderedPage] = []
         refused: list[RefusedPage] = []
+        total_bytes = 0
         for index in range(page_count):
             page_number = index + 1
             outcome = _render_page(document, index, page_number, scale, request)
             if isinstance(outcome, RenderedPage):  # ADR-032: nominal isinstance against an ELSPETH-owned dataclass
+                total_bytes += outcome.size_bytes
+                if total_bytes > request.max_total_bytes:
+                    # Release partial output before returning across the process
+                    # boundary; the parent's eventual directory cleanup is not an
+                    # adequate aggregate disk-space control.
+                    outcome.png_path.unlink(missing_ok=True)
+                    for page in rendered:
+                        page.png_path.unlink(missing_ok=True)
+                    return DocumentRefusal(
+                        kind=DocumentRefusalKind.OVERSIZE_OUTPUT,
+                        detail=(
+                            f"rendered output exceeds max_total_bytes={request.max_total_bytes} at page {page_number} ({total_bytes} bytes)"
+                        ),
+                        page_count=page_count,
+                    )
                 rendered.append(outcome)
             else:
                 refused.append(outcome)

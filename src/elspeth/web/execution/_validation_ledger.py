@@ -20,14 +20,14 @@ from elspeth.web.execution.schemas import (
     ValidationWarning,
 )
 
-_CORE_CHECK_COUNT: Final = 24
+_CORE_CHECK_COUNT: Final = 23
 _SCHEMA_CHECK_INDEX = VALIDATION_BLOCKING_CHECK_NAMES.index(RUNTIME_CHECK_SCHEMA_COMPATIBILITY)
 CORE_VALIDATION_CHECK_NAMES: Final[tuple[ValidationCheckName, ...]] = VALIDATION_BLOCKING_CHECK_NAMES[: _SCHEMA_CHECK_INDEX + 1]
 ADVISORY_VALIDATION_CHECK_NAMES: Final[frozenset[ValidationCheckName]] = frozenset(VALIDATION_CHECK_NAMES) - frozenset(
     VALIDATION_BLOCKING_CHECK_NAMES
 )
 if len(CORE_VALIDATION_CHECK_NAMES) != _CORE_CHECK_COUNT:
-    raise AssertionError("core validation checks must be the 24-name canonical prefix through schema_compatibility")
+    raise AssertionError("core validation checks must be the 23-name canonical prefix through schema_compatibility")
 
 
 @dataclass(slots=True)
@@ -57,7 +57,7 @@ class ValidationLedger:
         """Record one registered successful advisory after all core checks."""
         self._ensure_open()
         if self._core_count != len(CORE_VALIDATION_CHECK_NAMES):
-            raise RuntimeError("advisories require all 24 core checks to pass first")
+            raise RuntimeError("advisories require all 23 core checks to pass first")
         if check.name not in ADVISORY_VALIDATION_CHECK_NAMES:
             raise RuntimeError(f"{check.name} is not a registered advisory check")
         if not check.passed:
@@ -119,7 +119,7 @@ class ValidationLedger:
         """Build a successful result after the complete core prefix and advisories."""
         self._ensure_open()
         if self._core_count != len(CORE_VALIDATION_CHECK_NAMES):
-            raise RuntimeError("successful validation requires all 24 core checks to pass")
+            raise RuntimeError("successful validation requires all 23 core checks to pass")
         if not (readiness.authoring_valid and readiness.execution_ready and readiness.completion_ready) or readiness.blockers:
             raise RuntimeError("successful readiness requires all readiness axes true and no blockers")
         result = ValidationResult(

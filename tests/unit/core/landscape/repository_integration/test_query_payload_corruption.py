@@ -6,6 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from tests.fixtures.landscape import leader_coordination_token
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.errors import AuditIntegrityError
@@ -22,15 +23,15 @@ def _record_row_with_payload(tmp_path: Path) -> tuple[RecorderFactory, str, str,
     factory = RecorderFactory(LandscapeDB.in_memory(), payload_store=payload_store)
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
     source = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
         plugin_name="csv_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
         config={},
         schema_config=_DYNAMIC_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    row, _ = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run.run_id),
         source_node_id=source.node_id,
         row_index=0,
         data={"field": "value", "number": 42},

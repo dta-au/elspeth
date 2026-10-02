@@ -19,28 +19,67 @@ shared across expanded children. Same reasoning as fork_token - without
 this, mutations in one sibling leak to others, corrupting audit trail.
 Bug: P2-2026-01-21-expand-token-shared-row-data"
 
-These property tests prove the deepcopy fix works for ALL possible
-nested data structures, not just the specific case that triggered the bug.
+These property tests exercise generated nested data structures. They check
+distinct row wrappers and the live containers' deep immutability; sharing
+immutable nested values is safe. Identity checks on to_dict() results cannot
+prove isolation because each call constructs a fresh mutable graph.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
-from hypothesis import given, settings
+import pytest
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
-from elspeth.contracts import TokenInfo
+from elspeth.contracts import TokenInfo, schema_contract
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.engine.tokens import TokenManager
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
 from tests.strategies.ids import multiple_branches
 from tests.strategies.json import row_data
 from tests.strategies.mutable import deeply_nested_data, mutable_nested_data
+
+
+class _AdmittedTokenAuthority:
+    """Give isolation-only repository doubles a real admitted parent claim."""
+
+    @pytest.fixture(autouse=True)
+    def _admit_parent(self):
+        setup = make_recorder_with_run(run_id="test_run_1")
+        authority = leader_coordination_token(setup.factory, setup.run_id)
+        node_id = register_test_node(setup.data_flow, setup.run_id, "node_fork")
+        row, token = setup.data_flow.create_row_with_token(
+            coordination_token=authority,
+            source_node_id=setup.source_node_id,
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            row_id="row_1",
+            token_id="parent_1",
+            data={},
+        )
+        self.member_token = authority.membership
+        self.work_item = setup.factory.scheduler.enqueue_ready_claimed(
+            member_token=self.member_token,
+            token_id=token.token_id,
+            row_id=row.row_id,
+            node_id=node_id,
+            step_index=1,
+            ingest_sequence=0,
+            row_payload_json=setup.factory.scheduler.serialize_row_payload(_wrap_dict_as_pipeline_row({})),
+            lease_owner=self.member_token.worker_id,
+            lease_seconds=300,
+        )
+        yield
+        setup.db.close()
 
 
 def _make_observed_contract() -> SchemaContract:
@@ -51,6 +90,22 @@ def _make_observed_contract() -> SchemaContract:
 def _wrap_dict_as_pipeline_row(data: dict[str, Any]) -> PipelineRow:
     """Wrap dict as PipelineRow with OBSERVED contract for property tests."""
     return PipelineRow(data, _make_observed_contract())
+
+
+def _assert_live_nested_frozen(value: Any, expected: Any, path: str) -> None:
+    """Inspect live row values, never a freshly thawed to_dict() copy."""
+    if isinstance(expected, dict):
+        assert isinstance(value, MappingProxyType), f"Live nested mapping at {path} is mutable"
+        assert value.keys() == expected.keys(), f"Live nested keys differ at {path}"
+        for key in expected:
+            _assert_live_nested_frozen(value[key], expected[key], f"{path}.{key}")
+    elif isinstance(expected, list):
+        assert isinstance(value, tuple), f"Live nested list at {path} is mutable"
+        assert len(value) == len(expected), f"Live nested lengths differ at {path}"
+        for index, (actual_item, expected_item) in enumerate(zip(value, expected, strict=True)):
+            _assert_live_nested_frozen(actual_item, expected_item, f"{path}[{index}]")
+    else:
+        assert value == expected, f"Live nested value differs at {path}"
 
 
 @dataclass(frozen=True)
@@ -109,7 +164,7 @@ def _create_fake_recorder(branches: list[str]) -> _RecordingTokenRepository:
     return _RecordingTokenRepository(branches=branches)
 
 
-class TestForkIsolationProperties:
+class TestForkIsolationProperties(_AdmittedTokenAuthority):
     """Property tests for data isolation during fork operations."""
 
     @given(
@@ -138,8 +193,9 @@ class TestForkIsolationProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         assert len(children) == len(branches), "Wrong number of children"
@@ -165,6 +221,7 @@ class TestForkIsolationProperties:
         branches=multiple_branches,
     )
     @settings(max_examples=100)
+    @example(row_data={"nested": [{"leaf": [1]}]}, branches=["left", "right"])
     def test_fork_isolates_deeply_nested_data(self, row_data: Any, branches: list[str]) -> None:
         """Property: Deep nesting doesn't break isolation.
 
@@ -188,8 +245,9 @@ class TestForkIsolationProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         # Verify each child has independent PipelineRow instances
@@ -208,34 +266,14 @@ class TestForkIsolationProperties:
                 f"Deep nesting test: Child {i} has different data! Expected {expected_data!r}, got {actual_data!r}"
             )
 
-        # Additionally verify that the underlying data dict is NOT shared
-        # (even though PipelineRow is immutable, the dict inside should be independent)
-        # This ensures deep copying happened correctly
-        if len(children) >= 2:
-            # Get the internal data dicts (they should be different instances)
-            data_0 = children[0].row_data.to_dict()
-            data_1 = children[1].row_data.to_dict()
-            # They should be equal in value but not the same object
-            assert data_0 == data_1, "Children should have equal data"
-
-            # For mutable nested structures, verify they're independent copies
-            def check_independent_nested(obj1: Any, obj2: Any, path: str = "") -> None:
-                """Recursively verify nested mutable objects are independent."""
-                if isinstance(obj1, dict) and isinstance(obj2, dict):
-                    for key in obj1:
-                        if key in obj2:
-                            check_independent_nested(obj1[key], obj2[key], f"{path}.{key}")
-                elif isinstance(obj1, list) and isinstance(obj2, list):
-                    for idx in range(min(len(obj1), len(obj2))):
-                        check_independent_nested(obj1[idx], obj2[idx], f"{path}[{idx}]")
-                elif isinstance(obj1, (dict, list)):
-                    # Both are mutable - they must be different objects
-                    assert obj1 is not obj2, f"Mutable objects at {path} are shared!"
-
-            check_independent_nested(data_0, data_1)
+        # Frozen nested values may safely share identity. Mutable containers
+        # anywhere in a live child's graph would break the isolation contract.
+        for child in children:
+            for key, expected in row_data.items():
+                _assert_live_nested_frozen(child.row_data[key], expected, key)
 
 
-class TestForkParentPreservationProperties:
+class TestForkParentPreservationProperties(_AdmittedTokenAuthority):
     """Property tests for parent preservation during fork."""
 
     @given(
@@ -266,8 +304,9 @@ class TestForkParentPreservationProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         # Verify parent's PipelineRow is not shared with any child
@@ -310,8 +349,9 @@ class TestForkParentPreservationProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         # Verify each child
@@ -331,7 +371,7 @@ class TestForkParentPreservationProperties:
             assert child.fork_group_id is not None, f"Child {i} missing fork_group_id"
 
 
-class TestForkRowDataOverrideProperties:
+class TestForkRowDataOverrideProperties(_AdmittedTokenAuthority):
     """Property tests for row_data override during fork."""
 
     @given(
@@ -340,6 +380,8 @@ class TestForkRowDataOverrideProperties:
         branches=multiple_branches,
     )
     @settings(max_examples=100)
+    @example(original_data={"value": "parent"}, override_data={"value": "override"}, branches=["left", "right"])
+    @example(original_data={"nested": [{"value": 1}]}, override_data={"nested": [{"value": 2}]}, branches=["left", "right"])
     def test_fork_with_override_uses_override(
         self,
         original_data: dict[str, Any],
@@ -363,15 +405,16 @@ class TestForkRowDataOverrideProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
             row_data=_wrap_dict_as_pipeline_row(override_data),  # Explicit override
         )
 
         # Children should have override data, not parent data
+        assert len(children) == len(branches), "Wrong number of override children"
         for child in children:
-            # Compare structure (values may be copied)
-            assert set(child.row_data.keys()) == set(override_data.keys()), "Child doesn't have override data keys"
+            assert child.row_data.to_dict() == override_data, "Child doesn't have override data values"
 
     @given(
         original_data=mutable_nested_data,
@@ -401,8 +444,9 @@ class TestForkRowDataOverrideProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
             # No row_data override
         )
 
@@ -451,7 +495,7 @@ def _create_fake_recorder_for_expand(count: int) -> _RecordingTokenRepository:
 # =============================================================================
 
 
-class TestExpandIsolationProperties:
+class TestExpandIsolationProperties(_AdmittedTokenAuthority):
     """Property tests for data isolation during expand operations.
 
     Mirrors TestForkIsolationProperties but exercises the expand_token
@@ -483,7 +527,7 @@ class TestExpandIsolationProperties:
             expanded_rows=expanded_rows,
             output_contract=output_contract,
             node_id=NodeID("node_expand"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         assert len(children) == count, f"Wrong number of children: {len(children)} != {count}"
@@ -503,6 +547,7 @@ class TestExpandIsolationProperties:
 
     @given(row_data=deeply_nested_data, count=st.integers(min_value=2, max_value=4))
     @settings(max_examples=100)
+    @example(row_data={"nested": [{"leaf": [1]}]}, count=2)
     def test_expand_isolates_deeply_nested_data(self, row_data: Any, count: int) -> None:
         """Property: Deep nesting doesn't break expand isolation.
 
@@ -528,7 +573,7 @@ class TestExpandIsolationProperties:
             expanded_rows=expanded_rows,
             output_contract=output_contract,
             node_id=NodeID("node_expand"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         # Verify each child has independent PipelineRow instances
@@ -536,28 +581,13 @@ class TestExpandIsolationProperties:
             for j in range(i + 1, len(children)):
                 assert children[i].row_data is not children[j].row_data, f"Deep nesting: Expanded children {i} and {j} share PipelineRow!"
 
-        # Verify underlying data dicts are independent copies
-        if len(children) >= 2:
-            data_0 = children[0].row_data.to_dict()
-            data_1 = children[1].row_data.to_dict()
-            assert data_0 == data_1, "Expanded children should have equal data"
-
-            def check_independent_nested(obj1: Any, obj2: Any, path: str = "") -> None:
-                """Recursively verify nested mutable objects are independent."""
-                if isinstance(obj1, dict) and isinstance(obj2, dict):
-                    for key in obj1:
-                        if key in obj2:
-                            check_independent_nested(obj1[key], obj2[key], f"{path}.{key}")
-                elif isinstance(obj1, list) and isinstance(obj2, list):
-                    for idx in range(min(len(obj1), len(obj2))):
-                        check_independent_nested(obj1[idx], obj2[idx], f"{path}[{idx}]")
-                elif isinstance(obj1, (dict, list)):
-                    assert obj1 is not obj2, f"Mutable objects at {path} are shared!"
-
-            check_independent_nested(data_0, data_1)
+        for child in children:
+            assert child.row_data.to_dict() == row_data, "Expanded children should retain the input data"
+            for key, expected in row_data.items():
+                _assert_live_nested_frozen(child.row_data[key], expected, key)
 
 
-class TestExpandParentPreservationProperties:
+class TestExpandParentPreservationProperties(_AdmittedTokenAuthority):
     """Property tests for parent preservation during expand."""
 
     @given(row_data=mutable_nested_data, count=st.integers(min_value=2, max_value=5))
@@ -586,7 +616,7 @@ class TestExpandParentPreservationProperties:
             expanded_rows=expanded_rows,
             output_contract=output_contract,
             node_id=NodeID("node_expand"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         # Verify parent's PipelineRow is not shared with any child
@@ -625,7 +655,7 @@ class TestExpandParentPreservationProperties:
             expanded_rows=expanded_rows,
             output_contract=output_contract,
             node_id=NodeID("node_expand"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         seen_token_ids = set()
@@ -674,7 +704,41 @@ class TestExpandParentPreservationProperties:
                 expanded_rows=expanded_rows,
                 output_contract=unlocked_contract,
                 node_id=NodeID("node_expand"),
-                run_id="test_run_1",
+                member_token=self.member_token,
             )
 
         assert not mock_recorder.expand_called
+
+
+class TestNestedIsolationNegativeControls(_AdmittedTokenAuthority):
+    """The deep-isolation properties must reject a shallow-freeze regression."""
+
+    @pytest.mark.parametrize("operation", ["fork", "expand"])
+    @pytest.mark.parametrize("nested", [{"nested": [{"leaf": [1]}]}, {"nested": {"leaf": [1]}}], ids=["list", "dict"])
+    def test_properties_reject_mutable_nested_containers(
+        self, monkeypatch: pytest.MonkeyPatch, operation: str, nested: dict[str, Any]
+    ) -> None:
+        monkeypatch.setattr(schema_contract, "deep_freeze", MappingProxyType)
+        with pytest.raises(AssertionError, match="Live nested"):
+            if operation == "fork":
+                TestForkIsolationProperties.test_fork_isolates_deeply_nested_data.hypothesis.inner_test(
+                    self, row_data=nested, branches=["left", "right"]
+                )
+            else:
+                TestExpandIsolationProperties.test_expand_isolates_deeply_nested_data.hypothesis.inner_test(self, row_data=nested, count=2)
+
+
+class TestOverrideNegativeControl(_AdmittedTokenAuthority):
+    def test_override_property_rejects_wrong_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        original_fork = TokenManager.fork_token
+
+        def corrupt_override(manager: TokenManager, **kwargs: Any) -> Any:
+            override = kwargs["row_data"]
+            kwargs["row_data"] = PipelineRow(dict.fromkeys(override.keys()), override.contract)
+            return original_fork(manager, **kwargs)
+
+        monkeypatch.setattr(TokenManager, "fork_token", corrupt_override)
+        with pytest.raises(AssertionError, match="override data values"):
+            TestForkRowDataOverrideProperties.test_fork_with_override_uses_override.hypothesis.inner_test(
+                self, original_data={"value": "parent"}, override_data={"value": "override"}, branches=["left", "right"]
+            )

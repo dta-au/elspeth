@@ -37,15 +37,17 @@ from typing import TYPE_CHECKING
 from elspeth.contracts import RowResult, TokenInfo, TransformProtocol
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierScalars, CoalescePendingScalars
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import BatchStatus, FrameKind, GroupSettlementReason, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.identity import LineageFrame, innermost_own_frame, path_fork_group_id
-from elspeth.contracts.results import FailureInfo
+from elspeth.contracts.results import FailureInfo, failed_barrier_group_results
 from elspeth.contracts.scheduler import BatchMembershipSpec, BufferedOutcomeSpec, GroupLossSpec, TokenWorkItem
 from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
-from elspeth.core.dag.group_bindings import GroupBinding, GroupBindingRegistry
+from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
+from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
 from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.scheduler_repository import GroupLoss, token_from_journal_item
 from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
@@ -56,20 +58,19 @@ if TYPE_CHECKING:
         CommittedAggregationOutputReceipt,
         CommittedAggregationResidual,
         CommittedCoalesceResidual,
+        RecordedAggregationFailure,
     )
-    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.core.config import AggregationSettings
     from elspeth.core.landscape.data_flow_repository import DataFlowRepository
     from elspeth.core.landscape.execution_repository import ExecutionRepository
-    from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
     from elspeth.engine.clock import Clock
     from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
     from elspeth.engine.dag_navigator import DAGNavigator
     from elspeth.engine.executors import AggregationExecutor
     from elspeth.engine.executors.collector import CollectorExecutor, CollectorOutcome
-    from elspeth.engine.processor import CollectorRelease, _PreparedAggregationRoute
+    from elspeth.engine.processor import CollectorRelease, _FailedFlushDisposition, _PreparedAggregationRoute
     from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome, RowUnionRestoreEntry
 
 logger = logging.getLogger(__name__)
@@ -89,13 +90,18 @@ GROUP_FAILED_REASON = "group_failed"
 class _LiveBarrierHold:
     """In-memory companion of one durable BLOCKED barrier hold (ADR-030 §E.2).
 
-    Stashed by the processor at the moment a claimed token is about to block
-    at a barrier (aggregation buffering / coalesce hold) and consumed by the
-    next drain iteration's journal-first intake: the LIVE token preserves the
-    exact post-transform payload and resume provenance the old in-claim accept
-    used (N=1 parity). Inherited rows with no stash entry (leader takeover)
-    fall back to journal rehydration with audit-derived attempt offsets —
-    the same semantics as the restore path.
+    Recorded by the processor (``RowProcessor._record_barrier_arrival``, the
+    one producer) at the moment a claimed token arrives at a barrier:
+    aggregation buffering or a coalesce / row_union / collector hold, on a
+    leader or a follower. The drain writes the BLOCKED row's barrier_key and
+    held row from it, so the durable row is the token as it ARRIVED, after any
+    transforms the claim ran on the way (elspeth-5887fb7928 AC-R4). On a leader
+    the next drain iteration's journal-first intake then consumes it: the LIVE
+    token keeps its resume provenance and this process's arrival instant (N=1
+    parity). On a follower the drain drops it once the row is durable, because
+    the leader adopts from the journal. Rows with no record (leader takeover,
+    a follower's hand-off, resume) rehydrate from that same durable row with
+    audit-derived attempt offsets, the same semantics as the restore path.
 
     ``arrived_monotonic`` is this process's exact witness of the arrival
     instant on the monotonic scale. The durable ``barrier_blocked_at`` is
@@ -129,10 +135,12 @@ class BarrierJournalRestoreContext:
             unlatched / no-losses defaults. The scalars snapshot is
             NON-transactional vs the journal (D3 staleness model): an absent
             entry always means not-fired / re-derivable, never corruption.
-        batch_id_remap: old->retry batch_id mapping returned by
+        batch_id_remap: old->retry batch_id edges returned by
             ``handle_incomplete_batches`` — BUFFERED token_outcomes still
             reference the dead original batch ids, so the restored in-progress
-            batch id must be read through this remap.
+            batch id is read through this remap. Each entry is ONE retry hop;
+            after repeated crashes the edges form a chain (A->B, B->C), and
+            ``resolve_retry_chain`` is the only reader that follows it.
     """
 
     resume_checkpoint_id: str
@@ -143,6 +151,35 @@ class BarrierJournalRestoreContext:
         if not self.resume_checkpoint_id:
             raise ValueError("BarrierJournalRestoreContext.resume_checkpoint_id must not be empty")
         object.__setattr__(self, "batch_id_remap", deep_freeze(self.batch_id_remap))
+
+
+def resolve_retry_chain(batch_id_remap: Mapping[str, str], batch_id: str) -> tuple[str, ...]:
+    """Follow ``batch_id``'s old->retry edges to the live end of its chain.
+
+    ``handle_incomplete_batches`` records one edge per retried batch. A crash
+    inside a retried flush leaves the retry FAILED too, so the next resume
+    retries IT and the edges chain: ``{A: B, B: C}``. BUFFERED outcomes still
+    carry ``A``; the batch the members must be restored into is ``C``. One
+    lookup would land on the dead ``B`` (elspeth-5887fb7928 engine review).
+
+    Returns:
+        The chain, starting at ``batch_id`` and ending at the batch to use.
+        A batch that was never retried is a chain of one.
+
+    Raises:
+        AuditIntegrityError: If the edges loop back on themselves — a retry
+            always creates a fresh batch, so a cycle is audit corruption.
+    """
+    chain = [batch_id]
+    while chain[-1] in batch_id_remap:
+        successor = batch_id_remap[chain[-1]]
+        if successor in chain:
+            raise AuditIntegrityError(
+                f"Aggregation batch retry chain is cyclic: {' -> '.join([*chain, successor])} — a retry always "
+                "creates a new batch, so the old->retry remap is corrupt."
+            )
+        chain.append(successor)
+    return tuple(chain)
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,7 +277,7 @@ class BarrierIntakeCoordinator:
         complete_coalesce_fire: Callable[..., None],
         terminal_coalesce_row_result: Callable[..., RowResult],
         emit_token_completed: Callable[..., None],
-        mark_coalesce_consumed_terminal: Callable[..., None],
+        settle_failed_coalesce_group: Callable[..., list[RowResult]],
         record_group_member_terminals: Callable[..., list[RowResult]],
         take_pending_group_losses: Callable[[], tuple[GroupLossSpec, ...]],
         row_union_executor: RowUnionExecutor | None = None,
@@ -279,7 +316,7 @@ class BarrierIntakeCoordinator:
         self._complete_coalesce_fire = complete_coalesce_fire
         self._terminal_coalesce_row_result = terminal_coalesce_row_result
         self._emit_token_completed = emit_token_completed
-        self._mark_coalesce_consumed_terminal = mark_coalesce_consumed_terminal
+        self._settle_failed_coalesce_group = settle_failed_coalesce_group
         self._record_group_member_terminals = record_group_member_terminals
         self._take_pending_group_losses = take_pending_group_losses
         self._row_union_executor = row_union_executor
@@ -290,6 +327,11 @@ class BarrierIntakeCoordinator:
         self._group_bindings: GroupBindingRegistry = group_bindings if group_bindings is not None else GroupBindingRegistry(bindings=())
         self._collector_executor = collector_executor
         self._collector_node_ids: Mapping[CollectorName, NodeID] = collector_node_ids or {}
+        self._require_all_collector_openers: dict[str, str] = {
+            str(node_id): binding.closer_name
+            for node_id, binding in self._group_bindings.by_opener_node().items()
+            if binding.closer_kind is CloserKind.COLLECTOR and binding.policy == "require_all"
+        }
         self._complete_collector_fire = complete_collector_fire
         self._route_collector_release = route_collector_release
         self._merged_continuation_cursor = merged_continuation_cursor
@@ -314,7 +356,7 @@ class BarrierIntakeCoordinator:
 
     def _require_coordination_token(self) -> CoordinationToken:
         """The leader fencing token, REQUIRED for the slice-3 adoption verbs."""
-        if self._coordination_token is None:
+        if not isinstance(self._coordination_token, CoordinationToken):
             raise OrchestrationInvariantError(
                 "Journal-first barrier intake requires the leader coordination token (ADR-030 §E.2): "
                 "adopt_blocked_barrier_item / adopt_group_losses are fenced verbs with no "
@@ -443,12 +485,32 @@ class BarrierIntakeCoordinator:
 
         dispositions.extend(self._replay_group_losses(ctx))
         dispositions.extend(self._flush_restored_collector_groups(ctx))
+        self._close_pending_empty_collector_groups(ctx)
         # spec §6.3 (Task 8) — escalation runs AFTER durable-loss replay, in
         # the SAME intake step: a note staged into the ledger THIS pass is
         # picked up by the NEXT pass's replay above (one-pass-per-drain-cycle
         # latency, spec-accepted).
         self._stage_pending_escalations()
         return BarrierIntakePassOutcome(dispositions=tuple(dispositions))
+
+    def _close_pending_empty_collector_groups(self, ctx: PluginContext) -> None:
+        """Leader-close zero-member groups minted by followers or interrupted openers.
+
+        Such a group has no child journal row to adopt. The durable group
+        record and opener node state are the only discovery path; the failure
+        marker excludes already closed groups on every later pass and resume.
+        Best-effort groups need no failure marker or child disposition.
+        """
+        if self._collector_executor is None or not self._require_all_collector_openers:
+            return
+        if not isinstance(self._barrier_restore_reads, BarrierRestoreReadModel):
+            raise OrchestrationInvariantError("Collector empty-group intake requires the barrier restore read model")
+        pending = self._barrier_restore_reads.pending_empty_expansion_groups(
+            run_id=self._run_id,
+            opener_node_ids=tuple(self._require_all_collector_openers),
+        )
+        for group_id, opener_node_id in pending:
+            self._collector_executor.notify_empty_group(self._require_all_collector_openers[opener_node_id], group_id, ctx)
 
     def _adopt_aggregation_row(self, row: TokenWorkItem, ctx: PluginContext) -> BarrierIntakeDisposition | None:
         """Adopt one aggregation barrier row, then evaluate the node's trigger.
@@ -466,9 +528,8 @@ class BarrierIntakeCoordinator:
         # refused with ZERO durable mutation. Valid follower handoffs can be
         # rebuilt from the durable row even without a live stash entry.
         token, arrived_monotonic = self._intake_arrival(row)
-        batch_id, ordinal = self._aggregation_executor.open_batch_membership(node_id)
+        batch_id, ordinal = self._aggregation_executor.open_batch_membership(node_id, coordination_token=coordination_token)
         adoption = self._scheduler.adopt_blocked_barrier_item(
-            run_id=self._run_id,
             work_item_id=row.work_item_id,
             token_id=row.token_id,
             barrier_key=row.barrier_key,
@@ -533,7 +594,6 @@ class BarrierIntakeCoordinator:
         # for invalid journal rows — see the aggregation arm).
         token, arrived_monotonic = self._intake_arrival(row)
         adoption = self._scheduler.adopt_blocked_barrier_item(
-            run_id=self._run_id,
             work_item_id=row.work_item_id,
             token_id=row.token_id,
             barrier_key=row.barrier_key,
@@ -544,6 +604,7 @@ class BarrierIntakeCoordinator:
         if not adoption.adopted:
             return None
         outcome = self._coalesce_executor.accept(
+            coordination_token=coordination_token,
             token=token,
             coalesce_name=str(coalesce_name),
             arrival_time=arrived_monotonic,
@@ -597,7 +658,6 @@ class BarrierIntakeCoordinator:
             )
             late_group_losses = self._take_pending_group_losses()
             released = self._scheduler.mark_blocked_barrier_terminal(
-                run_id=self._run_id,
                 barrier_key=str(coalesce_name),
                 token_ids=(token.token_id,),
                 coordination_token=coordination_token,
@@ -624,6 +684,12 @@ class BarrierIntakeCoordinator:
                         outcome=TerminalOutcome.FAILURE,
                         path=TerminalPath.UNROUTED,
                         error=FailureInfo(exception_type="CoalesceFailure", message=late_reason),
+                        # A group that failed with zero arrived members wrote
+                        # nothing at the barrier; this straggler's FAILED
+                        # state is its first failure evidence, so it is the
+                        # group's one counted failed barrier (the audit
+                        # derive's unit). Every other straggler is not.
+                        counts_failed_barrier=outcome.first_failure_evidence,
                     ),
                     *late_cascaded_results,
                 ),
@@ -634,52 +700,26 @@ class BarrierIntakeCoordinator:
             return self._fire_coalesce_merge(coalesce_name, outcome, scope_row_id=row.row_id)
 
         if outcome.failure_reason:
-            error_msg = outcome.failure_reason
-            # The executor no longer writes any consumed branch's terminal
-            # outcome itself (Task 6, spec §6.1) — every consumed token
-            # (the arriving token included; it is a member of
-            # outcome.consumed_tokens too) is terminalized here, through the
-            # settlement channel, which also walks each one's REMAINING
-            # lineage for an enclosing bound frame (escalation). Fix round 3
-            # (Ruling 43): runs BEFORE the durable "release them all" below
-            # so any escalated loss it stages is drained and threaded into
-            # THAT SAME call — see the late-arrival arm's comment above for
-            # the full rationale (this intake pass is out-of-claim too).
-            self._note_coalesce_group_failed_from_token(closer_name=str(coalesce_name), token=token, reason=error_msg)
+            # Group failure completed by this arrival. Every consumed token —
+            # the arriving one AND each held sibling; all hold BLOCKED rows —
+            # is terminalized and surfaced through the ONE failed-group seam
+            # (RowProcessor.settle_failed_coalesce_group): one result per
+            # consumed token, so the live counters match the audit derive.
+            # Out-of-claim: an escalated loss the settlement walk stages is
+            # drained into THIS release's transaction (Ruling 43).
+            self._note_coalesce_group_failed_from_token(closer_name=str(coalesce_name), token=token, reason=outcome.failure_reason)
             cascade_child_items: list[WorkItem] = []
-            cascaded_results = self._record_group_member_terminals(
+            failure_results = self._settle_failed_coalesce_group(
                 tuple(outcome.consumed_tokens),
-                group_id=self._arriving_fork_group_id(closer_name=str(coalesce_name), token=token),
-                failure_reason=error_msg,
-                child_items=cascade_child_items,
-                group_failed=True,
-            )
-            # Group failure completed by this arrival: every consumed branch
-            # (this one included) holds a BLOCKED row — release them all.
-            self._mark_coalesce_consumed_terminal(
                 coalesce_name=coalesce_name,
-                consumed_tokens=tuple(outcome.consumed_tokens),
-                group_losses=self._take_pending_group_losses(),
+                group_id=self._arriving_fork_group_id(closer_name=str(coalesce_name), token=token),
+                failure_reason=outcome.failure_reason,
+                child_items=cascade_child_items,
+                losses_ride_claim=False,
             )
-            # Emit TokenCompleted telemetry AFTER Landscape recording. Only
-            # the arriving token surfaces a RowResult of its own (the held
-            # siblings' outcomes are recorded above with no RowResult of
-            # their own) — the pre-§E.2 shape, unchanged by Task 6; any
-            # cascaded consequence from the escalation walk above DOES
-            # surface below.
-            self._emit_token_completed(token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
             return BarrierIntakeDisposition(
                 kind=BarrierIntakeDispositionKind.TERMINAL,
-                results=(
-                    RowResult(
-                        token=token,
-                        final_data=token.row_data,
-                        outcome=TerminalOutcome.FAILURE,
-                        path=TerminalPath.UNROUTED,
-                        error=FailureInfo(exception_type="CoalesceFailure", message=error_msg),
-                    ),
-                    *cascaded_results,
-                ),
+                results=tuple(failure_results),
                 child_items=tuple(cascade_child_items),
             )
 
@@ -707,7 +747,6 @@ class BarrierIntakeCoordinator:
         coordination_token = self._require_coordination_token()
         token, arrived_monotonic = self._intake_arrival(row)
         adoption = self._scheduler.adopt_blocked_barrier_item(
-            run_id=self._run_id,
             work_item_id=row.work_item_id,
             token_id=row.token_id,
             barrier_key=row.barrier_key,
@@ -718,6 +757,7 @@ class BarrierIntakeCoordinator:
         if not adoption.adopted:
             return None
         outcome = self._row_union_executor.accept(
+            coordination_token=coordination_token,
             token=token,
             row_union_name=str(row_union_name),
             arrival_time=arrived_monotonic,
@@ -731,7 +771,6 @@ class BarrierIntakeCoordinator:
                 closer_name=str(row_union_name), token=token, reason=outcome.failure_reason or "late_arrival_after_release"
             )
             released = self._scheduler.mark_blocked_barrier_terminal(
-                run_id=self._run_id,
                 barrier_key=str(row_union_name),
                 token_ids=(token.token_id,),
                 coordination_token=coordination_token,
@@ -757,6 +796,10 @@ class BarrierIntakeCoordinator:
                         outcome=TerminalOutcome.FAILURE,
                         path=TerminalPath.UNROUTED,
                         error=FailureInfo(exception_type="RowUnionFailure", message=outcome.failure_reason or "late_arrival_after_release"),
+                        # The first straggler of a group closed by a branch
+                        # loss before any arrival is that group's one counted
+                        # failed barrier (its FAILED state is the first).
+                        counts_failed_barrier=outcome.first_failure_evidence,
                     ),
                 ),
             )
@@ -777,35 +820,13 @@ class BarrierIntakeCoordinator:
                 child_items=released_items,
             )
 
-        if outcome.failure_reason:
-            # Whole-group failure completed by this arrival (v1 fail-closed):
-            # every held branch — this one included — holds a BLOCKED row.
-            self._note_row_union_group_failed_from_token(closer_name=str(row_union_name), token=token, reason=outcome.failure_reason)
-            self._scheduler.mark_blocked_barrier_terminal(
-                run_id=self._run_id,
-                barrier_key=str(row_union_name),
-                token_ids=tuple(consumed.token_id for consumed in outcome.consumed_tokens),
-                coordination_token=coordination_token,
-                release_context={
-                    "reason": outcome.failure_reason,
-                    "released_by": self._scheduler_lease_owner,
-                    "scope_row_id": row.row_id,
-                },
-            )
-            self._emit_token_completed(token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
-            return BarrierIntakeDisposition(
-                kind=BarrierIntakeDispositionKind.TERMINAL,
-                results=(
-                    RowResult(
-                        token=token,
-                        final_data=token.row_data,
-                        outcome=TerminalOutcome.FAILURE,
-                        path=TerminalPath.UNROUTED,
-                        error=FailureInfo(exception_type="RowUnionFailure", message=outcome.failure_reason),
-                    ),
-                ),
-            )
-
+        # No arrival-completed FAILURE arm, by construction: RowUnionExecutor.accept
+        # returns only held, a late-arrival failure (above) or a release — a
+        # v1 row_union group fails only by timeout/EOF sweep or branch loss,
+        # both of which surface one result per consumed token elsewhere. An
+        # accept() that ever returned a whole-group failure here is an
+        # executor contract break and must not be surfaced as a one-token
+        # result: it falls through to the invalid-state raise.
         raise OrchestrationInvariantError(
             f"RowUnionOutcome for token {token.token_id} in row_union '{row_union_name}' is in invalid state: "
             f"held={outcome.held}, released={len(outcome.released_tokens)}, failure_reason={outcome.failure_reason!r}"
@@ -849,7 +870,6 @@ class BarrierIntakeCoordinator:
         coordination_token = self._require_coordination_token()
         token, arrived_monotonic = self._intake_arrival(row)
         adoption = self._scheduler.adopt_blocked_barrier_item(
-            run_id=self._run_id,
             work_item_id=row.work_item_id,
             token_id=row.token_id,
             barrier_key=row.barrier_key,
@@ -1008,8 +1028,11 @@ class BarrierIntakeCoordinator:
             # spec §6.3 "survivors terminate scope_group_failed" write — plus
             # ONE escalation walk over their shared remaining lineage (an
             # enclosing bound frame, if any, is staged a group_failed loss).
-            # A failure arm never flushed, so no member holds a prior
-            # terminal; the seam's own duplicate detection stands.
+            # Live, no member holds a prior terminal. Resume completing a
+            # RECORDED failure verdict may find some or all of them written
+            # by the crashed process (the terminals are separate writes before
+            # the journal release): those are skipped and still walked.
+            unterminalized = self._unterminalized(consumed_tokens)
             cascaded_results = self._record_group_member_terminals(
                 consumed_tokens,
                 group_id=group_id,
@@ -1017,10 +1040,10 @@ class BarrierIntakeCoordinator:
                 child_items=failure_child_items,
                 group_failed=True,
                 frame_kind=FrameKind.EXPAND,
+                already_terminal=frozenset(token.token_id for token in consumed_tokens) - {token.token_id for token in unterminalized},
             )
             if consumed_tokens:
                 self._scheduler.mark_blocked_barrier_terminal(
-                    run_id=self._run_id,
                     barrier_key=barrier_key,
                     token_ids=tuple(token.token_id for token in consumed_tokens),
                     coordination_token=self._require_coordination_token(),
@@ -1204,7 +1227,6 @@ class BarrierIntakeCoordinator:
             return dispositions
         coordination_token = self._require_coordination_token()
         self._scheduler.adopt_group_losses(
-            run_id=self._run_id,
             loss_ids=[loss.loss_id for loss in losses],
             coordination_token=coordination_token,
         )
@@ -1246,6 +1268,7 @@ class BarrierIntakeCoordinator:
                 if self._row_union_executor.has_recorded_branch_loss(loss.closer_name, loss.group_id, loss.member_key):
                     continue
                 row_union_outcome = self._row_union_executor.notify_branch_lost(
+                    coordination_token=coordination_token,
                     row_union_name=loss.closer_name,
                     fork_group_id=loss.group_id,
                     lost_branch=loss.member_key,
@@ -1264,22 +1287,14 @@ class BarrierIntakeCoordinator:
                     consumed_tokens=consumed_tokens,
                     scope_row_id=row_id,
                 )
-                row_union_failure_results: list[RowResult] = []
                 for consumed_token in consumed_tokens:
                     self._emit_token_completed(consumed_token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
-                    row_union_failure_results.append(
-                        RowResult(
-                            token=consumed_token,
-                            final_data=consumed_token.row_data,
-                            outcome=TerminalOutcome.FAILURE,
-                            path=TerminalPath.UNROUTED,
-                            error=FailureInfo(exception_type="RowUnionFailure", message=row_union_outcome.failure_reason),
-                        )
-                    )
                 dispositions.append(
                     BarrierIntakeDisposition(
                         kind=BarrierIntakeDispositionKind.TERMINAL,
-                        results=tuple(row_union_failure_results),
+                        results=failed_barrier_group_results(
+                            consumed_tokens, exception_type="RowUnionFailure", failure_reason=row_union_outcome.failure_reason
+                        ),
                     )
                 )
                 continue
@@ -1290,6 +1305,7 @@ class BarrierIntakeCoordinator:
             if self._coalesce_executor.has_recorded_branch_loss(loss.closer_name, loss.group_id, loss.member_key):
                 continue
             outcome = self._coalesce_executor.notify_branch_lost(
+                coordination_token=coordination_token,
                 coalesce_name=loss.closer_name,
                 fork_group_id=loss.group_id,
                 lost_branch=loss.member_key,
@@ -1303,48 +1319,27 @@ class BarrierIntakeCoordinator:
                 continue
             if outcome.failure_reason:
                 # Replayed must-fail (§6.2: a must-fail group fails within one
-                # drain iteration of the loss becoming visible): mirror the
-                # group-loss notification failure arm — RowResults for the
-                # held siblings the failure consumed. The executor no longer
-                # writes their terminal outcomes itself (Task 6, spec §6.1);
-                # terminalized here through the settlement channel, which
-                # also walks each one's REMAINING lineage for an enclosing
-                # bound frame (escalation). Fix round 3 (Ruling 43): runs
-                # BEFORE the durable "release them all" below so any
-                # escalated loss it stages is drained and threaded into
-                # THAT SAME call — this replay loop is out-of-claim too.
-                # loss.group_id IS the failed group's own id — no need to
-                # re-derive it from a consumed token's lineage.
+                # drain iteration of the loss becoming visible): the SAME
+                # failed-group seam as the live notification and the intake
+                # arm — one result per consumed held sibling. Out-of-claim
+                # (Ruling 43): an escalated loss the settlement walk stages is
+                # drained into this release's transaction. loss.group_id IS
+                # the failed group's own id — no need to re-derive it from a
+                # consumed token's lineage.
                 self.note_group_failed(closer_name=loss.closer_name, group_id=loss.group_id, reason=outcome.failure_reason)
                 replay_child_items: list[WorkItem] = []
-                cascaded_replay_results = self._record_group_member_terminals(
+                replay_results = self._settle_failed_coalesce_group(
                     tuple(outcome.consumed_tokens),
+                    coalesce_name=coalesce_name,
                     group_id=loss.group_id,
                     failure_reason=outcome.failure_reason,
                     child_items=replay_child_items,
-                    group_failed=True,
+                    losses_ride_claim=False,
                 )
-                self._mark_coalesce_consumed_terminal(
-                    coalesce_name=coalesce_name,
-                    consumed_tokens=tuple(outcome.consumed_tokens),
-                    group_losses=self._take_pending_group_losses(),
-                )
-                coalesce_failure_results: list[RowResult] = []
-                for consumed_token in outcome.consumed_tokens:
-                    self._emit_token_completed(consumed_token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.UNROUTED)
-                    coalesce_failure_results.append(
-                        RowResult(
-                            token=consumed_token,
-                            final_data=consumed_token.row_data,
-                            outcome=TerminalOutcome.FAILURE,
-                            path=TerminalPath.UNROUTED,
-                            error=FailureInfo(exception_type="CoalesceFailure", message=outcome.failure_reason),
-                        )
-                    )
                 dispositions.append(
                     BarrierIntakeDisposition(
                         kind=BarrierIntakeDispositionKind.TERMINAL,
-                        results=(*coalesce_failure_results, *cascaded_replay_results),
+                        results=tuple(replay_results),
                         child_items=tuple(replay_child_items),
                     )
                 )
@@ -1563,7 +1558,6 @@ class BarrierIntakeCoordinator:
         that is the one-pass-per-drain-cycle latency the spec accepts."""
         coordination_token = self._require_coordination_token()
         self._scheduler.stage_escalation_loss(
-            run_id=self._run_id,
             spec=spec,
             frame_kind=frame_kind,
             declared_roster=binding.member_roster if frame_kind is FrameKind.FORK else None,
@@ -1596,7 +1590,7 @@ class BarrierIntakeCoordinator:
                 # real built graph: build_group_binding_registry guarantees a
                 # binding for every executable coalesce/row_union/collector
                 # closer (collector closers are reachable here since the
-                # integration lift; filigree elspeth-c00a82bf97).
+                # integration lift; archived issue elspeth-c00a82bf97).
                 del self._failed_group_notes[(closer_name, group_id)]
                 continue
             if not self._group_roster_settled(closer_name=closer_name, group_id=group_id, binding=failed_binding):
@@ -1644,6 +1638,10 @@ class BarrierRecoveryCoordinator:
             Callable[[CommittedAggregationOutputReceipt, Sequence[TokenWorkItem]], _PreparedAggregationRoute] | None
         ) = None,
         complete_committed_aggregation_output: Callable[[_PreparedAggregationRoute], None] | None = None,
+        prepare_recorded_aggregation_failure: (
+            Callable[[RecordedAggregationFailure, Sequence[TokenWorkItem]], _FailedFlushDisposition] | None
+        ) = None,
+        complete_recorded_aggregation_failure: Callable[[_FailedFlushDisposition], object] | None = None,
         complete_committed_coalesce_residual: Callable[[CommittedCoalesceResidual, Sequence[TokenWorkItem]], None] | None = None,
         collector_executor: CollectorExecutor | None = None,
         collector_node_ids: Mapping[CollectorName, NodeID] | None = None,
@@ -1669,7 +1667,14 @@ class BarrierRecoveryCoordinator:
         self._complete_committed_aggregation_residual = complete_committed_aggregation_residual
         self._prepare_committed_aggregation_output = prepare_committed_aggregation_output
         self._complete_committed_aggregation_output = complete_committed_aggregation_output
+        self._prepare_recorded_aggregation_failure = prepare_recorded_aggregation_failure
+        self._complete_recorded_aggregation_failure = complete_recorded_aggregation_failure
         self._complete_committed_coalesce_residual = complete_committed_coalesce_residual
+
+    def _require_coordination_token(self) -> CoordinationToken:
+        if not isinstance(self._coordination_token, CoordinationToken):
+            raise OrchestrationInvariantError("Barrier recovery requires the admitted leader token")
+        return self._coordination_token
 
     def restore_from_journal(self, restore: BarrierJournalRestoreContext) -> None:
         """Rebuild aggregation buffers and coalesce pendings from journal BLOCKED rows.
@@ -1829,11 +1834,8 @@ class BarrierRecoveryCoordinator:
 
         # ---- Audit derivations (no mutation yet) ---------------------------
         # Attempt offsets: max node_states attempt per journal token, + 1.
-        # Derived here with ONE focused query rather than plumbed from
-        # recovery's incomplete_by_row map: that map's exclusion set reads
-        # journal BLOCKED rows (so the resume loop does not re-drive blocked
-        # tokens), which excludes exactly the tokens this restore needs
-        # offsets for.
+        # Derived here with ONE focused query over exactly the journal tokens
+        # this restore re-drives.
         token_ids = [item.token_id for item in items]
         max_attempts = self._barrier_restore_reads.get_max_node_state_attempts(self._run_id, token_ids) if token_ids else {}
         attempt_offsets: dict[str, int] = {
@@ -1844,6 +1846,7 @@ class BarrierRecoveryCoordinator:
         agg_plans: list[_AggregationRestorePlan] = []
         committed_aggregation_plans: list[tuple[CommittedAggregationResidual, tuple[TokenWorkItem, ...]]] = []
         committed_aggregation_output_plans: list[_PreparedAggregationRoute] = []
+        recorded_failure_plans: list[_FailedFlushDisposition] = []
         committed_coalesce_plans: list[tuple[CommittedCoalesceResidual, tuple[TokenWorkItem, ...]]] = []
         if self._aggregation_settings:
             members_by_batch: dict[str, list[str]] = {}
@@ -1876,11 +1879,11 @@ class BarrierRecoveryCoordinator:
                     scalars.aggregation[str(node_id)] if str(node_id) in scalars.aggregation else AggregationNodeScalars(None, None)
                 )
                 # ---- ADR-030 §E.3a aggregation reconcile (elspeth-55546a6fd6) ---
-                # A FAILED out-of-claim flush records terminal FAILURE/UNROUTED
-                # token_outcomes for every buffered token (_handle_flush_error)
-                # and THEN releases their BLOCKED scheduler rows in a SEPARATE
-                # transaction (_mark_buffered_scheduler_work_terminal). A crash
-                # between the two strands durable BLOCKED rows whose tokens are
+                # A flush whose cross-check raises a Tier-1 declaration-contract
+                # violation records terminal FAILURE/UNROUTED token_outcomes for
+                # every buffered token (RowProcessor._record_flush_violation) and
+                # the run then dies before any journal release. That strands
+                # durable BLOCKED rows whose tokens are
                 # already terminally failed: they carry NO live BUFFERED outcome,
                 # so _derive_restored_batch_id below would refuse loudly and
                 # brick EVERY resume attempt. Mirror the coalesce §E.3a holdless
@@ -1890,6 +1893,14 @@ class BarrierRecoveryCoordinator:
                 # tokens. A fully-reconciled node then falls through to the
                 # counter-only branch below ("flushes all FAILED" — exactly the
                 # state that branch already anticipates).
+                #
+                # A FAILED flush that returned its error has no such window
+                # since operator ruling B3: a discarded batch's
+                # (FAILURE, QUARANTINED_AT_SOURCE) terminals ride the same
+                # complete_barrier transaction that consumes its BLOCKED rows,
+                # and a batch routed to its on_error sink writes no
+                # processor-side terminal. So the reconcile stays scoped to
+                # (FAILURE, UNROUTED) and never needs the discard pair.
                 #
                 # A successful transform-mode flush may have committed its
                 # batch result and expanded children before complete_barrier.
@@ -1939,6 +1950,30 @@ class BarrierRecoveryCoordinator:
                         committed_aggregation_output_plans.append(prepared_route)
                         node_items = [item for item in node_items if item.token_id not in member_ids]
 
+                # A batch whose FAILED verdict was recorded (atomically, by
+                # complete_aggregation_failure) before the crash keeps its
+                # members BLOCKED until their disposition's complete_barrier.
+                # The verdict is final: complete that disposition from the
+                # recorded reason and destination — never re-run the flush
+                # (operator ruling 2026-09-23: crash timing must not change the
+                # outcome). handle_incomplete_batches never retried it, so no
+                # retry batch exists for these members to resolve into.
+                if node_items:
+                    recorded_failures = self._barrier_restore_reads.list_recorded_aggregation_failures(
+                        self._run_id,
+                        aggregation_node_id=str(node_id),
+                        blocked_token_ids=[item.token_id for item in node_items],
+                    )
+                    for recorded_failure in recorded_failures:
+                        if self._prepare_recorded_aggregation_failure is None or self._complete_recorded_aggregation_failure is None:
+                            raise OrchestrationInvariantError(
+                                "Recorded aggregation failure recovery requires prepare and completion callbacks"
+                            )
+                        member_ids = frozenset(recorded_failure.member_token_ids)
+                        failure_items = tuple(item for item in node_items if item.token_id in member_ids)
+                        recorded_failure_plans.append(self._prepare_recorded_aggregation_failure(recorded_failure, failure_items))
+                        node_items = [item for item in node_items if item.token_id not in member_ids]
+
                 # Scoped to (FAILURE, UNROUTED): this has no output receipt;
                 # the already-terminal failed inputs are simply released.
                 if node_items:
@@ -1948,7 +1983,6 @@ class BarrierRecoveryCoordinator:
                     if failed_terminal_ids:
                         reconciled = [item for item in node_items if item.token_id in failed_terminal_ids]
                         released = self._scheduler.mark_blocked_barrier_terminal(
-                            run_id=self._run_id,
                             barrier_key=str(node_id),
                             token_ids=tuple(item.token_id for item in reconciled),
                             coordination_token=self._coordination_token,
@@ -2110,7 +2144,6 @@ class BarrierRecoveryCoordinator:
                     # survived the crash. Journal-release it under this
                     # leader's coordination token, mirroring the live arm.
                     released = self._scheduler.mark_blocked_barrier_terminal(
-                        run_id=self._run_id,
                         barrier_key=str(item.barrier_key),
                         token_ids=(item.token_id,),
                         coordination_token=self._coordination_token,
@@ -2187,7 +2220,6 @@ class BarrierRecoveryCoordinator:
                 if terminal_ids:
                     for item in [i for i in row_union_holdless_items if i.token_id in terminal_ids]:
                         released = self._scheduler.mark_blocked_barrier_terminal(
-                            run_id=self._run_id,
                             barrier_key=str(item.barrier_key),
                             token_ids=(item.token_id,),
                             coordination_token=self._coordination_token,
@@ -2348,7 +2380,6 @@ class BarrierRecoveryCoordinator:
                             else GroupSettlementReason.SCOPE_GROUP_FAILED.value
                         )
                         released = self._scheduler.mark_blocked_barrier_terminal(
-                            run_id=self._run_id,
                             barrier_key=str(coalesce_name_str),
                             token_ids=(item.token_id,),
                             coordination_token=self._coordination_token,
@@ -2439,6 +2470,10 @@ class BarrierRecoveryCoordinator:
             if self._complete_committed_aggregation_output is None:  # pragma: no cover - checked while planning
                 raise OrchestrationInvariantError("Committed aggregation output recovery requires the completion callback")
             self._complete_committed_aggregation_output(prepared_route)
+        for failure_disposition in recorded_failure_plans:
+            if self._complete_recorded_aggregation_failure is None:  # pragma: no cover - checked while planning
+                raise OrchestrationInvariantError("Recorded aggregation failure recovery requires the completion callback")
+            self._complete_recorded_aggregation_failure(failure_disposition)
         for coalesce_residual, residual_items in committed_coalesce_plans:
             if self._complete_committed_coalesce_residual is None:  # pragma: no cover - checked while planning
                 raise OrchestrationInvariantError("Committed coalesce residual recovery requires the processor continuation callback")
@@ -2526,7 +2561,9 @@ class BarrierRecoveryCoordinator:
                             arrival_time=now_monotonic - max(0.0, (now - item.barrier_blocked_at).total_seconds()),
                         )
                     )
-                release_outcome = self._row_union_executor.reconcile_released_group(entries=tuple(group_entries))
+                release_outcome = self._row_union_executor.reconcile_released_group(
+                    entries=tuple(group_entries), coordination_token=self._require_coordination_token()
+                )
                 self._commit_restored_row_union_outcome(release_outcome)
 
             restore_entries: list[RowUnionRestoreEntry] = []
@@ -2545,7 +2582,9 @@ class BarrierRecoveryCoordinator:
                         arrival_time=now_monotonic - max(0.0, (now - item.barrier_blocked_at).total_seconds()),
                     )
                 )
-            outcomes = self._row_union_executor.restore_from_journal(entries=restore_entries)
+            outcomes = self._row_union_executor.restore_from_journal(
+                entries=restore_entries, coordination_token=self._require_coordination_token()
+            )
             for outcome in outcomes:
                 self._commit_restored_row_union_outcome(outcome)
 
@@ -2634,19 +2673,21 @@ class BarrierRecoveryCoordinator:
 
         Source of truth: each buffered token's BUFFERED token_outcome carries
         the batch_id it was accepted into (written by the fenced adoption
-        verb since ADR-030 §E.2), read through the
-        ``handle_incomplete_batches`` old->retry remap because the audit
-        outcomes still reference the dead original batch when a crash
-        interrupted a flush.
+        verb since ADR-030 §E.2), resolved through the
+        ``handle_incomplete_batches`` old->retry edges to the END of the retry
+        chain (``resolve_retry_chain``): the audit outcomes keep the original
+        acceptance batch id however many resumes have retried it since.
 
         Raises:
             AuditIntegrityError: If any token lacks a BUFFERED outcome with a
-                batch_id, the group's tokens disagree on the (remapped)
-                batch_id, the batch row is missing, or the batch belongs to a
-                different aggregation node.
+                batch_id, the group's tokens disagree on the resolved
+                batch_id, the retry chain is cyclic, the batch row is
+                missing, the batch belongs to a different aggregation node,
+                or the resolved batch is already terminal.
         """
         batch_id: str | None = None
         first_token_id: str | None = None
+        first_outcome_batch_id: str | None = None
         for item in node_items:
             live_buffered = self._barrier_restore_reads.list_live_buffered_outcomes(TokenRef(token_id=item.token_id, run_id=self._run_id))
             if len(live_buffered) > 1:
@@ -2674,10 +2715,11 @@ class BarrierRecoveryCoordinator:
                     f"matching BUFFERED token_outcome with a batch_id (got {outcome!r}) — the journal "
                     "and the audit trail disagree about this token being buffered."
                 )
-            resolved = restore.batch_id_remap.get(outcome.batch_id, outcome.batch_id)
+            resolved = resolve_retry_chain(restore.batch_id_remap, outcome.batch_id)[-1]
             if batch_id is None:
                 batch_id = resolved
                 first_token_id = item.token_id
+                first_outcome_batch_id = outcome.batch_id
             elif resolved != batch_id:
                 raise AuditIntegrityError(
                     f"BLOCKED journal rows at aggregation node {node_id!r} (run {self._run_id!r}, resume "
@@ -2685,7 +2727,7 @@ class BarrierRecoveryCoordinator:
                     f"{first_token_id!r} resolves batch_id={batch_id!r} but token {item.token_id!r} "
                     f"resolves batch_id={resolved!r}. One node has exactly one in-progress batch."
                 )
-        if batch_id is None:  # pragma: no cover - callers pass non-empty node_items
+        if batch_id is None or first_outcome_batch_id is None:  # pragma: no cover - callers pass non-empty node_items
             raise AuditIntegrityError(f"_derive_restored_batch_id called with no journal rows for node {node_id!r}.")
         batch = self._execution.get_batch(batch_id)
         if batch is None:
@@ -2698,5 +2740,22 @@ class BarrierRecoveryCoordinator:
                 f"Restored batch_id {batch_id!r} belongs to aggregation node "
                 f"{batch.aggregation_node_id!r}, but the journal BLOCKED rows carry barrier_key "
                 f"{str(node_id)!r} (run {self._run_id!r}) — journal/audit disagreement."
+            )
+        if batch.status in (BatchStatus.COMPLETED, BatchStatus.FAILED):
+            # The BLOCKED rows are still held, so their batch must still be
+            # able to flush. A terminal tip means the retry chain ends at an
+            # attempt that already finished: flushing it would only die later
+            # on the immutable-terminal-batch transition, after the restore
+            # had adopted every member into it. The two legitimate terminal
+            # tips never reach here: a COMPLETED receipt and a recorded FAILED
+            # verdict are dispositioned (and their members removed) by the
+            # restore arms before this derivation, and every FAILED batch
+            # WITHOUT a verdict was retried by handle_incomplete_batches.
+            chain = " -> ".join(resolve_retry_chain(restore.batch_id_remap, first_outcome_batch_id))
+            raise AuditIntegrityError(
+                f"Restored batch for aggregation node {node_id!r} (run {self._run_id!r}, resume checkpoint "
+                f"{restore.resume_checkpoint_id!r}) resolves through the retry chain {chain} to batch "
+                f"{batch_id!r} with terminal status {batch.status.value!r}; the BLOCKED rows need a live "
+                "(draft) batch to flush into."
             )
         return batch_id

@@ -41,7 +41,7 @@ class PassThrough(BaseTransform):
     name = "passthrough"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4465297d3b60b81e"
+    source_file_hash: str | None = "sha256:f8c2fe03ad0bdf86"
     config_model = PassThroughConfig
     usage_when_to_use: str = (
         "Use as an explicit wiring, schema, or debugging boundary when a pipeline stage should emit an unchanged copy of every input row."
@@ -108,7 +108,10 @@ class PassThrough(BaseTransform):
             PluginContractViolation: Raised by executor if row fails input schema
                 validation. This indicates a bug in the upstream source/transform.
         """
-        output_contract = self._align_output_contract(row.contract)
+        # The operator's schema.fields types the fields it declares; the ONE
+        # stamp writes that declaration onto the emitted contract (ADR-050
+        # Decision 2). The strict input check already admitted each value.
+        output_contract = self._align_output_contract(self._apply_declared_output_field_contracts(row.contract))
         return TransformResult.success(
             PipelineRow(copy.deepcopy(row.to_dict()), output_contract),
             success_reason={"action": "passthrough"},

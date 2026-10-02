@@ -24,6 +24,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectState,
 )
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_decision_time
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution import sink_effect_lifecycle
 from elspeth.core.landscape.execution.sink_effect_lifecycle import SinkEffectLifecycle
@@ -182,14 +183,11 @@ def test_foreign_lease_expires_then_waiter_reclaims_and_publishes_once(
 def test_waiter_starting_inside_the_stamp_second_outlasts_the_lease_on_database_time() -> None:
     """A wait that begins in the same database second the foreign lease was stamped in still reaches the takeover.
 
-    Real clocks throughout. A lease stamped at whole database second S with
-    a TTL of T seconds (ADR-047: ``expires_at = database_now + ttl``) is
-    refused for takeover until the database clock is strictly past S + T,
-    i.e. until second S + T + 1. A waiter that starts inside second S reads
-    "T seconds remain", so a budget capped at the TTL ends inside the
-    lease's last second and re-raises the refusal one poll before the
-    takeover instant. The window is forced: the holder stamps at the top of
-    a fresh database second and the waiter starts before that second ends.
+    Real clocks throughout. The holder stamps just after a fresh database
+    second and the waiter starts before that second ends. Fresh Landscape
+    decisions now retain SQLite milliseconds, so takeover becomes legal
+    strictly after the exact stored deadline. The wait budget must cover
+    that boundary and its next poll, without publishing for the live holder.
     """
     from tests.fixtures.landscape import make_factory, make_landscape_db
 
@@ -221,8 +219,11 @@ def test_waiter_starting_inside_the_stamp_second_outlasts_the_lease_on_database_
         assert held.state is SinkEffectState.IN_FLIGHT
         assert held.lease_owner == "lease-holder"
         assert held.lease_expires_at is not None
-        stamp_second = held.lease_expires_at.replace(tzinfo=UTC) - lease_ttl
+        held_deadline = held.lease_expires_at.replace(tzinfo=UTC)
+        stamp_second = (held_deadline - lease_ttl).replace(microsecond=0)
         assert landscape_database_now(db.engine) == stamp_second, "the wait must begin inside the stamp's database second"
+        with db.read_only_connection() as conn:
+            assert read_landscape_decision_time(conn) < held_deadline, "the waiter must encounter a live holder"
 
         result = SinkEffectCoordinator(
             factory=factory,
@@ -235,9 +236,10 @@ def test_waiter_starting_inside_the_stamp_second_outlasts_the_lease_on_database_
         assert result.effect.state is SinkEffectState.FINALIZED
         # The holder faulted before publishing, so the one publication is the waiter's.
         assert target.publication_count == 1
-        # The takeover happened on the database clock's terms: strictly past
-        # the stamped deadline, never inside the lease's last second.
-        assert landscape_database_now(db.engine) >= stamp_second + lease_ttl + timedelta(seconds=1)
+        # The observed completion follows the exact millisecond deadline;
+        # no additional whole-second expiry quantum is part of ADR-047.
+        with db.read_only_connection() as conn:
+            assert read_landscape_decision_time(conn) > held_deadline
     finally:
         db.close()
 

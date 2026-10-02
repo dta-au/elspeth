@@ -25,6 +25,14 @@ from elspeth.core.config import ElspethSettings
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.engine.token_traversal import _branch_loss_reason
 from elspeth.engine.tokens import TokenManager
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
+
+
+@pytest.fixture
+def admitted_member():
+    setup = make_recorder_with_run(run_id="run-1")
+    yield leader_coordination_token(setup.factory, setup.run_id).membership
+    setup.db.close()
 
 
 class _MintReached(Exception):
@@ -53,7 +61,7 @@ def _make_manager(*, ceiling: int | None) -> tuple[TokenManager, Mock]:
 
 
 class TestExpandTokenWidthBackstop:
-    def test_over_ceiling_refuses_before_any_db_work(self) -> None:
+    def test_over_ceiling_refuses_before_any_db_work(self, admitted_member) -> None:
         manager, data_flow = _make_manager(ceiling=2)
         contract = Mock(spec=SchemaContract)
         contract.locked = True
@@ -64,12 +72,12 @@ class TestExpandTokenWidthBackstop:
                 expanded_rows=[{"v": 1}, {"v": 2}, {"v": 3}],
                 output_contract=contract,
                 node_id=NodeID("t-explode"),
-                run_id="run-1",
+                member_token=admitted_member,
             )
 
         data_flow.expand_token.assert_not_called()
 
-    def test_at_ceiling_proceeds_to_mint(self) -> None:
+    def test_at_ceiling_proceeds_to_mint(self, admitted_member) -> None:
         # The control: a mint AT the ceiling passes the fence. The sentinel
         # raise from the mocked repository proves the mint was reached without
         # modelling the rest of the mint's return contract.
@@ -84,10 +92,10 @@ class TestExpandTokenWidthBackstop:
                 expanded_rows=[{"v": 1}, {"v": 2}],
                 output_contract=contract,
                 node_id=NodeID("t-explode"),
-                run_id="run-1",
+                member_token=admitted_member,
             )
 
-    def test_none_ceiling_is_unfenced(self) -> None:
+    def test_none_ceiling_is_unfenced(self, admitted_member) -> None:
         manager, data_flow = _make_manager(ceiling=None)
         contract = Mock(spec=SchemaContract)
         contract.locked = True
@@ -99,7 +107,7 @@ class TestExpandTokenWidthBackstop:
                 expanded_rows=[{"v": n} for n in range(50)],
                 output_contract=contract,
                 node_id=NodeID("t-explode"),
-                run_id="run-1",
+                member_token=admitted_member,
             )
 
 

@@ -52,7 +52,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_sync_in_worker
 from elspeth.web.auth.claims import IdTokenClaims, UserinfoClaims, optional_string_claim
 from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, IdentityClaims, UserIdentity, UserProfile
@@ -662,6 +662,16 @@ def discovery_endpoints(document: object, *, issuer: str, expected_origins: froz
         raise SsoDiscoveryFailed(str(exc)) from exc
 
 
+async def _read_bounded_response(response: httpx.Response, *, max_bytes: int, overflow_error: SsoLoginError) -> bytes:
+    """Stop consuming the decoded response as soon as its size exceeds the cap."""
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > max_bytes:
+            raise overflow_error
+        body.extend(chunk)
+    return bytes(body)
+
+
 async def fetch_discovery_endpoints(
     *,
     issuer: str,
@@ -685,17 +695,21 @@ async def fetch_discovery_endpoints(
     """
     url = f"{issuer.rstrip('/')}{_DISCOVERY_PATH}"
     try:
-        async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT, follow_redirects=False, transport=transport) as client:
-            response = await client.get(url)
+        async with (
+            httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT, follow_redirects=False, transport=transport) as client,
+            client.stream("GET", url) as response,
+        ):
             response.raise_for_status()
-            body = response.content
+            body = await _read_bounded_response(
+                response,
+                max_bytes=_MAX_DISCOVERY_BYTES,
+                overflow_error=SsoDiscoveryFailed("discovery document exceeds the maximum accepted size"),
+            )
     except httpx.HTTPError as exc:
         # Class name only. str(exc) on a connect error can carry the resolved
         # IP of the IdP, and on an InvalidURL the offending URL itself.
         raise SsoDiscoveryFailed(f"discovery request failed ({type(exc).__name__})") from exc
 
-    if len(body) > _MAX_DISCOVERY_BYTES:
-        raise SsoDiscoveryFailed("discovery document exceeds the maximum accepted size")
     try:
         document = json.loads(body)
     except ValueError as exc:
@@ -982,18 +996,23 @@ async def redeem_authorization_code(
         "code_verifier": verifier,
     }
     try:
-        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False, transport=transport) as client:
-            response = await client.post(token_endpoint, data=form, headers=headers)
+        async with (
+            httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False, transport=transport) as client,
+            client.stream("POST", token_endpoint, data=form, headers=headers) as response,
+        ):
+            if response.status_code != 200:
+                raise SsoTokenExchangeFailed(f"token endpoint returned HTTP {response.status_code}")
+            body = await _read_bounded_response(
+                response,
+                max_bytes=_MAX_TOKEN_RESPONSE_BYTES,
+                overflow_error=SsoTokenExchangeFailed("token response exceeds the maximum accepted size"),
+            )
     except httpx.HTTPError as exc:
         # Class name only: str(exc) can carry the resolved address of the IdP.
         raise SsoTokenExchangeFailed(f"token request failed ({type(exc).__name__})") from exc
 
-    if response.status_code != 200:
-        raise SsoTokenExchangeFailed(f"token endpoint returned HTTP {response.status_code}")
-    if len(response.content) > _MAX_TOKEN_RESPONSE_BYTES:
-        raise SsoTokenExchangeFailed("token response exceeds the maximum accepted size")
     try:
-        document = json.loads(response.content)
+        document = json.loads(body)
     except ValueError as exc:
         raise SsoTokenExchangeFailed("token response is not valid JSON") from exc
     return parse_token_response(document)
@@ -1059,20 +1078,25 @@ async def fetch_userinfo(
     """
     headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
     try:
-        async with httpx.AsyncClient(timeout=_USERINFO_TIMEOUT, follow_redirects=False, transport=transport) as client:
-            response = await client.get(userinfo_endpoint, headers=headers)
+        async with (
+            httpx.AsyncClient(timeout=_USERINFO_TIMEOUT, follow_redirects=False, transport=transport) as client,
+            client.stream("GET", userinfo_endpoint, headers=headers) as response,
+        ):
+            if response.status_code != 200:
+                raise SsoUserinfoInvalid(f"userinfo endpoint returned HTTP {response.status_code}")
+            content_type = response.headers["content-type"] if "content-type" in response.headers else ""
+            if _media_type(content_type) != "application/json":
+                raise SsoUserinfoInvalid("userinfo response is not application/json")
+            body = await _read_bounded_response(
+                response,
+                max_bytes=_MAX_USERINFO_BYTES,
+                overflow_error=SsoUserinfoInvalid("userinfo response exceeds the maximum accepted size"),
+            )
     except httpx.HTTPError as exc:
         raise SsoUserinfoInvalid(f"userinfo request failed ({type(exc).__name__})") from exc
 
-    if response.status_code != 200:
-        raise SsoUserinfoInvalid(f"userinfo endpoint returned HTTP {response.status_code}")
-    content_type = response.headers["content-type"] if "content-type" in response.headers else ""
-    if _media_type(content_type) != "application/json":
-        raise SsoUserinfoInvalid("userinfo response is not application/json")
-    if len(response.content) > _MAX_USERINFO_BYTES:
-        raise SsoUserinfoInvalid("userinfo response exceeds the maximum accepted size")
     try:
-        document = json.loads(response.content)
+        document = json.loads(body)
     except ValueError as exc:
         raise SsoUserinfoInvalid("userinfo response is not valid JSON") from exc
     return parse_userinfo(document, expected_subject=expected_subject)
@@ -1274,12 +1298,20 @@ async def login_callback(
     # first login is exactly how a pending row comes to exist. The refusal
     # for a pending or disabled identity belongs to ``complete``, where the
     # token would otherwise be minted, and it is recorded there.
-    identity = upsert_identity(claims)
-    record_login(identity)
+    def finish_login() -> str:
+        # One worker submission keeps persistence and its required audit in
+        # order even if the caller disconnects after the worker has started.
+        identity = upsert_identity(claims)
+        record_login(identity)
 
-    handoff = new_handoff_code()
-    handoffs.issue(code_hash=handoff_code_hash(handoff), identity_id=identity.identity_id, request_id=request_id)
-    return handoff_location(client.public_base_url, handoff)
+        handoff = new_handoff_code()
+        handoffs.issue(code_hash=handoff_code_hash(handoff), identity_id=identity.identity_id, request_id=request_id)
+        return handoff_location(client.public_base_url, handoff)
+
+    try:
+        return await run_sync_in_worker(finish_login)
+    except AsyncWorkerAdmissionTimeoutError as exc:
+        raise AuthProviderUnavailable("the login could not be admitted to a worker: the request pool is saturated") from exc
 
 
 # ── complete ─────────────────────────────────────────────────────────────

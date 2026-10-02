@@ -19,8 +19,8 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -28,24 +28,28 @@ from elspeth.plugins.transforms._scalar_buckets import append_unique_bucket_valu
 
 type BatchDataQualityReportRow = dict[str, object]
 
-_QUALITY_OUTPUT_FIELDS = frozenset(
-    {
-        "batch_size",
-        "blank_string_count",
-        "blank_string_rate",
-        "distinct_count",
-        "duplicate_count",
-        "field",
-        "missing_count",
-        "missing_rate",
-        "non_finite_count",
-        "non_scalar_count",
-        "observed_count",
-        "observed_type_counts",
-        "valid_count",
-        "valid_rate",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050): ``field``
+# is the inspected column's configured name, the counts are ints, the rates are
+# ``count / batch_size`` true divisions (floats; an empty batch is an error
+# before any rate is computed), and ``observed_type_counts`` is a mapping the
+# schema DSL has no type for.
+_QUALITY_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("blank_string_count", "int"),
+    FieldDefinition("blank_string_rate", "float"),
+    FieldDefinition("distinct_count", "int"),
+    FieldDefinition("duplicate_count", "int"),
+    FieldDefinition("field", "str"),
+    FieldDefinition("missing_count", "int"),
+    FieldDefinition("missing_rate", "float"),
+    FieldDefinition("non_finite_count", "int"),
+    FieldDefinition("non_scalar_count", "int"),
+    FieldDefinition("observed_count", "int"),
+    FieldDefinition("observed_type_counts", "any"),
+    FieldDefinition("valid_count", "int"),
+    FieldDefinition("valid_rate", "float"),
 )
+_QUALITY_OUTPUT_FIELDS = frozenset(field.name for field in _QUALITY_CREATED_FIELDS)
 _MAX_INSPECT_FIELDS = 128
 
 
@@ -113,9 +117,11 @@ class BatchDataQualityReport(BaseTransform):
     name = "batch_data_quality_report"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:48f6f012c7606a45"
+    source_file_hash: str | None = "sha256:a8aa93a021ea783c"
     config_model = BatchDataQualityReportConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use to emit one quality row per configured existing field in a flushed batch; a present None is missing, "
         "while absent columns are errors rather than missing observations."
@@ -151,6 +157,7 @@ class BatchDataQualityReport(BaseTransform):
                 issue_code=None,
                 summary="Emits data-quality counts for configured fields across a batch.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_data_quality_report under aggregations with a trigger; it inspects a flushed batch.",
                     "inspect_fields must name existing input fields and must not be empty or duplicated.",
                     "It emits one report row per inspected field with missing, blank, non-finite, non-scalar, and type counts.",
@@ -204,6 +211,10 @@ class BatchDataQualityReport(BaseTransform):
             required_fields=None,
             audit_fields=None,
         )
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed table above: the same fields on every quality row (ADR-050)."""
+        return _QUALITY_CREATED_FIELDS
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the report output path for the backward invariant."""
@@ -296,22 +307,6 @@ class BatchDataQualityReport(BaseTransform):
             "observed_type_counts": dict(stats.observed_type_counts),
         }
 
-    def _output_contract_for(self, results: list[BatchDataQualityReportRow]) -> SchemaContract:
-        """Build one shared output contract for quality report rows."""
-        field_names = list(dict.fromkeys(key for result in results for key in result))
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,
-                required=False,
-                source="inferred",
-            )
-            for key in field_names
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
-
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext
     ) -> TransformResult:
@@ -320,7 +315,7 @@ class BatchDataQualityReport(BaseTransform):
             return TransformResult.error({"reason": "empty_batch"}, retryable=False)
 
         results = [self._quality_row_for(rows, field_name) for field_name in self._inspect_fields]
-        output_contract = self._output_contract_for(results)
+        output_contract = self._batch_output_contract(key for result in results for key in result)
         fields_added = [field.normalized_name for field in output_contract.fields]
         pipeline_rows = [PipelineRow(result, output_contract) for result in results]
 

@@ -165,9 +165,9 @@ class _BlockingSpliceComposer:
         current_state_id: str | None = None,
         user_id: str | None = None,
         progress: Any = None,
-        guided_terminal: Any = None,
         user_message_id: str | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        completion_gates: Any = None,
     ) -> ComposerResult:
         del (
             message,
@@ -176,9 +176,9 @@ class _BlockingSpliceComposer:
             current_state_id,
             user_id,
             progress,
-            guided_terminal,
             user_message_id,
             session_operation_context,
+            completion_gates,
         )
         result = execute_tool(
             "splice_transform",
@@ -224,7 +224,7 @@ async def test_concurrent_http_splices_serialize_reload_and_apply_once(tmp_path:
         async def send(content: str):
             return await client.post(
                 f"/api/sessions/{session_id}/messages",
-                json={"content": content},
+                json={"content": content, "client_request_id": str(uuid.uuid4())},
             )
 
         first_task = asyncio.create_task(send("Insert the transform"))

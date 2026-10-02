@@ -1,6 +1,6 @@
 [project]
 name = "elspeth"
-version = "0.8.0"
+version = "0.8.1"
 description = "Auditable Sense/Decide/Act pipelines for high-reliability systems"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -44,6 +44,7 @@ dependencies = [
 
     # HTTP client
     "httpx>=0.28,<1",  # Async HTTP client
+    "httpcore>=1.0.9,<2",  # Public backend interfaces for absolute HTTP deadlines
 
     # Database
     "sqlalchemy>=2.0,<3",  # SQL toolkit and ORM
@@ -134,7 +135,7 @@ llm = [
     "jinja2>=3.1,<4",  # Template engine for prompts
     "httpx>=0.28,<1",  # HTTP client (inherited from main deps)
     "openai>=2.36,<3",  # OpenAI SDK
-    "litellm>=1.83.10,<2",  # Multi-provider LLM interface
+    "litellm>=1.102.0,<2",  # Bundled pricing includes the production GPT-5.6 Terra model
 ]
 
 azure = [
@@ -152,7 +153,7 @@ aws = [
     "botocore[crt]>=1.40,<2",
     "ijson>=3.3,<4",
     "jinja2>=3.1,<4",
-    "cryptography>=49,<50",
+    "cryptography>=50,<51",
 ]
 
 mcp = [
@@ -169,12 +170,12 @@ webui = [
     # Web UX -- LLM Composer MVP
     "fastapi>=0.136,<1",
     "uvicorn[standard]>=0.46,<1",
-    "PyJWT[crypto]>=2.12,<3",
+    "PyJWT[crypto]>=2.15,<3",
     "python-multipart>=0.0.27",
     "websockets>=14.2,<15",
     "httpx>=0.28,<1",
     "bcrypt>=4.3,<5",
-    "litellm>=1.83.10,<2",
+    "litellm>=1.102.0,<2",
     # Prometheus metrics exposition endpoint (B1-r3 MeterProvider precondition)
     "opentelemetry-exporter-prometheus>=0.61b0,<0.62",
     "prometheus_client>=0.21,<1",
@@ -223,7 +224,7 @@ all = [
     # llm dependencies
     "jinja2>=3.1,<4",
     "openai>=2.36,<3",
-    "litellm>=1.83.10,<2",
+    "litellm>=1.102.0,<2",
     # azure dependencies
     "azure-storage-blob>=12.28,<13",
     "azure-identity>=1.25,<2",
@@ -233,7 +234,7 @@ all = [
     "boto3>=1.40,<2",
     "botocore[crt]>=1.40,<2",
     "ijson>=3.3,<4",
-    "cryptography>=49,<50",
+    "cryptography>=50,<51",
     # mcp dependencies
     "mcp>=1.27,<2",
     # tracing dependencies
@@ -244,7 +245,7 @@ all = [
     # webui dependencies
     "fastapi>=0.136,<1",
     "uvicorn[standard]>=0.46,<1",
-    "PyJWT[crypto]>=2.12,<3",
+    "PyJWT[crypto]>=2.15,<3",
     "python-multipart>=0.0.27",
     "websockets>=14.2,<15",
     "httpx>=0.28,<1",
@@ -274,8 +275,24 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/elspeth"]
 
+[tool.uv]
+# Security floors for packages also pulled in through SDK dependencies.
+constraint-dependencies = [
+    "oauthlib>=4,<5",
+    "PyJWT>=2.15,<3",
+]
+
 [tool.uv.sources]
 elspeth-lints = { path = "elspeth-lints", editable = true }
+
+[dependency-groups]
+# Required gate executables run from the reviewed lock. They are separate from
+# the shipped application and developer extras because CI audits those graphs;
+# resolving the auditor itself during the gate would make the verdict mutable.
+audit = [
+    "pip-audit==2.10.1",
+    "pip-licenses==5.5.5",
+]
 
 # === Ruff Configuration ===
 [tool.ruff]
@@ -326,6 +343,7 @@ extend-immutable-calls = ["typer.Option", "typer.Argument"]
 ".claude/skills/**/*.py" = ["T20"]  # Symlinks into .agents/skills; kept so a resolved path is treated the same
 "evals/composer-parity/live_acceptance.py" = ["T20"]  # CLI oracle: print/stderr is the accept/reject output channel
 "evals/composer-battery/*.py" = ["T20"]  # CLI: print is the report/stderr output channel
+"docs/github-issues/*.py" = ["T20"]  # Issue-migration CLIs: print is the gate/import report channel
 "notes/**/*.py" = ["T20"]  # Ad-hoc diagnostic scripts — print is the output channel
 "docs-archive/**/*.py" = ["T20"]  # Archived sources are frozen-as-of-relocation; not maintained against current lint rules
 "elspeth-lints/src/elspeth_lints/rules/trust_tier/tier_model/rule.py" = [

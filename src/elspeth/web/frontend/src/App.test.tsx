@@ -14,6 +14,7 @@ import { resetStore } from "@/test/store-helpers";
 import { useSessionStore } from "./stores/sessionStore";
 import { useExecutionStore } from "./stores/executionStore";
 import { useAuthStore } from "./stores/authStore";
+import { useMailboxStore } from "./stores/mailboxStore";
 import { usePreferencesStore } from "./stores/preferencesStore";
 import {
   OPEN_GRAPH_MODAL_EVENT,
@@ -55,7 +56,6 @@ const artifactWorkspacePropsSpy = vi.hoisted(() => vi.fn());
 vi.mock("./components/workspace/ComposerWorkspace", () => ({
   ComposerWorkspace: (props: {
     authoring: React.ReactNode;
-    authoringStatus?: React.ReactNode;
     artifact: React.ReactNode;
     inspector: React.ReactNode;
     actionBar: React.ReactNode;
@@ -65,7 +65,6 @@ vi.mock("./components/workspace/ComposerWorkspace", () => ({
     return (
       <div data-testid="composer-workspace-stub">
         {props.authoring}
-        {props.authoringStatus}
         {props.artifact}
         {props.inspector}
         {props.actionBar}
@@ -103,15 +102,6 @@ vi.mock("./components/workspace/ArtifactWorkspace", () => ({
       </div>
     );
   },
-}));
-
-vi.mock("./components/workspace/WorkspaceInspector", () => ({
-  WorkspaceInspector: () => (
-    <div data-testid="workspace-inspector-stub">
-      <div data-testid="audit-readiness-stub" />
-      <div data-testid="side-rail-validation-banner-stub" />
-    </div>
-  ),
 }));
 
 vi.mock("./components/workspace/WorkspaceActionBar", () => ({
@@ -260,6 +250,7 @@ vi.mock("./api/client", () => ({
   fetchSystemStatus: vi.fn().mockResolvedValue({
     composer_available: true,
     composer_model: "gpt-4o",
+    composer_advisor_model: "anthropic/claude-sonnet-4-6",
     composer_provider: "openai",
     composer_reason: null,
     composer_missing_keys: [],
@@ -285,8 +276,6 @@ vi.mock("./api/client", () => ({
   // module imports these from @/api/client and would receive `undefined`
   // (throwing at first call) without the mock entries.
   fetchUserComposerPreferences: vi.fn().mockResolvedValue({
-    default_mode: "guided",
-    banner_dismissed_at: null,
     freeform_intro_dismissed_at: null,
     tutorial_completed_at: "2026-05-19T00:00:00Z",
     tutorial_stage: null,
@@ -308,6 +297,21 @@ vi.mock("./api/shareableReviews", () => ({
   fetchSharedInspect: vi.fn().mockReturnValue(new Promise(() => {})),
   markReadyForReview: vi.fn(),
   fetchShareableLink: vi.fn(),
+}));
+
+// ── People directory API stub ────────────────────────────────────────────────
+// App asks the server's capability projection whether to offer People &
+// access. Default: the signed-in test operator holds neither capability, so
+// no other test grows an account-menu entry. The mount test below grants one.
+
+const peopleCapabilities = vi.hoisted(() => ({
+  current: { identity_admin: false, local_accounts: false, auth_provider: "local", self_identity_id: "test-001", self_username: "test-operator" },
+}));
+
+vi.mock("./api/people", async () => ({
+  ...(await vi.importActual<typeof import("./api/people")>("./api/people")),
+  fetchPeopleCapabilities: vi.fn(() => Promise.resolve(peopleCapabilities.current)),
+  listPeople: vi.fn(() => Promise.resolve({ people: [], limit: 25, offset: 0, has_more: false, capabilities: peopleCapabilities.current, active_human_admin_count: 2 })),
 }));
 
 // ── Store subscriptions ──────────────────────────────────────────────────────
@@ -337,6 +341,8 @@ describe("App banner roles", () => {
         dev_admin: false,
       } as never,
     } as never);
+    useMailboxStore.getState().reset();
+    peopleCapabilities.current = { ...peopleCapabilities.current, identity_admin: false, local_accounts: false };
     localStorage.clear();
     window.history.replaceState(null, "", "/");
     // Restore the default (backend up, composer available) after any
@@ -344,6 +350,7 @@ describe("App banner roles", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -354,6 +361,37 @@ describe("App banner roles", () => {
     workspaceMountSpy.mockClear();
     workspaceCapabilitiesSpy.mockClear();
     artifactWorkspacePropsSpy.mockClear();
+  });
+
+  it("mounts mailbox, library and People & access from the account menu", async () => {
+    // The mailbox reports NO admin role: the entry comes from the server's
+    // capability projection, not from whatever the mailbox happened to load.
+    useMailboxStore.setState({ summary: {
+      governance: "on", roles: [], approvals_to_decide: 0, reviews_to_attest: 0, decisions_unseen: 0,
+    } });
+    peopleCapabilities.current = { ...peopleCapabilities.current, identity_admin: true };
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    await userEvent.click(screen.getByRole("button", { name: "Mailbox" }));
+    expect(screen.getByRole("dialog", { name: "Mailbox" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Close mailbox" }));
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    await userEvent.click(screen.getByRole("button", { name: "Shared library" }));
+    expect(screen.getByRole("dialog", { name: "Shared library" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Close shared library" }));
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    await userEvent.click(await screen.findByRole("button", { name: "People & access" }));
+    expect(screen.getByRole("dialog", { name: "People & access" })).toBeInTheDocument();
+    // Sign-out unmounts the panel, and with it every piece of administrative state.
+    act(() => useAuthStore.setState({ token: null, user: null } as never));
+    expect(screen.queryByRole("dialog", { name: "People & access" })).not.toBeInTheDocument();
+  });
+
+  it("offers no People & access entry to a user who holds neither capability", async () => {
+    render(<App />);
+    await userEvent.click(screen.getByRole("button", { name: "account menu" }));
+    expect(screen.getByRole("button", { name: "Mailbox" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "People & access" })).not.toBeInTheDocument();
   });
 
   it("uses role=alert for the backend-unavailable banner (hard outage)", async () => {
@@ -382,6 +420,7 @@ describe("App banner roles", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -393,6 +432,26 @@ describe("App banner roles", () => {
     const banner = await screen.findByTestId("classification-banner");
     expect(banner).toHaveTextContent("UNOFFICIAL");
     expect(banner).toHaveClass("classification-banner--unofficial");
+  });
+
+  it("publishes the advisor model from the status payload into the session store", async () => {
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: true,
+      composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-opus-4-7",
+      composer_provider: "openai",
+      composer_reason: null,
+      composer_missing_keys: [],
+    } satisfies SystemStatus);
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(useSessionStore.getState().composerAdvisorModel).toBe(
+        "anthropic/claude-opus-4-7",
+      ),
+    );
+    expect(useSessionStore.getState().composerModel).toBe("gpt-4o");
   });
 
   it("renders no classification banner when the deployment declares none", async () => {
@@ -408,6 +467,7 @@ describe("App banner roles", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: false,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: "No API key configured",
       composer_missing_keys: ["OPENAI_API_KEY"],
@@ -432,6 +492,7 @@ describe("App banner roles", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: false,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: "No API key configured",
       composer_missing_keys: ["OPENAI_API_KEY"],
@@ -467,6 +528,7 @@ describe("App banner roles", () => {
       vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
         composer_available: false,
         composer_model: "gpt-4o",
+        composer_advisor_model: "anthropic/claude-sonnet-4-6",
         composer_provider: "openai",
         composer_reason: "No API key configured",
         composer_missing_keys: ["OPENAI_API_KEY"],
@@ -581,7 +643,7 @@ describe("App banner roles", () => {
     expect(screen.queryByLabelText(/sessions sidebar/i)).not.toBeInTheDocument();
   });
 
-  it("mounts one common workspace with authoring, artifact, inspector, and actions", async () => {
+  it("mounts one common workspace with authoring, artifact, and actions", async () => {
     // An active session keeps the composer shell mounted — with no sessions
     // at all App now renders the empty landing instead (elspeth-e69642fede).
     useSessionStore.setState({ activeSessionId: "session-1" });
@@ -590,10 +652,6 @@ describe("App banner roles", () => {
     await waitFor(() => {
       expect(api.fetchSystemStatus).toHaveBeenCalled();
     });
-    expect(screen.getByTestId("audit-readiness-stub")).toBeInTheDocument();
-    expect(
-      screen.getByTestId("side-rail-validation-banner-stub"),
-    ).toBeInTheDocument();
     expect(screen.getByTestId("chat-panel-stub")).toBeInTheDocument();
     expect(screen.getByTestId("artifact-workspace-stub")).toBeInTheDocument();
     expect(screen.getByTestId("workspace-action-bar-stub")).toBeInTheDocument();
@@ -627,8 +685,8 @@ describe("App banner roles", () => {
   });
 
   it.each([
-    ["busy", { guidedChatPending: true, error: null }],
-    ["error", { guidedChatPending: false, error: "authoring failed" }],
+    ["busy", { isComposing: true, error: null }],
+    ["error", { isComposing: false, error: "authoring failed" }],
   ] as const)(
     "renders the real App-owned collapsed status projection with %s tone",
     async (tone, state) => {
@@ -646,85 +704,6 @@ describe("App banner roles", () => {
       expect(projection).toHaveClass("workspace-collapsed-status");
     },
   );
-
-  it("keeps the common workspace during active guided work but exposes status controls only", async () => {
-    useSessionStore.setState({
-      activeSessionId: "session-1",
-      // Non-terminal guided session at step_3 with no server turn — the
-      // cold-start arm of isGuidedBuildActive, the same predicate ChatPanel's
-      // workspace branch renders under. Rendering the SideRail alongside it
-      // would put two rails side by side.
-      guidedSession: {
-        step: "step_3_transforms",
-        history: [],
-        terminal: null,
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      } as unknown as import("./types/guided").GuidedSession,
-      guidedNextTurn: null,
-    });
-    render(<App />);
-
-    await waitFor(() => {
-      expect(api.fetchSystemStatus).toHaveBeenCalled();
-    });
-    expect(screen.getByTestId("composer-workspace-stub")).toBeInTheDocument();
-    expect(screen.getByTestId("chat-panel-stub")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /validation/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /audit/i })).toBeInTheDocument();
-    expect(screen.queryByTestId("completion-bar")).toBeNull();
-    expect(screen.queryByRole("button", { name: /import yaml/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: /catalog/i })).toBeNull();
-    expect(screen.getAllByTestId("composer-workspace-stub")).toHaveLength(1);
-    expect(workspaceMountSpy).toHaveBeenCalled();
-    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
-      completion: false,
-    });
-    expect(artifactWorkspacePropsSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ catalogAvailable: false }),
-    );
-  });
-
-  it("keeps the same common workspace and restores actions after guided completion", async () => {
-    useSessionStore.setState({
-      activeSessionId: "session-1",
-      guidedSession: {
-        step: "step_4_wire",
-        history: [],
-        terminal: {
-          kind: "completed",
-          reason: null,
-          pipeline_yaml: "pipeline: {}",
-        },
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      } as unknown as import("./types/guided").GuidedSession,
-      guidedNextTurn: null,
-    });
-    render(<App />);
-
-    await waitFor(() => {
-      expect(api.fetchSystemStatus).toHaveBeenCalled();
-    });
-    expect(screen.getByTestId("audit-readiness-stub")).toBeInTheDocument();
-    expect(
-      screen.getByTestId("side-rail-validation-banner-stub"),
-    ).toBeInTheDocument();
-    expect(screen.getByTestId("composer-workspace-stub")).toBeInTheDocument();
-    expect(screen.getByTestId("completion-bar")).toBeInTheDocument();
-    expect(screen.getAllByTestId("composer-workspace-stub")).toHaveLength(1);
-    expect(workspaceMountSpy).toHaveBeenCalled();
-    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
-      completion: true,
-    });
-    expect(artifactWorkspacePropsSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ catalogAvailable: true }),
-    );
-  });
 
   it("loads sessions on startup after SessionSidebar removal", async () => {
     const session: Session = {
@@ -778,78 +757,6 @@ describe("App banner roles", () => {
     expect(onOpenCatalog).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("dialog", { name: "Plugin catalog" })).toBeInTheDocument();
     window.removeEventListener("open-catalog", onOpenCatalog);
-  });
-
-  it("blocks ambient and shortcut catalog requests during active guided work", async () => {
-    const onOpenCatalog = vi.fn();
-    window.addEventListener("open-catalog", onOpenCatalog);
-    useSessionStore.setState({
-      activeSessionId: "session-1",
-      guidedSession: {
-        step: "step_3_transforms",
-        history: [],
-        terminal: null,
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      } as unknown as import("./types/guided").GuidedSession,
-      guidedNextTurn: null,
-    });
-    render(<App />);
-    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
-
-    act(() => window.dispatchEvent(new CustomEvent("open-catalog")));
-    expect(onOpenCatalog).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("dialog", { name: "Plugin catalog" })).toBeNull();
-
-    fireEvent.keyDown(document, {
-      key: "P",
-      code: "KeyP",
-      ctrlKey: true,
-      shiftKey: true,
-    });
-    expect(onOpenCatalog).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("dialog", { name: "Plugin catalog" })).toBeNull();
-    window.removeEventListener("open-catalog", onOpenCatalog);
-  });
-
-  it("closes the Catalog drawer when active guided work revokes the capability", async () => {
-    useSessionStore.setState({ activeSessionId: "session-1" });
-    render(<App />);
-    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
-
-    act(() => window.dispatchEvent(new CustomEvent("open-catalog")));
-    expect(
-      screen.getByRole("dialog", { name: "Plugin catalog" }),
-    ).toBeInTheDocument();
-
-    act(() => {
-      useSessionStore.setState({
-        guidedSession: {
-          step: "step_3_transforms",
-          history: [],
-          terminal: null,
-          chat_history: [],
-          chat_turn_seq: 0,
-          reviewed_components: { sources: [], outputs: [] },
-          profile: null,
-        } as unknown as import("./types/guided").GuidedSession,
-        guidedNextTurn: null,
-      });
-    });
-
-    await waitFor(() =>
-      expect(
-        screen.queryByRole("dialog", { name: "Plugin catalog" }),
-      ).toBeNull(),
-    );
-    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
-      completion: false,
-    });
-    expect(artifactWorkspacePropsSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ catalogAvailable: false }),
-    );
   });
 
   it("routes Graph and YAML shortcuts to the active session's persistent artifact tabs", async () => {
@@ -1006,41 +913,6 @@ describe("App banner roles", () => {
     fireEvent.keyDown(document, { key: "e", metaKey: true });
 
     expect(onRequestRun).toHaveBeenCalledTimes(1);
-    expect(execute).not.toHaveBeenCalled();
-    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
-  });
-
-  it("does not dispatch run intent from Ctrl+E while the guided build hides the run owner", async () => {
-    const execute = vi.fn();
-    const onRequestRun = vi.fn();
-    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
-    useSessionStore.setState({
-      activeSessionId: "session-1",
-      compositionState: makeState(1),
-      guidedSession: {
-        step: "step_3_transforms",
-        history: [],
-        terminal: null,
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      } as unknown as import("./types/guided").GuidedSession,
-      guidedNextTurn: null,
-    });
-    render(<App />);
-    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
-    useExecutionStore.setState({
-      validationResult: makeValidationResult({
-        readiness: READY_VALIDATION_READINESS,
-      }),
-      isExecuting: false,
-      progress: null,
-      execute,
-    });
-    fireEvent.keyDown(document, { key: "e", ctrlKey: true });
-
-    expect(onRequestRun).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
     window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
   });
@@ -1324,6 +1196,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -1360,6 +1233,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -1385,6 +1259,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
       .mockResolvedValueOnce({
         composer_available: true,
         composer_model: "gpt-4o",
+        composer_advisor_model: "anthropic/claude-sonnet-4-6",
         composer_provider: "openai",
         composer_reason: null,
         composer_missing_keys: [],
@@ -1393,6 +1268,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
       .mockResolvedValue({
         composer_available: true,
         composer_model: "gpt-4o",
+        composer_advisor_model: "anthropic/claude-sonnet-4-6",
         composer_provider: "openai",
         composer_reason: null,
         composer_missing_keys: [],
@@ -1422,6 +1298,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
   const GOOD_STATUS = {
     composer_available: true,
     composer_model: "gpt-4o",
+    composer_advisor_model: "anthropic/claude-sonnet-4-6",
     composer_provider: "openai",
     composer_reason: null,
     composer_missing_keys: [],
@@ -1430,6 +1307,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
   const PARTIAL_STATUS = {
     composer_available: true,
     composer_model: "gpt-4o",
+    composer_advisor_model: "anthropic/claude-sonnet-4-6",
     composer_provider: "openai",
     composer_reason: null,
     composer_missing_keys: [],
@@ -1505,6 +1383,7 @@ describe("App composer recovery panel", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -1661,6 +1540,7 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -1687,12 +1567,12 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     // silent-swallow was the I5 bug (CorruptPreferencesError got
     // logged-and-forgotten, leaving the user with no signal). Bootstrap
     // is now contracted to NEVER reject; failures are surfaced via the
-    // store's writeError so the role="alert" region (Phase 1B-round-2)
+    // store's bootstrapError so the role="alert" region (Phase 1B-round-2)
     // shows the user something is wrong.
     //
     // We exercise the failure path through the lower API mock rather
     // than spying on bootstrap directly, so the test runs through the
-    // real bootstrap() implementation including the catch/writeError
+    // real bootstrap() implementation including the catch/bootstrapError
     // branch — the part that was previously uncovered.
     const apiClient = await import("@/api/client");
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
@@ -1706,19 +1586,18 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     await waitFor(() => {
       const state = usePreferencesStore.getState();
       expect(state.loaded).toBe(true);
-      expect(state.writeError).not.toBeNull();
+      expect(state.bootstrapError).not.toBeNull();
+      expect(state.writeError).toBeNull();
     });
-    // No-fabrication shape: defaultMode is still null (we don't guess).
-    expect(usePreferencesStore.getState().defaultMode).toBeNull();
     // App chrome remains rendered. The Layout/ChatPanel stubs are still
     // present — proves the bootstrap failure didn't unmount the tree.
     expect(screen.getByTestId("chat-panel-stub")).toBeInTheDocument();
     // I5: the failure MUST be surfaced to the user via the always-mounted
     // alert region in App.tsx. Without this assertion the test would
-    // pass even if writeError were set in the store but never rendered
+    // pass even if bootstrapError were set in the store but never rendered
     // to the DOM — the silent-failure-one-layer-up regression I5
     // exists to prevent. The role="alert" region carries the
-    // writeError text from the store.
+    // bootstrapError text from the store.
     await waitFor(() => {
       const alerts = screen.getAllByRole("alert");
       const surfaced = alerts.some(
@@ -1732,7 +1611,6 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "guided",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
     });
@@ -1750,7 +1628,6 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "guided",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
     });
@@ -1771,14 +1648,52 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     );
   });
 
+  it("keeps the tutorial visible when saving a preference fails", async () => {
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    usePreferencesStore.setState({
+      loaded: true,
+      tutorialCompletedAt: null,
+      tutorialCompleted: false,
+      bootstrapError: null,
+      writeError: "Couldn't save your preference: network down",
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+
+    render(<App />);
+
+    expect(screen.getByTestId("tutorial-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-workspace-stub")).not.toBeInTheDocument();
+    expect(screen.getByText(/Couldn't save your preference: network down/)).toBeInTheDocument();
+  });
+
+  it("blocks the tutorial when preferences could not be loaded", async () => {
+    const { usePreferencesStore } = await import("@/stores/preferencesStore");
+    usePreferencesStore.setState({
+      loaded: true,
+      tutorialCompletedAt: null,
+      tutorialCompleted: false,
+      bootstrapError: "Preferences could not be loaded: network down",
+      writeError: null,
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+
+    render(<App />);
+
+    expect(screen.queryByTestId("tutorial-stub")).not.toBeInTheDocument();
+    expect(screen.getByText(/Preferences could not be loaded: network down/)).toBeInTheDocument();
+  });
+
   it("remounts the tutorial shell after Reset tutorial succeeds", async () => {
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "guided",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
-      tutorialStage: "guided",
+      tutorialStage: "build",
       tutorialSessionId: "sess-in-progress",
       tutorialRunId: null,
       tutorialSourceDataHash: null,
@@ -1788,8 +1703,6 @@ describe("App preferences bootstrap (Phase 1B)", () => {
       undefined,
     );
     vi.spyOn(api, "updateUserComposerPreferences").mockResolvedValueOnce({
-      default_mode: "guided",
-      banner_dismissed_at: null,
       freeform_intro_dismissed_at: null,
       tutorial_completed_at: null,
       tutorial_stage: null,
@@ -1853,6 +1766,7 @@ describe("App shared-route Layout suppression (Phase 6B Task 8)", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],
@@ -1923,6 +1837,7 @@ describe("App empty landing and auto-resume", () => {
     vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
       composer_available: true,
       composer_model: "gpt-4o",
+      composer_advisor_model: "anthropic/claude-sonnet-4-6",
       composer_provider: "openai",
       composer_reason: null,
       composer_missing_keys: [],

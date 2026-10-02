@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -24,6 +24,9 @@ class ImportAliasEffect:
     proven: tuple[tuple[str, str], ...] = ()
     invalidated: tuple[str, ...] = ()
     clears_all: bool = False
+
+
+type ImportAliasResolver = Callable[[ast.Import | ast.ImportFrom], ImportAliasEffect]
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +182,9 @@ def function_local_binding_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -
     return names - declarations
 
 
-def possibly_bound_names(statements: Sequence[ast.stmt]) -> tuple[set[str], bool]:
+def possibly_bound_names(
+    statements: Sequence[ast.stmt], *, resolve_import: ImportAliasResolver = import_alias_effect
+) -> tuple[set[str], bool]:
     """Return every name ``statements`` may bind in their own scope, plus a star-import flag.
 
     Scope-respecting via :func:`iter_own_scope`: binders inside nested
@@ -205,7 +210,7 @@ def possibly_bound_names(statements: Sequence[ast.stmt]) -> tuple[set[str], bool
             elif isinstance(child, ast.ExceptHandler) and child.name is not None:
                 names.add(child.name)
             elif isinstance(child, (ast.Import, ast.ImportFrom)):
-                effect = import_alias_effect(child)
+                effect = resolve_import(child)
                 names.update(name for name, _target in effect.proven)
                 names.update(effect.invalidated)
                 clears_all = clears_all or effect.clears_all
@@ -230,6 +235,8 @@ def identical_alias_join(paths: Sequence[Mapping[str, str]]) -> dict[str, str]:
 def evaluate_alias_flow(
     statements: Sequence[ast.stmt],
     import_aliases: Mapping[str, str],
+    *,
+    resolve_import: ImportAliasResolver = import_alias_effect,
 ) -> tuple[AliasFlowPath, ...]:
     """Evaluate import-alias effects without emitting findings or matches.
 
@@ -238,13 +245,15 @@ def evaluate_alias_flow(
     suite is evaluated once for every incoming path, with an abrupt finalbody
     result replacing the pending transfer and normal completion preserving it.
     """
-    evaluator = _AliasEffectsEvaluator()
+    evaluator = _AliasEffectsEvaluator(resolve_import)
     return evaluator.statements(statements, (AliasFlowPath(dict(import_aliases)),))
 
 
 def evaluate_finally_entry_aliases(
     node: ast.Try | ast.TryStar,
     import_aliases: Mapping[str, str],
+    *,
+    resolve_import: ImportAliasResolver = import_alias_effect,
 ) -> dict[str, str]:
     """Return aliases proven identical on every path entering ``finally``.
 
@@ -254,13 +263,16 @@ def evaluate_finally_entry_aliases(
     that lexical state must not leak into the runtime entry state of
     ``finally``.
     """
-    evaluator = _AliasEffectsEvaluator()
+    evaluator = _AliasEffectsEvaluator(resolve_import)
     paths = evaluator.try_outgoing(node, dict(import_aliases))
     return identical_alias_join(tuple(path.aliases for path in paths))
 
 
 class _AliasEffectsEvaluator:
     """Non-emitting, fail-closed alias/control-flow evaluator."""
+
+    def __init__(self, resolve_import: ImportAliasResolver) -> None:
+        self._resolve_import = resolve_import
 
     def statements(
         self,
@@ -291,7 +303,7 @@ class _AliasEffectsEvaluator:
                 if path.transfer is not None:
                     next_paths.append(path)
                     continue
-                bound_names, clears_all = possibly_bound_names((statement,))
+                bound_names, clears_all = possibly_bound_names((statement,), resolve_import=self._resolve_import)
                 exception_aliases = {} if clears_all else {name: target for name, target in path.aliases.items() if name not in bound_names}
                 next_paths.append(AliasFlowPath(exception_aliases, "raise"))
                 next_paths.extend(self.statement(statement, path.aliases))
@@ -530,7 +542,7 @@ class _AliasEffectsEvaluator:
             aliases.pop(name, None)
 
     def _apply_import(self, aliases: dict[str, str], node: ast.Import | ast.ImportFrom) -> None:
-        effect = import_alias_effect(node)
+        effect = self._resolve_import(node)
         if effect.clears_all:
             aliases.clear()
         self._invalidate(aliases, effect.invalidated)

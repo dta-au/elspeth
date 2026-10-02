@@ -6,10 +6,97 @@ template fields at configuration time, before any data processing occurs.
 
 Note: Tests in TestDAGContractValidationWithLLMConfig and TestMultiTransformChain
 manually construct graphs to test validate_edge_compatibility(), which is a graph
-algorithm. Per CLAUDE.md, manual graph construction is acceptable for graph algorithm tests.
+algorithm. Per the ``engine-patterns-reference`` skill §Test Path Integrity, manual graph
+construction is acceptable for unit tests of isolated algorithms.
 """
 
+from pathlib import Path
+
 import pytest
+
+from elspeth.config_loading import load_settings_from_config_dict
+from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose
+from elspeth.core.dag import ExecutionGraph
+from elspeth.core.dag.models import EdgeContractError
+from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
+
+
+@pytest.mark.parametrize("multi_query", [False, True], ids=["single", "multi"])
+@pytest.mark.parametrize("consumer_type", ["str", "int"])
+def test_structured_llm_success_contract_builds_real_graph(tmp_path: Path, multi_query: bool, consumer_type: str) -> None:
+    """Generated answers satisfy string consumers; incompatible consumers still fail."""
+    names = ("good_colour_pair_answer", "approximate_hex_answer") if multi_query else ("answer",)
+    llm_options = {
+        "provider": "azure",
+        "deployment_name": "gpt-4o",
+        "endpoint": "https://test.openai.azure.com",
+        "api_key": "test-key",
+        "prompt_template": "Describe {{ row.colour }}",
+        "required_input_fields": ["colour"],
+        "schema": {"mode": "flexible", "fields": ["colour: str"]},
+    }
+    if multi_query:
+        llm_options["queries"] = {
+            name: {"input_fields": {"colour": "colour"}, "output_fields": [{"suffix": "answer", "type": "string"}]}
+            for name in ("good_colour_pair", "approximate_hex")
+        }
+    else:
+        llm_options["output_fields"] = [{"suffix": "answer", "type": "string"}]
+    settings = load_settings_from_config_dict(
+        {
+            "sources": {
+                "colours": {
+                    "plugin": "csv",
+                    "on_success": "enrich",
+                    "options": {
+                        "path": str(tmp_path / "input.csv"),
+                        "on_validation_failure": "discard",
+                        "schema": {"mode": "flexible", "fields": ["colour: str"]},
+                    },
+                }
+            },
+            "transforms": [
+                {"name": "enrich", "plugin": "llm", "input": "enrich", "on_success": "map", "on_error": "discard", "options": llm_options},
+                {
+                    "name": "map",
+                    "plugin": "field_mapper",
+                    "input": "map",
+                    "on_success": "results",
+                    "on_error": "discard",
+                    "options": {
+                        "mapping": {"colour": "colour", **{name: name for name in names}},
+                        "schema": {"mode": "flexible", "fields": ["colour: str", *(f"{name}: {consumer_type}" for name in names)]},
+                    },
+                },
+            ],
+            "sinks": {
+                "results": {
+                    "plugin": "json",
+                    "on_write_failure": "discard",
+                    "options": {"path": str(tmp_path / "output.json"), "schema": {"mode": "observed"}},
+                }
+            },
+        }
+    )
+    bundle = instantiate_plugins_from_config(settings, preflight_mode=True, sink_effect_purpose=SinkEffectExecutionPurpose.FRESH)
+
+    def build() -> ExecutionGraph:
+        return ExecutionGraph.from_plugin_instances(
+            sources=bundle.sources,
+            source_settings_map=bundle.source_settings_map,
+            transforms=bundle.transforms,
+            sinks=bundle.sinks,
+        )
+
+    if consumer_type == "int":
+        with pytest.raises(EdgeContractError) as caught:
+            build()
+        for name in names:
+            assert name in str(caught.value)
+        assert "expected int, got str" in str(caught.value)
+    else:
+        graph = build()
+        graph.validate_edge_compatibility()
 
 
 class TestLLMContractValidationBasics:

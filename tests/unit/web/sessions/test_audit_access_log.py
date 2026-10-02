@@ -25,7 +25,7 @@ def test_writer_principal_check(engine):
     with engine.begin() as conn:
         _make_session(conn, session_id="s1")
         # Accepted values
-        for principal in ("audit_grade_view", "admin_tool"):
+        for principal in ("audit_grade_view", "admin_tool", "workflow_inspect"):
             conn.execute(
                 insert(models.audit_access_log_table).values(
                     id=f"al_{principal}",

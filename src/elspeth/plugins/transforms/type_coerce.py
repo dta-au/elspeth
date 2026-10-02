@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import math
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -27,14 +28,54 @@ if TYPE_CHECKING:
     from elspeth.contracts.contexts import TransformContext
 
 
-class CoercionError(Exception):
-    """Raised when type coercion fails."""
+CoercionFailure = Literal[
+    "none_value",
+    "bool_not_numeric",
+    "non_finite",
+    "fractional_float",
+    "empty_string",
+    "not_integer_string",
+    "not_numeric_string",
+    "int_not_zero_or_one",
+    "float_not_bool",
+    "not_boolean_string",
+    "not_scalar",
+    "unsupported_type",
+]
 
-    def __init__(self, value: Any, target_type: str, reason: str) -> None:
-        self.value = value
+# One fixed sentence per failure arm. The coerced value is row data (Tier 2/3):
+# it stays in the row carrier (transform_errors.row_data_json), never in the
+# reason, so no sentence here may interpolate it.
+_FAILURE_MESSAGES: dict[CoercionFailure, str] = {
+    "none_value": "None cannot be converted",
+    "bool_not_numeric": "bool cannot be converted to a number",
+    "non_finite": "non-finite values are not allowed",
+    "fractional_float": "float has fractional part",
+    "empty_string": "empty string cannot be converted",
+    "not_integer_string": "string is not a valid integer string",
+    "not_numeric_string": "string is not a valid numeric string",
+    "int_not_zero_or_one": "only 0 and 1 can be converted to bool",
+    "float_not_bool": "float cannot be converted to bool",
+    "not_boolean_string": "string is not a valid boolean string",
+    "not_scalar": "value is not a scalar type",
+    "unsupported_type": "unsupported type",
+}
+
+
+class CoercionError(Exception):
+    """Raised when type coercion fails.
+
+    Carries only the failure arm, the target type and the input's type name —
+    never the input value, so neither ``str(exc)`` nor the audit reason built
+    from it can put row content into the Landscape.
+    """
+
+    def __init__(self, *, failure: CoercionFailure, target_type: str, actual_type: str) -> None:
+        self.failure = failure
         self.target_type = target_type
-        self.reason = reason
-        super().__init__(f"Cannot coerce {type(value).__name__} to {target_type}: {reason}")
+        self.actual_type = actual_type
+        self.message = _FAILURE_MESSAGES[failure]
+        super().__init__(f"Cannot coerce {actual_type} to {target_type}: {self.message}")
 
 
 def coerce_to_int(value: Any) -> int:
@@ -55,11 +96,11 @@ def coerce_to_int(value: Any) -> int:
     """
     # Reject None first
     if value is None:
-        raise CoercionError(value, "int", "None cannot be converted to int")
+        raise CoercionError(failure="none_value", target_type="int", actual_type=type(value).__name__)
 
     # Reject bool explicitly (before int check, since bool is subclass of int)
     if type(value) is bool:
-        raise CoercionError(value, "int", "bool cannot be converted to int")
+        raise CoercionError(failure="bool_not_numeric", target_type="int", actual_type=type(value).__name__)
 
     # int passes through
     if type(value) is int:
@@ -68,22 +109,22 @@ def coerce_to_int(value: Any) -> int:
     # float: only if no fractional part
     if type(value) is float:
         if not math.isfinite(value):
-            raise CoercionError(value, "int", "non-finite float cannot be converted to int")
+            raise CoercionError(failure="non_finite", target_type="int", actual_type=type(value).__name__)
         if value != int(value):
-            raise CoercionError(value, "int", f"float {value} has fractional part")
+            raise CoercionError(failure="fractional_float", target_type="int", actual_type=type(value).__name__)
         return int(value)
 
     # string: parse as integer
     if type(value) is str:
         trimmed = value.strip()
         if not trimmed:
-            raise CoercionError(value, "int", "empty string cannot be converted to int")
+            raise CoercionError(failure="empty_string", target_type="int", actual_type=type(value).__name__)
         try:
             return int(trimmed)
-        except ValueError as exc:
-            raise CoercionError(value, "int", f"'{trimmed}' is not a valid integer string") from exc
+        except ValueError:
+            raise CoercionError(failure="not_integer_string", target_type="int", actual_type=type(value).__name__) from None
 
-    raise CoercionError(value, "int", f"unsupported type {type(value).__name__}")
+    raise CoercionError(failure="unsupported_type", target_type="int", actual_type=type(value).__name__)
 
 
 def coerce_to_float(value: Any) -> float:
@@ -102,16 +143,16 @@ def coerce_to_float(value: Any) -> float:
     """
     # Reject None first
     if value is None:
-        raise CoercionError(value, "float", "None cannot be converted to float")
+        raise CoercionError(failure="none_value", target_type="float", actual_type=type(value).__name__)
 
     # Reject bool explicitly
     if type(value) is bool:
-        raise CoercionError(value, "float", "bool cannot be converted to float")
+        raise CoercionError(failure="bool_not_numeric", target_type="float", actual_type=type(value).__name__)
 
     # float: check finite
     if type(value) is float:
         if not math.isfinite(value):
-            raise CoercionError(value, "float", "non-finite float values are not allowed")
+            raise CoercionError(failure="non_finite", target_type="float", actual_type=type(value).__name__)
         return value
 
     # int -> float
@@ -122,16 +163,16 @@ def coerce_to_float(value: Any) -> float:
     if type(value) is str:
         trimmed = value.strip()
         if not trimmed:
-            raise CoercionError(value, "float", "empty string cannot be converted to float")
+            raise CoercionError(failure="empty_string", target_type="float", actual_type=type(value).__name__)
         try:
             result = float(trimmed)
-        except ValueError as exc:
-            raise CoercionError(value, "float", f"'{trimmed}' is not a valid numeric string") from exc
+        except ValueError:
+            raise CoercionError(failure="not_numeric_string", target_type="float", actual_type=type(value).__name__) from None
         if not math.isfinite(result):
-            raise CoercionError(value, "float", f"'{trimmed}' produces non-finite value")
+            raise CoercionError(failure="non_finite", target_type="float", actual_type=type(value).__name__)
         return result
 
-    raise CoercionError(value, "float", f"unsupported type {type(value).__name__}")
+    raise CoercionError(failure="unsupported_type", target_type="float", actual_type=type(value).__name__)
 
 
 # Boolean string mappings (case-insensitive after trim)
@@ -156,7 +197,7 @@ def coerce_to_bool(value: Any) -> bool:
     """
     # Reject None first
     if value is None:
-        raise CoercionError(value, "bool", "None cannot be converted to bool")
+        raise CoercionError(failure="none_value", target_type="bool", actual_type=type(value).__name__)
 
     # bool passes through
     if type(value) is bool:
@@ -168,11 +209,11 @@ def coerce_to_bool(value: Any) -> bool:
             return False
         if value == 1:
             return True
-        raise CoercionError(value, "bool", f"only 0 and 1 can be converted to bool, got {value}")
+        raise CoercionError(failure="int_not_zero_or_one", target_type="bool", actual_type=type(value).__name__)
 
     # float: reject
     if type(value) is float:
-        raise CoercionError(value, "bool", "float cannot be converted to bool")
+        raise CoercionError(failure="float_not_bool", target_type="bool", actual_type=type(value).__name__)
 
     # string: check against true/false sets
     if type(value) is str:
@@ -181,9 +222,9 @@ def coerce_to_bool(value: Any) -> bool:
             return True
         if normalized in _BOOL_FALSE_STRINGS:
             return False
-        raise CoercionError(value, "bool", f"'{value}' is not a valid boolean string")
+        raise CoercionError(failure="not_boolean_string", target_type="bool", actual_type=type(value).__name__)
 
-    raise CoercionError(value, "bool", f"unsupported type {type(value).__name__}")
+    raise CoercionError(failure="unsupported_type", target_type="bool", actual_type=type(value).__name__)
 
 
 # Scalar types accepted for string conversion
@@ -203,11 +244,11 @@ def coerce_to_str(value: Any) -> str:
     """
     # Reject None first
     if value is None:
-        raise CoercionError(value, "str", "None cannot be converted to str")
+        raise CoercionError(failure="none_value", target_type="str", actual_type=type(value).__name__)
 
     # Only accept scalar types
     if type(value) not in _SCALAR_TYPES:
-        raise CoercionError(value, "str", f"{type(value).__name__} is not a scalar type")
+        raise CoercionError(failure="not_scalar", target_type="str", actual_type=type(value).__name__)
 
     return str(value)
 
@@ -239,6 +280,25 @@ class TypeCoerceConfig(TransformDataConfig):
         ...,
         description="List of field type conversions to apply",
     )
+
+    @property
+    def declared_input_fields(self) -> frozenset[str]:
+        """Every conversion's ``field`` is an input this transform requires.
+
+        A conversion names an existing field it reads and retypes, and the
+        output config keys that field's declaration by the same name
+        (``_build_type_coerce_output_schema_config``), so the name is a
+        declaration, not a mere lookup. Projecting it here puts it on the one
+        surface every declared-input authority reads: the build's
+        ``validate_transform_declared_input_fields`` and the Web Composer's
+        mirror (a conversion naming a column a participating, closed upstream
+        does not carry is refused before the run), the executor's pre-emission
+        check, and the field-name spelling rule (operator ruling 2026-09-25,
+        2026-09-26 Q4 amendment), which refuses a header spelling (``Price``
+        for the header of ``price``) at build where the upstream proves it and
+        routes the row otherwise.
+        """
+        return super().declared_input_fields | frozenset(spec.field for spec in self.conversions)
 
     @model_validator(mode="after")
     def _validate_conversions_not_empty(self) -> TypeCoerceConfig:
@@ -280,7 +340,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:96417ef64dbb534f"
+    source_file_hash: str | None = "sha256:c1b155d1c89b28cc"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
@@ -325,6 +385,10 @@ class TypeCoerce(BaseTransform):
             allow_coercion=False,
         )
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """Publish successful conversions to the runtime and graph stamp table."""
+        return tuple(FieldDefinition(name=spec.field, field_type=spec.to, required=True, nullable=False) for spec in self._conversions)
+
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
         return {
@@ -358,26 +422,14 @@ class TypeCoerce(BaseTransform):
         conversion_targets: dict[str, Literal["int", "float", "bool", "str"]] = {}
 
         for spec in self._conversions:
-            config_field = spec.field  # Field name from config (may be original header)
+            # The row carries ``field`` under exactly this name: it is a
+            # declared input (``TypeCoerceConfig.declared_input_fields``), so the
+            # engine refused a row without it before process() (ADR-013), and
+            # the field-name spelling rule refused a header spelling of it (the
+            # build, or the executor preflight, operator ruling 2026-09-25).
+            config_field = spec.field
             target_type_name = spec.to
-
-            # Check field exists (PipelineRow resolves both original and normalized names)
-            if config_field not in row:
-                return TransformResult.error(
-                    {
-                        "reason": "missing_field",
-                        "field": config_field,
-                        "message": f"Field '{config_field}' not found in row",
-                    }
-                )
-
-            # Resolve to normalized key for output dict (handles original header names)
-            normalized_key = row.contract.find_name(config_field)
-            if normalized_key is None:
-                # Field exists in row but not in contract — use config name as-is
-                # (shouldn't happen for valid rows, but defensive for edge cases)
-                normalized_key = config_field
-            conversion_targets[normalized_key] = target_type_name
+            conversion_targets[config_field] = target_type_name
 
             value = row[config_field]
 
@@ -397,7 +449,7 @@ class TypeCoerce(BaseTransform):
             target_type = _TARGET_TYPES[target_type_name]
             # Use type() not isinstance() to avoid bool matching int
             if type(value) is target_type:
-                fields_unchanged.append(normalized_key)
+                fields_unchanged.append(config_field)
                 continue
 
             # Apply conversion
@@ -411,12 +463,13 @@ class TypeCoerce(BaseTransform):
                         "field": config_field,
                         "expected": target_type_name,
                         "actual": type(value).__name__,
-                        "message": e.reason,
+                        "error_type": e.failure,
+                        "message": e.message,
                     }
                 )
 
-            output[normalized_key] = converted
-            fields_coerced.append(normalized_key)
+            output[config_field] = converted
+            fields_coerced.append(config_field)
 
         output_contract = self._build_output_contract(row.contract, conversion_targets)
         return TransformResult.success(
@@ -446,12 +499,13 @@ class TypeCoerce(BaseTransform):
         recursed past this node to a stale upstream declaration, producing both
         a false accept and a false reject on the same root cause
         (elspeth-85e8afa2f5 panel review). ``value_transform`` already declares
-        its operation targets (as ``any``, since expression result types are
-        uninferable); a conversion target's type is exactly ``spec.to``, so the
+        its operation targets (from expressions over declared inputs); a
+        conversion target's type is exactly ``spec.to``, so the
         declaration here is concrete. ``required=True, nullable=False`` is
-        truthful for the success stream: a missing or ``None`` conversion field
-        errors the row onto the divert path, so every emitted row carries a
-        non-None converted value. Observed-mode configs (``fields is None``)
+        truthful for the success stream: a conversion field is a declared input
+        the engine requires before ``process()``, and a ``None`` one errors the
+        row onto the divert path, so every emitted row carries a non-None
+        converted value. Observed-mode configs (``fields is None``)
         stay observed — declaring into them would flip downstream edges off the
         observed bypass path; the walk abstains at undeclared pass-throughs
         instead.
@@ -491,40 +545,39 @@ class TypeCoerce(BaseTransform):
         contract: SchemaContract,
         conversion_targets: dict[str, Literal["int", "float", "bool", "str"]],
     ) -> SchemaContract:
-        """Return an aligned output contract whose field types match the emitted row."""
-        if not conversion_targets:
-            return self._align_output_contract(contract)
+        """The emitted contract: each converted field retyped, then the node's declarations stamped.
 
+        A converted field carries the type this transform wrote (never
+        ``None``: a ``None`` or unconvertible value errors the row). That is
+        the whole contract of an observed-mode node, whose output config
+        deliberately declares nothing (see
+        ``_build_type_coerce_output_schema_config``). When the operator's
+        schema declares fields, the output config holds the declaration of
+        every declared field and every conversion target, and the ONE stamp
+        (``_apply_declared_output_field_contracts``, ADR-050 Decision 2)
+        writes it onto the emitted contract; the strict input check admitted
+        every value it did not convert.
+        """
         changed = False
         output_fields: list[FieldContract] = []
         for field in contract.fields:
             target_type_name = conversion_targets.get(field.normalized_name)
-            if target_type_name is None:
-                output_fields.append(field)
-                continue
-
-            target_type = _TARGET_TYPES[target_type_name]
-            new_field = FieldContract(
-                normalized_name=field.normalized_name,
-                original_name=field.original_name,
-                python_type=target_type,
-                required=field.required,
-                source=field.source,
-                nullable=False,
-            )
+            new_field = field
+            if target_type_name is not None:
+                new_field = replace(field, python_type=_TARGET_TYPES[target_type_name], nullable=False)
             output_fields.append(new_field)
             if new_field != field:
                 changed = True
 
-        evolved_contract = contract
+        converted_contract = contract
         if changed:
-            evolved_contract = SchemaContract(
+            converted_contract = SchemaContract(
                 mode=contract.mode,
                 fields=tuple(output_fields),
                 locked=contract.locked,
             )
 
-        return self._align_output_contract(evolved_contract)
+        return self._align_output_contract(self._apply_declared_output_field_contracts(converted_contract))
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
@@ -532,10 +585,10 @@ class TypeCoerce(BaseTransform):
             return PluginAssistance(
                 plugin_name="type_coerce",
                 issue_code=None,
-                summary="Explicit type casting at a pipeline midpoint — str → int, str → float, etc. Use on_error to route un-coercible rows.",
+                summary="Explicit type casting for values arriving from sources or upstream transforms. Use on_error to route failed rows.",
                 composer_hints=(
-                    "Sources already validate/coerce; use type_coerce only when an upstream transform's output is the wrong type.",
-                    "Set on_error to a quarantine sink to capture un-coercible rows for audit, instead of crashing the run.",
+                    "Use type_coerce when values arrive with the wrong type: observed source values may be strings, and upstream transforms may emit an unresolved any.",
+                    "A missing declared conversion field routes as missing_field to on_error; an uncoercible present value routes too. Use a quarantine sink to retain failed rows; discard records them without output.",
                     "conversions is a LIST of {field, to} entries, e.g. conversions: [{field: price, to: float}, "
                     "{field: quantity, to: int}] — a field-to-type mapping is rejected; to accepts 'int', 'float', "
                     "'bool', 'str'.",

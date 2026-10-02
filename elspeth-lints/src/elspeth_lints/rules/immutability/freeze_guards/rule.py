@@ -25,6 +25,9 @@ from elspeth_lints.rules.immutability.shared import (
 )
 
 _ALL_RULE_IDS = frozenset(RULES)
+_VALIDATION_CALLS = frozenset({"isinstance", "len", "any", "all"})
+_VALIDATION_TYPES = frozenset({"dict", "list", "set", "tuple", "frozenset", "str", "int", "float", "bool", "bytes"})
+_VALIDATION_BUILTINS = _VALIDATION_CALLS | _VALIDATION_TYPES
 # Types whose isinstance(self.x, T) inside __post_init__ is a banned conditional
 # freeze guard. list/set are included because isinstance(self.x, list) gates a
 # deep_freeze the same way the wrapper types do.
@@ -85,6 +88,12 @@ class FreezeGuardVisitor(ast.NodeVisitor):
         self.symbol_stack: list[str] = []
         self._scope_is_class: list[bool] = []
         self._in_post_init = False
+        self._validation_calls: set[ast.Call] = set()
+        self._shadowed_validation_builtins: set[str] = set()
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self._shadowed_validation_builtins = _shadowed_validation_builtins(node)
+        self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.symbol_stack.append(node.name)
@@ -124,7 +133,27 @@ class FreezeGuardVisitor(ast.NodeVisitor):
         self._scope_is_class.append(False)
         was_in_post_init = self._in_post_init
         self._in_post_init = node.name == "__post_init__" and self._parent_is_class()
+        previous_validation_calls = self._validation_calls
+        self._validation_calls = set()
+        if (
+            self._in_post_init
+            and isinstance(node, ast.FunctionDef)
+            and not node.decorator_list
+            and not any(isinstance(child, (ast.Return, ast.Yield, ast.YieldFrom)) for child in ast.walk(node))
+        ):
+            # Only direct method-body rejection can qualify. A nested raise
+            # may be caught or conditional, and an else arm may skip freezing.
+            for statement in node.body:
+                if (
+                    isinstance(statement, ast.If)
+                    and len(statement.body) == 1
+                    and isinstance(statement.body[0], ast.Raise)
+                    and not statement.orelse
+                    and _is_validation_predicate(statement.test, self._shadowed_validation_builtins)
+                ):
+                    self._validation_calls.update(child for child in ast.walk(statement.test) if isinstance(child, ast.Call))
         self.generic_visit(node)
+        self._validation_calls = previous_validation_calls
         self._in_post_init = was_in_post_init
         self._scope_is_class.pop()
         self.symbol_stack.pop()
@@ -141,7 +170,7 @@ class FreezeGuardVisitor(ast.NodeVisitor):
                 )
 
             guard_types = self._isinstance_has_freeze_guard_types(node)
-            if guard_types:
+            if guard_types and node not in self._validation_calls:
                 self._add_finding(
                     "FG2",
                     node,
@@ -323,6 +352,102 @@ def _called_name(func: ast.expr) -> str:
     if isinstance(func, ast.Attribute):
         return func.attr
     return ""
+
+
+def _shadowed_validation_builtins(tree: ast.Module) -> set[str]:
+    """Conservatively reject uncertain builtin bindings anywhere in the file.
+
+    This deliberately does not attempt scope or alias flow analysis. A binding
+    in an unrelated scope may retain FG2, but cannot hide a conditional freeze.
+    """
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if node.id in {"exec", "eval", "globals", "locals", "vars", "setattr", "getattr", "delattr", "__import__", "__builtins__"}:
+                return set(_VALIDATION_BUILTINS)
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                bound.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            if node.attr in {"__dict__", "__setattr__", "__delattr__"}:
+                return set(_VALIDATION_BUILTINS)
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                bound.add(node.attr)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.Import):
+            bound.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if any(alias.name == "*" for alias in node.names):
+                return set(_VALIDATION_BUILTINS)
+            bound.update(alias.asname or alias.name for alias in node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            bound.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, ast.Match):
+            # Pattern bindings have several carriers; unsupported until needed.
+            return set(_VALIDATION_BUILTINS)
+    return bound & _VALIDATION_BUILTINS
+
+
+def _is_validation_predicate(expression: ast.expr, shadowed: set[str]) -> bool:
+    """Recognize a small validation grammar, not arbitrary Python purity.
+
+    Unknown calls, mutations, comprehensions, async expressions, and uncertain
+    builtin names keep FG2. Generator targets must be local names, so evaluating
+    validation cannot assign an attribute as an iteration side effect.
+    """
+    for node in ast.walk(expression):
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _VALIDATION_CALLS or node.func.id in shadowed or node.keywords:
+                return False
+            if node.func.id == "isinstance":
+                if len(node.args) != 2:
+                    return False
+                types = node.args[1].elts if isinstance(node.args[1], ast.Tuple) else [node.args[1]]
+                if not types or any(
+                    not isinstance(item, ast.Name) or item.id not in _VALIDATION_TYPES or item.id in shadowed for item in types
+                ):
+                    return False
+            elif len(node.args) != 1 or (node.func.id in {"any", "all"} and not isinstance(node.args[0], ast.GeneratorExp)):
+                return False
+        elif isinstance(node, ast.Attribute):
+            if not isinstance(node.value, ast.Name) or node.value.id != "self" or not isinstance(node.ctx, ast.Load):
+                return False
+        elif isinstance(node, ast.comprehension):
+            if node.is_async or not isinstance(node.target, ast.Name):
+                return False
+        elif not isinstance(
+            node,
+            (
+                ast.Name,
+                ast.Constant,
+                ast.Load,
+                ast.Store,
+                ast.Tuple,
+                ast.BoolOp,
+                ast.And,
+                ast.Or,
+                ast.UnaryOp,
+                ast.Not,
+                ast.Compare,
+                ast.Eq,
+                ast.NotEq,
+                ast.Lt,
+                ast.LtE,
+                ast.Gt,
+                ast.GtE,
+                ast.Is,
+                ast.IsNot,
+                ast.In,
+                ast.NotIn,
+                ast.GeneratorExp,
+            ),
+        ):
+            return False
+    return True
 
 
 def _expr_contains_deep_freeze_call(expr: ast.expr) -> bool:

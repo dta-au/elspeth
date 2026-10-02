@@ -65,7 +65,8 @@ group_losses: panel_merge / quarantined     ← L1: a reviewer was lost, so the 
 group_losses: doc_verdict  / group_failed   ← L2: a page was missing, so SUB-02's verdict was refused
 corpus_summary: {"count": 3, ...}           ← L3: the number is over 3 of 4 documents
 ✗5 failed, PARTIAL, exit 1
-23 llm calls                                ← 24 minus the one arm never spent
+23 row-level LLM calls                      ← 24 minus the one arm never spent
+2 runtime preflight LLM calls               ← one per reviewer node
 ```
 
 Read the ledger, not just the exit code:

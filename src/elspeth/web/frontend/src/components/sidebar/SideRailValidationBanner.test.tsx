@@ -64,6 +64,8 @@ describe("SideRailValidationBanner", () => {
               component_id: "select_columns",
               component_type: "transform",
               detail: "select_columns",
+              suggestion: null,
+              note: null,
             },
           ],
         },
@@ -111,6 +113,8 @@ describe("SideRailValidationBanner", () => {
               component_id: "select_columns",
               component_type: "transform",
               detail: "select_columns",
+              suggestion: null,
+              note: null,
             },
           ],
         },
@@ -330,6 +334,7 @@ describe("SideRailValidationBanner", () => {
       const user = userEvent.setup();
       const sendMessage = vi.fn().mockResolvedValue(undefined);
       useSessionStore.setState({
+        activeSessionId: "session-1",
         compositionState: makeComposition(1, {
           validation_suggestions: [SUGGESTION],
         }),
@@ -353,6 +358,7 @@ describe("SideRailValidationBanner", () => {
       const user = userEvent.setup();
       const sendMessage = vi.fn().mockResolvedValue(undefined);
       useSessionStore.setState({
+        activeSessionId: "session-1",
         compositionState: makeComposition(1, {
           validation_suggestions: [SUGGESTION],
         }),
@@ -542,6 +548,7 @@ describe("SideRailValidationBanner", () => {
         validation_suggestions: [
           {
             component: "select_columns",
+            error_code: "schema_contract_violation",
             message:
               "Schema contract violation: 'source' -> 'select_columns': required field 'id' is not guaranteed",
             severity: "info",
@@ -594,12 +601,14 @@ describe("SideRailValidationBanner", () => {
         validation_suggestions: [
           {
             component: "select_columns",
+            error_code: "schema_contract_violation",
             message:
               "Schema contract violation: 'source' -> 'select_columns': required field 'id' is not guaranteed",
             severity: "info",
           },
           {
             component: "sink_a",
+            error_code: "schema_contract_violation",
             message:
               "Schema contract violation: 'select_columns' -> 'sink_a': required field 'total' is not guaranteed",
             severity: "info",

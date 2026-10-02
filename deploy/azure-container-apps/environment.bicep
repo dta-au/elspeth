@@ -114,9 +114,12 @@ var suffix = uniqueString(resourceGroup().id)
 var fileStorageAccountName = toLower(take(replace('${namePrefix}fs${suffix}', '-', ''), 24))
 var blobStorageAccountName = toLower(take(replace('${namePrefix}bs${suffix}', '-', ''), 24))
 var keyVaultName = take('${namePrefix}-kv-${suffix}', 24)
+var schemaOwnerKeyVaultName = take('${namePrefix}-skv-${suffix}', 24)
 var postgresServerName = '${namePrefix}-pg-${suffix}'
 var nfsShareName = 'elspeth'
-var nfsStorageName = 'elspeth-nfs'
+// AVM managed-environment 0.16.0 uses this name for BOTH the environment
+// storage alias and the physical /<account>/<share> NFS export path.
+var nfsStorageName = nfsShareName
 var payloadContainerName = 'elspeth-payloads'
 var registrySubscriptionId = split(containerRegistryResourceId, '/')[2]
 var registryResourceGroupName = split(containerRegistryResourceId, '/')[4]
@@ -131,6 +134,24 @@ module identity 'br/public:avm/res/managed-identity/user-assigned-identity:0.6.0
     name: '${namePrefix}-id'
     location: location
     tags: tags
+  }
+}
+
+module schemaOwnerIdentity 'br/public:avm/res/managed-identity/user-assigned-identity:0.6.0' = {
+  name: '${namePrefix}-schema-owner-identity'
+  params: {
+    name: '${namePrefix}-schema-owner-id'
+    location: location
+    tags: tags
+  }
+}
+
+module schemaOwnerRegistryPull 'modules/registry-pull-role.bicep' = {
+  name: '${namePrefix}-schema-owner-registry-pull'
+  scope: resourceGroup(registrySubscriptionId, registryResourceGroupName)
+  params: {
+    registryName: registryName
+    principalId: schemaOwnerIdentity.outputs.principalId
   }
 }
 
@@ -373,6 +394,8 @@ module blobStorage 'br/public:avm/res/storage/storage-account:0.33.0' = {
 
 // ---------------------------------------------------------------------------
 // Key Vault: RBAC, secrets resolved by the identity (Key Vault Secrets User).
+// This vault contains runtime credentials and application keys only. Schema
+// init reads the application keys with its own identity, never the runtime one.
 // ---------------------------------------------------------------------------
 module keyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
   name: '${namePrefix}-key-vault'
@@ -396,6 +419,11 @@ module keyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
         roleDefinitionIdOrName: 'Key Vault Secrets User'
         principalType: 'ServicePrincipal'
       }
+      {
+        principalId: schemaOwnerIdentity.outputs.principalId
+        roleDefinitionIdOrName: 'Key Vault Secrets User'
+        principalType: 'ServicePrincipal'
+      }
     ]
     privateEndpoints: [
       {
@@ -414,6 +442,47 @@ module keyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
 }
 
 // ---------------------------------------------------------------------------
+// Schema-owner credentials have a separate vault so runtime vault-wide read
+// authority can never recover the database-owner credentials.
+module schemaOwnerKeyVault 'br/public:avm/res/key-vault/vault:0.14.0' = {
+  name: '${namePrefix}-schema-owner-key-vault'
+  params: {
+    name: schemaOwnerKeyVaultName
+    location: location
+    tags: tags
+    sku: 'standard'
+    enableRbacAuthorization: true
+    enableSoftDelete: true
+    enablePurgeProtection: keyVaultPurgeProtection
+    publicNetworkAccess: empty(keyVaultAllowedIpRules) ? 'Disabled' : 'Enabled'
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Deny'
+      ipRules: map(keyVaultAllowedIpRules, ip => { value: ip })
+    }
+    roleAssignments: [
+      {
+        principalId: schemaOwnerIdentity.outputs.principalId
+        roleDefinitionIdOrName: 'Key Vault Secrets User'
+        principalType: 'ServicePrincipal'
+      }
+    ]
+    privateEndpoints: [
+      {
+        service: 'vault'
+        subnetResourceId: vnet.outputs.subnetResourceIds[1]
+        privateDnsZoneGroup: {
+          privateDnsZoneGroupConfigs: [
+            {
+              privateDnsZoneResourceId: keyVaultDnsZone.outputs.resourceId
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
+
 // PostgreSQL Flexible Server: BOTH databases, password authentication (Entra
 // excluded on the record, plan D4), private endpoint plus optional operator
 // firewall rule.
@@ -510,6 +579,9 @@ output environmentDefaultDomain string = managedEnvironment.outputs.defaultDomai
 output identityResourceId string = identity.outputs.resourceId
 output identityPrincipalId string = identity.outputs.principalId
 output identityClientId string = identity.outputs.clientId
+output schemaOwnerIdentityResourceId string = schemaOwnerIdentity.outputs.resourceId
+output schemaOwnerKeyVaultName string = schemaOwnerKeyVault.outputs.name
+output schemaOwnerKeyVaultUri string = schemaOwnerKeyVault.outputs.uri
 output keyVaultName string = keyVault.outputs.name
 output keyVaultUri string = keyVault.outputs.uri
 output postgresServerResourceId string = postgres.outputs.resourceId

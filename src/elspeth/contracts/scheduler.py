@@ -37,6 +37,29 @@ class SchedulerEventType(StrEnum):
     MARK_PENDING_SINK = "mark_pending_sink"
     MARK_PENDING_SINK_TERMINAL = "mark_pending_sink_terminal"
     MARK_BLOCKED_BARRIER_TERMINAL = "mark_blocked_barrier_terminal"
+    # Resume returns a FAILED item whose token has no completed outcome (a claim
+    # that died on an exception mid-row) to READY for re-drive.
+    RESUME_REQUEUE_FAILED = "resume_requeue_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceIngestSpec:
+    """Source identity and detached data for one atomic scheduler ingest."""
+
+    source_node_id: str
+    row_index: int
+    source_row_index: int
+    ingest_sequence: int
+    row_id: str
+    token_id: str
+    data: Mapping[str, object]
+    source_contract_json: str | None = None
+
+    def __post_init__(self) -> None:
+        require_int(self.row_index, "row_index", min_value=0)
+        require_int(self.source_row_index, "source_row_index", min_value=0)
+        require_int(self.ingest_sequence, "ingest_sequence", min_value=0)
+        freeze_fields(self, "data")
 
 
 @dataclass(frozen=True)
@@ -259,3 +282,39 @@ class SchedulerEvent:
         _validate_scheduler_enum(self.to_status, TokenWorkStatus, "to_status")
         require_int(self.from_attempt, "from_attempt", optional=True, min_value=0)
         require_int(self.to_attempt, "to_attempt", min_value=0)
+
+
+# How many token ids a resume refusal names in its recorded event and message:
+# enough to start an investigation, bounded independent of the run's size.
+RESUME_REFUSAL_TOKEN_ID_LIMIT = 10
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeCoverageRefusal:
+    """The resume coverage check's refusal: undecided tokens no scheduler work covers.
+
+    Resume re-drives only durable scheduler work and never re-derives a row,
+    so every token of a resumable run is decided (a completed outcome) or
+    covered by a READY / LEASED / BLOCKED / PENDING_SINK item. This names the
+    tokens that are neither. Carries ELSPETH token identifiers and a count
+    only — never row values. ``first_token_ids`` is the sorted head of the
+    offending set, bounded by ``RESUME_REFUSAL_TOKEN_ID_LIMIT``.
+    """
+
+    token_count: int
+    first_token_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        require_int(self.token_count, "token_count", min_value=1)
+        if type(self.first_token_ids) is not tuple:
+            raise TypeError(f"first_token_ids must be a tuple, got {type(self.first_token_ids).__name__}")
+        for token_id in self.first_token_ids:
+            if type(token_id) is not str or not token_id:
+                raise ValueError(f"first_token_ids entries must be non-empty strings, got {token_id!r}")
+        if len(self.first_token_ids) != min(self.token_count, RESUME_REFUSAL_TOKEN_ID_LIMIT):
+            raise ValueError(
+                f"first_token_ids must name min(token_count, {RESUME_REFUSAL_TOKEN_ID_LIMIT}) tokens; "
+                f"got {len(self.first_token_ids)} for token_count={self.token_count}"
+            )
+        if list(self.first_token_ids) != sorted(set(self.first_token_ids)):
+            raise ValueError("first_token_ids must be sorted and distinct")

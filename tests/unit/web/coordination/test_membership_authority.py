@@ -131,6 +131,28 @@ def _settings(**overrides: Any) -> WebSettings:
 
 
 class TestIdentityFromSettings:
+    def test_aca_registers_the_platform_revision_and_candidate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CONTAINER_APP_REVISION", "elspeth--candidate-123")
+        identity = web_instance_identity_from_settings(
+            _settings(deployment_target="azure-container-apps", operator_telemetry_release="a" * 40),
+            instance_id="replica-123",
+        )
+        assert identity.deployment_generation == "elspeth--candidate-123"
+        assert identity.revision_label == "elspeth--candidate-123"
+        assert identity.image_digest == "a" * 40
+
+    @pytest.mark.parametrize("missing", ["revision", "release"])
+    def test_aca_requires_deployment_identity(self, missing: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CONTAINER_APP_REVISION", raising=False)
+        if missing != "revision":
+            monkeypatch.setenv("CONTAINER_APP_REVISION", "elspeth--candidate-123")
+        settings = _settings(
+            deployment_target="azure-container-apps",
+            operator_telemetry_release=None if missing == "release" else "a" * 40,
+        )
+        with pytest.raises(ValueError, match="membership identity requires"):
+            web_instance_identity_from_settings(settings, instance_id="replica-123")
+
     def test_aws_ecs_registers_the_contract_carried_identity(self) -> None:
         settings = _settings(
             deployment_target="aws-ecs",
@@ -480,7 +502,7 @@ class TestRegisteredMembership:
         assert _row_count(engine) == 0
 
     @pytest.mark.asyncio
-    async def test_bounded_transient_heartbeat_failures_cancel_the_owning_task(
+    async def test_bounded_transient_heartbeat_failures_request_process_recovery(
         self, engine: Engine, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         authority = RepositoryWebInstanceMembershipAuthority(engine)
@@ -497,32 +519,27 @@ class TestRegisteredMembership:
         monkeypatch.setattr(lifecycle_module, "run_sync_in_worker", contended_worker)
         monkeypatch.setattr(lifecycle_module, "_HEARTBEAT_MAX_CONSECUTIVE_FAILURES", 3)
         membership = RegisteredWebInstanceMembership(authority, identity, lease_seconds=30, interval_seconds=1)
-
-        async def owner() -> None:
-            await membership.start()
-            await asyncio.sleep(30)
-
-        owning = asyncio.create_task(owner())
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(owning, timeout=20)
+        recovery_requested = asyncio.Event()
+        monkeypatch.setattr("elspeth.web.process_recovery.os.kill", lambda _pid, _signal: recovery_requested.set())
+        await membership.start()
+        await asyncio.wait_for(recovery_requested.wait(), timeout=20)
         assert calls == 3
+        assert membership.draining.is_set()
         with pytest.raises(OperationalError):
             await membership.stop()
 
     @pytest.mark.asyncio
-    async def test_a_non_transient_heartbeat_failure_escalates_at_once(self, engine: Engine) -> None:
+    async def test_a_non_transient_heartbeat_failure_escalates_at_once(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
         authority = RepositoryWebInstanceMembershipAuthority(engine)
         identity = _identity()
         membership = RegisteredWebInstanceMembership(authority, identity, lease_seconds=30, interval_seconds=1)
 
-        async def owner() -> None:
-            await membership.start()
-            with engine.begin() as conn:
-                conn.execute(web_instances_table.delete().where(web_instances_table.c.instance_id == identity.instance_id))
-            await asyncio.sleep(30)
-
-        owning = asyncio.create_task(owner())
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(owning, timeout=20)
+        recovery_requested = asyncio.Event()
+        monkeypatch.setattr("elspeth.web.process_recovery.os.kill", lambda _pid, _signal: recovery_requested.set())
+        await membership.start()
+        with engine.begin() as conn:
+            conn.execute(web_instances_table.delete().where(web_instances_table.c.instance_id == identity.instance_id))
+        await asyncio.wait_for(recovery_requested.wait(), timeout=20)
+        assert membership.draining.is_set()
         with pytest.raises(WebInstanceMembershipLost):
             await membership.stop()

@@ -7,24 +7,35 @@ from datetime import UTC, datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import Engine, func, insert, select
+from sqlalchemy import Engine, func, insert, select, text
+from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.blobs import blob_record_snapshot_hash
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.coordination.approval_authority import ApprovalBinding, ApprovalTransactionAuthority, RepositoryApprovalAuthority
 from elspeth.web.coordination.contracts import SessionOperationFenceLost, SessionOperationKind
 from elspeth.web.coordination.repository import SessionDerivedCustodyError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.sessions.models import (
+    approvals_table,
     blob_inline_resolutions_table,
     blob_run_links_table,
     blobs_table,
     composition_states_table,
+    identity_roles_table,
     proposal_blob_effect_receipts_table,
     run_events_table,
     runs_table,
 )
 from elspeth.web.sessions.protocol import CompositionStateData, SessionCompositionStateCreation
+
+
+@pytest.fixture(autouse=True)
+def session_owner(engine: Engine) -> None:
+    """The session mutations in this module belong to an admitted identity."""
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
 
 
 def _create(authority: SQLiteLocalSessionOperationAuthority, *, title: str):
@@ -164,6 +175,75 @@ def test_composition_state_facet_allocates_versions_and_preserves_owned_lineage(
     assert [row.version for row in rows] == [1, 2]
     assert rows[0].sources == {"_version": 1, "data": {"orders": {"plugin": "csv", "options": {"path": "orders.csv"}}}}
     assert rows[1].derived_from_state_id == str(first.id)
+
+
+def test_state_advance_audits_approval_supersession_and_rolls_back_on_audit_failure(engine: Engine) -> None:
+    outcomes: list = []
+    authority = SQLiteLocalSessionOperationAuthority(engine, approval_supersession_recorder=outcomes.append)
+    session = _create(authority, title="approval supersession")
+    context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    first = authority.mutate(context, lambda transaction: transaction.composition_states.append_state(_state_creation()))
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="approver")
+        conn.execute(
+            insert(identity_roles_table).values(
+                role_id="approver-role",
+                identity_id="approver",
+                role="approver",
+                granted_by_identity_id="alice",
+                granted_at=datetime.now(UTC),
+            )
+        )
+    binding = ApprovalBinding("config", "canonical", "manifest", "catalog", "generation", "policy")
+    approval = ApprovalTransactionAuthority(engine).run(
+        str(session.id),
+        lambda token: RepositoryApprovalAuthority.request(
+            token,
+            session_id=str(session.id),
+            state_id=str(first.id),
+            binding=binding,
+            requested_by="alice",
+            approver="approver",
+            note=None,
+            record=lambda _record: None,
+        ),
+    )
+
+    def fail_audit(_outcome: object) -> None:
+        raise AuditIntegrityError("test audit failure")
+
+    refusing = SQLiteLocalSessionOperationAuthority(engine, approval_supersession_recorder=fail_audit)
+    with pytest.raises(AuditIntegrityError, match="test audit failure"):
+        refusing.mutate(
+            context, lambda transaction: transaction.composition_states.append_state(_state_creation(derived_from_state_id=first.id))
+        )
+    with engine.connect() as conn:
+        assert (
+            conn.execute(select(approvals_table.c.decision).where(approvals_table.c.approval_id == approval.approval_id)).scalar_one()
+            is None
+        )
+        assert (
+            conn.execute(
+                select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session.id))
+            ).scalar_one()
+            == 1
+        )
+
+    second = authority.mutate(
+        context, lambda transaction: transaction.composition_states.append_state(_state_creation(derived_from_state_id=first.id))
+    )
+    assert second.version == 2
+    assert [(outcome.approval.approval_id, outcome.cause) for outcome in outcomes] == [(approval.approval_id, "new_state")]
+    with engine.connect() as conn:
+        assert (
+            conn.execute(select(approvals_table.c.decision).where(approvals_table.c.approval_id == approval.approval_id)).scalar_one()
+            == "superseded"
+        )
 
 
 def test_composition_state_facet_rejects_wrong_kind_and_foreign_lineage_without_consuming_version(engine: Engine) -> None:
@@ -709,6 +789,28 @@ def test_run_event_append_rejects_naive_timestamp_before_write(engine: Engine) -
         assert conn.execute(select(func.count()).select_from(run_events_table)).scalar_one() == 0
 
 
+def test_soft_archive_stores_a_non_utc_archived_at_as_the_same_instant(engine: Engine) -> None:
+    """SQLite writes an aware datetime's wall-clock digits and drops the offset (#194).
+
+    ``decide_and_soft_archive`` normalises through the repository's own ``_ensure_utc``,
+    so a ``+10:00`` value naming the same instant as the UTC control must store the
+    same text, not ten hours later.
+    """
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    instant = datetime.now(UTC).replace(microsecond=0)
+    stored: dict[str, object] = {}
+    for label, archived_at in (("utc", instant), ("offset", instant.astimezone(timezone(timedelta(hours=10))))):
+        session = _create(authority, title=label)
+        # A run is durable history, so the archive is SOFT and writes archived_at.
+        _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+        fence = _acquire(authority, session_id=session.id)
+        authority.mutate(fence, lambda transaction, value=archived_at: transaction.session.decide_and_soft_archive(archived_at=value))
+        with engine.connect() as conn:
+            stored[label] = conn.execute(text("SELECT archived_at FROM sessions WHERE id = :id"), {"id": str(session.id)}).scalar_one()
+    assert stored["utc"] is not None
+    assert stored["offset"] == stored["utc"]
+
+
 def test_run_event_immediate_and_replay_records_are_canonical_and_deeply_immutable(engine: Engine) -> None:
     authority = SQLiteLocalSessionOperationAuthority(engine)
     session = _create(authority, title="canonical event")
@@ -764,3 +866,69 @@ def test_output_reads_fail_closed_on_cross_session_link(engine: Engine) -> None:
     assert inserted is True
     assert duplicate is False
     assert [(link.blob_id, link.run_id, link.direction) for link in links] == [(owned_blob, owned_run, "output")]
+
+
+def test_inline_resolution_exact_retry_preserves_original_receipt(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="inline retry")
+    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    context = _acquire(authority, session_id=session.id)
+    resolutions = (
+        ResolvedBlobContent(
+            field_path="source.options.text",
+            blob_id=blob_id,
+            content_hash="a" * 64,
+            byte_length=3,
+            mime_type="text/plain",
+            encoding="utf-8",
+        ),
+    )
+    first_time = datetime(2026, 1, 1, tzinfo=UTC)
+    authority.mutate(
+        context,
+        lambda tx: tx.blobs.insert_blob_inline_resolutions(run_id=run_id, attempt=1, resolutions=resolutions, resolved_at=first_time),
+    )
+    with engine.connect() as conn:
+        before = conn.execute(select(blob_inline_resolutions_table)).all()
+    authority.release(context)
+    context = _acquire(authority, session_id=session.id)
+    authority.mutate(
+        context,
+        lambda tx: tx.blobs.insert_blob_inline_resolutions(
+            run_id=run_id, attempt=1, resolutions=resolutions, resolved_at=datetime.now(UTC)
+        ),
+    )
+    with engine.connect() as conn:
+        assert conn.execute(select(blob_inline_resolutions_table)).all() == before
+
+
+@pytest.mark.parametrize("changed", ["encoding", "additional_field", "missing_field"])
+def test_inline_resolution_retry_refuses_changed_manifest_without_mutation(engine: Engine, changed: str) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="inline mismatch")
+    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+    context = _acquire(authority, session_id=session.id)
+    resolution = ResolvedBlobContent(
+        field_path="source.options.text", blob_id=blob_id, content_hash="a" * 64, byte_length=3, mime_type="text/plain", encoding="utf-8"
+    )
+    authority.mutate(
+        context,
+        lambda tx: tx.blobs.insert_blob_inline_resolutions(
+            run_id=run_id, attempt=1, resolutions=(resolution,), resolved_at=datetime.now(UTC)
+        ),
+    )
+    with engine.connect() as conn:
+        before = conn.execute(select(blob_inline_resolutions_table)).all()
+    if changed == "encoding":
+        retry = (replace(resolution, encoding="latin-1"),)
+    elif changed == "additional_field":
+        retry = (resolution, replace(resolution, field_path="source.options.other"))
+    else:
+        retry = ()
+    with pytest.raises(AuditIntegrityError, match="inline resolution"):
+        authority.mutate(
+            context,
+            lambda tx: tx.blobs.insert_blob_inline_resolutions(run_id=run_id, attempt=1, resolutions=retry, resolved_at=datetime.now(UTC)),
+        )
+    with engine.connect() as conn:
+        assert conn.execute(select(blob_inline_resolutions_table)).all() == before

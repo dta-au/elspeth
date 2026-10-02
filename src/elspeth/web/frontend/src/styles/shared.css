@@ -556,8 +556,9 @@
   padding: var(--space-xl);
 }
 
-/* Per-dialog closures for the three settings dialogs (SecretsPanel,
-   UserAdminDialog, ComposerPreferencesPanel — elspeth-e6fcd8d703). These were
+/* Per-dialog closures for the settings-family dialogs (SecretsPanel,
+   ComposerPreferencesPanel, People & access, and the mailbox and library
+   that share the wide closure — elspeth-e6fcd8d703). These were
    the last inline-styled frames: each carried a copy-pasted style object at
    literal z-index 100/101 (the NON-modal overlay band, so they stacked as if
    they were not modal), a hardcoded backdrop rgba and a string box-shadow no

@@ -91,6 +91,10 @@ def test_line_explode_preserves_empty_lines(ctx: PluginContext) -> None:
 
     assert result.rows is not None
     assert [row.to_dict()["html_line"] for row in result.rows] == ["a", "", "b"]
+    assistance = LineExplode.get_agent_assistance()
+    assert assistance is not None
+    assert "blank lines are retained" in assistance.summary
+    assert "non-empty line" not in assistance.summary
 
 
 def test_line_explode_rejects_more_than_default_max_lines(ctx: PluginContext) -> None:
@@ -114,6 +118,68 @@ def test_line_explode_rejects_more_than_default_max_lines(ctx: PluginContext) ->
     assert result.reason["line_count"] == DEFAULT_MAX_LINES + 1
     assert result.reason["max_lines"] == DEFAULT_MAX_LINES
     assert not result.retryable
+
+
+def test_line_explode_rejects_aggregate_output_before_copying(ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.transforms import line_explode as line_explode_module
+    from elspeth.plugins.transforms.line_explode import LineExplode, LineExplodeConfig
+
+    assert "max_output_bytes" in LineExplodeConfig.model_fields
+
+    transform = LineExplode(
+        {
+            "schema": DYNAMIC_SCHEMA,
+            "source_field": "html",
+            "output_field": "html_line",
+            "max_output_bytes": 200,
+        }
+    )
+
+    def fail_if_called(value: object) -> object:
+        pytest.fail(f"deepcopy must not run after the aggregate output limit is exceeded: {value!r}")
+
+    monkeypatch.setattr(line_explode_module.copy, "deepcopy", fail_if_called)
+    result = transform.process(make_pipeline_row({"html": "a\nb\nc", "retained": list(range(20))}), ctx)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "output_too_large"
+    assert result.reason["estimated_output_bytes"] > result.reason["max_output_bytes"]
+    assert result.reason["max_output_bytes"] == 200
+    assert result.reason["line_count"] == 3
+    assert not result.retryable
+
+
+@pytest.mark.parametrize(
+    ("retained", "admitted"),
+    [
+        # ~3.4 MiB of canonical JSON either way; only the container-heavy
+        # value multiplies memory, because deepcopy() copies every container
+        # per line while sharing scalars. Canonical bytes alone admitted it,
+        # and process() then peaked near 213 MiB under a 4 MiB cap.
+        pytest.param("x" * 60_000, True, id="flat-string"),
+        pytest.param([{} for _ in range(20_000)], False, id="20k-empty-dicts"),
+    ],
+)
+def test_line_explode_output_estimate_charges_copied_containers(ctx: PluginContext, retained: object, admitted: bool) -> None:
+    from elspeth.plugins.transforms.line_explode import LineExplode
+
+    transform = LineExplode(
+        {
+            "schema": DYNAMIC_SCHEMA,
+            "source_field": "text",
+            "output_field": "line",
+            "max_output_bytes": 4 * 1024 * 1024,
+        }
+    )
+    result = transform.process(make_pipeline_row({"text": "\n".join(["a"] * 60), "retained": retained}), ctx)
+
+    if admitted:
+        assert result.status == "success"
+    else:
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "output_too_large"
 
 
 def test_line_explode_can_omit_index(ctx: PluginContext) -> None:

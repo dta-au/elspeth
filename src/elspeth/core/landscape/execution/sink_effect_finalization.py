@@ -16,6 +16,7 @@ from elspeth.contracts import NodeStateStatus
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     SinkEffectAttemptAction,
@@ -34,10 +35,11 @@ from elspeth.contracts.sink_effects import (
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
-from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
+from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository, TokenOutcomeWrite
 from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import read_landscape_decision_time
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.artifacts import ArtifactRepository
 from elspeth.core.landscape.execution.node_states import NodeStateRepository
@@ -311,26 +313,30 @@ class SinkEffectFinalization:
         if operation_result.rowcount != 1:
             raise LandscapeRecordError("sink effect operation completion CAS lost")
 
-        outcome_ids: list[str] = []
         member_by_ordinal = {int(member.ordinal): member for member in members}
         state_ids = dict(current_state_ids)
-        for finalization_member in request.members:
-            durable_member = member_by_ordinal[finalization_member.ordinal]
-            outcome_ids.append(
-                self._outcomes.record_token_outcome(
-                    TokenRef(token_id=str(durable_member.token_id), run_id=str(effect.run_id)),
-                    finalization_member.outcome,
-                    finalization_member.path,
+        outcome_ids = self._outcomes.record_token_outcomes_on(
+            conn,
+            run_id=str(effect.run_id),
+            outcomes=[
+                TokenOutcomeWrite(
+                    ref=TokenRef(
+                        token_id=str(member_by_ordinal[finalization_member.ordinal].token_id),
+                        run_id=str(effect.run_id),
+                    ),
+                    outcome=finalization_member.outcome,
+                    path=finalization_member.path,
                     sink_name=finalization_member.sink_name,
                     sink_node_id=str(effect.sink_node_id),
                     artifact_id=artifact.artifact_id,
                     batch_id=finalization_member.batch_id,
                     error_hash=finalization_member.error_hash,
                     context=finalization_member.context,
-                    conn=conn,
-                    dependencies_prelocked=True,
                 )
-            )
+                for finalization_member in request.members
+            ],
+            dependencies_prelocked=True,
+        )
 
         # One executemany UPDATE stamps every member's final disposition; the
         # fencing gate forbids a DML construction inside a loop, and an
@@ -454,12 +460,19 @@ class SinkEffectFinalization:
             if stream is None:
                 raise LandscapeRecordError("sink effect stream disappeared during finalization")
         effect_ids = tuple(sorted(set(linked_effect_ids) | {str(optimistic_effect.effect_id)}))
-        rows = conn.execute(
-            select(sink_effects_table)
-            .where(sink_effects_table.c.effect_id.in_(effect_ids))
-            .order_by(sink_effects_table.c.effect_id)
-            .with_for_update(of=sink_effects_table)
-        ).fetchall()
+        # Linked effects are caller-derived (every primary effect a member
+        # names), so the lock read runs in ascending chunks of the shared bind
+        # budget, which keeps the effect_id lock order.
+        rows = [
+            row
+            for chunk in bind_budget_chunks(effect_ids)
+            for row in conn.execute(
+                select(sink_effects_table)
+                .where(sink_effects_table.c.effect_id.in_(chunk))
+                .order_by(sink_effects_table.c.effect_id)
+                .with_for_update(of=sink_effects_table)
+            ).fetchall()
+        ]
         by_id = {str(row.effect_id): row for row in rows}
         if set(by_id) != set(effect_ids):
             raise LandscapeRecordError("linked sink effect set changed or disappeared during finalization")
@@ -488,7 +501,7 @@ class SinkEffectFinalization:
                 raise LandscapeRecordError("sink effect finalization has stale lease owner")
             if effect.generation != request.generation:
                 raise LandscapeRecordError("sink effect finalization has stale generation")
-            database_now = read_landscape_transaction_time(conn)
+            database_now = read_landscape_decision_time(conn)
             if not lease_is_live(conn, str(effect.effect_id), sink_effects_table.c.lease_expires_at >= database_now):
                 raise LandscapeRecordError("sink effect finalization lease has expired")
         primary_effect_ids = {str(member.primary_effect_id) for member in members if member.primary_effect_id is not None}
@@ -539,7 +552,7 @@ class SinkEffectFinalization:
         if effect.plan_json is None or effect.plan_hash is None or effect.descriptor_mode is None:
             raise LandscapeRecordError("sink effect finalization requires one complete immutable plan")
         try:
-            plan = json.loads(effect.plan_json)
+            plan = canonical_json_loads(effect.plan_json)
         except (TypeError, json.JSONDecodeError) as exc:
             raise LandscapeRecordError("sink effect durable plan is not valid JSON") from exc
         if type(plan) is not dict:

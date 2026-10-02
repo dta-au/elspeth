@@ -17,6 +17,52 @@ from elspeth.contracts.audit_export import (
 from elspeth.core.config import LandscapeExportSettings
 
 
+def test_auth_event_policy_is_closed_and_default_omission_is_explicit() -> None:
+    settings = LandscapeExportSettings(**_enabled_config())
+    assert settings.exporter_version == "landscape-exporter-auth-v2"
+    assert settings.auth_events == "omitted"
+    assert settings.public_snapshot_config()["auth_events"] == "omitted"
+    assert settings.public_snapshot_config()["compartment_id"] == "test-compartment"
+    included = LandscapeExportSettings(**_enabled_config(auth_events="deployment_snapshot"))
+    assert included.public_snapshot_config()["auth_events"] == "deployment_snapshot"
+    with pytest.raises(ValidationError, match="auth_events"):
+        LandscapeExportSettings(**_enabled_config(auth_events="all"))
+    with pytest.raises(ValidationError, match="exporter_version"):
+        LandscapeExportSettings(**_enabled_config(exporter_version="landscape-exporter-auth-v1", compartment_id=None))
+    with pytest.raises(ValidationError, match="exporter_version"):
+        LandscapeExportSettings(**_enabled_config(exporter_version="landscape-exporter-v1", auth_events="deployment_snapshot"))
+
+
+@pytest.mark.parametrize("signed", [False, True])
+def test_missing_compartment_refuses_enabled_export_at_config_parse(signed: bool) -> None:
+    config = _enabled_config(compartment_id=None)
+    if signed:
+        config.update(signing_mode="hmac_sha256", signer_key_id="test-signer", signing_secret_ref="TEST_SIGNER_KEY")
+    with pytest.raises(ValidationError, match="compartment_id"):
+        LandscapeExportSettings(**config)
+
+
+@pytest.mark.parametrize("compartment_id", ["a", "0", "research-a", "a" * 63])
+def test_export_compartment_accepts_public_marking_identifier(compartment_id: str) -> None:
+    export = LandscapeExportSettings(**_enabled_config(compartment_id=compartment_id))
+    assert export.public_snapshot_config()["compartment_id"] == compartment_id
+
+
+@pytest.mark.parametrize("compartment_id", ["", " ", "Research-A", "-research", "research_a", "research a", "research\n", "é", "a" * 64])
+def test_export_compartment_rejects_malformed_public_marking_identifier(compartment_id: str) -> None:
+    with pytest.raises(ValidationError, match="compartment_id"):
+        LandscapeExportSettings(**_enabled_config(compartment_id=compartment_id))
+
+
+@pytest.mark.parametrize("signed", [False, True])
+def test_explicit_auth_v1_settings_are_rejected(signed: bool) -> None:
+    config = _enabled_config(exporter_version="landscape-exporter-auth-v1")
+    if signed:
+        config.update(signing_mode="hmac_sha256", signer_key_id="legacy-key", signing_secret_ref="LEGACY_KEY")
+    with pytest.raises(ValidationError, match="exporter_version"):
+        LandscapeExportSettings(**config)
+
+
 def _enabled_config(**overrides: object) -> dict[str, object]:
     config: dict[str, object] = {
         "enabled": True,
@@ -26,6 +72,7 @@ def _enabled_config(**overrides: object) -> dict[str, object]:
         "signer_key_id": "UNSIGNED",
         "signing_secret_ref": None,
         "signer_rotation_policy": "multi_version",
+        "compartment_id": "test-compartment",
         "total_record_limit": 10_000,
         "total_byte_limit": 10_000_000,
         "chunk_limit": 100,
@@ -43,6 +90,30 @@ def _enabled_config(**overrides: object) -> dict[str, object]:
     }
     config.update(overrides)
     return config
+
+
+def test_enabled_export_requires_explicit_signing_decision() -> None:
+    config = _enabled_config()
+    del config["signing_mode"]
+
+    with pytest.raises(ValidationError, match="requires explicit fields: signing_mode"):
+        LandscapeExportSettings(**config)
+
+
+def test_required_authentication_policy_refuses_unsigned_and_accepts_signed_export() -> None:
+    with pytest.raises(ValidationError, match="forbids unsigned"):
+        LandscapeExportSettings(**_enabled_config(authentication_policy="required"))
+
+    signed = LandscapeExportSettings(
+        **_enabled_config(
+            authentication_policy="required",
+            signing_mode="hmac_sha256",
+            signer_key_id="audit-key-2026-q3",
+            signing_secret_ref="AUDIT_EXPORT_SIGNING_KEY",
+        )
+    )
+    assert signed.authentication_policy == "required"
+    assert signed.sign is True
 
 
 def test_enabled_export_requires_complete_explicit_bounded_resource_policy() -> None:

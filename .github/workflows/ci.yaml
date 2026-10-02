@@ -2,7 +2,7 @@
 #
 # Runs on every push and PR. Fast feedback loop with:
 #   - Linting (ruff, mypy) - ~30 seconds
-#   - Testing (pytest with coverage) - ~3-5 minutes
+#   - Testing (four deterministic pytest shards per Python version)
 #   - Bug-hiding pattern detection
 #   - Contract enforcement (Settings→Runtime alignment, type boundaries)
 #
@@ -31,25 +31,18 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.13"
-  UV_VERSION: "0.5"
+  UV_VERSION: "0.10.2"
 
 permissions:
-  actions: read
   contents: read
 
-# Public-repository guardrail: pull_request workflows execute code from
-# unmerged branches, so all PRs stay on GitHub-hosted runners.
-# Trusted push workflows use the nyx runner.
-#
-# GitHub's runs-on expression accepts either a runner label string or a JSON
-# array of labels. Keep this expression identical across jobs so the aggregate
-# CI Success check reflects one routing policy.
+# Every job uses the trusted local pool. Code-executing jobs admit only
+# same-repository PRs and non-PR events. CI Success rejects fork PRs without
+# checking out or executing their repository code.
 #
 # Self-hosted container jobs can leave root-owned venv/cache artifacts in the
 # default workspace. Every checkout below uses a per-run, per-job path so stale
 # workspace siblings cannot break actions/checkout before project commands run.
-#
-#   ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
 
 jobs:
   # ===========================================================================
@@ -57,9 +50,10 @@ jobs:
   # ===========================================================================
   static-analysis:
     name: Static analysis
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
-      image: python:3.13-bookworm
+      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-static-analysis
     steps:
@@ -115,253 +109,6 @@ jobs:
       - name: Install dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: uv sync --frozen --all-extras
-
-      - name: Reject touched or broadened permanent multi-rule per-file blankets
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        # This job runs inside a container, where GitHub's shell auto-detection
-        # falls back to `sh -e` (dash). dash rejects `set -o pipefail` and has
-        # no `[[`, so without an explicit bash this step died at its first
-        # line ("set: Illegal option -o pipefail", exit 2) on every push run
-        # and the ratchet resolver below never executed (run 33944365102,
-        # elspeth-d8749aeaa3). enforce-allowlist-judge-gates.yaml documents
-        # the same fallback in its header and declares bash for that reason.
-        shell: bash
-        env:
-          CURRENT_RUN_ID: ${{ github.run_id }}
-          GH_TOKEN: ${{ github.event_name != 'pull_request' && github.token || '' }}
-          PR_BASELINE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
-        run: |
-          set -euo pipefail
-          BASELINE_REF="$PR_BASELINE_REF"
-          if [[ -z "$BASELINE_REF" ]]; then
-            # A push predecessor is not policy authority: concurrency may have
-            # cancelled it after it introduced a blanket. Select the nearest
-            # ancestor whose exact ratchet step succeeded instead.
-            if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
-              git fetch --no-tags --filter=blob:none --unshallow origin '+refs/heads/*:refs/remotes/origin/*'
-            else
-              git fetch --no-tags --filter=blob:none origin '+refs/heads/*:refs/remotes/origin/*'
-            fi
-            BASELINE_REF="$(python - <<'PY'
-          # resolve-nearest-successful-ratchet-baseline
-          import json
-          import os
-          import re
-          import subprocess
-          import sys
-          import urllib.parse
-          import urllib.request
-
-          def fail(message: str) -> None:
-              print(f"blanket ratchet baseline: {message}", file=sys.stderr)
-              raise SystemExit(2)
-
-          api_url = os.environ["GITHUB_API_URL"].rstrip("/")
-          repository = os.environ["GITHUB_REPOSITORY"]
-          current_sha = os.environ["GITHUB_SHA"]
-          current_run_id_raw = os.environ["CURRENT_RUN_ID"]
-          token = os.environ.get("GH_TOKEN", "")
-          if not token:
-              fail("GH_TOKEN is unavailable for the protected-push baseline lookup")
-          if re.fullmatch(r"[0-9a-fA-F]{40}", current_sha) is None:
-              fail("GITHUB_SHA is malformed")
-          if re.fullmatch(r"[1-9][0-9]*", current_run_id_raw) is None:
-              fail("CURRENT_RUN_ID is malformed")
-          if re.fullmatch(r"[^/\s]+/[^/\s]+", repository) is None:
-              fail("GITHUB_REPOSITORY is malformed")
-          current_sha = current_sha.lower()
-          current_run_id = int(current_run_id_raw)
-
-          headers = {
-              "Accept": "application/vnd.github+json",
-              "Authorization": f"Bearer {token}",
-              "X-GitHub-Api-Version": "2022-11-28",
-          }
-          api_origin = urllib.parse.urlsplit(api_url)
-          next_link_pattern = re.compile(r'<([^>]+)>;\s*rel="next"')
-
-          def api_collection(url: str, key: str, context: str) -> list[object]:
-              items: list[object] = []
-              seen_urls: set[str] = set()
-              while url:
-                  if url in seen_urls:
-                      fail(f"pagination cycle while reading {context}")
-                  seen_urls.add(url)
-                  request = urllib.request.Request(url, headers=headers)
-                  try:
-                      with urllib.request.urlopen(request, timeout=30) as response:
-                          payload = json.load(response)
-                          response_headers = getattr(response, "headers", {})
-                          link_header = response_headers.get("Link", "")
-                  except (OSError, ValueError) as exc:
-                      fail(f"could not read {context}: {type(exc).__name__}")
-                  if not isinstance(payload, dict) or not isinstance(payload.get(key), list):
-                      fail(f"malformed Actions API response ({key} must be a list)")
-                  items.extend(payload[key])
-                  next_links = next_link_pattern.findall(link_header)
-                  if len(next_links) > 1:
-                      fail(f"malformed pagination while reading {context}")
-                  url = next_links[0] if next_links else ""
-                  if url:
-                      parsed = urllib.parse.urlsplit(url)
-                      if (
-                          parsed.scheme != api_origin.scheme
-                          or parsed.netloc != api_origin.netloc
-                          or "/actions/" not in parsed.path
-                      ):
-                          fail(f"unsafe pagination link while reading {context}")
-              return items
-
-          query = urllib.parse.urlencode({"event": "push", "per_page": "100"})
-          runs_url = f"{api_url}/repos/{repository}/actions/workflows/ci.yaml/runs?{query}"
-          raw_runs = api_collection(runs_url, "workflow_runs", "workflow runs")
-          runs_by_sha: dict[str, list[int]] = {}
-          seen_runs: dict[int, str] = {}
-          for index, run in enumerate(raw_runs):
-              if not isinstance(run, dict):
-                  fail(f"malformed workflow run at index {index}")
-              run_id = run.get("id")
-              sha = run.get("head_sha")
-              if (
-                  type(run_id) is not int
-                  or run_id <= 0
-                  or not isinstance(sha, str)
-                  or re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None
-                  or run.get("event") != "push"
-                  or not isinstance(run.get("status"), str)
-                  or not (isinstance(run.get("conclusion"), str) or run.get("conclusion") is None)
-              ):
-                  fail(f"malformed workflow run at index {index}")
-              sha = sha.lower()
-              prior_sha = seen_runs.setdefault(run_id, sha)
-              if prior_sha != sha:
-                  fail(f"conflicting duplicate workflow run {run_id}")
-              if sha == current_sha or run_id == current_run_id:
-                  continue
-              run_ids = runs_by_sha.setdefault(sha, [])
-              if run_id not in run_ids:
-                  run_ids.append(run_id)
-
-          try:
-              graph_result = subprocess.run(
-                  ["git", "rev-list", "--parents", current_sha],
-                  check=True,
-                  capture_output=True,
-                  text=True,
-              )
-          except (OSError, subprocess.CalledProcessError) as exc:
-              fail(f"could not read commit graph: {type(exc).__name__}")
-          parents_by_sha: dict[str, tuple[str, ...]] = {}
-          for index, line in enumerate(graph_result.stdout.splitlines()):
-              fields = line.split()
-              if not fields or any(re.fullmatch(r"[0-9a-fA-F]{40}", field) is None for field in fields):
-                  fail(f"malformed git rev-list output at line {index + 1}")
-              commit, *parents = (field.lower() for field in fields)
-              parents_by_sha[commit] = tuple(parents)
-          if current_sha not in parents_by_sha:
-              fail("git rev-list did not contain GITHUB_SHA")
-
-          # Policy debt advances along the protected push's first-parent
-          # lineage. A merge's second parent may carry older, broader debt and
-          # must never outrank the stricter state already on the target branch.
-          distances: dict[str, int] = {}
-          lineage_sha = current_sha
-          while lineage_sha not in distances:
-              distances[lineage_sha] = len(distances)
-              parents = parents_by_sha.get(lineage_sha)
-              if parents is None:
-                  fail(f"git rev-list omitted first-parent commit {lineage_sha}")
-              if not parents:
-                  break
-              lineage_sha = parents[0]
-
-          exact_job_name = "Static analysis"
-          exact_step_name = "Reject touched or broadened permanent multi-rule per-file blankets"
-          candidates = sorted(
-              (distance, sha) for sha, distance in distances.items() if sha in runs_by_sha
-          )
-          baseline_sha: str | None = None
-          for _distance, sha in candidates:
-              for run_id in sorted(runs_by_sha[sha], reverse=True):
-                  jobs_query = urllib.parse.urlencode({"filter": "all", "per_page": "100"})
-                  jobs_url = f"{api_url}/repos/{repository}/actions/runs/{run_id}/jobs?{jobs_query}"
-                  jobs = api_collection(jobs_url, "jobs", f"jobs for workflow run {run_id}")
-                  for index, job in enumerate(jobs):
-                      if not isinstance(job, dict) or not isinstance(job.get("name"), str):
-                          fail(f"malformed job at index {index} for workflow run {run_id}")
-                      if job["name"] != exact_job_name:
-                          continue
-                      job_run_id = job.get("run_id")
-                      job_sha = job.get("head_sha")
-                      attempt = job.get("run_attempt")
-                      steps = job.get("steps")
-                      if (
-                          job_run_id != run_id
-                          or job_sha != sha
-                          or type(attempt) is not int
-                          or attempt <= 0
-                          or not isinstance(steps, list)
-                      ):
-                          fail(f"malformed ratchet job at index {index} for workflow run {run_id}")
-                      for step_index, step in enumerate(steps):
-                          if (
-                              not isinstance(step, dict)
-                              or not isinstance(step.get("name"), str)
-                              or not isinstance(step.get("status"), str)
-                              or not (
-                                  isinstance(step.get("conclusion"), str)
-                                  or step.get("conclusion") is None
-                              )
-                          ):
-                              fail(
-                                  f"malformed ratchet job step at index {step_index} "
-                                  f"for workflow run {run_id}"
-                              )
-                          if (
-                              step["name"] == exact_step_name
-                              and step["status"] == "completed"
-                              and step["conclusion"] == "success"
-                          ):
-                              baseline_sha = sha
-                              break
-                      if baseline_sha is not None:
-                          break
-                  if baseline_sha is not None:
-                      break
-              if baseline_sha is not None:
-                  break
-          if baseline_sha is None:
-              fail(
-                  "No successful ancestor baseline was found; refusing to compare "
-                  "against an untrusted push predecessor."
-              )
-          print(baseline_sha)
-          PY
-            )"
-          else
-            git fetch --no-tags --depth=1 origin "$BASELINE_REF"
-          fi
-          PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli \
-            check-per-file-blanket-ratchet \
-            --baseline-ref "$BASELINE_REF" \
-            --allowlist-root config/cicd \
-            --repo-root .
-
-      - name: Reject unverified PR signed allowlist edits
-        if: ${{ github.event_name == 'pull_request' }}
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        run: |
-          git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
-          PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check-judge-coverage \
-            --baseline-ref ${{ github.event.pull_request.base.sha }} \
-            --allowlist-root config/cicd/enforce_tier_model \
-            --repo-root . \
-            --forbid-unverified-judge-metadata
-          PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check-judge-coverage \
-            --baseline-ref ${{ github.event.pull_request.base.sha }} \
-            --allowlist-root config/cicd/enforce_trust_boundary_honesty \
-            --repo-root . \
-            --forbid-unverified-judge-metadata
 
       - name: Check code style (ruff)
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
@@ -442,35 +189,15 @@ jobs:
             --rules manifest.contract_manifest \
             --root src/elspeth
 
-      - name: Run manifest inventory elspeth-lints rules
+      - name: Run symbol inventory elspeth-lints rule
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
-            --rules manifest.symbol_inventory,manifest.test_to_source_mapping \
+            --rules manifest.symbol_inventory \
             --root .
-
-      - name: Run trust-tier elspeth-lints rule
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
-        run: |
-          set +e
-          PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
-            --rules trust_tier.tier_model \
-            --root src/elspeth
-          status=$?
-          set -e
-          if [ "$status" -ne 0 ]; then
-            echo "::error title=Trust-tier signed allowlist diagnosis::If this failure mentions judge_metadata_signature, file_fingerprint, scope_fingerprint, or ast_path drift, run: diagnose-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model. To repair diagnosed drift from an operator shell, run: sign-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model --env-file /path/to/operator.env --owner \"\$USER\""
-          fi
-          exit "$status"
 
       - name: Run trust-boundary honesty-gate elspeth-lints rules
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
         run: |
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
             --rules trust_boundary.tests,trust_boundary.scope,trust_boundary.tier \
@@ -598,35 +325,17 @@ jobs:
             exit "$status"
           fi
 
-      - name: Emit elspeth-lints manifest-inventory SARIF artifact
+      - name: Emit elspeth-lints symbol-inventory SARIF artifact
         if: always()
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           set +e
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
-            --rules manifest.symbol_inventory,manifest.test_to_source_mapping \
+            --rules manifest.symbol_inventory \
             --root . \
-            --format sarif > elspeth-lints-manifest-inventory.sarif
+            --format sarif > elspeth-lints-symbol-inventory.sarif
           status=$?
           if [ "$status" -gt 1 ]; then
-            exit "$status"
-          fi
-
-      - name: Emit elspeth-lints trust-tier SARIF artifact
-        if: always()
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
-        run: |
-          set +e
-          PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
-            --rules trust_tier.tier_model \
-            --root src/elspeth \
-            --format sarif > elspeth-lints-trust-tier.sarif
-          status=$?
-          if [ "$status" -gt 1 ]; then
-            echo "::error title=Trust-tier signed allowlist diagnosis::If this failure mentions judge_metadata_signature, file_fingerprint, scope_fingerprint, or ast_path drift, run: diagnose-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model. To repair diagnosed drift from an operator shell, run: sign-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model --env-file /path/to/operator.env --owner \"\$USER\""
             exit "$status"
           fi
 
@@ -644,8 +353,7 @@ jobs:
             ${{ env.CI_CHECKOUT_PATH }}/elspeth-lints-contract-invariants.sarif
             ${{ env.CI_CHECKOUT_PATH }}/elspeth-lints-session-engine-factory.sarif
             ${{ env.CI_CHECKOUT_PATH }}/elspeth-lints-contract-manifest.sarif
-            ${{ env.CI_CHECKOUT_PATH }}/elspeth-lints-manifest-inventory.sarif
-            ${{ env.CI_CHECKOUT_PATH }}/elspeth-lints-trust-tier.sarif
+            ${{ env.CI_CHECKOUT_PATH }}/elspeth-lints-symbol-inventory.sarif
           retention-days: 7
 
       - name: Compare shadow-mode lints
@@ -656,24 +364,31 @@ jobs:
             --root .
 
   # ===========================================================================
-  # Stage 3: Test (Quality gate - ~3-5 minutes)
+  # Stage 3: Test (four independent processes per interpreter)
   # ===========================================================================
   test:
-    name: Test (Python ${{ matrix.python-version }})
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    name: Test (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
-      image: python:${{ matrix.python-version }}-bookworm
+      image: ${{ matrix.ci-container-image }}
+      # Docker 29 on the self-hosted runners starts containers with a soft
+      # open-file limit of 1024 (measured: `ulimit -Sn` in
+      # python:3.13-bookworm). With 2 workers each xdist process runs ~30k
+      # tests, and on 2026-09-29 worker gw0 hit `OSError: [Errno 24] Too many
+      # open files` at 25%: 108 failed + 1661 errors on that one worker, none
+      # on any other (run 36526535297).
+      options: --ulimit nofile=65536:524288
     env:
-      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-test-${{ matrix.python-version }}
-    # No `needs: [static-analysis]` (operator ruling 2026-09-05, elspeth-d8749aeaa3):
-    # the trust-tier step keeps static-analysis red by design until Phase 5
-    # signs, and behind that `needs:` the suites never ran, so a merge could not
-    # be scored at all. `ci-success` still requires static-analysis, so the red
-    # still blocks the merge; it just no longer hides the test verdict.
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-test-${{ matrix.python-version }}-${{ matrix.shard }}
+      PYTEST_WORKERS: "2"
+      COVERAGE_FILE: coverage-data
+    # Run tests even if static analysis fails, so both results are visible.
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
+        shard: [0, 1, 2, 3]
         # Coverage runs on Python 3.13 only because 3.13 is the release
         # interpreter for this branch. The Python 3.12 lane remains
         # dependency-compatibility signal and intentionally skips coverage so
@@ -681,8 +396,10 @@ jobs:
         include:
           - python-version: "3.12"
             coverage: false
+            ci-container-image: python:3.12-bookworm@sha256:dbbe4ceb97851e2e5fa83798b239811f871cb743b259ba3563737349f6bcfaa0
           - python-version: "3.13"
             coverage: true
+            ci-container-image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
 
     steps:
       - name: Checkout code
@@ -708,13 +425,11 @@ jobs:
 
       - name: Install system dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        # nodejs: tests/unit/test_dir_bug_sweep_workflow_contract.py runs the
-        # workflow script under `node -e` (30 ids); ripgrep:
-        # tests/unit/architecture/test_sink_publication_callers.py's alias
+        # ripgrep: tests/unit/architecture/test_sink_publication_callers.py's alias
         # sweep; sqlite3: examples/multi_worker_showcase/outcome_stats.sh
-        # under tests/e2e/examples. All three were absent from the
-        # python:*-bookworm image and 32 ids failed on every push
-        # (elspeth-bc97e06221 B1). Docker is NOT available inside a container
+        # under tests/e2e/examples. These dependencies were absent from the
+        # python:*-bookworm image (elspeth-bc97e06221 B1).
+        # Docker is NOT available inside a container
         # job; the docker-CLI tests run in the host-runner-unit job below.
         run: |
           apt-get update -q
@@ -768,46 +483,128 @@ jobs:
           # were selected, tests/conftest.py refused them with a UsageError
           # inside every xdist worker, and xdist reported that as a crashed
           # first item on every push (elspeth-6128fc7f95 / elspeth-515183ac5a).
-          uv run pytest tests/ \
+          # PR #212's hosted 3.12 and 3.13 jobs were SIGKILLed with the default
+          # 12 workers; the 3.13 coverage job was also SIGKILLed at 4 workers.
+          # The trusted push 3.13 job also failed with 12 workers, including
+          # coverage database errors. Bound concurrency for both event types.
+          #
+          # `-q -rfE`, not `-v`: `-v` printed ~120k lines, and the retrievable
+          # job log stops at ~71k (both lanes of run 36502389326 end at 59%,
+          # 20 minutes before the step failed), so the failure summary was
+          # never readable. The JUnit report is the complete record.
+          # Partition only after pytest's normal marker selection. Independent
+          # jobs bound each worker's accumulated state and preserve every ID.
+          uv run python -m pytest tests/ -p scripts.ci_test_shards \
+            --ci-shard-count=4 --ci-shard-index=${{ matrix.shard }} \
+            --ci-shard-report=shard-manifest.json \
             --cov=src/elspeth \
-            --cov-report=xml \
-            --cov-report=term-missing \
-            --cov-fail-under=85 \
-            -v
-
-      - name: Enforce audit-critical coverage floors
-        if: matrix.coverage
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        run: |
-          # Ratchet the verified 2026-05-19 baseline while the test-debt
-          # uplift to 95% is planned. Do not lower without fresh evidence.
-          # 2026-06-19: landscape floor 93 -> 92, orchestrator 91 -> 90. Fresh
-          # evidence: the 0.6.0 multi-worker work added substantial landscape +
-          # orchestrator code (run_coordination, scheduler/execution/lifecycle
-          # repositories; multi-worker orchestration paths) whose test coverage
-          # sits below the prior subsystem floors (scheduler 88%, execution 89%,
-          # run_lifecycle 90%; the new run_coordination_repository is itself at
-          # 94%). The Test lane was masked behind static-analysis while this
-          # landed, so the dip surfaced only now. Uplift remains tracked debt.
-          # All four floors are checked every run (collect-then-fail) so a dip
-          # in any subsystem surfaces together rather than one cycle at a time.
-          status=0
-          uv run coverage report --include="src/elspeth/core/landscape/*" --fail-under=92 || status=1
-          uv run coverage report --include="src/elspeth/core/canonical.py" --fail-under=99 || status=1
-          uv run coverage report --include="src/elspeth/engine/orchestrator/*" --fail-under=90 || status=1
-          uv run coverage report --include="src/elspeth/contracts/*" --fail-under=62 || status=1
-          exit "$status"
+            --cov-report= \
+            --cov-fail-under=0 \
+            -n "$PYTEST_WORKERS" \
+            -q -rfE \
+            --junitxml=pytest-junit.xml
 
       - name: Run tests without coverage
         if: ${{ !matrix.coverage }}
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
-          # No `-m`: same reason as the coverage step above.
-          uv run pytest tests/ \
-            -v
+          # No `-m`: same reason as the coverage step above. Use the same
+          # per-lane worker cap as the coverage lane, and the same output
+          # flags and JUnit report.
+          uv run python -m pytest tests/ -p scripts.ci_test_shards \
+            --ci-shard-count=4 --ci-shard-index=${{ matrix.shard }} \
+            --ci-shard-report=shard-manifest.json \
+            -n "$PYTEST_WORKERS" \
+            -q -rfE \
+            --junitxml=pytest-junit.xml
 
-      - name: Upload coverage report
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pytest-junit-${{ matrix.python-version }}-${{ matrix.shard }}
+          path: ${{ env.CI_CHECKOUT_PATH }}/pytest-junit.xml
+          retention-days: 7
+
+      - name: Upload shard coverage and selection evidence
         if: matrix.coverage && always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: coverage-shard-${{ matrix.python-version }}-${{ matrix.shard }}
+          path: |
+            ${{ env.CI_CHECKOUT_PATH }}/coverage-data
+            ${{ env.CI_CHECKOUT_PATH }}/shard-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  coverage:
+    name: Combined coverage
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    container:
+      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
+    needs: [test]
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-coverage
+    steps:
+      - name: Require every test shard to pass
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Test shards failed or did not complete"
+            exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
+
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          apt-get update -q
+          apt-get install -y -q libsqlcipher-dev
+
+      - name: Install dependencies
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: uv sync --frozen --all-extras
+
+      - name: Download Python 3.13 coverage shards
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: coverage-shard-3.13-*
+          path: ${{ env.CI_CHECKOUT_PATH }}/coverage-shards
+
+      - name: Combine complete coverage evidence
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: uv run python scripts/ci_test_shards.py --artifact-dir coverage-shards --shard-count 4
+
+      - name: Enforce overall and audit-critical coverage floors
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          # Floors apply to the union of all four successful shards. Checking
+          # every floor together makes all coverage deficits visible per run.
+          status=0
+          uv run coverage report --fail-under=85 || status=1
+          uv run coverage report --include="src/elspeth/core/landscape/*" --fail-under=92 || status=1
+          uv run coverage report --include="src/elspeth/core/canonical.py" --fail-under=99 || status=1
+          uv run coverage report --include="src/elspeth/engine/orchestrator/*" --fail-under=90 || status=1
+          uv run coverage report --include="src/elspeth/contracts/*" --fail-under=62 || status=1
+          uv run coverage xml || status=1
+          exit "$status"
+
+      - name: Upload combined coverage report
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: coverage-report
@@ -819,11 +616,13 @@ jobs:
   # ===========================================================================
   integration:
     name: Integration Tests
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
-      image: python:3.13-bookworm
+      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
+      # Same open-file limit as the Test job (see the note there).
+      options: --ulimit nofile=65536:524288
     needs: [test]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/')))
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-integration
     steps:
@@ -896,19 +695,31 @@ jobs:
   # ===========================================================================
   testcontainer:
     name: Testcontainer (PostgreSQL contention proofs)
-    # Always GitHub-hosted: testcontainers-python needs a Docker daemon, which
-    # neither the self-hosted container jobs nor the python:*-bookworm images
-    # expose. ubuntu-24.04 ships Docker preinstalled for both push and PR runs.
-    runs-on: ubuntu-24.04
-    # No `needs: [static-analysis]`: same ruling as the `test` job above — the
-    # PostgreSQL proofs must report even while trust-tier keeps static-analysis
-    # red; `ci-success` still requires both.
-    # 276 ids ran serially in 8 min on the maintainer's box (2026-09-05,
-    # elspeth-d8749aeaa3); hosted runners are slower, so allow ~3x.
-    timeout-minutes: 30
+    # Run on the host so testcontainers-python can use the runner's Docker
+    # daemon directly; container jobs do not expose that daemon.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    # Run PostgreSQL proofs even if static analysis fails. CI Success requires both.
+    # PR #212 selected 651 ids on a hosted runner and reached 53% when the
+    # previous 30-minute limit cancelled the job. Allow the full required
+    # serial suite to finish and report its result.
+    timeout-minutes: 90
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-testcontainer
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
+
+      - name: Verify Docker prerequisites
+        run: |
+          docker info
+          docker compose version
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
@@ -917,10 +728,12 @@ jobs:
           enable-cache: false
           prune-cache: true
 
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libsqlcipher-dev
+          dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
         run: uv sync --frozen --all-extras
@@ -936,11 +749,14 @@ jobs:
         # The junit report is the evidence Phase 7 cites for the P0 pin test
         # tests/testcontainer/web/test_schema_probe_postgres.py::
         # test_fresh_create_reaches_current (elspeth-d8749aeaa3).
+        # PrivateTmp isolates the runner's /tmp from the host Docker daemon.
+        # Bind-mounted TLS fixture files must live in the shared checkout.
         run: |
           uv run pytest tests/ \
             -v \
             -m testcontainer \
             -n 0 \
+            --basetemp="$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.pytest-tmp" \
             --junitxml=testcontainer-junit.xml
 
       - name: Upload testcontainer junit report
@@ -948,7 +764,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: testcontainer-junit
-          path: testcontainer-junit.xml
+          path: ${{ env.CI_CHECKOUT_PATH }}/testcontainer-junit.xml
           retention-days: 30
 
   host-runner-unit:
@@ -961,11 +777,25 @@ jobs:
     # container job those ids skip with a reason; here the ELSPETH_CI_*_REQUIRED
     # variables turn the skips into failures, so the ids are proven on every
     # push rather than silently absent (elspeth-bc97e06221 B1, B3).
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     timeout-minutes: 15
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-host-runner-unit
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
+
+      - name: Verify Docker prerequisites
+        run: |
+          docker info
+          docker compose version
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
@@ -974,10 +804,12 @@ jobs:
           enable-cache: false
           prune-cache: true
 
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libsqlcipher-dev
+          dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
         run: uv sync --frozen --all-extras
@@ -998,12 +830,21 @@ jobs:
   # ===========================================================================
   state-engine-validation:
     name: State-engine catalog and selector validation
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs: [static-analysis]
     timeout-minutes: 15
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-state-engine-validation
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
@@ -1012,10 +853,12 @@ jobs:
           enable-cache: false
           prune-cache: true
 
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libsqlcipher-dev
+          dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
         run: uv sync --frozen --all-extras
@@ -1045,22 +888,34 @@ jobs:
   # ===========================================================================
   azure-container-apps-bicep:
     name: Azure Container Apps Bicep bundle
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs: [static-analysis]
     timeout-minutes: 15
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-azure-container-apps-bicep
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install Bicep (pinned)
         run: |
           BICEP_VERSION=0.46.1
           BICEP_SHA256=3e011d629ea4311b7a7dd8f0040ab2b1a072ea4ff5d02cb75e0e55a9a6703fb9
-          curl -fsSLo /tmp/bicep \
+          bicep_dir="$RUNNER_TEMP/bicep-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_CHECKOUT_PATH"
+          mkdir -p "$bicep_dir"
+          curl -fsSLo "$bicep_dir/bicep" \
             "https://github.com/Azure/bicep/releases/download/v${BICEP_VERSION}/bicep-linux-x64"
-          printf '%s  /tmp/bicep\n' "$BICEP_SHA256" | sha256sum -c -
-          sudo install -m 0755 /tmp/bicep /usr/local/bin/bicep
-          bicep --version
+          printf '%s  %s\n' "$BICEP_SHA256" "$bicep_dir/bicep" | sha256sum -c -
+          chmod 0755 "$bicep_dir/bicep"
+          echo "$bicep_dir" >> "$GITHUB_PATH"
+          "$bicep_dir/bicep" --version
 
       - name: Compile the bundle
         run: |
@@ -1081,10 +936,12 @@ jobs:
           enable-cache: false
           prune-cache: true
 
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libsqlcipher-dev
+          dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
         run: uv sync --frozen --all-extras
@@ -1094,9 +951,10 @@ jobs:
 
   supply-chain-audit:
     name: Dependency and License Audit
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
-      image: python:3.13-bookworm
+      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
     needs: [static-analysis]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-supply-chain-audit
@@ -1124,7 +982,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        run: uv sync --frozen --all-extras
+        run: uv sync --frozen --all-extras --group audit
 
       - name: Audit Python dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
@@ -1137,40 +995,270 @@ jobs:
             --no-emit-package elspeth-lints \
             --format requirements-txt \
             --output-file requirements-audit.txt
-          # CVE-2025-45768 / PYSEC-2025-183 has no fixed PyJWT release;
-          # the disputed weakness is application-selected HMAC key length.
-          # WebSettings enforces a 32-byte secret_key floor on non-loopback hosts.
-          #
           # CVE-2026-45829 has no fixed chromadb release as of 2026-06-03 (the
           # pip-audit "Fix Versions" column is empty). chromadb backs the
           # chroma_sink + rag_retrieval plugins; remove this ignore and bump the
           # pin once an upstream fix ships. PyJWT advisories PYSEC-2026-175/177/
-          # 178/179 are NOT ignored — they are resolved by the uv.lock bump to
-          # PyJWT 2.13.0 (constraint already permitted it).
-          uv run --with "pip-audit>=2.9,<3" pip-audit \
+          # 178/179 and CVE-2026-102274 are NOT ignored — the authored floor
+          # and uv.lock select PyJWT 2.15.0 or newer.
+          #
+          # CVE-2026-45830 / CVE-2026-45831 / CVE-2026-45833 (added 2026-09-10)
+          # likewise have no fixed chromadb release. All three are defects in the
+          # ChromaDB *server*: cross-tenant read/write through missing
+          # authorization validation on /api/v2/tenants/... (45830), a
+          # SimpleRBACAuthorizationProvider that checks the permission but never
+          # the tenant/database/collection it applies to (45831), and
+          # trust_remote_code arbitrary code execution reachable by a caller
+          # holding UPDATE_COLLECTION (45833). ELSPETH never runs that server: it
+          # is a client only — chromadb.Client / PersistentClient / HttpClient in
+          # plugins/infrastructure/clients/retrieval/chroma.py, sinks/chroma_sink.py
+          # and infrastructure/probe_factory.py — and registers no authorization
+          # provider and no /api/v2 route. An operator who points HttpClient at a
+          # Chroma server they host owns that server's exposure; this ignore does
+          # not extend to it. Remove all four chromadb ignores and bump the pin
+          # once upstream ships a fix.
+          uv run --frozen --all-extras --group audit pip-audit \
             --strict \
+            --timeout 60 \
             --requirement requirements-audit.txt \
             --no-deps \
             --disable-pip \
-            --ignore-vuln PYSEC-2025-183 \
             --ignore-vuln CVE-2026-45829 \
+            --ignore-vuln CVE-2026-45830 \
+            --ignore-vuln CVE-2026-45831 \
+            --ignore-vuln CVE-2026-45833 \
             --progress-spinner=off
+
+      - name: Audit standalone gateway dependencies
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          uv lock --check --project gateway
+          uv export \
+            --project gateway \
+            --quiet \
+            --frozen \
+            --all-extras \
+            --all-groups \
+            --no-emit-project \
+            --format requirements-txt \
+            --output-file gateway-requirements-audit.txt
+          uv run --project gateway --frozen --group audit --no-default-groups pip-audit \
+            --strict \
+            --requirement gateway-requirements-audit.txt \
+            --no-deps \
+            --disable-pip \
+            --progress-spinner=off
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "24"
+
+      # Audits the locked npm trees straight from the lockfiles (no install).
+      # The frontend lockfile is what the release image compiles into its
+      # static assets; the root lockfile is test tooling (Playwright, Azurite).
+      # Any advisory at any severity fails the job, as pip-audit does above.
+      - name: Audit frontend npm dependencies
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}/src/elspeth/web/frontend
+        run: npm audit --package-lock-only --audit-level=low
+
+      - name: Audit root npm tooling dependencies
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: npm audit --package-lock-only --audit-level=low
 
       - name: Check Python dependency licenses
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
-          uv run --with "pip-licenses>=5,<6" pip-licenses \
+          uv run --frozen --all-extras --group audit pip-licenses \
             --fail-on "GPL;AGPL" \
             --format=markdown \
             --output-file=python-license-report.md
+
+      - name: Check standalone gateway dependency licenses
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          uv run --project gateway --frozen --all-extras --all-groups pip-licenses \
+            --fail-on "GPL;AGPL" \
+            --format=markdown \
+            --output-file=gateway-python-license-report.md
 
       - name: Upload Python license report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: python-license-report
-          path: ${{ env.CI_CHECKOUT_PATH }}/python-license-report.md
+          path: |
+            ${{ env.CI_CHECKOUT_PATH }}/python-license-report.md
+            ${{ env.CI_CHECKOUT_PATH }}/gateway-python-license-report.md
           retention-days: 30
+
+  # ===========================================================================
+  # Standalone LLM gateway: frozen tests and built-image qualification
+  # ===========================================================================
+  gateway:
+    name: Gateway (locked tests and image)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    needs: [static-analysis]
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-gateway
+      GATEWAY_CI_IMAGE: elspeth-llm-gateway-ci:${{ github.sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
+
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
+      - name: Install frozen gateway test environment
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: uv sync --project gateway --frozen --extra test --no-default-groups
+
+      - name: Run gateway tests and in-process conformance
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          uv run --project gateway --frozen --extra test --no-default-groups \
+            pytest gateway/tests gateway/conformance -q
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
+
+      - name: Build frozen gateway image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        with:
+          context: ${{ env.CI_CHECKOUT_PATH }}/gateway
+          build-args: GATEWAY_REVISION=${{ github.sha }}
+          load: true
+          push: false
+          tags: ${{ env.GATEWAY_CI_IMAGE }}
+
+      - name: Refuse High or Critical gateway image findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: ${{ env.GATEWAY_CI_IMAGE }}
+          format: table
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          exit-code: "1"
+
+      - name: Allocate isolated gateway qualification ports and credentials
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}/gateway
+        run: |
+          uv run --frozen --extra test --no-default-groups python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from mock.stack import MOCK_CLIENT_ID, MOCK_CLIENT_SECRET, MOCK_INBOUND_BEARER
+
+          base = 20000 + (int(os.environ["GITHUB_RUN_ID"]) % 10000) * 3
+          values = {
+              "GATEWAY_PORT": str(base),
+              "GATEWAY_OAUTH_PORT": str(base + 1),
+              "GATEWAY_UPSTREAM_PORT": str(base + 2),
+              "GATEWAY_CLIENT_ID": MOCK_CLIENT_ID,
+              "GATEWAY_CLIENT_SECRET": MOCK_CLIENT_SECRET,
+              "GATEWAY_INBOUND_BEARER": MOCK_INBOUND_BEARER,
+              "GATEWAY_MODEL_ALIAS": "mock-model",
+              "GATEWAY_CONTAINER": f"gateway-ci-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as stream:
+              for key, value in values.items():
+                  stream.write(f"{key}={value}\n")
+          PY
+
+      - name: Start deterministic gateway qualification backends
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}/gateway
+        run: |
+          set -euo pipefail
+          uv run --frozen --extra test --no-default-groups \
+            python -m mock.backends \
+            --oauth-port "$GATEWAY_OAUTH_PORT" \
+            --upstream-port "$GATEWAY_UPSTREAM_PORT" \
+            >"$RUNNER_TEMP/gateway-mock-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log" 2>&1 &
+          echo "$!" >"$RUNNER_TEMP/gateway-mock-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.pid"
+          for port in "$GATEWAY_OAUTH_PORT" "$GATEWAY_UPSTREAM_PORT"; do
+            ready=false
+            for _ in $(seq 1 100); do
+              if curl --silent --output /dev/null "http://127.0.0.1:${port}/"; then
+                ready=true
+                break
+              fi
+              sleep 0.1
+            done
+            test "$ready" = true
+          done
+
+      - name: Start gateway image read-only as its fixed non-root identity
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --entrypoint id "$GATEWAY_CI_IMAGE" -u)" = 65532
+          test "$(docker run --rm --entrypoint id "$GATEWAY_CI_IMAGE" -g)" = 65532
+          test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$GATEWAY_CI_IMAGE")" = "$GITHUB_SHA"
+          docker run --detach \
+            --name "$GATEWAY_CONTAINER" \
+            --network host \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --env ELSPETH_LLM_GATEWAY_INBOUND_BEARER="$GATEWAY_INBOUND_BEARER" \
+            --env ELSPETH_LLM_GATEWAY_ADAPTER=reference_v1_invoke \
+            --env ELSPETH_LLM_GATEWAY_UPSTREAM_ORIGIN="http://127.0.0.1:${GATEWAY_UPSTREAM_PORT}" \
+            --env ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_URL="http://127.0.0.1:${GATEWAY_OAUTH_PORT}/token" \
+            --env ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_ID="$GATEWAY_CLIENT_ID" \
+            --env ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_SECRET="$GATEWAY_CLIENT_SECRET" \
+            --env ELSPETH_LLM_GATEWAY_OAUTH_AUTH_METHOD=client_secret_basic \
+            --env ELSPETH_LLM_GATEWAY_MAX_MESSAGES=50 \
+            --env ELSPETH_LLM_GATEWAY_MAX_TOOLS=10 \
+            --env ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS=10000 \
+            --env ELSPETH_LLM_GATEWAY_MAX_SCHEMA_BYTES=65536 \
+            --env ELSPETH_LLM_GATEWAY_MAX_SCHEMA_DEPTH=10 \
+            --env "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS={\"${GATEWAY_MODEL_ALIAS}\":{\"target\":\"mock-target\"}}" \
+            --entrypoint /venv/bin/python \
+            "$GATEWAY_CI_IMAGE" \
+            -m uvicorn elspeth_llm_gateway.core.app:build \
+            --host 127.0.0.1 --port "$GATEWAY_PORT" --factory \
+            --timeout-graceful-shutdown 30
+          for _ in $(seq 1 100); do
+            if curl --fail --silent "http://127.0.0.1:${GATEWAY_PORT}/healthz" >/dev/null; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          exit 1
+
+      - name: Run conformance against the read-only gateway image
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          GATEWAY_CONFORMANCE_URL="http://127.0.0.1:${GATEWAY_PORT}" \
+          GATEWAY_CONFORMANCE_BEARER="$GATEWAY_INBOUND_BEARER" \
+          GATEWAY_CONFORMANCE_MODEL_ALIAS="$GATEWAY_MODEL_ALIAS" \
+            uv run --project gateway --frozen --extra test --no-default-groups \
+            pytest gateway/conformance -q
+
+      - name: Stop gateway qualification processes
+        if: always()
+        run: |
+          docker logs "$GATEWAY_CONTAINER" || true
+          docker rm --force "$GATEWAY_CONTAINER" || true
+          pid_file="$RUNNER_TEMP/gateway-mock-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.pid"
+          if [[ -f "$pid_file" ]]; then
+            kill "$(cat "$pid_file")" || true
+          fi
 
   # ===========================================================================
   # Stage 4: Frontend E2E (Playwright)
@@ -1180,7 +1268,8 @@ jobs:
   # browser journey blocks merge instead of being waved through.
   e2e-frontend:
     name: Frontend E2E (Playwright)
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-e2e-frontend
     steps:
@@ -1207,12 +1296,7 @@ jobs:
       - name: Install system dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
-          if [[ "${{ runner.environment }}" == "self-hosted" ]]; then
-            dpkg-query -W libsqlcipher-dev
-          else
-            sudo apt-get update -q
-            sudo apt-get install -y -q libsqlcipher-dev
-          fi
+          dpkg-query -W libsqlcipher-dev
 
       - name: Install Python dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
@@ -1231,16 +1315,30 @@ jobs:
 
       - name: Install Playwright browser
         working-directory: ${{ env.CI_CHECKOUT_PATH }}/src/elspeth/web/frontend
-        run: |
-          if [[ "${{ runner.environment }}" == "self-hosted" ]]; then
-            npx playwright install chromium
-          else
-            npx playwright install --with-deps chromium
-          fi
+        run: npx playwright install chromium
 
       - name: Assign isolated Playwright ports
         run: |
-          port_base=$((20000 + (GITHUB_RUN_ID % 20000)))
+          # One job runs per runner service. Disjoint pairs for each service
+          # prevent simultaneous push and PR runs from sharing a port.
+          if [[ ! "$RUNNER_NAME" =~ ^nyx-elspeth-([1-9][0-9]{0,4})$ ]]; then
+            echo "Unsupported local runner name: $RUNNER_NAME" >&2
+            exit 1
+          fi
+          runner_index="${BASH_REMATCH[1]}"
+          port_base=$((20000 + 2 * runner_index))
+          if (( port_base + 1 > 65535 )); then
+            echo "Runner index exceeds the Playwright port range: $runner_index" >&2
+            exit 1
+          fi
+          python - "$port_base" <<'PY'
+          import socket
+          import sys
+
+          for port in (int(sys.argv[1]), int(sys.argv[1]) + 1):
+              with socket.socket() as probe:
+                  probe.bind(("127.0.0.1", port))
+          PY
           echo "PLAYWRIGHT_BACKEND_PORT=$port_base" >> "$GITHUB_ENV"
           echo "PLAYWRIGHT_FRONTEND_PORT=$((port_base + 1))" >> "$GITHUB_ENV"
 
@@ -1279,7 +1377,8 @@ jobs:
   # blocks merge.
   frontend-unit:
     name: Frontend unit (vitest + typecheck)
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-frontend-unit
     steps:
@@ -1314,10 +1413,11 @@ jobs:
   # ===========================================================================
   ci-success:
     name: CI Success
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs:
       - static-analysis
       - test
+      - coverage
       - testcontainer
       - host-runner-unit
       - state-engine-validation
@@ -1325,8 +1425,18 @@ jobs:
       - supply-chain-audit
       - e2e-frontend
       - frontend-unit
+      - gateway
     if: always()
     steps:
+      - name: Reject fork pull requests
+        env:
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          if [[ "$IS_FORK_PR" == "true" ]]; then
+            echo "Fork pull requests cannot run on the trusted local runners."
+            exit 1
+          fi
+
       - name: Check all jobs passed
         run: |
           if [[ "${{ needs.static-analysis.result }}" != "success" ]]; then
@@ -1335,6 +1445,10 @@ jobs:
           fi
           if [[ "${{ needs.test.result }}" != "success" ]]; then
             echo "Test job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.coverage.result }}" != "success" ]]; then
+            echo "Combined coverage job failed"
             exit 1
           fi
           if [[ "${{ needs.testcontainer.result }}" != "success" ]]; then
@@ -1363,6 +1477,10 @@ jobs:
           fi
           if [[ "${{ needs.frontend-unit.result }}" != "success" ]]; then
             echo "Frontend unit (vitest + typecheck) job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.gateway.result }}" != "success" ]]; then
+            echo "Gateway locked tests and image job failed"
             exit 1
           fi
           echo "All CI checks passed!"

@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from elspeth.contracts.audit_export import AuditExportDerivationConfig, derive_audit_export_bundle
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.sink_effects import (
     AuditExportFormat,
@@ -30,6 +31,8 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReconcileKind,
     _create_restricted_audit_export_snapshot_reader,
 )
+from elspeth.core import audit_export_verifier as verifier_module
+from elspeth.core.audit_export_verifier import MappingAuditExportVerificationKeyResolver, verify_audit_export
 from elspeth.plugins.sinks import _audit_export_bundle_effects as bundle_effects
 
 EFFECT_ID = "e" * 64
@@ -55,8 +58,9 @@ def _snapshot(
         source_status="completed",
         source_completed_at=COMPLETED_AT,
         export_format="csv",
-        exporter_version="landscape-exporter-v2",
-        serialization_version="audit-export-v2",
+        exporter_version="landscape-exporter-auth-v2",
+        compartment_id="test-compartment",
+        serialization_version="audit-export-v3",
         chunking_algorithm_version="complete-frame-v1",
         include_raw_error_rows=False,
         per_chunk_byte_limit=1024 * 1024,
@@ -65,7 +69,19 @@ def _snapshot(
         signer_key_id="audit-key-v1" if signed else "UNSIGNED",
         signing_key=b"audit-test-key" if signed else None,
     )
-    bundle = derive_audit_export_bundle(records, config)
+    current_records: tuple[dict[str, object], ...] = (
+        {"record_type": "audit_export_config", "public_config": config.public_snapshot_config()},
+        {
+            "record_type": "auth_event_coverage",
+            "policy": "omitted",
+            "selection_cutoff": None,
+            "selection_basis": None,
+            "selected_count": None,
+            "reason": "not_requested",
+        },
+        *records,
+    )
+    bundle = derive_audit_export_bundle(current_records, config)
     chunks = tuple(
         AuditExportSnapshotChunkInput(
             ordinal=chunk.ordinal,
@@ -89,7 +105,7 @@ def _snapshot(
         signer_key_id="audit-key-v1" if signed else "UNSIGNED",
         record_count=len(bundle.record_frames),
         total_bytes=sum(len(frame) for frame in bundle.record_frames),
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         exported_at=COMPLETED_AT,
         source_completed_at=COMPLETED_AT,
         source_status="completed",
@@ -108,7 +124,7 @@ def _snapshot(
             registry_key_hash=bundle.registry_key_hash,
             manifest_hash=bundle.manifest_hash,
             snapshot_hash=bundle.snapshot_hash,
-            serialization_version="audit-export-v2",
+            serialization_version="audit-export-v3",
             export_format=AuditExportFormat.CSV,
             signing_mode=AuditExportSigningMode.HMAC_SHA256 if signed else AuditExportSigningMode.UNSIGNED,
             signer_key_id="audit-key-v1" if signed else "UNSIGNED",
@@ -178,7 +194,7 @@ def _forged_snapshot(record: dict[str, object]) -> tuple[SinkEffectAuditExportSn
         signer_key_id="UNSIGNED",
         record_count=1,
         total_bytes=len(chunk_bytes),
-        serialization_version="audit-export-v2",
+        serialization_version="audit-export-v3",
         exported_at=COMPLETED_AT,
         source_completed_at=COMPLETED_AT,
         source_status="completed",
@@ -197,7 +213,7 @@ def _forged_snapshot(record: dict[str, object]) -> tuple[SinkEffectAuditExportSn
             registry_key_hash="2" * 64,
             manifest_hash="3" * 64,
             snapshot_hash="4" * 64,
-            serialization_version="audit-export-v2",
+            serialization_version="audit-export-v3",
             export_format=AuditExportFormat.CSV,
             signing_mode=AuditExportSigningMode.UNSIGNED,
             signer_key_id="UNSIGNED",
@@ -236,22 +252,65 @@ def _target(plan) -> Path:
     return Path(str(plan.safe_evidence["target_path"]))
 
 
+def test_verification_records_have_a_dedicated_csv_with_exact_difference_evidence(tmp_path: Path) -> None:
+    records = tuple(
+        {
+            "record_type": "call_verification",
+            "run_id": "run-1",
+            "current_call_id": f"current-{index}",
+            "source_run_id": "source-run",
+            "source_call_id": f"source-{index}" if is_match is not None else None,
+            "is_match": is_match,
+            "differences_json": differences,
+            "recorded_at": COMPLETED_AT,
+        }
+        for index, (is_match, differences) in enumerate(
+            ((True, "{}"), (False, '{"response_hash":{"expected":"a","actual":"b"}}'), (None, '{"reason":"missing_source_call"}'))
+        )
+    )
+    snapshot, _manifest_bytes = _snapshot(records=records)
+    plan = _prepare(tmp_path / "audit", snapshot)
+    with (_stage(plan) / "call_verification.csv").open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert [row["current_call_id"] for row in rows] == [record["current_call_id"] for record in records]
+    assert [row["differences_json"] for row in rows] == [record["differences_json"] for record in records]
+    assert [row["is_match"] for row in rows] == ["True", "False", ""]
+    assert [row["source_call_id"] for row in rows] == ["source-0", "source-1", ""]
+
+
 @pytest.mark.parametrize("signed", [False, True])
 def test_prepare_pins_exact_csv_files_manifest_and_aggregate_hash(tmp_path: Path, signed: bool) -> None:
     snapshot, manifest_bytes = _snapshot(signed=signed)
     plan = _prepare(tmp_path / "audit", snapshot)
     stage = _stage(plan)
 
-    assert sorted(path.name for path in stage.iterdir()) == ["audit_manifest.v2.json", "node.csv", "run.csv"]
+    assert sorted(path.name for path in stage.iterdir()) == [
+        "audit_export_config.csv",
+        "audit_manifest.v2.json",
+        "audit_records.v3.jsonl",
+        "auth_event_coverage.csv",
+        "node.csv",
+        "run.csv",
+    ]
     assert (stage / "audit_manifest.v2.json").read_bytes() == manifest_bytes
+    assert (stage / "audit_records.v3.jsonl").read_bytes() == (
+        b"".join(snapshot.reader.iter_verified_chunks()) + snapshot.reader.read_verified_signed_manifest()
+    )
     assert not manifest_bytes.endswith(b"\n")
     with (stage / "run.csv").open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
     assert rows[0]["formula"] == "'=1+1"
 
     files = list(plan.safe_evidence["files"])
-    assert [entry["relative_path"] for entry in files] == ["audit_manifest.v2.json", "node.csv", "run.csv"]
-    manifest_entry = files[0]
+    assert [entry["relative_path"] for entry in files] == [
+        "audit_export_config.csv",
+        "audit_manifest.v2.json",
+        "audit_records.v3.jsonl",
+        "auth_event_coverage.csv",
+        "node.csv",
+        "run.csv",
+    ]
+    manifest_entry = files[1]
     assert manifest_entry == {
         "content_hash": snapshot.signed_manifest.content_hash,
         "relative_path": "audit_manifest.v2.json",
@@ -263,6 +322,322 @@ def test_prepare_pins_exact_csv_files_manifest_and_aggregate_hash(tmp_path: Path
     assert plan.expected_descriptor is not None
     assert plan.expected_descriptor.content_hash == expected_bundle_hash
     assert plan.expected_descriptor.size_bytes == sum(int(entry["size_bytes"]) for entry in files)
+
+
+def test_signed_portable_csv_bundle_verifies_every_delivered_projection(tmp_path: Path) -> None:
+    snapshot, _manifest_bytes = _snapshot(signed=True)
+    plan = _prepare(tmp_path / "audit", snapshot)
+    stage = _stage(plan)
+    resolver = MappingAuditExportVerificationKeyResolver({"audit-key-v1": b"audit-test-key"})
+
+    report = verify_audit_export(stage, key_resolver=resolver)
+
+    assert report.format == "csv"
+    assert report.authenticated is True
+    assert report.signer_key_id == "audit-key-v1"
+    assert report.artifact_digest == plan.payload_hash
+
+    run_csv = stage / "run.csv"
+    original = run_csv.read_bytes()
+    run_csv.write_bytes(original + b"changed")
+    with pytest.raises(AuditIntegrityError, match="projection"):
+        verify_audit_export(stage, key_resolver=resolver)
+
+
+def test_portable_csv_verification_captures_every_delivered_file_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, _manifest_bytes = _snapshot(signed=True)
+    stage = _stage(_prepare(tmp_path / "audit", snapshot))
+    resolver = MappingAuditExportVerificationKeyResolver({"audit-key-v1": b"audit-test-key"})
+    original_open = os.open
+    opened: dict[str, int] = {}
+
+    def tracked_open(
+        path: str | bytes | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        candidate = Path(os.fsdecode(path))
+        if candidate.parent == stage:
+            opened[candidate.name] = opened.get(candidate.name, 0) + 1
+            assert flags & os.O_NOFOLLOW
+            assert flags & os.O_NONBLOCK
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", tracked_open)
+
+    assert verify_audit_export(stage, key_resolver=resolver).authenticated is True
+    assert opened == {path.name: 1 for path in stage.iterdir()}
+
+
+def test_portable_csv_verification_reports_the_private_snapshot_after_source_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, _manifest_bytes = _snapshot(signed=True)
+    plan = _prepare(tmp_path / "audit", snapshot)
+    stage = _stage(plan)
+    resolver = MappingAuditExportVerificationKeyResolver({"audit-key-v1": b"audit-test-key"})
+    original_inspect_export = verifier_module._inspect_export
+    changed = False
+
+    def change_source_after_capture(source):
+        nonlocal changed
+        inspected = original_inspect_export(source)
+        if not changed:
+            run_csv = stage / "run.csv"
+            run_csv.write_bytes(run_csv.read_bytes() + b"source-path-changed-after-private-capture")
+            changed = True
+        return inspected
+
+    monkeypatch.setattr(verifier_module, "_inspect_export", change_source_after_capture)
+
+    report = verify_audit_export(stage, key_resolver=resolver)
+
+    assert changed
+    assert report.artifact_digest == plan.payload_hash
+    assert (stage / "run.csv").read_bytes().endswith(b"source-path-changed-after-private-capture")
+
+
+@pytest.mark.parametrize("mutation", ["append", "same_bytes_replacement", "symlink_replacement"])
+def test_portable_csv_bundle_refuses_projection_changes_during_private_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    snapshot, _manifest_bytes = _snapshot(signed=True)
+    stage = _stage(_prepare(tmp_path / "audit", snapshot))
+    resolver = MappingAuditExportVerificationKeyResolver({"audit-key-v1": b"audit-test-key"})
+    target = stage / "run.csv"
+    target_inode = target.stat().st_ino
+    original_read = os.read
+    changed = False
+
+    def change_during_capture(descriptor: int, size: int) -> bytes:
+        nonlocal changed
+        block = original_read(descriptor, size)
+        if block and os.fstat(descriptor).st_ino == target_inode and not changed:
+            if mutation == "append":
+                target.write_bytes(target.read_bytes() + b"tampered-during-capture")
+            elif mutation == "same_bytes_replacement":
+                replacement = tmp_path / "same-bytes-replacement"
+                replacement.write_bytes(target.read_bytes())
+                replacement.replace(target)
+            else:
+                target.unlink()
+                target.symlink_to(stage / "node.csv")
+            changed = True
+        return block
+
+    monkeypatch.setattr(os, "read", change_during_capture)
+
+    with pytest.raises(AuditIntegrityError):
+        verify_audit_export(stage, key_resolver=resolver)
+
+    assert changed
+
+
+def test_portable_csv_bundle_refuses_a_cryptographically_mixed_capture(tmp_path: Path) -> None:
+    first, _manifest_bytes = _snapshot(signed=True)
+    second, _manifest_bytes = _snapshot(
+        records=(
+            {
+                "completed_at": COMPLETED_AT,
+                "formula": "different",
+                "record_type": "run",
+                "run_id": "run-1",
+                "status": "completed",
+            },
+            {"node_id": "source", "record_type": "node", "run_id": "run-1"},
+        ),
+        signed=True,
+    )
+    first_stage = _stage(_prepare(tmp_path / "first", first))
+    second_stage = _stage(_prepare(tmp_path / "second", second))
+    (first_stage / "run.csv").write_bytes((second_stage / "run.csv").read_bytes())
+    resolver = MappingAuditExportVerificationKeyResolver({"audit-key-v1": b"audit-test-key"})
+
+    with pytest.raises(AuditIntegrityError, match="projection"):
+        verify_audit_export(first_stage, key_resolver=resolver)
+
+
+@pytest.mark.parametrize("replacement", ["copy", "symlink"])
+def test_portable_csv_bundle_refuses_directory_identity_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    snapshot, _manifest_bytes = _snapshot(signed=True)
+    stage = _stage(_prepare(tmp_path / "audit", snapshot))
+    resolver = MappingAuditExportVerificationKeyResolver({"audit-key-v1": b"audit-test-key"})
+    original_directory_names = verifier_module._directory_names
+    changed = False
+
+    def replace_after_enumeration(path: Path) -> tuple[str, ...]:
+        nonlocal changed
+        names = original_directory_names(path)
+        if not changed:
+            moved = path.with_name(f"{path.name}-moved")
+            path.rename(moved)
+            if replacement == "copy":
+                shutil.copytree(moved, path)
+            else:
+                path.symlink_to(moved, target_is_directory=True)
+            changed = True
+        return names
+
+    monkeypatch.setattr(verifier_module, "_directory_names", replace_after_enumeration)
+
+    with pytest.raises(AuditIntegrityError):
+        verify_audit_export(stage, key_resolver=resolver)
+
+    assert changed
+
+
+def test_portable_csv_bundle_refuses_truthful_oversize_before_content_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, _manifest_bytes = _snapshot(signed=True)
+    stage = _stage(_prepare(tmp_path / "audit", snapshot))
+    resolver = MappingAuditExportVerificationKeyResolver({"audit-key-v1": b"audit-test-key"})
+    monkeypatch.setattr(verifier_module, "AUDIT_EXPORT_MAX_DELIVERED_BYTES", 1)
+
+    def unexpected_read(_descriptor: int, _size: int) -> bytes:
+        raise AssertionError("oversized metadata must be rejected before content read")
+
+    monkeypatch.setattr(os, "read", unexpected_read)
+
+    with pytest.raises(AuditIntegrityError, match="byte maximum"):
+        verify_audit_export(stage, key_resolver=resolver)
+
+
+def test_portable_csv_bundle_caps_a_growing_file_at_its_declared_size_plus_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, _manifest_bytes = _snapshot(signed=True)
+    stage = _stage(_prepare(tmp_path / "audit", snapshot))
+    resolver = MappingAuditExportVerificationKeyResolver({"audit-key-v1": b"audit-test-key"})
+    target = stage / "run.csv"
+    initial_size = target.stat().st_size
+    target_inode = target.stat().st_ino
+    original_read = os.read
+    changed = False
+    target_bytes_read = 0
+
+    def grow_before_read(descriptor: int, size: int) -> bytes:
+        nonlocal changed, target_bytes_read
+        is_target = os.fstat(descriptor).st_ino == target_inode
+        if is_target and not changed:
+            with target.open("ab") as stream:
+                stream.write(b"x" * 4096)
+            changed = True
+        block = original_read(descriptor, size)
+        if is_target:
+            target_bytes_read += len(block)
+        return block
+
+    monkeypatch.setattr(os, "read", grow_before_read)
+
+    with pytest.raises(AuditIntegrityError, match="byte maximum"):
+        verify_audit_export(stage, key_resolver=resolver)
+
+    assert changed
+    assert target_bytes_read == initial_size + 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "extra",
+        "missing",
+        "rename",
+        "symlink",
+        "fifo",
+        "nested",
+        "case_alias",
+        "manifest",
+        "portable_record",
+        "row_order",
+    ],
+)
+def test_portable_csv_bundle_refuses_file_set_and_type_mutations(tmp_path: Path, mutation: str) -> None:
+    records: tuple[dict[str, object], ...] | None = None
+    if mutation == "row_order":
+        records = (
+            {
+                "completed_at": COMPLETED_AT,
+                "record_type": "run",
+                "run_id": "run-1",
+                "status": "completed",
+            },
+            {
+                "completed_at": COMPLETED_AT,
+                "record_type": "run",
+                "run_id": "run-2",
+                "status": "completed",
+            },
+            {"node_id": "source", "record_type": "node", "run_id": "run-1"},
+        )
+    snapshot, _manifest_bytes = _snapshot(signed=True, **({"records": records} if records is not None else {}))
+    stage = _stage(_prepare(tmp_path / "audit", snapshot))
+    resolver = MappingAuditExportVerificationKeyResolver({"audit-key-v1": b"audit-test-key"})
+    if mutation == "extra":
+        (stage / "extra.csv").write_bytes(b"record_type\r\n")
+    elif mutation == "missing":
+        (stage / "node.csv").unlink()
+    elif mutation == "rename":
+        (stage / "node.csv").rename(stage / "nodes.csv")
+    elif mutation == "symlink":
+        (stage / "node.csv").unlink()
+        (stage / "node.csv").symlink_to(stage / "run.csv")
+    elif mutation == "fifo":
+        (stage / "node.csv").unlink()
+        os.mkfifo(stage / "node.csv")
+    elif mutation == "nested":
+        (stage / "node.csv").unlink()
+        (stage / "node.csv").mkdir()
+    elif mutation == "case_alias":
+        (stage / "RUN.csv").write_bytes(b"record_type\r\n")
+    elif mutation == "manifest":
+        manifest = stage / "audit_manifest.v2.json"
+        manifest.write_bytes(manifest.read_bytes() + b"changed")
+    elif mutation == "portable_record":
+        records_path = stage / "audit_records.v3.jsonl"
+        records_path.write_bytes(records_path.read_bytes().replace(b'"run-1"', b'"run-x"', 1))
+    else:
+        run_csv = stage / "run.csv"
+        lines = run_csv.read_bytes().splitlines(keepends=True)
+        assert len(lines) == 3
+        run_csv.write_bytes(lines[0] + lines[2] + lines[1])
+
+    with pytest.raises(AuditIntegrityError):
+        verify_audit_export(stage, key_resolver=resolver)
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value"),
+    [("AUDIT_EXPORT_MAX_DELIVERED_FILES", 5), ("AUDIT_EXPORT_MAX_DELIVERED_BYTES", 1)],
+)
+def test_portable_csv_bundle_verifier_owned_limits_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit_value: int,
+) -> None:
+    snapshot, _manifest_bytes = _snapshot(signed=True)
+    stage = _stage(_prepare(tmp_path / "audit", snapshot))
+    resolver = MappingAuditExportVerificationKeyResolver({"audit-key-v1": b"audit-test-key"})
+    assert verify_audit_export(stage, key_resolver=resolver).authenticated is True
+
+    monkeypatch.setattr(verifier_module, limit_name, limit_value)
+    with pytest.raises(AuditIntegrityError):
+        verify_audit_export(stage, key_resolver=resolver)
 
 
 def test_prepare_refuses_staging_tree_changed_during_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

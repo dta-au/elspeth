@@ -11,7 +11,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.engine import Engine
-from sqlalchemy.schema import CreateIndex
+from sqlalchemy.schema import CreateIndex, CreateTable
 
 import elspeth.core.landscape.database as database_module
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
@@ -81,10 +81,13 @@ class _InspectorFake:
 class _CreateEngineFake:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        # Construction is lazy: no PostgreSQL connection is opened, but the
+        # returned Engine supports the production event-listener contract.
+        self.engine = create_engine("postgresql+psycopg://db.example/audit")
 
-    def __call__(self, *args: object, **kwargs: object) -> object:
+    def __call__(self, *args: object, **kwargs: object) -> Engine:
         self.calls.append((args, kwargs))
-        return object()
+        return self.engine
 
     def assert_called_once_with(self, *args: object, **kwargs: object) -> None:
         assert self.calls == [(args, kwargs)]
@@ -141,6 +144,7 @@ class TestExplicitEngineKwargs:
         fake.assert_called_once_with(
             "postgresql+psycopg://db.example/audit",
             echo=False,
+            hide_parameters=True,
             pool_size=3,
             max_overflow=2,
             pool_pre_ping=True,
@@ -162,6 +166,7 @@ class TestExplicitEngineKwargs:
         fake.assert_called_once_with(
             "postgresql+psycopg://db.example/audit",
             echo=False,
+            hide_parameters=True,
             pool_size=3,
             max_overflow=2,
             pool_pre_ping=True,
@@ -253,14 +258,14 @@ class TestSyncSchemaEpochDirectionalGuard:
 class TestSchemaCompatibilityGuards:
     """Coverage for fail-fast schema compatibility checks."""
 
-    def test_phase5b_resolved_prompt_template_hash_is_required_schema_contract(self) -> None:
+    def test_phase5b_approved_prompt_artifact_hash_is_required_schema_contract(self) -> None:
         """Phase 5b call-hash anchor must participate in stale-DB detection.
 
         The Landscape metadata alone is not enough: existing SQLite audit DBs
         are validated against these required lists before runtime writes begin.
         """
-        assert ("calls", "resolved_prompt_template_hash") in database_module._REQUIRED_COLUMNS
-        assert ("calls", "ix_calls_resolved_prompt_template_hash") in database_module._REQUIRED_INDEXES
+        assert ("calls", "approved_prompt_artifact_hash") in database_module._REQUIRED_COLUMNS
+        assert ("calls", "ix_calls_approved_prompt_artifact_hash") in database_module._REQUIRED_INDEXES
 
     def test_openrouter_catalog_source_check_is_required_schema_contract(self) -> None:
         """OpenRouter catalog source validity must participate in stale-DB detection."""
@@ -310,6 +315,77 @@ class TestSchemaCompatibilityGuards:
             epoch = conn.exec_driver_sql("PRAGMA user_version").scalar_one()
         verify_engine.dispose()
         assert epoch == 0
+
+    def test_collector_group_failure_reason_check_is_required_schema_contract(self) -> None:
+        """The closed reason vocabulary folded into epoch 45 must participate in stale-DB detection."""
+        assert ("collector_group_failures", "ck_collector_group_failures_failure_reason") in database_module._REQUIRED_CHECK_CONSTRAINTS
+
+    def test_from_url_rejects_a_collector_group_failures_table_made_before_the_reason_check(self, tmp_path: Path) -> None:
+        """A store created at the current epoch before the CHECK was folded in is refused, not silently opened.
+
+        The fold carries no epoch bump (operator ruling 2026-09-25), so the
+        epoch cannot tell such a store apart; the required CHECK does.
+        """
+        db_path = tmp_path / "pre_fold_collector_group_failures.db"
+        engine = create_engine(f"sqlite:///{db_path}")
+        metadata.create_all(engine)
+        _stamp_current_landscape_identity(engine)
+        with engine.begin() as conn:
+            conn.exec_driver_sql("DROP TABLE collector_group_failures")
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE collector_group_failures (
+                        run_id VARCHAR(64) NOT NULL,
+                        group_id VARCHAR(64) NOT NULL,
+                        collector_node_id VARCHAR(64) NOT NULL,
+                        failure_reason VARCHAR(64) NOT NULL,
+                        recorded_at DATETIME NOT NULL,
+                        PRIMARY KEY (run_id, group_id),
+                        FOREIGN KEY(run_id, group_id) REFERENCES group_records (run_id, group_id),
+                        FOREIGN KEY(collector_node_id, run_id) REFERENCES nodes (node_id, run_id)
+                    )
+                    """
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(SchemaCompatibilityError) as exc_info:
+            LandscapeDB.from_url(f"sqlite:///{db_path}")
+
+        msg = str(exc_info.value)
+        assert "Missing check constraints:" in msg
+        assert "collector_group_failures.ck_collector_group_failures_failure_reason" in msg
+
+    def test_from_url_rejects_a_scheduler_events_table_made_before_the_requeue_event_fold(self, tmp_path: Path) -> None:
+        """A store created at epoch 46 before ``resume_requeue_failed`` joined the event_type CHECK is refused.
+
+        The fold carries no epoch bump (lane ruling 2026-09-26: fold into 46 only
+        if a pre-fold store is refused at open), so the epoch cannot tell such a
+        store apart; startup shape validation of the CHECK does. The pre-fold
+        table is today's DDL with exactly the new literal removed.
+        """
+        db_path = tmp_path / "pre_fold_scheduler_events.db"
+        engine = create_engine(f"sqlite:///{db_path}")
+        metadata.create_all(engine)
+        _stamp_current_landscape_identity(engine)
+        table = metadata.tables["scheduler_events"]
+        current_ddl = str(CreateTable(table).compile(dialect=engine.dialect))
+        pre_fold_ddl = current_ddl.replace(", 'resume_requeue_failed'", "")
+        assert pre_fold_ddl != current_ddl  # the mutation really removed the literal
+        with engine.begin() as conn:
+            conn.exec_driver_sql("DROP TABLE scheduler_events")
+            conn.exec_driver_sql(pre_fold_ddl)
+            for index in table.indexes:
+                conn.exec_driver_sql(str(CreateIndex(index).compile(dialect=engine.dialect)))
+        engine.dispose()
+
+        with pytest.raises(SchemaCompatibilityError) as exc_info:
+            LandscapeDB.from_url(f"sqlite:///{db_path}")
+
+        msg = str(exc_info.value)
+        assert "scheduler_events.ck_scheduler_events_event_type CHECK constraint SQL mismatch" in msg
+        assert "Missing indexes" not in msg
 
     def test_checkpoint_sequence_uniqueness_is_required_schema_contract(self) -> None:
         """Per-run checkpoint ordering must be mechanically unique in fresh and stale DBs."""
@@ -1706,7 +1782,7 @@ class TestJournalPathGuards:
         with pytest.raises(ValueError, match="dump_to_jsonl requires dump_to_jsonl_path for non-SQLite databases"):
             LandscapeDB.from_url("postgresql://user@host/db", dump_to_jsonl=True)
 
-        create_engine_fake.assert_called_once_with("postgresql://user@host/db", echo=False)
+        create_engine_fake.assert_called_once_with("postgresql://user@host/db", echo=False, hide_parameters=True)
 
     def test_from_url_dump_to_jsonl_rejects_in_memory_sqlite_without_path(self) -> None:
         """In-memory SQLite has no file path, so automatic journal derivation must fail."""
@@ -1721,7 +1797,7 @@ class TestJournalPathGuards:
         with pytest.raises(ValueError, match="dump_to_jsonl requires dump_to_jsonl_path for non-SQLite databases"):
             LandscapeDB.from_url("postgresql://user@host/db", dump_to_jsonl=True, dump_to_jsonl_path="")
 
-        create_engine_fake.assert_called_once_with("postgresql://user@host/db", echo=False)
+        create_engine_fake.assert_called_once_with("postgresql://user@host/db", echo=False, hide_parameters=True)
 
     def test_from_url_dump_to_jsonl_rejects_explicit_path_outside_sqlite_db_dir(self, tmp_path: Path) -> None:
         """Explicit SQLite journal paths must not escape the database directory."""

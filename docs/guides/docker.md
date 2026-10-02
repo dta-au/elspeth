@@ -62,8 +62,8 @@ sudo chmod 0700 ./data ./data/blobs ./data/outputs
 ```
 
 Generate fresh signing keys in the shell, then pass all required web settings
-into the container. The values below for the four Composer limits match the
-project's browser-test configuration:
+into the container. The Composer timeout is five minutes, with a six-minute
+declared transport ceiling; any proxy in front must support that ceiling:
 
 ```bash
 export ELSPETH_WEB_SECRET_KEY="$(openssl rand -hex 32)"
@@ -76,7 +76,8 @@ docker run --rm --name elspeth-web \
   -e ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY="${ELSPETH_WEB_SHAREABLE_LINK_SIGNING_KEY}" \
   -e ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS=15 \
   -e ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS=10 \
-  -e ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=180.0 \
+  -e ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS=300.0 \
+  -e ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS=360.0 \
   -e ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE=60 \
   -v "$(pwd)/data:/app/data" \
   ghcr.io/dta-au/elspeth:${IMAGE_TAG} \
@@ -327,6 +328,59 @@ volume holds payload persistence and local data. Back up and restore them as
 separate stores. Do not scale `web` beyond one replica or run more than one
 web process.
 
+### TLS proxy and WebSocket acceptance
+
+The Compose backend listens on port 8451. For host nginx, use the tracked
+[`deploy/compose/nginx.conf`](../../deploy/compose/nginx.conf) as an include
+inside nginx's `http` context, such as `/etc/nginx/conf.d/elspeth.conf`.
+Provision a certificate valid for the public hostname and its private key at
+`/etc/nginx/tls/elspeth/fullchain.pem` and `privkey.pem` first. Restrict direct
+access to port 8451 with the host firewall or change the Compose port binding
+to `127.0.0.1:8451:8451`. Set the public hostname in `server_name` and configure
+the application's allowed origins for that HTTPS origin.
+
+For an existing deployment, review the installed configuration against this
+template and carry the changes into its owning Ansible or deployment source.
+This repository does not ship an Ansible role. Validate with `nginx -t` after
+provisioning certificates; service reload remains an operator deployment step.
+Do not install another proxy or overwrite an existing TLS configuration blindly.
+
+The HTTP-scope map and upstream `Upgrade`/`Connection` headers preserve
+WebSocket negotiation through `/ws/runs/...`; ordinary authenticated requests
+continue through the same proxy. A healthy `/api/ready` does not prove upgrade
+works. Both nginx proxy timeouts are 360 seconds, matching the bundle's declared
+transport ceiling. Composer has 300 seconds (five minutes) with 30 seconds of required
+headroom. Any additional CDN or load balancer must allow at least 360 seconds;
+otherwise lower the declared ceiling to the smallest actual hop and lower the
+Composer timeout to preserve headroom. The 15/10 turn settings are upper bounds,
+not a promise that all 25 provider turns fit inside 300 seconds.
+
+The nginx access log uses `$uri` without query strings and records status and
+timings. Stock nginx error logs can include the full request with a one-use
+WebSocket ticket; this template disables that server's error log because it
+cannot redact those credentials. Diagnose failures using safe access status and
+timing fields plus application telemetry. Do not enable raw request/error logging
+on this endpoint to investigate a ticket failure.
+
+After an operator deploys the configuration, use a small canary run owned by the
+authenticated user. Store that user's existing session bearer token in a private
+file (mode 0600); never put it in command-line arguments or a shared log. The
+probe uses normal ticket authorization and does not create or cancel runs:
+
+```bash
+python -m scripts.probe_websocket_ingress \
+  --origin https://elspeth.example.org \
+  --run-id "$CANARY_RUN_ID" \
+  --bearer-file "$PRIVATE_BEARER_FILE" \
+  --timeout 240
+```
+
+It requires a first event through public WSS, rejection of ticket reuse, a fresh
+ticket, replay from sequence zero through the terminal event, and clean closure.
+Only status, event sequences and an exception class on failure are printed.
+Keep the returned JSON and exit code as ingress acceptance evidence. Unit tests
+of the backend alone do not establish that the deployed proxy passes this probe.
+
 ---
 
 ## Health Checks
@@ -551,6 +605,9 @@ docker run --rm \
 - [AWS ECS Cold Install](../runbooks/aws-ecs-cold-install.md) - Complete disposable stack with Aurora, monitoring, and Bedrock
 - [AWS ECS Existing-Service Redeploy](../runbooks/aws-ecs-existing-service-redeploy.md) - Everyday immutable image redeploy
 - [AWS ECS Full Acceptance Runbook](../runbooks/aws-ecs-deployment.md) - Disposable two-scenario provisioning and acceptance
+- [Azure Container Apps Cold Install](../runbooks/azure-container-apps-cold-install.md) - Bicep environment with external PostgreSQL and NFS Azure Files
+- [Azure Container Apps Existing-Service Redeploy](../runbooks/azure-container-apps-existing-service-redeploy.md) - Digest-pinned revision rollout
+- [Azure Container Apps Full Acceptance Runbook](../runbooks/azure-container-apps-deployment.md) - Disposable 0.8.1 test and fix-on-fail procedure
 - [Your First Pipeline](your-first-pipeline.md) - Getting started guide
 - [Configuration Reference](../reference/configuration.md) - Complete config options
 - [Runbooks](../runbooks/) - Operational procedures

@@ -14,6 +14,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from elspeth.contracts.schema import FieldDefinition
+
 FeatureType = Literal["TABLES", "FORMS", "QUERIES", "SIGNATURES", "LAYOUT"]
 AuthMode = Literal["default_chain", "secret_refs"]
 
@@ -128,3 +130,32 @@ class TextractExtractFields(BaseModel):
             ("signatures", self.signatures),
             ("layout", self.layout),
         )
+
+
+def textract_created_output_fields(
+    *,
+    text_field: str | None,
+    page_count_field: str | None,
+    metadata_field: str | None,
+    result_field: str | None,
+    facet_fields: tuple[str, ...],
+) -> tuple[FieldDefinition, ...]:
+    """The configured output targets with the type the plugin's code fixes for each (ADR-050).
+
+    Shared by both Textract transforms, which write the same ``NormalizedTextractResult``
+    shape: the text is the page-ordered LINE text (``str``), the page count the
+    validated ``int``, while the bounded metadata, the provider-shaped result
+    and every extracted facet are mappings or lists the schema DSL has no
+    scalar type for (``any``).
+    """
+    created: list[FieldDefinition] = []
+    if text_field is not None:
+        created.append(FieldDefinition(text_field, "str"))
+    if page_count_field is not None:
+        created.append(FieldDefinition(page_count_field, "int"))
+    if metadata_field is not None:
+        created.append(FieldDefinition(metadata_field, "any"))
+    if result_field is not None:
+        created.append(FieldDefinition(result_field, "any"))
+    created.extend(FieldDefinition(name, "any") for name in facet_fields)
+    return tuple(created)

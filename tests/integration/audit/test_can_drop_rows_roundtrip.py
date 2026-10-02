@@ -40,7 +40,7 @@ from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import make_landscape_db, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import make_landscape_db, make_recorder_with_run, member_token_for, register_test_node
 from tests.fixtures.plugins import CollectSink, ListSource
 from tests.fixtures.stores import MockPayloadStore
 
@@ -58,30 +58,32 @@ def _setup_landscape(*, run_id: str, row_id: str, token_id: str, node_id: str):
         node_type=NodeType.TRANSFORM,
         plugin_name="CanDropRowsTransform",
     )
-    row = setup.factory.data_flow.create_row(
-        run_id=run_id,
+    setup.factory.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id="source-0",
         row_index=0,
         data={"source": "v"},
         row_id=row_id,
+        token_id=token_id,
         source_row_index=0,
         ingest_sequence=0,
     )
-    setup.factory.data_flow.create_token(row_id=row.row_id, token_id=token_id)
     return setup
 
 
 def _record_failure(setup, *, token_id: str, node_id: str, run_id: str, error: ExecutionError) -> dict[str, Any]:
+    member = member_token_for(setup.db.engine, worker_id=setup.coordination_token.worker_id)
     state = setup.factory.execution.begin_node_state(
         token_id=token_id,
         node_id=node_id,
-        run_id=run_id,
+        member_token=member,
         step_index=1,
         input_data={"source": "v"},
     )
     setup.factory.execution.complete_node_state(
         state.state_id,
         NodeStateStatus.FAILED,
+        member_token=member,
         duration_ms=1.0,
         error=error,
     )

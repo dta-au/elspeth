@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Never, cast
 from unittest.mock import ANY, MagicMock, create_autospec
 
@@ -11,6 +12,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.contracts.data import CompatibilityResult
+from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
@@ -219,12 +221,13 @@ def _reframe_missing(exc: PydanticValidationError) -> list[ValidationError]:
 def test_settings_phase_loads_exact_yaml_without_host_expansion_and_detaches_evidence() -> None:
     materialized = _materialized(pipeline_yaml="sources: {}\nsinks: {}\n")
     parsed_settings = _settings()
-    load_yaml = _autospec_callable(load_bounded_pipeline_yaml)
+    load_yaml = _autospec_callable(load_bounded_pipeline_yaml, return_value={"sources": {}, "sinks": {}})
     load_settings_yaml = _autospec_callable(load_settings_from_yaml_string, return_value=parsed_settings)
     load_settings_dict = _autospec_callable(load_settings_from_config_dict)
 
     result = load_runtime_settings(
         materialized,
+        operator_settings=None,
         secret_service=None,
         user_id=None,
         load_yaml=load_yaml,
@@ -242,7 +245,7 @@ def test_settings_phase_loads_exact_yaml_without_host_expansion_and_detaches_evi
     assert result.artifact.materialized.authored.semantic_contracts[0].outcome == "satisfied"
     assert [(check.name, check.detail) for check in result.checks] == [("settings_load", "Settings loaded successfully")]
     load_settings_yaml.assert_called_once_with(materialized.pipeline_yaml, expand_env_vars=False)
-    load_yaml.assert_not_called()
+    load_yaml.assert_called_once_with(materialized.pipeline_yaml)
     load_settings_dict.assert_not_called()
 
 
@@ -256,9 +259,10 @@ def test_settings_phase_reframes_missing_parts_but_retains_raw_check_detail() ->
 
     result = load_runtime_settings(
         _materialized(),
+        operator_settings=None,
         secret_service=None,
         user_id=None,
-        load_yaml=_autospec_callable(load_bounded_pipeline_yaml),
+        load_yaml=load_bounded_pipeline_yaml,
         load_settings_yaml=_autospec_callable(load_settings_from_yaml_string, side_effect=exc_info.value),
         load_settings_dict=_autospec_callable(load_settings_from_config_dict),
         reframe_missing_parts=_reframe_missing,
@@ -276,9 +280,10 @@ def test_settings_phase_reframes_missing_parts_but_retains_raw_check_detail() ->
 def test_settings_phase_converts_only_expected_non_pydantic_errors(error: Exception) -> None:
     result = load_runtime_settings(
         _materialized(),
+        operator_settings=None,
         secret_service=None,
         user_id=None,
-        load_yaml=_autospec_callable(load_bounded_pipeline_yaml),
+        load_yaml=load_bounded_pipeline_yaml,
         load_settings_yaml=_autospec_callable(load_settings_from_yaml_string, side_effect=error),
         load_settings_dict=_autospec_callable(load_settings_from_config_dict),
         reframe_missing_parts=_reframe_missing,
@@ -294,13 +299,89 @@ def test_settings_phase_propagates_unexpected_exceptions() -> None:
     with pytest.raises(RuntimeError, match="loader invariant"):
         load_runtime_settings(
             _materialized(),
+            operator_settings=None,
             secret_service=None,
             user_id=None,
-            load_yaml=_autospec_callable(load_bounded_pipeline_yaml),
+            load_yaml=load_bounded_pipeline_yaml,
             load_settings_yaml=_autospec_callable(load_settings_from_yaml_string, side_effect=RuntimeError("loader invariant")),
             load_settings_dict=_autospec_callable(load_settings_from_config_dict),
             reframe_missing_parts=_reframe_missing,
         )
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        "run_mode: replay",
+        "run_mode: verify",
+        "run_mode: LIVE",
+        "run_mode: null",
+        "run_mode: false",
+        "replay_from: old-run",
+        "run_mode: live\nreplay_from: old-run",
+        "replay_from: ''",
+        "replay_from: false",
+    ],
+)
+@pytest.mark.parametrize("secret_resolver_present", [False, True])
+def test_private_validation_refuses_nonlive_before_secret_access(
+    invocation: str, secret_resolver_present: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from elspeth.web.execution import _validation_runtime
+
+    def forbid_secrets(*args: object, **kwargs: object) -> Never:
+        raise AssertionError("nonlive Web validation reached secret processing")
+
+    monkeypatch.setattr(_validation_runtime, "resolve_secret_refs", forbid_secrets)
+    monkeypatch.setattr(_validation_runtime, "redact_secret_refs_for_validation", forbid_secrets)
+    materialized = _materialized(pipeline_yaml=f"{invocation}\nsources: {{}}\nsinks: {{}}\nprivate: {{secret_ref: FLOW_URL}}\n")
+    materialized = replace(materialized, authored=replace(materialized.authored, all_secret_refs=(("FLOW_URL", None),)))
+    load_settings_yaml = _autospec_callable(load_settings_from_yaml_string)
+    load_settings_dict = _autospec_callable(load_settings_from_config_dict)
+    result = load_runtime_settings(
+        materialized,
+        operator_settings=None,
+        secret_service=cast(WebSecretResolver, create_autospec(WebSecretResolver, instance=True, spec_set=True))
+        if secret_resolver_present
+        else None,
+        user_id="test",
+        load_yaml=load_bounded_pipeline_yaml,
+        load_settings_yaml=load_settings_yaml,
+        load_settings_dict=load_settings_dict,
+        reframe_missing_parts=_reframe_missing,
+    )
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "settings_load"
+    assert result.failed_check.detail == "Web execution does not support nonlive run invocation"
+    load_settings_yaml.assert_not_called()
+    load_settings_dict.assert_not_called()
+
+
+@pytest.mark.parametrize("invocation", ["", "run_mode: live\n", "run_mode: live\nreplay_from: null\n"])
+def test_private_validation_live_invocation_reaches_ordinary_secret_resolution(invocation: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.execution import _validation_runtime
+
+    materialized = _materialized(pipeline_yaml=f"{invocation}sources: {{}}\nsinks: {{}}\nprivate: {{secret_ref: FLOW_URL}}\n")
+    materialized = replace(materialized, authored=replace(materialized.authored, all_secret_refs=(("FLOW_URL", None),)))
+    parsed_config = load_bounded_pipeline_yaml(materialized.pipeline_yaml)
+    resolve = _autospec_callable(_validation_runtime.resolve_secret_refs, spec_set=True, return_value=(parsed_config, ()))
+    monkeypatch.setattr(_validation_runtime, "resolve_secret_refs", resolve)
+    parsed_settings = _settings()
+    loader = _autospec_callable(load_settings_from_config_dict, return_value=parsed_settings)
+    result = load_runtime_settings(
+        materialized,
+        operator_settings=None,
+        secret_service=cast(WebSecretResolver, create_autospec(WebSecretResolver, instance=True, spec_set=True)),
+        user_id="test",
+        load_yaml=load_bounded_pipeline_yaml,
+        load_settings_yaml=_autospec_callable(load_settings_from_yaml_string),
+        load_settings_dict=loader,
+        reframe_missing_parts=_reframe_missing,
+    )
+    assert isinstance(result, PhaseReport)
+    assert result.artifact.settings is parsed_settings
+    resolve.assert_called_once()
+    loader.assert_called_once_with(parsed_config, expand_env_vars=False)
 
 
 def test_plugin_and_value_source_successes_are_separate_ordered_phases() -> None:

@@ -34,7 +34,7 @@
 //     user may want to amend before continuing — that's F-4.
 // ============================================================================
 
-import { useState } from "react";
+import { type JSX, useState } from "react";
 import type { InlineSourceSummary, InlineSourceProvenance } from "@/types/api";
 import { Button } from "@/components/ui";
 import { describeRowCount } from "@/utils/contentStructure";

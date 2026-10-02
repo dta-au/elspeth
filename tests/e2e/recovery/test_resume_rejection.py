@@ -41,6 +41,7 @@ from elspeth.core.landscape.schema import (
 )
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.base_classes import as_sink, as_source
 from tests.fixtures.pipeline import build_linear_pipeline
 from tests.fixtures.plugins import CollectSink, ListSource
@@ -185,7 +186,7 @@ class TestResumeRejection:
                 runs_table.insert().values(
                     run_id=run_id,
                     started_at=now,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     settings_json="{}",
                     canonical_version="sha256-rfc8785-v1",
                     status=RunStatus.FAILED,
@@ -202,7 +203,7 @@ class TestResumeRejection:
                     node_type=NodeType.SOURCE,
                     plugin_version="1.0",
                     determinism=Determinism.DETERMINISTIC,
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -215,7 +216,7 @@ class TestResumeRejection:
                     source_name="source",
                     plugin_name="test_source",
                     lifecycle_state="loaded",
-                    config_hash="test",
+                    config_hash=fake_sha256("test"),
                     schema_json='{"properties": {"id": {"type": "integer"}, "value": {"type": "integer"}}, "required": ["id", "value"]}',
                     schema_contract_json=contract_json,
                     schema_contract_hash=contract_hash,
@@ -233,7 +234,7 @@ class TestResumeRejection:
                     row_index=0,
                     source_row_index=0,
                     ingest_sequence=0,
-                    source_data_hash="hash-0",
+                    source_data_hash=fake_sha256("hash-0"),
                     created_at=now,
                 )
             )

@@ -64,6 +64,7 @@ def profiled_source_harness(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Profil
                     "provider": "bedrock",
                     "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
                     "region_name": "us-east-1",
+                    "temperature": 0.2,
                 }
             },
             "default_llm_profile": _PROFILE_ALIAS,
@@ -230,8 +231,18 @@ def test_set_source_rejects_conflicting_duplicate_validation_failure_route(
 
     assert result.success is False
     assert result.updated_state is profiled_source_harness.empty_state
-    assert "on_validation_failure" in str(result.data)
-    assert "conflicts" in str(result.data)
+    assert result.affected_nodes == ()
+    assert result.data is None
+    assert result.validation.is_valid is False
+    rejection = result.validation.errors[0]
+    assert rejection.component == "rejected_mutation"
+    assert rejection.error_code == "plugin_options_invalid"
+    assert rejection.severity == "high"
+    assert rejection.plugin_identity == ("source", "llm")
+    assert rejection.message == (
+        "Invalid options for source 'llm': options.on_validation_failure conflicts with the source routing field on_validation_failure"
+    )
+    assert result.validation.errors[1:] == profiled_source_harness.empty_state.validate().errors
 
 
 def test_patch_source_options_revalidates_profile_without_persisting_private_binding(
@@ -245,17 +256,56 @@ def test_patch_source_options_revalidates_profile_without_persisting_private_bin
     assert created.success is True, created.data
 
     patched = _execute_patch_source_options(
-        {"source_name": "briefing", "patch": {"temperature": 0.2}},
+        {"source_name": "briefing", "patch": {"prompt_template": "Write a detailed audit briefing."}},
         created.updated_state,
         profiled_source_harness.context,
     )
 
     assert patched.success is True, patched.data
     source = patched.updated_state.sources["briefing"]
-    assert dict(source.options) == _authored_options(temperature=0.2)
+    assert dict(source.options) == _authored_options(prompt_template="Write a detailed audit briefing.")
     assert source.on_validation_failure == "discard"
-    for private_name in ("provider", "model", "api_key", "region_name", "profile_alias"):
+    for private_name in ("provider", "model", "api_key", "region_name", "profile_alias", "temperature"):
         assert private_name not in source.options
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.2])
+def test_patch_source_options_rejects_operator_temperature_override_atomically(
+    profiled_source_harness: _ProfiledSourceHarness,
+    temperature: float,
+) -> None:
+    created = _execute_set_source(_source_args(), profiled_source_harness.empty_state, profiled_source_harness.context)
+    assert created.success is True
+    patched = _execute_patch_source_options(
+        {"source_name": "briefing", "patch": {"temperature": temperature}},
+        created.updated_state,
+        profiled_source_harness.context,
+    )
+    assert patched.success is False
+    assert patched.updated_state is created.updated_state
+    assert patched.affected_nodes == ()
+    assert "temperature" in patched.validation.errors[0].message
+    _assert_audit_safe_source_options(patched.updated_state.sources["briefing"].options)
+
+
+def test_null_temperature_merge_patch_preserves_operator_binding(profiled_source_harness: _ProfiledSourceHarness) -> None:
+    created = _execute_set_source(_source_args(), profiled_source_harness.empty_state, profiled_source_harness.context)
+    assert created.success is True
+    patched = _execute_patch_source_options(
+        {"source_name": "briefing", "patch": {"temperature": None}},
+        created.updated_state,
+        profiled_source_harness.context,
+    )
+    assert patched.success is True
+    options = patched.updated_state.sources["briefing"].options
+    _assert_audit_safe_source_options(options)
+    lowered = profiled_source_harness.profiles.lower_options(
+        _LLM_SOURCE,
+        alias=_PROFILE_ALIAS,
+        safe_options={name: value for name, value in options.items() if name != "profile"},
+    )
+    assert lowered.executable_options["temperature"] == 0.2
+    assert "temperature" not in lowered.audit_safe_options
 
 
 @pytest.mark.parametrize("container", ["source", "sources"])
@@ -300,7 +350,16 @@ def test_set_source_rejects_unknown_profile_alias_atomically(
 
     assert result.success is False
     assert result.updated_state is profiled_source_harness.empty_state
-    assert "profile_unavailable" in str(result.data)
+    assert result.affected_nodes == ()
+    assert result.data is None
+    assert result.validation.is_valid is False
+    rejection = result.validation.errors[0]
+    assert rejection.component == "rejected_mutation"
+    assert rejection.error_code == "plugin_options_invalid"
+    assert rejection.severity == "high"
+    assert rejection.plugin_identity == ("source", "llm")
+    assert "profile_unavailable" in rejection.message
+    assert result.validation.errors[1:] == profiled_source_harness.empty_state.validate().errors
 
 
 @pytest.mark.parametrize(
@@ -309,12 +368,15 @@ def test_set_source_rejects_unknown_profile_alias_atomically(
         ("provider", "openrouter"),
         ("api_key", "author-controlled-secret"),
         ("profile_alias", "forged-alias"),
+        ("temperature", None),
+        ("temperature", 0.0),
+        ("temperature", 0.2),
     ],
 )
 def test_set_pipeline_rejects_private_profile_binding_fields_atomically(
     profiled_source_harness: _ProfiledSourceHarness,
     private_name: str,
-    private_value: str,
+    private_value: object,
 ) -> None:
     candidate = build_set_pipeline_candidate(
         {

@@ -1,4 +1,4 @@
-"""Executable contract for the Azure Container Apps runbooks and skill.
+"""Executable contract for the Azure Container Apps runbooks.
 
 Mirrors ``test_aws_ecs_runbook_contract.py`` for the ACA trio. The two rules
 that matter most here are the ECS lessons: every epoch literal in prose or
@@ -11,11 +11,13 @@ never reaches a receipt.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 
-import yaml
+import pytest
 
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web._aws_ecs_acceptance import receipt_contracts
@@ -28,13 +30,12 @@ COLD_INSTALL_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-cold-install.md"
 REDEPLOY_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-existing-service-redeploy.md"
 RUNBOOKS = (ACCEPTANCE_RUNBOOK, COLD_INSTALL_RUNBOOK, REDEPLOY_RUNBOOK)
 PLATFORM_FACTS = REPO_ROOT / "docs" / "plans" / "2026-09-05-phase6b-azure-container-apps-platform-facts.md"
-SKILL_DIR = REPO_ROOT / ".agents" / "skills" / "operating-azure-container-apps"
-SKILL_SYMLINK = REPO_ROOT / ".claude" / "skills" / "operating-azure-container-apps"
 KEY_DERIVATION_MODULE = REPO_ROOT / "src" / "elspeth" / "web" / "key_derivation.py"
 KEY_DERIVATION_TEST = REPO_ROOT / "tests" / "unit" / "web" / "test_key_derivation_wiring.py"
 
 FACTS_LINK = "../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md"
-RECEIPT_PATH = "docs/operator/evidence/azure-container-apps/0.8.0.json"
+CURRENT_VERSION = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+RECEIPT_PATH = f"docs/operator/evidence/azure-container-apps/{CURRENT_VERSION}.json"
 INGRESS_REQUEST_TIMEOUT_SECONDS = 240
 MECHANISMS = (
     "session_operation_fence",
@@ -56,6 +57,8 @@ CHECK_KINDS = (
     "replica-run-start",
     "replica-lease-takeover",
     "replica-progress",
+    "single-revision-fence-conflict",
+    "single-revision-progress",
     "resource-graph-cleanup",
     "testcontainer-run",
 )
@@ -67,11 +70,6 @@ def _text(path: Path) -> str:
 
 def _fences(text: str, language: str) -> list[str]:
     return re.findall(rf"```{language}\n(.*?)```", text, flags=re.DOTALL)
-
-
-def _skill_texts() -> list[str]:
-    paths = (SKILL_DIR / "SKILL.md", *sorted((SKILL_DIR / "references").glob("*.md")))
-    return [_text(path) for path in paths]
 
 
 def _compatibility_record() -> dict[str, object]:
@@ -108,9 +106,10 @@ def test_protected_command_wrappers_are_bounded_and_redacted() -> None:
         assert f"{helper}() {{" in capture, helper
     for marker in (
         "ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES=2097152",
-        "ulimit -f 4096",
+        'mkfifo "$scratch/stderr-pipe"',
+        "command_output_limit_exceeded",
         "timeout --signal=TERM --kill-after=5s",
-        "trap 'rm -f -- \"$stderr_file\"' RETURN",
+        'trap "$cleanup" EXIT',
         "chmod 600",
         "az_command_failed",
         "az_deployment_failed",
@@ -123,10 +122,37 @@ def test_protected_command_wrappers_are_bounded_and_redacted() -> None:
         "AZURE_CORE_ONLY_SHOW_ERRORS=true",
     ):
         assert marker in capture, marker
-    assert 'cat "$stderr_file"' not in capture
+    assert 'cat "$scratch/stderr"' not in capture
+    assert "ulimit -f" not in capture
     for script in _fences(capture, "bash"):
         assert "PGPASSWORD" not in script
     assert "never receives a connection URI on its command line" in " ".join(capture.split())
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_documented_capture_rejects_output_overflow_without_exposing_it(stream: str) -> None:
+    text = _text(ACCEPTANCE_RUNBOOK)
+    capture = text[text.index("### Protected command capture") : text.index("### Inputs")]
+    script = _fences(capture, "bash")[0]
+    redirect = " >&2" if stream == "stderr" else ""
+    script += "\nexport ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES=16\n"
+    script += f"protected_capture http expected_failure bash -c 'printf PRIVATE_OUTPUT_MUST_NOT_ESCAPE{redirect}'\n"
+    result = subprocess.run(["bash"], input=script, capture_output=True, text=True, check=False, timeout=10)
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == "command_output_limit_exceeded\n"
+
+
+def test_documented_capture_preserves_child_file_size_limit_and_failure_status() -> None:
+    text = _text(ACCEPTANCE_RUNBOOK)
+    capture = text[text.index("### Protected command capture") : text.index("### Inputs")]
+    script = _fences(capture, "bash")[0]
+    script += '\nbefore=$(ulimit -f)\nafter=$(protected_capture http expected_failure bash -c "ulimit -f")\n'
+    script += 'test "$before" = "$after"\nprotected_capture http expected_failure bash -c "exit 7"\n'
+    result = subprocess.run(["bash"], input=script, capture_output=True, text=True, check=False, timeout=10)
+    assert result.returncode == 7
+    assert result.stdout == ""
+    assert result.stderr == "expected_failure\n"
 
 
 def test_compatibility_record_is_byte_bound_to_the_live_derivation() -> None:
@@ -154,7 +180,7 @@ def test_compatibility_record_is_byte_bound_to_the_live_derivation() -> None:
 
 
 def test_every_epoch_literal_matches_the_live_constants() -> None:
-    texts = [_text(runbook) for runbook in RUNBOOKS] + _skill_texts()
+    texts = [_text(runbook) for runbook in RUNBOOKS]
     session_hits = 0
     landscape_hits = 0
     for text in texts:
@@ -205,7 +231,7 @@ def test_replica_probes_name_their_mechanism_and_run_in_order() -> None:
         "ALTER ROLE elspeth_runtime_a LOGIN;",
         "terminationGracePeriodSeconds: 0",
         "downgrades to `graceful_stop`",
-        "asserts that no `run_start_permits` row exists",
+        "does not measure durable permit admission or handoff",
         "P4b (recorded, cannot pass)",
         "`kill -9 1`",
         "recorded, not used",
@@ -239,8 +265,27 @@ def test_runbooks_cite_the_measured_facts_and_the_bundle_and_declare_their_statu
         assert "deploy/azure-container-apps" in text, runbook.name
         assert RECEIPT_PATH in text, runbook.name
         assert "**Status.**" in text, runbook.name
-        assert "not a support claim" in " ".join(text.split()), runbook.name
+        normalized = " ".join(text.replace("> ", "").split())
+        assert "desktop acceptance" in normalized, runbook.name
+        assert "closed on 2026-09-10" in normalized, runbook.name
+        assert "No live cloud acceptance is claimed" in normalized, runbook.name
+        assert "durable run-event replay" in normalized, runbook.name
+        assert "shared budgets" in normalized, runbook.name
+        assert "interrupted provider request is not automatically resumed" in normalized, runbook.name
+        assert "reconnect" in normalized, runbook.name
+        assert "not a support claim" not in normalized, runbook.name
         assert "**LIVE" in text, runbook.name
+
+
+def test_prospective_receipt_paths_match_the_current_release() -> None:
+    surfaces = (
+        *RUNBOOKS,
+        REPO_ROOT / "deploy" / "azure-container-apps" / "README.md",
+        REPO_ROOT / ".agents" / "skills" / "operating-azure-container-apps" / "SKILL.md",
+    )
+    for surface in surfaces:
+        versions = re.findall(r"docs/operator/evidence/azure-container-apps/(\d+\.\d+\.\d+)\.json", _text(surface))
+        assert set(versions) == {CURRENT_VERSION}, surface
 
 
 def test_image_publication_is_a_digest_preserving_copy_in_every_runbook() -> None:
@@ -312,6 +357,420 @@ def test_cold_install_orders_storage_schema_runtime_before_traffic() -> None:
         assert phrase in normalized, phrase
 
 
+def test_cold_install_secret_upload_routes_owner_credentials_to_separate_vault(tmp_path: Path) -> None:
+    secret_names = (
+        "elspeth-session-db-url-runtime",
+        "elspeth-landscape-url-runtime",
+        "elspeth-session-db-url-schema-owner",
+        "elspeth-landscape-url-schema-owner",
+        "elspeth-secret-key",
+        "elspeth-shareable-link-signing-key",
+        "elspeth-fingerprint-key",
+        "elspeth-operator-metrics-bearer-token",
+    )
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    for name in secret_names:
+        (secrets / name).write_text("private-secret-value")
+    (tmp_path / "environment-outputs.json").write_text(
+        json.dumps({"keyVaultName": {"value": "runtime-vault"}, "schemaOwnerKeyVaultName": {"value": "owner-vault"}})
+    )
+    azure = tmp_path / "az"
+    azure.write_text("""#!/usr/bin/env python3
+import pathlib, sys
+args = sys.argv[1:]
+assert args[:3] == ["keyvault", "secret", "set"]
+name = args[args.index("--name") + 1]
+vault = args[args.index("--vault-name") + 1]
+assert vault == ("owner-vault" if name.endswith("-schema-owner") else "runtime-vault")
+assert pathlib.Path(args[args.index("--file") + 1]).read_text() == "private-secret-value"
+print("https://" + vault + ".vault.azure.net/secrets/" + name + "/" + "a" * 32)
+""")
+    azure.chmod(0o755)
+    script = next(block for block in _fences(_text(COLD_INSTALL_RUNBOOK), "bash") if "SECRET_VALUE_DIR:?" in block)
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "OPERATOR_DIR": str(tmp_path), "SECRET_VALUE_DIR": str(secrets)}
+    result = subprocess.run(["bash", "-Eeuo", "pipefail", "-c", script], env=env, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    for name in secret_names:
+        assert (tmp_path / f"{name}.version").is_file()
+
+
+@pytest.mark.parametrize("failed_job", ["", "provision-storage", "doctor-schema-init", "doctor-runtime"])
+def test_cold_install_commands_create_dependencies_and_stop_on_failed_execution(tmp_path: Path, failed_job: str) -> None:
+    """Execute the actual runbook commands with stateful Azure API responses."""
+    output = tmp_path / "environment-outputs.json"
+    prefix = "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/aca-live/providers/"
+    output.write_text(
+        json.dumps(
+            {
+                "environmentResourceId": {"type": "String", "value": prefix + "Microsoft.App/managedEnvironments/aca-env"},
+                "identityResourceId": {"type": "String", "value": prefix + "Microsoft.ManagedIdentity/userAssignedIdentities/aca-id"},
+                "identityClientId": {"value": "12345678-1234-1234-1234-123456789abc"},
+                "schemaOwnerIdentityResourceId": {"value": prefix + "Microsoft.ManagedIdentity/userAssignedIdentities/aca-schema-id"},
+                "nfsStorageName": {"value": "elspeth"},
+                "keyVaultName": {"value": "aca-vault"},
+                "schemaOwnerKeyVaultName": {"value": "aca-schema-vault"},
+            }
+        )
+    )
+    azure = tmp_path / "az"
+    azure.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+state = pathlib.Path(os.environ["OPERATOR_DIR"])
+with (state / "events.jsonl").open("a") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:3] == ["keyvault", "secret", "show"]:
+    name = args[args.index("--name") + 1]
+    vault = args[args.index("--vault-name") + 1]
+    assert vault == ("aca-schema-vault" if name.endswith("-schema-owner") else "aca-vault")
+    print("https://" + vault + ".vault.azure.net/secrets/" + name + "/" + "a" * 32)
+elif args[:3] == ["deployment", "group", "create"]:
+    if "deployWebApp=false" in args:
+        (state / "jobs-created").touch()
+    else:
+        assert (state / "doctor-runtime-succeeded").exists()
+        (state / "app-created").touch()
+elif args[:3] == ["containerapp", "job", "start"]:
+    assert (state / "jobs-created").exists(), "job was started before creation"
+    print("new-execution")
+elif args[:4] == ["containerapp", "job", "execution", "show"]:
+    assert args[args.index("--job-execution-name") + 1] == "new-execution"
+    name = args[args.index("--name") + 1]
+    failed = name == os.environ["FAILED_JOB"]
+    if not failed:
+        (state / (name + "-succeeded")).touch()
+    print("Failed" if failed else "Succeeded")
+elif args[:3] != ["deployment", "group", "what-if"]:
+    raise AssertionError(args)
+""")
+    azure.chmod(0o755)
+    candidate = "b" * 40
+    params = tmp_path / "workload.parameters.json"
+    application = tmp_path / "application.json"
+    application.write_text(
+        json.dumps(
+            {
+                "composerMaxCompositionTurns": 15,
+                "composerMaxDiscoveryTurns": 10,
+                "composerTimeoutSeconds": 180,
+                "composerRateLimitPerMinute": 10,
+                "authProvider": "entra",
+                "registrationMode": "closed",
+            }
+        )
+    )
+    for secret_name in (
+        "elspeth-session-db-url-runtime",
+        "elspeth-landscape-url-runtime",
+        "elspeth-session-db-url-schema-owner",
+        "elspeth-landscape-url-schema-owner",
+        "elspeth-secret-key",
+        "elspeth-shareable-link-signing-key",
+        "elspeth-fingerprint-key",
+        "elspeth-operator-metrics-bearer-token",
+    ):
+        vault = "aca-schema-vault" if secret_name.endswith("-schema-owner") else "aca-vault"
+        (tmp_path / f"{secret_name}.version").write_text(f"https://{vault}.vault.azure.net/secrets/{secret_name}/" + "a" * 32)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "OPERATOR_DIR": str(tmp_path),
+        "WORKLOAD_PARAMETERS": str(params),
+        "APPLICATION_PARAMETERS": str(application),
+        "SECRET_VERSION_DIR": str(tmp_path),
+        "CANDIDATE_SHA": candidate,
+        "CANDIDATE_IMAGE": "registry.azurecr.io/elspeth@sha256:" + "c" * 64,
+        "PROVISION_STORAGE_IMAGE": "mcr.microsoft.com/azurelinux/base/core@sha256:" + "d" * 64,
+        "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS": "210",
+        "RESOURCE_GROUP": "aca-live",
+        "FAILED_JOB": failed_job,
+    }
+    text = _text(COLD_INSTALL_RUNBOOK)
+    commands = "\n".join(_fences(text[text.index("## 5.") : text.index("## 9.")], "bash"))
+    result = subprocess.run(["bash", "-Eeuo", "pipefail", "-c", commands], cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+    assert result.returncode == (1 if failed_job else 0), result.stderr
+    assert (tmp_path / "app-created").exists() == (not failed_job)
+    resolved = json.loads(params.read_text())["parameters"]
+    assert resolved["candidateSourceSha"]["value"] == candidate
+    assert all(set(entry) == {"value"} for entry in resolved.values())
+    assert resolved["environmentResourceId"]["value"] == prefix + "Microsoft.App/managedEnvironments/aca-env"
+    assert resolved["sessionDbUrlRuntimeSecretUrl"]["value"].endswith("/" + "a" * 32)
+    assert params.stat().st_mode & 0o777 == 0o600
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    starts = [args[args.index("--name") + 1] for args in events if args[:3] == ["containerapp", "job", "start"]]
+    jobs = ["provision-storage", "doctor-schema-init", "doctor-runtime"]
+    assert starts == (jobs[: jobs.index(failed_job) + 1] if failed_job else jobs)
+
+
+@pytest.mark.parametrize(
+    "parameter,value",
+    [
+        ("image", "registry.azurecr.io/elspeth:latest"),
+        ("candidateSourceSha", "0" * 40),
+        ("sessionDbUrlRuntimeSecretUrl", "https://aca-vault.vault.azure.net/secrets/runtime/latest"),
+        ("composerTransportIdleCeilingSeconds", 0),
+        pytest.param(
+            "schemaOwnerIdentityResourceId",
+            "/SUBSCRIPTIONS/12345678-1234-1234-1234-123456789ABC/RESOURCEGROUPS/ACA-LIVE/PROVIDERS/"
+            "MICROSOFT.MANAGEDIDENTITY/USERASSIGNEDIDENTITIES/ACA-ID",
+            id="same-identity-different-case",
+        ),
+    ],
+)
+def test_parameter_validator_rejects_unresolved_configuration(tmp_path: Path, parameter: str, value: object) -> None:
+    prefix = "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/aca-live/providers/"
+    inputs = {
+        "environmentResourceId": prefix + "Microsoft.App/managedEnvironments/aca-env",
+        "identityResourceId": prefix + "Microsoft.ManagedIdentity/userAssignedIdentities/aca-id",
+        "schemaOwnerIdentityResourceId": prefix + "Microsoft.ManagedIdentity/userAssignedIdentities/aca-schema-id",
+        "identityClientId": "12345678-1234-1234-1234-123456789abc",
+        "nfsStorageName": "elspeth",
+        "containerAppName": "elspeth-web",
+        "image": "registry.azurecr.io/elspeth@sha256:" + "b" * 64,
+        "provisionStorageImage": "mcr.microsoft.com/azurelinux/base/core@sha256:" + "c" * 64,
+        "candidateSourceSha": "d" * 40,
+        "revisionSuffix": "r" + "d" * 12,
+        "composerTransportIdleCeilingSeconds": 210,
+        "composerMaxCompositionTurns": 15,
+        "composerMaxDiscoveryTurns": 10,
+        "composerTimeoutSeconds": 180,
+        "composerRateLimitPerMinute": 10,
+        "authProvider": "entra",
+        "registrationMode": "closed",
+        "composerEndpointApiKeySecretUrl": "",
+        "minReplicas": 2,
+        "maxReplicas": 4,
+        "activeRevisionsMode": "Single",
+        "stickySessionsAffinity": "sticky",
+    }
+    for name in (
+        "sessionDbUrlRuntimeSecretUrl",
+        "landscapeUrlRuntimeSecretUrl",
+        "sessionDbUrlSchemaOwnerSecretUrl",
+        "landscapeUrlSchemaOwnerSecretUrl",
+        "secretKeySecretUrl",
+        "shareableLinkSigningKeySecretUrl",
+        "fingerprintKeySecretUrl",
+        "operatorMetricsBearerTokenSecretUrl",
+    ):
+        vault = "aca-schema-vault" if "SchemaOwner" in name else "aca-vault"
+        inputs[name] = "https://" + vault + ".vault.azure.net/secrets/" + name.lower() + "/" + "e" * 32
+    path = tmp_path / "invalid.json"
+    command = ["jq", "-e", "-f", str(REPO_ROOT / "deploy/azure-container-apps/scripts/validate-workload-parameters.jq"), str(path)]
+    path.write_text(json.dumps({"parameters": {key: {"value": item} for key, item in inputs.items()}}))
+    assert subprocess.run(command, capture_output=True).returncode == 0
+    inputs[parameter] = value
+    path.write_text(json.dumps({"parameters": {key: {"value": item} for key, item in inputs.items()}}))
+    result = subprocess.run(command, capture_output=True)
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize("fail_sql", [False, True])
+@pytest.mark.parametrize("rbac", ["ready", "delayed", "firewall", "permanent"])
+def test_acceptance_bootstrap_creates_role_secret_dependencies_and_protects_values(tmp_path: Path, fail_sql: bool, rbac: str) -> None:
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    password = "sensitive:+ /?password"
+    names = (
+        "elspeth-schema-owner-password",
+        "elspeth-runtime-password",
+        "elspeth-runtime-a-password",
+        "elspeth-runtime-b-password",
+        "elspeth-secret-key",
+        "elspeth-shareable-link-signing-key",
+        "elspeth-fingerprint-key",
+        "elspeth-operator-metrics-bearer-token",
+    )
+    for name in names:
+        (secrets / name).write_text(password)
+    inventory = tmp_path / "inventory.json"
+    prefix = "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/aca-live/providers/"
+    inventory.write_text(
+        json.dumps(
+            {
+                key: {"type": "String", "value": value}
+                for key, value in {
+                    "postgresFqdn": "aca-pg.postgres.database.azure.com",
+                    "keyVaultName": "aca-vault",
+                    "schemaOwnerKeyVaultName": "aca-schema-vault",
+                    "environmentResourceId": prefix + "Microsoft.App/managedEnvironments/aca-env",
+                    "identityResourceId": prefix + "Microsoft.ManagedIdentity/userAssignedIdentities/aca-id",
+                    "schemaOwnerIdentityResourceId": prefix + "Microsoft.ManagedIdentity/userAssignedIdentities/aca-schema-id",
+                    "nfsStorageName": "elspeth",
+                    "blobStorageAccountName": "acabls",
+                    "payloadContainerName": "elspeth-payloads",
+                    "identityClientId": "12345678-1234-1234-1234-123456789abc",
+                }.items()
+            }
+        )
+    )
+    main = tmp_path / "main.json"
+    main.write_text(
+        json.dumps(
+            {
+                "parameters": {
+                    "postgresAdministratorLogin": {"value": "aca_admin"},
+                    "postgresAdministratorPassword": {"value": password},
+                }
+            }
+        )
+    )
+    psql = tmp_path / "psql"
+    psql.write_text("""#!/usr/bin/env python3
+import os, pathlib, sys
+root = pathlib.Path(os.environ["FAKE_STATE"])
+assert os.environ["ELSPETH_RUNTIME_A_PASSWORD"] == "sensitive:+ /?password"
+assert sys.argv[-1].endswith("bootstrap-acceptance-roles.sql")
+print("sensitive:+ /?password", file=sys.stderr)
+if os.environ["FAIL_SQL"] == "true":
+    sys.exit(3)
+(root / "sql-done").touch()
+""")
+    psql.chmod(0o755)
+    az = tmp_path / "az"
+    az.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ["FAKE_STATE"])
+a = sys.argv[1:]
+with (root / "azure-argv.jsonl").open("a") as log:
+    log.write(json.dumps(a) + "\\n")
+if a[:2] == ["keyvault", "show"]:
+    print("/subscriptions/live/resourceGroups/live/providers/Microsoft.KeyVault/vaults/" + a[a.index("--name") + 1])
+elif a[:3] == ["role", "assignment", "create"]:
+    (root / "role-done").touch()
+elif a[:3] == ["keyvault", "secret", "set"]:
+    assert (root / "role-done").exists()
+    name = a[a.index("--name") + 1]
+    vault = a[a.index("--vault-name") + 1]
+    if "-url-" in name:
+        assert vault == ("aca-schema-vault" if name.endswith("-schema-owner") else "aca-vault")
+    if name in ("elspeth-secret-key", "elspeth-session-db-url-schema-owner"):
+        attempts = root / "rbac-attempts"
+        attempt = int(attempts.read_text()) + 1 if attempts.exists() else 1
+        attempts.write_text(str(attempt))
+        mode = os.environ["FAKE_RBAC"]
+        if mode == "firewall":
+            print('Inner error: {"code":"ForbiddenByFirewall"}', file=sys.stderr)
+            sys.exit(1)
+        if mode == "permanent" or (mode == "delayed" and attempt == 1):
+            print('Inner error: {"code":"ForbiddenByRbac"}', file=sys.stderr)
+            sys.exit(1)
+    else:
+        assert (root / "sql-done").exists()
+    value = pathlib.Path(a[a.index("--file") + 1]).read_text()
+    if "-url-" in name:
+        assert "sensitive%3A%2B%20%2F%3Fpassword" in value
+        assert not value.endswith("\\n")
+    (root / (name + ".uploaded")).touch()
+    print("https://" + vault + ".vault.azure.net/secrets/" + name + "/" + "a" * 32)
+elif a[:3] == ["keyvault", "secret", "show"]:
+    name = a[a.index("--name") + 1]
+    vault = a[a.index("--vault-name") + 1]
+    assert vault == ("aca-schema-vault" if name.endswith("-schema-owner") else "aca-vault")
+    assert (root / (name + ".uploaded")).exists()
+    print("https://" + vault + ".vault.azure.net/secrets/" + name + "/" + "a" * 32)
+else:
+    raise AssertionError(a)
+""")
+    az.chmod(0o755)
+    sleeper = tmp_path / "sleep"
+    sleeper.write_text('#!/bin/bash\nif [[ "$FAKE_RBAC" != delayed ]]; then exec /bin/sleep "$@"; fi\n')
+    sleeper.chmod(0o755)
+    output = tmp_path / "parameters"
+    application = tmp_path / "application.json"
+    application.write_text(
+        json.dumps(
+            {
+                "composerMaxCompositionTurns": 15,
+                "composerMaxDiscoveryTurns": 10,
+                "composerTimeoutSeconds": 180,
+                "composerRateLimitPerMinute": 10,
+                "authProvider": "entra",
+                "registrationMode": "closed",
+            }
+        )
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FAKE_STATE": str(tmp_path),
+        "MAIN_PARAMETERS": str(main),
+        "APPLICATION_PARAMETERS": str(application),
+        "PGSSLROOTCERT": "/operator/trust.pem",
+        "BOOTSTRAP_PRINCIPAL_ID": "12345678-1234-1234-1234-123456789abc",
+        "BOOTSTRAP_PRINCIPAL_TYPE": "User",
+        "CANDIDATE_SHA": "b" * 40,
+        "CANDIDATE_IMAGE": "registry.azurecr.io/elspeth@sha256:" + "c" * 64,
+        "PROVISION_STORAGE_IMAGE": "mcr.microsoft.com/azurelinux/base/core@sha256:" + "d" * 64,
+        "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS": "210",
+        "FAIL_SQL": str(fail_sql).lower(),
+        "FAKE_RBAC": rbac,
+        # Successful retries also launch several mock CLI processes; allow host
+        # scheduling time while keeping the permanent-denial timeout bounded.
+        "KEY_VAULT_RBAC_WAIT_SECONDS": "1" if rbac == "permanent" else "10",
+    }
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "deploy/azure-container-apps/scripts/bootstrap-acceptance.sh"), str(inventory), str(secrets), str(output)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    expected = 1 if rbac == "firewall" else 124 if rbac == "permanent" else 3 if fail_sql else 0
+    assert result.returncode == expected, result.stderr
+    assert password not in result.stdout + result.stderr
+    assert list(output.glob("bootstrap-private.*")) == []
+    if rbac in {"firewall", "permanent"}:
+        assert not (tmp_path / "sql-done").exists()
+        assert not (output / "workload.parameters.json").exists()
+        if rbac == "firewall":
+            assert (tmp_path / "rbac-attempts").read_text() == "1"
+        else:
+            assert "key_vault_rbac_propagation_timeout" in result.stderr
+    elif fail_sql:
+        assert not (tmp_path / "elspeth-session-db-url-runtime.uploaded").exists()
+        assert not (output / "workload.parameters.json").exists()
+        assert (output / "bootstrap-error.log").stat().st_mode & 0o777 == 0o600
+    else:
+        assert (tmp_path / "rbac-attempts").read_text() == ("3" if rbac == "delayed" else "2")
+        assert not (output / "bootstrap-error.log").exists()
+        assert password not in (tmp_path / "azure-argv.jsonl").read_text()
+        credentials_path = output / "acceptance-env.json"
+        assert credentials_path.stat().st_mode & 0o777 == 0o600
+        credentials = json.loads(credentials_path.read_text())
+        assert set(credentials) == {
+            "ELSPETH_ACCEPTANCE_PG_ADMIN_URL",
+            "ELSPETH_ACCEPTANCE_PG_RUNTIME_A_URL",
+            "ELSPETH_ACCEPTANCE_PG_RUNTIME_B_URL",
+            "ELSPETH_ACCEPTANCE_SESSION_DB_URL",
+            "ELSPETH_ACCEPTANCE_LANDSCAPE_URL",
+            "ELSPETH_TEST_POSTGRES_URL",
+        }
+        assert "elspeth_runtime_a:" in credentials["ELSPETH_ACCEPTANCE_PG_RUNTIME_A_URL"]
+        assert "elspeth_runtime_b:" in credentials["ELSPETH_ACCEPTANCE_PG_RUNTIME_B_URL"]
+        assert "/postgres?" in credentials["ELSPETH_TEST_POSTGRES_URL"]
+        assert all("sslrootcert=%2Foperator%2Ftrust.pem" in url for url in credentials.values())
+        production_parameters = json.loads((output / "workload.parameters.json").read_text())["parameters"]
+        for role in ("", "a", "b"):
+            suffix = f"-{role}" if role else ""
+            parameters = json.loads((output / f"workload{suffix}.parameters.json").read_text())["parameters"]
+            role_urls = parameters["acceptanceRuntimeSecretUrls"]["value"]
+            assert role_urls == production_parameters["acceptanceRuntimeSecretUrls"]["value"]
+            for name in ("sessionDbUrlRuntimeSecretUrl", "landscapeUrlRuntimeSecretUrl"):
+                assert parameters[name] == production_parameters[name]
+                assert "-runtime/" in parameters[name]["value"]
+            assert set(role_urls) == {"a", "b"}
+            for label in ("a", "b"):
+                assert f"runtime-{label}/" in role_urls[label]["sessionDbUrl"]
+                assert f"runtime-{label}/" in role_urls[label]["landscapeUrl"]
+            if role:
+                assert parameters["runtimeRoleLabel"]["value"] == role
+            assert parameters["verifyBlobManagedIdentity"]["value"] is True
+            assert parameters["blobAccountUrl"]["value"] == "https://acabls.blob.core.windows.net"
+            assert parameters["identityClientId"]["value"] == env["BOOTSTRAP_PRINCIPAL_ID"]
+
+
 def test_secret_rotation_cites_the_key_derivation_authority() -> None:
     assert KEY_DERIVATION_MODULE.is_file()
     assert KEY_DERIVATION_TEST.is_file()
@@ -326,11 +785,24 @@ def test_secret_rotation_cites_the_key_derivation_authority() -> None:
 
 def test_receipt_vocabulary_is_closed_and_named() -> None:
     text = _text(ACCEPTANCE_RUNBOOK)
-    receipt = " ".join(text[text.index("## Receipt and docs flip") :].split())
+    receipt = " ".join(text[text.index("## Receipt from an operator-run acceptance") :].split())
     for kind in CHECK_KINDS:
         assert f"`{kind}`" in receipt, kind
-    assert "in **one commit**" in receipt
-    assert "the bar is a second clean run end to end" in receipt
+    assert "only after the live procedure completes" in receipt
+    assert "Task `elspeth-5ec3befc1a` already closed through desktop acceptance" in receipt
+    assert "Never create a receipt from desktop analysis" in receipt
+    assert "legacy v2 P4b" in text
+    assert "does not measure the new runtime capabilities" in " ".join(text.split())
+
+
+def test_package_documents_v3_deferral_without_erasing_future_triggers() -> None:
+    path = REPO_ROOT / "src/elspeth/web/_azure_container_apps_acceptance/README.md"
+    text = " ".join(_text(path).split())
+    assert "0.8.1 disposition (2026-09-10): explicitly defer v3 implementation" in text
+    assert "changes neither the receipt envelope nor the provider set" in text
+    assert "third acceptance provider" in text
+    assert "compatibility-record field set" in text
+    assert "both provider regression suites" in text
 
 
 def test_testcontainer_run_is_recorded_with_the_ci_selection_and_gated() -> None:
@@ -360,29 +832,3 @@ def test_testcontainer_run_is_recorded_with_the_ci_selection_and_gated() -> None
         < section.index("unset ELSPETH_TEST_POSTGRES_URL")
     )
     assert text.index("## Connection budget") < text.index("## Testcontainer run") < text.index("## Evidence")
-
-
-def test_skill_mirrors_the_ecs_layout_and_worktree_guidance() -> None:
-    assert (SKILL_DIR / "SKILL.md").is_file()
-    assert (SKILL_DIR / "agents" / "openai.yaml").is_file()
-    assert (SKILL_DIR / "references" / "command-cheatsheet.md").is_file()
-    assert (SKILL_DIR / "references" / "test-and-triage.md").is_file()
-    assert SKILL_SYMLINK.is_symlink()
-    assert SKILL_SYMLINK.resolve() == SKILL_DIR.resolve()
-
-    skill = _text(SKILL_DIR / "SKILL.md")
-    frontmatter = yaml.safe_load(skill.split("---\n")[1])
-    assert frontmatter["name"] == "operating-azure-container-apps"
-    assert "Do not use for AWS ECS" in " ".join(frontmatter["description"].split())
-
-    combined = "\n".join(_skill_texts())
-    assert not re.search(r"(?m)^\s*uv sync\b", combined)
-    assert not re.search(r"(?m)^\s*uv run\b", combined)
-    assert "PYTHONPATH" in combined
-    assert ".venv/bin/pytest" in combined
-    assert "Azure Files carries no database" in combined
-    assert "docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md" in combined
-
-    agent = yaml.safe_load(_text(SKILL_DIR / "agents" / "openai.yaml"))
-    assert agent["interface"]["display_name"] == "Operate Azure Container Apps"
-    assert "$operating-azure-container-apps" in agent["interface"]["default_prompt"]

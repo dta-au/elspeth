@@ -94,7 +94,6 @@ EXPECTED_DIMENSION_VALUES = (
     "recovery",
     "concurrency",
     "freeform",
-    "guided",
     "round_trip",
     "scale",
 )
@@ -121,7 +120,7 @@ EXPECTED_SCENARIO_VALUES = (
 )
 
 EXPECTED_STATUS_MATRIX = {
-    "linear": ("pass", "pass", "pass", "pass", "pass", "pass", "unknown", "pass", "partial", "partial", "partial"),
+    "linear": ("pass", "pass", "pass", "pass", "pass", "pass", "unknown", "pass", "partial", "partial"),
     "multiple-independent-sources": (
         "pass",
         "pass",
@@ -131,7 +130,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -144,7 +142,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -157,7 +154,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -170,7 +166,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -183,7 +178,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "partial",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -196,7 +190,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -209,7 +202,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -222,7 +214,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -235,7 +226,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "partial",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -247,7 +237,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "pass",
         "unknown",
-        "pass",
         "pass",
         "partial",
         "unknown",
@@ -261,7 +250,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -275,7 +263,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "pass",
         "partial",
-        "partial",
         "unknown",
     ),
     "checkpoint-deterministic-resume": (
@@ -288,7 +275,6 @@ EXPECTED_STATUS_MATRIX = {
         "unknown",
         "not_applicable",
         "not_applicable",
-        "not_applicable",
         "unknown",
     ),
     "multi-worker-lease-reclaim-late-completion": (
@@ -299,7 +285,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "partial",
         "partial",
-        "not_applicable",
         "not_applicable",
         "not_applicable",
         "unknown",
@@ -376,7 +361,7 @@ EXPECTED_ASSESSMENT_LOCATORS = {
     "runtime-disposition-drains": (
         "tests/unit/engine/test_scheduler_drain_characterization.py::test_sink_bound_result_parks_pending_sink_with_fenced_owner_and_tags_result",
         "tests/unit/engine/test_scheduler_drain_characterization.py::test_claimed_token_failure_marks_failed_with_fence",
-        "tests/unit/engine/test_scheduler_drain_characterization.py::test_non_sink_terminal_marks_terminal_and_unregistered_build_is_unfenced",
+        "tests/unit/engine/test_scheduler_drain_characterization.py::test_non_sink_terminal_uses_membership_derived_from_leader",
         "tests/unit/engine/test_processor.py::TestDurableSchedulerResumeDrain::test_aggregation_buffering_leaves_scheduler_work_blocked",
     ),
     "focused-crash-restart": (
@@ -394,8 +379,8 @@ EXPECTED_ASSESSMENT_LOCATORS = {
         "tests/integration/engine/test_two_process_scheduler_contention.py",
         "tests/integration/engine/test_multi_source_chaos.py::test_lease_expiry_mid_transform_peer_reclaim_bumps_attempt_and_fences_stale_owner",
         "tests/e2e/recovery/test_suspended_winner_fences.py",
-        "tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_routes_registered_worker_to_strict_and_unregistered_to_explicit_legacy",
-        "tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinned",
+        "tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_uses_registered_membership_for_explicit_and_derived_owner",
+        "tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_requires_member_and_has_no_legacy_production_references",
     ),
     "conditional-routing-destination-negatives": (
         "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b1_conditional_routing_rejects_missing_boolean_gate_destination",
@@ -431,7 +416,7 @@ EXPECTED_ASSESSMENT_LOCATORS = {
         "::test_row_union_two_variant_ab_preserves_complete_declared_groups_and_statistics",
     ),
     "composer-row-union-authoring-parity": (
-        "tests/integration/web/composer/parity/test_fixture_matrix.py::test_surface_derives_isomorphic_committed_graph",
+        "tests/integration/web/composer/parity/test_fixture_matrix.py::test_freeform_derives_isomorphic_committed_graph",
     ),
 }
 
@@ -465,7 +450,16 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
 # verified against pre-migration HEAD b5b92c2b5 (WS2 Task 6 BASE); new
 # manifest verified against this commit's harness run (real observed
 # projection_sha256/counts captured via the corpus harness, never hand-computed).
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016aaede9839d9dce0b19764"
+# Current scheduler authority test names; scenario and runtime oracle bytes are unchanged.
+# Rotated 2026-09-27 (elspeth-5887fb7928 G1 E7, union_collision_policy: fail;
+# lane ruling option B): only the harness-fork-coalesce-policies-union-
+# collision-fail claim moved — the case now proves a routed data-dependent
+# collision (every consumed token failed union_field_collision, collision
+# record on each FAILED hold, FAILED run, export unavailable by policy)
+# instead of pinning the abort-at-row-1 CoalesceCollisionError.
+# Merged 2026-09-28 with release e1a2ef001 (its own evidence-registry move);
+# digest re-captured from the merged tree.
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd4e54681f780013ef34354"
 # Digests the FULL case content, so it moves whenever a pinned expected
 # projection does — including a plugin ``source_file_hash`` refresh reaching the
 # corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
@@ -503,9 +497,8 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016
 # manifest).
 # Verified mechanical
 # each time: a field-by-field diff of the live durable projection against the
-# frozen expectation showed every other field equal — schema_fields,
-# schema_hash and schema_mode are unchanged, so no audit projection material
-# moved.
+# frozen expectation showed every other field equal — schema_fields and
+# schema_mode are unchanged, so no audit projection material moved.
 # Rotated again 2026-08-07 for the json_explode comment correction: editing that
 # plugin file changed its ``source_file_hash``, which the manifest pins verbatim
 # inside one node record's audit material. Exactly ONE token moved
@@ -673,7 +666,305 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016
 # Merged 2026-09-01: the two rotations above landed on separate branches and
 # touch different plugins, so both provenance pins are live on the merged
 # manifest and this digest covers both.
-EXPECTED_CASE_REGISTRY_SHA256 = "fc99a2fd10d8d7b0d5540f9e68a8e4a3f222db535ee2db93dac3b7144d0eca53"
+# Release 0.8.1: refresh only engine-owned node plugin_version audit metadata.
+# Frozen semantic oracles and behavioral expectations are unchanged.
+# JSON source provenance refresh: update its one exact audit-record hash pin
+# after the plugin hash repair; behavioral and frozen semantic oracles stay fixed.
+# VANguard's current auth exporter adds one public configuration record and
+# one explicit omitted-auth coverage record to each exported run. Existing
+# runtime counts and the separate frozen semantic snapshots remain unchanged.
+# Full audit projections also bind the changed exporter settings and manifest
+# record count; a controlled reversal reproduces every former material/hash.
+# Rotated for the approval-artifact audit field rename: canonical call material
+# now sorts approved_prompt_artifact_hash first. The terminal resume digest was
+# measured through the production harness; semantic oracle snapshots did not move.
+# Rotated 2026-09-21 when the never-written node schema-digest column left the
+# Landscape and its always-null key left the exported node record: 52 literal
+# null tokens on 29 manifest lines were removed (the old manifest with those
+# tokens stripped is byte-identical to the new one apart from the resume digest).
+# Node keys hash the semantic config only, so no ``@`` suffix moved. Then
+# reopen-resume's resumed_full_projection_sha256 (6ede4243... -> 4947c833...,
+# captured from the production harness's own failure output), then this digest.
+# No oracle_freeze snapshot moved.
+# Rotated 2026-09-23 (elspeth-5887fb7928, U2): a PLUGIN PROVENANCE rotation, not
+# a semantic one. The input-free ValidationError renderer moved from
+# plugins/sources/_safe_validation_errors.py to
+# contracts/safe_validation_errors.py so the engine can call it, which changed
+# one import line in each source plugin. csv_source's source_file_hash moved
+# (5e8324e0e8280e22 -> d8a9c799bf5895c0, 15 manifest pins) and json_source's
+# (0ecba5e947ba4010 -> 33fd5411565563bb, 1 pin), recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash; reverting those 16
+# literals reproduces the prior manifest byte for byte. Then reopen-resume's
+# resumed_full_projection_sha256 (4947c833... -> 188207f6..., captured from the
+# production harness's own failure output), then this digest. No oracle_freeze
+# snapshot moved.
+# Persisted node execution order for replay admission changes only the 52
+# sequence_in_pipeline values in exact node audit records and the dependent
+# terminal-resume full-history hash; frozen runtime surfaces remain unchanged.
+# 2026-09-25: audit-export-v3 rotates the recorded settings digest for the
+# fourteen exact run cases and the checkpoint full-history digest. Recomputed
+# through the corpus canonical projection helpers; changing only the export
+# serialization version back to v2 reproduces every prior digest. No runtime
+# rows, routes, outcomes, audit record counts, or semantic-runtime pins changed.
+# CSV source teaching now names the required raw validation-failure route:
+# its source hash rotates d8a9c799bf5895c0 -> 5d131927c2baea3a in 15 node
+# records. Combined with v3 settings, the production reopen-resume harness
+# measures full-history pin 9cc4101e...; v2 settings reproduce bd33669a...,
+# while the prior CSV hash reproduces 4ec1e1ab.... Runtime semantics stay fixed.
+# ValueTransform metadata/output declaration repair changes only its three
+# source_file_hash tokens in union-collision-fail audit node records. The
+# token-normalized manifest is byte-identical; runtime oracle data is unchanged.
+# Rotated 2026-09-23 (elspeth-5887fb7928, E2): a SEMANTIC move ruled by the
+# operator plus a plugin provenance rotation. The validation renderer became
+# value-free and model-aware (safe_validation_error_text(exc, schema): a
+# top-level name only when the validated schema declares it, pydantic-core type
+# codes only, never msg), which changed each source plugin's call line.
+# (1) Ruled text move in retry-quarantine-discard-routed-errors /
+# source-quarantine-routed: validation_errors.error and node_states.error
+# "1 validation error: id: Input should be a valid integer, unable to parse
+# string as an integer [int_parsing]" -> "1 validation error: id: [int_parsing]",
+# terminal error_hash 00616901a7f46051 -> 8a4095b278791181; its frozen oracle
+# snapshot was rewritten for that one case only (the only oracle_freeze file
+# that moved). (2) csv_source source_file_hash 5d131927c2baea3a ->
+# 081b2eaaf545bb99 (15 manifest pins) and json_source 33fd5411565563bb ->
+# 9773d7d4da8358a9 (1 pin), recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash on the tree rebased
+# onto release/0.8.1 @ e991b35fb. The reopen-resume projection digest and this
+# digest are re-derived once, on the final rebased tree (see the latest entry).
+# Rotated 2026-09-24 (elspeth-5887fb7928, R3): a PLUGIN PROVENANCE rotation, not
+# a semantic one. value_transform now types a nested result 'any' through the
+# shared contract inference rule and rejects an expression that can store a
+# set, so its source_file_hash moved (281e1dce4c33c4f4 -> b044c849faeb8da8 on
+# the rebased tree, 3 manifest pins, all in
+# fork-coalesce-policies/union-collision-fail), recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash; reverting those 3
+# literals reproduces the prior manifest byte for byte. No resume digest moved
+# and no oracle_freeze snapshot moved.
+# Rotated 2026-09-24 (elspeth-5887fb7928, R3 fix round 1): a PLUGIN PROVENANCE
+# rotation, not a semantic one. value_transform now pins a target its schema
+# types (a row whose computed value is another type is a routed type_mismatch
+# error instead of a run abort), so its source_file_hash moved
+# (b044c849faeb8da8 -> e45fbb4c22b9900f on the rebased tree, the same 3
+# manifest pins in fork-coalesce-policies/union-collision-fail, whose
+# value_transforms are observed-mode and pin nothing), recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash; reverting those 3
+# literals reproduces the prior manifest byte for byte. No resume digest moved
+# and no oracle_freeze snapshot moved.
+# Rotated 2026-09-24 (elspeth-5887fb7928, R6): a PLUGIN PROVENANCE rotation, not
+# a semantic one. json_explode's docstrings and comments were corrected to the
+# behaviour ac97b3265 shipped (a wrong-typed or empty array_field is a returned,
+# routed error); its code is AST-identical once docstrings are neutralised. Its
+# source_file_hash moved (36c7c718e2cee382 -> 8ad41f481a0a1400, the one manifest
+# pin in the json-explode-parent-child case), recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash; reverting that literal
+# reproduces the prior manifest byte for byte. No resume digest moved and no
+# oracle_freeze snapshot moved.
+# Rotated again 2026-09-24 (R6 follow-up): the same docstring correction was
+# narrowed (a raised PluginContractViolation IS converted to a routed error;
+# only TypeError/KeyError escape unconverted), so the hash moved again
+# (8ad41f481a0a1400 -> fc4a2bcdd9d3fa2b, same single pin, same proofs).
+# Rotated 2026-09-25 (elspeth-5887fb7928, S1a / ADR-050): a PLUGIN PROVENANCE
+# rotation, not a semantic one. Transform outputs now DECLARE the contract of
+# every created field before the first row (value_transform declares its
+# targets any, json_explode its output_field any / item_index int, field_mapper
+# its dotted targets any, blob_csv_expand its CSV columns str), so the four
+# source_file_hashes moved: value_transform e45fbb4c22b9900f ->
+# 89bb2afff7b49a6b on the rebased tree (the 3 manifest pins,
+# fork-coalesce-policies/union-collision-fail) and json_explode
+# fc4a2bcdd9d3fa2b -> 67ab862fbd369a2b (1 manifest pin,
+# json-explode-parent-child); field_mapper e30482871023e9a6 -> d87d0325cdeb243f
+# and blob_csv_expand f21d43dc7385e82e -> cf7fd4418a151e3a have no manifest pin.
+# Recomputed with scripts/cicd/plugin_hash.py::compute_source_file_hash;
+# reverting the literals reproduces the prior manifest byte for byte.
+# Re-derived 2026-09-25 on fix/5887-rebased rebased onto release/0.8.1 @
+# e991b35fb (the digests the entries above name were measured on the old base
+# and are superseded here). Order: (1) every manifest source_file_hash literal
+# equals its live, recomputed plugin pin (6 distinct hashes, 39 pins: csv
+# 081b2eaaf545bb99 x15, json 9773d7d4da8358a9 x1, value_transform
+# 89bb2afff7b49a6b x3, json_explode 67ab862fbd369a2b x1, and two untouched
+# upstream pins); (2) reopen-resume's resumed_full_projection_sha256
+# 9cc4101e... -> 0488ea94..., captured from the production harness's own
+# failure output; setting only the csv and json source pins back to
+# release/0.8.1's literals reproduces 9cc4101e... exactly, so the move is
+# plugin provenance, not runtime semantics; (3) this digest. The only
+# oracle_freeze snapshot that differs from release/0.8.1 is the ruled E2 move
+# (retry-quarantine-discard-routed-errors/source-quarantine-routed, one line).
+# Rotated 2026-09-25 (elspeth-5887fb7928, S1a fix round, review-S1a-r1 F1): a
+# PLUGIN PROVENANCE rotation with no manifest pin. field_mapper stopped
+# carrying a rename declared only by its target name, so its source_file_hash
+# moved d87d0325cdeb243f -> e424629ddeb631e4 (recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash); no manifest literal,
+# resume digest, registry digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-25 (elspeth-5887fb7928, S1a fix round 2, review-S1a-r2 F1):
+# a PLUGIN PROVENANCE rotation with no manifest pin. field_mapper now carries
+# an identity mapping by original header, so its source_file_hash moved
+# e424629ddeb631e4 -> a45ae2bec03f6d88 (same tool); no manifest literal,
+# resume digest, registry digest or oracle_freeze snapshot moved. The same
+# round then un-carried a declared header literal on such a mapping:
+# a45ae2bec03f6d88 -> df53a6bf11f5e647, likewise unpinned.
+# Rotated 2026-09-26 (elspeth-5887fb7928, S6, review-R6 F1): a PLUGIN
+# PROVENANCE rotation. json_explode's process() comment was narrowed to the
+# module docstring's claim (a raised TypeError escapes; a raised
+# PluginContractViolation is converted), comment-only, so its source_file_hash
+# moved 67ab862fbd369a2b -> 26471026c209f7ef (the 1 manifest pin in
+# json-explode-parent-child; same tool). The production-path and oracle-freeze
+# files pass unchanged, so no resume digest and no oracle_freeze snapshot moved.
+# Rotated 2026-09-26 (elspeth-5887fb7928, S7, review-S1a-r4 F2): a PLUGIN
+# PROVENANCE rotation. passthrough now routes its emitted contract through the
+# one declaration stamp (ADR-050 Decision 2), so its source_file_hash moved
+# 4465297d3b60b81e -> f8c2fe03ad0bdf86 (the 2 manifest pins, plain and
+# JSON-escaped, of its observed-mode node record; scripts/cicd/plugin_hash).
+# Every corpus passthrough is observed-mode, where the stamp has nothing to
+# stamp, so no count, terminal, projection, resume digest or oracle_freeze
+# snapshot moved. truncate, keyword_filter and type_coerce moved too but no
+# corpus case uses them.
+# Rotated 2026-09-26 (elspeth-5887fb7928, field-name spelling rule): a PLUGIN
+# PROVENANCE rotation. value_transform refuses a target that is a header
+# spelling of another of its targets at config, so its source_file_hash moved
+# 89bb2afff7b49a6b -> f645e8e83a012f3f (the 3 manifest pins, plain and
+# JSON-escaped, in fork-coalesce-policies/union-collision-fail;
+# scripts/cicd/plugin_hash). type_coerce b83875b8e25d513d -> d6cb511830dd8923
+# (conversion fields are declared inputs) and dataverse 2b76d08ac316a480 ->
+# aade9b9e9425a491 (field_mapping keys are read declarations) have no manifest
+# pin. The production-path and oracle-freeze files pass unchanged, so no resume
+# digest and no oracle_freeze snapshot moved.
+# Rotated 2026-09-26 (elspeth-5887fb7928, field-name spelling rule): a PLUGIN
+# PROVENANCE rotation with no manifest pin. field_mapper dropped the limb that
+# un-carried a declared header literal on an identity mapping (the rule refuses
+# that declaration as a read), so its source_file_hash moved df53a6bf11f5e647
+# -> 7858d4b8d78e3a9e (same tool); no manifest literal, resume digest, registry
+# digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-26 (elspeth-5887fb7928, field-name spelling rule, review): a
+# PLUGIN PROVENANCE rotation with no manifest pin. field_mapper checks a rename
+# target against the row it forwards where an original-header source leaves
+# the executor unable to name the removal, so its source_file_hash moved
+# 7858d4b8d78e3a9e -> b39aa95f4046c12c (same tool); no manifest literal, resume
+# digest, registry digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-26 (elspeth-5887fb7928, S4 quarantine dilution): a PLUGIN
+# PROVENANCE rotation with no manifest pin. batch_replicate's stale comment on
+# how the batch pass-through check treats quarantined inputs moved into the
+# engine (RowProcessor._cross_check_flush_output), comment-only, so its
+# source_file_hash moved 3b2052704496be8f -> 7eae6b13382ca8db
+# (scripts/cicd/plugin_hash); no manifest literal, resume digest, registry
+# digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-27 (elspeth-5887fb7928, field-name spelling rule, review r2):
+# a PLUGIN PROVENANCE rotation with no manifest pin. field_mapper classifies an
+# identity mapping by an original header ({"Name": "Name"}) as the rename it
+# is: its target is a created name, and a declared header literal is the
+# target's declaration and is not carried (restoring the limb the 2026-09-26
+# rotation above dropped on a false premise), so its source_file_hash moved
+# b39aa95f4046c12c -> 45320b13b23f6e0b (scripts/cicd/plugin_hash); no manifest
+# literal, resume digest, registry digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-27 (elspeth-5887fb7928 G2, certain union-merge type
+# conflicts): a PLUGIN PROVENANCE rotation with no manifest pin. field_mapper
+# declares its carried renames as a target -> source map
+# (carried_output_sources, the authority carried_output_fields now derives
+# from) so the build can follow a carried value's type upstream; its
+# source_file_hash moved 45320b13b23f6e0b -> b96c5b5e88bcd1eb
+# (scripts/cicd/plugin_hash); no manifest literal, resume digest, registry
+# digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-27 (elspeth-5887fb7928 G1 E7, union_collision_policy: fail;
+# lane ruling option B): fork-coalesce-policies/union-collision-fail was
+# reshaped to a DATA-DEPENDENT collision (observed source, marker_a/b/c) —
+# the certain-from-config shape is now refused at build — and its exact
+# expectation re-captured through the corpus harness (never hand-computed):
+# status failed, 3 tokens failed union_field_collision, every scheduler row
+# terminal. The corpus's exception-expectation mechanism (expected_error /
+# observed_error), whose only user pinned the abort, is deleted, so its nine
+# `"expected_error": null` manifest literals dropped. Exactly one oracle_freeze
+# snapshot moved (this case's), sanctioned by the same ruling.
+# Rotated 2026-09-28 (elspeth-5887fb7928 B1, field_mapper `strict` retired): a
+# PLUGIN PROVENANCE rotation with no manifest pin. field_mapper refuses the
+# retired `strict` option and routes every missing mapping source, so its
+# source_file_hash moved b96c5b5e88bcd1eb -> 4fed05d6f8252950
+# (scripts/cicd/plugin_hash); no corpus case uses field_mapper, so no manifest
+# literal, resume digest, registry digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-27 (elspeth-5887fb7928, field-name spelling rule, C1 fix
+# round 1): a PLUGIN PROVENANCE rotation. csv_source publishes what it matches
+# field_mapping keys against (headerless columns as written) on
+# SourceProtocol.field_renames, so its source_file_hash moved
+# 081b2eaaf545bb99 -> 040ed5b1c21f4dae (scripts/cicd/plugin_hash). Order: (1)
+# the manifest's 15 csv literals; (2) reopen-resume's
+# resumed_full_projection_sha256 0488ea94... -> 3c03ee77..., captured from
+# test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
+# output — setting only the csv pin (code and manifest) back to
+# 081b2eaaf545bb99 reproduces 0488ea94... exactly, so the move is plugin
+# provenance, not runtime semantics; (3) this digest. aws_s3
+# (aaaf6619345f0665 -> b491b922f1b34cb4) and azure_blob (6bf3a35d44316f7b ->
+# 719563e76907222d) moved too with no manifest pin. No oracle_freeze snapshot
+# moved.
+# Rotated 2026-09-27 (elspeth-5887fb7928, C3 value-free reasons, review r1 F1):
+# a PLUGIN PROVENANCE rotation. value_transform records the evaluator's
+# value-free ``kind`` as ``error_type`` in its failure reason, so its
+# source_file_hash moved f645e8e83a012f3f -> de648209de2ccdd6
+# (scripts/cicd/plugin_hash). Order: (1) the 3 manifest pins, plain and
+# JSON-escaped, in fork-coalesce-policies/union-collision-fail; (2) this
+# digest 5134cb96... -> 1908eb05... — with the new code and the OLD manifest
+# pins this parity test passed and only the provenance-pin test failed, so the
+# move is the pin literal alone. No union-collision-fail row hits an
+# evaluation error; no resume digest and no oracle_freeze snapshot moved.
+# The same round moved reference_join 46245d6f287224d6 -> 6aa4025393448c89 (it
+# tells a sparse miss from a broken expression by the evaluator's ``kind``, the
+# chained cause being gone) with no manifest pin; no digest moved.
+# Rotated 2026-09-28 (elspeth-5887fb7928, C3 value-free reasons, review r3 +
+# sink census): a PLUGIN PROVENANCE rotation. json_sink's encode/serialize
+# diversion reasons carry the exception class, never the codec's text (which
+# quotes the row's character), so its source_file_hash moved
+# 2629742182442969 -> 9ef547005076060e (scripts/cicd/plugin_hash). Order:
+# (1) the manifest's 15 literal pins; (2) reopen-resume's
+# resumed_full_projection_sha256 3c03ee77... -> cab4aab8..., captured from
+# test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
+# output — with ONLY the json_sink pin (code and manifest) set back to
+# 2629742182442969 the reopen/checkpoint production-path and oracle-freeze
+# cases pass 23/23, so the move is the pin literal alone; (3) this digest
+# 1908eb05... -> a3b8a299.... csv_sink cb4119567e0d1b1c, dataverse
+# 934b0bdb38c02efa and azure_blob 0719093e3ea19a79 moved in the same round
+# with no manifest pin. No oracle_freeze snapshot moved.
+# Rotated 2026-09-28 (elspeth-5887fb7928 merge-1 integration of the codex
+# branch onto the lane): the two rotation chains above ran on sibling branches;
+# the manifest carries both sides' literals and this digest is re-captured from
+# the merged tree (never hand-computed).
+# Rotated 2026-09-27 (elspeth-5887fb7928, R2 declared-input miss): a PLUGIN
+# PROVENANCE rotation. json_explode now declares array_field as an input
+# (declared_input_fields), so its source_file_hash moved 26471026c209f7ef ->
+# 1919e96964500441 (the 1 manifest pin in json-explode-parent-child;
+# scripts/cicd/plugin_hash). No count, terminal, projection, resume digest or
+# oracle_freeze snapshot moved (test_oracle_freeze + production-path files green).
+# Rotated 2026-09-28 (elspeth-5887fb7928 merge-1 integration of the R2 branch):
+# the R2 json_explode pin above joins the lane's chain; digest re-captured from
+# the merged tree.
+# Rotated 2026-09-28 (elspeth-5887fb7928, CSV inference width cap): a PLUGIN
+# PROVENANCE rotation. csv_source refuses a header wider than the 1024-field
+# inference cap at header read, so its source_file_hash moved
+# 040ed5b1c21f4dae -> 678589d6b1a6bf62 (scripts/cicd/plugin_hash). Order: (1)
+# the manifest's 15 csv literals; (2) reopen-resume's
+# resumed_full_projection_sha256 cab4aab8... -> f57c9c95..., captured from
+# test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
+# output — setting only the csv pin (code and manifest) back to
+# 040ed5b1c21f4dae with the new code reproduces cab4aab8... exactly, so the
+# move is plugin provenance, not runtime semantics; (3) this digest, captured
+# from this file's parity failure. No oracle_freeze snapshot moved.
+# Rotated 2026-09-29 (elspeth-5887fb7928, QR source-quarantine resume): an
+# AUDIT SHAPE rotation. A source-quarantined row is ingested with a born-parked
+# PENDING_SINK work item (QR-1), so source-quarantine-routed's exact projection
+# gains one scheduler_work entry (mark_pending_sink -> mark_pending_sink_terminal)
+# and its export gains the 2 scheduler_event records (manifest record_count
+# 27 -> 29). Order: (1) that case's expected block, captured from the harness's
+# own run evidence (durable == portable); (2) this digest 7d9bebc6... ->
+# 14a3a5cc..., captured from this file's parity failure. No oracle_freeze
+# snapshot moved (test_oracle_freeze green: the frozen surface carries no
+# scheduler_work or audit records).
+# T1 expression typing: value_transform's three union-collision-fail
+# provenance pins changed to 1a8ad03e147600d0. The case outcome is unchanged.
+# S-02 source spelling: the csv/json plugin hashes and the reopen-resume
+# projection changed with their source bytes. This registry digest is derived
+# from the merged manifest through the canonical corpus loader.
+# B3 runtime attribution: value_transform's three union-collision-fail pins
+# moved with its source hash; the reopen-resume case does not use that plugin.
+# Strict snapshot opt-in: csv/json source hashes moved; the exact projection
+# pins retain their behavior and the checkpoint full-history hash was measured
+# by the production harness. This digest comes from the canonical loader.
+EXPECTED_CASE_REGISTRY_SHA256 = "5b90e5b4eef5e7fb7b7f3f509a7f9eb6b3d3e997d71c20570d80173427afc215"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -737,7 +1028,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "fork-coalesce-policies:first-all-lost": "36d4b7a025847dd3a5ad0f7c066e9f260e7a16c1267a3010f329995ce730fb1e",
     "fork-coalesce-policies:union-collision-last-wins": "986df56cc9ca6ceeab7ccd5472f0c5605e296d48054112487d72b05174d2a6dd",
     "fork-coalesce-policies:union-collision-first-wins": "8a20e5eceb01859427ac5e60d0e370f8ba100a7b9ce0903b2ca6e28f288073c7",
-    "fork-coalesce-policies:union-collision-fail": "973269df09a38f4beabc778c2b06365a10363444229530974e71888f98a4d57f",
+    "fork-coalesce-policies:union-collision-fail": "536ae1b00e0e74c4cc5e0da9c7e064d5320ae206cddde761b237762307c05a57",
     "sequential-nested-fork-coalesce:two-sequential-require-all": "0a2ddc91942fe2a2466bfe1d7f486d8915c7b48e149b286c7a4c5eddcc52347e",
     "sequential-nested-fork-coalesce:reopen-terminal-publication": "0a2ddc91942fe2a2466bfe1d7f486d8915c7b48e149b286c7a4c5eddcc52347e",
     "parallel-coalesces:two-parallel-require-all": "41399be936e2425b392b5b241c2b2a87f69e6a2d3423dcd6519b2b99701614df",
@@ -1396,10 +1687,17 @@ EXPECTED_COALESCE_NEGATIVE_YAMLS = {
         b"    merge: union\n",
         b"    merge: union\n    union_collision_policy: first_wins\n",
     ),
+    # E7 (ruling 2026-09-27): the collision is DATA-DEPENDENT — an observed
+    # source (nothing guaranteed) and a distinct marker per branch — so the
+    # build cannot refuse it and every row's group routes union_field_collision.
     "union-collision-fail": _EXPECTED_COLLISION_UNION.replace(
         b"    merge: union\n",
         b"    merge: union\n    union_collision_policy: fail\n",
-    ),
+    )
+    .replace(b'      schema: {mode: fixed, fields: ["id: int", "value: int"]}\n', b"      schema: {mode: observed}\n")
+    .replace(b"target: branch_marker, expression: \"'a'\"", b"target: marker_a, expression: \"'a'\"")
+    .replace(b"target: branch_marker, expression: \"'b'\"", b"target: marker_b, expression: \"'b'\"")
+    .replace(b"target: branch_marker, expression: \"'c'\"", b"target: marker_c, expression: \"'c'\""),
 }
 EXPECTED_COALESCE_YAMLS = EXPECTED_COALESCE_MATRIX_YAMLS | EXPECTED_COALESCE_NEGATIVE_YAMLS
 
@@ -3472,48 +3770,20 @@ def test_exact_runtime_evidence_allows_intentionally_absent_sink_artifacts() -> 
     assert runtime.output_rows == 0
 
 
-def test_exact_failed_run_expectation_declares_exact_production_exception() -> None:
+def test_exact_failed_run_expectation_declares_no_exception() -> None:
+    """A failed run is an outcome the run RETURNS; the manifest never declares
+    an escaped exception as an expected result (the key is refused)."""
     values = _exact_run_expectation_values()
     values["status"] = "failed"
+
+    assert RunExpectation.model_validate(values).status == "failed"
+
     values["expected_error"] = {"exception_type": "CoalesceCollisionError"}
-
-    expectation = RunExpectation.model_validate(values)
-
-    assert expectation.status == "failed"
-    assert expectation.expected_error is not None
-    assert expectation.expected_error.exception_type == "CoalesceCollisionError"
-
-
-def test_expected_run_error_is_forbidden_for_nonfailed_status() -> None:
-    values = _exact_run_expectation_values()
-    values["expected_error"] = {"exception_type": "CoalesceCollisionError"}
-
-    with pytest.raises(ValidationError, match="expected_error requires status=failed"):
+    with pytest.raises(ValidationError, match="expected_error"):
         RunExpectation.model_validate(values)
 
 
-def test_observed_run_error_is_forbidden_for_completed_runtime() -> None:
-    values = _exact_runtime_evidence_values(_exact_runtime_projection_values())
-    values["observed_error"] = {"exception_type": "CoalesceCollisionError"}
-
-    with pytest.raises(ValidationError, match="observed_error requires status=failed"):
-        RuntimeEvidence.model_validate(values)
-
-
-def test_observed_run_error_is_forbidden_for_summary_runtime() -> None:
-    values = {
-        "kind": "summary",
-        "attempted": True,
-        "run_id": "run-1",
-        "status": "failed",
-        "observed_error": {"exception_type": "CoalesceCollisionError"},
-    }
-
-    with pytest.raises(ValidationError, match="observed_error requires kind=exact"):
-        RuntimeEvidence.model_validate(values)
-
-
-def test_failed_expected_error_evidence_types_portable_export_unavailable_by_policy() -> None:
+def test_failed_run_evidence_types_portable_export_unavailable_by_policy() -> None:
     projection = _failed_runtime_projection_values()
     runtime = _exact_runtime_evidence_values(projection)
     runtime.update(
@@ -3522,7 +3792,6 @@ def test_failed_expected_error_evidence_types_portable_export_unavailable_by_pol
         rows_failed=1,
         output_rows=0,
         sink_outputs=(),
-        observed_error={"exception_type": "CoalesceCollisionError"},
     )
     audit = _exact_audit_evidence_values(projection)
     audit.update(
@@ -3537,9 +3806,27 @@ def test_failed_expected_error_evidence_types_portable_export_unavailable_by_pol
 
     evidence = ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
 
-    assert evidence.runtime.observed_error is not None
+    assert evidence.runtime.status == "failed"
     assert evidence.audit.kind == "unavailable_by_policy"
     assert evidence.audit.portable_export_unavailable is not None
+
+
+def test_portable_export_unavailable_by_policy_requires_failed_runtime() -> None:
+    projection = _exact_runtime_projection_values()
+    runtime = _exact_runtime_evidence_values(projection)
+    audit = _exact_audit_evidence_values(projection)
+    audit.update(
+        kind="unavailable_by_policy",
+        portable_projection=None,
+        portable_export_unavailable={
+            "run_status": "failed",
+            "exception_type": "ValueError",
+            "reason": "Audit export requires an immutable export-terminal run",
+        },
+    )
+
+    with pytest.raises(ValidationError, match="portable export unavailable_by_policy requires failed runtime"):
+        ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
 
 
 def test_portable_export_unavailable_by_policy_rejects_completed_terminal() -> None:
@@ -3587,7 +3874,6 @@ def test_unavailable_export_audit_counts_must_match_exact_durable_projection() -
         rows_failed=1,
         output_rows=0,
         sink_outputs=(),
-        observed_error={"exception_type": "CoalesceCollisionError"},
     )
     audit = _exact_audit_evidence_values(projection)
     audit.update(
@@ -3617,7 +3903,6 @@ def test_unavailable_export_source_operation_count_must_match_exact_durable_proj
         rows_failed=1,
         output_rows=0,
         sink_outputs=(),
-        observed_error={"exception_type": "CoalesceCollisionError"},
     )
     audit = _exact_audit_evidence_values(projection)
     audit.update(
@@ -3635,7 +3920,7 @@ def test_unavailable_export_source_operation_count_must_match_exact_durable_proj
         ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
 
 
-def test_expected_error_runtime_rejects_exportable_exact_audit() -> None:
+def test_failed_runtime_rejects_exportable_exact_audit() -> None:
     projection = _failed_runtime_projection_values()
     runtime = _exact_runtime_evidence_values(projection)
     runtime.update(
@@ -3644,11 +3929,10 @@ def test_expected_error_runtime_rejects_exportable_exact_audit() -> None:
         rows_failed=1,
         output_rows=0,
         sink_outputs=(),
-        observed_error={"exception_type": "CoalesceCollisionError"},
     )
     audit = _exact_audit_evidence_values(projection)
 
-    with pytest.raises(ValidationError, match="observed expected-error runtime requires portable export unavailable_by_policy"):
+    with pytest.raises(ValidationError, match="failed runtime requires portable export unavailable_by_policy"):
         ScenarioRunEvidence.model_validate(_scenario_exact_evidence_values(runtime=runtime, audit=audit))
 
 
@@ -5894,8 +6178,6 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-f321e3ff21"
             elif scenario.id == "checkpoint-deterministic-resume" and dimension == "recovery":
                 expected_owner = "elspeth-245b21351b"
-            elif dimension == "guided":
-                expected_owner = "elspeth-7e2dd67275"
             elif dimension == "round_trip":
                 expected_owner = "elspeth-7cf763da7c"
             elif dimension == "scale":
@@ -6214,7 +6496,7 @@ def test_manifest_rejects_harness_attached_beyond_its_workflow_even_with_other_e
         load_manifest(write_manifest(tmp_path, raw))
 
 
-@pytest.mark.parametrize("dimension", ["concurrency", "guided", "scale"])
+@pytest.mark.parametrize("dimension", ["concurrency", "freeform", "scale"])
 def test_manifest_rejects_run_harness_attached_to_non_lifecycle_dimension(tmp_path: Path, dimension: str) -> None:
     raw = valid_manifest_dict()
     independent_sources = next(scenario for scenario in _raw_scenarios(raw) if scenario["id"] == "multiple-independent-sources")

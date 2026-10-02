@@ -27,6 +27,8 @@ Some examples need setup or use multiple configurations:
 | `chroma_rag_indexed` | `elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute` |
 | `textract_inline` | `python examples/textract_inline/scripts/prepare_document_blobs.py`, then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute` |
 | `join_refused` | `./examples/join_refused/run.sh` |
+| `replay_verify` | `./examples/replay_verify/run.sh` |
+| `fixed_web_search` (local fixture) | `./examples/fixed_web_search/run_fixture.sh` |
 | `multi_worker` | `./examples/multi_worker/run.sh` |
 | `multi_worker_showcase` | `./examples/multi_worker_showcase/run.sh` |
 | `statistical_batch_plugins` | Run one `settings_*.yaml` file at a time |
@@ -52,6 +54,8 @@ These examples run locally with no credentials or external services.
 | [`ab_llm_experiment`](ab_llm_experiment/) | The same A/B barrier with real LLM calls in the arms — one case study forked to two assessments, `row_union` releasing the pair. `settings.yaml` varies the prompt, `settings_models.yaml` varies the model, and `settings_arm_loss.yaml` shows what a lost arm costs: the whole row, including a completed sibling assessment |
 | [`document_review_panel`](document_review_panel/) | The combined example — a two-reviewer LLM fork nested inside an EXPAND group of pages, closed by a collector, summarised by a run-level aggregation. Shows one lost token unrolling into a lost page, a refused document verdict, and a short corpus number — and how encapsulating the run as one row makes the whole thing fail closed |
 | [`batch_aggregation`](batch_aggregation/) | Count-triggered aggregation with group-by statistics |
+| [`batch_error_routing`](batch_error_routing/) | One wrongly typed value fails its whole aggregation batch: every row of it goes to the `on_error` sink with its original values and a value-free reason; three configs — a quarantine sink, `on_error: discard`, and a declared `value_transform` output type that routes the bad row before the batch (all exit 1 by design) |
+| [`batch_rank_passthrough`](batch_rank_passthrough/) | Aggregation `output_mode: passthrough`: `batch_rank` ranks each prompt's candidates by judge score within the batch and the SAME tokens continue to a shortlist gate; a null score passes through unranked. `settings_transform.yaml` runs the same pipeline in `transform` mode to contrast the lineage (both exit 0) |
 | [`report_assemble`](report_assemble/) | Assemble text rows into paginated markdown reports with flush metadata |
 | [`statistical_batch_plugins`](statistical_batch_plugins/) | Statistical batch QA: distributions, experiments, classifier metrics, paired preferences, drift, outliers, data quality, top-k, thresholds, and effect sizes |
 | [`deaggregation`](deaggregation/) | 1-to-N row expansion via `batch_replicate` |
@@ -85,6 +89,7 @@ These examples demonstrate Retrieval-Augmented Generation using ChromaDB as a ve
 |---------|---------------------|
 | [`chroma_rag`](chroma_rag/) | Basic RAG retrieval — `./examples/chroma_rag/run.sh` seeds the collection, then runs retrieval |
 | [`chroma_rag_qa`](chroma_rag_qa/) | RAG + LLM via `./examples/chroma_rag_qa/run.sh` (requires `OPENROUTER_API_KEY`) |
+| [`azure_search_rag`](azure_search_rag/) | RAG retrieval against an existing Azure AI Search index — field mapping, search modes, score ranges, managed identity (requires `AZURE_SEARCH_ENDPOINT`, `AZURE_SEARCH_INDEX`, `AZURE_SEARCH_API_KEY`) |
 | [`chroma_rag_indexed`](chroma_rag_indexed/) | **Pipeline dependencies** — `depends_on` runs an indexing pipeline first, commencement gate verifies the collection, then query pipeline retrieves context. Entry point: `query_pipeline.yaml` |
 
 ### 0.6.0 — Multi-Worker & Concurrent Scheduling
@@ -123,6 +128,7 @@ export OPENROUTER_API_KEY="your-key-from-openrouter.ai"
 | [`azure_blob_sentiment`](azure_blob_sentiment/) | Azure Blob Storage source with LLM processing |
 | [`azure_keyvault_secrets`](azure_keyvault_secrets/) | Secret resolution from Azure Key Vault |
 | [`multi_query_assessment`](multi_query_assessment/) | Azure-backed multi-query assessment matrix |
+| [`power_automate`](power_automate/) | HTTP-triggered paginated source and inspectable member sink, with secret-backed callbacks and durable delivery reconciliation |
 
 ### AWS (requires AWS credentials)
 
@@ -150,6 +156,13 @@ shown in the individual READMEs.
 | [`chaosweb`](chaosweb/) | Web scraping resilience with ChaosWeb fault injection |
 | [`chaosllm`](chaosllm/) | Response data used by ChaosLLM server (not a runnable pipeline) |
 
+### Replay and Verify (local fixture server, no credentials)
+
+| Example | What It Demonstrates |
+|---------|---------------------|
+| [`replay_verify`](replay_verify/) | `run_mode: live` → `replay` → `verify` against one recorded run. `web_scrape` fetches pages from a deterministic local server, then replay answers from the audit trail with the server stopped, and verify re-fetches and records a verdict per call in `call_verifications`. `run.sh` also asserts three negative cases: a missing `replay_from` run, drifted settings, and a changed page. The README lists the 0.8.1 limitations, including OpenRouter replay and verify against real servers |
+| [`fixed_web_search`](fixed_web_search/) | A fixed node URL plus a row-mapped query value; the local fixture and ABN Lookup configuration use different addresses and query names. The fixture runner asserts three live requests, offline replay, and three matching verification calls. |
+
 ### Expected Non-Complete Demonstrations
 
 Some examples deliberately exercise failure accounting:
@@ -158,13 +171,16 @@ Some examples deliberately exercise failure accounting:
 |--------------------|-----------------|
 | `deep_routing`, `error_routing` | `PARTIAL`, exit 1; packaged blocked-content rows reach quarantine |
 | `pdf_rasterize` | `PARTIAL`, exit 1; 1 malformed PDF is quarantined by design (3 page rows still succeed) |
-| `fork_coalesce/settings_union_fail.yaml` | `FAILED`, non-zero exit; the first field collision aborts the run |
+| `fork_coalesce/settings_union_fail.yaml` | `FAILED`, exit 2; every row's group fails `union_field_collision` (the run never aborts) |
 | `row_union_ab_experiment/settings_screened_at_settlement.yaml` | `PARTIAL`, exit 1; screened pairs fail closed and remain audited |
 | `scope_collector/settings.yaml` | `PARTIAL`, exit 1; one page is malformed by construction and `require_all` withholds that document's statistics |
 | `scope_collector/settings_best_effort.yaml` | `PARTIAL`, exit 1; the same lost page, but `best_effort` still reports over the survivors |
 | `ab_llm_experiment/settings_arm_loss.yaml` | `PARTIAL`, exit 1; 3 of 24 cases lose one arm and each surviving sibling is invalidated with it |
 | `document_review_panel/settings_incomplete.yaml` | `PARTIAL`, exit 1; one page loses a reviewer, so the page and then the document verdict fail closed |
 | `document_review_panel/settings_run_as_row.yaml` | `PARTIAL`, exit 1; the same loss with the run as a single row — nothing is published, and the empty sink is the pass |
+| `batch_error_routing/settings.yaml` | `PARTIAL`, exit 1; 1 wrongly typed amount fails its batch, and all 3 rows of that batch reach `failed_batches` |
+| `batch_error_routing/settings_discard.yaml` | `PARTIAL`, exit 1; the same failed batch under `on_error: discard`, its 3 rows recorded as quarantined |
+| `batch_error_routing/settings_declared.yaml` | `PARTIAL`, exit 1; a declared `amount_cents: int` routes the 1 bad row before the batch, and every batch completes |
 | ChaosLLM / ChaosWeb realistic fault profiles | Stochastic `COMPLETED`, `PARTIAL`, or preflight failure depending on injected faults; verify every ingested row reached a result or error sink |
 
 ## Resetting examples
@@ -200,6 +216,8 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Closing an expand group (completeness)** | [`scope_collector`](scope_collector/) — a collector barrier, and the `require_all` / `best_effort` policy that decides what an incomplete group means |
 | **Error handling / quarantine** | [`error_routing`](error_routing/) — `on_error` diversion pattern |
 | **Aggregation (N to 1)** | [`batch_aggregation`](batch_aggregation/) — count triggers, group-by stats; [`report_assemble`](report_assemble/) — paginated markdown reports |
+| **A failed batch (N rows, one bad)** | [`batch_error_routing`](batch_error_routing/) — the whole batch fails and `on_error` takes every row of it; the reason names field and types, never the value |
+| **Annotating a batch but keeping every row (passthrough)** | [`batch_rank_passthrough`](batch_rank_passthrough/) — rank within a batch, then route on the rank; the token that reaches the sink is the one the source created |
 | **Statistical batch QA** | [`statistical_batch_plugins`](statistical_batch_plugins/) — prompt/model score comparisons, classifier metrics, drift, outlier annotation, data quality, top-k, thresholds, and effect sizes |
 | **Deaggregation (1 to N)** | [`deaggregation`](deaggregation/), [`json_explode`](json_explode/), or [`blob_transforms`](blob_transforms/) |
 | **PDF to page images** | [`pdf_rasterize`](pdf_rasterize/) — one PNG page row per page, with malformed-document quarantine |
@@ -213,7 +231,9 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Schema contracts** | [`schema_contracts_demo`](schema_contracts_demo/) (pure data) or [`schema_contracts_llm_assessment`](schema_contracts_llm_assessment/) (with LLM) |
 | **Jinja2 templates** | [`template_lookups`](template_lookups/) — field extraction and template-driven prompts |
 | **Web scraping** | [`chaosweb`](chaosweb/) — fault-injected scraping with content gates |
+| **Fixed-site web search** | [`fixed_web_search`](fixed_web_search/) — row-sourced search terms against a fixed URL |
 | **Database output** | [`database_sink`](database_sink/) — write to SQLite or PostgreSQL |
+| **Replaying or re-verifying a recorded run** | [`replay_verify`](replay_verify/) — `run_mode: replay` / `verify` with `replay_from`, verdicts in `call_verifications` |
 | **Crash recovery / resume** | [`checkpoint_resume`](checkpoint_resume/) — checkpoint + Ctrl-C + `elspeth resume` |
 | **Graceful shutdown** | [`checkpoint_resume`](checkpoint_resume/) — covers Ctrl-C shutdown behaviour |
 | **Payload retention / blob refs** | [`retention_purge`](retention_purge/) — payload lifecycle and `elspeth purge`; [`blob_transforms`](blob_transforms/) — fetch/store blobs and expand CSV blobs |
@@ -225,5 +245,6 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Stress testing** | [`large_scale_test`](large_scale_test/) or [`chaosllm_endurance`](chaosllm_endurance/) |
 | **RAG retrieval** | [`chroma_rag`](chroma_rag/) — basic vector search against ChromaDB |
 | **RAG + LLM** | [`chroma_rag_qa`](chroma_rag_qa/) — retrieval then LLM-generated answers |
+| **RAG against Azure AI Search** | [`azure_search_rag`](azure_search_rag/) — hybrid retrieval from an existing index |
 | **Pipeline dependencies (`depends_on`)** | [`chroma_rag_indexed`](chroma_rag_indexed/) — index → gate → query in one command |
 | **Commencement gates** | [`chroma_rag_indexed`](chroma_rag_indexed/) — go/no-go check before pipeline starts |

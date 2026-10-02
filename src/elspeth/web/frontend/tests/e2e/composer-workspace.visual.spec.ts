@@ -166,41 +166,6 @@ test.describe("Composer workspace visual baselines", () => {
     });
   }
 
-  // 1920x1080 joined the guided matrix with the 1080p remediation
-  // (elspeth-8fa71e6d15): the guided decision state is where the stepper and
-  // the sparse-content whitespace live, and neither defect family was visible
-  // at 1536x760 alone.
-  for (const viewport of [
-    { width: 1536, height: 760 },
-    { width: 1920, height: 1080 },
-  ] as const) {
-    test(`guided decision at ${viewport.width}x${viewport.height}`, async ({
-      page,
-    }) => {
-      const { composer, sessionId } = await openStableVisualScenario(
-        page,
-        "active-guided-decision",
-        viewport,
-        2,
-      );
-      try {
-        await expect(
-          composer.authoringPane().getByRole("log", { name: "Guided wizard step" }),
-        ).toBeVisible();
-        await settleAuthoringScroll(
-          composer.authoringPane().locator(".guided-authoring-scroll"),
-          "top",
-        );
-        await expect(composer.workspace()).toHaveScreenshot(
-          `guided-decision-${viewport.width}x${viewport.height}.png`,
-          { animations: "disabled", caret: "hide" },
-        );
-      } finally {
-        await deleteWorkspaceScenario(page, sessionId);
-      }
-    });
-  }
-
   // The collapsed state had NO visual baseline before 2026-08-15 — the
   // restore affordance (collapsed strip + icon toggle) shipped and was
   // recut without a pixel oracle (flagged by that day's UX review). The

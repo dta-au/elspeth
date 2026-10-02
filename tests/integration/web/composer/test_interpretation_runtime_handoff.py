@@ -2,21 +2,21 @@
 
 Verifies the runtime-side half of the Option A hash-anchored cross-DB linkage:
 when an LLM transform that originated from a resolved interpretation event
-makes its LLM call at runtime, the Landscape ``calls.resolved_prompt_template_hash``
+makes its LLM call at runtime, the Landscape ``calls.approved_prompt_artifact_hash``
 column gets populated with the same SHA-256 that
-``interpretation_events.resolved_prompt_template_hash`` carries in the session
+``interpretation_events.approved_prompt_artifact_hash`` carries in the session
 DB.
 
 Test shape (per spec ``docs/composer/ux-redesign-2026-05/18a-phase-5b-backend.md``
 lines 2941-2982):
 
 1. Seed the session DB with a resolved interpretation event whose
-   ``resolved_prompt_template_hash`` we capture.
+   ``approved_prompt_artifact_hash`` we capture.
 2. Drive an audited LLM call against an in-memory Landscape DB, passing the
    same hash through the public hand-off kwarg. Azure uses
    ``AuditedLLMClient.chat_completion`` directly; OpenRouter records a logical
    ``CallType.LLM`` row around its HTTP transport.
-3. Read back ``calls.resolved_prompt_template_hash`` from the Landscape DB and
+3. Read back ``calls.approved_prompt_artifact_hash`` from the Landscape DB and
    assert byte equality with the session DB value.
 4. External-recompute step (spec step 9): compute
    ``stable_hash(resolved_template_str)`` over the prompt-template string
@@ -61,6 +61,7 @@ from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import calls_table
@@ -77,8 +78,10 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.landscape import leader_coordination_token, member_token_for
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -153,7 +156,9 @@ def _make_session_service() -> tuple[SessionServiceImpl, Any]:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    service = DualFencedSessionServiceHarness(
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -241,7 +246,7 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
     # node carrying the placeholder, a pending interpretation event, and
     # resolve it. ``resolve_interpretation_event`` writes
     # ``options.prompt_template`` (patched) and
-    # ``options.resolved_prompt_template_hash`` into the new state row.
+    # ``options.approved_prompt_artifact_hash`` into the new state row.
     service, _ = _make_session_service()
     sid = uuid.uuid4()
     with service._engine.begin() as conn:
@@ -306,10 +311,10 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
     )
 
     # Step 6 (spec): session-side read — non-NULL hash, capture for the join.
-    assert resolved.resolved_prompt_template_hash is not None, (
-        "resolve_interpretation_event MUST populate resolved_prompt_template_hash on the session-DB row at resolve time"
+    assert resolved.approved_prompt_artifact_hash is not None, (
+        "resolve_interpretation_event MUST populate approved_prompt_artifact_hash on the session-DB row at resolve time"
     )
-    session_hash: str = resolved.resolved_prompt_template_hash
+    session_hash: str = resolved.approved_prompt_artifact_hash
     assert len(session_hash) == 64
 
     # Round-trip + production-shape check: the resolved hash must land on
@@ -320,21 +325,23 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
     assert cs.nodes, "Resolved state must contain the patched LLM node"
     patched_options = cs.nodes[0].options
     assert patched_options["prompt_template"] == resolved_template
-    assert patched_options["resolved_prompt_template_hash"] == session_hash
+    assert patched_options["approved_prompt_artifact_hash"] == session_hash
 
     # ── Landscape side: instantiate a real in-memory Landscape DB +
     # recorder, register a run/source/transform node + node_state, then
     # drive an audited LLM call carrying the same hash. This is the L3
     # plugin's hand-off point: the provider reads
-    # ``self._resolved_prompt_template_hash`` (snapshotted from
-    # ``LLMConfig.resolved_prompt_template_hash`` at transform construction)
+    # ``self._approved_prompt_artifact_hash`` (snapshotted from
+    # ``LLMConfig.approved_prompt_artifact_hash`` at transform construction)
     # and Azure passes it to ``client.chat_completion``.
     db = LandscapeDB.in_memory()
     factory = RecorderFactory(db)
 
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+    coordination = leader_coordination_token(factory, run.run_id)
+    member = member_token_for(db.engine, worker_id=coordination.worker_id, run_id=run.run_id)
     source_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="csv_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -342,26 +349,39 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
         schema_config=DYNAMIC_SCHEMA,
     )
     llm_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="llm",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
         config={"prompt_template": resolved_template},
         schema_config=DYNAMIC_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=coordination,
         source_node_id=source_node.node_id,
         row_index=0,
         data={"input": "demo"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
+    work_item = factory.scheduler.enqueue_ready_claimed(
+        member_token=member,
+        token_id=token.token_id,
+        row_id=row.row_id,
+        node_id=llm_node.node_id,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=factory.scheduler.serialize_row_payload(
+            PipelineRow({"input": "demo"}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
+        ),
+        lease_owner=member.worker_id,
+        lease_seconds=300,
+    )
     node_state = factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=llm_node.node_id,
-        run_id=run.run_id,
+        member_token=member,
+        attempt=work_item.attempt,
         step_index=1,
         input_data={"input": "demo"},
     )
@@ -377,6 +397,9 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
         execution=factory.execution,
         state_id=node_state.state_id,
         run_id=run.run_id,
+        token_id=token.token_id,
+        member_token=member,
+        work_item=work_item,
         telemetry_emit=lambda event: None,
         underlying_client=openai_stub,
         provider="stub",
@@ -385,16 +408,16 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
     response = client.chat_completion(
         model="stub-model",
         messages=[ChatMessage(role="user", content=resolved_template)],
-        resolved_prompt_template_hash=session_hash,
+        approved_prompt_artifact_hash=session_hash,
     )
     assert response.content == "7 / 10"
 
     # Step 7 (spec): Landscape-side read — non-NULL hash on the LLM call row.
     with db.connection() as conn:
         landscape_row = conn.execute(select(calls_table).where(calls_table.c.state_id == node_state.state_id)).one()
-    landscape_hash = landscape_row.resolved_prompt_template_hash
+    landscape_hash = landscape_row.approved_prompt_artifact_hash
     assert landscape_hash is not None, (
-        "AuditedLLMClient.chat_completion MUST forward resolved_prompt_template_hash "
+        "AuditedLLMClient.chat_completion MUST forward approved_prompt_artifact_hash "
         f"to the Landscape calls row when non-None at the public API. "
         f"run_id={run.run_id} state_id={node_state.state_id} session_hash={session_hash}"
     )
@@ -410,14 +433,17 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
         f"  state_id:       {node_state.state_id}"
     )
 
-    # Step 9 (spec): external recompute — read the resolved prompt template
-    # string from composition_states.nodes JSON and hash it with the same
-    # stable_hash() the production code used. This is the external audit
-    # check that proves the stored hashes match the string actually embedded
-    # in the composition state, not a hash silently computed over different
-    # bytes somewhere in the chain.
+    # Independently reconstruct the versioned effective artifact from the
+    # persisted options so an incorrect production hash builder cannot make
+    # all three storage surfaces agree on an unused template.
     embedded_template = patched_options["prompt_template"]
-    recomputed_hash = stable_hash(embedded_template)
+    recomputed_hash = stable_hash(
+        {
+            "domain": "elspeth.approved-prompt-artifact.v1",
+            "system_prompt": None,
+            "queries": [(None, embedded_template)],
+        }
+    )
     assert recomputed_hash == session_hash == landscape_hash, (
         "External recompute fails — composition_states.nodes.options.prompt_template "
         "does not match either stored hash. The stored hashes drift from the "
@@ -432,7 +458,7 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
     """OpenRouter's HTTP transport must not carry the LLM prompt hash.
 
     Regression guard for the live execution crash where
-    ``resolved_prompt_template_hash`` leaked onto an ``http`` call row and
+    ``approved_prompt_artifact_hash`` leaked onto an ``http`` call row and
     tripped the ``Call`` invariant before the logical LLM audit row could be
     written.
     """
@@ -440,8 +466,10 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
     factory = RecorderFactory(db)
 
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+    coordination = leader_coordination_token(factory, run.run_id)
+    member = member_token_for(db.engine, worker_id=coordination.worker_id, run_id=run.run_id)
     source_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="csv_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -449,26 +477,39 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
         schema_config=DYNAMIC_SCHEMA,
     )
     llm_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="llm",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
         config={"prompt_template": "Rate how modern this is."},
         schema_config=DYNAMIC_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=coordination,
         source_node_id=source_node.node_id,
         row_index=0,
         data={"input": "demo"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
+    work_item = factory.scheduler.enqueue_ready_claimed(
+        member_token=member,
+        token_id=token.token_id,
+        row_id=row.row_id,
+        node_id=llm_node.node_id,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=factory.scheduler.serialize_row_payload(
+            PipelineRow({"input": "demo"}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
+        ),
+        lease_owner=member.worker_id,
+        lease_seconds=300,
+    )
     node_state = factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=llm_node.node_id,
-        run_id=run.run_id,
+        member_token=member,
+        attempt=work_item.attempt,
         step_index=1,
         input_data={"input": "demo"},
     )
@@ -481,7 +522,7 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
         recorder=factory.execution,
         run_id=run.run_id,
         telemetry_emit=lambda event: None,
-        resolved_prompt_template_hash=session_hash,
+        approved_prompt_artifact_hash=session_hash,
     )
     monkeypatch.setattr("elspeth.plugins.infrastructure.clients.http.httpx.Client", _FakeHTTPXClient)
 
@@ -493,20 +534,22 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
         audit_parent=LLMAuditParent.for_row(
             state_id=node_state.state_id,
             token_id=token.token_id,
+            member_token=member,
+            work_item=work_item,
         ),
     )
 
     assert result.content == "7 / 10"
     with db.connection() as conn:
         rows = conn.execute(
-            select(calls_table.c.call_type, calls_table.c.resolved_prompt_template_hash)
+            select(calls_table.c.call_type, calls_table.c.approved_prompt_artifact_hash)
             .where(calls_table.c.state_id == node_state.state_id)
             .order_by(calls_table.c.call_index)
         ).all()
 
     assert [row.call_type for row in rows].count("http") == 1
-    assert [row.resolved_prompt_template_hash for row in rows if row.call_type == "http"] == [None]
-    assert [row.resolved_prompt_template_hash for row in rows if row.call_type == "llm"] == [session_hash]
+    assert [row.approved_prompt_artifact_hash for row in rows if row.call_type == "http"] == [None]
+    assert [row.approved_prompt_artifact_hash for row in rows if row.call_type == "llm"] == [session_hash]
 
 
 @pytest.mark.asyncio
@@ -521,8 +564,10 @@ async def test_runtime_handoff_none_hash_records_null() -> None:
     factory = RecorderFactory(db)
 
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+    coordination = leader_coordination_token(factory, run.run_id)
+    member = member_token_for(db.engine, worker_id=coordination.worker_id, run_id=run.run_id)
     source_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="csv_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -530,26 +575,39 @@ async def test_runtime_handoff_none_hash_records_null() -> None:
         schema_config=DYNAMIC_SCHEMA,
     )
     llm_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="llm",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
         config={"prompt_template": "plain template, no interpretation"},
         schema_config=DYNAMIC_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=coordination,
         source_node_id=source_node.node_id,
         row_index=0,
         data={"input": "demo"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
+    work_item = factory.scheduler.enqueue_ready_claimed(
+        member_token=member,
+        token_id=token.token_id,
+        row_id=row.row_id,
+        node_id=llm_node.node_id,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=factory.scheduler.serialize_row_payload(
+            PipelineRow({"input": "demo"}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
+        ),
+        lease_owner=member.worker_id,
+        lease_seconds=300,
+    )
     node_state = factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=llm_node.node_id,
-        run_id=run.run_id,
+        member_token=member,
+        attempt=work_item.attempt,
         step_index=1,
         input_data={"input": "demo"},
     )
@@ -565,6 +623,9 @@ async def test_runtime_handoff_none_hash_records_null() -> None:
         execution=factory.execution,
         state_id=node_state.state_id,
         run_id=run.run_id,
+        token_id=token.token_id,
+        member_token=member,
+        work_item=work_item,
         telemetry_emit=lambda event: None,
         underlying_client=openai_stub,
         provider="stub",
@@ -578,7 +639,7 @@ async def test_runtime_handoff_none_hash_records_null() -> None:
 
     with db.connection() as conn:
         landscape_row = conn.execute(select(calls_table).where(calls_table.c.state_id == node_state.state_id)).one()
-    assert landscape_row.resolved_prompt_template_hash is None
+    assert landscape_row.approved_prompt_artifact_hash is None
 
 
 @pytest.mark.asyncio
@@ -586,9 +647,9 @@ async def test_session_db_records_match_runtime_landscape_join() -> None:
     """Reverse-direction lookup: given a Landscape calls row, the hash
     points to exactly one interpretation_events row.
 
-    This is the auditor's traversal: ``calls.resolved_prompt_template_hash``
-    → ``interpretation_events WHERE resolved_prompt_template_hash = ?``.
-    Verifies the index ``ix_calls_resolved_prompt_template_hash`` and the
+    This is the auditor's traversal: ``calls.approved_prompt_artifact_hash``
+    → ``interpretation_events WHERE approved_prompt_artifact_hash = ?``.
+    Verifies the index ``ix_calls_approved_prompt_artifact_hash`` and the
     session-side column are populated consistently.
     """
     service, engine = _make_session_service()
@@ -647,14 +708,14 @@ async def test_session_db_records_match_runtime_landscape_join() -> None:
         runtime_model_identifier="anthropic/claude-opus-4-7",
         runtime_model_version="2026-05-01",
     )
-    target_hash = resolved.resolved_prompt_template_hash
+    target_hash = resolved.approved_prompt_artifact_hash
     assert target_hash is not None
 
     # Reverse query in the session DB: given a Landscape hash, find the
     # matching interpretation_events row.
     with engine.begin() as conn:
         matches = conn.execute(
-            select(interpretation_events_table).where(interpretation_events_table.c.resolved_prompt_template_hash == target_hash)
+            select(interpretation_events_table).where(interpretation_events_table.c.approved_prompt_artifact_hash == target_hash)
         ).all()
     assert len(matches) == 1, f"Cross-DB join must resolve to exactly one event; got {len(matches)} for hash {target_hash}"
     assert str(matches[0].id) == str(resolved.id)

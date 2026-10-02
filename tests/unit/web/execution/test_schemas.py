@@ -52,6 +52,7 @@ def _accounting(
     routed_failure: int = 0,
     quarantined: int = 0,
     discarded: int = 0,
+    collector_groups_failed: int = 0,
 ) -> RunAccounting:
     terminal = succeeded + failed + structural
     if emitted is None:
@@ -73,6 +74,7 @@ def _accounting(
             quarantined=quarantined,
             discarded=discarded,
         ),
+        collector_groups_failed=collector_groups_failed,
         integrity=RunAccountingIntegrity(
             closure=closure,
             missing_terminal_outcomes=missing_terminal_outcomes,
@@ -195,6 +197,8 @@ class TestValidationResult:
                 completion_ready=True,
                 blockers=[
                     ValidationReadinessBlocker(
+                        suggestion=None,
+                        note=None,
                         code="interpretation_review_pending",
                         component_id="rate_coolness",
                         component_type="transform",
@@ -292,6 +296,8 @@ class TestValidationResult:
                 completion_ready=False,
                 blockers=[
                     ValidationReadinessBlocker(
+                        suggestion=None,
+                        note=None,
                         code="graph_structure",
                         component_id="gate_1",
                         component_type="gate",
@@ -364,6 +370,8 @@ class TestValidationResult:
                 completion_ready=False,
                 blockers=[
                     ValidationReadinessBlocker(
+                        suggestion=None,
+                        note=None,
                         code="settings_load",
                         component_id=None,
                         component_type=None,
@@ -415,7 +423,7 @@ class TestRunEvent:
         assert "tokens_routed_success" in progress_fields
         assert "tokens_routed_failure" in progress_fields
 
-    def test_event_sequence_is_internal_to_json_and_schema(self) -> None:
+    def test_event_sequence_is_public_reconnect_cursor_in_json_and_schema(self) -> None:
         event = RunEvent(
             run_id="run-1",
             timestamp=datetime.now(tz=UTC),
@@ -424,8 +432,8 @@ class TestRunEvent:
         ).with_event_sequence(7)
 
         assert event.event_sequence == 7
-        assert "event_sequence" not in event.model_dump(mode="json")
-        assert "event_sequence" not in RunEvent.model_json_schema()["properties"]
+        assert event.model_dump(mode="json")["event_sequence"] == 7
+        assert "event_sequence" in RunEvent.model_json_schema()["properties"]
 
     def test_completed_event_valid(self) -> None:
         event = RunEvent(
@@ -1449,6 +1457,15 @@ class TestRunStatusResponseStatusInvariant:
         with pytest.raises(pydantic.ValidationError, match=r"completed.*tokens.failed == 0"):
             self._build(status="completed", accounting=_accounting(source_rows=10, succeeded=7, failed=3))
 
+    def test_completed_rejects_collector_group_failure(self) -> None:
+        with pytest.raises(pydantic.ValidationError, match=r"completed.*collector_groups_failed == 0"):
+            self._build(status="completed", accounting=_accounting(collector_groups_failed=1))
+
+    def test_completed_with_failures_accepts_structural_group_failure(self) -> None:
+        response = self._build(status="completed_with_failures", accounting=_accounting(collector_groups_failed=1))
+        assert response.accounting is not None
+        assert response.accounting.collector_groups_failed == 1
+
     def test_completed_with_failures_rejects_zero_succeeded(self) -> None:
         with pytest.raises(pydantic.ValidationError, match=r"completed_with_failures.*tokens.succeeded > 0"):
             self._build(status="completed_with_failures", accounting=_accounting(source_rows=6, succeeded=0, failed=6))
@@ -1720,7 +1737,8 @@ class TestTerminalEventStatusDiscriminator:
 class TestS8FabricationGuard:
     """S-8: ProgressData and CancelledData require all six counters explicitly.
 
-    Per CLAUDE.md fabrication test, defaulting an absent count to ``0`` makes
+    An absent value stays None rather than coerced to zero: defaulting an
+    absent count to ``0`` makes
     "we don't know" indistinguishable from "definitely zero".  The engine's
     ``ProgressEvent`` (contracts/cli.py) already populates every counter on
     every emission; making the wire schema require them too closes the
@@ -1825,3 +1843,15 @@ class TestS8FabricationGuard:
         with pytest.raises(pydantic.ValidationError) as exc_info:
             CancelledData(**kwargs)  # type: ignore[arg-type]
         assert missing_field in str(exc_info.value)
+
+
+def test_readiness_blocker_requires_an_explicit_note() -> None:
+    """elspeth-032ec69c41: ``note`` is REQUIRED (nullable, no default) so a
+    blocker builder cannot forget the decision — the advisor's own words ride
+    the ``advisor_signoff_blocked`` row only; every other builder says None."""
+    without_note = {"code": "x", "component_id": None, "component_type": None, "detail": "d", "suggestion": None}
+    with pytest.raises(pydantic.ValidationError):
+        ValidationReadinessBlocker.model_validate(without_note)
+    blocker = ValidationReadinessBlocker.model_validate({**without_note, "note": None})
+    assert blocker.model_dump()["note"] is None
+    assert ValidationReadinessBlocker.model_validate({**without_note, "note": "the advisor's words"}).note == "the advisor's words"

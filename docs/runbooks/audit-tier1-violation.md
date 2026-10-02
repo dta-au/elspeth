@@ -62,8 +62,8 @@ quotable value sufficient to find the server-side record:
 error was rendered:
 
 - **Under `detail`** (`{"detail": {"error_type": ..., "request_id": ...}}`) for
-  anything raised as an `HTTPException` with a dict detail — all guided
-  terminal-failure envelopes, freeform convergence 422s, execution and
+  anything raised as an `HTTPException` with a dict detail — Composer
+  convergence 422s, execution and
   interpretation envelopes. A single app-level handler injects it there.
 - **Top level** (`{"error_type": ..., "request_id": ...}`) for the named-
   exception handlers that render their `JSONResponse` directly:
@@ -86,18 +86,8 @@ Search the structured server log for that id. The terminal-error events are:
 | `http_error_envelope` | app-level structured `HTTPException` handler | A dict-shaped HTTP error was returned. The event contains only the bounded middleware-issued `request_id` and status code; envelope fields are deliberately withheld. |
 | `http_validation_error_envelope` | app-level request-validation handler | A redacted request-body validation 422 was returned. The event contains only the bounded middleware-issued `request_id` and status code; validation details and input are deliberately withheld. |
 | `http_audit_integrity_error` | app-level `AuditIntegrityError` handler | A Tier-1 read-side verification refused to proceed. `message` carries the server-authored raise-site text, which is the only discriminator between the byte-identical 500 bodies. |
-| `guided.operation_terminal_failure` | the guided routes (`site` names which one: `post_guided_start`, `post_guided_respond`, `post_guided_convert`, `post_guided_chat`) | A guided operation was settled as failed and re-raised as a closed HTTP envelope. `exc_class` and `frames` carry the diagnostic; the user-visible body never does. |
-
-The guided event is **not** emitted for every guided 500. `post_guided_start`
-and `post_guided_convert` emit it only when the failure was an
-`AuditIntegrityError`; `post_guided_respond` and `post_guided_chat` emit it for
-every terminal failure. So an absent log line on a start/convert 500 means the
-failure was classified as `operation_failed` or `stale_conflict`, not that
-logging was lost — check the `guided_operations` table for the operation's
-recorded `failure_code`.
-
-These event names are stable identifiers. Do not rename them — dashboards and
-this runbook key off them.
+These event names are stable identifiers. Do not rename them without updating
+dashboards and this runbook.
 
 ## Triage Queries
 
@@ -158,7 +148,7 @@ SELECT session_id, actor, route_name, created_at
 
 This repository currently has telemetry documentation and runbooks, but no
 deployable Alertmanager/Grafana dashboard configuration under `config/` or
-`infra/` for this PR to patch. These Filigree tasks must be resolved before
+`infra/` for this PR to patch. These legacy issue tracker tasks must be resolved before
 Phase 3 ships to production:
 
 - `elspeth-6e55a05547` — alert route for compose-loop Tier-1 audit failures.

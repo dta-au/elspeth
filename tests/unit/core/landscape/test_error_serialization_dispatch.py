@@ -24,7 +24,7 @@ from elspeth.contracts.errors import CoalesceFailureReason, ExecutionError, Tran
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
 
 # ---------------------------------------------------------------------------
 # Helper: replicate the dispatch from _node_state_recording.py:199
@@ -51,8 +51,16 @@ def _setup_with_token(
     setup = make_recorder_with_run(run_id=run_id, source_node_id="source-0")
     db, factory, run_id = setup.db, setup.factory, setup.run_id
     register_test_node(factory.data_flow, run_id, "transform-1", node_type=NodeType.TRANSFORM, plugin_name="transform")
-    row = factory.data_flow.create_row(run_id, "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-    token = factory.data_flow.create_token("row-1", token_id="tok-1")
+    row, token = factory.data_flow.create_row_with_token(
+        "source-0",
+        0,
+        {"name": "test"},
+        row_id="row-1",
+        token_id="tok-1",
+        source_row_index=0,
+        ingest_sequence=0,
+        coordination_token=leader_coordination_token(factory, run_id),
+    )
     return db, factory, row.row_id, token.token_id
 
 
@@ -310,7 +318,7 @@ class TestCompleteNodeStateWithExecutionError:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
             step_index=0,
             input_data={"x": 1},
         )
@@ -319,6 +327,7 @@ class TestCompleteNodeStateWithExecutionError:
         result = factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
+            member_token=leader_coordination_token(factory, "run-1").membership,
             error=error,
             duration_ms=42.0,
         )
@@ -338,7 +347,7 @@ class TestCompleteNodeStateWithExecutionError:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
             step_index=0,
             input_data={"a": 1},
         )
@@ -352,6 +361,7 @@ class TestCompleteNodeStateWithExecutionError:
         result = factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
+            member_token=leader_coordination_token(factory, "run-1").membership,
             error=error,
             duration_ms=15.0,
         )
@@ -370,7 +380,7 @@ class TestCompleteNodeStateWithExecutionError:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
             step_index=0,
             input_data={"z": 1},
         )
@@ -379,6 +389,7 @@ class TestCompleteNodeStateWithExecutionError:
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
+            member_token=leader_coordination_token(factory, "run-1").membership,
             error=error,
             duration_ms=5.0,
         )
@@ -399,7 +410,7 @@ class TestCompleteNodeStateWithCoalesceFailureReason:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
             step_index=0,
             input_data={"x": 1},
         )
@@ -413,6 +424,7 @@ class TestCompleteNodeStateWithCoalesceFailureReason:
         result = factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
+            member_token=leader_coordination_token(factory, "run-1").membership,
             error=reason,
             duration_ms=100.0,
         )
@@ -432,7 +444,7 @@ class TestCompleteNodeStateWithCoalesceFailureReason:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
             step_index=0,
             input_data={"y": 2},
         )
@@ -448,6 +460,7 @@ class TestCompleteNodeStateWithCoalesceFailureReason:
         result = factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
+            member_token=leader_coordination_token(factory, "run-1").membership,
             error=reason,
             duration_ms=5001.0,
         )
@@ -463,7 +476,7 @@ class TestCompleteNodeStateWithCoalesceFailureReason:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
             step_index=0,
             input_data={"q": 9},
         )
@@ -478,6 +491,7 @@ class TestCompleteNodeStateWithCoalesceFailureReason:
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
+            member_token=leader_coordination_token(factory, "run-1").membership,
             error=reason,
             duration_ms=3001.0,
         )
@@ -497,7 +511,7 @@ class TestCompleteNodeStateWithTransformErrorReason:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
             step_index=0,
             input_data={"x": 1},
         )
@@ -510,6 +524,7 @@ class TestCompleteNodeStateWithTransformErrorReason:
         result = factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
+            member_token=leader_coordination_token(factory, "run-1").membership,
             error=reason,
             duration_ms=1500.0,
         )
@@ -528,7 +543,7 @@ class TestCompleteNodeStateWithTransformErrorReason:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
             step_index=0,
             input_data={"w": 3},
         )
@@ -543,6 +558,7 @@ class TestCompleteNodeStateWithTransformErrorReason:
         result = factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
+            member_token=leader_coordination_token(factory, "run-1").membership,
             error=reason,
             duration_ms=800.0,
         )
@@ -558,7 +574,7 @@ class TestCompleteNodeStateWithTransformErrorReason:
         state = factory.execution.begin_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="run-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
             step_index=0,
             input_data={"v": 7},
         )
@@ -570,6 +586,7 @@ class TestCompleteNodeStateWithTransformErrorReason:
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
+            member_token=leader_coordination_token(factory, "run-1").membership,
             error=reason,
             duration_ms=2.0,
         )

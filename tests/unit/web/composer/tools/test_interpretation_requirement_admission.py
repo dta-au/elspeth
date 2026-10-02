@@ -36,10 +36,12 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
     ServerStagedRequiredControlUserTerm,
+    parse_interpretation_requirements,
+    project_planner_context_interpretation_requirement,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
-_SENSITIVE_SENTINEL: Final[str] = "sk-sensitive-requirement-value"
+_SENSITIVE_SENTINEL: Final[str] = "sensitive-requirement-value"
 _PLUGIN_NAMES: Final[tuple[str | None, ...]] = (
     "llm",
     "passthrough",
@@ -64,6 +66,49 @@ def _valid_authored_requirement() -> dict[str, str]:
         "user_term": "prompt_injection_shield_recommendation",
         "draft": "Recommend a prompt-injection shield.",
     }
+
+
+def test_display_title_survives_authoring_projection_echo_and_serialization() -> None:
+    authored = {**_valid_authored_requirement(), "display_title": "Prompt injection protection"}
+    options = {INTERPRETATION_REQUIREMENTS_KEY: [authored]}
+    assert common_tools._resolver_owned_interpretation_requirement_error(options, tool_name="upsert_node") is None
+    canonical = common_tools._canonicalize_authored_interpretation_requirements(options, component_id="summarize")
+    assert common_tools._canonical_interpretation_requirement_error(canonical, tool_name="upsert_node") is None
+    parsed = parse_interpretation_requirements(canonical)
+    assert parsed is not None
+    assert parsed[0]["display_title"] == "Prompt injection protection"
+    projected = project_planner_context_interpretation_requirement(parsed[0])
+    assert projected["display_title"] == authored["display_title"]
+    echoed, was_echoed = common_tools._normalize_echoed_interpretation_requirements(
+        {INTERPRETATION_REQUIREMENTS_KEY: [projected]}, stored_options=canonical
+    )
+    assert was_echoed
+    assert echoed[INTERPRETATION_REQUIREMENTS_KEY] == [authored]
+    assert common_tools._serialize_authoring_options(canonical)[INTERPRETATION_REQUIREMENTS_KEY] == [authored]
+    plain = common_tools._canonicalize_authored_interpretation_requirements(
+        {INTERPRETATION_REQUIREMENTS_KEY: [_valid_authored_requirement()]}, component_id="summarize"
+    )
+    assert parsed[0]["id"] == plain[INTERPRETATION_REQUIREMENTS_KEY][0]["id"]
+    assert parsed[0]["user_term"] == authored["user_term"]
+    assert "display_title" not in plain[INTERPRETATION_REQUIREMENTS_KEY][0]
+
+
+@pytest.mark.parametrize("title", [None, "", "  ", 7, True, {}, "x" * 201])
+def test_malformed_display_title_is_rejected_at_authoring_and_persisted_boundaries(title: object) -> None:
+    authored = {**_valid_authored_requirement(), "display_title": title}
+    assert (
+        common_tools._resolver_owned_interpretation_requirement_error(
+            {INTERPRETATION_REQUIREMENTS_KEY: [authored]}, tool_name="upsert_node"
+        )
+        is not None
+    )
+    canonical = common_tools._canonicalize_authored_interpretation_requirements(
+        {INTERPRETATION_REQUIREMENTS_KEY: [_valid_authored_requirement()]}, component_id="summarize"
+    )
+    canonical[INTERPRETATION_REQUIREMENTS_KEY][0]["display_title"] = title
+    with pytest.raises(TypeError, match="display_title"):
+        parse_interpretation_requirements(canonical)
+    assert common_tools._canonical_interpretation_requirement_error(canonical, tool_name="upsert_node") is not None
 
 
 def _canonical_pending_requirement(
@@ -645,7 +690,7 @@ def test_every_source_writer_rejects_malformed_or_resolver_owned_requirements(
 
     assert result.success is False, (writer, result.to_dict())
     assert result.updated_state is state
-    assert "interpretation_requirements" in result.data["error"]
+    assert "interpretation_requirements" in result.validation.errors[0].message
 
 
 @pytest.mark.parametrize(
@@ -677,7 +722,7 @@ def test_every_node_writer_rejects_for_llm_and_non_llm_plugins(
 
     assert result.success is False, (writer, plugin_name, result.to_dict())
     assert result.updated_state is state
-    assert "interpretation_requirements" in result.data["error"]
+    assert "interpretation_requirements" in result.validation.errors[0].message
 
 
 _COLLIDING_REQUIREMENT_LISTS: Final[tuple[list[dict[str, str]], ...]] = (
@@ -861,9 +906,9 @@ def test_every_node_writer_rejects_unregistered_pipeline_decision_before_publica
 
     assert result.success is False, (writer, result.to_dict())
     assert result.updated_state is state
-    assert "pipeline_decision user_term is not registered" in result.data["error"]
-    assert "closest registered term: 'drop_raw_html_fields'" in result.data["error"]
-    assert "required_control_auto_wired" not in result.data["error"]
+    assert "pipeline_decision user_term is not registered" in result.validation.errors[0].message
+    assert "closest registered term: 'drop_raw_html_fields'" in result.validation.errors[0].message
+    assert "required_control_auto_wired" not in result.validation.errors[0].message
     assert state.nodes == result.updated_state.nodes
 
 
@@ -892,8 +937,8 @@ def test_every_source_writer_rejects_identity_collisions_before_round_trip_poiso
 
     assert result.success is False, (writer, result.to_dict())
     assert result.updated_state is state
-    assert _IDENTITY_COLLISION_ERROR in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert _IDENTITY_COLLISION_ERROR in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
     _payload, round_trip_error = _serialize_set_pipeline_arguments(result.updated_state)
     assert round_trip_error is None
 
@@ -924,8 +969,8 @@ def test_every_node_writer_rejects_identity_collisions_before_round_trip_poisoni
 
     assert result.success is False, (writer, plugin_name, result.to_dict())
     assert result.updated_state is state
-    assert _IDENTITY_COLLISION_ERROR in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert _IDENTITY_COLLISION_ERROR in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
     _payload, round_trip_error = _serialize_set_pipeline_arguments(result.updated_state)
     assert round_trip_error is None
 
@@ -979,7 +1024,8 @@ def test_direct_source_writers_preserve_trusted_requirement_id(writer: str) -> N
 
 
 @pytest.mark.parametrize("writer", ("upsert_node", "patch_node_options"))
-def test_direct_node_writers_preserve_trusted_requirement_id(writer: str) -> None:
+@pytest.mark.parametrize("display_title", (None, "Prompt injection protection"))
+def test_direct_node_writers_preserve_trusted_requirement_id(writer: str, display_title: str | None) -> None:
     catalog = _catalog()
     trusted_id = "trusted-node-review-id"
     canonical = _canonical_pending_requirement(
@@ -995,6 +1041,8 @@ def test_direct_node_writers_preserve_trusted_requirement_id(writer: str) -> Non
         },
     )
     shell = {field: canonical[field] for field in ("kind", "user_term", "draft")}
+    if display_title is not None:
+        shell["display_title"] = display_title
     if writer == "upsert_node":
         arguments = {
             "id": "existing",
@@ -1021,6 +1069,8 @@ def test_direct_node_writers_preserve_trusted_requirement_id(writer: str) -> Non
     assert result.success, result.to_dict()
     retained = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY]
     assert retained[0]["id"] == trusted_id
+    if display_title is not None:
+        assert retained[0]["display_title"] == display_title
 
 
 @pytest.mark.parametrize("writer", ("upsert_node", "patch_node_options"))
@@ -1166,18 +1216,32 @@ def test_public_composition_mutations_reject_preexisting_output_review_metadata(
 
     assert result.success is False
     assert result.updated_state is state
-    assert result.data["error_code"] == "interpretation_requirements_invalid"
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 def test_composition_gate_registry_covers_every_public_state_mutation() -> None:
-    from elspeth.web.composer.tools._dispatch import _COMPOSITION_STATE_MUTATION_TOOL_NAMES
+    from elspeth.web.composer.redaction import SetPipelineArgumentsModel
     from elspeth.web.composer.tools._registry import (
         _MUTATION_TOOL_NAMES,
+        _REGISTERED_TOOLS,
         _SECRET_MUTATION_TOOL_NAMES,
+        resolve_tool_effects,
     )
+    from elspeth.web.composer.tools.declarations import EffectDomain
 
-    covered = _COMPOSITION_STATE_MUTATION_TOOL_NAMES
+    pipeline_arguments = {
+        "source": {"plugin": "csv", "on_success": "rows"},
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+    SetPipelineArgumentsModel.model_validate(pipeline_arguments)
+    covered = frozenset(
+        decl.name
+        for decl in _REGISTERED_TOOLS
+        if EffectDomain.GRAPH in resolve_tool_effects(decl.name, pipeline_arguments if decl.name == "set_pipeline" else {}).domains
+    )
 
     assert covered == (
         _MUTATION_TOOL_NAMES
@@ -1225,8 +1289,8 @@ def test_node_writers_enforce_canonical_identity_after_automatic_review_staging(
 
     assert result.success is False
     assert result.updated_state is state
-    assert "interpretation_requirements_invalid" in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 @pytest.mark.parametrize(
@@ -1277,8 +1341,8 @@ def test_patch_without_requirements_rejects_auto_stager_collision_with_trusted_r
 
     assert result.success is False, result.to_dict()
     assert result.updated_state is state
-    assert "interpretation_requirements_invalid" in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
     _payload, round_trip_error = _serialize_set_pipeline_arguments(result.updated_state)
     assert round_trip_error is None
 
@@ -1315,8 +1379,8 @@ def test_patch_source_without_requirements_enforces_b_after_merge() -> None:
 
     assert result.success is False
     assert result.updated_state is state
-    assert "interpretation_requirements_invalid" in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 def test_splice_enforces_b_again_after_final_reconciliation() -> None:
@@ -1362,8 +1426,8 @@ def test_splice_enforces_b_again_after_final_reconciliation() -> None:
 
     assert result.success is False
     assert result.updated_state is state
-    assert "interpretation_requirements_invalid" in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 def test_internal_revalidation_skips_raw_admission_but_never_canonical_invariant() -> None:
@@ -1404,8 +1468,8 @@ def test_internal_revalidation_skips_raw_admission_but_never_canonical_invariant
 
     assert result.success is False
     assert result.updated_state is state
-    assert "interpretation_requirements_invalid" in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert "interpretation_requirements_invalid" in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 def test_internal_revalidation_normalizes_trusted_legacy_pending_row_once() -> None:
@@ -1500,14 +1564,14 @@ def test_runtime_hash_remains_llm_only() -> None:
     assert (
         _runtime_owned_llm_option_error(
             "passthrough",
-            {"resolved_prompt_template_hash": _SENSITIVE_SENTINEL},
+            {"approved_prompt_artifact_hash": _SENSITIVE_SENTINEL},
             tool_name="upsert_node",
         )
         is None
     )
     error = _runtime_owned_llm_option_error(
         "llm",
-        {"resolved_prompt_template_hash": _SENSITIVE_SENTINEL},
+        {"approved_prompt_artifact_hash": _SENSITIVE_SENTINEL},
         tool_name="upsert_node",
     )
     assert error is not None
@@ -1548,8 +1612,8 @@ def test_queue_upsert_reaches_plugin_agnostic_review_admission_without_leaking(
 
     assert result.success is False
     assert result.updated_state is state
-    assert expected_error in result.data["error"]
-    assert _SENSITIVE_SENTINEL not in result.data["error"]
+    assert expected_error in result.validation.errors[0].message
+    assert _SENSITIVE_SENTINEL not in result.validation.errors[0].message
 
 
 def test_queue_upsert_preserves_canonical_unknown_option_error_after_review_admission() -> None:
@@ -1572,4 +1636,83 @@ def test_queue_upsert_preserves_canonical_unknown_option_error_after_review_admi
 
     assert result.success is False
     assert result.updated_state is state
-    assert "unknown option" in result.data["error"]
+    assert "unknown option" in result.validation.errors[0].message
+
+
+# ---------------------------------------------------------------------------
+# Prompt-template review auto-stager on a multi-query node (session 94f6f00c):
+# the staged draft is the rendered prompt SURFACE, and a query-template or
+# system-prompt edit re-stages the review while an identical mutation does not.
+# ---------------------------------------------------------------------------
+
+_MULTI_QUERY_OPTIONS: Final[dict[str, Any]] = {
+    "prompt_template": "Answer the question about the colour {{ row.colour }} in one short reply.",
+    "system_prompt": "Reply with only the value asked for and nothing else.",
+    "queries": {
+        "good_pair": {
+            "input_fields": {"colour": "colour"},
+            "template": "What is a good colour pair for {{ row.colour }}? Reply with the single colour name only.",
+        },
+    },
+    "required_input_fields": ["colour"],
+}
+
+
+def _staged_prompt_review(options: Any) -> dict[str, Any]:
+    requirements = options["interpretation_requirements"]
+    matches = [dict(entry) for entry in requirements if entry["kind"] == "llm_prompt_template"]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def test_prompt_review_auto_stager_drafts_the_multi_query_prompt_surface() -> None:
+    from elspeth.web.interpretation_state import prompt_review_draft_from_options
+
+    staged = common_tools._options_with_default_prompt_template_review(
+        node_id="colour_questions", plugin="llm", options=_MULTI_QUERY_OPTIONS
+    )
+    requirement = _staged_prompt_review(staged)
+
+    assert requirement["status"] == "pending"
+    assert requirement["draft"] == prompt_review_draft_from_options(_MULTI_QUERY_OPTIONS)
+    assert "Query 'good_pair':" in requirement["draft"]
+    assert "System prompt (sent with every query):" in requirement["draft"]
+    assert "not used (every query supplies its own template)" in requirement["draft"]
+    # Single-prompt nodes keep drafting the prompt_template itself.
+    single = common_tools._options_with_default_prompt_template_review(
+        node_id="rate", plugin="llm", options={"prompt_template": "Rate {{ row.text }}."}
+    )
+    assert _staged_prompt_review(single)["draft"] == "Rate {{ row.text }}."
+
+
+def test_prompt_review_auto_stager_restages_on_a_query_template_edit_but_not_on_a_replay() -> None:
+    first = common_tools._options_with_default_prompt_template_review(
+        node_id="colour_questions", plugin="llm", options=_MULTI_QUERY_OPTIONS
+    )
+    first_requirement = _staged_prompt_review(first)
+
+    replay = common_tools._options_with_default_prompt_template_review(
+        node_id="colour_questions", plugin="llm", options=dict(first), existing_options=first
+    )
+    assert _staged_prompt_review(replay) == first_requirement
+
+    edited = deepcopy(dict(first))
+    edited["queries"]["good_pair"]["template"] = "Name a colour that pairs with {{ row.colour }}. One word."
+    restaged = common_tools._options_with_default_prompt_template_review(
+        node_id="colour_questions", plugin="llm", options=edited, existing_options=first
+    )
+    restaged_requirement = _staged_prompt_review(restaged)
+    assert restaged_requirement["draft"] != first_requirement["draft"]
+    assert "Name a colour that pairs with {{ row.colour }}. One word." in restaged_requirement["draft"]
+    assert restaged_requirement["status"] == "pending"
+
+    system_edit = deepcopy(dict(first))
+    system_edit["system_prompt"] = "Be terse."
+    assert (
+        _staged_prompt_review(
+            common_tools._options_with_default_prompt_template_review(
+                node_id="colour_questions", plugin="llm", options=system_edit, existing_options=first
+            )
+        )["draft"]
+        != first_requirement["draft"]
+    )

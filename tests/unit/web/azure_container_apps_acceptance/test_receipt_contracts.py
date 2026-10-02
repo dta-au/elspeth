@@ -23,9 +23,18 @@ import pytest
 from elspeth.web._acceptance_common.compatibility_gate import compatibility_record_gate
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError, AcceptanceInputError
 from elspeth.web._acceptance_common.replica_probes import MECHANISMS as PROBE_MECHANISMS_SET
-from elspeth.web._acceptance_common.replica_probes import PROBE_MECHANISMS, Mechanism, Probe, ProbeResult
-from elspeth.web._acceptance_common.schema_facts import _expected_schema_facts
+from elspeth.web._acceptance_common.replica_probes import (
+    PROBE_MECHANISMS,
+    CrossReplicaProgressObservation,
+    Mechanism,
+    Probe,
+    ProbeResult,
+    decide_cross_replica_progress,
+    decide_lease_takeover,
+)
+from elspeth.web._acceptance_common.schema_facts import _CANDIDATE_PACKAGE_VERSION, _expected_schema_facts
 from elspeth.web._acceptance_common.testcontainer_run import (
+    REQUIRED_POSTGRES_PROOF_IDS,
     TESTCONTAINER_RUN_RECEIPT_KIND,
     TESTCONTAINER_SELECTION,
     resolve_testcontainer_run_target,
@@ -74,6 +83,8 @@ RUNBOOK_CHECK_KINDS = (
     "replica-run-start",
     "replica-lease-takeover",
     "replica-progress",
+    "single-revision-fence-conflict",
+    "single-revision-progress",
     "resource-graph-cleanup",
     "testcontainer-run",
 )
@@ -99,6 +110,25 @@ def _budget() -> dict[str, object]:
 
 
 def _probe(probe: str, *, outcome: str = "pass", mechanism: str | None = None, reasons: list[str] | None = None) -> dict[str, object]:
+    from .test_replica_probes import _takeover
+
+    evidence: dict[str, object] = {"trials": 20, "distinct_winners": 2}
+    if probe == "P3":
+        evidence = decide_lease_takeover(_takeover()).to_receipt_details()["evidence"]
+    elif probe == "P4a":
+        evidence = decide_cross_replica_progress(
+            CrossReplicaProgressObservation(
+                owner_instance_id="instance-a",
+                reader_instance_id="instance-b",
+                poll_interval_seconds=2.0,
+                status_visible_after_seconds=0.5,
+                outputs_visible_after_seconds=1.0,
+                messages_visible_after_seconds=1.5,
+                blob_sha256_via_owner=SHA,
+                blob_sha256_via_reader=SHA,
+                terminal_status_on_reader="completed",
+            )
+        ).to_receipt_details()["evidence"]
     return {
         "probe": probe,
         "outcome": outcome,
@@ -108,12 +138,66 @@ def _probe(probe: str, *, outcome: str = "pass", mechanism: str | None = None, r
         if probe != "P3"
         else "role_revocation_lease_expiry",
         "reasons": reasons if reasons is not None else ([] if outcome == "pass" else ["trial[0]:not_one_success_and_one_fence_refusal"]),
-        "evidence": {"trials": 20, "distinct_winners": 2},
+        "evidence": evidence,
     }
+
+
+@pytest.mark.parametrize("kind", ["replica-fence-conflict", "replica-run-start", "single-revision-fence-conflict"])
+@pytest.mark.parametrize("trials", [None, 0, -1, 1, 19, True, 20.0, "20"])
+def test_external_passing_receipts_cannot_claim_weak_contention(kind: str, trials: object) -> None:
+    details = VALID[kind]()
+    details["evidence"] = {"trials": trials, "distinct_winners": 2}
+    with pytest.raises(AcceptanceCheckError):
+        _validate(kind, details)
+
+
+@pytest.mark.parametrize("winners", [None, 0, 1, True, 2.0, 21])
+def test_external_p1_pass_requires_real_distinct_winner_count(winners: object) -> None:
+    details = VALID["replica-fence-conflict"]()
+    details["evidence"] = {"trials": 20, "distinct_winners": winners}
+    with pytest.raises(AcceptanceCheckError):
+        _validate("replica-fence-conflict", details)
+
+
+@pytest.mark.parametrize("kind", ["replica-lease-takeover", "replica-progress"])
+@pytest.mark.parametrize("evidence", [{}, {"owner_row_state": "stopped"}])
+def test_external_p3_p4_receipts_require_replayable_observations(kind: str, evidence: object) -> None:
+    details = VALID[kind]()
+    details["evidence"] = evidence
+    with pytest.raises(AcceptanceCheckError):
+        _validate(kind, details)
+
+
+def test_external_p3_receipt_replays_before_expiry_identity_and_physical_effects() -> None:
+    for field, value in (("duplicate_sink_effects", 1), ("cancelled_run_reason", None)):
+        details = VALID["replica-lease-takeover"]()
+        details["evidence"]["observation"][field] = value
+        with pytest.raises(AcceptanceCheckError):
+            _validate("replica-lease-takeover", details)
+    details = VALID["replica-lease-takeover"]()
+    details["evidence"]["observation"]["before_expiry"]["instance_id"] = "third-instance"
+    with pytest.raises(AcceptanceCheckError):
+        _validate("replica-lease-takeover", details)
 
 
 def _job(name: str) -> dict[str, object]:
     return {"mechanism": "container_apps_job", "job_name": name, "execution_name": f"{name}-iwpi4il", "execution_status": "Succeeded"}
+
+
+def _single_topology() -> dict[str, object]:
+    peer = ReplicaBinding(APP_ID, REVISION, f"{REVISION}-86c8c4b497-peer1")
+    return {
+        "container_app_id": APP_ID,
+        "active_revisions_mode": "Single",
+        "session_affinity": "sticky",
+        "min_replicas": 2,
+        "max_replicas": 2,
+        "revision": REVISION,
+        "replicas": [
+            {"instance_id": "instance-a", "replica": REPLICA, "replica_binding_sha256": BINDING.sha256},
+            {"instance_id": "instance-b", "replica": peer.replica, "replica_binding_sha256": peer.sha256},
+        ],
+    }
 
 
 VALID: dict[str, Callable[[], dict[str, object]]] = {
@@ -170,6 +254,8 @@ VALID: dict[str, Callable[[], dict[str, object]]] = {
         "deployment_target": "azure-container-apps",
     },
     "replica-fence-conflict": lambda: _probe("P1"),
+    "single-revision-fence-conflict": lambda: {**_probe("P1"), "topology": _single_topology()},
+    "single-revision-progress": lambda: {**VALID["replica-progress"](), "topology": _single_topology()},
     "replica-run-start": lambda: _probe("P2"),
     "replica-lease-takeover": lambda: _probe("P3"),
     "replica-progress": lambda: {
@@ -186,9 +272,12 @@ VALID: dict[str, Callable[[], dict[str, object]]] = {
         "mechanism": "resource_graph_query",
         "resource_group_sha256": SHA,
         "remaining_resources": 0,
-        "key_vault_purged": False,
-        "key_vault_tombstoned": True,
-        "scheduled_purge_date": "2026-12-04T10:00:00Z",
+        "runtime_key_vault_purged": False,
+        "runtime_key_vault_tombstoned": True,
+        "runtime_scheduled_purge_date": "2026-12-04T10:00:00Z",
+        "schema_owner_key_vault_purged": True,
+        "schema_owner_key_vault_tombstoned": False,
+        "schema_owner_scheduled_purge_date": None,
     },
 }
 
@@ -207,6 +296,72 @@ def _envelope(check: str, details: object, **overrides: object) -> dict[str, obj
     return payload
 
 
+@pytest.mark.parametrize(
+    "kind,labelled", [("single-revision-fence-conflict", "replica-fence-conflict"), ("single-revision-progress", "replica-progress")]
+)
+def test_single_proofs_cannot_substitute_labelled_details(kind: str, labelled: str) -> None:
+    with pytest.raises(AcceptanceCheckError, match="exec_receipt_schema"):
+        _validate(kind, VALID[labelled]())
+
+
+@pytest.mark.parametrize(
+    "fault", ["mode", "affinity", "count", "same_replica", "same_instance", "revision", "owner_hash", "peer_hash", "progress_identity"]
+)
+def test_single_proof_topology_and_binding_cannot_be_replaced(fault: str) -> None:
+    details = VALID["single-revision-progress"]()
+    topology = details["topology"]
+    if fault == "mode":
+        topology["active_revisions_mode"] = "Multiple"
+    elif fault == "affinity":
+        topology["session_affinity"] = "none"
+    elif fault == "count":
+        topology["min_replicas"] = True
+    elif fault == "same_replica":
+        topology["replicas"][1]["replica"] = topology["replicas"][0]["replica"]
+    elif fault == "same_instance":
+        topology["replicas"][1]["instance_id"] = topology["replicas"][0]["instance_id"]
+    elif fault == "revision":
+        topology["revision"] = "elspeth-web--another"
+    elif fault == "owner_hash":
+        topology["replicas"][0]["replica_binding_sha256"] = "0" * 64
+    elif fault == "peer_hash":
+        topology["replicas"][1]["replica_binding_sha256"] = "0" * 64
+    else:
+        topology["replicas"][0]["instance_id"] = "third-instance"
+    with pytest.raises(AcceptanceCheckError):
+        encode_exec_receipt("single-revision-progress", details, candidate_sha=CANDIDATE, binding=BINDING, scenario_id="A")
+
+
+def test_single_stored_receipt_cannot_move_topology_to_another_envelope_binding() -> None:
+    document = _envelope("single-revision-progress", VALID["single-revision-progress"](), replica_binding_sha256="0" * 64)
+    with pytest.raises(AcceptanceCheckError, match="replica_binding"):
+        validate_stored_receipt(
+            document, kind="single-revision-progress", scenario_id="A", subject_sha256="0" * 64, candidate_sha=CANDIDATE
+        )
+
+
+@pytest.mark.parametrize("fault", ["peer_hash", "revision_and_names", "app_id"])
+def test_direct_single_stored_admission_rederives_both_bindings(fault: str) -> None:
+    details = VALID["single-revision-progress"]()
+    topology = details["topology"]
+    if fault == "peer_hash":
+        topology["replicas"][1]["replica_binding_sha256"] = "0" * 64
+    elif fault == "app_id":
+        topology["container_app_id"] = APP_ID.replace("elspeth-acc-run1", "elspeth-acc-other")
+    else:
+        topology["revision"] = "elspeth-web--wrong"
+        topology["replicas"][0]["replica"] = "elspeth-web--wrong-owner"
+        topology["replicas"][1]["replica"] = "elspeth-web--wrong-peer"
+    with pytest.raises(AcceptanceCheckError, match="replica_binding"):
+        validate_stored_receipt(
+            _envelope("single-revision-progress", details),
+            kind="single-revision-progress",
+            scenario_id="A",
+            subject_sha256=BINDING.sha256,
+            candidate_sha=CANDIDATE,
+        )
+
+
 def _validate(check: str, details: object) -> None:
     EXEC_RECEIPT_DESCRIPTOR.detail_validators[check](cast(dict[str, object], details))
 
@@ -215,8 +370,8 @@ def _validate(check: str, details: object) -> None:
 
 
 class TestVocabularies:
-    def test_the_twelve_kinds_plus_testcontainer_run_are_exactly_the_runbooks(self) -> None:
-        assert len(CHECK_KINDS) == 12
+    def test_the_required_kinds_plus_testcontainer_run_are_exactly_the_runbooks(self) -> None:
+        assert len(CHECK_KINDS) == 14
         assert frozenset(RUNBOOK_CHECK_KINDS) == STORED_RECEIPT_KINDS
         assert EXEC_RECEIPT_DESCRIPTOR.check_kinds == CHECK_KINDS
         assert set(VALID) == CHECK_KINDS
@@ -274,6 +429,34 @@ def test_every_kind_accepts_its_valid_details_and_round_trips_through_the_envelo
     assert decoded["details"] == details
     assert decoded["replica_binding_sha256"] == BINDING.sha256
     assert receipt.kind == kind and receipt.subject_sha256 == BINDING.sha256
+
+
+@pytest.mark.parametrize("kind", ["replica-progress", "single-revision-progress"])
+@pytest.mark.parametrize(
+    "reason",
+    ["progress_stream_and_websocket_ticket_are_process_local", "legacy_p4b_contract_does_not_measure_durable_progress"],
+)
+def test_legacy_p4b_reasons_preserve_envelope_and_stored_admission(kind: str, reason: str) -> None:
+    details = VALID[kind]()
+    affine = cast(dict[str, object], details["owner_affine"])
+    affine["reasons"] = [reason]
+    line = encode_exec_receipt(kind, cast(contracts.CheckDetails, details), candidate_sha=CANDIDATE, binding=BINDING, scenario_id="A")
+    extracted = extract_exec_receipt(
+        line, expected_candidate_sha=CANDIDATE, expected_binding=BINDING, expected_scenario_id="A", expected_check=kind
+    )
+    document = json.loads(extracted.canonical_json)
+    admitted = validate_stored_receipt(document, kind=kind, scenario_id="A", subject_sha256=BINDING.sha256, candidate_sha=CANDIDATE)
+    assert json.loads(admitted.canonical_json) == document
+    assert document["details"]["owner_affine"] == {
+        "probe": "P4b",
+        "outcome": "cannot_pass",
+        "mechanism": "owner_affine",
+        "reasons": [reason],
+        "evidence": {"mitigation": "single_revision_sticky_sessions"},
+    }
+    affine.update({"outcome": "pass", "reasons": []})
+    with pytest.raises(AcceptanceCheckError, match="exec_receipt_schema"):
+        _validate(kind, details)
 
 
 def _scalar_paths(value: object, prefix: tuple[object, ...] = ()) -> list[tuple[object, ...]]:
@@ -470,14 +653,17 @@ class TestKindSemantics:
 
     def test_resource_graph_cleanup_requires_zero_resources_and_exactly_one_vault_fate(self) -> None:
         purged = VALID["resource-graph-cleanup"]()
-        purged.update({"key_vault_purged": True, "key_vault_tombstoned": False, "scheduled_purge_date": None})
+        purged.update({"runtime_key_vault_purged": True, "runtime_key_vault_tombstoned": False, "runtime_scheduled_purge_date": None})
         _validate("resource-graph-cleanup", purged)
         for mutation in (
             {"remaining_resources": 1},
-            {"key_vault_purged": True},
-            {"key_vault_purged": True, "key_vault_tombstoned": False},
-            {"scheduled_purge_date": None},
-            {"scheduled_purge_date": "2026-12-04T10:00:00+00:00"},
+            {"runtime_key_vault_purged": True},
+            {"runtime_key_vault_purged": True, "runtime_key_vault_tombstoned": False},
+            {"runtime_scheduled_purge_date": None},
+            {"runtime_scheduled_purge_date": "2026-12-04T10:00:00+00:00"},
+            {"schema_owner_key_vault_purged": False},
+            {"schema_owner_key_vault_tombstoned": True},
+            {"schema_owner_scheduled_purge_date": "2026-12-04T10:00:00Z"},
         ):
             details = VALID["resource-graph-cleanup"]()
             details.update(mutation)
@@ -594,13 +780,14 @@ def test_extract_exec_receipt_rejects_malformed_streams_and_wrong_bindings() -> 
 _TARGET = resolve_testcontainer_run_target({})
 
 
-def _testcontainer_run(*, schema: str = "elspeth.azure-container-apps-testcontainer-run.v1", exit_code: int = 0) -> dict[str, object]:
+def _testcontainer_run(*, schema: str = "elspeth.azure-container-apps-testcontainer-run.v2", exit_code: int = 0) -> dict[str, object]:
     return {
         "schema": schema,
         "kind": TESTCONTAINER_RUN_RECEIPT_KIND,
         "candidate_sha": CANDIDATE,
         "scenario_id": "A",
         "selection": list(TESTCONTAINER_SELECTION),
+        "required_tests_passed": sorted(REQUIRED_POSTGRES_PROOF_IDS),
         "exit_code": exit_code,
         "collected": 40,
         "passed": 40 - (2 if exit_code else 0),
@@ -665,7 +852,7 @@ def test_validate_stored_receipt_rejects_foreign_kinds_and_mismatched_bindings()
         ),
         ([], "replica-run-start", "A", BINDING.sha256, CANDIDATE, "receipt_store_schema"),
         (
-            _testcontainer_run(schema="elspeth.aws-ecs-testcontainer-run.v1"),
+            _testcontainer_run(schema="elspeth.aws-ecs-testcontainer-run.v2"),
             TESTCONTAINER_RUN_RECEIPT_KIND,
             "A",
             JUNIT_SUBJECT,
@@ -687,7 +874,7 @@ def test_testcontainer_run_is_stored_under_the_azure_schema_id_through_the_share
         candidate_sha=CANDIDATE,
     )
     document = json.loads(stored.canonical_json)
-    assert document["schema"] == "elspeth.azure-container-apps-testcontainer-run.v1"
+    assert document["schema"] == "elspeth.azure-container-apps-testcontainer-run.v2"
     assert document["exit_code"] == 1, "a failing run is recorded, not refused; the gate decides"
 
 
@@ -704,7 +891,7 @@ def _record() -> dict[str, object]:
         "candidate_image_digest": f"sha256:{SHA}",
         "candidate_revision_sha256": "1" * 64,
         "candidate_doctor_job_sha256": "2" * 64,
-        "candidate_package_version": "0.8.0",
+        "candidate_package_version": _CANDIDATE_PACKAGE_VERSION,
         "previous_source_sha": "",
         "previous_image_digest": "",
         "previous_revision_sha256": "",
@@ -760,6 +947,14 @@ def test_compatibility_record_rejects_open_field_sets_and_foreign_facts() -> Non
             validate_compatibility_record(record, bindings=BINDINGS, now=NOW)
     with pytest.raises(AcceptanceCheckError, match="compatibility_record_schema"):
         validate_compatibility_record(["not", "a", "record"], bindings=BINDINGS, now=NOW)
+
+
+def test_compatibility_record_rejects_stale_candidate_package_version() -> None:
+    record = _record()
+    record["candidate_package_version"] = "0.8.0"
+
+    with pytest.raises(AcceptanceCheckError, match="compatibility_record_binding"):
+        validate_compatibility_record(record, bindings=BINDINGS, now=NOW)
 
 
 def test_schema_facts_are_byte_equal_with_the_ecs_derivation_through_the_shared_core() -> None:

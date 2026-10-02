@@ -1,0 +1,12 @@
+{"prompt_id": "P-101", "candidate_id": "P-101-a", "model": "model-a", "judge_score": 8.5}
+{"prompt_id": "P-101", "candidate_id": "P-101-b", "model": "model-b", "judge_score": 6.0}
+{"prompt_id": "P-101", "candidate_id": "P-101-c", "model": "model-c", "judge_score": 9.0}
+{"prompt_id": "P-101", "candidate_id": "P-101-d", "model": "model-d", "judge_score": 7.5}
+{"prompt_id": "P-102", "candidate_id": "P-102-a", "model": "model-a", "judge_score": 7.0}
+{"prompt_id": "P-102", "candidate_id": "P-102-b", "model": "model-b", "judge_score": null}
+{"prompt_id": "P-102", "candidate_id": "P-102-c", "model": "model-c", "judge_score": 8.0}
+{"prompt_id": "P-102", "candidate_id": "P-102-d", "model": "model-d", "judge_score": 5.5}
+{"prompt_id": "P-103", "candidate_id": "P-103-a", "model": "model-a", "judge_score": 6.5}
+{"prompt_id": "P-103", "candidate_id": "P-103-b", "model": "model-b", "judge_score": 9.5}
+{"prompt_id": "P-103", "candidate_id": "P-103-c", "model": "model-c", "judge_score": 8.0}
+{"prompt_id": "P-103", "candidate_id": "P-103-d", "model": "model-d", "judge_score": 8.0}

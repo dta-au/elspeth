@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from elspeth.web.composer import service as service_module
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.web.composer import provider_gateway
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl
-from tests.unit.web.composer._helpers import _empty_state, _make_llm_response, _make_settings, _mock_catalog
+from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.config import WebSettings
+from tests.helpers.session_fences import fenced_operation_context
+from tests.unit.web.composer._helpers import _composer_service_with_session, _empty_state, _make_llm_response, _make_settings, _mock_catalog
 
 _BEDROCK_PRIMARY = "bedrock/global.anthropic.claude-sonnet-4-6"
 _BEDROCK_ADVISOR = "bedrock/global.anthropic.claude-opus-4-6-v1"
@@ -40,14 +46,17 @@ def _clear_static_provider_keys(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
-def _bedrock_service() -> ComposerServiceImpl:
-    settings = _make_settings(
+def _bedrock_settings() -> WebSettings:
+    return _make_settings(
         composer_model=_BEDROCK_PRIMARY,
         composer_advisor_model=_BEDROCK_ADVISOR,
         composer_temperature=None,
         composer_seed=None,
     )
-    return ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)
+
+
+def _bedrock_service() -> ComposerServiceImpl:
+    return ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_bedrock_settings())
 
 
 @pytest.mark.asyncio
@@ -64,16 +73,23 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     async def clean_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
         return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
 
-    monkeypatch.setattr(service_module, "_litellm_acompletion", fake_acompletion)
-    service = _bedrock_service()
-    monkeypatch.setattr(service, "_run_advisor_checkpoint", clean_checkpoint)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
+    service, session_id = _composer_service_with_session(_mock_catalog(), _bedrock_settings())
+    monkeypatch.setattr(service._advisor_checkpoint, "_run_advisor_checkpoint", clean_checkpoint)
 
     availability = service.get_availability()
     assert availability.available is True
     assert availability.provider == "bedrock"
-    expected_tool_names = {tool["function"]["name"] for tool in service._get_litellm_tools()}
+    expected_tool_names = {tool["function"]["name"] for tool in composer_loop_tool_definitions(ToolContractDialect.NONE)}
 
-    await service.compose("No pipeline changes are needed.", [], _empty_state())
+    engine = service._require_sessions_service()._engine
+    try:
+        with fenced_operation_context(engine, session_id) as context:
+            await service.compose(
+                "No pipeline changes are needed.", [], _empty_state(), session_id=session_id, session_operation_context=context
+            )
+    finally:
+        engine.dispose()
 
     assert len(captured) == 1
     request = captured[0]
@@ -82,7 +98,8 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     assert all(tool["type"] == "function" and set(tool["function"]) == {"name", "description", "parameters"} for tool in request["tools"])
     # reasoning_effort: Bedrock models carry the discovery knob
     # (elspeth-dc459d438e); LiteLLM maps it to an Anthropic thinking budget.
-    assert set(request) == {"model", "messages", "tools", "reasoning_effort"}
+    assert set(request) == {"model", "messages", "tools", "reasoning_effort", "num_retries", "max_retries"}
+    assert request["num_retries"] == request["max_retries"] == 0
     assert request["reasoning_effort"] == "low"
     assert not (_FORBIDDEN_BEDROCK_KWARGS & set(request))
 
@@ -91,22 +108,28 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
 async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import litellm
+
     _clear_static_provider_keys(monkeypatch)
     captured: list[dict[str, Any]] = []
+    dispatches: list[bool] = []
+    reply = json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None})
 
     async def fake_acompletion(**kwargs: Any) -> Any:
+        assert dispatches == [True]
         captured.append(kwargs)
         return SimpleNamespace(
             model=_BEDROCK_ADVISOR,
-            choices=[SimpleNamespace(message=SimpleNamespace(content="CLEAN"))],
+            choices=[SimpleNamespace(message=SimpleNamespace(content=reply, tool_calls=[]))],
             usage=SimpleNamespace(prompt_tokens=11, completion_tokens=2, total_tokens=13),
         )
 
-    monkeypatch.setattr(service_module, "_litellm_acompletion", fake_acompletion)
+    # Observe actual SDK arguments after the wrapper consumes its callback.
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
     service = _bedrock_service()
     recorder = BufferingRecorder()
 
-    guidance, metadata = await service._call_advisor_with_audit(
+    guidance, metadata = await service._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "end",
             "problem_summary": "Review the complete pipeline.",
@@ -114,16 +137,21 @@ async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overr
             "attempted_actions": [],
         },
         recorder=recorder,
+        structured_output=True,
+        on_provider_dispatch=lambda: dispatches.append(True),
     )
 
-    assert guidance == "CLEAN"
+    assert guidance == reply
     assert metadata["model"] == _BEDROCK_ADVISOR
     assert len(captured) == 1
     request = captured[0]
     assert request["model"] == _BEDROCK_ADVISOR
     # reasoning_effort: the advisor knob rides Bedrock calls too
     # (elspeth-dc459d438e).
-    assert set(request) == {"model", "messages", "max_tokens", "reasoning_effort"}
+    assert set(request) == {"model", "messages", "max_tokens", "reasoning_effort", "response_format", "num_retries", "max_retries"}
+    assert request["num_retries"] == request["max_retries"] == 0
+    assert request["response_format"]["type"] == "json_schema"
+    assert request["response_format"]["json_schema"]["strict"] is True
     assert request["reasoning_effort"] == "medium"
     assert "tools" not in request
     assert not (_FORBIDDEN_BEDROCK_KWARGS & set(request))

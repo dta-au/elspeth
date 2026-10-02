@@ -18,26 +18,30 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError
 
 type ReportAssembleRow = dict[str, object]
 
-_REPORT_METADATA_FIELDS = frozenset(
-    {
-        "report_format",
-        "report_index",
-        "line_start",
-        "line_end",
-        "line_count",
-        "lines_seen_total",
-        "flush_trigger",
-        "is_end_of_source_report",
-    }
+# The pagination metadata every report row carries, with the type the plugin's
+# code fixes for each (ADR-050): the format is the configured label, and the
+# rest are copied from the engine-owned ``AggregationBatchContext`` (a str
+# trigger type, int window bounds and counters, a bool end-of-source flag).
+_REPORT_METADATA_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("report_format", "str"),
+    FieldDefinition("report_index", "int"),
+    FieldDefinition("line_start", "int"),
+    FieldDefinition("line_end", "int"),
+    FieldDefinition("line_count", "int"),
+    FieldDefinition("lines_seen_total", "int"),
+    FieldDefinition("flush_trigger", "str"),
+    FieldDefinition("is_end_of_source_report", "bool"),
 )
+_REPORT_METADATA_FIELDS = frozenset(field.name for field in _REPORT_METADATA_CREATED_FIELDS)
 
 
 # ``title`` and ``join_with`` are rendered into user-visible report output. A
@@ -98,7 +102,7 @@ class ReportAssemble(BaseTransform):
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:15e6746e7fb9cdca"
+    source_file_hash: str | None = "sha256:500cf78b62c27090"
     config_model = ReportAssembleConfig
     usage_when_to_use: str = (
         "Use in an aggregations node to assemble each flushed batch into a page or section of a "
@@ -127,6 +131,11 @@ class ReportAssemble(BaseTransform):
 """
     capability_tags: tuple[str, ...] = ("report", "aggregation", "batch", "pagination")
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to one assembled report row.
+    flush_emits_one_row_per_buffered_row = False
+    # Pagination reads the flush window (flush_index, row_start/row_end,
+    # trigger), which a collector's end_of_group flush does not have.
+    requires_aggregation_batch_context = True
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
@@ -136,6 +145,7 @@ class ReportAssemble(BaseTransform):
                 issue_code=None,
                 summary="Assembles a flushed batch of text rows into one paginated report row.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use report_assemble under aggregations with a trigger; it requires aggregation_batch context.",
                     "text_field must be a string field present on every input row.",
                     "Choose format as plain_text, markdown, or html_fragment; html_fragment escapes text before wrapping paragraphs.",
@@ -234,20 +244,9 @@ class ReportAssemble(BaseTransform):
         # Literal type guarantees the only remaining value is "html_fragment".
         return self._render_html_fragment(lines)
 
-    def _output_contract_for(self, output: ReportAssembleRow) -> SchemaContract:
-        """Build one shared output contract for the assembled report row."""
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,
-                required=False,
-                source="inferred",
-            )
-            for key in output
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The rendered report (``str``, every renderer returns text) plus the metadata table above (ADR-050)."""
+        return (FieldDefinition(self._output_field, "str"), *_REPORT_METADATA_CREATED_FIELDS)
 
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         # Hypothesis-generated probe rows arrive without ``text_field``, so the
@@ -276,9 +275,21 @@ class ReportAssemble(BaseTransform):
         for index, row in enumerate(rows):
             value = row[self._text_field]
             if type(value) is not str:
-                raise TypeError(
-                    f"Field {self._text_field!r} must be a string, got {type(value).__name__} in batch row {index}. "
-                    "This indicates an upstream validation bug — check source schema or prior transforms."
+                # A wrongly-typed row fails the WHOLE batch (ruling
+                # elspeth-d5034647f0): no report is assembled over the other
+                # rows, and the returned error routes every buffered row to the
+                # aggregation's on_error. No coercion — a number is not text.
+                # There is deliberately no None branch: None fails the batch
+                # through this same guard (found "NoneType"). The reason names
+                # the field, the batch row index and the types, never the value.
+                return TransformResult.error(
+                    BatchRowTypeError(
+                        field=self._text_field,
+                        row_index=index,
+                        expected="a string",
+                        found=type(value).__name__,
+                    ).as_reason(),
+                    retryable=False,
                 )
             lines.append(value)
 
@@ -295,7 +306,7 @@ class ReportAssemble(BaseTransform):
             "flush_trigger": batch.trigger_type,
             "is_end_of_source_report": batch.is_end_of_source,
         }
-        output_contract = self._output_contract_for(output)
+        output_contract = self._batch_output_contract(output)
         return TransformResult.success(
             PipelineRow(output, output_contract),
             success_reason={

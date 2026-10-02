@@ -33,7 +33,14 @@ from elspeth.core.landscape.schema import (
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
-from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_worker
+from tests.fixtures.landscape import (
+    leader_coordination_token,
+    leader_token_for,
+    make_factory,
+    make_landscape_db,
+    member_token_for,
+    register_test_worker,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,78 +268,86 @@ def test_source_a_oversize_row_does_not_starve_source_b_claim_ordering() -> None
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-isolation")
     schema_config = SchemaConfig.from_dict({"mode": "observed"})
     source_a = factory.data_flow.register_node(
-        run_id=run.run_id,
         node_id="source-a",
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
         config={},
         schema_config=schema_config,
+        coordination_token=leader_coordination_token(factory, run.run_id),
     )
     source_b = factory.data_flow.register_node(
-        run_id=run.run_id,
         node_id="source-b",
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
         config={},
         schema_config=schema_config,
+        coordination_token=leader_coordination_token(factory, run.run_id),
     )
     transform = factory.data_flow.register_node(
-        run_id=run.run_id,
         node_id="normalize",
         plugin_name="type_coerce",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
         config={},
         schema_config=schema_config,
+        coordination_token=leader_coordination_token(factory, run.run_id),
     )
-    row_a = factory.data_flow.create_row(
-        run.run_id,
+    row_a, token_a = factory.data_flow.create_row_with_token(
         source_a.node_id,
         0,
         {"payload": "x" * 8192},
         row_id="row-a",
         source_row_index=0,
         ingest_sequence=0,
+        token_id="token-a",
+        coordination_token=leader_coordination_token(factory, run.run_id),
     )
-    row_b = factory.data_flow.create_row(
-        run.run_id,
+    row_b, token_b = factory.data_flow.create_row_with_token(
         source_b.node_id,
         1,
         {"payload": "ok"},
         row_id="row-b",
         source_row_index=0,
         ingest_sequence=1,
+        token_id="token-b",
+        coordination_token=leader_coordination_token(factory, run.run_id),
     )
-    token_a = factory.data_flow.create_token(row_a.row_id, token_id="token-a")
-    token_b = factory.data_flow.create_token(row_b.row_id, token_id="token-b")
     contract = SchemaContract(mode="OBSERVED", fields=(), locked=True)
     assert row_a.ingest_sequence is not None
     assert row_b.ingest_sequence is not None
     item_a = factory.scheduler.enqueue_ready(
-        run_id=run.run_id,
         token_id=token_a.token_id,
         row_id=row_a.row_id,
         node_id=transform.node_id,
         step_index=1,
         ingest_sequence=row_a.ingest_sequence,
         row_payload_json=factory.scheduler.serialize_row_payload(PipelineRow({"payload": "x" * 8192}, contract)),
+        member_token=leader_token_for(factory._db, run.run_id).membership,
     )
     item_b = factory.scheduler.enqueue_ready(
-        run_id=run.run_id,
         token_id=token_b.token_id,
         row_id=row_b.row_id,
         node_id=transform.node_id,
         step_index=1,
         ingest_sequence=row_b.ingest_sequence,
         row_payload_json=factory.scheduler.serialize_row_payload(PipelineRow({"payload": "ok"}, contract)),
+        member_token=leader_token_for(factory._db, run.run_id).membership,
     )
 
     register_test_worker(db, run_id=run.run_id, worker_id="worker-a")
     register_test_worker(db, run_id=run.run_id, worker_id="worker-b")
-    claimed_a = factory.scheduler.claim_ready(run_id=run.run_id, lease_owner="worker-a", lease_seconds=30)
-    claimed_b = factory.scheduler.claim_ready(run_id=run.run_id, lease_owner="worker-b", lease_seconds=30)
+    claimed_a = factory.scheduler.claim_ready(
+        lease_owner="worker-a",
+        lease_seconds=30,
+        member_token=member_token_for(factory._db.engine, run_id=run.run_id, worker_id="worker-a"),
+    )
+    claimed_b = factory.scheduler.claim_ready(
+        lease_owner="worker-b",
+        lease_seconds=30,
+        member_token=member_token_for(factory._db.engine, run_id=run.run_id, worker_id="worker-b"),
+    )
 
     assert claimed_a is not None
     assert claimed_b is not None

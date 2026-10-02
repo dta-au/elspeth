@@ -78,10 +78,9 @@ from tests.e2e.recovery.test_barrier_process_death_matrix import (
     _new_barrier_factory,
     _rebuild_member,
     _RecordingSumBatch,
-    _register_worker,
     _run_fresh_recovery,
 )
-from tests.integration.pipeline.test_barrier_intake_dispositions import RUN_ID, USURPER, _usurp_seat
+from tests.integration.pipeline.test_barrier_intake_dispositions import RUN_ID, _usurp_seat
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -165,8 +164,7 @@ def _resume_member_0_last(db: LandscapeDB, payload_path: str) -> None:
     once the roster is closed by release."""
     factory = RecorderFactory(db, payload_store=FilesystemPayloadStore(Path(payload_path)))
     clock = MockClock(start=_T0 + 10)
-    _usurp_seat(db, clock)
-    _register_worker(db, USURPER, role="leader")
+    _usurp_seat(db)
     executor = _witnessing_collector_executor(factory, clock)
     processor: RowProcessor = _collector_processor(
         factory,

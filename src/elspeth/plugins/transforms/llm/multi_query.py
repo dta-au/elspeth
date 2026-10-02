@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.config_base import PluginConfig
-from elspeth.plugins.infrastructure.templates import TemplateError
+from elspeth.plugins.infrastructure.templates import RowProjection, TemplateError, TemplateRow
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
 
@@ -48,7 +48,8 @@ class OutputFieldConfig(PluginConfig):
 
     Attributes:
         suffix: Column suffix in output row (e.g., "score" -> "{prefix}_score")
-        type: Data type for schema enforcement
+        type: Data type for schema enforcement, and the output column's row type
+            (integer -> int, number -> float, boolean -> bool, string/enum -> str)
         values: Required for enum type - list of allowed values
     """
 
@@ -59,7 +60,7 @@ class OutputFieldConfig(PluginConfig):
     # data-validation schema. Left as-is it lowers to a spurious editable
     # ``schema`` knob per output field in the composer catalog discovery. Override
     # the inherited field solely to mark it ``composer_hidden`` (mirroring
-    # ``LLMConfig.resolved_prompt_template_hash``) so ``_lower_nested_model``
+    # ``LLMConfig.approved_prompt_artifact_hash``) so ``_lower_nested_model``
     # skips it; the type/alias/default and the inherited ``_parse_schema_config``
     # validator (bound by field name) are preserved unchanged.
     schema_config: SchemaConfig | None = Field(
@@ -69,7 +70,14 @@ class OutputFieldConfig(PluginConfig):
         json_schema_extra={"composer_hidden": True},
     )
     suffix: str = Field(..., description="Column suffix in output row")
-    type: OutputFieldType = Field(..., description="Data type for schema enforcement")
+    type: OutputFieldType = Field(
+        ...,
+        description=(
+            "Data type for schema enforcement, and the output column's row type: integer -> int, number -> float, "
+            "boolean -> bool, string/enum -> str. A JSON number is parsed into it: 5.0 under integer arrives as 5 "
+            "(5.5 fails the row), 7 under number as 7.0."
+        ),
+    )
     values: list[str] | None = Field(None, description="Allowed values (required for enum type)")
 
     @model_validator(mode="after")
@@ -94,6 +102,12 @@ class OutputFieldConfig(PluginConfig):
         else:
             # Direct type mapping
             return {"type": self.type.value}
+
+
+# Names a query's ``row`` (a plain ``dict`` of its variables plus ``source_row``)
+# never resolves to a variable: its own ``source_row`` entry, and every public
+# attribute of ``dict``, which ``row.<name>`` finds before the key.
+_QUERY_CONTEXT_RESERVED_NAMES: frozenset[str] = frozenset({"source_row"} | {name for name in dir(dict) if not name.startswith("_")})
 
 
 class QueryDefinition(BaseModel):
@@ -144,6 +158,30 @@ class QueryDefinition(BaseModel):
         description="Per-query Jinja2 template override (None = use the config-level prompt_template).",
     )
 
+    @field_validator("input_fields")
+    @classmethod
+    def validate_input_field_variables(cls, v: dict[str, str]) -> dict[str, str]:
+        """Refuse a variable name the query's ``row`` cannot read as that variable.
+
+        A query renders with ``row`` bound to a plain mapping of its variables
+        plus ``source_row`` (``build_template_context``). ``source_row`` is that
+        mapping's own entry, so a variable of that name is overwritten; and
+        attribute syntax on a mapping finds the mapping's method before its
+        key, so ``row.items`` for a variable named ``items`` renders the bound
+        method (with a memory address) on every row. Both are fixed by the
+        name alone, so configuration refuses them.
+        """
+        shadowed = sorted(name for name in v if name in _QUERY_CONTEXT_RESERVED_NAMES)
+        if shadowed:
+            names = ", ".join(f"'{name}'" for name in shadowed)
+            raise ValueError(
+                f"input_fields variable {names} cannot be read as that variable: a query's row is a mapping of its "
+                "input_fields variables plus 'source_row', so 'source_row' is taken and row.<name> for a mapping "
+                "method name (keys, items, values, get, ...) renders the method, not the value. Rename the variable, "
+                "e.g. 'items_text'."
+            )
+        return v
+
     @field_validator("template")
     @classmethod
     def validate_template(cls, v: str | None) -> str | None:
@@ -180,6 +218,14 @@ class QueryDefinition(BaseModel):
         default=None,
         description="Per-query max_tokens override (None = use the config-level max_tokens).",
     )
+
+    @field_validator("max_tokens", mode="before")
+    @classmethod
+    def reject_boolean_max_tokens(cls, value: object) -> object:
+        """Preserve boolean rejection at the authoring boundary, before coercion."""
+        if isinstance(value, bool):
+            raise ValueError("max_tokens must be an integer, not a boolean")
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,14 +267,18 @@ class QuerySpec:
         if self.output_fields is not None:
             object.__setattr__(self, "output_fields", tuple(self.output_fields))
 
-    def build_template_context(self, row: PipelineRow | dict[str, Any]) -> dict[str, Any]:
+    def build_template_context(self, row: PipelineRow, projection: RowProjection) -> dict[str, Any]:
         """Build template context mapping named variables to row values.
 
         Args:
-            row: Full row data (dict or PipelineRow)
+            row: The full row. Each ``input_fields`` value names a column the
+                query declares, read here in the parent process.
+            projection: The node's declaration (``declared_row_projection`` of
+                its ``required_input_fields``): ``source_row`` holds only those
+                fields (ADR-051).
 
         Returns:
-            Context dict with named variables and source_row reference
+            Context dict with named variables and the projected ``source_row``
 
         Raises:
             KeyError: If a required row column is missing
@@ -236,7 +286,7 @@ class QuerySpec:
         context: dict[str, Any] = {}
         for template_var, row_column in self.input_fields.items():
             context[template_var] = row[row_column]
-        context["source_row"] = row
+        context["source_row"] = TemplateRow.project(row, projection)
         return context
 
 

@@ -15,6 +15,22 @@ updates:
         patterns:
           - "*"
 
+  - package-ecosystem: "uv"
+    directory: "/gateway"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:15"
+      timezone: "Australia/Canberra"
+    labels:
+      - "dependencies"
+      - "python"
+      - "gateway"
+    groups:
+      gateway-python:
+        patterns:
+          - "*"
+
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
@@ -70,3 +86,15 @@ updates:
     labels:
       - "dependencies"
       - "docker"
+
+  - package-ecosystem: "docker"
+    directory: "/gateway"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "11:15"
+      timezone: "Australia/Canberra"
+    labels:
+      - "dependencies"
+      - "docker"
+      - "gateway"

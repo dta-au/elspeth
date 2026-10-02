@@ -87,16 +87,6 @@ async function assertScenario(
       await expectIntendedPaneScrollers(page, { transcriptMustScroll: true });
       await expectResizeGeometry(page, composer, page.viewportSize()!.width);
       break;
-    case "active-guided-decision":
-      await expect(
-        composer.authoringPane().getByRole("log", { name: "Step chat history" }),
-      ).toBeVisible();
-      await expect(
-        composer.authoringPane().getByRole("log", { name: "Guided wizard step" }),
-      ).toBeVisible();
-      await expect(page.getByTestId("completion-bar")).toHaveCount(0);
-      await expect(composer.catalogButton()).toHaveCount(0);
-      break;
     case "validation-audit-issues": {
       await expect(composer.checksTab()).toHaveAccessibleName(
         "Checks: 25 issues",
@@ -113,7 +103,7 @@ async function assertScenario(
       expect(await boxWidth(composer.authoringPane())).toBeCloseTo(beforeAuthoring, 0);
       expect(await boxWidth(composer.artifactRegion())).toBeCloseTo(beforeArtifact, 0);
       await expectIntendedPaneScrollers(page, {});
-      await composer.artifactTab("Graph").click();
+      await composer.artifactTab("Workflow").click();
       break;
     }
     case "pending-acknowledgement":
@@ -132,7 +122,7 @@ async function assertScenario(
       await page.getByRole("button", { name: "Runs (1)" }).click();
       await expect(page.getByText("completed", { exact: true })).toBeVisible();
       await page.getByRole("button", { name: "Close runs" }).click();
-      await composer.artifactTab("Graph").click();
+      await composer.artifactTab("Workflow").click();
       break;
     case "multiple-notices":
       await expect(page.getByTestId("app-notice-primary")).toHaveCount(1);
@@ -294,9 +284,10 @@ test.describe("Composer deterministic workspace geometry", () => {
           await expectNoDocumentHorizontalOverflow(page);
           await assertScenario(scenario, composer);
           await expectPrimaryControlsInViewport(page, composer, {
-            completion: scenario !== "active-guided-decision",
-            catalog: scenario !== "active-guided-decision",
+            completion: true,
+            catalog: true,
             importYaml: false,
+            fullscreen: scenario !== "empty-freeform",
           });
           await expectIntendedPaneScrollers(page, {
             transcriptMustScroll: scenario === "populated-long-transcript",
@@ -552,7 +543,7 @@ test.describe("Composer deterministic workspace geometry", () => {
       );
 
       setRunHistoryRequestPhase(page, "inactive");
-      await composer.artifactTab("Graph").click();
+      await composer.artifactTab("Workflow").click();
       await expect.poll(() => activeRunPollingIntervals(page)).toBe(0);
       await page.clock.fastForward(6_001);
       expect(workspaceScenarioTelemetry(page).runHistoryRequests).toBe(
@@ -1089,13 +1080,13 @@ test.describe("Composer deterministic workspace geometry", () => {
         // bar's own buttons keep that register via the bottom-row contract
         // tests.
         const controls: Array<[ReturnType<ComposerPage["catalogButton"]>, number]> = [
-          [composer.artifactTab("Graph"), 36],
+          [composer.artifactTab("Workflow"), 36],
           [composer.artifactTab("Spec"), 36],
           [composer.artifactTab("YAML"), 36],
           [composer.checksTab(), 36],
           [composer.artifactTab("Run"), 36],
           [composer.catalogButton(), 36],
-          [page.getByRole("button", { name: "Focus graph" }), 36],
+          [page.getByRole("button", { name: "Fullscreen" }), 36],
         ];
         const boxes = await Promise.all(
           controls.map(([control]) => control.boundingBox()),
@@ -1162,11 +1153,11 @@ test.describe("Composer deterministic workspace geometry", () => {
       await palette.getByRole("option", { name: /Show graph/ }).click();
 
       await expect(palette).toBeHidden();
-      await expect(composer.artifactTab("Graph")).toHaveAttribute(
+      await expect(composer.artifactTab("Workflow")).toHaveAttribute(
         "aria-selected",
         "true",
       );
-      await expect(composer.artifactTab("Graph")).toBeFocused();
+      await expect(composer.artifactTab("Workflow")).toBeFocused();
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }

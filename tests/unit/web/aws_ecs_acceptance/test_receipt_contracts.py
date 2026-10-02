@@ -12,6 +12,7 @@ import pytest
 
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web import aws_ecs_acceptance as acceptance
+from elspeth.web._acceptance_common.schema_facts import _CANDIDATE_PACKAGE_VERSION
 from elspeth.web._aws_ecs_acceptance import receipt_contracts
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
@@ -605,7 +606,7 @@ def _compatibility_receipt(scenario_id: str) -> dict[str, object]:
         "candidate_image_digest": "sha256:" + "d" * 64,
         "candidate_task_definition_sha256": "e" * 64,
         "candidate_doctor_task_definition_sha256": "f" * 64,
-        "candidate_package_version": "0.8.0",
+        "candidate_package_version": _CANDIDATE_PACKAGE_VERSION,
         "previous_source_sha": "1" * 40 if previous else None,
         "previous_image_digest": "sha256:" + "2" * 64 if previous else None,
         "previous_task_definition_sha256": "3" * 64 if previous else None,
@@ -669,6 +670,22 @@ def test_stored_compatibility_receipt_rejects_wrong_hash_binding_or_variant(muta
         )
 
 
+@pytest.mark.parametrize("scenario_id", ["A", "B"])
+def test_stored_compatibility_receipt_rejects_stale_candidate_package_version(scenario_id: str) -> None:
+    payload = _compatibility_receipt(scenario_id)
+    payload["candidate_package_version"] = "0.8.0"
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="receipt_store_binding"):
+        receipt_contracts._validate_stored_receipt(
+            payload,
+            kind="compatibility-record",
+            scenario_id=scenario_id,
+            subject_sha256="9" * 64,
+            candidate_sha="c" * 40,
+            subject_id="a" * 64,
+        )
+
+
 def test_compatibility_schema_facts_track_current_epochs() -> None:
     """Regression: elspeth-7f4c87b341 — the compatibility validators must demand
     the CURRENT candidate epochs and a migration label naming the current
@@ -690,9 +707,9 @@ def test_compatibility_schema_facts_track_current_epochs() -> None:
     }
     assert label == (
         f"session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
-        "_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema"
+        "_blob_cleanup_row_union_barrier_and_coordination_schema"
     )
-    assert facts["semantics_only_changes"] == "guided_coalesce_timeout_seconds_and_node_options_summary_required"
+    assert facts["semantics_only_changes"] == "coalesce_timeout_seconds_and_node_options_summary_required"
     facts_a = acceptance._expected_schema_facts("A")
     assert facts_a["previous"] is None
     assert facts_a["structural_changes"] == "initial_create"

@@ -1,9 +1,9 @@
 """Surface-agnostic composition-graph isomorphism helper.
 
-This is the shared correctness core of the composer capability-parity matrix.
-The three authoring surfaces (freeform, guided-full, guided-staged) each derive
-a committed ``CompositionState`` through an independent production code path.
-Parity means the *semantic* graphs agree even though surface-specific noise
+This is the shared correctness core of the Composer capability matrix.
+Freeform authoring and reference graph construction each derive a committed
+``CompositionState`` through an independent production code path.
+Parity means the *semantic* graphs agree even though path-specific noise
 (generated ids, connection names, temp paths, composition version, session /
 profile metadata) legitimately differs. This module reduces a committed
 ``CompositionState`` (the primary surface) to a canonical, comparable structure
@@ -117,11 +117,11 @@ def _canon_value(value: Any, *, key: str | None = None) -> Any:
 def _effective_options(options: Any, plugin_kind: str | None, plugin_name: str | None) -> Any:
     """Drop a source/sink plugin's default-valued option keys so options compare by value.
 
-    Different commit paths persist the *same* plugin config at different levels
-    of explicitness: ``set_pipeline`` keeps the authored option keys, while the
-    guided stage protocol persists the full pydantic ``model_dump`` (every
-    default made explicit — e.g. csv ``delimiter`` / ``encoding`` / ``skip_rows``,
-    json ``indent`` / ``headers``). Those are the identical effective
+    Different commit paths can persist the *same* plugin config at different
+    levels of explicitness: ``set_pipeline`` can keep authored option keys,
+    while a pydantic ``model_dump`` materializes defaults such as csv
+    ``delimiter`` / ``encoding`` / ``skip_rows`` and json ``indent`` / ``headers``.
+    Those are the identical effective
     configuration, so "normalized options" (a PRESERVE attribute above) must mean
     the *effective* options, not the authored surface form. Dropping every option
     key whose value equals its plugin config-model field default collapses that
@@ -247,7 +247,7 @@ def _build_model(state: Mapping[str, Any]) -> _Model:
             # PRESERVE list above ("every failure policy"). Queue always forbids
             # on_error (it is None there). Emit unconditionally and normalize
             # through ``.get`` so an absent key (set_pipeline authored-minimal)
-            # and an explicit None (guided-staged full model_dump) both collapse
+            # and an explicit None (full model_dump) both collapse
             # to the same terminal ``discard``, exactly as ``_effective_options``
             # absorbs the explicit-default-vs-absent asymmetry for options.
             links.append((atom, "node.on_error", failure_target(node.get("on_error"))))

@@ -1,10 +1,9 @@
 """Per-tool-call dispatch pipeline for the composer compose loop.
 
-Extracted verbatim from ComposerServiceImpl._dispatch_tool_batch (service.py)
-to take the single largest method out of the god class. The loop body is
-UNCHANGED; only its enclosing context is made explicit via the two carriers
-below, replacing the prior nested-closure capture of loop-invariant inputs and
-loop-carried accumulators.
+Extracted from ComposerServiceImpl._dispatch_tool_batch (service.py).
+The loop keeps its dispatch order while named collaborators and batch facts
+replace whole-service reads. Context and accumulator carriers replace the
+prior nested-closure capture of loop-invariant and loop-carried inputs.
 
 Behaviour-preservation contract: every terminal arm's
 recorder.record(finish_*) / anti_anchor.record_* / llm_messages.append /
@@ -21,8 +20,10 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 from uuid import UUID
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
@@ -46,6 +47,7 @@ from elspeth.web.composer._required_paths_validator import (
     _TOOL_REQUIRED_PATHS,
     _find_missing_required_paths,
 )
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -59,11 +61,15 @@ from elspeth.web.composer.audit import (
 )
 from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads
+from elspeth.web.composer.composer_preflight import ComposerPreflight
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
 )
 from elspeth.web.composer.discovery_cache import (
     RuntimePreflightCache as _RuntimePreflightCache,
+)
+from elspeth.web.composer.discovery_cache import (
+    admitted_result_from_cached_discovery_payload,
 )
 from elspeth.web.composer.discovery_cache import (
     cached_discovery_payload as _cached_discovery_payload,
@@ -80,6 +86,12 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_cache import (
     tool_result_mutated_composition_state as _tool_result_mutated_composition_state,
 )
+from elspeth.web.composer.discovery_response import (
+    AdmittedDiscoveryResult,
+    admit_discovery_result,
+    serialize_admitted_discovery_result,
+)
+from elspeth.web.composer.llm_response_parsing import attach_llm_calls
 from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.pipeline_custody import (
     finalize_pipeline_custody,
@@ -90,7 +102,6 @@ from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
     PipelineProposal,
-    PlannerSurface,
     PresentBase,
     composition_content_hash,
     owned_composition_state_authority,
@@ -104,9 +115,9 @@ from elspeth.web.composer.progress import (
 )
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
+    ComposerConvergenceError,
     ComposerPluginCrashError,
     ComposerRuntimePreflightError,
-    ComposerServiceError,
     ToolArgumentError,
 )
 from elspeth.web.composer.required_controls import (
@@ -114,10 +125,12 @@ from elspeth.web.composer.required_controls import (
     wire_required_controls,
     wire_required_controls_state,
 )
+from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tool_error_payloads import (
     INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
     unknown_tool_arguments_redaction,
+    wire_argument_repair_message,
 )
 from elspeth.web.composer.tool_error_payloads import (
     arg_error_payload as _arg_error_payload,
@@ -139,8 +152,16 @@ from elspeth.web.composer.tools import (
     normalize_tool_result_validation,
 )
 from elspeth.web.composer.tools._common import _failure_result
-from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
+from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
+from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, canonicalize_authored_node_review_requirements
+from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
+from elspeth.web.credential_guard import (
+    require_no_credential_material,
+    require_no_credential_material_in_llm_metadata,
+    require_no_credential_material_in_tool_wire,
+)
 from elspeth.web.execution.schemas import ValidationResult
+from elspeth.web.interpretation_state import interpretation_sites
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 if TYPE_CHECKING:
@@ -148,10 +169,14 @@ if TYPE_CHECKING:
 
     from sqlalchemy import Engine
 
+    from elspeth.contracts.secrets import WebSecretResolver
     from elspeth.web.composer.pipeline_custody import PipelineCustodyPreparation
-    from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
+    from elspeth.web.composer.session_tool import SessionToolOwner
+    from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
     from elspeth.web.sessions.protocol import (
         ComposerSessionPreferencesRecord,
+        SessionOperationAuthority,
         SessionServiceProtocol,
     )
 
@@ -185,8 +210,8 @@ class _ProposalPayload(TypedDict):
 class _PrevalidationRejectedStatus(TypedDict):
     """The status fields merged onto a PREVALIDATION_REJECTED payload, in wire order.
 
-    The payload itself is the candidate's own ``data`` (its ``error`` /
-    ``error_code``) plus these; they are merged through a TypedDict constructor
+    The payload retains any independent candidate ``data`` plus these fields;
+    rejection details remain in ``validation.errors``. Fields merge through a TypedDict constructor
     rather than a bare dict literal so mypy refuses an extra key at the merge —
     a ``"success": True`` added here is the F1 twin returning eleven lines from
     the payload that pins it out, and nothing in the tree killed that mutant
@@ -250,6 +275,10 @@ def _admit_tool_batch(tool_calls: Sequence[Any]) -> _AdmittedToolBatch:
             raise AuditIntegrityError("Composer tool batch is missing a provider tool-call ID")
         if type(call_id) is not str:
             raise AuditIntegrityError("Composer tool batch contains a non-string provider tool-call ID")
+        require_no_credential_material(
+            {"tool_call_id": call_id},
+            surface="composer_provider_response",
+        )
         if not call_id.strip():
             raise AuditIntegrityError("Composer tool batch contains a blank provider tool-call ID")
         if len(call_id) > PROVIDER_TOOL_CALL_ID_MAX_LENGTH:
@@ -262,6 +291,12 @@ def _admit_tool_batch(tool_calls: Sequence[Any]) -> _AdmittedToolBatch:
         function_arguments = getattr(function, "arguments", _MISSING_TOOL_CALL_FIELD)
         if type(function_name) is not str or type(function_arguments) is not str:
             raise AuditIntegrityError("Composer tool batch contains malformed provider function metadata")
+        require_no_credential_material(
+            {"tool_name": function_name},
+            surface="composer_provider_response",
+        )
+        if not function_name.strip():
+            raise AuditIntegrityError("Composer tool batch contains blank provider function name")
 
         call_ids.add(call_id)
         admitted_calls.append(
@@ -284,8 +319,15 @@ async def _preflight_session_tool_call_ids(
     *,
     sessions_service: SessionServiceProtocol | None,
     session_id: UUID | None,
+    recorder: BufferingRecorder,
 ) -> None:
-    """Reject IDs already owned by durable rows before current-turn effects."""
+    """Reject IDs already owned by durable rows before current-turn effects.
+
+    The refusal is correct and fail-closed, but the provider completion that
+    carried the reused ID is already buffered in ``recorder`` and nothing
+    before P4 makes it durable. The recorder's LLM calls are attached to the
+    exception so the route's LLM-call persistence still writes them.
+    """
     if sessions_service is None or session_id is None:
         return
 
@@ -301,7 +343,50 @@ async def _preflight_session_tool_call_ids(
     )
     prior_tool_call_ids.update(event.tool_call_id for event in prior_interpretations if event.tool_call_id is not None)
     if not batch.call_ids.isdisjoint(prior_tool_call_ids):
-        raise AuditIntegrityError("Composer tool batch reuses a provider tool-call ID already persisted in this session")
+        reused_id_error = AuditIntegrityError("Composer tool batch reuses a provider tool-call ID already persisted in this session")
+        attach_llm_calls(reused_id_error, recorder)
+        raise reused_id_error
+
+
+def _pending_proposal_cap_error(
+    observed: int,
+    *,
+    ctx: ToolBatchContext,
+    state: CompositionState,
+) -> ComposerConvergenceError:
+    """Build the failure for an explicit-approval turn over the pending-proposal cap.
+
+    The model's own turn exceeded a composer per-turn budget, so this is a
+    convergence failure (422 with partial-state persistence), not the generic
+    service-setup failure a bare ``ComposerServiceError`` maps to. The
+    provider completion that carried the batch is already in ``ctx.recorder``
+    and rides out on the exception for the route's LLM-call persistence.
+
+    ``tool_invocations`` is empty: the cap applies only to a session-bound
+    explicit-approval turn, where every earlier tool turn was made durable by
+    P4, and the preflight site dispatches nothing from this batch, so the
+    route has no invocation to replay.
+
+    Mirrors ``ComposerServiceImpl._enforce_tool_call_cap``: the same reason
+    code (the wire reason is derived from ``budget_exhausted``), with a
+    value-free ``cap_kind`` evidence key that tells the two per-turn caps
+    apart in the exception evidence.
+    """
+    return ComposerConvergenceError.capture(
+        max_turns=ctx.composition_turns_used + ctx.discovery_turns_used,
+        budget_exhausted="composition",
+        state=state,
+        initial_version=ctx.initial_version,
+        tool_invocations=(),
+        llm_calls=ctx.recorder.llm_calls,
+        reason="tool_call_cap_exceeded",
+        evidence={
+            "observed": observed,
+            "cap": _MAX_PENDING_PROPOSALS_PER_TURN,
+            "cap_kind": "pending_proposals",
+        },
+        failed_turn=ctx.failed_turn,
+    )
 
 
 async def _try_finalize_proposal_custody(
@@ -310,6 +395,8 @@ async def _try_finalize_proposal_custody(
     engine: Engine,
     data_dir: str | Path,
     max_storage_per_session: int,
+    session_operation_context: SessionOperationContext | None,
+    session_operation_authority: SessionOperationAuthority | None,
 ) -> Literal["ready", "quota_exceeded"]:
     """Return an explicit quota outcome while preserving other failures."""
     try:
@@ -318,6 +405,8 @@ async def _try_finalize_proposal_custody(
             engine=engine,
             data_dir=data_dir,
             max_storage_per_session=max_storage_per_session,
+            session_operation_context=session_operation_context,
+            session_operation_authority=session_operation_authority,
         )
     except BlobQuotaExceededError:
         return "quota_exceeded"
@@ -345,8 +434,8 @@ def _prevalidation_feedback_seed(candidate_data: Any) -> Mapping[str, Any]:
     ``isinstance(x, dict)`` are False — only ``isinstance(x, Mapping)`` is
     True. The membership test MUST stay ABC-shaped: an exact-dict form makes
     the first arm unreachable, sends every rejection to the fallback, and stops
-    the composer model seeing the candidate's own ``error``/``error_code`` keys
-    at the top level of the feedback it is asked to repair from. Tracing the
+    the composer model seeing independent candidate data, such as credential
+    repair metadata, at the top level of the feedback. Tracing the
     producers does not establish otherwise — the container freezes the field
     after they built it.
 
@@ -365,19 +454,47 @@ def _prevalidation_feedback_seed(candidate_data: Any) -> Mapping[str, Any]:
     return {"candidate_data": candidate_data}
 
 
+def _pre_dispatch_argument_error(tool_name: str, category: ToolArgumentErrorCategory) -> ToolArgumentError:
+    """Build the owned rejection a pre-dispatch argument gate records.
+
+    The wire and required-path gates in :func:`run_tool_batch` reject before
+    any handler runs and answer the planner with their own text. They record
+    the ``ToolArgumentError`` built here, so the audit ``error_class`` names a
+    class the site actually constructed, never a hand-written label.
+    """
+    return ToolArgumentError(
+        argument=f"{tool_name} arguments",
+        expected="an object conforming to the declared argument schema",
+        actual_type="invalid_schema",
+        category=category,
+    )
+
+
 def _replace_llm_tool_call_arguments(
     llm_messages: Sequence[Mapping[str, Any]],
     *,
     tool_call_id: str,
     arguments: Mapping[str, Any],
+    dialect: ToolContractDialect,
+    semantic: bool,
 ) -> None:
     """Replace the latest assistant call with custody-safe arguments.
 
     The compose loop appends the provider-authored assistant message before
     dispatch.  A subsequent provider turn must not receive raw inline bytes
     from that history after ELSPETH has intercepted them for proposal custody.
-    ``arguments`` are always the flat internal semantic shape; set_pipeline is
+    ``arguments`` are always the flat internal shape; set_pipeline is
     re-enveloped only while serializing the provider transcript.
+
+    ``semantic`` says whether ``arguments`` are the tool's semantic arguments
+    (encoded back to the wire form of ``dialect`` through
+    ``encode_semantic_arguments``) or a redaction sentinel, which keeps the
+    plain ``{"pipeline": ...}`` wrap. In S1 both give the same bytes, because
+    set_pipeline is non-strict on every dialect.
+
+    The transcript keeps the model's key order: map order in ``sources``,
+    ``row_union.branches`` and ``coalesce.branches`` is semantic, so a sorted
+    re-serialisation would show the model an order it never authored.
     """
     for message in reversed(llm_messages):
         if "role" not in message or message["role"] != "assistant":
@@ -396,8 +513,14 @@ def _replace_llm_tool_call_arguments(
             if "name" not in function or type(function["name"]) is not str:
                 raise AuditIntegrityError("Assistant tool call has malformed function envelope")
             function_name = function["name"]
-            provider_arguments: Mapping[str, Any] = {"pipeline": arguments} if function_name == "set_pipeline" else arguments
-            encoded = json.dumps(provider_arguments, sort_keys=True, separators=(",", ":"))
+            provider_arguments: Mapping[str, Any]
+            if function_name != "set_pipeline":
+                provider_arguments = arguments
+            elif semantic:
+                provider_arguments = encode_semantic_arguments(function_name, dialect, arguments)
+            else:
+                provider_arguments = {"pipeline": arguments}
+            encoded = json.dumps(provider_arguments, separators=(",", ":"))
             function["arguments"] = encoded
             return
     raise AuditIntegrityError("Assistant tool call was not present in the active LLM transcript")
@@ -537,6 +660,26 @@ async def _finalize_completed_incremental_mutation(
     )
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class ToolBatchProvenance:
+    """Requested-model and skill identity reused by tool audit and proposals."""
+
+    model_identifier: str
+    provider: str | None
+    skill_hash: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ToolBatchCustody:
+    """Stable deployment custody inputs, with references frozen for this batch."""
+
+    data_dir: str
+    session_engine: Engine | None
+    secret_service: WebSecretResolver | None
+    secret_wiring_policy: SecretWiringPolicy
+    max_blob_storage_per_session_bytes: int
+
+
 @dataclass(frozen=True, slots=True)
 class ToolBatchContext:
     """Loop-invariant inputs to the dispatch loop, built once per batch.
@@ -549,7 +692,15 @@ class ToolBatchContext:
     No ``__post_init__`` freeze guard is added for that reason.
     """
 
-    service: ComposerServiceImpl
+    session_tools: SessionToolOwner
+    provenance: ToolBatchProvenance
+    custody: ToolBatchCustody
+    redaction_telemetry: RedactionTelemetry
+    preflight: ComposerPreflight
+    schema_disclosure: SchemaDisclosureTracker
+    advisor_checkpoint: AdvisorCheckpointOwner
+    advisor_max_calls_per_compose: int
+    advisor_timeout_seconds: float
     recorder: BufferingRecorder
     anti_anchor: AntiAnchorTracker
     discovery_cache: dict[str, _CachedDiscoveryPayload]
@@ -571,6 +722,35 @@ class ToolBatchContext:
     cancellation_requested: asyncio.Event
     plugin_snapshot: PluginAvailabilitySnapshot
     policy_catalog: PolicyCatalogView
+    # The dialect the loop's tool list was sent under on this call. The
+    # service resolves it once and builds both the sent list and this context
+    # from the same value, so decode always reads the W that was sent.
+    tool_contract_dialect: ToolContractDialect
+    session_operation_authority: SessionOperationAuthority | None = None
+    # Driver turn counters and last persisted tool-call turn, read only when
+    # the batch raises a ComposerConvergenceError (``turns_used`` and
+    # ``failed_turn`` on the 422 body), exactly as ``_enforce_tool_call_cap``
+    # reports them.
+    composition_turns_used: int = 0
+    discovery_turns_used: int = 0
+    failed_turn: FailedTurnMetadata | None = None
+
+
+@dataclass(slots=True)
+class _CallWireFacts:
+    """One tool call's wire facts, filled in as ``run_tool_batch`` learns them.
+
+    Deliberately mutable: it is created at the top of each call's iteration
+    and captured by that iteration's ``_append_tool_outcome`` as a default
+    argument, and decode runs after the closure is defined, so a holder
+    avoids late binding through a loop variable. ``strict_sent`` follows
+    D16 (the ``strict`` key sent for the tool, ``None`` when none was sent)
+    and ``wire_conformant`` is ``None`` exactly where no arguments were
+    decoded.
+    """
+
+    strict_sent: bool | None = None
+    wire_conformant: bool | None = None
 
 
 @dataclass(slots=True)
@@ -605,18 +785,18 @@ async def run_tool_batch(
 
     See the module docstring and ``ToolBatchContext`` for the
     behaviour-preservation contract. The body below is the former method
-    body with ``self.`` rewritten to ``ctx.service.`` and the
-    loop-invariant / driver-owned locals supplied by the alias preamble.
+    body with deployment facts and collaborators supplied through
+    ``ToolBatchContext`` and driver-owned locals supplied by the preamble.
     """
     # ------------------------------------------------------------------
     # Alias preamble: reconstruct the original ``_dispatch_tool_batch``
-    # local namespace so the body below is genuinely verbatim. Loop-invariant
+    # local namespace so the branch ordering below remains intact. Loop-invariant
     # inputs come from ``ctx``; the four driver-owned loop-carried inputs come
     # from ``acc``. Every other body init (``tool_outcomes = []``,
     # ``turn_has_mutation = False``, ...) stays inline exactly as before, so
     # the closures, the ``_append_tool_outcome`` default-arg capture, and
     # every loop reassignment keep working against the same local names.
-    # ``self.`` is rewritten to ``ctx.service.`` — the only token change.
+    # Former service reads now use named collaborators and immutable batch facts.
     # ------------------------------------------------------------------
     recorder = ctx.recorder
     anti_anchor = ctx.anti_anchor
@@ -645,13 +825,37 @@ async def run_tool_batch(
     raw_assistant_content = assistant_message.content
     admitted_batch = completion.tool_batch
     assistant_tool_calls = admitted_batch.calls
-    provider_model_version = completion.provider_metadata.model_returned or ctx.service._model
+    # Scan the complete response metadata before progress, history, audit,
+    # proposal, blob, or state effects. Internal adapters can supply an
+    # already-admitted completion without passing through ProviderGateway, so
+    # this common owner must cover prose, identifiers, reasoning, and mixed
+    # batches all-or-nothing as well.
+    require_no_credential_material_in_llm_metadata(
+        content=raw_assistant_content,
+        tool_calls=tuple((call.id, call.function.name) for call in assistant_tool_calls),
+        reasoning_content=completion.provider_metadata.reasoning_content,
+        reasoning_details=completion.provider_metadata.reasoning_details,
+        thinking_blocks=completion.provider_metadata.thinking_blocks,
+        model_returned=completion.provider_metadata.model_returned,
+        provider_request_id=completion.provider_metadata.provider_request_id,
+        finish_reason=completion.provider_metadata.finish_reason,
+        provider_served=completion.provider_metadata.provider_served,
+        surface="composer_tool_batch",
+    )
+    for tool_call in assistant_tool_calls:
+        require_no_credential_material_in_tool_wire(
+            tool_call.function.name,
+            tool_call.function.arguments,
+            surface="composer_tool_wire",
+        )
+    provider_model_version = completion.provider_metadata.model_returned or ctx.provenance.model_identifier
     if (
         turn_sessions_service is not None
         and turn_session_uuid is not None
         and turn_preferences is not None
         and turn_preferences.trust_mode == "explicit_approve"
-        and sum(
+    ):
+        approval_required_mutations = sum(
             1
             for tool_call in assistant_tool_calls
             if is_mutation_tool(tool_call.function.name)
@@ -660,15 +864,13 @@ async def run_tool_batch(
                 or is_approval_required_blob_store_only_mutation_tool(tool_call.function.name)
             )
         )
-        > _MAX_PENDING_PROPOSALS_PER_TURN
-    ):
-        raise ComposerServiceError(
-            f"Composer produced too many pending tool proposals in one turn ({_MAX_PENDING_PROPOSALS_PER_TURN} maximum)."
-        )
+        if approval_required_mutations > _MAX_PENDING_PROPOSALS_PER_TURN:
+            raise _pending_proposal_cap_error(approval_required_mutations, ctx=ctx, state=state)
     await _preflight_session_tool_call_ids(
         admitted_batch,
         sessions_service=turn_sessions_service,
         session_id=turn_session_uuid,
+        recorder=recorder,
     )
 
     await emit_progress(
@@ -714,7 +916,6 @@ async def run_tool_batch(
     advisor_failure: Exception | None = None
     advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = current_state_id
-    ctx.service._phase3_last_expected_current_state_id = pre_state_id
     decoded_args_by_call_id: dict[str, dict[str, Any]] = {}
     proposals_this_turn = 0
     mutation_success_observed = False
@@ -739,33 +940,48 @@ async def run_tool_batch(
                 raise AuditIntegrityError(f"Registered composer tool {tool_name!r} is missing from the redaction manifest")
             unknown_audit_arguments = cast(
                 dict[str, Any],
-                unknown_tool_arguments_redaction(telemetry=ctx.service._redaction_telemetry),
+                unknown_tool_arguments_redaction(telemetry=ctx.redaction_telemetry),
             )
             decoded_args_by_call_id[tool_call.id] = unknown_audit_arguments
             _replace_llm_tool_call_arguments(
                 llm_messages,
                 tool_call_id=tool_call.id,
                 arguments=unknown_audit_arguments,
+                dialect=ctx.tool_contract_dialect,
+                semantic=False,
             )
+        # The loop always sends every tool of the dialect's W, so the sent set
+        # is exactly its keys. A name outside it (hallucinated or unknown) is
+        # never decoded (D17): its arguments flow on as today, with no facts.
+        sent_wire_tools = _WIRE_TOOL_DEFS[ctx.tool_contract_dialect]
+        tool_was_sent = tool_name in sent_wire_tools
+        call_wire_facts = _CallWireFacts()
+        if tool_was_sent and ctx.tool_contract_dialect is ToolContractDialect.OPENAI_STRICT:
+            call_wire_facts.strict_sent = sent_wire_tools[tool_name].strict_capable
 
         def _append_tool_outcome(
             *,
             response: Any,
             error_class: str | None,
+            error_category: ToolArgumentErrorCategory | None,
             error_message: str | None,
             post_version: int,
             _tool_outcomes: list[_ToolOutcome] = tool_outcomes,
             _tool_call: Any = tool_call,
             _pre_version: int = pre_version,
+            _wire: _CallWireFacts = call_wire_facts,
         ) -> None:
             _tool_outcomes.append(
                 _ToolOutcome(
                     call=_tool_call,
                     response=response,
                     error_class=error_class,
+                    error_category=error_category,
                     error_message=error_message,
                     pre_version=_pre_version,
                     post_version=post_version,
+                    strict_sent=_wire.strict_sent,
+                    wire_conformant=_wire.wire_conformant,
                 )
             )
 
@@ -786,29 +1002,48 @@ async def run_tool_batch(
             audit_arguments: Mapping[str, Any] | str = (
                 unknown_audit_arguments if unknown_audit_arguments is not None else tool_call.function.arguments
             )
-            if isinstance(exc, JsonBoundaryError) and unknown_audit_arguments is None:
-                audit_arguments = {
+            if unknown_audit_arguments is None:
+                replay_arguments = {
                     "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
                     "error_class": type(exc).__name__,
                 }
-                decoded_args_by_call_id[tool_call.id] = dict(audit_arguments)
+                # Keep the original malformed wire bytes in the audit record
+                # for ordinary JSON decode failures, but send a valid JSON
+                # placeholder in the next provider request. The gateway's
+                # tool-call contract cannot replay malformed JSON arguments.
                 _replace_llm_tool_call_arguments(
                     llm_messages,
                     tool_call_id=tool_call.id,
-                    arguments=audit_arguments,
+                    arguments=replay_arguments,
+                    dialect=ctx.tool_contract_dialect,
+                    semantic=False,
                 )
+                if isinstance(exc, JsonBoundaryError):
+                    audit_arguments = replay_arguments
+                    decoded_args_by_call_id[tool_call.id] = dict(replay_arguments)
+            # No arguments were decoded, so wire_conformant stays None.
             audit = begin_dispatch(
                 tool_call.id,
                 tool_name,
                 audit_arguments,
                 version_before=state.version,
                 actor=actor,
+                strict_sent=call_wire_facts.strict_sent,
+                wire_conformant=call_wire_facts.wire_conformant,
             )
             error_payload = {"error": f"Invalid JSON in arguments: {exc}"}
+            # JsonBoundaryError is ELSPETH's own final-in-practice class (no
+            # subclasses); the other three caught classes are decode failures.
+            wire_category = (
+                ToolArgumentErrorCategory.WIRE_JSON_BOUNDS
+                if type(exc) is JsonBoundaryError
+                else ToolArgumentErrorCategory.WIRE_JSON_INVALID
+            )
             recorder.record(
                 finish_arg_error(
                     audit,
                     error_class=type(exc).__name__,
+                    error_category=wire_category,
                     error_message=type(exc).__name__,
                     error_payload=error_payload,
                 )
@@ -816,6 +1051,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=None,
                 error_class=type(exc).__name__,
+                error_category=wire_category,
                 error_message=type(exc).__name__,
                 post_version=state.version,
             )
@@ -845,26 +1081,35 @@ async def run_tool_batch(
             # canonicalized record wraps the (possibly scalar/list)
             # value under ``_decoded_non_object`` so the audit trail
             # captures it deterministically.
+            if tool_was_sent:
+                call_wire_facts.wire_conformant = False
             audit, canonicalization_failed = begin_dispatch_or_arg_error(
                 tool_call.id,
                 tool_name,
                 unknown_audit_arguments if unknown_audit_arguments is not None else {"_decoded_non_object": decoded_arguments},
                 version_before=state.version,
                 actor=actor,
+                strict_sent=call_wire_facts.strict_sent,
+                wire_conformant=call_wire_facts.wire_conformant,
             )
+            error_category: ToolArgumentErrorCategory
             if canonicalization_failed is None:
                 err_msg = f"Tool '{tool_name}' arguments must be a JSON object, got {type(decoded_arguments).__name__}."
-                error_class = "TypeError"
+                not_object = _pre_dispatch_argument_error(tool_name, ToolArgumentErrorCategory.WIRE_NOT_OBJECT)
+                error_class = type(not_object).__name__
+                error_category = not_object.category
                 error_message = f"non-object arguments ({type(decoded_arguments).__name__})"
             else:
                 err_msg = f"Tool '{tool_name}' arguments are not canonical JSON ({type(canonicalization_failed).__name__})."
                 error_class = type(canonicalization_failed).__name__
+                error_category = ToolArgumentErrorCategory.CANONICALIZATION
                 error_message = type(canonicalization_failed).__name__
             error_payload = {"error": err_msg}
             recorder.record(
                 finish_arg_error(
                     audit,
                     error_class=error_class,
+                    error_category=error_category,
                     error_message=error_message,
                     error_payload=error_payload,
                 )
@@ -872,6 +1117,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=None,
                 error_class=error_class,
+                error_category=error_category,
                 error_message=error_message,
                 post_version=state.version,
             )
@@ -886,19 +1132,30 @@ async def run_tool_batch(
             all_cache_hits = False
             continue
 
-        if tool_name == "set_pipeline":
-            pipeline_arguments = decoded_arguments["pipeline"] if "pipeline" in decoded_arguments else None
-            if set(decoded_arguments) != {"pipeline"} or type(pipeline_arguments) is not dict:
-                turn_has_mutation = True
+        if tool_was_sent:
+            # Decode the provider arguments against the W that was sent:
+            # classify wire conformance, unwrap the set_pipeline envelope, and
+            # on openai_strict strip ``null`` at promoted positions. A
+            # malformed envelope or no-argument marker rejects before S.
+            try:
+                decoded = decode_wire_arguments(tool_name, ctx.tool_contract_dialect, decoded_arguments)
+            except ToolArgumentError as envelope_rejection:
+                call_wire_facts.wire_conformant = False
+                if is_discovery_tool(tool_name):
+                    turn_has_discovery = True
+                else:
+                    turn_has_mutation = True
                 audit_arguments = {
                     "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
-                    "error_class": "TypeError",
+                    "error_class": type(envelope_rejection).__name__,
                 }
                 decoded_args_by_call_id[tool_call.id] = dict(audit_arguments)
                 _replace_llm_tool_call_arguments(
                     llm_messages,
                     tool_call_id=tool_call.id,
                     arguments=audit_arguments,
+                    dialect=ctx.tool_contract_dialect,
+                    semantic=False,
                 )
                 audit = begin_dispatch(
                     tool_call.id,
@@ -906,20 +1163,25 @@ async def run_tool_batch(
                     audit_arguments,
                     version_before=state.version,
                     actor=actor,
+                    strict_sent=call_wire_facts.strict_sent,
+                    wire_conformant=call_wire_facts.wire_conformant,
                 )
-                error_payload = {"error": "Tool 'set_pipeline' arguments must contain exactly one 'pipeline' object field."}
+                envelope_error = wire_argument_repair_message(sent_wire_tools[tool_name])
+                error_payload = {"error": envelope_error}
                 recorder.record(
                     finish_arg_error(
                         audit,
-                        error_class="TypeError",
-                        error_message="invalid provider argument envelope",
+                        error_class=type(envelope_rejection).__name__,
+                        error_category=envelope_rejection.category,
+                        error_message=envelope_error,
                         error_payload=error_payload,
                     )
                 )
                 _append_tool_outcome(
                     response=None,
-                    error_class="TypeError",
-                    error_message="invalid provider argument envelope",
+                    error_class=type(envelope_rejection).__name__,
+                    error_category=envelope_rejection.category,
+                    error_message=envelope_error,
                     post_version=state.version,
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash)
@@ -932,7 +1194,10 @@ async def run_tool_batch(
                 )
                 all_cache_hits = False
                 continue
-            arguments = cast(dict[str, Any], pipeline_arguments)
+            # From here on ``arguments`` is the decoded (semantic) form: S is
+            # the contract every later gate, handler and validator reads.
+            arguments = cast(dict[str, Any], deep_thaw(decoded.semantic))
+            call_wire_facts.wire_conformant = decoded.wire_conformant
         else:
             arguments = cast(dict[str, Any], decoded_arguments)
         if unknown_audit_arguments is not None:
@@ -954,12 +1219,16 @@ async def run_tool_batch(
             audit_arguments,
             version_before=state.version,
             actor=actor,
+            strict_sent=call_wire_facts.strict_sent,
+            wire_conformant=call_wire_facts.wire_conformant,
         )
         if audit_arguments is not arguments:
             _replace_llm_tool_call_arguments(
                 llm_messages,
                 tool_call_id=tool_call.id,
                 arguments=audit_arguments,
+                dialect=ctx.tool_contract_dialect,
+                semantic=True,
             )
         if canonicalization_failed is not None:
             if is_discovery_tool(tool_name):
@@ -971,6 +1240,7 @@ async def run_tool_batch(
                 finish_arg_error(
                     audit,
                     error_class=type(canonicalization_failed).__name__,
+                    error_category=ToolArgumentErrorCategory.CANONICALIZATION,
                     error_message=type(canonicalization_failed).__name__,
                     error_payload=error_payload,
                 )
@@ -978,6 +1248,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=None,
                 error_class=type(canonicalization_failed).__name__,
+                error_category=ToolArgumentErrorCategory.CANONICALIZATION,
                 error_message=type(canonicalization_failed).__name__,
                 post_version=state.version,
             )
@@ -1009,16 +1280,36 @@ async def run_tool_batch(
                         likely_next="ELSPETH will continue from the cached tool result.",
                     ),
                 )
-                cached_result = _result_from_cached_discovery_payload(
-                    state,
-                    discovery_cache[cache_key],
-                )
-                cached_result = normalize_tool_result_validation(cached_result, ctx.policy_catalog)
-                cached_payload = {
-                    "success": cached_result.success,
-                    "data": cached_result.data,
-                    "cache_hit": True,
-                }
+                try:
+                    cached_admitted = (
+                        admitted_result_from_cached_discovery_payload(tool_name, state, discovery_cache[cache_key])
+                        if response_contract_for(tool_name) is not None
+                        else None
+                    )
+                    cached_result = (
+                        cached_admitted.result
+                        if cached_admitted is not None
+                        else _result_from_cached_discovery_payload(state, discovery_cache[cache_key])
+                    )
+                    cached_result = normalize_tool_result_validation(cached_result, ctx.policy_catalog)
+                    if cached_admitted is not None:
+                        cached_admitted = AdmittedDiscoveryResult(cached_result, cached_admitted.response, cached_admitted.contract)
+                    cached_payload = {
+                        "success": cached_result.success,
+                        "data": cached_admitted.response.to_wire()
+                        if cached_admitted is not None and cached_admitted.response is not None
+                        else cached_result.data,
+                        "cache_hit": True,
+                    }
+                    cached_outcome = cached_admitted.to_tool_result() if cached_admitted is not None else cached_result
+                    cached_json = (
+                        serialize_admitted_discovery_result(cached_admitted)
+                        if cached_admitted is not None
+                        else _serialize_tool_result(cached_result)
+                    )
+                except Exception as cache_exc:
+                    recorder.record(finish_plugin_crash(audit, exc=cache_exc))
+                    raise
                 recorder.record(
                     finish_success(
                         audit,
@@ -1028,8 +1319,9 @@ async def run_tool_batch(
                     )
                 )
                 _append_tool_outcome(
-                    response=cached_result,
+                    response=cached_outcome,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1043,7 +1335,7 @@ async def run_tool_batch(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": _serialize_tool_result(cached_result),
+                        "content": cached_json,
                     }
                 )
                 continue
@@ -1071,17 +1363,20 @@ async def run_tool_batch(
             # safe to echo verbatim.
             err_msg = f"Tool '{tool_name}' missing required argument(s): {', '.join(missing)}"
             error_payload = {"error": err_msg}
+            missing_paths = _pre_dispatch_argument_error(tool_name, ToolArgumentErrorCategory.MISSING_REQUIRED_PATH)
             recorder.record(
                 finish_arg_error(
                     audit,
-                    error_class="MissingRequiredPaths",
+                    error_class=type(missing_paths).__name__,
+                    error_category=missing_paths.category,
                     error_message=f"missing: {', '.join(missing)}",
                     error_payload=error_payload,
                 )
             )
             _append_tool_outcome(
                 response=None,
-                error_class="MissingRequiredPaths",
+                error_class=type(missing_paths).__name__,
+                error_category=missing_paths.category,
                 error_message=f"missing: {', '.join(missing)}",
                 post_version=state.version,
             )
@@ -1130,21 +1425,23 @@ async def run_tool_batch(
                 candidate_context = ToolContext(
                     catalog=ctx.policy_catalog,
                     plugin_snapshot=ctx.plugin_snapshot,
-                    data_dir=ctx.service._data_dir,
+                    data_dir=ctx.custody.data_dir,
                     require_data_dir_for_paths=True,
-                    session_engine=ctx.service._session_engine,
+                    session_engine=ctx.custody.session_engine,
                     session_id=session_id,
-                    secret_service=ctx.service._secret_service,
-                    secret_wiring_policy=ctx.service._secret_wiring_policy,
+                    session_operation_context=ctx.session_operation_context,
+                    session_operation_authority=ctx.session_operation_authority,
+                    secret_service=ctx.custody.secret_service,
+                    secret_wiring_policy=ctx.custody.secret_wiring_policy,
                     user_id=user_id,
                     current_validation=candidate_prior_validation,
-                    max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
+                    max_blob_storage_per_session_bytes=ctx.custody.max_blob_storage_per_session_bytes,
                     user_message_id=user_message_id,
                     user_message_content=user_message_content,
-                    composer_model_identifier=ctx.service._model,
+                    composer_model_identifier=ctx.provenance.model_identifier,
                     composer_model_version=provider_model_version,
-                    composer_provider=ctx.service._availability.provider or "unknown",
-                    composer_skill_hash=ctx.service._composer_skill_hash,
+                    composer_provider=ctx.provenance.provider or "unknown",
+                    composer_skill_hash=ctx.provenance.skill_hash,
                     tool_arguments_hash=audit.binding_arguments_hash,
                 )
                 finalization = await _finalize_complete_set_pipeline_candidate(
@@ -1165,6 +1462,8 @@ async def run_tool_batch(
                         llm_messages,
                         tool_call_id=tool_call.id,
                         arguments=audit_arguments,
+                        dialect=ctx.tool_contract_dialect,
+                        semantic=True,
                     )
                     interpretation_requirements_are_internal = True
             except BaseException as exc:
@@ -1177,9 +1476,10 @@ async def run_tool_batch(
             assert turn_sessions_service is not None
             assert turn_session_uuid is not None
             if proposals_this_turn >= _MAX_PENDING_PROPOSALS_PER_TURN:
-                raise ComposerServiceError(
-                    f"Composer produced too many pending tool proposals in one turn ({_MAX_PENDING_PROPOSALS_PER_TURN} maximum)."
-                )
+                # Shadowed by the batch preflight above (same population, same
+                # cap); kept so a later change to either count cannot open an
+                # unbounded proposal turn.
+                raise _pending_proposal_cap_error(proposals_this_turn + 1, ctx=ctx, state=state)
 
             from pydantic import ValidationError as PydanticValidationError
 
@@ -1206,7 +1506,7 @@ async def run_tool_batch(
                 redacted_arguments = redact_tool_call_arguments(
                     tool_name,
                     arguments,
-                    telemetry=ctx.service._redaction_telemetry,
+                    telemetry=ctx.redaction_telemetry,
                 )
             except PydanticValidationError:
                 redacted_arguments = None
@@ -1229,21 +1529,23 @@ async def run_tool_batch(
                         candidate_context = ToolContext(
                             catalog=ctx.policy_catalog,
                             plugin_snapshot=ctx.plugin_snapshot,
-                            data_dir=ctx.service._data_dir,
+                            data_dir=ctx.custody.data_dir,
                             require_data_dir_for_paths=True,
-                            session_engine=ctx.service._session_engine,
+                            session_engine=ctx.custody.session_engine,
                             session_id=session_id,
-                            secret_service=ctx.service._secret_service,
-                            secret_wiring_policy=ctx.service._secret_wiring_policy,
+                            session_operation_context=ctx.session_operation_context,
+                            session_operation_authority=ctx.session_operation_authority,
+                            secret_service=ctx.custody.secret_service,
+                            secret_wiring_policy=ctx.custody.secret_wiring_policy,
                             user_id=user_id,
                             current_validation=candidate_prior_validation,
-                            max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
+                            max_blob_storage_per_session_bytes=ctx.custody.max_blob_storage_per_session_bytes,
                             user_message_id=user_message_id,
                             user_message_content=user_message_content,
-                            composer_model_identifier=ctx.service._model,
+                            composer_model_identifier=ctx.provenance.model_identifier,
                             composer_model_version=provider_model_version,
-                            composer_provider=ctx.service._availability.provider or "unknown",
-                            composer_skill_hash=ctx.service._composer_skill_hash,
+                            composer_provider=ctx.provenance.provider or "unknown",
+                            composer_skill_hash=ctx.provenance.skill_hash,
                             tool_arguments_hash=audit.binding_arguments_hash,
                         )
                         finalization = await _finalize_complete_set_pipeline_candidate(
@@ -1264,12 +1566,14 @@ async def run_tool_batch(
                                 llm_messages,
                                 tool_call_id=tool_call.id,
                                 arguments=audit_arguments,
+                                dialect=ctx.tool_contract_dialect,
+                                semantic=True,
                             )
                             interpretation_requirements_are_internal = True
                             redacted_arguments = redact_tool_call_arguments(
                                 tool_name,
                                 arguments,
-                                telemetry=ctx.service._redaction_telemetry,
+                                telemetry=ctx.redaction_telemetry,
                             )
                         finalized_candidate_result = finalize_tool_result(
                             candidate.result,
@@ -1280,13 +1584,13 @@ async def run_tool_batch(
                         )
                         proposal_acceptable = candidate.acceptable
                         if proposal_acceptable and candidate.prepared_inline_blob is not None:
-                            if session_id is None or ctx.service._session_engine is None:
+                            if session_id is None or ctx.custody.session_engine is None:
                                 raise AuditIntegrityError("Inline proposal custody requires session context")
                             custody = prepare_pipeline_custody(
                                 arguments,
                                 candidate.prepared_inline_blob,
                                 session_id=session_id,
-                                max_storage_per_session=ctx.service._settings.max_blob_storage_per_session_bytes,
+                                max_storage_per_session=ctx.custody.max_blob_storage_per_session_bytes,
                             )
 
                             # From this point forward every authority-bearing
@@ -1298,6 +1602,8 @@ async def run_tool_batch(
                                 llm_messages,
                                 tool_call_id=tool_call.id,
                                 arguments=arguments,
+                                dialect=ctx.tool_contract_dialect,
+                                semantic=True,
                             )
                             safe_candidate_context = replace(
                                 candidate_context,
@@ -1305,9 +1611,11 @@ async def run_tool_batch(
                             )
                             custody_outcome = await _try_finalize_proposal_custody(
                                 custody,
-                                engine=ctx.service._session_engine,
-                                data_dir=ctx.service._data_dir,
-                                max_storage_per_session=ctx.service._settings.max_blob_storage_per_session_bytes,
+                                engine=ctx.custody.session_engine,
+                                data_dir=ctx.custody.data_dir,
+                                max_storage_per_session=ctx.custody.max_blob_storage_per_session_bytes,
+                                session_operation_context=ctx.session_operation_context,
+                                session_operation_authority=ctx.session_operation_authority,
                             )
                             if custody_outcome == "quota_exceeded":
                                 proposal_acceptable = False
@@ -1343,7 +1651,7 @@ async def run_tool_batch(
                             redacted_arguments = redact_tool_call_arguments(
                                 tool_name,
                                 arguments,
-                                telemetry=ctx.service._redaction_telemetry,
+                                telemetry=ctx.redaction_telemetry,
                             )
                     except BaseException as exc:
                         # Candidate finalization is one-time pre-proposal work.
@@ -1422,21 +1730,23 @@ async def run_tool_batch(
                         state,
                         ctx.policy_catalog,
                         plugin_snapshot=ctx.plugin_snapshot,
-                        data_dir=ctx.service._data_dir,
-                        session_engine=ctx.service._session_engine,
+                        data_dir=ctx.custody.data_dir,
+                        session_engine=ctx.custody.session_engine,
                         session_id=session_id,
-                        secret_service=ctx.service._secret_service,
-                        secret_wiring_policy=ctx.service._secret_wiring_policy,
+                        session_operation_context=ctx.session_operation_context,
+                        session_operation_authority=ctx.session_operation_authority,
+                        secret_service=ctx.custody.secret_service,
+                        secret_wiring_policy=ctx.custody.secret_wiring_policy,
                         user_id=user_id,
                         prior_validation=last_validation,
                         runtime_preflight=None,
-                        max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
+                        max_blob_storage_per_session_bytes=ctx.custody.max_blob_storage_per_session_bytes,
                         user_message_id=user_message_id,
                         user_message_content=user_message_content,
-                        composer_model_identifier=ctx.service._model,
+                        composer_model_identifier=ctx.provenance.model_identifier,
                         composer_model_version=provider_model_version,
-                        composer_provider=ctx.service._availability.provider or "unknown",
-                        composer_skill_hash=ctx.service._composer_skill_hash,
+                        composer_provider=ctx.provenance.provider or "unknown",
+                        composer_skill_hash=ctx.provenance.skill_hash,
                         tool_arguments_hash=audit.binding_arguments_hash,
                         validate_arguments=True,
                         require_data_dir_for_paths=True,
@@ -1466,7 +1776,7 @@ async def run_tool_batch(
                             proposal_redacted_arguments = redact_tool_call_arguments(
                                 proposal_tool_name,
                                 cast(dict[str, Any], proposal_summary_arguments),
-                                telemetry=ctx.service._redaction_telemetry,
+                                telemetry=ctx.redaction_telemetry,
                             )
                 except ToolArgumentError:
                     # Preserve the established explicit-approval contract for
@@ -1499,12 +1809,8 @@ async def run_tool_batch(
                     pipeline_proposal = PipelineProposal.create(
                         pipeline=proposal_arguments,
                         base=proposal_base,
-                        reviewed_facts={},
-                        surface=PlannerSurface.FREEFORM,
                         repair_count=0,
-                        skill_hash=ctx.service._composer_skill_hash,
-                        covered_deferred_intent_ids=(),
-                        supersedes_draft_hash=None,
+                        skill_hash=ctx.provenance.skill_hash,
                     )
                     if type(ctx.session_operation_context) is not SessionOperationContext:
                         raise AuditIntegrityError("Composition proposal creation requires exact session operation authority")
@@ -1515,9 +1821,9 @@ async def run_tool_batch(
                             proposal=pipeline_proposal,
                             tool_call_id=tool_call.id,
                             custody_result=pipeline_custody_result,
-                            model_identifier=ctx.service._model,
+                            model_identifier=ctx.provenance.model_identifier,
                             model_version=provider_model_version,
-                            provider=ctx.service._availability.provider or "unknown",
+                            provider=ctx.provenance.provider or "unknown",
                         ),
                         summary=proposal_summary.summary,
                         rationale=proposal_summary.rationale,
@@ -1525,9 +1831,9 @@ async def run_tool_batch(
                         arguments_redacted_json=proposal_summary.arguments_redacted_json,
                         actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
                         user_message_id=UUID(user_message_id) if user_message_id is not None else None,
-                        composer_model_identifier=ctx.service._model,
+                        composer_model_identifier=ctx.provenance.model_identifier,
                         composer_model_version=provider_model_version,
-                        composer_provider=ctx.service._availability.provider or "unknown",
+                        composer_provider=ctx.provenance.provider or "unknown",
                     )
                 else:
                     if type(ctx.session_operation_context) is not SessionOperationContext:
@@ -1545,10 +1851,10 @@ async def run_tool_batch(
                         base_state_id=UUID(current_state_id) if current_state_id is not None else None,
                         actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
                         user_message_id=UUID(user_message_id) if user_message_id is not None else None,
-                        composer_model_identifier=ctx.service._model,
+                        composer_model_identifier=ctx.provenance.model_identifier,
                         composer_model_version=provider_model_version,
-                        composer_provider=ctx.service._availability.provider or "unknown",
-                        composer_skill_hash=ctx.service._composer_skill_hash,
+                        composer_provider=ctx.provenance.provider or "unknown",
+                        composer_skill_hash=ctx.provenance.skill_hash,
                         tool_arguments_hash=audit.binding_arguments_hash,
                     )
                 proposals_this_turn += 1
@@ -1589,6 +1895,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=proposal_result,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1624,12 +1931,53 @@ async def run_tool_batch(
         # LLM call is recorded separately via _call_advisor_with_audit
         # firing a ComposerLLMCall record.
         if tool_name == "request_advisor_hint":
+            if resolve_tool_effects(tool_name, arguments).domains:
+                raise AssertionError("Advisor dispatch must not author composition domains.")
             # Successful advisor guidance is governed solely by the
             # advisor budget so the composer can read it. Advisor
             # policy/error feedback with no usable guidance is still
             # a non-mutating correction turn, so it consumes discovery
             # budget before the loop asks the primary model again.
-            budget = ctx.service._settings.composer_advisor_max_calls_per_compose
+            # F3: validate argument types and total prompt size at the
+            # Tier-3 trust boundary. _TOOL_REQUIRED_PATHS only checks
+            # key presence, not value shape. Without this check the
+            # LLM could send a non-list (silently iterated char-by-
+            # char) or a megabyte-scale value (unbounded provider
+            # cost). ARG_ERRORs do NOT consume advisor budget — no
+            # outbound call is made — but anti-anchor counts them
+            # so repeated identical bad-arg calls trigger the §7.7
+            # structural hint.
+            advisor_arg_error = ctx.advisor_checkpoint._validate_advisor_arguments(arguments)
+            if not isinstance(advisor_arg_error, RequestAdvisorHintArgumentsModel):
+                advisor_rejection_payload = advisor_arg_error.to_payload()
+                recorder.record(
+                    finish_arg_error(
+                        audit,
+                        error_class=advisor_arg_error.error_class,
+                        error_category=advisor_arg_error.category,
+                        error_message=advisor_arg_error.error,
+                        error_payload=advisor_rejection_payload,
+                    )
+                )
+                _append_tool_outcome(
+                    response=None,
+                    error_class=advisor_arg_error.error_class,
+                    error_category=advisor_arg_error.category,
+                    error_message=advisor_arg_error.error,
+                    post_version=state.version,
+                )
+                anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                llm_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(advisor_rejection_payload),
+                    }
+                )
+                turn_has_discovery = True
+                continue
+
+            budget = ctx.advisor_max_calls_per_compose
             if advisor_calls_used >= budget:
                 budget_payload = {
                     "status": "BUDGET_EXHAUSTED",
@@ -1652,6 +2000,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=budget_payload,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1670,61 +2019,28 @@ async def run_tool_batch(
                 turn_has_discovery = True
                 continue
 
-            # F3: validate argument types and total prompt size at the
-            # Tier-3 trust boundary. _TOOL_REQUIRED_PATHS only checks
-            # key presence, not value shape. Without this check the
-            # LLM could send a non-list (silently iterated char-by-
-            # char) or a megabyte-scale value (unbounded provider
-            # cost). ARG_ERRORs do NOT consume advisor budget — no
-            # outbound call is made — but anti-anchor counts them
-            # so repeated identical bad-arg calls trigger the §7.7
-            # structural hint.
-            advisor_arg_error = ctx.service._validate_advisor_arguments(arguments)
-            if advisor_arg_error is not None:
-                recorder.record(
-                    finish_arg_error(
-                        audit,
-                        error_class=str(advisor_arg_error["error_class"]),
-                        error_message=str(advisor_arg_error["error"]),
-                        error_payload=advisor_arg_error,
-                    )
-                )
-                _append_tool_outcome(
-                    response=None,
-                    error_class=str(advisor_arg_error["error_class"]),
-                    error_message=str(advisor_arg_error["error"]),
-                    post_version=state.version,
-                )
-                anti_anchor.record_failure(tool_name, audit.arguments_hash)
-                llm_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps(advisor_arg_error),
-                    }
-                )
-                turn_has_discovery = True
-                continue
-
             remaining = _remaining_compose_seconds(deadline)
             if remaining <= 0:
-                timeout_payload: dict[str, Any] = {
+                # Nothing was raised here: the pre-call deadline check refused
+                # the call, so the payload names no exception class. The
+                # ``COMPOSE_TIMEOUT`` status is the discriminant.
+                pre_call_timeout_payload: dict[str, Any] = {
                     "status": "COMPOSE_TIMEOUT",
                     "error": "Advisor call exceeded the remaining compose deadline.",
-                    "error_class": "TimeoutError",
                     "budget_used": advisor_calls_used,
                     "budget_remaining": budget - advisor_calls_used,
                 }
                 recorder.record(
                     finish_success(
                         audit,
-                        result_payload=timeout_payload,
+                        result_payload=pre_call_timeout_payload,
                         version_after=state.version,
                     )
                 )
                 _append_tool_outcome(
-                    response=timeout_payload,
+                    response=pre_call_timeout_payload,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1748,6 +2064,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=deadline_payload,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1761,7 +2078,7 @@ async def run_tool_batch(
                 turn_has_discovery = True
                 continue
 
-            advisor_timeout = ctx.service._settings.composer_advisor_timeout_seconds
+            advisor_timeout = ctx.advisor_timeout_seconds
             effective_advisor_timeout = min(advisor_timeout, remaining)
             advisor_deadline_limited = remaining <= advisor_timeout
 
@@ -1776,8 +2093,8 @@ async def run_tool_batch(
             advisor_calls_used += 1
 
             try:
-                advisor_outcome = await ctx.service._call_advisor_for_tool(
-                    arguments,
+                advisor_outcome = await ctx.advisor_checkpoint._call_advisor_for_tool(
+                    advisor_arg_error,
                     recorder=recorder,
                     timeout=effective_advisor_timeout,
                 )
@@ -1793,7 +2110,7 @@ async def run_tool_batch(
                     timeout_payload = {
                         "status": "COMPOSE_TIMEOUT",
                         "error": "Advisor call exceeded the remaining compose deadline.",
-                        "error_class": "TimeoutError",
+                        "error_class": type(advisor_exc).__name__,
                         "budget_used": advisor_calls_used,
                         "budget_remaining": budget - advisor_calls_used,
                     }
@@ -1807,6 +2124,7 @@ async def run_tool_batch(
                     _append_tool_outcome(
                         response=timeout_payload,
                         error_class=None,
+                        error_category=None,
                         error_message=None,
                         post_version=state.version,
                     )
@@ -1832,6 +2150,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=advisor_error_payload,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1868,6 +2187,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=advisor_error_payload,
                     error_class=None,
+                    error_category=None,
                     error_message=None,
                     post_version=state.version,
                 )
@@ -1897,6 +2217,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=None,
                     error_class=type(first_party_exc).__name__,
+                    error_category=None,
                     error_message=type(first_party_exc).__name__,
                     post_version=state.version,
                 )
@@ -1934,6 +2255,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=success_payload,
                 error_class=None,
+                error_category=None,
                 error_message=None,
                 post_version=state.version,
             )
@@ -1967,8 +2289,21 @@ async def run_tool_batch(
         # ``_SESSION_AWARE_TOOL_HANDLERS`` and the per-tool
         # kwarg-build dict below; no new dispatch branch is needed.
         if is_session_aware_tool(tool_name):
+            # Preflight is infrastructure work, before the session-aware
+            # handler. Its failure/deadline carriers must reach the phase
+            # owner without being recategorized as a handler crash.
             try:
-                session_aware_outcome = await ctx.service._dispatch_session_aware_tool(
+                review_preflight = await _pending_review_runtime_findings(state, ctx)
+            except ComposerRuntimePreflightError as preflight_exc:
+                raise ComposerRuntimePreflightError(
+                    original_exc=preflight_exc.original_exc,
+                    partial_state=preflight_exc.partial_state,
+                    tool_invocations=recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=preflight_exc.failed_turn,
+                ) from preflight_exc.original_exc
+            try:
+                session_aware_outcome = await ctx.session_tools._dispatch_session_aware_tool(
                     tool_name=tool_name,
                     tool_call_id=tool_call.id,
                     arguments=arguments,
@@ -1982,6 +2317,7 @@ async def run_tool_batch(
                     llm_messages=llm_messages,
                     anti_anchor=anti_anchor,
                     policy_catalog=ctx.policy_catalog,
+                    review_preflight=review_preflight,
                 )
             except (AssertionError, MemoryError, RecursionError, SystemError):
                 # Same narrow-class discipline as the sync execute_tool
@@ -2004,6 +2340,7 @@ async def run_tool_batch(
                 _append_tool_outcome(
                     response=None,
                     error_class=type(tool_exc).__name__,
+                    error_category=None,
                     error_message=type(tool_exc).__name__,
                     post_version=state.version,
                 )
@@ -2020,6 +2357,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=session_aware_outcome.result,
                 error_class=session_aware_outcome.error_class,
+                error_category=session_aware_outcome.error_category,
                 error_message=session_aware_outcome.error_message,
                 post_version=session_aware_outcome.post_version,
             )
@@ -2040,7 +2378,7 @@ async def run_tool_batch(
         structural_preflight_callback: RuntimePreflight | None = None
         if tool_name == "preview_pipeline":
             try:
-                preview_preflight = await ctx.service._cached_runtime_preflight(
+                preview_preflight = await ctx.preflight.cached_runtime_preflight(
                     state,
                     user_id=user_id,
                     session_id=session_id,
@@ -2049,6 +2387,7 @@ async def run_tool_batch(
                     session_scope=session_scope,
                     llm_calls=recorder.llm_calls,
                     plugin_snapshot=ctx.plugin_snapshot,
+                    session_operation_context=ctx.session_operation_context,
                 )
             except ComposerRuntimePreflightError as preflight_exc:
                 recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
@@ -2084,7 +2423,7 @@ async def run_tool_batch(
             # turn claimed to check for.
             if is_pending_interpretation_handoff(preview_preflight):
                 try:
-                    structural_preflight_result = await ctx.service._cached_runtime_preflight(
+                    structural_preflight_result = await ctx.preflight.cached_runtime_preflight(
                         state,
                         user_id=user_id,
                         session_id=session_id,
@@ -2093,6 +2432,7 @@ async def run_tool_batch(
                         session_scope=session_scope,
                         llm_calls=recorder.llm_calls,
                         plugin_snapshot=ctx.plugin_snapshot,
+                        session_operation_context=ctx.session_operation_context,
                         interpretation_tolerant=True,
                     )
                 except ComposerRuntimePreflightError as preflight_exc:
@@ -2139,8 +2479,10 @@ async def run_tool_batch(
         #
         # Any other exception — TypeError, ValueError, UnicodeError,
         # KeyError, AttributeError — escaping execute_tool() is a
-        # plugin bug (Tier 1/2) and MUST crash.  Per CLAUDE.md,
-        # silently laundering a plugin bug as an LLM-argument error
+        # plugin bug (Tier 1/2) and MUST crash.  Per
+        # docs/guides/data-trust-and-error-handling.md §Plugin
+        # Ownership: System Code, Not User Code, silently
+        # laundering a plugin bug as an LLM-argument error
         # is worse than crashing: it pollutes the audit trail with
         # a confident but wrong Tier-3 story, and the LLM's "retry"
         # cannot correct a fault in our own code.
@@ -2179,10 +2521,10 @@ async def run_tool_batch(
             _structural_preflight_callback: RuntimePreflight | None = structural_preflight_callback,
             _user_message_id: str | None = user_message_id,
             _user_message_content: str | None = user_message_content,
-            _composer_model_identifier: str = ctx.service._model,
+            _composer_model_identifier: str = ctx.provenance.model_identifier,
             _composer_model_version: str = provider_model_version,
-            _composer_provider: str = ctx.service._availability.provider or "unknown",
-            _composer_skill_hash: str = ctx.service._composer_skill_hash,
+            _composer_provider: str = ctx.provenance.provider or "unknown",
+            _composer_skill_hash: str = ctx.provenance.skill_hash,
             _tool_arguments_hash: str = audit.binding_arguments_hash,
             _interpretation_requirements_are_internal: bool = interpretation_requirements_are_internal,
             _prevalidated_unapplied_result: ToolResult | None = prevalidated_unapplied_result,
@@ -2199,16 +2541,18 @@ async def run_tool_batch(
                 _state,
                 ctx.policy_catalog,
                 plugin_snapshot=ctx.plugin_snapshot,
-                data_dir=ctx.service._data_dir,
-                session_engine=ctx.service._session_engine,
+                data_dir=ctx.custody.data_dir,
+                session_engine=ctx.custody.session_engine,
                 session_id=session_id,
-                secret_service=ctx.service._secret_service,
-                secret_wiring_policy=ctx.service._secret_wiring_policy,
+                session_operation_context=ctx.session_operation_context,
+                session_operation_authority=ctx.session_operation_authority,
+                secret_service=ctx.custody.secret_service,
+                secret_wiring_policy=ctx.custody.secret_wiring_policy,
                 user_id=user_id,
                 prior_validation=_last_validation,
                 runtime_preflight=_runtime_preflight_callback,
                 structural_preflight=_structural_preflight_callback,
-                max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
+                max_blob_storage_per_session_bytes=ctx.custody.max_blob_storage_per_session_bytes,
                 user_message_id=_user_message_id,
                 user_message_content=_user_message_content,
                 composer_model_identifier=_composer_model_identifier,
@@ -2234,6 +2578,8 @@ async def run_tool_batch(
                     plugin_snapshot=ctx.plugin_snapshot,
                     policy_catalog=ctx.policy_catalog,
                 )
+            if is_discovery_tool(_tool_name) and response_contract_for(_tool_name) is not None:
+                return admit_discovery_result(_tool_name, dispatched_result)
             return dispatched_result
 
         # ``_arg_error_payload`` is a module-level helper (F2 — testable
@@ -2257,6 +2603,8 @@ async def run_tool_batch(
             # the post-mutation version inside the recorder call.
             if _prevalidated_unapplied_result is not None:
                 return _state.version
+            if isinstance(_result, AdmittedDiscoveryResult):
+                return _result.result.updated_state.version
             return cast(int, _result.updated_state.version)
 
         try:
@@ -2301,7 +2649,8 @@ async def run_tool_batch(
             arg_error_payload = _arg_error_payload(exc, tool_name)
             _append_tool_outcome(
                 response=None,
-                error_class="ToolArgumentError",
+                error_class=type(exc).__name__,
+                error_category=exc.category,
                 error_message=str(exc.args[0] if exc.args else "ToolArgumentError"),
                 post_version=state.version,
             )
@@ -2315,11 +2664,12 @@ async def run_tool_batch(
             )
             continue
         except (AssertionError, MemoryError, RecursionError, SystemError):
-            # CLAUDE.md policy exception — DOCUMENTED DIVERGENCE.
+            # Plugin-ownership policy exception — DOCUMENTED DIVERGENCE.
             #
-            # CLAUDE.md "Plugin Ownership" says a defective plugin
-            # MUST crash rather than be wrapped and laundered as a
-            # recoverable error.  The web server relaxes this for
+            # docs/guides/data-trust-and-error-handling.md §Plugin
+            # Ownership: System Code, Not User Code says a defective
+            # plugin MUST crash rather than be wrapped and laundered
+            # as a recoverable error.  The web server relaxes this for
             # ordinary exception classes (see the wider except
             # Exception below) because crashing the whole ASGI
             # process on one bad request would take down every
@@ -2335,7 +2685,9 @@ async def run_tool_batch(
             #
             # - AssertionError: a plain ``assert`` fired inside
             #   plugin code.  Asserts encode Tier-1 invariants
-            #   (CLAUDE.md: "crash on any anomaly").  Writing the
+            #   (crash on any anomaly — see
+            #   docs/guides/data-trust-and-error-handling.md §The
+            #   Three-Tier Trust Model).  Writing the
             #   composition_states row after an invariant failure
             #   would persist data the invariant said was
             #   impossible.
@@ -2357,6 +2709,16 @@ async def run_tool_batch(
             # ``type(exc).__name__`` — no poisoned memory work.
             # Closes blocker B2 from the panel review (2026-05-04).
             raise
+        except ComposerRuntimePreflightError as preflight_exc:
+            # A successful mutation may precede its structural preflight.
+            # Preserve that new state instead of recapturing the old loop state.
+            raise ComposerRuntimePreflightError(
+                original_exc=preflight_exc.original_exc,
+                partial_state=preflight_exc.partial_state,
+                tool_invocations=recorder.invocations,
+                llm_calls=recorder.llm_calls,
+                failed_turn=preflight_exc.failed_turn,
+            ) from preflight_exc.original_exc
         except AuditIntegrityError:
             # Tier-1 audit invariant. Do not let the plugin-bug
             # catch-all below launder it into ComposerPluginCrashError.
@@ -2364,16 +2726,19 @@ async def run_tool_batch(
         except Exception as tool_exc:
             # Plugin-bug path: any exception class OTHER than
             # ToolArgumentError escaping execute_tool() is a plugin
-            # bug (CLAUDE.md tier 1/2). Capture the loop-local
-            # ``state`` — which has been rebound to
-            # result.updated_state on every successful prior
-            # iteration — so the route layer can persist the
+            # bug (docs/guides/data-trust-and-error-handling.md
+            # §Plugin Ownership: System Code, Not User Code).
+            # Capture the loop-local ``state`` — which has been
+            # rebound to result.updated_state on every successful
+            # prior iteration — so the route layer can persist the
             # accumulated mutations into composition_states before
             # returning the 500. Without this, any tool call that
             # successfully mutated state prior to the crash would
             # be silently dropped from the state history.
             #
-            # Web-server policy exception: CLAUDE.md says a
+            # Web-server policy exception: the plugin-ownership rule
+            # (docs/guides/data-trust-and-error-handling.md §Plugin
+            # Ownership: System Code, Not User Code) says a
             # defective plugin must crash.  In the pipeline engine
             # (single-shot CLI process) that is straightforward —
             # abort the run.  In the web server a single malformed
@@ -2403,6 +2768,7 @@ async def run_tool_batch(
             _append_tool_outcome(
                 response=None,
                 error_class=type(tool_exc).__name__,
+                error_category=None,
                 error_message=type(tool_exc).__name__,
                 post_version=state.version,
             )
@@ -2423,7 +2789,30 @@ async def run_tool_batch(
         # from outcome.result and continue with the LLM-message
         # append.
         version_before_tool = state.version
-        result = outcome.result
+        admitted_result = outcome.result if isinstance(outcome.result, AdmittedDiscoveryResult) else None
+        result = admitted_result.result if admitted_result is not None else outcome.result
+        if (
+            prevalidated_unapplied_result is None
+            and is_mutation_tool(tool_name)
+            and result.success
+            and result.updated_state.version > state.version
+            and result.validation.is_valid
+        ):
+            # The mutation has succeeded and its applied version is already
+            # audited. A separate preflight failure cannot relabel that tool
+            # as a crash or erase the version the route must persist.
+            try:
+                findings = await _pending_review_runtime_findings(result.updated_state, ctx)
+            except ComposerRuntimePreflightError as preflight_exc:
+                raise ComposerRuntimePreflightError(
+                    original_exc=preflight_exc.original_exc,
+                    partial_state=preflight_exc.partial_state,
+                    tool_invocations=recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=preflight_exc.failed_turn or ctx.failed_turn,
+                ) from preflight_exc.original_exc
+            if findings is not None:
+                result = replace(result, runtime_preflight=findings)
         if prevalidated_unapplied_result is None:
             state = result.updated_state
             last_validation = result.validation
@@ -2435,7 +2824,7 @@ async def run_tool_batch(
         # ``composer_progress.schemas_loaded_this_session`` so
         # the model can compute its own schemas_gap without
         # re-introspecting plugins it has already seen. See
-        # ``ComposerServiceImpl._mark_plugin_schema_loaded`` and
+        # ``SchemaDisclosureTracker.mark_plugin_schema_loaded`` and
         # ``prompts.build_context_string``.
         #
         # Lifted from the prior inline compose-loop body into the
@@ -2446,7 +2835,7 @@ async def run_tool_batch(
         # lift-and-shift into ``dispatch_tools`` when the parallel
         # ``_compose_loop`` decomposition lands".
         if tool_name == "get_plugin_schema" and result.success:
-            ctx.service._mark_plugin_schema_loaded(
+            ctx.schema_disclosure.mark_plugin_schema_loaded(
                 session_id,
                 str(arguments["plugin_type"]),
                 str(arguments["name"]),
@@ -2479,19 +2868,22 @@ async def run_tool_batch(
                 anti_anchor.record_success()
         else:
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
-        result_json = _serialize_tool_result(result)
+        result_json = (
+            serialize_admitted_discovery_result(admitted_result) if admitted_result is not None else _serialize_tool_result(result)
+        )
         await emit_progress(progress, tool_completed_progress_event(tool_name, result.success))
         _append_tool_outcome(
-            response=result,
+            response=admitted_result.to_tool_result() if admitted_result is not None else result,
             error_class=None,
+            error_category=None,
             error_message=None,
             post_version=state.version,
         )
 
-        # Cache cacheable discovery results
-        if is_cacheable_discovery_tool(tool_name):
+        # Cached payloads omit rejection entries; only successful discovery is reusable.
+        if is_cacheable_discovery_tool(tool_name) and result.success:
             cache_key = _make_cache_key(tool_name, arguments)
-            discovery_cache[cache_key] = _cached_discovery_payload(result)
+            discovery_cache[cache_key] = _cached_discovery_payload(admitted_result if admitted_result is not None else result)
 
         llm_messages.append(
             {
@@ -2526,6 +2918,31 @@ async def run_tool_batch(
         pre_state_id=pre_state_id,
     )
     return dispatch, advisor_calls_used
+
+
+async def _pending_review_runtime_findings(state: CompositionState, ctx: ToolBatchContext) -> ValidationResult | None:
+    """Check a wired pending-review draft before feedback or card creation.
+
+    Stage 1 does not build the graph, and strict preflight stops at pending
+    reviews. Only publish failures from the masked pass: its green verdict
+    does not authorize execution while the real reviews remain unresolved.
+    """
+    if not state.sources or not state.outputs or not interpretation_sites(state):
+        return None
+    result = await ctx.preflight.cached_runtime_preflight(
+        state,
+        user_id=ctx.user_id,
+        session_id=ctx.session_id,
+        cache=ctx.runtime_preflight_cache,
+        initial_version=ctx.initial_version,
+        session_scope=ctx.session_scope,
+        llm_calls=ctx.recorder.llm_calls,
+        plugin_snapshot=ctx.plugin_snapshot,
+        session_operation_context=ctx.session_operation_context,
+        interpretation_tolerant=True,
+        deadline=ctx.deadline,
+    )
+    return None if result.is_valid else result
 
 
 _MIN_USEFUL_ADVISOR_SECONDS: Final[float] = 5.0

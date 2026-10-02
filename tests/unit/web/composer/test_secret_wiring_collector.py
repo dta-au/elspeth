@@ -102,5 +102,5 @@ def test_wire_collector_target_without_policy_reaches_authorization_denial() -> 
 
     assert result.success is False
     assert result.updated_state is state
-    assert "secret_wiring_allowlist" in result.data["error"]
+    assert "secret_wiring_allowlist" in result.validation.errors[0].message
     assert "api_key" not in deep_thaw(result.updated_state.nodes[0].options)

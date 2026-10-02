@@ -3,7 +3,7 @@
 Read-only aggregation queries plus the shared quiescence/unresolved
 predicates the engine's invariant checks are built on. No writes, no
 events. Extracted from ``TokenSchedulerRepository``
-(filigree elspeth-ef9c36d767).
+(archived issue elspeth-ef9c36d767).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from sqlalchemy import ColumnElement, and_, func, or_, select
 
 from elspeth.contracts.scheduler import TokenWorkStatus
-from elspeth.core.landscape.database import Tier1Engine
+from elspeth.core.landscape.database import Tier1Engine, _maybe_serialize_shared_connection
 from elspeth.core.landscape.schema import token_work_items_table
 
 
@@ -89,7 +89,7 @@ class SchedulerReadModel:
         chunk_size = 900
         ids = list(work_item_ids)
         total = 0
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             for start in range(0, len(ids), chunk_size):
                 chunk = ids[start : start + chunk_size]
                 result = conn.execute(
@@ -106,13 +106,13 @@ class SchedulerReadModel:
         """Count how many of the given work item IDs are in FAILED status.
 
         Companion to :meth:`count_ready_in_set` for the ADR-030 M1 relinquish
-        discriminator. FAILED is the ONLY ``token_work_items`` status absent from
-        BOTH the run-level backstop (:meth:`count_active_work` →
-        ``has_unresolved_scheduler_work``) AND ``complete_run``'s quiescence CAS
-        (which both cover READY/LEASED/BLOCKED/PENDING_SINK). So a leader that
-        relinquished a self-FAILED pending continuation would lose it with no
-        backstop. The leader uses this verb to REFUSE to relinquish whenever ANY
-        pending row is FAILED — keeping a self-FAILED stray loud. Scoped to
+        discriminator. FAILED is absent from the run-level backstop
+        (:meth:`count_active_work` → ``has_unresolved_scheduler_work``) and from
+        ``complete_run``'s residual-work arm (both cover READY/LEASED/BLOCKED/
+        PENDING_SINK); ``complete_run``'s second arm refuses a success only over a
+        FAILED item whose token has no outcome. The leader uses this verb to
+        REFUSE to relinquish whenever ANY pending row is FAILED — keeping every
+        self-FAILED stray loud at the drain, whatever its outcome. Scoped to
         ``run_id`` like every sibling verb; chunked for
         ``SQLITE_MAX_VARIABLE_NUMBER``. An empty input returns 0.
         """
@@ -121,7 +121,7 @@ class SchedulerReadModel:
         chunk_size = 900
         ids = list(work_item_ids)
         total = 0
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             for start in range(0, len(ids), chunk_size):
                 chunk = ids[start : start + chunk_size]
                 result = conn.execute(
@@ -167,7 +167,7 @@ class SchedulerReadModel:
         else:
             ids = list(work_item_ids)
             chunks = tuple(ids[start : start + 900] for start in range(0, len(ids), 900))
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             for chunk in chunks:
                 query = (
                     select(token_work_items_table.c.work_item_id)
@@ -192,7 +192,7 @@ class SchedulerReadModel:
             TokenWorkStatus.BLOCKED.value,
             TokenWorkStatus.PENDING_SINK.value,
         )
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             result = conn.execute(
                 select(func.count())
                 .select_from(token_work_items_table)
@@ -201,30 +201,9 @@ class SchedulerReadModel:
             ).scalar_one()
         return int(result)
 
-    def active_row_ids(self, *, run_id: str) -> frozenset[str]:
-        """Return row IDs represented by non-terminal scheduler work."""
-        active_statuses = (
-            TokenWorkStatus.READY.value,
-            TokenWorkStatus.LEASED.value,
-            TokenWorkStatus.BLOCKED.value,
-            TokenWorkStatus.PENDING_SINK.value,
-        )
-        with self._engine.connect() as conn:
-            rows = (
-                conn.execute(
-                    select(token_work_items_table.c.row_id)
-                    .distinct()
-                    .where(token_work_items_table.c.run_id == run_id)
-                    .where(token_work_items_table.c.status.in_(active_statuses))
-                )
-                .scalars()
-                .all()
-            )
-        return frozenset(rows)
-
     def count_unquiesced_work(self, *, run_id: str) -> int:
         """Count work items still able to deposit new barrier arrivals (§D step 2)."""
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             result = conn.execute(
                 select(func.count())
                 .select_from(token_work_items_table)
@@ -235,7 +214,7 @@ class SchedulerReadModel:
 
     def summarize_unquiesced_work(self, *, run_id: str) -> tuple[str, ...]:
         """Summarize §D step-2 unquiesced work for invariant diagnostics."""
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     select(
@@ -266,7 +245,7 @@ class SchedulerReadModel:
 
     def count_unresolved_work(self, *, run_id: str) -> int:
         """Count scheduler work not yet resolved into a durable sink handoff."""
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             result = conn.execute(
                 select(func.count())
                 .select_from(token_work_items_table)
@@ -277,7 +256,7 @@ class SchedulerReadModel:
 
     def summarize_unresolved_work(self, *, run_id: str) -> tuple[str, ...]:
         """Summarize unresolved work grouped by status and blocking keys."""
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     select(
@@ -314,7 +293,7 @@ class SchedulerReadModel:
             TokenWorkStatus.BLOCKED.value,
             TokenWorkStatus.PENDING_SINK.value,
         )
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     select(

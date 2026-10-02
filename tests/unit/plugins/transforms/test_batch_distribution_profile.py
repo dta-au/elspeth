@@ -151,18 +151,121 @@ class TestBatchDistributionProfile:
             {"row_index": 2, "reason": "non_finite_value"},
         ]
 
-    def test_non_numeric_values_raise_type_error(self, ctx: PluginContext) -> None:
+    def test_non_numeric_values_fail_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
+        """A wrongly-typed value fails the WHOLE batch with a value-free reason (no coercion).
+
+        elspeth-d5034647f0: the bad row is not skipped and no profile is
+        published over the survivors; the reason names the batch row, the field,
+        and the expected and found types, never the row value.
+        """
         from elspeth.plugins.transforms.batch_distribution_profile import BatchDistributionProfile
 
         transform = BatchDistributionProfile({"schema": DYNAMIC_SCHEMA, "value_field": "score"})
 
         rows = [
             _make_row({"id": 1, "score": 10.0}),
-            _make_row({"id": 2, "score": "not_a_number"}),
+            _make_row({"id": 2, "score": "not_a_number"}),  # Fails the BATCH, never skipped or coerced
+            _make_row({"id": 3, "score": 30.0}),
         ]
 
-        with pytest.raises(TypeError, match="must be numeric"):
-            transform.process(rows, ctx)
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "score"
+        assert result.reason["expected"] == "numeric (int or float)"
+        assert result.reason["actual_type"] == "str"
+        assert "in row 1" in result.reason["error"]
+        assert "must be numeric (int or float), got str" in result.reason["error"]
+        # The offending VALUE is row content and must not reach the audit trail.
+        assert "not_a_number" not in repr(result.reason)
+
+    def test_non_numeric_value_in_a_later_group_names_the_batch_row(self, ctx: PluginContext) -> None:
+        """The reported row is the BATCH index, not the index within the value's group."""
+        from elspeth.plugins.transforms.batch_distribution_profile import BatchDistributionProfile
+
+        transform = BatchDistributionProfile({"schema": DYNAMIC_SCHEMA, "value_field": "score", "group_by": "variant"})
+
+        rows = [
+            _make_row({"variant": "A", "score": 1.0}),
+            _make_row({"variant": "B", "score": 10.0}),
+            _make_row({"variant": "A", "score": 3.0}),
+            _make_row({"variant": "B", "score": "twelve"}),  # batch row 3, row 1 within group B
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["field"] == "score"
+        assert result.reason["actual_type"] == "str"
+        assert "in row 3" in result.reason["error"]
+        assert "twelve" not in repr(result.reason)
+
+    @pytest.mark.parametrize(("bad_value", "found"), [(True, "bool"), ("7", "str")])
+    def test_bool_and_numeric_looking_str_fail_the_batch(self, ctx: PluginContext, bad_value: object, found: str) -> None:
+        """bool is rejected (type(), not isinstance()); a numeric-looking str is not coerced."""
+        from elspeth.plugins.transforms.batch_distribution_profile import BatchDistributionProfile
+
+        transform = BatchDistributionProfile({"schema": DYNAMIC_SCHEMA, "value_field": "score"})
+
+        result = transform.process([_make_row({"score": bad_value}), _make_row({"score": 2.0})], ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason is not None
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["actual_type"] == found
+        assert "in row 0" in result.reason["error"]
+
+    def test_grouped_no_finite_values_reason_names_the_group_field_never_its_value(self, ctx: PluginContext) -> None:
+        """The group VALUE is row content: the reason carries group_by and the member row indices only."""
+        from elspeth.plugins.transforms.batch_distribution_profile import BatchDistributionProfile
+
+        transform = BatchDistributionProfile({"schema": DYNAMIC_SCHEMA, "value_field": "score", "group_by": "variant"})
+        rows = [
+            _make_row({"variant": "A", "score": 1.0}),
+            _make_row({"variant": "cohort-sentinel-7f3a", "score": None}),
+            _make_row({"variant": "cohort-sentinel-7f3a", "score": float("nan")}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["cause"] == "no_finite_values"
+        assert result.reason["group_by"] == "variant"
+        assert "group_value" not in result.reason
+        assert result.reason["row_errors"] == [
+            {"row_index": 1, "reason": "missing_value"},
+            {"row_index": 2, "reason": "non_finite_value"},
+        ]
+        assert "cohort-sentinel-7f3a" not in repr(result.reason)
+
+    def test_grouped_float_overflow_reason_names_the_group_field_never_its_value(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_distribution_profile import BatchDistributionProfile
+
+        transform = BatchDistributionProfile({"schema": DYNAMIC_SCHEMA, "value_field": "score", "group_by": "variant"})
+        rows = [
+            _make_row({"variant": "cohort-sentinel-7f3a", "score": 1e308}),
+            _make_row({"variant": "cohort-sentinel-7f3a", "score": 1e308}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "float_overflow"
+        assert result.reason["operation"] == "mean"
+        assert result.reason["group_by"] == "variant"
+        assert "group_value" not in result.reason
+        assert "cohort-sentinel-7f3a" not in repr(result.reason)
 
     @pytest.mark.parametrize("group_value", [float("nan"), float("inf"), float("-inf")])
     def test_non_finite_group_key_returns_error_before_success(self, ctx: PluginContext, group_value: float) -> None:

@@ -20,6 +20,7 @@ from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import (
@@ -28,7 +29,6 @@ from elspeth.plugins.infrastructure.config_base import (
     declared_source_schema_field_names,
 )
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldResolution,
@@ -82,6 +82,13 @@ class JSONSourceConfig(SourceDataConfig):
     Inherits from SourceDataConfig, which requires schema and on_validation_failure.
     Supports field_mapping for overriding normalized field names.
     """
+
+    snapshot_for_resume: bool = Field(
+        default=False,
+        strict=True,
+        description="For a single-source pipeline, materialize at most 64 MiB of immutable rows before processing so a failed run can resume unread rows.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
 
     format: Literal["json", "jsonl"] | None = Field(
         default=None,
@@ -173,10 +180,11 @@ class JSONSource(BaseSource):
         - Flexible: {"mode": "flexible", "fields": ["id: int"]} - at least these fields
     """
 
+    _normalizes_external_names = True
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9f0b0a653e365a0b"
+    source_file_hash: str | None = "sha256:b7e16113907d55c3"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -290,9 +298,10 @@ class JSONSource(BaseSource):
     def _load_jsonl(self, ctx: SourceContext) -> Iterator[SourceRow]:
         """Load from JSONL format (one JSON object per line).
 
-        Per Three-Tier Trust Model (CLAUDE.md), external data (Tier 3) that
-        fails to parse is quarantined, not crash the pipeline. This allows
-        subsequent valid lines to still be processed.
+        Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+        §The Three-Tier Trust Model), external data (Tier 3) that fails to parse is
+        quarantined, not crash the pipeline. This allows subsequent valid lines to
+        still be processed.
         """
         line_num = 0
         try:
@@ -356,8 +365,9 @@ class JSONSource(BaseSource):
     def _load_json_array(self, ctx: SourceContext) -> Iterator[SourceRow]:
         """Load from JSON array format.
 
-        Per Three-Tier Trust Model (CLAUDE.md), external data (Tier 3) that
-        fails to parse or decode is quarantined, not crash the pipeline.
+        Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+        §The Three-Tier Trust Model), external data (Tier 3) that fails to parse or
+        decode is quarantined, not crash the pipeline.
         """
         try:
             with open(self._path, encoding=self._encoding) as f:
@@ -396,8 +406,9 @@ class JSONSource(BaseSource):
             return
 
         # Extract from nested key if specified
-        # Per Three-Tier Trust Model (CLAUDE.md), structural mismatches in external
-        # data are quarantined, not exceptions. This handles:
+        # Per the three-tier trust model (docs/guides/data-trust-and-error-handling.md
+        # §The Three-Tier Trust Model), structural mismatches in external data are
+        # quarantined, not exceptions. This handles:
         # 1. data_key configured but JSON root is a list (not dict)
         # 2. data_key configured but key doesn't exist in JSON object
         # 3. data_key extraction results in non-list
@@ -641,7 +652,7 @@ class JSONSource(BaseSource):
                 row=normalized_row,
                 # Input-free text: str(e) echoes the offending Tier-3 value
                 # into audit surfaces (elspeth-a300402c58).
-                error_msg=safe_validation_error_text(e),
+                error_msg=safe_validation_error_text(e, self._schema_class),
                 source_row_index=source_row_index,
             )
             if quarantined is not None:

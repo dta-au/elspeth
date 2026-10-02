@@ -28,6 +28,25 @@ _REQUIRED_WEB_ENV = {
 }
 
 
+def test_composer_pricing_identities_load_from_environment(required_web_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_MODEL", "openai/primary-datazone")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", "openai/advisor-datazone")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_PRICING_MODEL", "azure/gpt-4o")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_ADVISOR_PRICING_MODEL", "azure/gpt-4o-mini")
+    settings = web_config.settings_from_env()
+    assert settings.composer_model == "openai/primary-datazone"
+    assert settings.composer_advisor_model == "openai/advisor-datazone"
+    assert settings.composer_pricing_model == "azure/gpt-4o"
+    assert settings.composer_advisor_pricing_model == "azure/gpt-4o-mini"
+
+
+@pytest.mark.parametrize("field", ["composer_pricing_model", "composer_advisor_pricing_model"])
+@pytest.mark.parametrize("value", ["", " ", "\t"])
+def test_composer_pricing_identity_rejects_blank(field: str, value: str) -> None:
+    with pytest.raises(ValidationError):
+        _settings(**{field: value})
+
+
 @pytest.fixture
 def required_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The five no-default WebSettings fields, supplied by the test, not by an operator's .env.
@@ -1177,6 +1196,34 @@ class TestServerSecretAllowlistValidation:
 
         assert "AZURE_CONTENT_SAFETY_KEY" not in settings.server_secret_allowlist
 
+    def test_bedrock_credentials_are_allowlisted_by_default(self) -> None:
+        settings = WebSettings(
+            composer_max_composition_turns=15,
+            composer_max_discovery_turns=10,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+
+        assert {
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        } <= set(settings.server_secret_allowlist)
+
+    def test_user_secrets_are_enabled_unless_the_operator_locks_down(self) -> None:
+        required = {
+            "composer_max_composition_turns": 15,
+            "composer_max_discovery_turns": 10,
+            "composer_timeout_seconds": 85.0,
+            "composer_rate_limit_per_minute": 10,
+            "shareable_link_signing_key": b"\x00" * 32,
+        }
+
+        assert WebSettings(**required).user_secrets_enabled is True
+        assert WebSettings(**required, user_secrets_enabled=False).user_secrets_enabled is False
+
     def test_reserved_elspeth_server_secret_names_rejected(self) -> None:
         with pytest.raises(ValidationError, match="ELSPETH_"):
             WebSettings(
@@ -1848,6 +1895,7 @@ class TestComposerEndpointCredentialPairing:
 
 
 def test_advisor_must_differ_from_primary_exact() -> None:
+    assert _settings().composer_allow_same_advisor_model is False
     with pytest.raises(ValidationError, match="composer_advisor_model must differ from composer_model"):
         _settings(composer_model="gpt-5.5", composer_advisor_model="gpt-5.5")
 
@@ -1861,6 +1909,48 @@ def test_advisor_distinct_normalizes_provider_prefix() -> None:
 def test_advisor_distinct_accepts_different_models() -> None:
     s = _settings(composer_model="claude-sonnet-4-6", composer_advisor_model="claude-opus-4-7")
     assert s.composer_advisor_model == "claude-opus-4-7"
+
+
+@pytest.mark.parametrize("composer_model", ["gpt-5.5", "openrouter/openai/gpt-5.5"])
+def test_advisor_same_model_requires_explicit_override(composer_model: str) -> None:
+    with pytest.raises(ValidationError, match="must differ"):
+        _settings(
+            composer_model=composer_model,
+            composer_advisor_model="gpt-5.5",
+            composer_allow_same_advisor_model=False,
+        )
+    settings = _settings(
+        composer_model=composer_model,
+        composer_advisor_model="gpt-5.5",
+        composer_allow_same_advisor_model=True,
+    )
+    assert settings.composer_model == composer_model
+    assert settings.composer_advisor_model == "gpt-5.5"
+
+
+@pytest.mark.usefixtures("required_web_env")
+@pytest.mark.parametrize("override", ["true", "false", "invalid"])
+def test_advisor_same_model_environment_override(monkeypatch: pytest.MonkeyPatch, override: str) -> None:
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_MODEL", "gpt-5.5")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", "gpt-5.5")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL", override)
+    if override == "true":
+        settings = web_config.settings_from_env()
+        assert settings.composer_allow_same_advisor_model is True
+        assert settings.composer_model == settings.composer_advisor_model == "gpt-5.5"
+    else:
+        with pytest.raises(ValidationError, match="must differ" if override == "false" else "composer_allow_same_advisor_model"):
+            web_config.settings_from_env()
+
+
+def test_advisor_same_model_override_keeps_endpoint_credentials_required() -> None:
+    with pytest.raises(ValidationError, match="composer_advisor_endpoint_base_url and composer_advisor_endpoint_api_key"):
+        _settings(
+            composer_model="gpt-5.5",
+            composer_advisor_model="gpt-5.5",
+            composer_allow_same_advisor_model=True,
+            composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+        )
 
 
 def test_advisor_checkpoint_budget_default_and_floor() -> None:
@@ -1900,6 +1990,62 @@ def test_settings_from_env_coerces_numeric_strings_for_strict_fields(monkeypatch
     assert settings.composer_timeout_seconds == 20.0
     assert settings.operator_metrics_bearer_token is not None
     assert settings.operator_metrics_bearer_token.get_secret_value() == "operator-metrics-token-from-environment-0001"
+
+
+_REQUIRED_ENV_FOR_RATE_LIMIT_TESTS = {
+    "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "30",
+    "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
+    "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "20.0",
+    "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
+}
+
+
+@pytest.mark.usefixtures("required_web_env")
+def test_settings_from_env_reads_execution_rate_limit_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The operator's run rate-limit block must be settable from the environment.
+
+    A composition cannot carry ``rate_limit``, so this is the only place a web
+    deployment can raise the engine's 60 calls/minute default. ``WebSettings``
+    is loaded by a hand-rolled env reader: a nested-model field that is not
+    registered as a JSON object reaches pydantic as a raw string and crash-loops
+    the service at startup.
+    """
+    from elspeth.web.config import settings_from_env
+
+    for key, value in _REQUIRED_ENV_FOR_RATE_LIMIT_TESTS.items():
+        monkeypatch.setenv(key, value)
+
+    assert settings_from_env().execution_rate_limit.get_service_config("openrouter").requests_per_minute == 60
+
+    monkeypatch.setenv("ELSPETH_WEB__EXECUTION_RATE_LIMIT", '{"services":{"openrouter":{"requests_per_minute":60000}}}')
+    configured = settings_from_env().execution_rate_limit
+
+    assert configured.get_service_config("openrouter").requests_per_minute == 60000
+    assert configured.get_service_config("bedrock").requests_per_minute == 60
+
+
+@pytest.mark.usefixtures("required_web_env")
+@pytest.mark.parametrize(
+    ("raw", "error"),
+    [
+        pytest.param("not json", RuntimeError, id="not-json"),
+        pytest.param("[1, 2]", RuntimeError, id="array-not-object"),
+        pytest.param('{"default_requests_per_minute": 0}', ValidationError, id="zero-rate"),
+        pytest.param('{"bogus": 1}', ValidationError, id="unknown-key"),
+    ],
+)
+def test_settings_from_env_rejects_malformed_execution_rate_limit(
+    monkeypatch: pytest.MonkeyPatch, raw: str, error: type[Exception]
+) -> None:
+    from elspeth.web.config import settings_from_env
+
+    for key, value in _REQUIRED_ENV_FOR_RATE_LIMIT_TESTS.items():
+        monkeypatch.setenv(key, value)
+    assert settings_from_env().execution_rate_limit.default_requests_per_minute == 60
+
+    monkeypatch.setenv("ELSPETH_WEB__EXECUTION_RATE_LIMIT", raw)
+    with pytest.raises(error):
+        settings_from_env()
 
 
 def test_settings_from_env_derives_deployment_region_only_from_ambient_aws_region(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2000,6 +2146,72 @@ def test_settings_from_env_rejects_invalid_textract_profiles_without_echoing_pri
 
     assert "AWS_TEXTRACT_PROFILES" in str(exc_info.value).upper()
     assert private_bucket not in str(exc_info.value)
+
+
+@pytest.mark.usefixtures("required_web_env")
+def test_settings_from_env_parses_azure_search_profiles_without_repr_leaking_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_endpoint = "https://operator-private-marker.search.windows.net"
+    monkeypatch.setenv(
+        "ELSPETH_WEB__AZURE_SEARCH_PROFILES",
+        json.dumps(
+            [
+                {
+                    "alias": "policies",
+                    "endpoint": private_endpoint,
+                    "auth": "managed_identity",
+                    "indexes": ["approved-documents"],
+                }
+            ]
+        ),
+    )
+
+    settings = web_config.settings_from_env()
+
+    assert settings.azure_search_profiles[0].alias == "policies"
+    assert settings.azure_search_profiles[0].endpoint == private_endpoint
+    assert settings.azure_search_profiles[0].indexes == ("approved-documents",)
+    assert "operator-private-marker" not in repr(settings.azure_search_profiles[0])
+
+
+@pytest.mark.parametrize(
+    "profiles",
+    [
+        pytest.param(
+            [
+                {
+                    "alias": "policies",
+                    "endpoint": "https://operator-private-marker.search.windows.net",
+                    "auth": "managed_identity",
+                    "indexes": "any",
+                },
+                {
+                    "alias": "policies",
+                    "endpoint": "https://operator-private-marker.search.windows.net",
+                    "auth": "managed_identity",
+                    "indexes": "any",
+                },
+            ],
+            id="duplicate-alias",
+        ),
+        pytest.param(
+            [{"alias": "policies", "endpoint": "https://operator-private-marker.search.windows.net", "auth": "managed_identity"}],
+            id="index-pin-absent",
+        ),
+    ],
+)
+def test_settings_from_env_rejects_invalid_azure_search_profiles_without_echoing_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    profiles: list[dict[str, object]],
+) -> None:
+    monkeypatch.setenv("ELSPETH_WEB__AZURE_SEARCH_PROFILES", json.dumps(profiles))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        web_config.settings_from_env()
+
+    assert "AZURE_SEARCH_PROFILES" in str(exc_info.value).upper()
+    assert "operator-private-marker" not in str(exc_info.value)
 
 
 def test_settings_from_env_rejects_duplicate_s3_profile_aliases_without_echoing_private_binding(
@@ -2257,3 +2469,75 @@ class TestInstanceId:
         monkeypatch.setenv("ELSPETH_WEB__INSTANCE_ID", "")
         with pytest.raises(ValidationError, match="instance_id"):
             web_config.settings_from_env()
+
+
+class TestWorkflowGovernanceSwitch:
+    def test_defaults_to_off(self) -> None:
+        assert _settings().workflow_governance == "off"
+
+    def test_accepts_on(self) -> None:
+        assert _settings(workflow_governance="on").workflow_governance == "on"
+
+    @pytest.mark.parametrize("value", ["true", "1", "ON", "yes", "", "enforce"])
+    def test_rejects_other_spellings(self, value: str) -> None:
+        with pytest.raises(ValidationError, match="Input should be 'off' or 'on'"):
+            _settings(workflow_governance=value)
+
+    @pytest.mark.usefixtures("required_web_env")
+    def test_settable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__WORKFLOW_GOVERNANCE", "on")
+        assert web_config.settings_from_env().workflow_governance == "on"
+
+    def test_open_local_governance_is_constructible_for_readiness(self) -> None:
+        settings = _settings(auth_provider="local", registration_mode="open", workflow_governance="on")
+        assert (settings.registration_mode, settings.workflow_governance) == ("open", "on")
+
+    def test_governance_without_compartment_is_constructible_for_readiness(self) -> None:
+        settings = _settings(registration_mode="closed", workflow_governance="on")
+        assert settings.compartment_id is None
+
+
+class TestCompartmentId:
+    @pytest.mark.parametrize("value", ["a", "0", "alpha", "compartment-a", "a" * 63])
+    def test_accepts_bounded_lowercase_shape(self, value: str) -> None:
+        assert _settings(compartment_id=value).compartment_id == value
+
+    @pytest.mark.parametrize("value", ["Alpha", "-alpha", "alpha_beta", "alpha beta", "alpha\n", "a" * 64])
+    def test_rejects_bad_shape(self, value: str) -> None:
+        with pytest.raises(ValidationError, match="compartment_id must match"):
+            _settings(compartment_id=value)
+
+
+class TestQuotaDefaultsWhenEnabled:
+    """Quotas on means a first personal cap can always be written.
+
+    A policy row stores tokens AND storage; an administrator sets one at a
+    time and the other comes from the deployment default. A half-configured
+    deployment therefore refuses every first cap for a reason nobody can fix
+    from the panel, so it must not start.
+    """
+
+    def test_no_quota_setting_at_all_is_quotas_off(self) -> None:
+        assert _settings().quotas_enabled is False
+
+    def test_both_defaults_is_quotas_on(self) -> None:
+        settings = _settings(quota_default_tokens_per_day=1000, quota_default_storage_bytes=2000)
+        assert settings.quotas_enabled is True
+
+    @pytest.mark.parametrize(
+        "partial",
+        [
+            {"quota_default_tokens_per_day": 1000},
+            {"quota_default_storage_bytes": 2000},
+            {"quota_container_tokens_per_day": 1000},
+            {"quota_container_storage_bytes": 2000},
+            {"quota_container_tokens_per_day": 1000, "quota_default_tokens_per_day": 10},
+        ],
+    )
+    def test_any_quota_setting_without_both_defaults_refuses_to_start(self, partial: dict[str, int]) -> None:
+        with pytest.raises(ValidationError, match="both quota_default_tokens_per_day and quota_default_storage_bytes must be set"):
+            _settings(**partial)
+
+    def test_a_container_ceiling_is_accepted_beside_both_defaults(self) -> None:
+        settings = _settings(quota_default_tokens_per_day=10, quota_default_storage_bytes=20, quota_container_tokens_per_day=1000)
+        assert settings.quotas_enabled is True

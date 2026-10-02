@@ -65,7 +65,8 @@ class TriggerEvaluator:
         self._last_triggered: Literal["count", "timeout", "condition"] | None = None
 
         # Track when each trigger first fired (for "first to fire wins" semantics)
-        # Per plugin-protocol.md:1211: "Multiple triggers can be combined (first one to fire wins)"
+        # Per docs/contracts/plugin-protocol.md §Trigger Types: "Multiple triggers
+        # can be combined (first one to fire wins)"
         self._count_fire_time: float | None = None
         self._condition_fire_time: float | None = None
         # Sorted durable arrival instants of every member fed through
@@ -178,7 +179,8 @@ class TriggerEvaluator:
                 }
                 result = self._condition_parser.evaluate(context)
                 # Defense-in-depth: reject non-boolean at runtime
-                # Per CLAUDE.md: "if bool(result)" coercion is forbidden for our data
+                # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier
+                # Trust Model: no coercion on our own data (no truthiness test)
                 if not isinstance(result, bool):
                     raise TypeError(
                         f"Trigger condition must return bool, got {type(result).__name__}: {result!r}. "
@@ -205,7 +207,8 @@ class TriggerEvaluator:
             }
             result = parser.evaluate(context)
             # Defense-in-depth: reject non-boolean at runtime
-            # Per CLAUDE.md: "if bool(result)" coercion is forbidden for our data
+            # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier
+            # Trust Model: no coercion on our own data (no truthiness test)
             if not isinstance(result, bool):
                 raise TypeError(
                     f"Trigger condition must return bool, got {type(result).__name__}: {result!r}. Expression: {parser.expression!r}"
@@ -268,7 +271,8 @@ class TriggerEvaluator:
                 }
                 result = self._condition_parser.evaluate(context)
                 # Defense-in-depth: reject non-boolean at runtime
-                # Per CLAUDE.md: "if bool(result)" coercion is forbidden for our data
+                # Per docs/guides/data-trust-and-error-handling.md §The Three-Tier
+                # Trust Model: no coercion on our own data (no truthiness test)
                 if not isinstance(result, bool):
                     raise TypeError(
                         f"Trigger condition must return bool, got {type(result).__name__}: {result!r}. "

@@ -1416,7 +1416,7 @@ def test_justify_operator_override_records_override_with_model_rationale(
 def test_justify_non_override_records_judge_model_verdict_as_none(tmp_path: Path) -> None:
     """Non-override ACCEPTED entries don't write judge_model_verdict.
 
-    Per the fabrication-decision test in CLAUDE.md: when the model's
+    An absent value stays absent rather than being fabricated: when the model's
     verdict and the entry's verdict agree, duplicating the model's
     verdict into a separate field would synthesise a divergence signal
     that doesn't exist. None / field-absent is the honest representation.
@@ -2587,7 +2587,8 @@ def test_provider_cache_accounting_rejects_impossible_bounds(
 def test_call_judge_distinguishes_cached_zero_from_cached_none() -> None:
     """Provider reported 0 hits != provider didn't report cached count at all.
 
-    Per the fabrication-decision test in CLAUDE.md: absence and zero are
+    Absence is evidence, and a fabricated zero is indistinguishable from a
+    measured zero: absence and zero are
     different facts. ``cached=0`` means caching was on but produced no
     hit (e.g. first call within a TTL window). ``cached=None`` means
     the provider didn't surface the field at all (older transport,

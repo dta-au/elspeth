@@ -37,20 +37,20 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [015](015-creates-tokens-contract.md) | Creates-Tokens Contract | - | **Accepted** |
 | [016](016-source-guaranteed-fields-contract.md) | Source Guaranteed Fields Contract | - | **Accepted** |
 | [017](017-sink-required-fields-contract.md) | Sink Required Fields Contract | - | **Accepted** |
-| [018](018-producer-site-outcome-discrimination.md) | Producer-Site Outcome Discrimination | 2026-05-02 | **Accepted** |
+| [018 (history)](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/architecture/adr/018-producer-site-outcome-discrimination.md) | Producer-Site Outcome Discrimination | 2026-05-02 | **Superseded** by [019](019-two-axis-terminal-model.md); preserved in `docs-archive/` |
 | [019](019-two-axis-terminal-model.md) | Two-Axis Terminal Model — Lifecycle, Outcome, and Path | 2026-05-04 | **Accepted** |
 | [020](020-retire-batch-llm-transforms.md) | Retire Batch-LLM Transforms (`azure_batch_llm`, `openrouter_batch_llm`) | 2026-05-06 | **Accepted** |
 | [021](021-sources-and-sinks-uniformly-boundary.md) | Sources and Sinks Are Uniformly Boundary by Architecture | 2026-05-18 | **Accepted** |
 | [022](022-shareable-reviews.md) | Shareable Reviews — Completion Gestures, Signed Tokens, and the Composer Completion Events Table | 2026-05-19 | **Accepted** |
 | [023](023-custom-python-ci-analyzer.md) | Custom Python Static Analyzer for ELSPETH-Specific CI Invariants (the `elspeth-lints` Package) | 2026-05-19 | **Accepted** |
-| [024](024-delivery-governance-for-single-maintainer-mode.md) | Delivery Governance for Single-Maintainer Mode | 2026-05-19 | **Accepted** |
+| [024 (history)](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/architecture/adr/024-delivery-governance-for-single-maintainer-mode.md) | Delivery Governance for Single-Maintainer Mode | 2026-05-19 | **Retired** — preserved in `docs-archive/`; current posture is in [GOVERNANCE.md](../../../GOVERNANCE.md) |
 | [025](025-multi-source-ingestion.md) | Multi-Source Ingestion — Source Surface Is Plural | 2026-05-23 | **Accepted** |
-| [026](026-durable-token-scheduler.md) | Durable Token Scheduler | 2026-05-23 | **Accepted** (with stated preconditions) |
+| [026](026-durable-token-scheduler.md) | Durable Token Scheduler | 2026-05-23 | **Accepted** |
 | [027](027-composer-operator-set-sampling.md) | Composer Sampling Is Operator-Set Configuration | 2026-06-04 | **Accepted** |
 | [028](028-queue-vs-coalesce-not-duplicates.md) | QUEUE and COALESCE Are Not Duplicates — Leave Them Separate | 2026-06-11 | **Accepted** |
 | [029](029-journal-is-barrier-buffer-truth.md) | Scheduler Journal Is the Single Source of Barrier-Buffer Truth | 2026-06-11 | **Accepted** |
 | [030](030-multi-worker-deployment-shape.md) | Multi-Worker Deployment Shape — One-Host WAL Pack | 2026-06-11 | **Accepted** |
-| [031](031-tutorial-is-a-fixed-script-canary.md) | The Tutorial Is a Fixed-Script Canary for the General Guided Surface | 2026-07-22 | **Accepted** |
+| [031](031-tutorial-is-a-fixed-script-canary.md) | The Tutorial Is a Fixed-Script Canary for Freeform Composer | 2026-09-28 | **Accepted** |
 | [032](032-validate-by-trust-domain.md) | Boundary Validation Splits by Trust Domain — Parse External Input, Nominally Type Internal Input | 2026-07-31 | **Accepted** |
 | [033](033-deferred-intent-admission-contract.md) | Deferred-Intent Admission Decides Closed Contradiction, Not Satisfiability | 2026-08-04 | **Accepted** |
 | [034](034-audited-inline-blob-content.md) | Audited Inline Blob Content | 2026-05-24 | **Accepted** |
@@ -62,10 +62,13 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [040](040-composer-runtime-validation-posture.md) | The Composer/Runtime Validation Posture — Soundness, Placement, and Per-Rule Authority | 2026-08-07 | **Accepted** |
 | [041](041-state-engine-supported-profiles.md) | State-Engine Supported Profiles | 2026-08-11 | **Accepted** |
 | [042](042-group-settlement-observability.md) | Group Settlement Vocabulary and Observability — One Closed Reason Set for Coalesce/Scope Settlement, One Lineage Read Authority | 2026-08-25 | **Accepted** |
-| [043](043-project-tooling.md) | Project Tooling — Filigree and Loomweave Only; Everything Else Ruled Out Until Superseded (folds the Wardline, Legis and Warpline retirements) | 2026-08-29 | **Accepted** |
+| [043](043-project-tooling.md) | Shared Development Tooling and GitHub Issues | 2026-08-29 | **Accepted** |
 | [046](046-audit-grade-is-a-product-characteristic.md) | Audit Grade Is a Product Characteristic, Not a Project One | 2026-08-29 | **Accepted** |
 | [047](047-landscape-database-clock-authority.md) | Landscape Database-Clock Authority — Custody, Liveness, Expiry and Takeover Decisions Read the Landscape Database's Clock | 2026-09-05 | **Accepted** |
 | [048](048-required-coordination-token-for-landscape-mutations.md) | Required Coordination Token for Landscape Mutations — Every Mutation API Takes One Current Token, Keyword-Only | 2026-09-06 | **Proposed** |
+| [049](049-tutorial-canary-baseline-is-configuration-relative.md) | The Tutorial Canary's Baseline Is Configuration-Relative, Not Byte-Fixed | 2026-09-28 | **Proposed** |
+| [050](050-transform-outputs-declare-sources-infer-and-lock.md) | Transform Outputs Declare, Sources Infer-and-Lock — Join Only at Multi-Producer Seams | 2026-09-25 | **Accepted** |
+| [051](051-a-template-sees-only-its-declared-fields.md) | A Template Sees Only Its Declared Fields | 2026-09-26 | **Accepted** |
 
 ## Status Definitions
 
@@ -73,6 +76,9 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 - **Accepted:** Decision has been made and is in effect
 - **Deprecated:** Decision is no longer recommended but still in use
 - **Superseded:** Decision has been replaced by a newer ADR
+- **Retired:** The record was not an architecture decision. The subject is
+  governed elsewhere, or was set outside this project; the file is kept as a
+  pointer so existing references resolve. No successor ADR.
 
 ## Creating a New ADR
 
@@ -86,4 +92,5 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 
 - [Architecture Overview](../overview.md)
 - [Requirements](../requirements.md)
-- [CLAUDE.md Guidelines](../../../CLAUDE.md)
+- [Contributing Guidelines](../../../CONTRIBUTING.md)
+- [Data Trust and Error Handling](../../guides/data-trust-and-error-handling.md)

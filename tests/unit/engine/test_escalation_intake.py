@@ -25,7 +25,9 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts import Token
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import CoalesceSettings
@@ -36,7 +38,33 @@ from elspeth.engine.coalesce_executor import CoalesceExecutor
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.tokens import TokenManager
 from tests.fixtures.factories import make_context
+from tests.fixtures.landscape import leader_coordination_token
 from tests.unit.engine.test_processor import _TEST_LEADER_WORKER_ID, _make_factory, _make_processor
+
+
+def _fork_tokens(factory: Any, parent: Token, branches: list[str], *, coordination_token: CoordinationToken) -> tuple[list[Token], str]:
+    """Create fork lineage under a real live item lease for the parent."""
+    member_token = coordination_token.membership
+    work_item = factory.scheduler.enqueue_ready_claimed(
+        member_token=member_token,
+        token_id=parent.token_id,
+        row_id=parent.row_id,
+        node_id=None,
+        step_index=0,
+        ingest_sequence=0,
+        row_payload_json="{}",
+        lease_owner=member_token.worker_id,
+        lease_seconds=60,
+        lineage_path=parent.lineage_path,
+    )
+    return factory.data_flow.fork_token(
+        TokenRef(token_id=parent.token_id, run_id=coordination_token.run_id),
+        parent.row_id,
+        branches,
+        member_token=member_token,
+        work_item=work_item,
+        parent_lineage_path=parent.lineage_path,
+    )
 
 
 class _UnusedCoalesceExecutor:
@@ -91,7 +119,8 @@ class _NestedIntakeHarness:
         return self.factory.scheduler.list_group_losses(run_id=self.run_id)
 
     def _terminalize(self, token_id: str) -> None:
-        self.factory.data_flow.record_token_outcome(
+        self.factory.data_flow.record_token_outcome_leader(
+            coordination_token=self.coordinator._require_coordination_token(),
             ref=TokenRef(token_id=token_id, run_id=self.run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
@@ -144,21 +173,28 @@ def nested_intake_harness():
     def _build(*, inner_policy: str = "require_all", outer_policy: str = "require_all", nesting: bool = True):
         run_id = "test-run"
         _db, factory = _make_factory(run_id=run_id)
-        row = factory.data_flow.create_row(run_id, "source-0", 0, {"value": 1}, source_row_index=0, ingest_sequence=0)
-        root = factory.data_flow.create_token(row.row_id)
+        coordination_token = leader_coordination_token(factory, run_id)
+        _, root = factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"value": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=coordination_token,
+        )
 
-        h = _NestedIntakeHarness(coordinator=None, factory=factory, run_id=run_id, ctx=make_context(run_id=run_id))
+        h = _NestedIntakeHarness(
+            coordinator=None,
+            factory=factory,
+            run_id=run_id,
+            ctx=make_context(run_id=run_id, coordination_token=coordination_token, member_token=coordination_token.membership),
+        )
 
         if nesting:
-            outer_children, outer_group_id = factory.data_flow.fork_token(
-                TokenRef(token_id=root.token_id, run_id=run_id), row.row_id, ["outer_a"]
-            )
+            outer_children, outer_group_id = _fork_tokens(factory, root, ["outer_a"], coordination_token=coordination_token)
             (outer_child,) = outer_children
-            inner_children, inner_group_id = factory.data_flow.fork_token(
-                TokenRef(token_id=outer_child.token_id, run_id=run_id),
-                row.row_id,
-                ["inner_1", "inner_2"],
-                parent_lineage_path=outer_child.lineage_path,
+            inner_children, inner_group_id = _fork_tokens(
+                factory, outer_child, ["inner_1", "inner_2"], coordination_token=coordination_token
             )
             outer_binding = GroupBinding(
                 kind=FrameKind.FORK,
@@ -193,9 +229,7 @@ def nested_intake_harness():
             h.inner_closer_name = "inner_closer"
             h.inner_member_tokens = {child.lineage_path[-1].member_key: child.token_id for child in inner_children}
         else:
-            solo_children, solo_group_id = factory.data_flow.fork_token(
-                TokenRef(token_id=root.token_id, run_id=run_id), row.row_id, ["solo_1", "solo_2"]
-            )
+            solo_children, solo_group_id = _fork_tokens(factory, root, ["solo_1", "solo_2"], coordination_token=coordination_token)
             solo_binding = GroupBinding(
                 kind=FrameKind.FORK,
                 opener_node_id=NodeID("solo-opener"),
@@ -310,17 +344,19 @@ def test_staged_escalation_replays_and_settles_the_enclosing_closer_on_next_pass
     uses before calling `notify_branch_lost`."""
     run_id = "test-run"
     _db, factory = _make_factory(run_id=run_id)
-    row = factory.data_flow.create_row(run_id, "source-0", 0, {"value": 1}, source_row_index=0, ingest_sequence=0)
-    root = factory.data_flow.create_token(row.row_id)
-
-    outer_children, outer_group_id = factory.data_flow.fork_token(TokenRef(token_id=root.token_id, run_id=run_id), row.row_id, ["outer_a"])
-    (outer_child,) = outer_children
-    inner_children, inner_group_id = factory.data_flow.fork_token(
-        TokenRef(token_id=outer_child.token_id, run_id=run_id),
-        row.row_id,
-        ["inner_1", "inner_2"],
-        parent_lineage_path=outer_child.lineage_path,
+    coordination_token = leader_coordination_token(factory, run_id)
+    _, root = factory.data_flow.create_row_with_token(
+        "source-0",
+        0,
+        {"value": 1},
+        source_row_index=0,
+        ingest_sequence=0,
+        coordination_token=coordination_token,
     )
+
+    outer_children, outer_group_id = _fork_tokens(factory, root, ["outer_a"], coordination_token=coordination_token)
+    (outer_child,) = outer_children
+    inner_children, inner_group_id = _fork_tokens(factory, outer_child, ["inner_1", "inner_2"], coordination_token=coordination_token)
 
     outer_binding = GroupBinding(
         kind=FrameKind.FORK,
@@ -384,13 +420,14 @@ def test_staged_escalation_replays_and_settles_the_enclosing_closer_on_next_pass
         coalesce_node_ids=coalesce_node_ids,
         scheduler_lease_owner=_TEST_LEADER_WORKER_ID,
     )
-    ctx = make_context(run_id=run_id)
+    ctx = make_context(run_id=run_id, coordination_token=coordination_token, member_token=coordination_token.membership)
 
     # Fail the inner group and settle all its members (identical to the
     # single-pass tests above).
     proc._barrier_intake.note_group_failed(closer_name="inner_closer", group_id=inner_group_id, reason="quarantined")
     for child in inner_children:
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
+            coordination_token=coordination_token,
             ref=TokenRef(token_id=child.token_id, run_id=run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
@@ -423,4 +460,7 @@ def test_staged_escalation_replays_and_settles_the_enclosing_closer_on_next_pass
     # completed-keys/Landscape dedup check would miss under the wrong key,
     # as it did before this fix (the group settled under outer_group_id,
     # a lookup by row_id would find nothing and re-run the loss).
-    assert outer_executor.notify_branch_lost("outer_closer", outer_group_id, "outer_a", "group_failed") is None
+    assert (
+        outer_executor.notify_branch_lost("outer_closer", outer_group_id, "outer_a", "group_failed", coordination_token=coordination_token)
+        is None
+    )

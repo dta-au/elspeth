@@ -162,8 +162,8 @@ describe("the app-dialog primitive (elspeth-e6fcd8d703)", () => {
   });
 
   it("keeps the settings-dialog closures to per-dialog decisions only", () => {
-    // The three settings dialogs (SecretsPanel, UserAdminDialog,
-    // ComposerPreferencesPanel) compose .app-dialog in their TSX; their
+    // The settings-family dialogs (SecretsPanel, ComposerPreferencesPanel,
+    // People & access, mailbox, library) compose .app-dialog in their TSX; their
     // closures may decide width and content scale, nothing more.
     // Re-declaring chrome in a closure forks the primitive the moment a
     // token moves — the exact pathology their inline style objects had.

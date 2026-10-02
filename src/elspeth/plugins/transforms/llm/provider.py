@@ -18,23 +18,50 @@ via their Audited*Client (D2 from architecture remediation).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, TypedDict, runtime_checkable
 
-from elspeth.contracts import Call, CallStatus, CallType
+from elspeth.contracts import Call, CallStatus, CallType, RunMode
 from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.contracts.call_data import CallPayload
+from elspeth.contracts.call_mode import CallModeSession
 from elspeth.contracts.chat_parts import ChatMessage
-from elspeth.contracts.token_usage import TokenUsage
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+
+
+@observation_boundary(
+    tier=3,
+    source="HTTP LLM response body before strict completion validation",
+    source_param="body",
+    suppresses=("R1", "R5"),
+    invariant="Malformed JSON or absent usage remains unknown; valid counters are retained even when completion content is refused.",
+)
+def observe_http_token_usage(body: bytes) -> TokenUsage:
+    """Preserve consumed tokens independently of completion admissibility."""
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeError, RecursionError):
+        return UNKNOWN_TOKEN_USAGE
+    if not isinstance(data, dict):
+        return UNKNOWN_TOKEN_USAGE
+    return TokenUsage.from_dict(data.get("usage"))
 
 
 class _AuditClientKwargs(TypedDict):
     state_id: str | None
     token_id: str | None
     operation_id: str | None
+    coordination_token: CoordinationToken | None
+    member_token: WorkerMembershipToken | None
+    work_item: TokenWorkItem | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +71,9 @@ class LLMAuditParent:
     state_id: str | None = None
     token_id: str | None = None
     operation_id: str | None = None
+    coordination_token: CoordinationToken | None = None
+    member_token: WorkerMembershipToken | None = None
+    work_item: TokenWorkItem | None = None
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -64,12 +94,27 @@ class LLMAuditParent:
             raise ValueError("operation audit parent requires a non-empty operation_id")
 
     @classmethod
-    def for_row(cls, *, state_id: str, token_id: str) -> LLMAuditParent:
-        return cls(state_id=state_id, token_id=token_id)
+    def for_row(cls, *, state_id: str, token_id: str, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> LLMAuditParent:
+        return cls(state_id=state_id, token_id=token_id, member_token=member_token, work_item=work_item)
 
     @classmethod
-    def for_operation(cls, *, operation_id: str) -> LLMAuditParent:
-        return cls(operation_id=operation_id)
+    def for_operation(cls, *, operation_id: str, coordination_token: CoordinationToken) -> LLMAuditParent:
+        return cls(operation_id=operation_id, coordination_token=coordination_token)
+
+    def _require_coordination_token(self) -> CoordinationToken:
+        if not isinstance(self.coordination_token, CoordinationToken):
+            raise RuntimeError("LLM operation audit parent lacks leader authority")
+        return self.coordination_token
+
+    def _require_member_token(self) -> WorkerMembershipToken:
+        if not isinstance(self.member_token, WorkerMembershipToken):
+            raise RuntimeError("LLM row audit parent lacks member authority")
+        return self.member_token
+
+    def _require_work_item(self) -> TokenWorkItem:
+        if not isinstance(self.work_item, TokenWorkItem):
+            raise RuntimeError("LLM row audit parent lacks its claimed work item")
+        return self.work_item
 
     @property
     def cache_key(self) -> str:
@@ -84,6 +129,9 @@ class LLMAuditParent:
             "state_id": self.state_id,
             "token_id": self.token_id,
             "operation_id": self.operation_id,
+            "coordination_token": self.coordination_token,
+            "member_token": self.member_token,
+            "work_item": self.work_item,
         }
 
     def tracing_metadata(self) -> dict[str, str]:
@@ -97,10 +145,10 @@ class LLMAuditParent:
     def allocate_call_index(self, recorder: CallRecorder) -> int:
         """Allocate the next semantic-call index under this parent."""
         if self.operation_id is not None:
-            return recorder.allocate_operation_call_index(self.operation_id)
+            return recorder.allocate_operation_call_index(self.operation_id, coordination_token=self._require_coordination_token())
         if self.state_id is None:
             raise RuntimeError("validated row parent lost state_id")
-        return recorder.allocate_call_index(self.state_id)
+        return recorder.allocate_call_index(self.state_id, member_token=self._require_member_token(), work_item=self._require_work_item())
 
     def record_call(
         self,
@@ -113,11 +161,38 @@ class LLMAuditParent:
         response_data: CallPayload | None = None,
         error: CallPayload | None = None,
         latency_ms: float | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        call_mode_session: CallModeSession | None = None,
     ) -> Call:
         """Record a semantic call under this validated parent."""
+        source_call_id: str | None = None
+        if call_mode_session is not None and call_mode_session.mode is RunMode.REPLAY:
+            evidence = call_mode_session.replay_call(
+                call_type=call_type,
+                request_data=request_data.to_dict(),
+                current_state_id=self.state_id,
+                current_operation_id=self.operation_id,
+                current_call_index=call_index,
+            )
+            actual_response = None if response_data is None else response_data.to_dict()
+            actual_error = None if error is None else error.to_dict()
+            recorded_response = None if evidence.response_data is None else deep_thaw(evidence.response_data)
+            recorded_error = None if evidence.error_data is None else deep_thaw(evidence.error_data)
+            if evidence.status is not status or recorded_response != actual_response or recorded_error != actual_error:
+                raise AuditIntegrityError("Replayed semantic LLM response differs from its source call")
+            source_call_id = evidence.source_call_id
+        if call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY:
+            call_mode_session.admit_verify_call(
+                call_type=call_type,
+                request_data=request_data.to_dict(),
+                current_state_id=self.state_id,
+                current_operation_id=self.operation_id,
+                current_call_index=call_index,
+            )
         if self.operation_id is not None:
-            return recorder.record_operation_call(
+            call = recorder.record_operation_call(
+                coordination_token=self._require_coordination_token(),
                 operation_id=self.operation_id,
                 call_index=call_index,
                 call_type=call_type,
@@ -126,21 +201,41 @@ class LLMAuditParent:
                 response_data=response_data,
                 error=error,
                 latency_ms=latency_ms,
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+                token_usage=token_usage,
+                source_call_id=source_call_id,
             )
-        if self.state_id is None:
-            raise RuntimeError("validated row parent lost state_id")
-        return recorder.record_call(
-            state_id=self.state_id,
-            call_index=call_index,
-            call_type=call_type,
-            status=status,
-            request_data=request_data,
-            response_data=response_data,
-            error=error,
-            latency_ms=latency_ms,
-            resolved_prompt_template_hash=resolved_prompt_template_hash,
-        )
+        else:
+            if self.state_id is None:
+                raise RuntimeError("validated row parent lost state_id")
+            call = recorder.record_call(
+                member_token=self._require_member_token(),
+                work_item=self._require_work_item(),
+                state_id=self.state_id,
+                call_index=call_index,
+                call_type=call_type,
+                status=status,
+                request_data=request_data,
+                response_data=response_data,
+                error=error,
+                latency_ms=latency_ms,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
+                token_usage=token_usage,
+                source_call_id=source_call_id,
+            )
+        if call_mode_session is not None and call_mode_session.mode is RunMode.VERIFY:
+            call_mode_session.verify_call(
+                call_type=call_type,
+                request_data=request_data.to_dict(),
+                current_state_id=self.state_id,
+                current_operation_id=self.operation_id,
+                current_call_index=call_index,
+                current_call_id=call.call_id,
+                live_status=status,
+                live_response_data=None if response_data is None else response_data.to_dict(),
+                live_error_data=None if error is None else error.to_dict(),
+            )
+        return call
 
 
 class FinishReason(StrEnum):
@@ -332,13 +427,13 @@ class LLMProvider(Protocol):
         messages: Sequence[ChatMessage],
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult: ...
 
-    def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Validate provider/model reachability before row processing."""
         ...
 

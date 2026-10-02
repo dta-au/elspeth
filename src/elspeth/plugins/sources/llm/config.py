@@ -4,20 +4,24 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Literal
 
-from jinja2.meta import find_undeclared_variables
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts.identifiers import validate_field_name
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
-from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment
+from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.llm.config_validation import (
     AZURE_MODEL_VALUE_SOURCES,
+    BEDROCK_ACCESS_KEY_ID_MAX_LENGTH,
+    BEDROCK_API_KEY_MAX_LENGTH,
+    BEDROCK_CREDENTIAL_MIN_LENGTH,
     BEDROCK_MODEL_MAX_LENGTH,
     BEDROCK_MODEL_MIN_LENGTH,
     BEDROCK_REGION_MAX_LENGTH,
     BEDROCK_REGION_MIN_LENGTH,
     BEDROCK_REGION_PATTERN,
+    BEDROCK_SECRET_ACCESS_KEY_MAX_LENGTH,
+    BEDROCK_SESSION_TOKEN_MAX_LENGTH,
     BEDROCK_VALUE_SOURCES,
     GATEWAY_MAX_TOKENS_LIMIT,
     GATEWAY_MAX_TOKENS_MIN_EXCLUSIVE,
@@ -29,7 +33,9 @@ from elspeth.plugins.llm.config_validation import (
     OPENROUTER_BASE_URL,
     OPENROUTER_MODEL_VALUE_SOURCES,
     derive_azure_model,
+    validate_azure_api_version,
     validate_azure_endpoint,
+    validate_bedrock_credential_fields,
     validate_bedrock_model,
     validate_gateway_capabilities,
     validate_gateway_contract_major,
@@ -52,9 +58,25 @@ class LLMSourceConfig(DataPluginConfig):
 
     provider: Literal["azure", "openrouter", "bedrock", "gateway"] = Field(..., description="LLM provider")
     model: str | None = Field(default=None, description="Model identifier")
+    pricing_model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=512,
+        pattern=r"\S",
+        strict=True,
+        description="LiteLLM catalog identity for audit costing; never changes endpoint routing",
+    )
     prompt_template: str = Field(..., description="Static Jinja2 prompt template")
     system_prompt: str | None = Field(default=None, description="Optional system prompt")
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="Sampling temperature")
+    temperature: float | None = Field(
+        default=0.0,
+        ge=0.0,
+        le=2.0,
+        description=(
+            "Sampling temperature. Set to null to omit it from the request so the provider default applies — "
+            "required for reasoning deployments, which reject any explicit temperature"
+        ),
+    )
     max_tokens: int | None = Field(default=None, gt=0, description="Maximum tokens in response")
     response_field: str = Field(default="llm_response", description="Field name for LLM response in output")
 
@@ -96,7 +118,7 @@ class LLMSourceConfig(DataPluginConfig):
             raise ValueError(f"Invalid Jinja2 template: {exc}") from exc
 
         environment = create_sandboxed_environment()
-        names = find_undeclared_variables(environment.parse(value))
+        names = find_runtime_unbound_variables(environment.parse(value))
         unsupported = sorted(names - _SOURCE_PROMPT_CONTEXT_NAMES - _SOURCE_PROMPT_GLOBAL_NAMES)
         if unsupported:
             raise ValueError(
@@ -163,9 +185,15 @@ class AzureOpenAILLMSourceConfig(LLMSourceConfig):
 
     provider: Literal["azure"] = Field(default="azure", description="LLM provider")
     model: str = Field(default="", description="Model identifier (defaults to deployment_name)")
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature. Omitted or null uses the deployment default; set explicitly for deployments supporting sampling.",
+    )
     deployment_name: str = Field(..., description="Azure deployment name")
     endpoint: str = Field(..., description="Azure OpenAI endpoint URL")
-    api_key: str = Field(..., description="Azure OpenAI API key")
+    api_key: str = Field(..., description="Azure OpenAI API key", repr=False)
     api_version: str = Field(default="2024-10-21", description="Azure API version")
     tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
 
@@ -173,6 +201,11 @@ class AzureOpenAILLMSourceConfig(LLMSourceConfig):
     @classmethod
     def _validate_endpoint_url(cls, value: str) -> str:
         return validate_azure_endpoint(value)
+
+    @field_validator("api_version")
+    @classmethod
+    def _validate_api_version(cls, value: str) -> str:
+        return validate_azure_api_version(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -201,7 +234,7 @@ class OpenRouterLLMSourceConfig(LLMSourceConfig):
 
 
 class BedrockLLMSourceConfig(LLMSourceConfig):
-    """Keyless LiteLLM Bedrock settings for one source request."""
+    """LiteLLM Bedrock settings for one source request; the AWS default chain unless a credential is wired."""
 
     provider: Literal["bedrock"] = Field(default="bedrock", description="LLM provider")
     model: str = Field(
@@ -217,12 +250,50 @@ class BedrockLLMSourceConfig(LLMSourceConfig):
         pattern=BEDROCK_REGION_PATTERN,
         description="AWS region override; default AWS region resolution otherwise",
     )
+    api_key: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_API_KEY_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved Amazon Bedrock API key (bearer token); mutually exclusive with the static AWS credential pair.",
+    )
+    aws_access_key_id: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_ACCESS_KEY_ID_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved AWS access-key identifier; required together with aws_secret_access_key.",
+    )
+    aws_secret_access_key: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_SECRET_ACCESS_KEY_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved AWS secret access key; required together with aws_access_key_id.",
+    )
+    aws_session_token: str | None = Field(
+        default=None,
+        min_length=BEDROCK_CREDENTIAL_MIN_LENGTH,
+        max_length=BEDROCK_SESSION_TOKEN_MAX_LENGTH,
+        repr=False,
+        description="Optional resolved AWS session token for temporary static credentials.",
+    )
     tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
 
     @field_validator("model")
     @classmethod
     def _require_bedrock_prefix(cls, value: str) -> str:
         return validate_bedrock_model(value)
+
+    @model_validator(mode="after")
+    def _validate_credentials(self) -> BedrockLLMSourceConfig:
+        validate_bedrock_credential_fields(
+            api_key=self.api_key,
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            aws_session_token=self.aws_session_token,
+        )
+        return self
 
     VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = BEDROCK_VALUE_SOURCES
 

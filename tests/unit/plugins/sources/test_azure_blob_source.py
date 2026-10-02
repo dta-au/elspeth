@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 from azure.core.exceptions import AzureError
 
+from elspeth.contracts import CallStatus
+from elspeth.contracts.enums import RunMode
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from tests.fixtures.factories import make_operation_context
@@ -70,6 +75,7 @@ class _SourceContextFake:
     run_id: str = "test-run"
     node_id: str | None = "source"
     operation_id: str | None = "operation-001"
+    call_mode_session: Any = None
     landscape: Any = None
     telemetry_emit: _CallRecorder = field(default_factory=_CallRecorder)
     record_call: _CallRecorder = field(default_factory=_CallRecorder)
@@ -79,9 +85,14 @@ class _SourceContextFake:
 @dataclass(slots=True)
 class _BlobDownloadFake:
     data: object
+    offset: int = 0
 
-    def readall(self) -> object:
-        return self.data
+    def read(self, size: int) -> object:
+        if type(self.data) is not bytes:
+            return self.data
+        chunk = self.data[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
 
 
 @dataclass(slots=True)
@@ -758,6 +769,18 @@ class TestAzureBlobSourceJSONL:
         assert rows[0].row == {"id": 1, "name": "alice"}
         assert rows[1].row["name"] == "bob"
 
+    def test_unsafe_integer_quarantines_and_next_line_survives(self, ctx: PluginContext) -> None:
+        """H1 (lane 5887): an integer outside ±(2**53-1) is quarantined, value-free, not passed as valid."""
+        blob_bytes = b'{"id": 1, "n": 9007199254740993}\n{"id": 2, "n": 5}\n'
+        source = _make_source(_base_config(format="jsonl"))
+
+        with patch(PATCH_AUTH, return_value=_fake_blob_service(blob_bytes)):
+            rows = list(source.load(ctx))
+
+        assert rows[0].is_quarantined
+        assert rows[0].quarantine_error == "1 validation error: <root>: [non_canonical_number]"
+        assert rows[1].row == {"id": 2, "n": 5}
+
     def test_skips_empty_lines(self, ctx: PluginContext) -> None:
         """JSONL skips blank lines."""
         blob_bytes = b'{"id": 1}\n\n{"id": 2}\n\n'
@@ -877,6 +900,8 @@ class TestAzureBlobSourceSchemaValidation:
 
         assert len(rows) == 1
         assert rows[0].is_quarantined is True
+        # The declared field keeps its name; the value and pydantic's msg never appear.
+        assert rows[0].quarantine_error == "1 validation error: id: [int_parsing]"
 
     def test_flexible_schema_locks_on_first_row(self, ctx: PluginContext) -> None:
         """Flexible schema locks contract after first valid row."""
@@ -1015,6 +1040,92 @@ class TestAzureBlobSourceAuditAndErrors:
     def ctx(self) -> PluginContext:
         return make_operation_context(plugin_name="azure_blob")
 
+    @pytest.mark.parametrize("reason", ["missing", "ambiguous"])
+    def test_verify_refuses_source_call_before_blob_client_construction(self, reason: str) -> None:
+        source = _make_source(_base_config())
+        ctx = _SourceContextFake()
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_request(self, **_kwargs: Any) -> str:
+                raise AuditIntegrityError(f"source call {reason}")
+
+        ctx.call_mode_session = _VerifySession()
+        with (
+            patch(PATCH_AUTH, side_effect=AssertionError("blob SDK client constructed")),
+            pytest.raises(AuditIntegrityError, match=f"source call {reason}"),
+        ):
+            list(source.load(ctx))
+
+        assert ctx.record_call.call_count == 0
+
+    def test_verify_admits_before_download_and_persists_call_decision(self) -> None:
+        source = _make_source(_base_config())
+        ctx = _SourceContextFake()
+        ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=3, call_id="current-call"))
+        events: list[str] = []
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_request(self, **kwargs: Any) -> str:
+                assert kwargs["current_operation_id"] == "operation-001"
+                assert kwargs["request_data"]["operation"] == "download_blob"
+                events.append("preflight")
+                return "source-call"
+
+            def admit_verify_call(self, **kwargs: Any) -> str:
+                assert kwargs["current_call_index"] is None
+                events.append("admit")
+                return "source-call"
+
+            def verify_call(self, **kwargs: Any) -> None:
+                assert kwargs["current_call_index"] == 3
+                assert kwargs["current_call_id"] == "current-call"
+                assert kwargs["live_status"].value == "success"
+                events.append("verify")
+
+        ctx.call_mode_session = _VerifySession()
+
+        def create_service(*_args: Any, **_kwargs: Any) -> Any:
+            assert events == ["preflight", "admit"]
+            events.append("client")
+            return _fake_blob_service(b"id,name\n1,Ada\n")
+
+        with patch(PATCH_AUTH, side_effect=create_service):
+            rows = list(source.load(ctx))
+
+        assert len(rows) == 1
+        assert events == ["preflight", "admit", "client", "verify"]
+
+    def test_verify_persists_download_error_decision(self) -> None:
+        source = _make_source(_base_config())
+        ctx = _SourceContextFake()
+        ctx.record_call = _CallRecorder(return_value=SimpleNamespace(call_index=2, call_id="current-error"))
+        verdicts: list[Any] = []
+
+        class _VerifySession:
+            mode = RunMode.VERIFY
+
+            def preflight_verify_request(self, **_kwargs: Any) -> str:
+                return "source-error"
+
+            def admit_verify_call(self, **_kwargs: Any) -> str:
+                return "source-error"
+
+            def verify_call(self, **kwargs: Any) -> None:
+                verdicts.append(kwargs)
+
+        ctx.call_mode_session = _VerifySession()
+        fake_service = _fake_blob_service(download_error=AzureError("connection refused"))
+        with patch(PATCH_AUTH, return_value=fake_service), pytest.raises(RuntimeError, match="Failed to download blob"):
+            list(source.load(ctx))
+        assert ctx.record_call.call_count == 1
+        assert verdicts[0]["live_status"] is CallStatus.ERROR
+        assert verdicts[0]["live_error_data"] == {"type": "AzureError"}
+        assert verdicts[0]["current_call_index"] == 2
+
     def test_download_failure_raises_runtime_error(self, ctx: PluginContext) -> None:
         """Azure download failure raises RuntimeError."""
         source = _make_source(_base_config())
@@ -1083,6 +1194,30 @@ class TestAzureBlobSourceAuditAndErrors:
             list(source.load(ctx))
         assert ctx.record_call.call_count == 0
 
+    def test_download_limit_rejects_oversized_blob_before_parsing(self) -> None:
+        source = _make_source(_base_config(max_object_bytes=5))
+        ctx = _SourceContextFake()
+
+        with patch(PATCH_AUTH, return_value=_fake_blob_service(b"id\n123\n")), pytest.raises(RuntimeError, match="Failed to download blob"):
+            list(source.load(ctx))
+
+        ctx.record_call.assert_called_once()
+        call = ctx.record_call.call_args.kwargs
+        assert call["status"].value == "error"
+        assert call["error"] == {"type": "AzureBlobSizeLimitExceeded"}
+
+    def test_download_at_limit_records_distinct_hashes_for_equal_size_blobs(self) -> None:
+        responses: list[dict[str, Any]] = []
+        for data in (b"id\n1\n", b"id\n2\n"):
+            source = _make_source(_base_config(max_object_bytes=len(data)))
+            ctx = _SourceContextFake()
+            with patch(PATCH_AUTH, return_value=_fake_blob_service(data)):
+                list(source.load(ctx))
+            responses.append(ctx.record_call.call_args.kwargs["response_data"])
+
+        assert responses[0]["size_bytes"] == responses[1]["size_bytes"] == 5
+        assert responses[0]["content_hash"] != responses[1]["content_hash"]
+
     @pytest.mark.parametrize(
         ("blob_format", "blob_path", "blob_bytes"),
         [
@@ -1116,7 +1251,10 @@ class TestAzureBlobSourceAuditAndErrors:
             "container": "test-container",
             "blob_path": blob_path,
         }
-        assert call_kwargs["response_data"] == {"size_bytes": len(blob_bytes)}
+        assert call_kwargs["response_data"] == {
+            "size_bytes": len(blob_bytes),
+            "content_hash": hashlib.sha256(blob_bytes).hexdigest(),
+        }
         assert call_kwargs["provider"] == "azure_blob_storage"
 
     def test_field_resolution_returned_for_csv(self, ctx: PluginContext) -> None:

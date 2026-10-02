@@ -32,8 +32,9 @@ from elspeth.web.composer.tutorial_service import (
     _tutorial_launch_blocker,
 )
 from elspeth.web.config import WebSettings
-from elspeth.web.sessions.protocol import RunRecord
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from elspeth.web.sessions.protocol import RunRecord, SessionRunStatus
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 from tests.helpers.session_fences import RecordingSessionOperationAuthority, make_execute_context
 
 
@@ -158,9 +159,8 @@ def _make_tutorial_settings(data_dir: Path, **overrides: Any) -> WebSettings:
 def test_launch_blocker_names_empty_transforms_distinctly() -> None:
     """A committed source→sink pipeline with NO nodes gets its own blocker.
 
-    Regression for tutorial run 18 (session 07e8a3a8, committed v11): a guided
-    walk that accepts the step-3 auto-proposal without the transforms
-    instruction commits a valid source→sink passthrough, and the launch gate
+    A source→sink passthrough can be valid composition but lacks the
+    transforms required by this tutorial. The launch gate
     rejected it with the generic plugin-set message — indistinguishable from a
     wrong-plugin build. Emptiness is a distinct, actionable state: name it.
     """
@@ -374,6 +374,11 @@ async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved
             state_id = approved_state_id if current_state_reads == 1 else newer_state_id
             return SimpleNamespace(id=state_id)
 
+        async def list_interpretation_events(self, _session_id: Any, *, status: str, composition_state_id: Any) -> list[Any]:
+            assert status == "pending"
+            assert composition_state_id == approved_state_id
+            return []
+
         async def get_run(self, requested_run_id: Any) -> Any:
             assert requested_run_id == run_id
             return SimpleNamespace(status="cancelled")
@@ -436,7 +441,13 @@ async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved
 
 
 @pytest.mark.asyncio
-async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("status", "rows_succeeded"),
+    [("failed", 0), ("completed_with_failures", 0), ("empty", 0), ("completed", 0), ("completed_with_failures", 1)],
+)
+async def test_failed_live_tutorial_run_response_omits_raw_run_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: SessionRunStatus, rows_succeeded: int
+) -> None:
     run_id = uuid4()
     session_id = uuid4()
     state_id = uuid4()
@@ -463,23 +474,40 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: P
                 id=run_id,
                 session_id=session_id,
                 state_id=state_id,
-                status="failed",
+                status=status,
                 started_at=now,
                 finished_at=now,
-                rows_processed=0,
-                rows_succeeded=0,
-                rows_failed=0,
+                rows_processed=3 + rows_succeeded if status == "completed_with_failures" else 0,
+                rows_succeeded=rows_succeeded,
+                rows_failed=3 if status == "completed_with_failures" else 0,
                 rows_routed_success=0,
                 rows_routed_failure=0,
                 rows_quarantined=0,
                 error=sentinel_error,
-                landscape_run_id=None,
+                landscape_run_id=None if status == "failed" else "audited-zero-output-run",
                 pipeline_yaml=None,
             )
 
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(execution_service=FakeExecutionService())))
     settings = _make_tutorial_settings(tmp_path)
     user = SimpleNamespace(user_id="tutorial-user")
+
+    def project_missing_artifacts(*args: Any, **kwargs: Any) -> Any:
+        return _rows_from_artifacts([], data_dir=tmp_path, run_id=str(run_id), session_id=str(session_id))
+
+    monkeypatch.setattr(tutorial_service_module, "_project_live_tutorial_output", project_missing_artifacts)
+
+    if status == "completed" or rows_succeeded > 0:
+        with pytest.raises(TutorialRunIntegrityError, match="no row-bearing artifact"):
+            await tutorial_service_module._run_live_tutorial(
+                request=request,
+                user=user,
+                session_id=session_id,
+                state_id=state_id,
+                settings=settings,
+                session_service=FakeSessionService(),
+            )
+        return
 
     with pytest.raises(HTTPException) as exc_info:
         await tutorial_service_module._run_live_tutorial(
@@ -491,11 +519,17 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: P
             session_service=FakeSessionService(),
         )
 
-    assert exc_info.value.status_code == 500
+    assert exc_info.value.status_code == (500 if status == "failed" else 409)
     detail = exc_info.value.detail
     assert detail["error_type"] == "tutorial_live_run_failed"
-    assert detail["status"] == "failed"
-    assert detail["detail"] == "The tutorial run did not complete successfully."
+    assert detail["status"] == status
+    if status == "failed":
+        assert detail["detail"] == "The tutorial run did not complete successfully."
+    else:
+        assert detail["run_id"] == str(run_id)
+        assert detail["rows_succeeded"] == 0
+        assert detail["rows_failed"] == (3 if status == "completed_with_failures" else 0)
+        assert "no output rows" in detail["detail"]
     assert sentinel_error not in repr(detail)
 
 
@@ -503,8 +537,7 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(tmp_path: P
 async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tmp_path: Path) -> None:
     """An unresolved interpretation review is a coded launch blocker, not a 500.
 
-    Session e1332b5a: the guided walk completed but the committed llm node
-    still carried a pending ``llm_prompt_template`` review, so
+    A committed llm node can still carry a pending ``llm_prompt_template`` review, so
     ``execution_service.execute`` raised
     ``UnresolvedInterpretationPlaceholderError`` — which the tutorial route
     surfaced as a raw 500 (and the run-turn UI rendered an EMPTY alert for the
@@ -560,6 +593,48 @@ async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tm
     assert detail["code"] == "tutorial_interpretations_pending"
     assert "review" in detail["detail"].lower()
     assert "SENTINEL_NODE_ID" not in repr(detail)
+
+
+@pytest.mark.asyncio
+async def test_readiness_refuses_pending_interpretations_before_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    session_id = uuid4()
+    state_id = uuid4()
+
+    class FakeSessionService:
+        async def get_current_state(self, requested_session_id: Any) -> Any:
+            assert requested_session_id == session_id
+            return SimpleNamespace(id=state_id)
+
+        async def list_interpretation_events(self, requested_session_id: Any, *, status: str, composition_state_id: Any) -> list[Any]:
+            assert requested_session_id == session_id
+            assert status == "pending"
+            assert composition_state_id == state_id
+            return [SimpleNamespace(id=uuid4())]
+
+    monkeypatch.setattr(tutorial_service_module, "state_from_record", lambda _record: SimpleNamespace())
+    monkeypatch.setattr(tutorial_service_module, "_tutorial_launch_blocker", lambda **_kwargs: None)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                plugin_snapshot_factory=lambda _user: SimpleNamespace(),
+                web_plugin_policy=SimpleNamespace(),
+                operator_profile_registry=SimpleNamespace(),
+                catalog_service=SimpleNamespace(),
+            )
+        )
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await tutorial_service_module._require_tutorial_launch_readiness(
+            request=request,
+            user=SimpleNamespace(user_id="tutorial-user"),
+            session_id=session_id,
+            settings=_make_tutorial_settings(tmp_path),
+            session_service=FakeSessionService(),
+        )
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail["code"] == "tutorial_interpretations_pending"
 
 
 @pytest.mark.asyncio
@@ -687,8 +762,9 @@ def test_count_calls_for_run_counts_only_llm_calls() -> None:
     schema_config = SchemaConfig.from_dict({"mode": "observed"})
     run_id = "run-llm-count"
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
+    coordination = leader_coordination_token(factory, run_id)
     source_node = factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=coordination,
         plugin_name="inline_blob",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -696,7 +772,7 @@ def test_count_calls_for_run_counts_only_llm_calls() -> None:
         schema_config=schema_config,
     )
     transform_node = factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=coordination,
         plugin_name="llm_rate",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
@@ -704,7 +780,7 @@ def test_count_calls_for_run_counts_only_llm_calls() -> None:
         schema_config=schema_config,
     )
     _row, token = factory.data_flow.create_row_with_token(
-        run_id=run_id,
+        coordination_token=coordination,
         source_node_id=source_node.node_id,
         row_index=0,
         source_row_index=0,
@@ -714,14 +790,14 @@ def test_count_calls_for_run_counts_only_llm_calls() -> None:
     state = factory.execution.record_completed_node_state(
         token_id=token.token_id,
         node_id=transform_node.node_id,
-        run_id=run_id,
+        coordination_token=coordination,
         step_index=1,
         input_data={"url": "https://example.gov"},
         output_data={"rating": 5},
         duration_ms=1.0,
     )
     operation = factory.execution.begin_operation(
-        run_id=run_id,
+        coordination_token=coordination,
         node_id=source_node.node_id,
         operation_type="source_load",
     )
@@ -736,8 +812,8 @@ def test_count_calls_for_run_counts_only_llm_calls() -> None:
                     call_index=0 if call_type is CallType.LLM else 1,
                     call_type=call_type.value,
                     status=CallStatus.SUCCESS.value,
-                    request_hash=f"{call_id}-request",
-                    response_hash=f"{call_id}-response",
+                    request_hash=fake_sha256(f"{call_id}-request"),
+                    response_hash=fake_sha256(f"{call_id}-response"),
                     created_at=datetime.now(UTC),
                 )
             )
@@ -762,8 +838,9 @@ def test_count_discarded_rows_counts_only_discard_destination() -> None:
     factory = make_factory(db)
     run_id = "run-discard-count"
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
+    coordination = leader_coordination_token(factory, run_id)
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=coordination,
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -773,7 +850,7 @@ def test_count_discarded_rows_counts_only_discard_destination() -> None:
     )
     for i in range(2):
         factory.data_flow.record_validation_error(
-            run_id=run_id,
+            coordination_token=coordination,
             node_id="source-0",
             row_data={"i": i},
             error="comma split the row",
@@ -782,7 +859,7 @@ def test_count_discarded_rows_counts_only_discard_destination() -> None:
         )
     # A quarantined-to-a-sink row must NOT be counted as discarded.
     factory.data_flow.record_validation_error(
-        run_id=run_id,
+        coordination_token=coordination,
         node_id="source-0",
         row_data={"i": 99},
         error="bad value",
@@ -805,8 +882,9 @@ def test_projection_opens_landscape_via_gated_factory(monkeypatch: pytest.Monkey
     factory = make_factory(seed_db)
     landscape_run_id = "tutorial-landscape-run"
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=landscape_run_id)
+    coordination = leader_coordination_token(factory, landscape_run_id)
     source = factory.data_flow.register_node(
-        run_id=landscape_run_id,
+        coordination_token=coordination,
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -814,7 +892,7 @@ def test_projection_opens_landscape_via_gated_factory(monkeypatch: pytest.Monkey
         schema_config=SchemaConfig.from_dict({"mode": "observed"}),
     )
     factory.data_flow.create_row_with_token(
-        run_id=landscape_run_id,
+        coordination_token=coordination,
         source_node_id=source.node_id,
         row_index=0,
         source_row_index=0,
@@ -857,7 +935,9 @@ def test_projection_opens_landscape_via_gated_factory(monkeypatch: pytest.Monkey
                 runs_table.c.run_id == landscape_run_id
             )
         ).one()
-    assert persisted == (0, False, None)
+    # A live run has no final call count until completion; projection must not
+    # finalize or mark it as a cache replay as a side effect of reading it.
+    assert persisted == (None, False, None)
 
 
 def test_coalesce_run_source_hashes_aggregates_row_hashes() -> None:

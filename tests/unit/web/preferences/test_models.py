@@ -11,11 +11,45 @@ from elspeth.web.preferences.models import (
 )
 
 
+def test_freeform_only_preferences_have_no_mode_field() -> None:
+    assert "default_mode" not in ComposerPreferences.model_fields
+    assert "default_mode" not in UpdateComposerPreferencesRequest.model_fields
+    payload = UpdateComposerPreferencesRequest.model_validate(
+        {"tutorial_completed_at": "2026-09-20T00:00:00Z", "tutorial_completed_via": "complete"}
+    )
+    assert payload.tutorial_completed_via == "complete"
+    with pytest.raises(ValidationError):
+        UpdateComposerPreferencesRequest.model_validate({"default_mode": "guided"})
+
+
+@pytest.mark.parametrize("via", ["complete", "skip", "exit"])
+def test_completion_requires_explicit_intent(via: str) -> None:
+    payload = {
+        "tutorial_completed_at": "2026-09-20T00:00:00Z",
+        "tutorial_completed_via": via,
+    }
+    assert UpdateComposerPreferencesRequest.model_validate(payload).tutorial_completed_via == via
+    for missing in ("tutorial_completed_via",):
+        with pytest.raises(ValidationError):
+            UpdateComposerPreferencesRequest.model_validate({key: value for key, value in payload.items() if key != missing})
+
+
+@pytest.mark.parametrize("completed_at", [None, "2026-09-20T00:00:00Z"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("tutorial_stage", "build"), ("tutorial_session_id", "session"), ("tutorial_run_id", "run"), ("tutorial_source_data_hash", "hash")],
+)
+def test_completion_and_reset_reject_populated_progress(completed_at: str | None, field: str, value: str) -> None:
+    payload: dict[str, object] = {"tutorial_completed_at": completed_at, field: value}
+    if completed_at is not None:
+        payload.update(tutorial_completed_via="complete")
+    with pytest.raises(ValidationError, match="progress"):
+        UpdateComposerPreferencesRequest.model_validate(payload)
+
+
 def test_composer_preferences_valid() -> None:
     """A well-formed payload constructs cleanly."""
     payload = ComposerPreferences(
-        default_mode="guided",
-        banner_dismissed_at=None,
         freeform_intro_dismissed_at=None,
         tutorial_completed_at=None,
         tutorial_stage=None,
@@ -25,17 +59,14 @@ def test_composer_preferences_valid() -> None:
         show_advanced=False,
         updated_at=datetime.now(UTC),
     )
-    assert payload.default_mode == "guided"
     assert payload.tutorial_completed_at is None
     assert payload.tutorial_stage is None
 
 
-def test_composer_preferences_rejects_invalid_mode() -> None:
-    """Tier-3 boundary: only 'guided' or 'freeform' are accepted."""
+def test_composer_preferences_rejects_retired_mode_field() -> None:
     with pytest.raises(ValidationError):
         ComposerPreferences(
-            default_mode="kiosk",  # type: ignore[arg-type]
-            banner_dismissed_at=None,
+            default_mode="guided",  # type: ignore[call-arg]
             tutorial_completed_at=None,
             tutorial_stage=None,
             tutorial_session_id=None,
@@ -45,19 +76,17 @@ def test_composer_preferences_rejects_invalid_mode() -> None:
         )
 
 
-def test_update_request_accepts_full_payload() -> None:
-    payload = UpdateComposerPreferencesRequest(default_mode="freeform")
-    assert payload.default_mode == "freeform"
-    assert payload.banner_dismissed_at is None
+def test_update_request_accepts_empty_payload() -> None:
+    payload = UpdateComposerPreferencesRequest()
+    assert payload.freeform_intro_dismissed_at is None
     assert payload.tutorial_completed_at is None
 
 
-def test_update_request_accepts_only_banner_field() -> None:
-    """Partial PATCH: caller sets only banner_dismissed_at."""
+def test_update_request_accepts_only_intro_field() -> None:
+    """Partial PATCH: caller sets only freeform_intro_dismissed_at."""
     stamp = datetime.now(UTC)
-    payload = UpdateComposerPreferencesRequest(banner_dismissed_at=stamp)
-    assert payload.default_mode is None
-    assert payload.banner_dismissed_at == stamp
+    payload = UpdateComposerPreferencesRequest(freeform_intro_dismissed_at=stamp)
+    assert payload.freeform_intro_dismissed_at == stamp
 
 
 def test_update_request_accepts_freeform_intro_dismissal() -> None:
@@ -70,24 +99,21 @@ def test_update_request_accepts_freeform_intro_dismissal() -> None:
     assert "freeform_intro_dismissed_at" in payload.model_fields_set
 
 
-def test_update_request_rejects_invalid_mode() -> None:
+def test_update_request_rejects_retired_mode_field() -> None:
     with pytest.raises(ValidationError):
-        UpdateComposerPreferencesRequest(default_mode="kiosk")  # type: ignore[arg-type]
+        UpdateComposerPreferencesRequest(default_mode="guided")  # type: ignore[call-arg]
 
 
 def test_update_request_accepts_empty_payload_as_noop() -> None:
     """An empty PATCH payload is a no-op; the request succeeds without changes."""
     payload = UpdateComposerPreferencesRequest()
-    assert payload.default_mode is None
-    assert payload.banner_dismissed_at is None
+    assert payload.freeform_intro_dismissed_at is None
     assert payload.tutorial_completed_at is None
 
 
 def test_composer_preferences_accepts_tutorial_completed_at() -> None:
     stamp = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
     payload = ComposerPreferences(
-        default_mode="guided",
-        banner_dismissed_at=None,
         freeform_intro_dismissed_at=None,
         tutorial_completed_at=stamp,
         tutorial_stage=None,
@@ -102,9 +128,8 @@ def test_composer_preferences_accepts_tutorial_completed_at() -> None:
 
 def test_update_request_accepts_tutorial_completed_at() -> None:
     stamp = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
-    payload = UpdateComposerPreferencesRequest(tutorial_completed_at=stamp)
-    assert payload.default_mode is None
-    assert payload.banner_dismissed_at is None
+    payload = UpdateComposerPreferencesRequest(tutorial_completed_at=stamp, tutorial_completed_via="complete")
+    assert payload.freeform_intro_dismissed_at is None
     assert payload.tutorial_completed_at == stamp
     assert "tutorial_completed_at" in payload.model_fields_set
 
@@ -127,8 +152,6 @@ def test_composer_preferences_rejects_unknown_field() -> None:
     """extra='forbid' on the response model too (codebase convention)."""
     with pytest.raises(ValidationError):
         ComposerPreferences(
-            default_mode="guided",
-            banner_dismissed_at=None,
             tutorial_completed_at=None,
             tutorial_stage=None,
             tutorial_session_id=None,
@@ -144,8 +167,6 @@ def test_composer_preferences_rejects_invalid_tutorial_stage() -> None:
     'welcome' is deliberately outside the set — it is never persisted."""
     with pytest.raises(ValidationError):
         ComposerPreferences(
-            default_mode="guided",
-            banner_dismissed_at=None,
             tutorial_completed_at=None,
             tutorial_stage="welcome",  # type: ignore[arg-type]
             tutorial_session_id="sess-1",
@@ -157,10 +178,10 @@ def test_composer_preferences_rejects_invalid_tutorial_stage() -> None:
 
 def test_update_request_accepts_tutorial_progress_fields() -> None:
     payload = UpdateComposerPreferencesRequest(
-        tutorial_stage="guided",
+        tutorial_stage="build",
         tutorial_session_id="sess-1",
     )
-    assert payload.tutorial_stage == "guided"
+    assert payload.tutorial_stage == "build"
     assert payload.tutorial_session_id == "sess-1"
     assert "tutorial_stage" in payload.model_fields_set
     assert "tutorial_run_id" not in payload.model_fields_set
@@ -213,8 +234,6 @@ def test_update_request_rejects_unknown_via_value() -> None:
 
 def test_composer_preferences_carries_show_advanced() -> None:
     prefs = ComposerPreferences(
-        default_mode="guided",
-        banner_dismissed_at=None,
         freeform_intro_dismissed_at=None,
         tutorial_completed_at=None,
         tutorial_stage=None,

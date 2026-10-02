@@ -86,6 +86,9 @@ FINALIZE_BLOB_STATUSES: frozenset[str] = frozenset(get_args(FinalizeBlobStatus))
 BLOB_CREATORS: frozenset[str] = frozenset(get_args(BlobCreator))
 BLOB_RUN_LINK_DIRECTIONS: frozenset[str] = frozenset(get_args(BlobRunLinkDirection))
 
+# Public authoring sentinel used when a blob-backed source has no public path.
+BLOB_REF_PATH_PREFIX = "blob:"
+
 _FORK_BLOB_NAMESPACE = UUID("d9e427b4-6f14-59ba-9f45-2ad41a923fb7")
 _FORK_BLOB_SCHEMA = "elspeth.session-fork-blob.v1"
 
@@ -132,7 +135,7 @@ class BlobForkPlanEntry:
 
 @dataclass(frozen=True, slots=True)
 class BlobForkWriteFence:
-    """Exact guided-operation lease authorizing staged-child blob writes."""
+    """Exact session-operation receipt lease authorizing staged-child blob writes."""
 
     source_session_id: UUID
     target_session_id: UUID
@@ -149,26 +152,6 @@ class BlobForkWriteFence:
             raise ValueError("BlobForkWriteFence.lease_token must be a non-empty bounded string")
         if type(self.attempt) is not int or self.attempt < 1:
             raise TypeError("BlobForkWriteFence.attempt must be a positive exact integer")
-
-
-@dataclass(frozen=True, slots=True)
-class BlobGuidedOperationWriteFence:
-    """Exact ``guided_plan`` lease authorizing inline-custody blob writes."""
-
-    session_id: UUID
-    operation_id: str
-    lease_token: str
-    attempt: int
-
-    def __post_init__(self) -> None:
-        if type(self.session_id) is not UUID:
-            raise TypeError("BlobGuidedOperationWriteFence.session_id must be an exact UUID")
-        if type(self.operation_id) is not str or not 1 <= len(self.operation_id) <= 128:
-            raise ValueError("BlobGuidedOperationWriteFence.operation_id must be a non-empty bounded string")
-        if type(self.lease_token) is not str or not 1 <= len(self.lease_token) <= 256:
-            raise ValueError("BlobGuidedOperationWriteFence.lease_token must be a non-empty bounded string")
-        if type(self.attempt) is not int or self.attempt < 1:
-            raise TypeError("BlobGuidedOperationWriteFence.attempt must be a positive exact integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,20 +305,6 @@ class BlobForkFenceLostError(BlobError):
         _guard_frozen_attr(self, name, value)
 
 
-class BlobGuidedOperationFenceLostError(BlobError):
-    """Raised when ``guided_plan`` no longer owns an inline-custody write."""
-
-    _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset({"operation_id", "attempt"})
-
-    def __init__(self, operation_id: str, *, attempt: int) -> None:
-        super().__init__(f"Guided operation {operation_id} attempt {attempt} no longer owns its blob-write fence")
-        self.operation_id = operation_id
-        self.attempt = attempt
-
-    def __setattr__(self, name: str, value: object) -> None:
-        _guard_frozen_attr(self, name, value)
-
-
 class BlobQuotaExceededError(BlobError):
     """Raised when a blob creation would exceed the session storage quota."""
 
@@ -346,6 +315,54 @@ class BlobQuotaExceededError(BlobError):
         self.session_id = session_id
         self.current_bytes = current_bytes
         self.limit_bytes = limit_bytes
+
+    def __setattr__(self, name: str, value: object) -> None:
+        _guard_frozen_attr(self, name, value)
+
+
+class IdentityStorageQuotaExceededError(BlobQuotaExceededError):
+    """The identity's live blobs would exceed its cap or the container ceiling."""
+
+    _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {"session_id", "current_bytes", "limit_bytes", "identity_id", "cap", "ceiling", "usage", "additional_bytes"}
+    )
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        identity_id: str,
+        cap: int | None,
+        ceiling: int | None,
+        usage: int,
+        additional_bytes: int,
+    ) -> None:
+        bounds = [bound for bound in (cap, ceiling) if bound is not None]
+        if not bounds:
+            raise ValueError("IdentityStorageQuotaExceededError requires a cap or ceiling")
+        limit = min(bounds)
+        BlobError.__init__(
+            self,
+            f"Identity {identity_id} blob storage ({usage} bytes) plus {additional_bytes} bytes would exceed its storage quota ({limit} bytes)",
+        )
+        self.session_id = session_id
+        self.current_bytes = usage
+        self.limit_bytes = limit
+        self.identity_id = identity_id
+        self.cap = cap
+        self.ceiling = ceiling
+        self.usage = usage
+        self.additional_bytes = additional_bytes
+
+
+class StorageAccountingUnavailableError(BlobError):
+    """A byte admitting write cannot establish its storage accounting."""
+
+    _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset({"session_id"})
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"Storage accounting for session {session_id} is unavailable; the blob write is refused")
+        self.session_id = session_id
 
     def __setattr__(self, name: str, value: object) -> None:
         _guard_frozen_attr(self, name, value)
@@ -478,8 +495,6 @@ class BlobServiceProtocol(Protocol):
     async def reserve_inline_custody(
         self,
         request: InlineCustodyRequest,
-        *,
-        write_fence: BlobGuidedOperationWriteFence | None = None,
     ) -> BlobRecord:
         """Idempotently materialize one deterministic inline-source blob."""
         ...
@@ -496,6 +511,14 @@ class BlobServiceProtocol(Protocol):
         the custody of the fence's session, so a foreign blob is
         indistinguishable from a missing one.
         """
+        ...
+
+    def get_blob_sync(self, blob_id: UUID, context: SessionOperationContext) -> BlobRecord:
+        """Get scoped metadata synchronously for a preflight worker."""
+        ...
+
+    def read_blob_content_sync(self, blob_id: UUID, context: SessionOperationContext) -> tuple[BlobRecord, bytes]:
+        """Read one fenced, verified metadata/content version in a preflight worker."""
         ...
 
     async def list_blobs(
@@ -613,7 +636,7 @@ class BlobServiceProtocol(Protocol):
         """Copy exactly the frozen plan from source to target session.
 
         ``checkpoint`` is awaited around each potentially long content copy so
-        the caller can renew and verify its guided-operation fence.
+        the caller can renew and verify its operation receipt lease.
         """
         ...
 
@@ -654,6 +677,40 @@ BlobDeletionPhase = Literal["intent", "staged", "purge_pending"]
 
 
 BlobReplacementPhase = Literal["intent", "swap_pending", "purge_pending"]
+
+
+@dataclass(frozen=True, slots=True)
+class BlobAtomicDeletionObligation:
+    """Post-commit purge from the live atomic deletion driver.
+
+    Atomic drivers delete metadata and insert this obligation together. They
+    record paths and timestamps, but no operation or content-hash evidence;
+    callers must not treat this narrower obligation as a qualified plan.
+    """
+
+    blob_id: UUID
+    session_id: UUID
+    storage_path: str
+    tombstone_path: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if type(self.blob_id) is not UUID or type(self.session_id) is not UUID:
+            raise TypeError("BlobAtomicDeletionObligation identities must be exact UUID values")
+        if type(self.storage_path) is not str or not self.storage_path.strip():
+            raise ValueError("BlobAtomicDeletionObligation.storage_path must be nonblank")
+        if self.tombstone_path is not None:
+            if type(self.tombstone_path) is not str or not self.tombstone_path.strip():
+                raise ValueError("BlobAtomicDeletionObligation.tombstone_path must be nonblank when present")
+            if self.storage_path == self.tombstone_path:
+                raise ValueError("BlobAtomicDeletionObligation paths must differ")
+        if type(self.created_at) is not datetime or type(self.updated_at) is not datetime:
+            raise TypeError("BlobAtomicDeletionObligation timestamps must be exact datetimes")
+        if self.created_at.utcoffset() is None or self.updated_at.utcoffset() is None:
+            raise ValueError("BlobAtomicDeletionObligation timestamps must be timezone-aware")
+        if self.updated_at < self.created_at:
+            raise ValueError("BlobAtomicDeletionObligation.updated_at must not precede created_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -856,6 +913,9 @@ def blob_record_snapshot_hash(record: BlobRecord) -> str:
 
 def names_same_blob(value: str, blob_id: str) -> bool:
     """Whether ``value`` names the blob ``blob_id``: the same UUID, in either hex case.
+
+    ``blob_id`` must be the canonical identifier from owned blob metadata.
+    This comparison is not a UUID validator for two arbitrary input strings.
 
     The binding path admits exactly one spelling variance — ``is_widened_blob_ref``
     matches a ``blob_ref`` against the hyphenated UUID form with ``[0-9a-fA-F]``

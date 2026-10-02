@@ -56,7 +56,7 @@ def test_completed_coalesce_effect_before_barrier_completion_resumes_without_rem
     assert _work_item_row(db, "tok-branch-a")["status"] == TokenWorkStatus.BLOCKED.value
     assert _work_item_row(db, "tok-branch-b")["status"] == TokenWorkStatus.BLOCKED.value
 
-    _usurp_seat(db, clock)
+    _usurp_seat(db)
     executor_b = _real_coalesce_executor(factory, clock, policy="require_all")
     processor_b = _coalesce_processor(
         factory,
@@ -110,7 +110,7 @@ def test_completed_coalesce_effect_with_partial_blocked_members_refuses_without_
             .values(status=TokenWorkStatus.TERMINAL.value)
         )
 
-    _usurp_seat(db, clock)
+    _usurp_seat(db)
     with pytest.raises(AuditIntegrityError, match="partial BLOCKED member set"):
         _coalesce_processor(
             factory,

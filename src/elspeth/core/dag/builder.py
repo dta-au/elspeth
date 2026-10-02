@@ -13,12 +13,13 @@ import hashlib
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts import RouteDestination, RoutingMode, error_edge_label
 from elspeth.contracts.enums import NodeType, OutputMode
 from elspeth.contracts.errors import FrameworkBugError
-from elspeth.contracts.schema import SchemaConfig, get_raw_schema_config
+from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig, get_raw_schema_config
 from elspeth.contracts.types import (
     AggregationName,
     BranchName,
@@ -29,6 +30,7 @@ from elspeth.contracts.types import (
     RowUnionName,
     SinkName,
 )
+from elspeth.contracts.union_merge import KnownBranchFieldType, certain_union_type_conflict, union_type_conflict_message
 from elspeth.core.canonical import canonical_json
 from elspeth.core.dag.bound_regions import (
     compute_bound_regions,
@@ -37,9 +39,14 @@ from elspeth.core.dag.bound_regions import (
     validate_openers_bound_in_region,
     validate_sese_regions,
 )
-from elspeth.core.dag.coalesce_merge import merge_coalesce_schema
+from elspeth.core.dag.coalesce_merge import certain_union_collisions, merge_coalesce_schema
 from elspeth.core.dag.group_bindings import build_group_binding_registry
-from elspeth.core.dag.guarantees import walk_effective_guarantee_vote
+from elspeth.core.dag.guarantees import (
+    EffectiveGuaranteeVote,
+    ResolvedGuaranteeType,
+    resolve_guaranteed_field_type,
+    walk_effective_guarantee_vote,
+)
 from elspeth.core.dag.models import (
     _NODE_ID_MAX_LENGTH,
     BranchInfo,
@@ -47,9 +54,12 @@ from elspeth.core.dag.models import (
     _GateEntry,
     _suggest_similar,
 )
+from elspeth.core.dag.schema_validation import compute_declared_input_proof
+from elspeth.core.expression_types import SchemaFieldType
 
 if TYPE_CHECKING:
-    from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
+    from elspeth.contracts import BatchTransformProtocol, SinkProtocol, SourceProtocol, TransformProtocol
+    from elspeth.contracts.schema_contract import OutputFieldDeclaration
     from elspeth.core.config import (
         AggregationSettings,
         CoalesceSettings,
@@ -63,6 +73,7 @@ if TYPE_CHECKING:
     from elspeth.core.dag.graph import ExecutionGraph
     from elspeth.core.dag.models import GraphValidationWarning, NodeConfig
     from elspeth.core.dag.wiring import WiredTransform
+    from elspeth.plugins.transforms.value_transform import ValueTransform
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +169,133 @@ def _validate_output_schema_contract(transform: Any) -> None:
                 f"{sorted(effective)}. "
                 f"declared_output_fields must be a subset of guaranteed_fields."
             )
+
+
+@dataclass(frozen=True, slots=True)
+class _PublishedOutputDeclarations:
+    output_field_declarations: Mapping[str, OutputFieldDeclaration]
+    carried_output_sources: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "output_field_declarations", "carried_output_sources")
+
+
+def _published_output_declarations(transform: TransformProtocol) -> _PublishedOutputDeclarations:
+    """Read the plugin's ADR-050 stamp table and carried-source map for ``NodeInfo``.
+
+    The ONE publishing site for ``NodeInfo.output_field_declarations`` and
+    ``NodeInfo.carried_output_sources`` (transform, aggregation and collector
+    nodes). Published verbatim from the constructed instance's public
+    accessors — the same table the runtime stamp rewrites emitted contracts
+    from — so build-time type reasoning (the union-coalesce refusal) and the
+    runtime stamp cannot disagree. A later build-time completion of the table
+    (binding upstream-derived types into a plugin during the topological
+    pass) republishes through this helper after the bind, so the only thing
+    such a change moves is the table's content.
+    """
+    return _PublishedOutputDeclarations(
+        output_field_declarations=transform.output_field_declarations(),
+        carried_output_sources=transform.carried_output_sources(),
+    )
+
+
+def _refuse_certain_union_type_conflict(
+    graph: ExecutionGraph,
+    *,
+    coalesce_id: NodeID,
+    coal_config: CoalesceSettings,
+    branch_producer_votes: Mapping[str, tuple[NodeID, EffectiveGuaranteeVote]],
+    node_labels: Mapping[str, str],
+) -> None:
+    """Refuse a union coalesce whose every row would fail the runtime merge (S3: refuse at construction where certain).
+
+    Runs for every union coalesce in EVERY schema mode — including the
+    all-observed case ``merge_union_fields`` returns early on, which is where
+    a declared-``any`` rewrite meets a concrete carried type (release
+    delivered it only by accident of per-row value typing; ADR-050 D8). The
+    per-branch inputs are each branch producer's presence vote and the
+    union-merge type walk (``resolve_guaranteed_field_type(mode="union_merge")``,
+    reading the published stamp tables), and the decision is the shared
+    ``certain_union_type_conflict``. Runs after the typed-schema merge, so a
+    conflict that merge already refuses keeps its historical message.
+    Everything the walk cannot prove abstains and stays the runtime's routed
+    ``contract_type_conflict``.
+    """
+    cache: dict[tuple[str, str], ResolvedGuaranteeType | None] = {}
+    field_counts = Counter(
+        field_name for _producer, vote in branch_producer_votes.values() if vote.participated for field_name in vote.fields
+    )
+    shared_fields = sorted(field_name for field_name, count in field_counts.items() if count >= 2)
+    known_branch_fields: dict[str, dict[str, KnownBranchFieldType]] = {}
+    for branch_name, (producer_node, vote) in branch_producer_votes.items():
+        if not vote.participated:
+            continue
+        known: dict[str, KnownBranchFieldType] = {}
+        for field_name in shared_fields:
+            if field_name not in vote.fields:
+                continue
+            resolved = resolve_guaranteed_field_type(graph, producer_node, field_name, cache=cache, mode="union_merge")
+            if resolved is None:
+                continue
+            known[field_name] = KnownBranchFieldType(
+                field_type=resolved.field_type,
+                declared_by=tuple(sorted(node_labels[declarer] for declarer in resolved.declared_by)),
+            )
+        known_branch_fields[branch_name] = known
+    conflict = certain_union_type_conflict(
+        known_branch_fields,
+        all_branches_merge=coal_config.has_all_branch_semantics,
+        branch_order=tuple(coal_config.branches.keys()),
+    )
+    if conflict is not None:
+        raise GraphValidationError(
+            union_type_conflict_message(f"'{coalesce_id}'", conflict),
+            component_id=str(coalesce_id),
+            component_type="coalesce",
+        )
+
+
+def _refuse_certain_union_name_collision(
+    *,
+    coalesce_id: NodeID,
+    coal_config: CoalesceSettings,
+    branch_producer_votes: Mapping[str, tuple[NodeID, EffectiveGuaranteeVote]],
+) -> None:
+    """Refuse a ``union_collision_policy: fail`` coalesce every merge of which would collide (S3).
+
+    ``fail`` is name-based: a field two ARRIVED branches both carry fails the
+    group. When every merge the arrival policy can perform is certain to see
+    two branches that both GUARANTEE the same name, every row would fail
+    here — a config-determined failure, refused at construction rather than
+    paid per row. The per-branch input is the presence vote the guarantee
+    merge already uses (a branch whose vote does not participate guarantees
+    nothing); the decision is ``certain_union_collisions``. Collisions on
+    fields observed only at runtime stay the executor's routed group failure
+    (``union_field_collision``), never a run abort.
+    """
+    branch_guarantees: dict[str, frozenset[str]] = {branch: frozenset() for branch in coal_config.branches}
+    for branch_name, (_producer, vote) in branch_producer_votes.items():
+        if vote.participated:
+            branch_guarantees[branch_name] = vote.fields
+    certain = certain_union_collisions(
+        branch_guarantees,
+        require_all=coal_config.has_all_branch_semantics,
+        policy=coal_config.policy,
+        quorum_count=coal_config.quorum_count,
+    )
+    if not certain:
+        return
+    collided = "; ".join(f"'{field_name}' (branches {list(branches)})" for field_name, branches in certain.items())
+    raise GraphValidationError(
+        f"Coalesce '{coal_config.name}' uses union_collision_policy 'fail', but every merge it can perform "
+        f"is certain to collide: {collided} are guaranteed on more than one branch. 'fail' rejects any "
+        "field name two arriving branches both carry — including fields every branch forwards from the "
+        "fork — so every row would fail here. Use union_collision_policy 'first_wins' or 'last_wins' to "
+        "choose a winner, merge 'nested' to keep each branch's row under its branch name, or 'select' "
+        "to keep one branch.",
+        component_id=str(coalesce_id),
+        component_type="coalesce",
+    )
 
 
 def _parse_contract_schema_config(
@@ -324,6 +462,7 @@ def build_execution_graph(
             output_schema=source_instance.output_schema,  # SourceProtocol requires this
             output_schema_config=source_schema_config,
             observed_value_type=source_instance.observed_value_type,
+            field_renames=source_instance.field_renames,
         )
 
     # Add sinks
@@ -346,6 +485,7 @@ def build_execution_graph(
             input_schema=sink.input_schema,  # SinkProtocol requires this
             output_schema_config=sink_schema_config,
             declared_required_fields=sink.declared_required_fields,
+            declared_read_fields=sink.declared_read_fields,
         )
 
     graph.set_sink_id_map(sink_ids)
@@ -393,8 +533,8 @@ def build_execution_graph(
         _validate_output_schema_contract(transform)
         output_schema_config = transform._output_schema_config
 
-        # Shape-preserving transforms don't compute _output_schema_config.
-        # Parse the raw schema config so every node has a typed schema.
+        # A transform without _output_schema_config (none is registered; test
+        # doubles are): parse the raw schema config so every node is typed.
         if output_schema_config is None:
             output_schema_config = _parse_contract_schema_config(
                 transform_config,
@@ -409,6 +549,7 @@ def build_execution_graph(
         # _initialize_declared_input_fields raises FrameworkBugError when a
         # batch-aware transform declares input fields, so the excluded space is
         # empty by construction rather than an unhandled case.
+        published = _published_output_declarations(transform)
         graph.add_node(
             tid,
             node_type=node_type,
@@ -420,10 +561,16 @@ def build_execution_graph(
             declared_output_fields=transform.declared_output_fields,
             declared_input_fields=transform.declared_input_fields,
             declared_string_input_fields=transform.declared_string_input_fields,
+            declared_read_fields=transform.declared_read_fields,
+            declared_created_fields=transform.declared_created_fields,
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,
             removed_input_fields=transform.removed_input_fields,
+            renamed_input_fields=transform.renamed_input_fields,
+            header_spelled_lookups=transform.header_spelled_lookups,
             preserves_input_values=transform.preserves_input_values,
+            output_field_declarations=published.output_field_declarations,
+            carried_output_sources=published.carried_output_sources,
         )
 
     graph.set_transform_id_map(transform_ids_by_seq)
@@ -465,6 +612,7 @@ def build_execution_graph(
                 component_type="aggregation",
             )
 
+        published = _published_output_declarations(transform)
         graph.add_node(
             aid,
             node_type=NodeType.AGGREGATION,
@@ -473,10 +621,15 @@ def build_execution_graph(
             input_schema=transform.input_schema,
             output_schema=transform.output_schema,
             output_schema_config=agg_output_schema_config,
+            # The runtime factory admits only batch-aware plugins as aggregations.
+            batch_required_input_fields=cast("BatchTransformProtocol", transform).schema_required_input_fields(),
+            declared_read_fields=transform.declared_read_fields,
             passes_through_input=transform.passes_through_input,
             forwards_input_fields=transform.forwards_input_fields,
             removed_input_fields=transform.removed_input_fields,
             preserves_input_values=transform.preserves_input_values,
+            output_field_declarations=published.output_field_declarations,
+            carried_output_sources=published.carried_output_sources,
         )
 
     graph.set_aggregation_id_map(aggregation_ids)
@@ -754,6 +907,7 @@ def build_execution_graph(
                     component_id=collector_name,
                     component_type="collector",
                 )
+            published = _published_output_declarations(transform)
             graph.add_node(
                 col_id,
                 node_type=NodeType.COLLECTOR,
@@ -762,10 +916,15 @@ def build_execution_graph(
                 input_schema=transform.input_schema,
                 output_schema=transform.output_schema,
                 output_schema_config=collector_output_schema_config,
+                # The runtime factory admits only batch-aware plugins as collectors.
+                batch_required_input_fields=cast("BatchTransformProtocol", transform).schema_required_input_fields(),
+                declared_read_fields=transform.declared_read_fields,
                 passes_through_input=transform.passes_through_input,
                 forwards_input_fields=transform.forwards_input_fields,
                 removed_input_fields=transform.removed_input_fields,
                 preserves_input_values=transform.preserves_input_values,
+                output_field_declarations=published.output_field_declarations,
+                carried_output_sources=published.carried_output_sources,
             )
     graph.set_collector_id_map(collector_ids)
     graph.set_collector_transform_map(collector_transforms)
@@ -1470,11 +1629,13 @@ def build_execution_graph(
 
     # rule 9 (spec §7): on_error may target the ENCLOSING bound region's
     # closer, not only a sink. closer_name_to_node collects every legal
-    # closer name (coalesce/row_union/collector) so the two error-edge loops
-    # below can recognize a closer-shaped on_error and DEFER it — region
-    # membership is not known yet (compute_bound_regions runs later, after
-    # these loops) — rather than misclassifying it as an unknown sink.
-    # Resolved after region computation, below.
+    # closer name (coalesce/row_union/collector) so the transform and gate
+    # error-edge loops below can recognize a closer-shaped on_error and DEFER
+    # it — region membership is not known yet (compute_bound_regions runs
+    # later, after these loops) — rather than misclassifying it as an unknown
+    # sink. Resolved after region computation, below. The third loop
+    # (aggregations) never defers: rule 6 bans aggregations inside every
+    # bound region, so a closer-named aggregation on_error is an unknown sink.
     closer_name_to_node: dict[str, NodeID] = {
         **{str(name): nid for name, nid in coalesce_ids.items()},
         **{str(name): nid for name, nid in row_union_ids.items()},
@@ -1533,6 +1694,37 @@ def build_execution_graph(
             mode=RoutingMode.DIVERT,
         )
 
+    # Aggregation batch-error edges (elspeth-d2e3f29d10). Structural DIVERT
+    # markers like the transform/gate edges above: when a flush fails, the
+    # processor routes every buffered input token of the batch to this sink
+    # as ON_ERROR_ROUTED, and the executor records the DIVERT routing_event
+    # on the flush node_state. No rule-9 closer deferral: rule 6
+    # (validate_no_aggregations_in_regions) bans aggregations inside every
+    # bound region, so a closer-named on_error falls through to the
+    # unknown-sink error. on_error is NOT part of the aggregation node config
+    # (node identity): the edges row is the audit record of the route. The
+    # edge IS hashed into the full topology hash, so a named route changes it
+    # (and a checkpoint taken without the edge is refused); discard does not.
+    for agg_name, (_agg_transform, agg_settings) in aggregations.items():
+        agg_on_error = agg_settings.on_error
+        if agg_on_error == "discard":
+            continue
+        if SinkName(agg_on_error) not in sink_ids:
+            suggestions = _suggest_similar(agg_on_error, sorted(str(s) for s in sink_ids))
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            raise GraphValidationError(
+                f"Aggregation '{agg_settings.name}' on_error '{agg_on_error}' references unknown sink.{hint} "
+                f"Available sinks: {', '.join(sorted(str(s) for s in sink_ids))}",
+                component_id=agg_settings.name,
+                component_type="aggregation",
+            )
+        graph.add_edge(
+            aggregation_ids[AggregationName(agg_name)],
+            sink_ids[SinkName(agg_on_error)],
+            label=error_edge_label(agg_settings.name),
+            mode=RoutingMode.DIVERT,
+        )
+
     # Sink failsink edges
     for sink_name_key, sink_node_id in sink_ids.items():
         sink_instance = sinks[str(sink_name_key)]
@@ -1586,11 +1778,58 @@ def build_execution_graph(
             cid = coalesce_ids[CoalesceName(coalesce_config.name)]
             coalesce_id_to_config[cid] = coalesce_config
 
-    deferred_gate_input_by_id = {gate_id: input_connection for gate_id, _gate_name, input_connection in deferred_config_gate_schemas}
+    gate_input_by_id = {gate_id: input_connection for gate_id, _gate_name, input_connection in config_gate_schema_inputs}
 
+    # Human labels for the nodes a union-merge type resolution can name as a
+    # declarer (sources and the plugin-bearing kinds), for refusal messages.
+    plugin_node_labels: dict[str, str] = {}
+    for label_kind, label_ids in (
+        ("source", source_ids),
+        ("transform", transform_ids_by_name),
+        ("aggregation", aggregation_ids),
+        ("collector", collector_ids),
+    ):
+        for label_name, label_node_id in label_ids.items():
+            plugin_node_labels[label_node_id] = f"{label_kind} '{label_name}' ({graph.get_node_info(label_node_id).plugin_name})"
+
+    transforms_by_id = {transform_ids_by_name[wired.settings.name]: wired.plugin for wired in transforms}
+    transform_names_by_id = {node_id: name for name, node_id in transform_ids_by_name.items()}
     for pass_through_id in pipeline_nodes:
-        if pass_through_id in deferred_gate_input_by_id:
-            input_connection = deferred_gate_input_by_id[pass_through_id]
+        candidate_transform = transforms_by_id.get(pass_through_id)
+        if candidate_transform is not None and candidate_transform.name == "value_transform":
+            value_transform = cast("ValueTransform", candidate_transform)
+            authored_schema = value_transform._schema_config
+            authored = {field.name for field in authored_schema.fields or ()} if authored_schema is not None else set()
+            reads = frozenset(
+                field for operation in value_transform._operations for field in operation.get_parser().static_field_reads().fields
+            )
+            incoming = {
+                edge.from_node for edge in graph.get_incoming_edges(pass_through_id) if edge.mode in (RoutingMode.MOVE, RoutingMode.COPY)
+            }
+            bound_inputs: dict[str, FieldDefinition] = {}
+            for field_name in sorted(reads - authored):
+                resolved = [resolve_guaranteed_field_type(graph, predecessor, field_name, mode="union_merge") for predecessor in incoming]
+                if not resolved or resolved[0] is None:
+                    continue
+                first_type = resolved[0].field_type
+                if all(item is not None and item.field_type == first_type for item in resolved):
+                    bound_inputs[field_name] = FieldDefinition(
+                        name=field_name,
+                        field_type=cast("SchemaFieldType", first_type),
+                        required=True,
+                        nullable=True,
+                    )
+            value_transform.bind_upstream_input_types(bound_inputs, component_id=transform_names_by_id[pass_through_id])
+            if value_transform._output_schema_config is None or value_transform.output_schema is None:
+                raise FrameworkBugError("Bound value_transform has no output schema")
+            graph.set_node_bound_output(
+                pass_through_id,
+                schema=value_transform._output_schema_config,
+                output_schema=value_transform.output_schema,
+                declarations=_published_output_declarations(candidate_transform).output_field_declarations,
+            )
+        if pass_through_id in gate_input_by_id:
+            input_connection = gate_input_by_id[pass_through_id]
             producer_id, _producer_label = producers[input_connection]
             _assign_schema(pass_through_id, _best_schema_config(producer_id))
 
@@ -1619,11 +1858,17 @@ def build_execution_graph(
         # for typed-field/mode/audit merging), this carries each branch's
         # PROPAGATION-WALKED effective guarantee so fields a pass-through branch
         # inherits from upstream (e.g. source columns carried through an LLM)
-        # survive the union. Non-participating branches are skipped, mirroring
-        # the composer preview's _connection_propagation_vote
-        # (web/composer/state.py) so build-time and preview agree
-        # (elspeth-0b14977817).
+        # survive the union. EVERY branch enters, a non-participating one as a
+        # schema without guarantees: merge_guaranteed_fields skips it under
+        # require_all (every branch arrives) and abstains on it under every
+        # other policy (a merged row can be that branch alone). The composer
+        # preview's _connection_propagation_vote (web/composer/state.py)
+        # builds the same map, so build-time and preview agree
+        # (elspeth-0b14977817; R2 fix round 1).
         guarantee_branch_schemas: dict[str, SchemaConfig] = {}
+        # Each branch's producer and presence vote, for the certain-conflict
+        # refusal below (the vote is the walk the guarantee merge already uses).
+        branch_producer_votes: dict[str, tuple[NodeID, EffectiveGuaranteeVote]] = {}
 
         coalesce_plan = coalesce_plans[CoalesceName(coal_config.name)]
         for branch_spec in coalesce_plan.branches:
@@ -1636,12 +1881,12 @@ def build_execution_graph(
                 producer_node = branch_plan.gate_node_id
             branch_to_schema[str(branch_plan.branch_name)] = _best_schema_config(producer_node)
             vote = walk_effective_guarantee_vote(graph, producer_node, {})
-            if vote.participated:
-                guarantee_branch_schemas[str(branch_plan.branch_name)] = SchemaConfig(
-                    mode="observed",
-                    fields=None,
-                    guaranteed_fields=tuple(sorted(vote.fields)),
-                )
+            branch_producer_votes[str(branch_plan.branch_name)] = (producer_node, vote)
+            guarantee_branch_schemas[str(branch_plan.branch_name)] = SchemaConfig(
+                mode="observed",
+                fields=None,
+                guaranteed_fields=tuple(sorted(vote.fields)) if vote.participated else None,
+            )
 
         # Update branch_info with schema information for runtime tracking of
         # lost branch fields. When a branch is diverted at runtime, the coalesce
@@ -1660,9 +1905,21 @@ def build_execution_graph(
             branch_order=tuple(coal_config.branches.keys()),
             select_branch=coal_config.select_branch,
             coalesce_id=str(coalesce_id),
-            guarantee_branch_schemas=guarantee_branch_schemas or None,
+            guarantee_branch_schemas=guarantee_branch_schemas,
         )
         _assign_schema(coalesce_id, merged_schema)
+        if coal_config.merge == "union":
+            _refuse_certain_union_type_conflict(
+                graph,
+                coalesce_id=coalesce_id,
+                coal_config=coal_config,
+                branch_producer_votes=branch_producer_votes,
+                node_labels=plugin_node_labels,
+            )
+            if coal_config.union_collision_policy == "fail":
+                _refuse_certain_union_name_collision(
+                    coalesce_id=coalesce_id, coal_config=coal_config, branch_producer_votes=branch_producer_votes
+                )
 
     # Update branch_info on the graph now that schemas are populated.
     # The initial set_branch_info (line ~821) stored entries without schemas.
@@ -1782,9 +2039,9 @@ def build_execution_graph(
         # barrier binding.
         #
         # output_mode: passthrough is NOT rejected by THIS check — it targets
-        # only the transform-mode identity-collision hazard
-        # (_route_passthrough_results validates 1:1 and updates the ORIGINAL
-        # tokens, so every buffered row_id keeps its own arrival for THAT
+        # only the transform-mode identity-collision hazard (the flush
+        # cross-check enforces 1:1 and _route_passthrough_results updates the
+        # ORIGINAL tokens, so every buffered row_id keeps its own arrival for THAT
         # hazard specifically). Rule 6 (validate_no_aggregations_in_regions,
         # called later in this function) independently bans ANY aggregation
         # inside a bound region regardless of output_mode (spec §7 rule 6,
@@ -2000,6 +2257,12 @@ def build_execution_graph(
     max_observed_depth = max((r.depth for r in regions), default=0)
     graph.set_max_bound_region_depth(max_observed_depth)
     graph.set_escalation_fixpoint_bound(derive_escalation_fixpoint_bound(max_observed_depth))
+
+    # The declared-input proof reads the FINAL topology: the rule-9 DIVERT
+    # edges above change what a closer's vote (and so its successors' proofs)
+    # may claim, and the runtime classifies a declared-input miss by exactly
+    # this map (ADR-013 Amendment 2026-09-27).
+    graph.set_declared_input_proof(compute_declared_input_proof(graph))
 
     # Step maps and node sequence support node_id-based processor traversal.
     graph.set_pipeline_nodes(pipeline_nodes)

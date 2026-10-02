@@ -87,6 +87,27 @@ class TestConsoleFormatters:
         assert "INTERRUPTED" in rendered
         assert "\u23f8" in rendered  # Pause symbol
 
+    def test_structural_collector_failure_is_separate_from_failed_rows(self) -> None:
+        summary_handler = create_console_formatters(prefix="Run")[RunSummary]
+        event = RunSummary(
+            run_id="run-group-failure",
+            status=RunCompletionStatus.PARTIAL,
+            total_rows=0,
+            succeeded=0,
+            failed=0,
+            quarantined=0,
+            duration_seconds=0.5,
+            exit_code=1,
+            collector_groups_failed=1,
+        )
+
+        with patch("elspeth.cli_formatters.typer.echo") as mock_echo:
+            summary_handler(event)
+
+        rendered = mock_echo.call_args.args[0]
+        assert "✗0 failed" in rendered
+        assert "1 collector group failed" in rendered
+
     def test_run_summary_all_statuses_have_symbols(self) -> None:
         """Every RunCompletionStatus value must be handled by the formatter.
 
@@ -189,9 +210,31 @@ class TestJsonFormatters:
             "succeeded": 0,
             "failed": 1,
             "quarantined": 0,
+            "collector_groups_failed": 0,
             "routed_success": 1,
             "routed_failure": 0,
             "routed_destinations": {"error_sink": 1},
             "duration_seconds": 0.0,
             "exit_code": 2,
         }
+
+    def test_structural_collector_failure_json_is_separate_from_failed_rows(self) -> None:
+        summary_handler = create_json_formatters()[RunSummary]
+        event = RunSummary(
+            run_id="run-group-failure",
+            status=RunCompletionStatus.PARTIAL,
+            total_rows=0,
+            succeeded=0,
+            failed=0,
+            quarantined=0,
+            duration_seconds=0.5,
+            exit_code=1,
+            collector_groups_failed=1,
+        )
+
+        with patch("elspeth.cli_formatters.typer.echo") as mock_echo:
+            summary_handler(event)
+
+        payload = json.loads(mock_echo.call_args.args[0])
+        assert payload["failed"] == 0
+        assert payload["collector_groups_failed"] == 1

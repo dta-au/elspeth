@@ -24,6 +24,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import RunSourceLifecycleState
 from elspeth.engine.orchestrator.ceremony import RunCeremony
 from elspeth.engine.orchestrator.source_lifecycle_recorder import SourceLifecycleRecorder
+from elspeth.engine.orchestrator.source_replay import AuditedSource
 
 # The recorder forwards the token BY VALUE (ADR-048 §3); it is the test's subject, so a
 # direct construction is honest here — nothing below reads a seat.
@@ -95,6 +96,39 @@ class TestRecordFieldResolution:
 
 
 class TestRecordRunSourceLifecycle:
+    def test_replay_uses_audited_metadata_without_source_hooks(self) -> None:
+        recorder = SourceLifecycleRecorder(ceremony=MagicMock(spec=RunCeremony))
+        factory = MagicMock(spec=RecorderFactory)
+        source = _make_source()
+        source.get_field_resolution = MagicMock(spec=source.get_field_resolution, side_effect=AssertionError("live source metadata called"))
+        source.get_schema_contract = MagicMock(spec=source.get_schema_contract, side_effect=AssertionError("live source metadata called"))
+        audited = AuditedSource(
+            name="rows",
+            source_run_node_id="old-source",
+            rows=(),
+            schema_contract=None,
+            source_schema_json='{"type":"object"}',
+            field_resolution={"Original": "normalized"},
+            normalization_version="v1",
+        )
+
+        recorder.record_run_source_lifecycle(
+            factory,
+            NodeID("new-source"),
+            "rows",
+            source,
+            RunSourceLifecycleState.LOADING,
+            audited_source=audited,
+            coordination_token=_TOKEN,
+        )
+
+        kwargs = factory.run_lifecycle.record_run_source.call_args.kwargs
+        assert kwargs["source_schema_json"] == audited.source_schema_json
+        assert kwargs["field_resolution_mapping"] == {"Original": "normalized"}
+        assert kwargs["normalization_version"] == "v1"
+        source.get_field_resolution.assert_not_called()
+        source.get_schema_contract.assert_not_called()
+
     def test_records_with_field_resolution(self) -> None:
         recorder = SourceLifecycleRecorder(ceremony=MagicMock(spec=RunCeremony))
         factory = MagicMock(spec=RecorderFactory)

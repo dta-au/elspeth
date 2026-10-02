@@ -10,6 +10,7 @@ from collections.abc import Collection, Mapping
 from copy import deepcopy
 from typing import Any
 
+from elspeth.contracts import credential_material as _credential_material
 from elspeth.contracts.secrets import (
     ResolvedSecret,
     ScopedSecretResolverContract,
@@ -20,67 +21,12 @@ from elspeth.contracts.secrets import (
 )
 from elspeth.contracts.trust_boundary import trust_boundary
 
+SECRET_FIELD_NAMES = _credential_material.SECRET_FIELD_NAMES
+SECRET_FIELD_SUFFIXES = _credential_material.SECRET_FIELD_SUFFIXES
+STRUCTURAL_FIELD_EXEMPTIONS = _credential_material.STRUCTURAL_FIELD_EXEMPTIONS
+is_secret_field = _credential_material.is_secret_field
+
 _EXACT_ENV_VAR_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}")
-
-# Field-name heuristic for credential-bearing options.
-#
-# This is the closed list of field names that the runtime (config fingerprinting)
-# treats as carrying credentials, and that the composer's fabrication-aware
-# `secret_refs` validator (web.execution.validation) treats as requiring a
-# wired `{secret_ref: ...}` or inventory env-marker.  Keeping the predicate in
-# core.secrets gives runtime and validate a single source of truth — divergence
-# would re-open the validator/runtime parity gap that issue elspeth-72d1dccd44
-# was filed to close.
-SECRET_FIELD_NAMES = frozenset(
-    {
-        "api_key",
-        "api-key",
-        "aws_access_key_id",
-        "authorization",
-        "connection_string",
-        "credential",
-        "password",
-        "secret",
-        "token",
-        "x-api-key",
-    }
-)
-
-SECRET_FIELD_SUFFIXES = ("_secret", "_key", "_token", "_password", "_credential", "_connection_string")
-
-# Exact-name exemptions from the suffix heuristic: structural (non-credential)
-# fields whose names happen to end in a secret suffix. The suffix set must
-# stay broad — real credential fields such as Langfuse tracing's
-# ``secret_key``/``public_key`` are matched only by the bare ``_key`` suffix,
-# so narrowing it would silently drop those from audit fingerprinting.
-# Exemptions are therefore exact lowercase names, never suffixes, and each
-# entry cites the plugin field it exists for. Failure asymmetry: a missing
-# exemption is a visible ``fabricated_secret`` block (add the name here); a
-# wrong exemption leaks a credential into the audit trail — keep this list
-# short and literal.
-STRUCTURAL_FIELD_EXEMPTIONS = frozenset(
-    {
-        # JSONSource.data_key / azure_blob_source data_key: the key that names
-        # the array to extract from a JSON document (e.g. "results").
-        "data_key",
-        # DataverseSink.alternate_key: the alternate-key *column name* used to
-        # route upserts (e.g. "crabc_code").
-        "alternate_key",
-    }
-)
-
-
-def is_secret_field(field_name: str) -> bool:
-    """Return True when a field name represents a credential-bearing option.
-
-    Case-insensitive: matches an exact name in ``SECRET_FIELD_NAMES`` or any
-    suffix in ``SECRET_FIELD_SUFFIXES``, unless the name is an exact
-    structural exemption in ``STRUCTURAL_FIELD_EXEMPTIONS``.
-    """
-    normalized = field_name.lower()
-    if normalized in STRUCTURAL_FIELD_EXEMPTIONS:
-        return False
-    return normalized in SECRET_FIELD_NAMES or normalized.endswith(SECRET_FIELD_SUFFIXES)
 
 
 class SecretResolutionError(Exception):

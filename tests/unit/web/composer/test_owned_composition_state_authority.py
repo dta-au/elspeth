@@ -20,7 +20,6 @@ from elspeth.web.composer.pipeline_proposal import (
     OWNED_COMPOSITION_STATE_AUTHORITY,
     AbsentBase,
     PipelineProposal,
-    PlannerSurface,
     is_owned_composition_state_authority,
     owned_composition_state_authority,
     owned_composition_state_execution_arguments,
@@ -107,12 +106,8 @@ def _proposal(authority: dict[str, Any]) -> PipelineProposal:
     return PipelineProposal.create(
         pipeline=authority,
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("composer-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
 
 
@@ -156,7 +151,7 @@ def test_owned_state_authority_round_trips_exact_content_without_lifecycle_versi
     }
 
     proposal = _proposal(authority)
-    assert PipelineProposal.from_dict(proposal.to_dict(), reviewed_facts={}) == proposal
+    assert PipelineProposal.from_dict(proposal.to_dict()) == proposal
 
 
 def test_owned_state_review_projection_withholds_blob_custody_but_keeps_control_evidence() -> None:

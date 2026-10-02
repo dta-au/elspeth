@@ -4,7 +4,7 @@
 arguments or the closed private owned-state authority needed when that public
 v1 shape cannot represent the authored topology losslessly. The latter reuses
 ``CompositionState`` rather than defining another topology model. The draft hash uses the
-``composer.pipeline-proposal-envelope.v3`` domain because it covers every
+``composer.pipeline-proposal-envelope.v4`` domain because it covers every
 authority-bearing envelope field. This intentionally supersedes the older
 design's ``composer.pipeline-proposal.v1`` pipeline-only preimage; accepting
 both would allow two different integrity meanings to share one draft concept.
@@ -16,7 +16,6 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
-from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Self, TypedDict, cast
 from uuid import UUID
@@ -35,8 +34,8 @@ from elspeth.web.composer.bounded_json import (
 if TYPE_CHECKING:
     from elspeth.web.composer.state import CompositionState
 
-_DRAFT_HASH_SCHEMA = "composer.pipeline-proposal-envelope.v3"
-_REVIEWED_ANCHOR_SCHEMA = "guided.reviewed-anchors.v1"
+_DRAFT_HASH_SCHEMA = "composer.pipeline-proposal-envelope.v4"
+_REVIEWED_ANCHOR_SCHEMA = "composer.reviewed-anchors.v1"
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 OWNED_COMPOSITION_STATE_AUTHORITY: Final = "owned_composition_state.v1"
 _OWNED_COMPOSITION_STATE_FIELDS = frozenset(
@@ -54,23 +53,10 @@ _PROPOSAL_FIELDS = frozenset(
         "pipeline",
         "draft_hash",
         "base",
-        "reviewed_anchor_hash",
-        "surface",
         "repair_count",
         "skill_hash",
-        "covered_deferred_intent_ids",
-        "supersedes_draft_hash",
     }
 )
-
-
-class PlannerSurface(StrEnum):
-    """Authoring controller that requested the shared planner."""
-
-    FREEFORM = "freeform"
-    GUIDED_FULL = "guided_full"
-    GUIDED_STAGED = "guided_staged"
-    TUTORIAL_PROFILE = "tutorial_profile"
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,12 +95,8 @@ class PipelineProposalData(TypedDict):
     pipeline: dict[str, Any]
     draft_hash: str
     base: dict[str, str]
-    reviewed_anchor_hash: str
-    surface: str
     repair_count: int
     skill_hash: str
-    covered_deferred_intent_ids: list[str]
-    supersedes_draft_hash: str | None
 
 
 class OwnedCompositionStateAuthorityData(TypedDict):
@@ -148,9 +130,7 @@ class OwnedCompositionStateSetPipelineArguments(TypedDict):
     metadata: dict[str, Any]
 
 
-def _require_hash(value: object, field_name: str, *, optional: bool = False) -> None:
-    if optional and value is None:
-        return
+def _require_hash(value: object, field_name: str) -> None:
     if type(value) is not str or _SHA256_HEX.fullmatch(value) is None:
         raise AuditIntegrityError(f"{field_name} must be exactly 64 lowercase hexadecimal characters")
 
@@ -282,17 +262,6 @@ def _validate_and_freeze_canonical_mapping(value: Mapping[str, Any], field_name:
     return cast(Mapping[str, Any], frozen)
 
 
-def _validate_covered_intent_ids(intent_ids: tuple[str, ...]) -> None:
-    if type(intent_ids) is not tuple:
-        raise AuditIntegrityError("covered_deferred_intent_ids must be a tuple")
-    seen: set[str] = set()
-    for index, intent_id in enumerate(intent_ids):
-        canonical_id = _canonical_uuid_text(intent_id, f"covered_deferred_intent_ids[{index}]")
-        if canonical_id in seen:
-            raise AuditIntegrityError("covered_deferred_intent_ids must not contain duplicates")
-        seen.add(canonical_id)
-
-
 def reviewed_anchor_hash(reviewed_facts: Mapping[str, Any]) -> str:
     """Hash a detached, recursively immutable snapshot of reviewed facts."""
     frozen_facts = _validate_and_freeze_canonical_mapping(reviewed_facts, "reviewed_facts")
@@ -324,13 +293,11 @@ def _project_owned_composition_state(state: CompositionState) -> OwnedCompositio
 def owned_composition_state_authority(state: CompositionState) -> OwnedCompositionStateAuthorityData:
     """Project exact authored content for a private pipeline proposal.
 
-    Lifecycle version and guided-session state are deliberately excluded. The
+    Lifecycle version is deliberately excluded. The
     proposal base binds the current persisted version/content, while settlement
     assigns exactly ``current.version + 1``. This seam exists for authored
     topologies that public ``set_pipeline`` v1 cannot represent losslessly.
     """
-    if state.guided_session is not None:
-        raise AuditIntegrityError("owned composition-state proposals are freeform-only")
     authority = _project_owned_composition_state(state)
     # Reuse the strict restore path here so construction and reload admit the
     # exact same closed shape.
@@ -587,34 +554,21 @@ def pipeline_draft_hash(
     *,
     pipeline: Mapping[str, Any],
     base: ProposalBase,
-    reviewed_anchor_hash: str,
-    surface: PlannerSurface,
     repair_count: int,
     skill_hash: str,
-    covered_deferred_intent_ids: tuple[str, ...],
-    supersedes_draft_hash: str | None,
 ) -> str:
-    """Hash the complete authority-bearing proposal envelope under v3."""
+    """Hash the complete authority-bearing proposal envelope under v4."""
     frozen_pipeline = _validate_and_freeze_canonical_mapping(pipeline, "pipeline")
-    _require_hash(reviewed_anchor_hash, "reviewed_anchor_hash")
-    if type(surface) is not PlannerSurface:
-        raise AuditIntegrityError("surface must be PlannerSurface")
     if type(repair_count) is not int or repair_count < 0:
         raise AuditIntegrityError("repair_count must be a non-negative integer")
     _require_hash(skill_hash, "skill_hash")
-    _validate_covered_intent_ids(covered_deferred_intent_ids)
-    _require_hash(supersedes_draft_hash, "supersedes_draft_hash", optional=True)
 
     preimage = {
         "schema": _DRAFT_HASH_SCHEMA,
         "pipeline": project_composer_authority_payload(frozen_pipeline),
         "base": _base_to_dict(base),
-        "reviewed_anchor_hash": reviewed_anchor_hash,
-        "surface": surface.value,
         "repair_count": repair_count,
         "skill_hash": skill_hash,
-        "covered_deferred_intent_ids": list(covered_deferred_intent_ids),
-        "supersedes_draft_hash": supersedes_draft_hash,
     }
     canonical_json(preimage)
     return stable_hash(preimage)
@@ -627,12 +581,8 @@ class PipelineProposal:
     pipeline: Mapping[str, Any]
     draft_hash: str
     base: ProposalBase
-    reviewed_anchor_hash: str
-    surface: PlannerSurface
     repair_count: int
     skill_hash: str
-    covered_deferred_intent_ids: tuple[str, ...]
-    supersedes_draft_hash: str | None
 
     def __post_init__(self) -> None:
         frozen_pipeline = _validate_and_freeze_canonical_mapping(self.pipeline, "pipeline")
@@ -640,29 +590,20 @@ class PipelineProposal:
             restore_owned_composition_state_authority(frozen_pipeline, version=1)
         _base_to_dict(self.base)
         _require_hash(self.draft_hash, "draft_hash")
-        _require_hash(self.reviewed_anchor_hash, "reviewed_anchor_hash")
-        if type(self.surface) is not PlannerSurface:
-            raise AuditIntegrityError("surface must be PlannerSurface")
         if type(self.repair_count) is not int or self.repair_count < 0:
             raise AuditIntegrityError("repair_count must be a non-negative integer")
         _require_hash(self.skill_hash, "skill_hash")
-        _validate_covered_intent_ids(self.covered_deferred_intent_ids)
-        _require_hash(self.supersedes_draft_hash, "supersedes_draft_hash", optional=True)
 
         expected_draft_hash = pipeline_draft_hash(
             pipeline=frozen_pipeline,
             base=self.base,
-            reviewed_anchor_hash=self.reviewed_anchor_hash,
-            surface=self.surface,
             repair_count=self.repair_count,
             skill_hash=self.skill_hash,
-            covered_deferred_intent_ids=self.covered_deferred_intent_ids,
-            supersedes_draft_hash=self.supersedes_draft_hash,
         )
         if self.draft_hash != expected_draft_hash:
             raise AuditIntegrityError("PipelineProposal draft_hash mismatch")
         object.__setattr__(self, "pipeline", frozen_pipeline)
-        freeze_fields(self, "pipeline", "covered_deferred_intent_ids")
+        freeze_fields(self, "pipeline")
 
     @classmethod
     def create(
@@ -670,29 +611,17 @@ class PipelineProposal:
         *,
         pipeline: Mapping[str, Any],
         base: ProposalBase,
-        reviewed_facts: Mapping[str, Any],
-        surface: PlannerSurface,
         repair_count: int,
         skill_hash: str,
-        covered_deferred_intent_ids: tuple[str, ...],
-        supersedes_draft_hash: str | None,
         supplied_draft_hash: str | None = None,
-        supplied_reviewed_anchor_hash: str | None = None,
     ) -> Self:
-        """Construct from reviewed facts, optionally verifying supplied hashes."""
+        """Construct a proposal, optionally verifying its supplied draft hash."""
         frozen_pipeline = _validate_and_freeze_canonical_mapping(pipeline, "pipeline")
-        computed_anchor_hash = reviewed_anchor_hash(reviewed_facts)
-        if supplied_reviewed_anchor_hash is not None and supplied_reviewed_anchor_hash != computed_anchor_hash:
-            raise AuditIntegrityError("PipelineProposal reviewed_anchor_hash mismatch")
         computed_draft_hash = pipeline_draft_hash(
             pipeline=frozen_pipeline,
             base=base,
-            reviewed_anchor_hash=computed_anchor_hash,
-            surface=surface,
             repair_count=repair_count,
             skill_hash=skill_hash,
-            covered_deferred_intent_ids=covered_deferred_intent_ids,
-            supersedes_draft_hash=supersedes_draft_hash,
         )
         if supplied_draft_hash is not None and supplied_draft_hash != computed_draft_hash:
             raise AuditIntegrityError("PipelineProposal draft_hash mismatch")
@@ -700,12 +629,8 @@ class PipelineProposal:
             pipeline=frozen_pipeline,
             draft_hash=computed_draft_hash,
             base=base,
-            reviewed_anchor_hash=computed_anchor_hash,
-            surface=surface,
             repair_count=repair_count,
             skill_hash=skill_hash,
-            covered_deferred_intent_ids=covered_deferred_intent_ids,
-            supersedes_draft_hash=supersedes_draft_hash,
         )
 
     def to_dict(self) -> PipelineProposalData:
@@ -714,22 +639,17 @@ class PipelineProposal:
             "pipeline": deep_thaw(self.pipeline),
             "draft_hash": self.draft_hash,
             "base": _base_to_dict(self.base),
-            "reviewed_anchor_hash": self.reviewed_anchor_hash,
-            "surface": self.surface.value,
             "repair_count": self.repair_count,
             "skill_hash": self.skill_hash,
-            "covered_deferred_intent_ids": list(self.covered_deferred_intent_ids),
-            "supersedes_draft_hash": self.supersedes_draft_hash,
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any], *, reviewed_facts: Mapping[str, Any]) -> Self:
-        """Strictly restore and reverify an envelope against reviewed facts."""
+    def from_dict(cls, payload: Mapping[str, Any]) -> Self:
+        """Strictly restore and reverify an envelope."""
         payload = _validate_and_freeze_canonical_mapping(payload, "pipeline proposal payload")
         if set(payload) != _PROPOSAL_FIELDS:
             raise AuditIntegrityError("PipelineProposal persisted fields are malformed")
         _require_hash(payload["draft_hash"], "PipelineProposal draft_hash")
-        _require_hash(payload["reviewed_anchor_hash"], "PipelineProposal reviewed_anchor_hash")
 
         raw_base = payload["base"]
         if type(raw_base) is not MappingProxyType:
@@ -751,37 +671,22 @@ class PipelineProposal:
         else:
             raise AuditIntegrityError("PipelineProposal base kind is malformed")
 
-        raw_surface = payload["surface"]
-        if type(raw_surface) is not str:
-            raise AuditIntegrityError("PipelineProposal surface is malformed")
-        try:
-            surface = PlannerSurface(raw_surface)
-        except ValueError as exc:
-            raise AuditIntegrityError("PipelineProposal surface is malformed") from exc
-
-        raw_covered_ids = payload["covered_deferred_intent_ids"]
-        if type(raw_covered_ids) is not FrozenJsonArray:
-            raise AuditIntegrityError("PipelineProposal covered_deferred_intent_ids must be a list")
-
         return cls.create(
             pipeline=payload["pipeline"],
             base=base,
-            reviewed_facts=reviewed_facts,
-            surface=surface,
             repair_count=payload["repair_count"],
             skill_hash=payload["skill_hash"],
-            covered_deferred_intent_ids=tuple(raw_covered_ids),
-            supersedes_draft_hash=payload["supersedes_draft_hash"],
             supplied_draft_hash=payload["draft_hash"],
-            supplied_reviewed_anchor_hash=payload["reviewed_anchor_hash"],
         )
 
 
 def composition_content_hash(state: CompositionState) -> str:
-    """Hash authored composition content, excluding version and guided metadata.
+    """Hash authored composition content, excluding version.
 
-    Non-row-union content retains the historical preimage. Row-union branches
-    use the Composer authority projection so authored order remains bound.
+    The preimage is the Composer authority projection: the ``sources`` map
+    and mapping-form row_union and coalesce branches are hashed as ordered
+    pair arrays, so their authored order remains bound. List-form branches
+    are already ordered.
 
     Memoized on the instance's ``_content_hash_memo`` slot: ``state`` is
     frozen (content identity cannot change) and every mutation constructor

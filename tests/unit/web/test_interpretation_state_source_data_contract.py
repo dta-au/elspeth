@@ -37,6 +37,7 @@ from elspeth.web.interpretation_state import (
 
 def _llm_node(*, required: list[str] | None, node_id: str = "rate") -> NodeSpec:
     options: dict[str, Any] = {
+        "system_prompt": "You rate colours. Reply with a score from 1 to 5.",
         "prompt_template": "Rate {{ row.colour }}",
         "model": "gpt-test",
         "schema": {"mode": "observed"},

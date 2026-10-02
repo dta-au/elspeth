@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 import pytest
 import structlog
 from sqlalchemy import Engine, update
+from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.membership_authority import (
@@ -88,8 +89,11 @@ def _expire_instance(engine: Engine, instance_id: str) -> None:
         )
 
 
-async def _create_running_run(service: SessionServiceImpl) -> tuple[RunRecord, SessionOperationContext]:
-    session = await service.create_session(str(uuid4()), "Pipeline", "local")
+async def _create_running_run(service: SessionServiceImpl, engine: Engine) -> tuple[RunRecord, SessionOperationContext]:
+    owner_id = str(uuid4())
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=owner_id)
+    session = await service.create_session(owner_id, "Pipeline", "local")
     compose_context = await service._run_sync(
         lambda: service.session_operation_authority.acquire(
             session_id=session.id,
@@ -124,7 +128,7 @@ async def _create_running_run(service: SessionServiceImpl) -> tuple[RunRecord, S
 async def test_recovery_requires_both_fence_and_membership_expiry_and_has_one_winner(deployment) -> None:
     first_engine, _second_engine, first, second = deployment
     _register_live_instance(first_engine, first.session_operation_owner_instance_id)
-    run, _context = await _create_running_run(first)
+    run, _context = await _create_running_run(first, first_engine)
     _expire_fence(first_engine, run.session_id)
 
     assert await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered") == []
@@ -143,7 +147,7 @@ async def test_recovery_requires_both_fence_and_membership_expiry_and_has_one_wi
 @pytest.mark.asyncio
 async def test_expired_fence_with_missing_membership_fails_closed(deployment) -> None:
     first_engine, _second_engine, first, second = deployment
-    run, _context = await _create_running_run(first)
+    run, _context = await _create_running_run(first, first_engine)
     _expire_fence(first_engine, run.session_id)
 
     assert await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered") == []
@@ -154,7 +158,7 @@ async def test_expired_fence_with_missing_membership_fails_closed(deployment) ->
 async def test_new_operation_acquisition_and_recovery_serialize_without_overwrite(deployment) -> None:
     first_engine, _second_engine, first, second = deployment
     _register_live_instance(first_engine, first.session_operation_owner_instance_id)
-    run, _context = await _create_running_run(first)
+    run, _context = await _create_running_run(first, first_engine)
     _expire_fence(first_engine, run.session_id)
     _expire_instance(first_engine, first.session_operation_owner_instance_id)
 

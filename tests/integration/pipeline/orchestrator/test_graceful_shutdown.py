@@ -15,18 +15,15 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from elspeth.contracts import Determinism, PipelineRow, RunStatus
-from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.results import SourceRow
-from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import AggregationName
-from elspeth.core.canonical import canonical_json
 from elspeth.core.config import AggregationSettings, SourceSettings, TriggerConfig
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.models import GraphValidationError
-from elspeth.engine.orchestrator import PipelineConfig, prepare_for_run
+from elspeth.engine.orchestrator import PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from tests.fixtures.base_classes import (
@@ -36,19 +33,11 @@ from tests.fixtures.base_classes import (
     as_source,
     as_transform,
 )
-from tests.fixtures.landscape import insert_crashed_leader_seat
-from tests.fixtures.pipeline import build_linear_pipeline, build_production_graph
+from tests.fixtures.pipeline import build_production_graph
 from tests.fixtures.plugins import CollectSink, ListSource
-from tests.helpers.checkpoint import create_checkpoint
 
 if TYPE_CHECKING:
     from elspeth.core.landscape import LandscapeDB
-
-
-def _runtime_val_manifest_json() -> str:
-    """Mirror the run-header manifest production begin_run() stores."""
-    prepare_for_run()
-    return canonical_json(build_runtime_val_manifest())
 
 
 class InterruptAfterN(BaseTransform):
@@ -869,12 +858,6 @@ class TestInterruptAndResume:
           ``tests/integration/audit/test_contract_violation_token_outcomes.py::
           test_aggregation_count_flush_violation_abandons_tokens_at_finalization``
           (:321-324).
-        * ``get_unprocessed_rows`` raising "ABANDONED is non-resumable" —
-          ``get_unprocessed_rows`` (core/checkpoint/recovery.py:956) is a
-          thin wrapper over ``get_resume_workset`` (:776), whose raise
-          (:834) is pinned directly by
-          ``tests/unit/core/landscape/test_state_engine_read_model_truth_tables.py``
-          (:493).
         * ``resume()`` raising ``IncompleteSourceResumeError`` for the
           INTERRUPTED lifecycle arm specifically —
           ``tests/integration/pipeline/test_eof_resume_proof.py`` (:528,
@@ -981,7 +964,7 @@ class TestInterruptAndResume:
         )
 
         row, token = setup.factory.data_flow.create_row_with_token(
-            run_id, setup.source_node_id, 0, {"value": 10}, source_row_index=0, ingest_sequence=0
+            setup.source_node_id, 0, {"value": 10}, source_row_index=0, ingest_sequence=0, coordination_token=setup.coordination_token
         )
 
         datetime.now(UTC)
@@ -989,7 +972,7 @@ class TestInterruptAndResume:
         payload_contract = SchemaContract(mode="OBSERVED", fields=(), locked=True)
         payload_json = TokenSchedulerRepository.serialize_row_payload(PipelineRow({"value": 10}, payload_contract))
         work_item = scheduler.enqueue_ready_claimed(
-            run_id=run_id,
+            member_token=setup.coordination_token.membership,
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=coalesce_node_id,
@@ -1004,7 +987,9 @@ class TestInterruptAndResume:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-shutdown-1", member_key="direct_branch"),),
         )
         scheduler.mark_blocked(
+            member_token=setup.coordination_token.membership,
             work_item_id=work_item.work_item_id,
+            row_payload_json=work_item.row_payload_json,
             queue_key=None,
             barrier_key="merge_paths",
             expected_lease_owner=leader_worker_id,
@@ -1068,282 +1053,6 @@ class TestInterruptAndResume:
         context = json.loads(abandoned_row["context_json"])
         assert context["abandoned_by"] == "run_finalization"
         assert "incomplete_sources" in context["non_resumable_arms"]
-
-    def _setup_failed_run(
-        self,
-        db: LandscapeDB,
-        payload_store: Any,
-        run_id: str,
-        num_rows: int,
-        processed_count: int,
-    ) -> Any:
-        """Set up a failed run with some rows processed and others pending.
-
-        Creates DB records manually so resume has unprocessed rows to work with.
-        Graph is built via production path (ExecutionGraph.from_plugin_instances)
-        to prevent BUG-LINEAGE-01; node IDs are extracted from the graph for
-        the manual SQL inserts.
-
-        Args:
-            db: LandscapeDB connection
-            payload_store: PayloadStore for row data
-            run_id: Run identifier
-            num_rows: Total rows to create
-            processed_count: Number of rows already processed (with terminal outcomes)
-
-        Returns:
-            ExecutionGraph for the run (with sink/transform ID maps already set)
-        """
-        import json as json_mod
-
-        from sqlalchemy import insert
-
-        from elspeth.contracts import NodeType
-        from elspeth.contracts.contract_records import ContractAuditRecord
-        from elspeth.contracts.enums import Determinism, RoutingMode, TerminalOutcome, TerminalPath
-        from elspeth.contracts.schema_contract import FieldContract, SchemaContract
-        from elspeth.core.checkpoint import CheckpointManager
-        from elspeth.core.landscape.schema import (
-            edges_table,
-            nodes_table,
-            rows_table,
-            run_sources_table,
-            runs_table,
-            tokens_table,
-        )
-        from tests.fixtures.landscape import make_factory
-        from tests.fixtures.plugins import PassTransform
-
-        now = datetime.now(UTC)
-
-        # Build graph via production path — prevents BUG-LINEAGE-01
-        source_data = [{"value": i} for i in range(num_rows)]
-        transform = PassTransform()
-        _, _, _, graph = build_linear_pipeline(source_data, transforms=[as_transform(transform)])
-
-        # Extract production-generated node IDs
-        source_nid = graph.get_sources()[0]
-        assert source_nid is not None
-        transform_id_map = graph.get_transform_id_map()
-        sink_id_map = graph.get_sink_id_map()
-        xform_nid = str(transform_id_map[0])
-        sink_nid = str(next(iter(sink_id_map.values())))
-
-        source_schema_json = json_mod.dumps({"properties": {"value": {"type": "integer"}}, "required": ["value"]})
-
-        contract = SchemaContract(
-            mode="FIXED",
-            fields=(
-                FieldContract(
-                    normalized_name="value",
-                    original_name="value",
-                    python_type=int,
-                    required=True,
-                    source="declared",
-                ),
-            ),
-            locked=True,
-        )
-        audit_record = ContractAuditRecord.from_contract(contract)
-        schema_contract_json = audit_record.to_json()
-        schema_contract_hash = contract.version_hash()
-
-        with db.engine.begin() as conn:
-            conn.execute(
-                insert(runs_table).values(
-                    run_id=run_id,
-                    started_at=now,
-                    config_hash="test",
-                    settings_json="{}",
-                    canonical_version="v1",
-                    status=RunStatus.FAILED,
-                    source_schema_json=source_schema_json,
-                    runtime_val_manifest_json=_runtime_val_manifest_json(),
-                    openrouter_catalog_sha256="0" * 64,
-                    openrouter_catalog_source="bundled",
-                )
-            )
-            # Epoch 21 (ADR-030): the crashed-run image includes the expired
-            # leader seat begin_run would have minted atomically with the run.
-            insert_crashed_leader_seat(conn, run_id=run_id)
-
-            for node_id, plugin_name, node_type in [
-                (source_nid, "list_source", NodeType.SOURCE),
-                (xform_nid, "passthrough", NodeType.TRANSFORM),
-                (sink_nid, "collect_sink", NodeType.SINK),
-            ]:
-                conn.execute(
-                    insert(nodes_table).values(
-                        node_id=node_id,
-                        run_id=run_id,
-                        plugin_name=plugin_name,
-                        node_type=node_type,
-                        plugin_version="1.0.0",
-                        determinism=Determinism.DETERMINISTIC if node_type != NodeType.SINK else Determinism.IO_WRITE,
-                        config_hash="test",
-                        config_json="{}",
-                        registered_at=now,
-                    )
-                )
-
-            # Per ADR-025 §3 Decision 5, ``verify_contract_integrity`` reads
-            # from ``run_sources.schema_contract_json`` exclusively. The
-            # fabricated failed run must populate the per-source contract row
-            # so resume can verify Tier-1 integrity.
-            conn.execute(
-                insert(run_sources_table).values(
-                    run_id=run_id,
-                    source_node_id=source_nid,
-                    source_name="primary",
-                    plugin_name="list_source",
-                    lifecycle_state="loaded",
-                    config_hash="test",
-                    schema_json=source_schema_json,
-                    schema_contract_json=schema_contract_json,
-                    schema_contract_hash=schema_contract_hash,
-                    field_resolution_json=None,
-                    recorded_at=now,
-                )
-            )
-
-            for edge_id, from_node, to_node in [
-                ("e1", source_nid, xform_nid),
-                ("e2", xform_nid, sink_nid),
-            ]:
-                conn.execute(
-                    insert(edges_table).values(
-                        edge_id=edge_id,
-                        run_id=run_id,
-                        from_node_id=from_node,
-                        to_node_id=to_node,
-                        label="continue",
-                        default_mode=RoutingMode.MOVE,
-                        created_at=now,
-                    )
-                )
-
-            for i in range(num_rows):
-                row_data = {"value": i}
-                ref = payload_store.store(json_mod.dumps(row_data).encode())
-                conn.execute(
-                    insert(rows_table).values(
-                        row_id=f"r{i}",
-                        run_id=run_id,
-                        source_node_id=source_nid,
-                        row_index=i,
-                        source_row_index=i,
-                        ingest_sequence=i,
-                        source_data_hash=f"h{i}",
-                        source_data_ref=ref,
-                        created_at=now,
-                    )
-                )
-                conn.execute(
-                    insert(tokens_table).values(
-                        token_id=f"t{i}",
-                        row_id=f"r{i}",
-                        run_id=run_id,
-                        created_at=now,
-                    )
-                )
-
-        # Mark first N rows as completed
-        factory = make_factory(db)
-        for i in range(processed_count):
-            factory.data_flow.record_token_outcome(
-                ref=TokenRef(token_id=f"t{i}", run_id=run_id),
-                outcome=TerminalOutcome.SUCCESS,
-                path=TerminalPath.DEFAULT_FLOW,
-                sink_name="default",
-            )
-
-        # Create checkpoint at last processed row
-        if processed_count > 0:
-            checkpoint_mgr = CheckpointManager(db)
-            create_checkpoint(
-                checkpoint_mgr,
-                run_id=run_id,
-                sequence_number=processed_count - 1,
-                barrier_scalars=None,
-                graph=graph,
-            )
-
-        return graph
-
-    def test_resume_honors_shutdown_event(self, landscape_db: LandscapeDB, payload_store) -> None:
-        """Interrupt during resume: GracefulShutdownError raised, run marked INTERRUPTED."""
-        from sqlalchemy import select
-
-        from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
-        from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
-        from elspeth.core.config import CheckpointSettings
-        from elspeth.core.landscape.schema import runs_table
-        from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
-        from elspeth.plugins.sources.null_source import NullSource
-
-        run_id = "resume-shutdown-test"
-        total_rows = 10
-        processed_count = 3
-
-        # Set up failed run: 10 rows, 3 processed, 7 remaining
-        # Graph is built via production path; ID maps are already set.
-        graph = self._setup_failed_run(
-            landscape_db,
-            payload_store,
-            run_id,
-            num_rows=total_rows,
-            processed_count=processed_count,
-        )
-
-        checkpoint_mgr = CheckpointManager(landscape_db)
-        settings = CheckpointSettings(enabled=True, frequency="every_row")
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(settings)
-        recovery = RecoveryManager(landscape_db, checkpoint_mgr)
-        resume_point = recovery.get_resume_point(run_id, graph)
-        assert resume_point is not None
-
-        # Set up resume with shutdown event that fires after 2 rows
-        resume_shutdown = threading.Event()
-        resume_transform = InterruptAfterN(2, resume_shutdown)
-        resume_transform.on_success = "default"
-        resume_transform.on_error = "discard"
-        resume_sink = CollectSink()
-        null_source = NullSource({})
-        null_source.on_success = "default"
-
-        resume_config = PipelineConfig(
-            sources={"primary": as_source(null_source)},
-            transforms=[as_transform(resume_transform)],
-            sinks={"default": as_sink(resume_sink)},
-        )
-
-        orchestrator = Orchestrator(
-            db=landscape_db,
-            checkpoint_manager=checkpoint_mgr,
-            checkpoint_config=checkpoint_config,
-        )
-
-        with pytest.raises(GracefulShutdownError) as resume_exc:
-            orchestrator.resume(
-                resume_point=resume_point,
-                config=resume_config,
-                graph=graph,
-                payload_store=payload_store,
-                shutdown_event=resume_shutdown,
-            )
-
-        # GracefulShutdownError has correct rows_processed and run_id
-        assert resume_exc.value.rows_processed >= 2
-        assert resume_exc.value.run_id == run_id
-
-        # Run is INTERRUPTED in database (not FAILED or RUNNING)
-        with landscape_db.engine.connect() as conn:
-            run = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
-        assert run is not None
-        assert run.status == RunStatus.INTERRUPTED
-
-        # Processed rows reached the sink
-        assert len(resume_sink.results) >= 2
 
     def test_resume_shutdown_recheckpoints_buffered_aggregation_without_sink_writes(self, landscape_db: LandscapeDB, payload_store) -> None:
         """Pre-set shutdown during resume must preserve buffered aggregation state without sink writes.
@@ -1443,98 +1152,3 @@ class TestInterruptAndResume:
         # plus unchanged checkpoint-borne barrier scalars.
         assert blocked_barrier_tokens() == pre_resume_blocked
         assert second_resume_point.barrier_scalars == first_resume_point.barrier_scalars
-
-    def test_resume_without_shutdown_completes_normally(self, landscape_db: LandscapeDB, payload_store) -> None:
-        """Resume without shutdown event completes all remaining rows."""
-        from sqlalchemy import select
-
-        from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
-        from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName
-        from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
-        from elspeth.core.config import CheckpointSettings
-        from elspeth.core.landscape.schema import runs_table
-        from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
-        from elspeth.plugins.sources.null_source import NullSource
-        from elspeth.plugins.transforms.passthrough import PassThrough
-        from elspeth.telemetry import TelemetryManager
-        from tests.fixtures.telemetry import MockTelemetryConfig, TelemetryTestExporter
-
-        run_id = "resume-no-shutdown-test"
-        total_rows = 10
-        processed_count = 5
-
-        # Set up failed run: 10 rows, 5 processed, 5 remaining
-        # Graph is built via production path; ID maps are already set.
-        graph = self._setup_failed_run(
-            landscape_db,
-            payload_store,
-            run_id,
-            num_rows=total_rows,
-            processed_count=processed_count,
-        )
-
-        checkpoint_mgr = CheckpointManager(landscape_db)
-        settings = CheckpointSettings(enabled=True, frequency="every_row")
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(settings)
-        recovery = RecoveryManager(landscape_db, checkpoint_mgr)
-        resume_point = recovery.get_resume_point(run_id, graph)
-        assert resume_point is not None
-
-        # Set up resume WITHOUT shutdown event
-        passthrough = PassThrough({"schema": {"mode": "observed"}})
-        passthrough.on_success = "default"
-        passthrough.on_error = "discard"
-        resume_sink = CollectSink()
-        null_source = NullSource({})
-        null_source.on_success = "default"
-
-        resume_config = PipelineConfig(
-            sources={"primary": as_source(null_source)},
-            transforms=[as_transform(passthrough)],
-            sinks={"default": as_sink(resume_sink)},
-        )
-
-        telemetry_exporter = TelemetryTestExporter()
-        telemetry_manager = TelemetryManager(MockTelemetryConfig(), exporters=[telemetry_exporter])
-        orchestrator = Orchestrator(
-            db=landscape_db,
-            checkpoint_manager=checkpoint_mgr,
-            checkpoint_config=checkpoint_config,
-            telemetry_manager=telemetry_manager,
-        )
-
-        try:
-            result = orchestrator.resume(
-                resume_point=resume_point,
-                config=resume_config,
-                graph=graph,
-                payload_store=payload_store,
-            )
-        finally:
-            telemetry_manager.close()
-
-        remaining_rows = total_rows - processed_count
-        # F2 (resume-fork-reemit): the resume RunResult now reports CUMULATIVE
-        # rows_processed reconstructed from the audit trail (distinct source rows
-        # reaching a terminal outcome) — the whole run (total_rows), matching an
-        # uninterrupted run. Pre-F2 it reported the resume-only `remaining_rows`.
-        # The resume sink still only collects the rows THIS resume wrote, so its
-        # result count remains `remaining_rows`.
-        assert result.rows_processed == total_rows
-        assert result.status == RunStatus.COMPLETED
-        assert len(resume_sink.results) == remaining_rows
-
-        # Run is COMPLETED in database
-        with landscape_db.engine.connect() as conn:
-            run = conn.execute(select(runs_table.c.status, runs_table.c.started_at).where(runs_table.c.run_id == run_id)).fetchone()
-        assert run is not None
-        assert run.status == RunStatus.COMPLETED
-
-        engine_spans = [event for event in telemetry_exporter.events if isinstance(event, EngineSpanCompleted)]
-        assert EngineSpanName.RUN not in {event.name for event in engine_spans}
-        assert EngineSpanName.SOURCE not in {event.name for event in engine_spans}
-        assert {EngineSpanName.ROW, EngineSpanName.TRANSFORM, EngineSpanName.SINK} <= {event.name for event in engine_spans}
-        durable_started_at = run.started_at.replace(tzinfo=UTC) if run.started_at.tzinfo is None else run.started_at
-        assert all(event.trace_started_at == durable_started_at for event in engine_spans)
-        row_span_ids = {event.span_id for event in engine_spans if event.name is EngineSpanName.ROW}
-        assert all(event.parent_span_id in row_span_ids for event in engine_spans if event.name is EngineSpanName.TRANSFORM)

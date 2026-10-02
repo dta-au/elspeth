@@ -201,6 +201,7 @@ def test_a_blank_setting_does_not_count_as_configured() -> None:
         sso_client_secret=SecretStr("s3cret"),
         sso_endpoint_origins=("https://origin.example",),
         quota_default_tokens_per_day=100_000,
+        quota_default_storage_bytes=1_000_000,
     )
     values = configured_auth_settings(configured)
     assert values["sso_client_secret"] is True
@@ -369,7 +370,7 @@ def test_secret_and_session_boundaries_do_not_widen_auth_provider_to_str() -> No
         ("SessionServiceImpl.list_sessions", SessionServiceImpl.list_sessions),
     ]
     # ``fork_session`` no longer takes a caller-supplied ``auth_provider_type``:
-    # it now accepts a ``GuidedOperationFence`` and derives the provider
+    # it now accepts ``SessionForkParentAuthority`` and derives the provider
     # discriminator internally from the fenced parent session row (a stricter,
     # not-caller-supplied boundary). There is no ``str``-widening seam to guard
     # here anymore, so it drops out of the closed-Literal contract list.

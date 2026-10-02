@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
+from threading import Lock
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, Self, TypedDict, cast
 
 import jwt as pyjwt
 import structlog
@@ -17,11 +18,15 @@ from sqlalchemy.exc import SQLAlchemyError
 from elspeth.contracts.auth import (
     AUTH_EVENT_CONSOLE_REQUEST_ID_KEY,
     AUTH_EVENT_ON_BEHALF_OF_KEY,
+    AuthAuditEventInput,
+    AuthAuditEventType,
+    AuthAuditOutcome,
     AuthProviderType,
     IdentityRole,
     RelationshipType,
 )
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.landscape.auth_audit_repository import AuthAuditRepository
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
@@ -32,6 +37,10 @@ from elspeth.web.schema_probe import postgres_engine_kwargs
 
 if TYPE_CHECKING:
     from elspeth.web.config import WebSettings
+    from elspeth.web.coordination.approval_authority import ApprovalRecord, ApprovalSupersession
+    from elspeth.web.coordination.identity_authority import PendingIdentitiesPurged
+    from elspeth.web.coordination.quota_authority import QuotaExceeded
+    from elspeth.web.coordination.quota_policy_authority import QuotaPolicyChange
 
 
 _slog = structlog.get_logger(__name__)
@@ -39,6 +48,151 @@ _slog = structlog.get_logger(__name__)
 
 MAX_AUTH_AUDIT_TEXT_LENGTH = 512
 """Maximum length for caller-controlled auth audit context fields."""
+
+
+@dataclass(frozen=True, slots=True)
+class _CompartmentStampedAuthAudit:
+    """Stamp the deployment compartment on every Web auth event write."""
+
+    repository: AuthAuditRepository
+    compartment_id: str | None
+
+    def _metadata(self, metadata: Mapping[str, object]) -> dict[str, object]:
+        if "compartment_id" in metadata:
+            raise AuditIntegrityError("Auth audit callers cannot override the deployment compartment")
+        return {**metadata, "compartment_id": self.compartment_id}
+
+    def record_auth_event(
+        self,
+        *,
+        event_type: AuthAuditEventType,
+        outcome: AuthAuditOutcome,
+        provider: AuthProviderType,
+        user_id: str | None,
+        username: str | None,
+        failure_category: str | None,
+        request_id: str | None,
+        client_host: str | None,
+        user_agent: str | None,
+        metadata: Mapping[str, object],
+        identity_id: str | None = None,
+    ) -> str:
+        return self.repository.record_auth_event(
+            event_type=event_type,
+            outcome=outcome,
+            provider=provider,
+            user_id=user_id,
+            username=username,
+            failure_category=failure_category,
+            request_id=request_id,
+            client_host=client_host,
+            user_agent=user_agent,
+            metadata=self._metadata(metadata),
+            identity_id=identity_id,
+        )
+
+    def record_auth_events(self, events: tuple[AuthAuditEventInput, ...]) -> tuple[str, ...]:
+        return self.repository.record_auth_events(tuple(replace(event, metadata=self._metadata(event.metadata)) for event in events))
+
+    def record_login_success_and_token_issued(
+        self,
+        *,
+        provider: AuthProviderType,
+        user_id: str,
+        username: str,
+        request_id: str | None,
+        client_host: str | None,
+        user_agent: str | None,
+        login_metadata: Mapping[str, object],
+        token_metadata: Mapping[str, object],
+        identity_id: str | None = None,
+    ) -> tuple[str, str]:
+        return self.repository.record_login_success_and_token_issued(
+            provider=provider,
+            user_id=user_id,
+            username=username,
+            request_id=request_id,
+            client_host=client_host,
+            user_agent=user_agent,
+            login_metadata=self._metadata(login_metadata),
+            token_metadata=self._metadata(token_metadata),
+            identity_id=identity_id,
+        )
+
+    def record_login_outcome(
+        self,
+        *,
+        outcome: AuthAuditOutcome,
+        provider: AuthProviderType,
+        user_id: str | None,
+        username: str | None,
+        failure_category: str | None,
+        request_id: str | None,
+        client_host: str | None,
+        user_agent: str | None,
+        metadata: Mapping[str, object],
+        identity_id: str | None = None,
+    ) -> str:
+        return self.repository.record_login_outcome(
+            outcome=outcome,
+            provider=provider,
+            user_id=user_id,
+            username=username,
+            failure_category=failure_category,
+            request_id=request_id,
+            client_host=client_host,
+            user_agent=user_agent,
+            metadata=self._metadata(metadata),
+            identity_id=identity_id,
+        )
+
+    def record_token_issued(
+        self,
+        *,
+        provider: AuthProviderType,
+        user_id: str,
+        username: str,
+        request_id: str | None,
+        client_host: str | None,
+        user_agent: str | None,
+        metadata: Mapping[str, object],
+        identity_id: str | None = None,
+    ) -> str:
+        return self.repository.record_token_issued(
+            provider=provider,
+            user_id=user_id,
+            username=username,
+            request_id=request_id,
+            client_host=client_host,
+            user_agent=user_agent,
+            metadata=self._metadata(metadata),
+            identity_id=identity_id,
+        )
+
+    def record_auth_failure(
+        self,
+        *,
+        provider: AuthProviderType,
+        user_id: str | None,
+        username: str | None,
+        failure_category: str,
+        request_id: str | None,
+        client_host: str | None,
+        user_agent: str | None,
+        metadata: Mapping[str, object],
+        identity_id: str | None = None,
+    ) -> str:
+        return self.repository.record_auth_failure(
+            provider=provider,
+            user_id=user_id,
+            username=username,
+            failure_category=failure_category,
+            request_id=request_id,
+            client_host=client_host,
+            user_agent=user_agent,
+            metadata=self._metadata(metadata),
+            identity_id=identity_id,
+        )
 
 
 class AuthAuditWriter(Protocol):
@@ -133,6 +287,29 @@ class AuthAuditWriter(Protocol):
         current_email: str,
     ) -> None: ...
 
+    # Two more with no ``request``, both R9: the dormancy re-pend is the
+    # authority's own act like the rebound disable, and D34's exemption is
+    # the decision NOT to act, which only this trail records at all.
+    def record_identity_dormant(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        last_login_at: datetime,
+        dormancy_days: int,
+    ) -> None: ...
+
+    def record_identity_dormancy_exempted(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        last_login_at: datetime,
+        dormancy_days: int,
+    ) -> None: ...
+
     def record_logout(
         self,
         request: Request,
@@ -159,6 +336,7 @@ class AuthAuditWriter(Protocol):
         note: str,
         role: IdentityRole | None,
         role_id: str | None,
+        retained_roles: tuple[tuple[IdentityRole, str | None], ...],
         tokens_per_day: int | None,
         storage_bytes: int | None,
         on_behalf_of: str | None,
@@ -226,6 +404,147 @@ class AuthAuditWriter(Protocol):
         console_request_id: str | None,
     ) -> None: ...
 
+    def record_pending_identities_purged(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        outcome: PendingIdentitiesPurged,
+    ) -> None: ...
+
+    # R13/R14 (identity sprint Tasks I1, I2): no ``request``. A quota refusal
+    # is decided inside an admission transaction, below every HTTP handler,
+    # and the row is written before that transaction commits (R4).
+    def record_quota_exceeded(self, outcome: QuotaExceeded) -> None:
+        """Write the Landscape ``quota_exceeded`` row for a committed quota refusal."""
+
+    def record_quota_set(self, request: Request | None, *, provider: AuthProviderType, change: QuotaPolicyChange) -> None: ...
+
+    def record_approval_requested(self, request: Request | None, *, provider: AuthProviderType, approval: ApprovalRecord) -> None: ...
+
+    def record_approval_decided(
+        self, request: Request | None, *, provider: AuthProviderType, approval: ApprovalRecord, actor_identity_id: str
+    ) -> None: ...
+
+    def record_approval_superseded(self, outcome: ApprovalSupersession) -> None: ...
+
+    def record_approval_rejection_with_supersessions(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        approval: ApprovalRecord,
+        actor_identity_id: str,
+        supersessions: tuple[ApprovalSupersession, ...],
+    ) -> None: ...
+
+    def record_review_requested(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        request_id: str,
+        session_id: str,
+        state_id: str,
+        requested_by_identity_id: str,
+        reviewer_identity_id: str | None,
+        note: str | None,
+    ) -> None: ...
+
+    def record_review_request_cancelled(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        request_id: str,
+        session_id: str,
+        state_id: str,
+        requested_by_identity_id: str,
+    ) -> None: ...
+
+    def record_review_attested(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        attestation_id: str,
+        authorizing_request_id: str,
+        session_id: str,
+        state_id: str,
+        payload_digest: str,
+        reviewer_identity_id: str,
+        author_identity_id: str,
+        verdict: str,
+        note: str | None,
+    ) -> None: ...
+
+    def record_library_published(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        entry_id: str,
+        publisher_identity_id: str,
+        actor_identity_id: str,
+        payload_digest: str,
+        entry_compartment_id: str,
+        title: str,
+        version: int,
+        published_from_session_id: str | None,
+    ) -> None: ...
+
+    def record_library_accepted(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        entry_id: str,
+        publisher_identity_id: str,
+        actor_identity_id: str,
+        payload_digest: str,
+        entry_compartment_id: str,
+        note: str | None,
+    ) -> None: ...
+
+    def record_library_rejected(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        entry_id: str,
+        publisher_identity_id: str,
+        actor_identity_id: str,
+        payload_digest: str,
+        entry_compartment_id: str,
+        note: str | None,
+    ) -> None: ...
+
+    def record_library_deprecated(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        entry_id: str,
+        publisher_identity_id: str,
+        actor_identity_id: str,
+        payload_digest: str,
+        entry_compartment_id: str,
+        note: str | None,
+    ) -> None: ...
+
+    def record_library_recalled(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        entry_id: str,
+        publisher_identity_id: str,
+        actor_identity_id: str,
+        payload_digest: str,
+        entry_compartment_id: str,
+        note: str | None,
+    ) -> None: ...
+
 
 AdminActivationCause = Literal["admin_activation", "pre_provision", "bootstrap"]
 """How an ``identity_activated`` admin row came to be written.
@@ -238,6 +557,7 @@ first login or from the operator CLI.
 
 RoleChange = Literal["granted", "revoked"]
 RelationshipChange = Literal["asserted", "revoked"]
+LibraryCurationEventType = Literal["library_accepted", "library_rejected", "library_deprecated", "library_recalled"]
 
 
 class AuthAuditOperation(StrEnum):
@@ -247,12 +567,29 @@ class AuthAuditOperation(StrEnum):
     AUTH_FAILURE = "auth_failure"
     LOGIN_FAILURE = "login_failure"
     IDENTITY_RETIRED = "identity_retired"
+    # R9's two: the re-pend, and D34's decision not to re-pend. Separate
+    # members because this value only ever reaches a log line naming which
+    # write failed, and "identity_disabled" for both would make the two
+    # indistinguishable in exactly the diagnostic that needs to tell them
+    # apart.
+    IDENTITY_DORMANT = "identity_dormant"
+    IDENTITY_DORMANCY_EXEMPTED = "identity_dormancy_exempted"
     LOGOUT = "logout"
     IDENTITY_ACTIVATED = "identity_activated"
     IDENTITY_ENABLED = "identity_enabled"
     IDENTITY_DISABLED = "identity_disabled"
     ROLE_CHANGED = "role_changed"
     RELATIONSHIP_CHANGED = "relationship_changed"
+    PENDING_IDENTITIES_PURGED = "pending_identities_purged"
+    QUOTA_EXCEEDED = "quota_exceeded"
+    QUOTA_SET = "quota_set"
+    APPROVAL_REQUESTED = "approval_requested"
+    APPROVAL_DECIDED = "approval_decided"
+    REVIEW_REQUESTED = "review_requested"
+    REVIEW_REQUEST_CANCELLED = "review_request_cancelled"
+    REVIEW_ATTESTED = "review_attested"
+    LIBRARY_PUBLISHED = "library_published"
+    LIBRARY_CURATED = "library_curated"
 
 
 def _bounded_text(value: str | None, *, max_length: int = MAX_AUTH_AUDIT_TEXT_LENGTH) -> str | None:
@@ -395,13 +732,50 @@ def classify_authentication_failure(exc: AuthenticationError) -> str:
     return "authentication_error"
 
 
-@dataclass(frozen=True)
+@dataclass
 class AuthAuditRecorder:
-    """Synchronous Landscape writer for web authentication events."""
+    """One owned Landscape engine shared by authentication event writes.
+
+    Start before entering identity transactions; close after all users have
+    stopped. Individual writes keep their own repository transactions.
+    """
 
     landscape_url: str
     landscape_passphrase: str | None
     create_tables: bool
+    compartment_id: str | None = None
+    _db: LandscapeDB | None = field(default=None, init=False, repr=False)
+    _lifecycle_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def start(self) -> LandscapeDB:
+        """Initialize once, outside the Sessions write lock, before serving auth."""
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Auth audit recorder is closed")
+            if self._db is None:
+                self._db = LandscapeDB.from_url(
+                    self.landscape_url,
+                    passphrase=self.landscape_passphrase,
+                    create_tables=self.create_tables,
+                    **postgres_engine_kwargs(self.landscape_url),
+                )
+            return self._db
+
+    def close(self) -> None:
+        """Dispose the owned engine once; a closed recorder cannot reopen it."""
+        with self._lifecycle_lock:
+            self._closed = True
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+
+    def __enter__(self) -> Self:
+        self.start()
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: object) -> None:
+        self.close()
 
     @classmethod
     def from_settings(
@@ -419,18 +793,16 @@ class AuthAuditRecorder:
             landscape_url=landscape_url,
             landscape_passphrase=settings.landscape_passphrase,
             create_tables=state_mode == "sqlite-single",
+            compartment_id=settings.compartment_id,
         )
+
+    def _auth_audit(self, db: LandscapeDB) -> _CompartmentStampedAuthAudit:
+        return _CompartmentStampedAuthAudit(RecorderFactory(db).auth_audit, self.compartment_id)
 
     @contextmanager
     def _open_landscape(self, operation: AuthAuditOperation) -> Iterator[LandscapeDB]:
         try:
-            with LandscapeDB.from_url(
-                self.landscape_url,
-                passphrase=self.landscape_passphrase,
-                create_tables=self.create_tables,
-                **postgres_engine_kwargs(self.landscape_url),
-            ) as db:
-                yield db
+            yield self.start()
         except (SchemaCompatibilityError, LandscapeRecordError, SQLAlchemyError, OSError) as exc:
             _slog.error(
                 "auth_audit_write_failed",
@@ -452,7 +824,7 @@ class AuthAuditRecorder:
         # SSO callback, where no token exists yet to derive it from — unlike
         # ``record_token_issued``, which reads it out of the minted token.
         with self._open_landscape(AuthAuditOperation.LOGIN_SUCCESS) as db:
-            RecorderFactory(db).auth_audit.record_login_outcome(
+            self._auth_audit(db).record_login_outcome(
                 outcome="success",
                 provider=provider,
                 user_id=user_id,
@@ -476,7 +848,7 @@ class AuthAuditRecorder:
     ) -> None:
         """Persist the two required login-success events atomically."""
         with self._open_landscape(AuthAuditOperation.LOGIN_SUCCESS_AND_TOKEN_ISSUED) as db:
-            RecorderFactory(db).auth_audit.record_login_success_and_token_issued(
+            self._auth_audit(db).record_login_success_and_token_issued(
                 provider=provider,
                 identity_id=_issued_identity_id(access_token),
                 user_id=user_id,
@@ -504,7 +876,7 @@ class AuthAuditRecorder:
         login_request_id: str | None = None,
     ) -> None:
         with self._open_landscape(AuthAuditOperation.TOKEN_ISSUED) as db:
-            RecorderFactory(db).auth_audit.record_token_issued(
+            self._auth_audit(db).record_token_issued(
                 provider=provider,
                 identity_id=_issued_identity_id(access_token),
                 user_id=user_id,
@@ -536,7 +908,7 @@ class AuthAuditRecorder:
         metadata["failure_stage"] = failure_stage
         metadata["exception_class"] = exception_class
         with self._open_landscape(AuthAuditOperation.AUTH_FAILURE) as db:
-            RecorderFactory(db).auth_audit.record_auth_failure(
+            self._auth_audit(db).record_auth_failure(
                 provider=provider,
                 identity_id=identity_id,
                 user_id=user_id,
@@ -557,7 +929,7 @@ class AuthAuditRecorder:
         failure_category: str,
     ) -> None:
         with self._open_landscape(AuthAuditOperation.LOGIN_FAILURE) as db:
-            RecorderFactory(db).auth_audit.record_login_outcome(
+            self._auth_audit(db).record_login_outcome(
                 outcome="failure",
                 provider=provider,
                 user_id=None,
@@ -593,7 +965,7 @@ class AuthAuditRecorder:
         unaudited would leave the identity's first refusal unexplainable.
         """
         with self._open_landscape(AuthAuditOperation.LOGIN_SUCCESS) as db:
-            recorder = RecorderFactory(db).auth_audit
+            recorder = self._auth_audit(db)
             recorder.record_auth_event(
                 event_type="identity_activated",
                 outcome="success",
@@ -664,7 +1036,7 @@ class AuthAuditRecorder:
         so a retirement this trail cannot hold does not commit.
         """
         with self._open_landscape(AuthAuditOperation.IDENTITY_RETIRED) as db:
-            RecorderFactory(db).auth_audit.record_auth_event(
+            self._auth_audit(db).record_auth_event(
                 event_type="identity_disabled",
                 outcome="success",
                 provider=provider,
@@ -718,7 +1090,7 @@ class AuthAuditRecorder:
         cannot hold does not commit.
         """
         with self._open_landscape(AuthAuditOperation.IDENTITY_DISABLED) as db:
-            RecorderFactory(db).auth_audit.record_auth_event(
+            self._auth_audit(db).record_auth_event(
                 event_type="identity_disabled",
                 outcome="success",
                 provider=provider,
@@ -737,6 +1109,120 @@ class AuthAuditRecorder:
                 },
             )
 
+    def record_identity_dormant(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        last_login_at: datetime,
+        dormancy_days: int,
+    ) -> None:
+        """Write the ``identity_disabled`` row for an R9 dormancy re-pend.
+
+        A re-pend is not a disable of the ``disabled`` kind -- the row lands
+        in ``pending`` and an administrator re-admits it through the
+        activation route -- but ``identity_disabled`` is the closed
+        vocabulary's word for "the system took this identity out of service",
+        and ``metadata.cause`` is already what distinguishes a retirement
+        (``credential_deleted``) from a rebound (``rebound``). A fourteenth
+        event type would cost a Landscape epoch bump and a service stop for a
+        discriminator the metadata already carries, so ``state`` names the
+        state the row actually reached and no reader has to infer it from the
+        event type.
+
+        The actor is ``system``: no person decided this, and naming one would
+        put an administrator's identity on a row they never touched.
+
+        Not request-bound, for the reason the rebound row is not. This row is
+        the authority's state change; the refused login writes its own
+        ``auth_failure`` row carrying the request context and the
+        ``sso_access_pending`` category, and the two join on ``identity_id``.
+
+        BOTH NUMBERS ARE RECORDED. ``last_login_at`` is the login the window
+        was measured from -- ``identities`` is current state and this very
+        transaction overwrites that column, so the moment the identity fell
+        silent survives nowhere else -- and ``dormancy_days`` is the window
+        in force when it tripped, which an operator who later widens the
+        setting needs in order to read the row as anything but an accusation.
+
+        Runs inside the authority's transaction, so a re-pend this trail
+        cannot hold does not commit.
+        """
+        with self._open_landscape(AuthAuditOperation.IDENTITY_DORMANT) as db:
+            self._auth_audit(db).record_auth_event(
+                event_type="identity_disabled",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=username,
+                username=username,
+                failure_category=None,
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={
+                    "actor": "system",
+                    "cause": "dormant",
+                    "state": "pending",
+                    "last_login_at": last_login_at.isoformat(),
+                    "dormancy_days": dormancy_days,
+                },
+            )
+
+    def record_identity_dormancy_exempted(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        last_login_at: datetime,
+        dormancy_days: int,
+    ) -> None:
+        """Write the row recording D34's last-admin exemption from R9.
+
+        THE OUTCOME IS ``failure`` AND THAT IS THE POINT. The identity was
+        dormant past the window and was NOT re-pended, because re-pending the
+        last active human administrator walks the container to zero active
+        admins by doing nothing and the first-login-only bootstrap seed
+        cannot re-fire. The event type is the one the re-pend would have
+        written and the outcome column says it did not happen, so a reader
+        keying on ``(event_type, outcome)`` -- the pair
+        ``ix_auth_events_type_outcome`` exists for -- cannot read this as a
+        disable. That is the shape available rather than the shape preferred:
+        ``AuthAuditEventType`` is closed and its CHECK is hand-written, so a
+        dedicated event type costs a Landscape epoch bump.
+
+        ``failure_category`` follows the auth-audit repository's own rule
+        that a business-rule refusal keeps its own category rather than being
+        filed as an authorization denial.
+
+        This row is the evidence that the exemption happened. The authority
+        invokes it inside its transaction, before advancing last_login_at.
+        An audit failure therefore preserves the old timestamp so the next
+        login must reconsider and record the exemption.
+        """
+        with self._open_landscape(AuthAuditOperation.IDENTITY_DORMANCY_EXEMPTED) as db:
+            self._auth_audit(db).record_auth_event(
+                event_type="identity_disabled",
+                outcome="failure",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=username,
+                username=username,
+                failure_category="dormancy_last_admin_exempt",
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={
+                    "actor": "system",
+                    "cause": "dormant",
+                    "exemption": "last_active_human_admin",
+                    "last_login_at": last_login_at.isoformat(),
+                    "dormancy_days": dormancy_days,
+                },
+            )
+
     def record_logout(
         self,
         request: Request,
@@ -747,7 +1233,7 @@ class AuthAuditRecorder:
     ) -> None:
         """Write the ``logout`` row. The client discards the token; nothing is revoked server-side (spec rev2)."""
         with self._open_landscape(AuthAuditOperation.LOGOUT) as db:
-            RecorderFactory(db).auth_audit.record_auth_event(
+            self._auth_audit(db).record_auth_event(
                 event_type="logout",
                 outcome="success",
                 provider=provider,
@@ -773,6 +1259,7 @@ class AuthAuditRecorder:
         note: str,
         role: IdentityRole | None,
         role_id: str | None,
+        retained_roles: tuple[tuple[IdentityRole, str | None], ...],
         tokens_per_day: int | None,
         storage_bytes: int | None,
         on_behalf_of: str | None,
@@ -784,12 +1271,27 @@ class AuthAuditRecorder:
         identity was admitted, this is the role it was admitted with, and
         this is its allowance. Invoked INSIDE the authority's transaction,
         so an activation this trail cannot hold does not commit.
+
+        ``retained_roles`` NAMES THE ACCESS THE ACTIVATION DID NOT GRANT, and
+        it exists because R9 made "no ``role_granted`` row" stop meaning "no
+        role". A dormancy re-pend leaves an identity's grants standing, so an
+        administrator re-admitting it with ``role="none"`` restores a
+        deployment ``admin`` while this method writes only the
+        ``identity_activated`` row -- a trail an auditor would read as an
+        admission with no authority. The roles go in the metadata of that row
+        rather than into ``role_granted`` rows of their own: those assert a
+        grant, and each of these already has one from the day it was made.
+
+        EACH ONE CARRIES ITS SCOPE. A deployment-wide ``admin`` and an
+        ``admin`` scoped to a single compartment are different authorities --
+        only the first satisfies ``_holds_deployment_admin`` -- and a bare
+        list of role names cannot tell an auditor which one came back.
         """
         provenance = _admin_provenance(
             request, actor_identity_id=actor_identity_id, on_behalf_of=on_behalf_of, console_request_id=console_request_id
         )
         with self._open_landscape(AuthAuditOperation.IDENTITY_ACTIVATED) as db:
-            recorder = RecorderFactory(db).auth_audit
+            recorder = self._auth_audit(db)
             recorder.record_auth_event(
                 event_type="identity_activated",
                 outcome="success",
@@ -798,7 +1300,18 @@ class AuthAuditRecorder:
                 user_id=username,
                 username=username,
                 failure_category=None,
-                metadata={**provenance.metadata, "cause": cause, "note": _bounded_text(note)},
+                metadata={
+                    **provenance.metadata,
+                    "cause": cause,
+                    "note": _bounded_text(note),
+                    # A list of objects, not a joined string: ``canonical_json``
+                    # renders it losslessly and a reader querying the trail
+                    # should not have to split text to learn whether an
+                    # unscoped ``admin`` is in it. Empty for every activation
+                    # of a never-activated pending row, which is every
+                    # activation there was before R9.
+                    "retained_roles": [{"role": role_held, "scope": scope} for role_held, scope in retained_roles],
+                },
                 **provenance.request_columns,
             )
             if role is not None and role_id is not None:
@@ -847,7 +1360,7 @@ class AuthAuditRecorder:
             request, actor_identity_id=actor_identity_id, on_behalf_of=on_behalf_of, console_request_id=console_request_id
         )
         with self._open_landscape(AuthAuditOperation.IDENTITY_ENABLED) as db:
-            RecorderFactory(db).auth_audit.record_auth_event(
+            self._auth_audit(db).record_auth_event(
                 event_type="identity_enabled",
                 outcome="success",
                 provider=provider,
@@ -877,7 +1390,7 @@ class AuthAuditRecorder:
             request, actor_identity_id=actor_identity_id, on_behalf_of=on_behalf_of, console_request_id=console_request_id
         )
         with self._open_landscape(AuthAuditOperation.IDENTITY_DISABLED) as db:
-            RecorderFactory(db).auth_audit.record_auth_event(
+            self._auth_audit(db).record_auth_event(
                 event_type="identity_disabled",
                 outcome="success",
                 provider=provider,
@@ -915,7 +1428,7 @@ class AuthAuditRecorder:
             request, actor_identity_id=actor_identity_id, on_behalf_of=on_behalf_of, console_request_id=console_request_id
         )
         with self._open_landscape(AuthAuditOperation.ROLE_CHANGED) as db:
-            RecorderFactory(db).auth_audit.record_auth_event(
+            self._auth_audit(db).record_auth_event(
                 event_type="role_granted" if change == "granted" else "role_revoked",
                 outcome="success",
                 provider=provider,
@@ -954,7 +1467,7 @@ class AuthAuditRecorder:
             request, actor_identity_id=actor_identity_id, on_behalf_of=on_behalf_of, console_request_id=console_request_id
         )
         with self._open_landscape(AuthAuditOperation.RELATIONSHIP_CHANGED) as db:
-            RecorderFactory(db).auth_audit.record_auth_event(
+            self._auth_audit(db).record_auth_event(
                 event_type="relationship_asserted" if change == "asserted" else "relationship_revoked",
                 outcome="success",
                 provider=provider,
@@ -972,6 +1485,546 @@ class AuthAuditRecorder:
                 },
                 **provenance.request_columns,
             )
+
+    def record_pending_identities_purged(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        outcome: PendingIdentitiesPurged,
+    ) -> None:
+        """Record one bounded batch summary plus one row for every identity actually deleted."""
+        provenance = _admin_provenance(
+            request,
+            actor_identity_id=outcome.actor_identity_id,
+            on_behalf_of=outcome.on_behalf_of,
+            console_request_id=outcome.console_request_id,
+        )
+        events = [
+            AuthAuditEventInput(
+                event_type="pending_identities_purged",
+                outcome="success",
+                provider=provider,
+                identity_id=None,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "batch_id": outcome.batch_id,
+                    "retention_days": outcome.retention_days,
+                    "scope": "batch",
+                    "deleted_count": len(outcome.identity_ids),
+                    "deleted_identity_ids": list(outcome.identity_ids),
+                    "has_more": outcome.has_more,
+                },
+                **provenance.request_columns,
+            )
+        ]
+        events.extend(
+            AuthAuditEventInput(
+                event_type="pending_identities_purged",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "batch_id": outcome.batch_id,
+                    "retention_days": outcome.retention_days,
+                    "scope": "identity",
+                },
+                **provenance.request_columns,
+            )
+            for identity_id in outcome.identity_ids
+        )
+        with self._open_landscape(AuthAuditOperation.PENDING_IDENTITIES_PURGED) as db:
+            self._auth_audit(db).record_auth_events(tuple(events))
+
+    def record_approval_requested(self, request: Request | None, *, provider: AuthProviderType, approval: ApprovalRecord) -> None:
+        metadata = _request_metadata(request) if request is not None else {}
+        metadata.update(
+            {
+                "actor": approval.requested_by_identity_id,
+                "approval_id": approval.approval_id,
+                "session_id": approval.session_id,
+                "state_id": approval.state_id,
+                "approver_identity_id": approval.approver_identity_id,
+                "binding": approval.binding.as_json(),
+                "note": _bounded_text(approval.request_note),
+            }
+        )
+        with self._open_landscape(AuthAuditOperation.APPROVAL_REQUESTED) as db:
+            self._auth_audit(db).record_auth_event(
+                event_type="approval_requested",
+                outcome="success",
+                provider=provider,
+                identity_id=approval.requested_by_identity_id,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                request_id=None if request is None else _request_id(request),
+                client_host=None if request is None else _client_host(request),
+                user_agent=None if request is None else _bounded_text(_optional_header(request, "user-agent")),
+                metadata=metadata,
+            )
+
+    @staticmethod
+    def _approval_decided_input(
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        approval: ApprovalRecord,
+        actor_identity_id: str,
+    ) -> AuthAuditEventInput:
+        if approval.decision not in ("approved", "rejected", "revoked"):
+            raise ValueError("record_approval_decided requires a decision or withdrawal")
+        metadata = _request_metadata(request) if request is not None else {}
+        metadata.update(
+            {
+                "actor": actor_identity_id,
+                "approval_id": approval.approval_id,
+                "session_id": approval.session_id,
+                "state_id": approval.state_id,
+                "requested_by_identity_id": approval.requested_by_identity_id,
+                "approver_identity_id": approval.approver_identity_id,
+                "decided_by_identity_id": approval.decided_by_identity_id,
+                "decision": approval.decision,
+                "note": _bounded_text(approval.decision_note),
+            }
+        )
+        return AuthAuditEventInput(
+            event_type="approval_decided",
+            outcome="success",
+            provider=provider,
+            identity_id=actor_identity_id,
+            user_id=None,
+            username=None,
+            failure_category=None,
+            request_id=None if request is None else _request_id(request),
+            client_host=None if request is None else _client_host(request),
+            user_agent=None if request is None else _bounded_text(_optional_header(request, "user-agent")),
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _approval_superseded_input(outcome: ApprovalSupersession) -> AuthAuditEventInput:
+        approval = outcome.approval
+        if approval.decision != "superseded":
+            raise ValueError("approval supersession audit requires a superseded row")
+        return AuthAuditEventInput(
+            event_type="approval_decided",
+            outcome="success",
+            provider=outcome.provider,
+            identity_id=outcome.actor_identity_id,
+            user_id=None,
+            username=None,
+            failure_category=None,
+            request_id=None,
+            client_host=None,
+            user_agent=None,
+            metadata={
+                "actor": outcome.actor_identity_id,
+                "approval_id": approval.approval_id,
+                "session_id": approval.session_id,
+                "state_id": approval.state_id,
+                "requested_by_identity_id": approval.requested_by_identity_id,
+                "approver_identity_id": approval.approver_identity_id,
+                "decision": "superseded",
+                "cause": outcome.cause,
+                "trigger_approval_id": outcome.trigger_approval_id,
+            },
+        )
+
+    def record_approval_decided(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        approval: ApprovalRecord,
+        actor_identity_id: str,
+    ) -> None:
+        event = self._approval_decided_input(request, provider=provider, approval=approval, actor_identity_id=actor_identity_id)
+        with self._open_landscape(AuthAuditOperation.APPROVAL_DECIDED) as db:
+            self._auth_audit(db).record_auth_events((event,))
+
+    def record_approval_superseded(self, outcome: ApprovalSupersession) -> None:
+        event = self._approval_superseded_input(outcome)
+        with self._open_landscape(AuthAuditOperation.APPROVAL_DECIDED) as db:
+            self._auth_audit(db).record_auth_events((event,))
+
+    def record_approval_rejection_with_supersessions(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        approval: ApprovalRecord,
+        actor_identity_id: str,
+        supersessions: tuple[ApprovalSupersession, ...],
+    ) -> None:
+        """Commit a rejection and every retired approval as one Landscape batch."""
+        if approval.decision != "rejected" or type(supersessions) is not tuple or not supersessions:
+            raise ValueError("rejection audit batch requires a rejection and supersessions")
+        if any(
+            item.cause != "later_rejection"
+            or item.trigger_approval_id != approval.approval_id
+            or item.approval.session_id != approval.session_id
+            or item.approval.state_id != approval.state_id
+            or item.actor_identity_id != actor_identity_id
+            or item.provider != provider
+            for item in supersessions
+        ):
+            raise AuditIntegrityError("approval retirement audit batch has mismatched custody")
+        events = (
+            self._approval_decided_input(request, provider=provider, approval=approval, actor_identity_id=actor_identity_id),
+            *(self._approval_superseded_input(item) for item in supersessions),
+        )
+        with self._open_landscape(AuthAuditOperation.APPROVAL_DECIDED) as db:
+            self._auth_audit(db).record_auth_events(events)
+
+    def record_quota_set(self, request: Request | None, *, provider: AuthProviderType, change: QuotaPolicyChange) -> None:
+        """Record each dimension changed before the Sessions policy transaction commits."""
+        provenance = _admin_provenance(
+            request,
+            actor_identity_id=change.actor_identity_id,
+            on_behalf_of=change.on_behalf_of,
+            console_request_id=change.console_request_id,
+        )
+        dimensions = ("tokens", "storage") if change.dimension is None else (change.dimension,)
+        with self._open_landscape(AuthAuditOperation.QUOTA_SET) as db:
+            recorder = self._auth_audit(db)
+            for dimension in dimensions:
+                policy = change.policy
+                previous = change.previous
+                container = change.container_policy
+                recorder.record_auth_event(
+                    event_type="quota_set",
+                    outcome="success",
+                    provider=provider,
+                    identity_id=change.identity_id,
+                    user_id=None,
+                    username=None,
+                    failure_category=None,
+                    metadata={
+                        **provenance.metadata,
+                        "source": "admin",
+                        "action": change.action,
+                        "dimension": dimension,
+                        "cap": None if policy is None else (policy.tokens_per_day if dimension == "tokens" else policy.storage_bytes),
+                        "previous_cap": None
+                        if previous is None
+                        else (previous.tokens_per_day if dimension == "tokens" else previous.storage_bytes),
+                        "ceiling": None
+                        if container is None
+                        else (container.tokens_per_day if dimension == "tokens" else container.storage_bytes),
+                        "usage": change.tokens_used_today if dimension == "tokens" else change.storage_bytes_used,
+                        "tokens_per_day": None if policy is None else policy.tokens_per_day,
+                        "storage_bytes": None if policy is None else policy.storage_bytes,
+                        "policy_id": None if policy is None else policy.policy_id,
+                        "revoked_policy_id": None if previous is None else previous.policy_id,
+                    },
+                    **provenance.request_columns,
+                )
+
+    def record_quota_exceeded(self, outcome: QuotaExceeded) -> None:
+        """Write the ``quota_exceeded`` row: dimension, cap, ceiling in force and measured usage (spec :834).
+
+        Anchored on the refused identity. ``user_id``/``username`` stay NULL
+        because the refusal is the authority's own act, joined to the person's
+        trail by ``identity_id`` exactly as ``record_identity_dormant`` is, and no
+        request column is invented for a refusal decided below the handler.
+        """
+        with self._open_landscape(AuthAuditOperation.QUOTA_EXCEEDED) as db:
+            self._auth_audit(db).record_auth_event(
+                event_type="quota_exceeded",
+                outcome="failure",
+                provider=outcome.provider,
+                identity_id=outcome.identity_id,
+                user_id=None,
+                username=None,
+                failure_category=f"quota_exceeded_{outcome.dimension}",
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={
+                    "actor": "system",
+                    "operation": outcome.operation,
+                    "dimension": outcome.dimension,
+                    "cap": outcome.cap,
+                    "ceiling": outcome.ceiling,
+                    "usage": outcome.usage,
+                    "identity_policy_id": outcome.identity_policy_id,
+                    "container_policy_id": outcome.container_policy_id,
+                },
+            )
+
+    def record_review_requested(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        request_id: str,
+        session_id: str,
+        state_id: str,
+        requested_by_identity_id: str,
+        reviewer_identity_id: str | None,
+        note: str | None,
+    ) -> None:
+        provenance = _admin_provenance(request, actor_identity_id=requested_by_identity_id, on_behalf_of=None, console_request_id=None)
+        with self._open_landscape(AuthAuditOperation.REVIEW_REQUESTED) as db:
+            self._auth_audit(db).record_auth_event(
+                event_type="review_requested",
+                outcome="success",
+                provider=provider,
+                identity_id=requested_by_identity_id,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "state_id": state_id,
+                    "reviewer_identity_id": reviewer_identity_id,
+                    "note": _bounded_text(note),
+                },
+                **provenance.request_columns,
+            )
+
+    def record_review_request_cancelled(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        request_id: str,
+        session_id: str,
+        state_id: str,
+        requested_by_identity_id: str,
+    ) -> None:
+        provenance = _admin_provenance(request, actor_identity_id=requested_by_identity_id, on_behalf_of=None, console_request_id=None)
+        with self._open_landscape(AuthAuditOperation.REVIEW_REQUEST_CANCELLED) as db:
+            self._auth_audit(db).record_auth_event(
+                event_type="review_request_cancelled",
+                outcome="success",
+                provider=provider,
+                identity_id=requested_by_identity_id,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "state_id": state_id,
+                },
+                **provenance.request_columns,
+            )
+
+    def record_review_attested(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        attestation_id: str,
+        authorizing_request_id: str,
+        session_id: str,
+        state_id: str,
+        payload_digest: str,
+        reviewer_identity_id: str,
+        author_identity_id: str,
+        verdict: str,
+        note: str | None,
+    ) -> None:
+        provenance = _admin_provenance(request, actor_identity_id=reviewer_identity_id, on_behalf_of=None, console_request_id=None)
+        with self._open_landscape(AuthAuditOperation.REVIEW_ATTESTED) as db:
+            self._auth_audit(db).record_auth_event(
+                event_type="review_attested",
+                outcome="success",
+                provider=provider,
+                identity_id=reviewer_identity_id,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "attestation_id": attestation_id,
+                    "authorizing_request_id": authorizing_request_id,
+                    "session_id": session_id,
+                    "state_id": state_id,
+                    "payload_digest": payload_digest,
+                    "author_identity_id": author_identity_id,
+                    "verdict": verdict,
+                    "note": _bounded_text(note),
+                },
+                **provenance.request_columns,
+            )
+
+    def record_library_published(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        entry_id: str,
+        publisher_identity_id: str,
+        actor_identity_id: str,
+        payload_digest: str,
+        entry_compartment_id: str,
+        title: str,
+        version: int,
+        published_from_session_id: str | None,
+    ) -> None:
+        provenance = _admin_provenance(request, actor_identity_id=actor_identity_id, on_behalf_of=None, console_request_id=None)
+        with self._open_landscape(AuthAuditOperation.LIBRARY_PUBLISHED) as db:
+            self._auth_audit(db).record_auth_event(
+                event_type="library_published",
+                outcome="success",
+                provider=provider,
+                identity_id=publisher_identity_id,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "entry_id": entry_id,
+                    "payload_digest": payload_digest,
+                    "entry_compartment_id": entry_compartment_id,
+                    "title": _bounded_text(title),
+                    "version": version,
+                    "published_from_session_id": published_from_session_id,
+                },
+                **provenance.request_columns,
+            )
+
+    def _record_library_curation(
+        self,
+        request: Request | None,
+        *,
+        event_type: LibraryCurationEventType,
+        provider: AuthProviderType,
+        entry_id: str,
+        publisher_identity_id: str,
+        actor_identity_id: str,
+        payload_digest: str,
+        entry_compartment_id: str,
+        note: str | None,
+    ) -> None:
+        provenance = _admin_provenance(request, actor_identity_id=actor_identity_id, on_behalf_of=None, console_request_id=None)
+        with self._open_landscape(AuthAuditOperation.LIBRARY_CURATED) as db:
+            self._auth_audit(db).record_auth_event(
+                event_type=event_type,
+                outcome="success",
+                provider=provider,
+                identity_id=publisher_identity_id,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "entry_id": entry_id,
+                    "payload_digest": payload_digest,
+                    "entry_compartment_id": entry_compartment_id,
+                    "note": _bounded_text(note),
+                },
+                **provenance.request_columns,
+            )
+
+    def record_library_accepted(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        entry_id: str,
+        publisher_identity_id: str,
+        actor_identity_id: str,
+        payload_digest: str,
+        entry_compartment_id: str,
+        note: str | None,
+    ) -> None:
+        self._record_library_curation(
+            request,
+            event_type="library_accepted",
+            provider=provider,
+            entry_id=entry_id,
+            publisher_identity_id=publisher_identity_id,
+            actor_identity_id=actor_identity_id,
+            payload_digest=payload_digest,
+            entry_compartment_id=entry_compartment_id,
+            note=note,
+        )
+
+    def record_library_rejected(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        entry_id: str,
+        publisher_identity_id: str,
+        actor_identity_id: str,
+        payload_digest: str,
+        entry_compartment_id: str,
+        note: str | None,
+    ) -> None:
+        self._record_library_curation(
+            request,
+            event_type="library_rejected",
+            provider=provider,
+            entry_id=entry_id,
+            publisher_identity_id=publisher_identity_id,
+            actor_identity_id=actor_identity_id,
+            payload_digest=payload_digest,
+            entry_compartment_id=entry_compartment_id,
+            note=note,
+        )
+
+    def record_library_deprecated(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        entry_id: str,
+        publisher_identity_id: str,
+        actor_identity_id: str,
+        payload_digest: str,
+        entry_compartment_id: str,
+        note: str | None,
+    ) -> None:
+        self._record_library_curation(
+            request,
+            event_type="library_deprecated",
+            provider=provider,
+            entry_id=entry_id,
+            publisher_identity_id=publisher_identity_id,
+            actor_identity_id=actor_identity_id,
+            payload_digest=payload_digest,
+            entry_compartment_id=entry_compartment_id,
+            note=note,
+        )
+
+    def record_library_recalled(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        entry_id: str,
+        publisher_identity_id: str,
+        actor_identity_id: str,
+        payload_digest: str,
+        entry_compartment_id: str,
+        note: str | None,
+    ) -> None:
+        self._record_library_curation(
+            request,
+            event_type="library_recalled",
+            provider=provider,
+            entry_id=entry_id,
+            publisher_identity_id=publisher_identity_id,
+            actor_identity_id=actor_identity_id,
+            payload_digest=payload_digest,
+            entry_compartment_id=entry_compartment_id,
+            note=note,
+        )
 
 
 class _AdminProvenanceMetadata(TypedDict):

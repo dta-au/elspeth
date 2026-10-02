@@ -81,7 +81,7 @@ from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
 )
 from tests.fixtures.dag_scenario_corpus.plugins import CorpusBranchLossTransform
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import leader_coordination_token
+from tests.fixtures.landscape import leader_coordination_token, leader_token_for
 from tests.fixtures.plugins import CollectSink
 from tests.integration.pipeline.test_aggregation_recovery import (
     _build_eof_aggregation_pipeline,
@@ -90,14 +90,18 @@ from tests.integration.pipeline.test_aggregation_recovery import (
 )
 from tests.integration.pipeline.test_barrier_intake_dispositions import (
     RUN_ID,
-    USURPER,
     _arrive_via_intake,
     _branch_token,
     _coalesce_processor,
     _real_coalesce_executor,
     _usurp_seat,
 )
-from tests.unit.engine.test_processor import _make_processor, _persist_blocked_scheduler_work, _persist_token_for_scheduler
+from tests.unit.engine.test_processor import (
+    _claim_processor_token,
+    _make_processor,
+    _persist_blocked_scheduler_work,
+    _persist_token_for_scheduler,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -137,13 +141,13 @@ def _new_barrier_factory(db: LandscapeDB, payload_path: str) -> RecorderFactory:
         leader_worker_id="test-leader",
     )
     factory.data_flow.register_node(
-        run_id=RUN_ID,
         plugin_name="test-source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
         config={},
         node_id="source-0",
         schema_config=_SCHEMA_CONFIG,
+        coordination_token=leader_token_for(factory._db, RUN_ID),
     )
     return factory
 
@@ -231,7 +235,7 @@ def _resume_coalesce_after_death(db: LandscapeDB, payload_path: str) -> None:
     """Reconcile completed merge evidence into one terminal continuation."""
     factory = RecorderFactory(db, payload_store=FilesystemPayloadStore(Path(payload_path)))
     clock = MockClock(start=_T0 + 10)
-    _usurp_seat(db, clock)
+    _usurp_seat(db)
     executor = _real_coalesce_executor(factory, clock, policy="require_all")
     processor = _coalesce_processor(
         factory,
@@ -298,7 +302,12 @@ def _arrive_row_union(factory: RecorderFactory, processor: RowProcessor, token: 
     processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
         token=token, barrier_key=str(_ROW_UNION), arrived_monotonic=processor._clock.monotonic()
     )
-    return processor.run_barrier_intake(make_context(landscape=factory.plugin_audit_writer()))
+    return processor.run_barrier_intake(
+        make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_token_for(factory._db, RUN_ID),
+        )
+    )
 
 
 def _run_row_union_to_release_seam(db: LandscapeDB, pause: Callable[[], None], payload_path: str) -> None:
@@ -322,7 +331,7 @@ def _resume_row_union_after_death(db: LandscapeDB, payload_path: str) -> None:
     """Reconcile the released group into two ordered READY continuations."""
     factory = RecorderFactory(db, payload_store=FilesystemPayloadStore(Path(payload_path)))
     clock = MockClock(start=_T0 + 10)
-    _usurp_seat(db, clock)
+    _usurp_seat(db)
     executor = _real_row_union_executor(factory, clock)
     processor = _row_union_processor(
         factory,
@@ -624,7 +633,12 @@ def _page_transform(factory: RecorderFactory, *, fails: bool, node_id: NodeID = 
     corpus branch-loss transform (on_error: discard) at the same node."""
     transform: Any = CorpusBranchLossTransform({"schema": {"mode": "observed"}}) if fails else _PassthroughTransform()
     transform.node_id = str(node_id)
-    transform.on_start(make_context(landscape=factory.plugin_audit_writer()))
+    transform.on_start(
+        make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_token_for(factory._db, RUN_ID),
+        )
+    )
     return transform
 
 
@@ -703,11 +717,11 @@ def _mint_expand_group(factory: RecorderFactory, processor: RowProcessor) -> tup
     factory.execution.record_completed_node_state(
         token_id=parent.token_id,
         node_id=str(_OPENER_NODE),
-        run_id=RUN_ID,
         step_index=1,
         input_data={"id": 1},
         output_data={"id": 1},
         duration_ms=1.0,
+        coordination_token=leader_token_for(factory._db, RUN_ID),
     )
     contract = SchemaContract(
         mode="OBSERVED",
@@ -718,7 +732,11 @@ def _mint_expand_group(factory: RecorderFactory, processor: RowProcessor) -> tup
         locked=True,
     )
     return processor._token_manager.expand_token(
-        parent_token=parent, expanded_rows=list(_MEMBER_ROWS), output_contract=contract, node_id=_OPENER_NODE, run_id=RUN_ID
+        parent_token=parent,
+        expanded_rows=list(_MEMBER_ROWS),
+        output_contract=contract,
+        node_id=_OPENER_NODE,
+        member_token=leader_token_for(factory._db, RUN_ID).membership,
     )
 
 
@@ -791,7 +809,12 @@ def _arrive_collector(factory: RecorderFactory, processor: RowProcessor, token: 
     processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
         token=token, barrier_key=barrier_key, arrived_monotonic=processor._clock.monotonic()
     )
-    return processor.run_barrier_intake(make_context(landscape=factory.plugin_audit_writer()))
+    return processor.run_barrier_intake(
+        make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_token_for(factory._db, RUN_ID),
+        )
+    )
 
 
 def _arrive_coalesce(factory: RecorderFactory, processor: RowProcessor, token: TokenInfo, *, ingest_sequence: int) -> list[Any]:
@@ -810,7 +833,12 @@ def _arrive_coalesce(factory: RecorderFactory, processor: RowProcessor, token: T
     processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
         token=token, barrier_key=str(_MERGE), arrived_monotonic=processor._clock.monotonic()
     )
-    return processor.run_barrier_intake(make_context(landscape=factory.plugin_audit_writer()))
+    return processor.run_barrier_intake(
+        make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_token_for(factory._db, RUN_ID),
+        )
+    )
 
 
 def _drive_member_through_page(factory: RecorderFactory, processor: RowProcessor, token: TokenInfo) -> list[Any]:
@@ -818,14 +846,28 @@ def _drive_member_through_page(factory: RecorderFactory, processor: RowProcessor
     or errors with on_error: discard), and the traversal itself deposits the
     collector hold / settles the loss — nothing crafted past this call."""
     item = WorkItem(token=token, current_node_id=_ERR_NODE, collector_name=_COLLECTOR)
-    return processor._drain_durable_work_queue(item, make_context(landscape=factory.plugin_audit_writer()))
+    return processor._drain_durable_work_queue(
+        item,
+        make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._coordination_token,
+            member_token=processor._require_member_token(),
+        ),
+    )
 
 
 def _lose_fork_branch(factory: RecorderFactory, processor: RowProcessor, token: TokenInfo) -> list[Any]:
     """A fork branch errors at err_b (on_error: discard) on the REAL drain, its
     cursor naming the in-scope coalesce."""
     item = WorkItem(token=token, current_node_id=_ERR_B_NODE, coalesce_node_id=_COALESCE_NODE, coalesce_name=_MERGE)
-    return processor._drain_durable_work_queue(item, make_context(landscape=factory.plugin_audit_writer()))
+    return processor._drain_durable_work_queue(
+        item,
+        make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._coordination_token,
+            member_token=processor._require_member_token(),
+        ),
+    )
 
 
 def _register_worker(db: LandscapeDB, worker_id: str, *, role: str) -> None:
@@ -959,7 +1001,12 @@ def _run_leader_holding_open_group(db: LandscapeDB, pause: Callable[[], None], p
     # the COLLECTOR arm of _replay_group_losses): one intake pass adopts the
     # follower's NULL-epoch row and fails the roster through the collector arm.
     assert _collector_plugin(executor).batch_calls == 0
-    results = processor.run_barrier_intake(make_context(landscape=factory.plugin_audit_writer()))
+    results = processor.run_barrier_intake(
+        make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_token_for(factory._db, RUN_ID),
+        )
+    )
     assert [(result.token.token_id, result.outcome, result.path) for result in results] == [
         (children[0].token_id, TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
     ]
@@ -1012,10 +1059,34 @@ def _run_nested_to_mid_unwrap_seam(db: LandscapeDB, pause: Callable[[], None], p
     coalesce = _real_nested_coalesce_executor(factory, clock)
     processor = _nested_collector_processor(factory, collector, coalesce, clock)
     children, _group_id = _mint_expand_group(factory, processor)
-    branches_0, _fork_0 = processor._token_manager.fork_token(children[0], ["a", "b"], node_id=_FORK_NODE, run_id=RUN_ID)
+    claim_0 = _claim_processor_token(factory, children[0], node_id=str(_FORK_NODE), run_id=RUN_ID)
+    branches_0, _fork_0 = processor._token_manager.fork_token(
+        children[0],
+        ["a", "b"],
+        node_id=_FORK_NODE,
+        member_token=processor._require_member_token(),
+        work_item=claim_0,
+    )
+    factory.scheduler.mark_terminal(
+        member_token=processor._require_member_token(),
+        work_item_id=claim_0.work_item_id,
+        expected_lease_owner=processor._require_member_token().worker_id,
+    )
     assert _arrive_coalesce(factory, processor, branches_0[0], ingest_sequence=1) == []
     assert _arrive_coalesce(factory, processor, branches_0[1], ingest_sequence=2) == []  # merged -> held at the collector
-    branches_1, _fork_1 = processor._token_manager.fork_token(children[1], ["a", "b"], node_id=_FORK_NODE, run_id=RUN_ID)
+    claim_1 = _claim_processor_token(factory, children[1], node_id=str(_FORK_NODE), run_id=RUN_ID)
+    branches_1, _fork_1 = processor._token_manager.fork_token(
+        children[1],
+        ["a", "b"],
+        node_id=_FORK_NODE,
+        member_token=processor._require_member_token(),
+        work_item=claim_1,
+    )
+    factory.scheduler.mark_terminal(
+        member_token=processor._require_member_token(),
+        work_item_id=claim_1.work_item_id,
+        expected_lease_owner=processor._require_member_token().worker_id,
+    )
     assert _arrive_coalesce(factory, processor, branches_1[0], ingest_sequence=3) == []
     assert processor.has_blocked_barrier_work() is True
     pause()
@@ -1030,8 +1101,7 @@ def _takeover_collector_processor(
 ) -> tuple[RecorderFactory, RowProcessor, CollectorExecutor]:
     factory = RecorderFactory(db, payload_store=FilesystemPayloadStore(Path(payload_path)))
     clock = MockClock(start=_T0 + 10)
-    _usurp_seat(db, clock)
-    _register_worker(db, USURPER, role="leader")
+    _usurp_seat(db)
     executor = _real_collector_executor(factory, clock)
     processor = _collector_processor(
         factory,
@@ -1083,7 +1153,12 @@ def _resume_collector_sweep(db: LandscapeDB, payload_path: str) -> None:
     )
     assert processor.has_blocked_barrier_work() is True
     assert _collector_plugin(executor).batch_calls == 0
-    processor.run_barrier_intake(make_context(landscape=factory.plugin_audit_writer()))
+    processor.run_barrier_intake(
+        make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_token_for(factory._db, RUN_ID),
+        )
+    )
     _assert_group_released_in_ordinal_order(db, executor)
 
 
@@ -1125,7 +1200,12 @@ def _takeover_and_lose_member(db: LandscapeDB, payload_path: str) -> None:
     member_1 = _rebuild_member(factory, db, 1)
     assert processor._group_bindings.binding_for(member_1.lineage_path[-1]) is None  # fresh registry: the miss META-9.1 exists for
     _drive_member_through_page(factory, processor, member_1)
-    processor.run_barrier_intake(make_context(landscape=factory.plugin_audit_writer()))
+    processor.run_barrier_intake(
+        make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_token_for(factory._db, RUN_ID),
+        )
+    )
     assert _collector_plugin(executor).batch_calls == 0
     _assert_flat_group_failed_by_lost_member_1(db, adopted_epoch=2)  # adopted by the takeover epoch
     assert processor.has_blocked_barrier_work() is False
@@ -1140,8 +1220,7 @@ def _takeover_and_lose_nested_branch(db: LandscapeDB, payload_path: str) -> None
     FORK->EXPAND boundary in a process that never minted either group."""
     factory = RecorderFactory(db, payload_store=FilesystemPayloadStore(Path(payload_path)))
     clock = MockClock(start=_T0 + 10)
-    _usurp_seat(db, clock)
-    _register_worker(db, USURPER, role="leader")
+    _usurp_seat(db)
     _assert_satisfiable(db, nested=True)  # the open mid-unwrap image is resumable (spec §8)
     collector = _real_collector_executor(factory, clock)
     coalesce = _real_nested_coalesce_executor(factory, clock)
@@ -1161,7 +1240,14 @@ def _takeover_and_lose_nested_branch(db: LandscapeDB, payload_path: str) -> None
     assert [frame.kind for frame in branch_b.lineage_path] == [FrameKind.EXPAND, FrameKind.FORK]
     assert processor._group_bindings.binding_for(branch_b.lineage_path[0]) is None  # the EXPAND frame: fresh registry
     results = _lose_fork_branch(factory, processor, branch_b)
-    results.extend(processor.run_barrier_intake(make_context(landscape=factory.plugin_audit_writer())))
+    results.extend(
+        processor.run_barrier_intake(
+            make_context(
+                landscape=factory.plugin_audit_writer(),
+                coordination_token=leader_token_for(factory._db, RUN_ID),
+            )
+        )
+    )
     branch_a = _fork_child_token_id(db, member_1, "a")
     with db.connection() as conn:
         outcomes = _outcome_rows(conn)
@@ -1228,6 +1314,8 @@ def _assert_killed_nested_image(database_url: str) -> None:
         merged_0 = next(token_id for token_id in blocked if token_id != a_1)  # the merged successor's id is minted by the merge
         assert blocked == {merged_0: (_collector_key(killed_db), 1), a_1: (str(_MERGE), 1)}
         assert {token_id: status for token_id, (status, _key, _epoch) in work.items() if token_id != merged_0 and token_id != a_1} == {
+            member_0: TokenWorkStatus.TERMINAL.value,
+            member_1: TokenWorkStatus.TERMINAL.value,
             a_0: TokenWorkStatus.TERMINAL.value,
             b_0: TokenWorkStatus.TERMINAL.value,
         }

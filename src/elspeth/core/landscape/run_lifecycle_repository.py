@@ -8,16 +8,17 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final, get_args
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import (
+    CallType,
     ContractAuditRecord,
     ExportStatus,
     NodeType,
@@ -32,13 +33,15 @@ from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
+    WorkerMembershipToken,
     mint_worker_id,
 )
-from elspeth.contracts.enums import TerminalPath
+from elspeth.contracts.enums import RunMode, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, RunLeadershipLostError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
-from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence, decode_admission_decision
 from elspeth.contracts.preflight import PreflightResult
+from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.contracts.runtime_val_manifest import (
     RuntimeValRegistryFingerprint,
     _assert_runtime_val_registries_frozen,
@@ -50,7 +53,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps, _safe_database_error_message
 from elspeth.core.landscape._helpers import now
-from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository
+from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository, TokenOutcomeWrite
 from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError, LandscapeRecordNotFoundError
@@ -61,20 +64,27 @@ from elspeth.core.landscape.run_coordination_repository import (
     CoordinationEventRow,
     RunCoordinationRepository,
     fenced_leader_transaction,
+    fenced_member_transaction,
     record_coordination_events,
 )
+from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
 from elspeth.core.landscape.schema import (
     SOURCE_COMPLETE_LIFECYCLE_STATES,
     RunSourceLifecycleState,
+    calls_table,
     checkpoints_table,
+    node_states_table,
     nodes_table,
+    operations_table,
     preflight_results_table,
     run_attributions_table,
     run_sources_table,
+    run_start_admissions_table,
     run_web_plugin_policy_table,
     run_workers_table,
     runs_table,
     secret_resolutions_table,
+    token_decided_clause,
     token_outcomes_table,
     token_work_items_table,
     tokens_table,
@@ -104,6 +114,8 @@ class RunSourceLifecycleRecord:
     source_node_id: str
     source_name: str
     lifecycle_state: str
+    source_schema_json: str | None = None
+    normalization_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +127,7 @@ class RunSourceFieldResolutionRecord:
     resolution_mapping: Mapping[str, str] | None
 
     def __post_init__(self) -> None:
-        # Frozen-dataclass deep-freeze contract (CLAUDE.md): resolution_mapping
+        # Frozen-dataclass deep-freeze contract: resolution_mapping
         # is a container field, so frozen=True alone leaves its contents mutable
         # through the attribute reference. Gate on `is not None` — the field is
         # nullable (sources that resolved no headers record None).
@@ -156,7 +168,7 @@ _NON_RESUMABLE_EFFECT_OPERATION_ERROR: Final[str] = "run finalized as non-resuma
 
 # 64 lowercase hex chars — matches the canonical sha256 hex digest format
 # produced by ``hashlib.sha256(...).hexdigest()``. Used by the Tier-1
-# write-side guards in this module, ``write_repository.py``, and
+# write-side guards in this module and
 # ``web/execution/service.py`` to reject malformed snapshot ids that
 # would otherwise corrupt the audit trail without a downstream signal.
 _SHA256_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
@@ -166,7 +178,7 @@ def is_valid_sha256_hex(value: str) -> bool:
     """Return True if ``value`` is exactly 64 lowercase hex chars.
 
     Canonical home for the sha256-hex shape check; imported by
-    ``write_repository.py`` and ``web/execution/service.py`` so all three
+    ``web/execution/service.py`` so both
     write-side guards reject the same out-of-domain values (empty,
     whitespace-only, non-hex strings, upper-case, wrong length).
     """
@@ -296,6 +308,9 @@ class RunLifecycleRepository:
         openrouter_catalog_source: str,
         leader_worker_id: str | None = None,
         web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        run_start_permit: RunStartPermitBinding | None = None,
+        run_mode: RunMode = RunMode.LIVE,
+        replay_from_run_id: str | None = None,
     ) -> Run:
         """Begin a new pipeline run.
 
@@ -347,6 +362,10 @@ class RunLifecycleRepository:
             raise AuditIntegrityError(
                 "begin_run() cannot create a COMPLETED run. Use complete_run() so completed_at is recorded in the audit trail."
             )
+        if type(run_mode) is not RunMode:
+            raise AuditIntegrityError("run_mode must be a RunMode")
+        if (run_mode is RunMode.LIVE) != (replay_from_run_id is None):
+            raise AuditIntegrityError("live runs have no replay source; replay/verify runs require one")
         validate_run_attribution(initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type)
         _validate_openrouter_catalog_snapshot(
             sha256=openrouter_catalog_sha256,
@@ -356,6 +375,10 @@ class RunLifecycleRepository:
             raise AuditIntegrityError("web_plugin_policy_evidence must be a WebPluginPolicyEvidence value")
 
         run_id = run_id or generate_id()
+        if replay_from_run_id == run_id:
+            raise AuditIntegrityError("a replay/verify run cannot cite itself as its source")
+        if run_start_permit is not None and (type(run_start_permit) is not RunStartPermitBinding or run_start_permit.run_id != run_id):
+            raise AuditIntegrityError("Run start permit must bind the exact run UUID")
         settings_json = canonical_json(config)
         config_hash = stable_hash(config)
         timestamp = now()
@@ -376,6 +399,8 @@ class RunLifecycleRepository:
             settings_json=settings_json,
             canonical_version=canonical_version,
             status=status,
+            run_mode=run_mode,
+            replay_from_run_id=replay_from_run_id,
             reproducibility_grade=reproducibility_grade,
         )
 
@@ -393,6 +418,22 @@ class RunLifecycleRepository:
         coordination = self._coordination_repo
         try:
             with self._db.write_connection() as conn:
+                if run_start_permit is not None:
+                    existing = self._observe_permitted_run_on(
+                        conn,
+                        run_start_permit,
+                        config_hash=config_hash,
+                        canonical_version=canonical_version,
+                        openrouter_catalog_sha256=openrouter_catalog_sha256,
+                        openrouter_catalog_source=openrouter_catalog_source,
+                        initiated_by_user_id=initiated_by_user_id,
+                        auth_provider_type=auth_provider_type,
+                        source_schema_json=source_schema_json,
+                        runtime_val_manifest_json=runtime_val_manifest_json,
+                        web_plugin_policy_evidence=web_plugin_policy_evidence,
+                    )
+                    if existing is not None:
+                        return existing
                 conn.execute(
                     runs_table.insert().values(
                         run_id=run.run_id,
@@ -401,6 +442,8 @@ class RunLifecycleRepository:
                         settings_json=run.settings_json,
                         canonical_version=run.canonical_version,
                         status=run.status.value,
+                        run_mode=run.run_mode.value,
+                        replay_from_run_id=run.replay_from_run_id,
                         reproducibility_grade=run.reproducibility_grade,
                         source_schema_json=source_schema_json,
                         runtime_val_manifest_json=runtime_val_manifest_json,
@@ -411,6 +454,16 @@ class RunLifecycleRepository:
                         openrouter_catalog_source=openrouter_catalog_source,
                     )
                 )
+                if run_start_permit is not None:
+                    conn.execute(
+                        run_start_admissions_table.insert().values(
+                            run_id=run_id,
+                            permit_id=run_start_permit.permit_id,
+                            permit_epoch=run_start_permit.permit_epoch,
+                            subject_hash=run_start_permit.subject_hash,
+                            state="prepared",
+                        )
+                    )
                 if initiated_by_user_id is not None and auth_provider_type is not None:
                     conn.execute(
                         run_attributions_table.insert().values(
@@ -430,20 +483,206 @@ class RunLifecycleRepository:
                 # the runs row above satisfies the run_coordination FK. The
                 # seat's deadline is Landscape database time (ADR-047); the
                 # forensic ``timestamp`` above never reaches it.
-                coordination.register_run_leader_on(
+                leader_token = coordination.register_run_leader_on(
                     conn,
                     run_id=run.run_id,
                     worker_id=worker_id,
                     window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                     entry_point="run",
                 )
+                coordination._finalize_leader_registration_on(conn, token=leader_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
         except SQLAlchemyError as exc:
+            # A concurrent identical creator may win the unique run UUID.
+            # Observe only after our failed transaction has rolled back; never
+            # return its initial token or allocate a second leadership epoch.
+            if run_start_permit is not None:
+                with self._db.engine.connect() as conn:
+                    existing = self._observe_permitted_run_on(
+                        conn,
+                        run_start_permit,
+                        config_hash=config_hash,
+                        canonical_version=canonical_version,
+                        openrouter_catalog_sha256=openrouter_catalog_sha256,
+                        openrouter_catalog_source=openrouter_catalog_source,
+                        initiated_by_user_id=initiated_by_user_id,
+                        auth_provider_type=auth_provider_type,
+                        source_schema_json=source_schema_json,
+                        runtime_val_manifest_json=runtime_val_manifest_json,
+                        web_plugin_policy_evidence=web_plugin_policy_evidence,
+                    )
+                    if existing is not None:
+                        return existing
             # Preserve the pre-epoch-21 error contract: begin_run surfaced
             # constraint violations (e.g. duplicate run_id) as
             # LandscapeRecordError via DatabaseOps.execute_insert.
-            raise LandscapeRecordError(f"begin_run — database rejected audit write: {type(exc).__name__}: {exc}") from exc
+            raise LandscapeRecordError(f"begin_run — database rejected audit write: {type(exc).__name__}") from exc
 
         return run
+
+    def _observe_permitted_run_on(
+        self,
+        conn: Connection,
+        binding: RunStartPermitBinding,
+        *,
+        config_hash: str,
+        canonical_version: str,
+        openrouter_catalog_sha256: str,
+        openrouter_catalog_source: str,
+        initiated_by_user_id: str | None,
+        auth_provider_type: str | None,
+        source_schema_json: str | None,
+        runtime_val_manifest_json: str | None,
+        web_plugin_policy_evidence: WebPluginPolicyEvidence | None,
+    ) -> Run | None:
+        row = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
+        if row is None:
+            return None
+        if RunStartAdmissionRepository.observe_on(conn, binding) is None:
+            raise AuditIntegrityError("Existing legacy run has no permit-bound baseline")
+        if (row.config_hash, row.canonical_version, row.openrouter_catalog_sha256, row.openrouter_catalog_source) != (
+            config_hash,
+            canonical_version,
+            openrouter_catalog_sha256,
+            openrouter_catalog_source,
+        ):
+            raise AuditIntegrityError("Permit retry changed immutable run configuration or catalog")
+        attribution = conn.execute(select(run_attributions_table).where(run_attributions_table.c.run_id == binding.run_id)).one_or_none()
+        actual_attribution = (None, None) if attribution is None else (attribution.initiated_by_user_id, attribution.auth_provider_type)
+        if actual_attribution != (initiated_by_user_id, auth_provider_type):
+            raise AuditIntegrityError("Permit retry changed run attribution")
+        if row.source_schema_json != source_schema_json or row.runtime_val_manifest_json != runtime_val_manifest_json:
+            raise AuditIntegrityError("Permit retry changed source schema or runtime VAL manifest")
+        policy = conn.execute(
+            select(run_web_plugin_policy_table).where(run_web_plugin_policy_table.c.run_id == binding.run_id)
+        ).one_or_none()
+        if web_plugin_policy_evidence is None:
+            if policy is not None:
+                raise AuditIntegrityError("Permit retry removed web plugin policy evidence")
+        elif policy is None:
+            raise AuditIntegrityError("Permit retry added web plugin policy evidence")
+        else:
+            evidence = web_plugin_policy_evidence
+            try:
+                admission_decision = decode_admission_decision(policy.admission_decision_json, policy.admission_decision_hash)
+            except ValueError as exc:
+                raise AuditIntegrityError("Permit retry found corrupt admission evidence") from exc
+            if (
+                policy.schema_version,
+                policy.policy_hash,
+                policy.snapshot_hash,
+                policy.authorized_plugin_ids_json,
+                policy.available_plugin_ids_json,
+                policy.control_modes_json,
+                policy.selected_implementations_json,
+                policy.selected_profile_aliases_json,
+                policy.plugin_code_identities_json,
+                policy.binding_generation_fingerprint,
+                policy.decision_codes_json,
+                admission_decision,
+            ) != (
+                evidence.schema_version,
+                evidence.policy_hash,
+                evidence.snapshot_hash,
+                canonical_json(evidence.authorized_plugin_ids),
+                canonical_json(evidence.available_plugin_ids),
+                canonical_json(evidence.control_modes),
+                canonical_json(evidence.selected_implementations),
+                canonical_json(evidence.selected_profile_aliases),
+                canonical_json(evidence.plugin_code_identities),
+                evidence.binding_generation_fingerprint,
+                canonical_json(evidence.decision_codes),
+                evidence.admission_decision,
+            ):
+                raise AuditIntegrityError("Permit retry changed web plugin policy evidence")
+        return self._run_loader.load(row)
+
+    def materialize_cancelled_permit(
+        self,
+        binding: RunStartPermitBinding,
+        config: Mapping[str, Any],
+        canonical_version: str,
+        *,
+        openrouter_catalog_sha256: str,
+        openrouter_catalog_source: str,
+        initiated_by_user_id: str | None = None,
+        auth_provider_type: str | None = None,
+        web_plugin_policy_evidence: WebPluginPolicyEvidence | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
+    ) -> Run:
+        """Record issued-permit cancellation without loading any pipeline plugin.
+
+        A retry observes immutable terminal truth. An incumbent live leader
+        defers through the ordinary leadership CAS; no token is refreshed.
+        """
+        if pre_effect_guard is not None:
+            pre_effect_guard()
+        worker_id = mint_worker_id(binding.run_id)
+        # Cancellation does not execute under this image's runtime registry or
+        # source schema. Preserve those original facts on an existing header.
+        with self._db.engine.connect() as conn:
+            header = conn.execute(select(runs_table).where(runs_table.c.run_id == binding.run_id)).one_or_none()
+            run = (
+                None
+                if header is None
+                else self._observe_permitted_run_on(
+                    conn,
+                    binding,
+                    config_hash=stable_hash(config),
+                    canonical_version=canonical_version,
+                    openrouter_catalog_sha256=openrouter_catalog_sha256,
+                    openrouter_catalog_source=openrouter_catalog_source,
+                    initiated_by_user_id=initiated_by_user_id,
+                    auth_provider_type=auth_provider_type,
+                    source_schema_json=header.source_schema_json,
+                    runtime_val_manifest_json=header.runtime_val_manifest_json,
+                    web_plugin_policy_evidence=web_plugin_policy_evidence,
+                )
+            )
+        if run is None:
+            run = self.begin_run(
+                config,
+                canonical_version,
+                run_id=binding.run_id,
+                openrouter_catalog_sha256=openrouter_catalog_sha256,
+                openrouter_catalog_source=openrouter_catalog_source,
+                initiated_by_user_id=initiated_by_user_id,
+                auth_provider_type=auth_provider_type,
+                web_plugin_policy_evidence=web_plugin_policy_evidence,
+                leader_worker_id=worker_id,
+                run_start_permit=binding,
+            )
+        if run.status in _TERMINAL_RUN_STATUSES:
+            return run
+        admission = RunStartAdmissionRepository(self._db).observe(binding)
+        if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
+            raise AuditIntegrityError("Cancellation materialization requires a prepared admission")
+        leader = self._coordination_repo.live_leader(run_id=binding.run_id)
+        if leader is not None and leader.leader_worker_id == worker_id:
+            # This invocation just minted this identity. No prior owner's
+            # token can reach this arm, including an exact duplicate retry.
+            token = CoordinationToken(binding.run_id, worker_id, leader.leader_epoch)
+        else:
+            token = self._coordination_repo.acquire_run_leadership(
+                run_id=binding.run_id,
+                worker_id=worker_id,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                entry_point="cancel-prepared",
+            )
+        try:
+            if pre_effect_guard is not None:
+                pre_effect_guard()
+            # The pre-acquisition observation was advisory. A predecessor may
+            # have crossed the first-effect boundary before losing its seat.
+            admission = RunStartAdmissionRepository(self._db).observe(binding)
+            if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
+                raise AuditIntegrityError("Prepared cancellation lost its pre-effect baseline")
+            self.complete_run(RunStatus.INTERRUPTED, coordination_token=token)
+        finally:
+            self._coordination_repo.release_seat(token=token)
+        result = self.get_run(binding.run_id)
+        if result is None:
+            raise AuditIntegrityError("Cancelled admission lost its run record")
+        return result
 
     def _insert_web_plugin_policy_evidence(
         self,
@@ -467,6 +706,10 @@ class RunLifecycleRepository:
                 plugin_code_identities_json=canonical_json(evidence.plugin_code_identities),
                 binding_generation_fingerprint=evidence.binding_generation_fingerprint,
                 decision_codes_json=canonical_json(evidence.decision_codes),
+                admission_decision_json=(
+                    evidence.admission_decision.model_dump_json() if evidence.admission_decision is not None else None
+                ),
+                admission_decision_hash=(evidence.admission_decision.canonical_hash if evidence.admission_decision is not None else None),
             )
         )
 
@@ -489,6 +732,7 @@ class RunLifecycleRepository:
                 plugin_code_identities=tuple(tuple(item) for item in json.loads(row.plugin_code_identities_json)),
                 binding_generation_fingerprint=row.binding_generation_fingerprint,
                 decision_codes=tuple(json.loads(row.decision_codes_json)),
+                admission_decision=decode_admission_decision(row.admission_decision_json, row.admission_decision_hash),
             )
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AuditIntegrityError(f"Web plugin-policy evidence is corrupt for run {run_id}") from exc
@@ -507,17 +751,23 @@ class RunLifecycleRepository:
         1. the verify-and-extend leader epoch fence (FIRST statement) — a
            deposed leader's finalize is refused with
            ``RunLeadershipLostError`` and a ``fence_refusal`` event;
-        2. the terminal conditional UPDATE — for SUCCESS statuses
+        2. lock the active follower roster before run or token writes, in the
+           same membership-before-token order used by follower audit writes;
+        3. the terminal conditional UPDATE — for SUCCESS statuses
            (COMPLETED / COMPLETED_WITH_FAILURES / EMPTY) it carries the
            in-statement quiescence arm ``NOT EXISTS (READY/LEASED/BLOCKED/
            PENDING_SINK token_work_items)`` so a run can never be stamped
-           successful over residual scheduler work; FAILED/INTERRUPTED check
-           only fence + immutability (the journal is left intact for resume);
-        3. ADR-038 abandonment of undecided tokens when the run is
+           successful over residual scheduler work, and a second arm
+           ``NOT EXISTS (token of the run with no completed token_outcomes
+           row)`` so it is never stamped successful over a row that has not
+           reached a recorded outcome — a claim that died mid-row, or a token
+           no scheduler work covers; FAILED/INTERRUPTED check only fence +
+           immutability (the journal is left intact for resume);
+        4. ADR-038 abandonment of undecided tokens when the run is
            non-resumable, plus fail-open of effect-linked operations;
-        4. follower departure hygiene (no-op at N=1) + ``worker_depart``
+        5. follower departure hygiene (no-op at N=1) + ``worker_depart``
            events;
-        5. the ``finalize`` run_coordination event.
+        6. the ``finalize`` run_coordination event.
 
         The run is ``coordination_token.run_id``: there is no second run id
         to disagree with the authority (ADR-048 §2).
@@ -535,7 +785,8 @@ class RunLifecycleRepository:
             AuditIntegrityError: If status is not a terminal run status
             AuditIntegrityError: If the run is not found or already terminal
             OrchestrationInvariantError: If a SUCCESS finalize found residual
-                scheduler work (quiescence violation)
+                scheduler work, or a token with no completed terminal outcome
+                (quiescence violation)
             RunLeadershipLostError: If ``coordination_token`` is stale
         """
         if status not in _TERMINAL_RUN_STATUSES:
@@ -637,15 +888,50 @@ class RunLifecycleRepository:
         coordination_token: CoordinationToken,
     ) -> None:
         """The fenced transaction body of :meth:`complete_run`, on the caller's fenced connection."""
-        # The SUCCESS quiescence arm rides in the SAME statement as the stamp;
+        # Follower audit writes hold membership before token rows. Acquire the
+        # departure roster in that order too, before abandonment can hold a
+        # token needed by an in-flight follower. Admission also locks the seat,
+        # so no new follower can enter after this roster has been locked.
+        follower_ids = (
+            conn.execute(
+                select(run_workers_table.c.worker_id)
+                .where(run_workers_table.c.run_id == run_id)
+                .where(run_workers_table.c.status == "active")
+                .where(run_workers_table.c.role == "follower")
+                .order_by(run_workers_table.c.worker_id)
+                .with_for_update()
+            )
+            .scalars()
+            .all()
+        )
+        # Every token of a successful run has exactly one completed outcome
+        # (the partial unique index caps it at one, so NOT EXISTS of a decided
+        # outcome is the whole check). An undecided token is a row that never
+        # reached a recorded outcome, whatever left it so: a claim that died
+        # mid-row (a FAILED item, which resume returns to READY), or a token
+        # with no scheduler work at all, which quiescence alone cannot see.
+        undecided_tokens = select(tokens_table.c.token_id).where(tokens_table.c.run_id == run_id).where(~token_decided_clause())
+        # The SUCCESS quiescence arms ride in the SAME statement as the stamp;
         # ``where()`` with no clauses is a no-op for the FAILED/INTERRUPTED arm.
-        quiescence_clauses = [~residual_work_exists] if is_success_status else []
+        quiescence_clauses = [~residual_work_exists, ~undecided_tokens.exists()] if is_success_status else []
+        state_llm_calls = (
+            select(func.count())
+            .select_from(calls_table.join(node_states_table, calls_table.c.state_id == node_states_table.c.state_id))
+            .where(node_states_table.c.run_id == run_id, calls_table.c.call_type == CallType.LLM.value)
+            .scalar_subquery()
+        )
+        operation_llm_calls = (
+            select(func.count())
+            .select_from(calls_table.join(operations_table, calls_table.c.operation_id == operations_table.c.operation_id))
+            .where(operations_table.c.run_id == run_id, calls_table.c.call_type == CallType.LLM.value)
+            .scalar_subquery()
+        )
         result = conn.execute(
             runs_table.update()
             .where(runs_table.c.run_id == run_id)
             .where(runs_table.c.status.notin_(terminal_values))
             .where(*quiescence_clauses)
-            .values(**values)
+            .values(**values, llm_call_count=state_llm_calls + operation_llm_calls)
         )
         if result.rowcount == 0:
             existing = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
@@ -653,12 +939,22 @@ class RunLifecycleRepository:
                 raise _already_terminal_error(run_id, str(existing.status))
             if existing is None:
                 raise AuditIntegrityError(f"Cannot complete run {run_id}: run not found")
-            # Run exists, not terminal ⇒ the quiescence arm refused
+            # Run exists, not terminal ⇒ a quiescence arm refused
             # (only reachable for SUCCESS statuses).
+            if conn.execute(select(residual_work_exists)).scalar_one():
+                raise OrchestrationInvariantError(
+                    f"Cannot complete run {run_id} as {status.value!r}: residual scheduler work "
+                    "(READY/LEASED/BLOCKED/PENDING_SINK token_work_items rows) exists. A run "
+                    "cannot be stamped successful over an unquiesced journal (ADR-030 §D)."
+                )
+            undecided_count = conn.execute(select(func.count()).select_from(undecided_tokens.subquery())).scalar_one()
+            first_undecided = conn.execute(undecided_tokens.order_by(tokens_table.c.token_id).limit(10)).scalars().all()
             raise OrchestrationInvariantError(
-                f"Cannot complete run {run_id} as {status.value!r}: residual scheduler work "
-                "(READY/LEASED/BLOCKED/PENDING_SINK token_work_items rows) exists. A run "
-                "cannot be stamped successful over an unquiesced journal (ADR-030 §D)."
+                f"Cannot complete run {run_id} as {status.value!r}: {undecided_count} token(s) have no completed "
+                f"terminal outcome (first 10: {list(first_undecided)!r}). A run cannot be stamped successful while "
+                "a row has not reached a recorded outcome. A token whose claim died mid-row (a FAILED work item) is "
+                "returned to READY and re-driven by `elspeth resume`; a token with no scheduler work at all cannot "
+                "be re-driven and resume refuses it."
             )
 
         # ADR-038 fate decision: the terminal stamp above succeeded, so the
@@ -684,17 +980,6 @@ class RunLifecycleRepository:
                 )
 
         # §D follower-departure hygiene (no-op at N=1, evented).
-        follower_ids = (
-            conn.execute(
-                select(run_workers_table.c.worker_id)
-                .where(run_workers_table.c.run_id == run_id)
-                .where(run_workers_table.c.status == "active")
-                .where(run_workers_table.c.role == "follower")
-                .order_by(run_workers_table.c.registered_at)
-            )
-            .scalars()
-            .all()
-        )
         if follower_ids:
             conn.execute(
                 run_workers_table.update()
@@ -835,14 +1120,20 @@ class RunLifecycleRepository:
             "non_resumable_arms": non_resumable_arms,
             "incomplete_sources": incomplete_sources,
         }
-        for token_id in undecided_token_ids:
-            self._outcomes_repo.record_token_outcome(
-                TokenRef(token_id=str(token_id), run_id=run_id),
-                None,
-                TerminalPath.ABANDONED,
-                context=context,
-                conn=conn,
-            )
+        self._outcomes_repo.record_token_outcomes_on(
+            conn,
+            run_id=run_id,
+            outcomes=tuple(
+                TokenOutcomeWrite(
+                    TokenRef(token_id=str(token_id), run_id=run_id),
+                    None,
+                    TerminalPath.ABANDONED,
+                    context=context,
+                )
+                for token_id in undecided_token_ids
+            ),
+            dependencies_prelocked=True,
+        )
 
     def get_run(self, run_id: str) -> Run | None:
         """Get a run by ID.
@@ -1224,6 +1515,13 @@ class RunLifecycleRepository:
             )
         return records
 
+    def get_run_source_config_hashes(self, run_id: str) -> dict[str, str]:
+        """Return stored source configuration identities for early archive admission."""
+        rows = self._ops.execute_fetchall(
+            select(run_sources_table.c.source_node_id, run_sources_table.c.config_hash).where(run_sources_table.c.run_id == run_id)
+        )
+        return {row.source_node_id: row.config_hash for row in rows}
+
     def get_run_source_lifecycle_records(self, run_id: str) -> dict[str, RunSourceLifecycleRecord]:
         """Return per-source lifecycle records without requiring replay schemas.
 
@@ -1238,6 +1536,8 @@ class RunLifecycleRepository:
                 run_sources_table.c.source_node_id,
                 run_sources_table.c.source_name,
                 run_sources_table.c.lifecycle_state,
+                run_sources_table.c.schema_json,
+                run_sources_table.c.field_resolution_json,
             ).where(run_sources_table.c.run_id == run_id)
         )
         return {
@@ -1245,6 +1545,10 @@ class RunLifecycleRepository:
                 source_node_id=row.source_node_id,
                 source_name=row.source_name,
                 lifecycle_state=row.lifecycle_state,
+                source_schema_json=row.schema_json,
+                normalization_version=(
+                    json.loads(row.field_resolution_json)["normalization_version"] if row.field_resolution_json is not None else None
+                ),
             )
             for row in rows
         }
@@ -1468,6 +1772,7 @@ class RunLifecycleRepository:
             values: dict[str, Any] = {"status": status.value}
             if status == RunStatus.RUNNING:
                 values["completed_at"] = None
+                values["reproducibility_grade"] = None
             result = conn.execute(
                 runs_table.update()
                 .where(runs_table.c.run_id == coordination_token.run_id)
@@ -1655,9 +1960,9 @@ class RunLifecycleRepository:
         reachable: bool,
         count: int | None,
         message: str,
-        coordination_token: CoordinationToken,
+        member_token: WorkerMembershipToken,
     ) -> None:
-        """Record a readiness check result in the audit trail.
+        """Record this worker's readiness check result in the audit trail.
 
         Called by transforms during on_start() after a provider readiness
         check passes. Records the collection state at startup time so
@@ -1666,7 +1971,7 @@ class RunLifecycleRepository:
         """
         row_data = {
             "result_id": generate_id(),
-            "run_id": coordination_token.run_id,
+            "run_id": member_token.run_id,
             "result_type": "readiness_check",
             "name": name,
             "result_json": canonical_json(
@@ -1675,16 +1980,16 @@ class RunLifecycleRepository:
                     "reachable": reachable,
                     "count": count,
                     "message": message,
+                    "worker_id": member_token.worker_id,
                 }
             ),
             "created_at": now(),
         }
 
         try:
-            with fenced_leader_transaction(
+            with fenced_member_transaction(
                 self._db.engine,
-                token=coordination_token,
-                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                member_token=member_token,
                 verb="record_readiness_check",
             ) as conn:
                 conn.execute(preflight_results_table.insert().values(**row_data))
@@ -1694,7 +1999,7 @@ class RunLifecycleRepository:
                     operation="record_readiness_check",
                     action="write",
                     exc=exc,
-                    context=f"run_id={coordination_token.run_id}",
+                    context=f"run_id={member_token.run_id}",
                 )
             ) from exc
 

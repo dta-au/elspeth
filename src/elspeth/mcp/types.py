@@ -211,7 +211,7 @@ class OperationCallRecord(TypedDict):
     latency_ms: float | None
     request_hash: str
     response_hash: str | None
-    resolved_prompt_template_hash: str | None
+    approved_prompt_artifact_hash: str | None
     created_at: str | None
 
 
@@ -328,13 +328,29 @@ class RunSummaryCounts(TypedDict):
     source_loads: int
     sink_writes: int
     runtime_preflights: int
+    collector_groups_failed: int
 
 
 class RunSummaryErrors(TypedDict):
-    """Error count sub-dict inside ``RunSummaryReport``."""
+    """Error count sub-dict inside ``RunSummaryReport``.
+
+    ``validation`` counts ``validation_errors`` rows (a source row that failed
+    validation has no token). ``transform`` counts tokens whose terminal
+    outcome is a failure decided by a transform error. It does not count
+    ``transform_errors`` rows, which record attempts: a resumed attempt can
+    fail again (a second row) or succeed and deliver the row (a row for a
+    token that did not fail).
+
+    ``collector_group`` counts tokens whose collector group FAILED as a whole,
+    each once (M in ``core/landscape/terminal_transform_failures.py``). It is
+    disjoint from ``transform`` by terminal path, so ``total`` is the sum of
+    all three. Failed GROUPS are ``counts.collector_groups_failed`` (G), a
+    different unit that no error total includes.
+    """
 
     validation: int
     transform: int
+    collector_group: int
     total: int
 
 
@@ -430,7 +446,12 @@ class ValidationErrorGroup(TypedDict):
 
 
 class TransformErrorGroup(TypedDict):
-    """Transform error group by transform plugin."""
+    """Transform error group by transform plugin.
+
+    ``count`` is the number of tokens whose terminal outcome is a failure a
+    transform error at this plugin decided. It never counts ``transform_errors``
+    rows, which record attempts.
+    """
 
     transform_plugin: str
     count: int
@@ -445,11 +466,47 @@ class ValidationErrorSummary(TypedDict):
 
 
 class TransformErrorSummary(TypedDict):
-    """Transform errors sub-dict in ``ErrorAnalysisReport``."""
+    """Transform errors sub-dict in ``ErrorAnalysisReport``.
+
+    ``total`` and ``by_transform`` count terminally failed tokens, each at the
+    node whose transform error decided it. ``sample_details`` is ATTEMPT
+    evidence: up to five raw ``transform_errors`` rows. These may include an
+    attempt whose resumed retry succeeded, or an earlier attempt of a token
+    that failed again, so they are never a failure count.
+    """
 
     total: int
     by_transform: list[TransformErrorGroup]
     sample_details: list[dict[str, Any] | None]
+
+
+class CollectorGroupFailureGroup(TypedDict):
+    """Failed collector groups at one collector node, under one recorded reason.
+
+    ``failure_reason`` is a ``CollectorGroupFailureReason`` code. ``groups``
+    counts group verdicts; ``member_tokens`` counts the tokens those groups
+    failed, and is 0 for a group no member reached.
+    """
+
+    collector_plugin: str
+    node_id: str
+    failure_reason: str
+    groups: int
+    member_tokens: int
+
+
+class CollectorGroupFailureSummary(TypedDict):
+    """Collector group failures sub-dict in ``ErrorAnalysisReport``.
+
+    ``groups_total`` is G (failed groups) and ``member_tokens_total`` is M
+    (the tokens they failed). There are no free-text samples: the flush
+    state's text is attempt evidence, and only the recorded reason code is
+    reported.
+    """
+
+    groups_total: int
+    member_tokens_total: int
+    by_collector: list[CollectorGroupFailureGroup]
 
 
 class ErrorAnalysisReport(TypedDict):
@@ -458,6 +515,7 @@ class ErrorAnalysisReport(TypedDict):
     run_id: str
     validation_errors: ValidationErrorSummary
     transform_errors: TransformErrorSummary
+    collector_group_failures: CollectorGroupFailureSummary
 
 
 class LLMSummary(TypedDict):
@@ -641,7 +699,14 @@ class FailureValidationError(TypedDict):
 
 
 class FailurePatterns(TypedDict):
-    """Patterns identified in failure analysis."""
+    """Patterns identified in failure analysis.
+
+    ``failure_count``, ``transform_error_count`` and
+    ``validation_error_count`` are the lengths of the ``limit``-bounded record
+    listings beside them. Each counts sampled records, not failed tokens.
+    ``transform_errors`` in particular lists ATTEMPT evidence, which can
+    include an attempt whose resumed retry succeeded.
+    """
 
     plugins_failing: list[str]
     has_retries: bool
@@ -753,6 +818,18 @@ class DivertSummary(TypedDict):
     reason_hash: str | None
 
 
+class VerificationDecisionRecord(TypedDict):
+    """Persisted comparison evidence for one current-run external call."""
+
+    current_call_id: str
+    current_run_id: str
+    source_run_id: str
+    source_call_id: str | None
+    is_match: bool | None
+    differences_json: str
+    recorded_at: str
+
+
 class ExplainTokenResult(TypedDict):
     """Return type for ``explain_token``.
 
@@ -773,6 +850,7 @@ class ExplainTokenResult(TypedDict):
     transform_errors: list[dict[str, Any]]
     outcome: dict[str, Any] | None
     divert_summary: DivertSummary | None
+    verification_decisions: list[VerificationDecisionRecord]
 
 
 class ErrorResult(TypedDict):

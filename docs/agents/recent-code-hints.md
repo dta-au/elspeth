@@ -8,6 +8,163 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-28 — `field_mapper`'s `strict` option is retired and refused; older items that name it are history**
+  (elspeth-5887fb7928 B1, lane fix/5887-rebased, 286be0b92)
+  Real `elspeth run --execute` runs measured `strict: true` and `strict: false` identical on 42 case pairs (plain,
+  dotted and header-spelled sources, present and missing, observed and fixed upstreams). A normalized source is a
+  declared input that the executor checks before `process()`. A dotted or original-header source routed its miss inside
+  `process()` whichever value was set. So the option decided only a branch the engine never reached. Every mapping source
+  is now a required input, and a row missing one routes to `on_error` as `missing_field`. A config that still carries
+  `strict` (either value) is refused at load: "field_mapper has no 'strict' option ... Remove 'strict'." The 2026-08-21
+  and 2026-08-20 items below mention `strict` as history. Do not apply their `strict` remedies. For a dotted source
+  under a fixed input schema, the executable repair is to declare the source's top-level root in `schema.fields`
+  (`user: any` for `user.name`). The composer's `_TRANSFORM_DECLARED_NOT_GUARANTEED_FIX` gives that advice, and
+  `test_rule_c_nested_read_remedy_is_executable_and_the_old_one_was_not` in `tests/unit/web/composer/test_state.py`
+  pins it through the executor-shaped chain.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
+- **2026-09-26 — template renderers are pinned, and a spawned worker latches a Tier-1 instead of raising it**
+  (elspeth-5887fb7928 S3, lane fix/5887-rebased)
+  The bounded template worker used to let every exception outside a fixed catch tuple escape. The child died, the
+  parent read EOF and routed every such row as the classless "Template worker stopped before completing". With the
+  parent's kill delayed, multiprocessing's bootstrap printed the child's traceback to the inherited stderr, and a
+  `.format` `KeyError` quoted the row value there (the panel's B9: 3 sentinel lines before the fix, 0 bytes after). The
+  worker now ends every request in a reply. A render failure is routed by its class alone. A Tier-1 error or a failure
+  in the worker's own setup aborts as `FrameworkBugError`. A missing reply is classified by exit status. Two whole-tree
+  checks came with it. `test_template_call_sites.py` pins the Jinja renderers. `TestReRaiseGuardPattern` gained
+  `_PROCESS_BOUNDARY_LATCHES`, because a first run found that the worker's returning `except TIER_1_ERRORS` arm
+  (by design) failed that gate. The file-name allowlist was not used because it would also have exempted
+  `core/templates.py`. Separately, `_BoundedEnvironment._parse` now refuses config-literal failures at build (an
+  unknown filter or test, including one inside `{% if %}`, a literal name given to `map`/`select`, a literal `truncate`
+  that breaks its preconditions), and RAG's config compiles its `query_template`: before this, the composer admitted
+  even a malformed RAG template.
+  Fix round 1 (f04637c40): the worker kept Python's SIGINT handler, so a terminal Ctrl-C (sent to the run's whole
+  process group) ended it with status 1 and the run aborted as a framework bug instead of stopping gracefully. The
+  worker now ignores SIGINT and is spawned with SIGINT blocked. A stdlib trap came with it: multiprocessing starts its
+  resource tracker on a process's first spawn and unblocks SIGINT in the calling thread afterwards (bpo-33613), so a
+  mask set around `Process.start()` silently did nothing for the first worker of every process. `ensure_running()`
+  now runs before the block. A mask-leak mutant survived one test round only because random order sometimes made
+  its test the process's first spawn; only a fresh interpreter (`test_the_first_worker_a_process_starts_holds_a_stop_too`)
+  sees the first-spawn case.
+  S3b (RC-9, capacity and timing): a worker's first message is now `("ready", "")`, sent once its interpreter has
+  started and its memory limit is set, and `_start_worker` waits for it (up to 60 s; a worker that never becomes ready
+  is a `FrameworkBugError`). The 5 s render clock starts after it, so a slow start is no longer charged to a row. A test
+  that spawns `_template_worker` itself and talks to the pipe must read that message first (`_await_ready` in
+  `test_template_worker_failures.py`), or it takes `ready` for the request's reply. The worker ignores SIGTERM as well
+  as SIGINT, because systemd's default stop sends SIGTERM to every process in the unit and the run stops gracefully on
+  it. Ignoring SIGTERM has a cost at interpreter exit: multiprocessing's own exit handler SIGTERMs every live daemon
+  child and then joins it, so a worker started after the templates exit handler (by a thread still rendering at
+  exit) hung the process for good (measured: a probe timed out at 30 s). The exit handler now sets
+  `_INTERPRETER_EXITING` under `_WORKER_SPAWN_LOCK`, and `_start_worker` refuses a later start as a
+  `FrameworkBugError`. A worker ended by any other signal raises the retryable `TemplateWorkerLostError`, which is a
+  `PluginRetryableError` and not a `TemplateError`. SIGXCPU is the row's only while a request renders. All workers
+  busy is backpressure, not an error: `_WORKER_SLOTS.acquire()` has blocked since 313a85bb1.
+  See [CONTRIBUTING: Gate: template renderers and the Tier-1 process-boundary latch](../../CONTRIBUTING.md#gate-template-renderers-and-the-tier-1-process-boundary-latch).
+
+- **2026-09-24 — no bare `TypeError` may escape a plugin's `process` path** (elspeth-5887fb7928, lane
+  fix/5887-batch-row-quarantine)
+  Twelve sites in eleven batch plugins raised `TypeError(... "This indicates an upstream validation bug" ...)` on a
+  wrongly-typed row value. Nothing in the engine converts a bare `TypeError`, so each one aborted the run (exit 4, zero
+  terminal outcomes) where the operator ruling (elspeth-d5034647f0) requires the whole batch to fail with a value-free
+  reason and route via `on_error`. The convention spread by copying: two type-enforcement commits (28be95bf0,
+  0733b3d51) seeded it, every new plugin family copied it, one plan cited a sibling as precedent, and the doctrine
+  sentence "wrong type at Transform: upstream bug, should crash" (`plugin-protocol.md`, the data-trust guide, the
+  tier-model skill, README, the website) read as authority. The sites now raise `BatchRowTypeError` from their
+  helpers and `process()` converts it once, and the docs say "rejected by a RETURNED error; at a batch node the whole
+  batch fails". The gate `tests/unit/plugins/test_process_path_type_error_gate.py` (class-scoped reachability from
+  `process`, expected set empty) flagged exactly those twelve at base 74c0ce0db and nothing else. It did NOT flag the
+  RAG query builder's two live-abort sites (`transforms/rag/query.py`, fixed separately in 11f5475d8): a helper object
+  composed from another module, under a `process` six registered transforms inherit from another module, is outside
+  its reach, so a green gate does not prove a plugin cannot abort. It is scoped to
+  `TypeError` on purpose: widening to `ValueError`/`KeyError`/`RuntimeError`/`NotImplementedError` adds only
+  lifecycle and self-consistency invariants whose conditions read no row value. Its anti-vacuity floor
+  (`MIN_PROCESS_ROOTS`) exists because a copy of the tree under a gitignored path, or a nonexistent root, scans as
+  zero roots and zero findings, exactly what a clean tree reports.
+  See [CONTRIBUTING: Gate: no bare TypeError on a plugin process path](../../CONTRIBUTING.md#gate-no-bare-typeerror-on-a-plugin-process-path).
+
+- **2026-09-24 — the wire fidelity matrix pins LiteLLM's strict-tool wire per route, and the root conftest now fixes
+  the cost map on purpose** (composer strict tool contracts S1, task T11; branch `feat/strict-tool-contracts-s1`).
+  `tests/unit/web/composer/test_wire_fidelity_matrix.py` records what LiteLLM 1.102 transmits (loopback
+  `ThreadingHTTPServer` on port 0, `respx` for `api.openai.com`) for requests built by the production builders under
+  each route's resolved dialect. Measured: OpenRouter forwards the stamped list byte-for-byte (an ECMA-only `pattern`,
+  a root `oneOf` and an `enum` `null` included); OpenAI-compatible and hosted chat drop the ECMA-only `pattern`; Azure
+  and hosted chat flatten a root `oneOf`; Bedrock converse drops `null` from an `enum`; native Anthropic drops a forced
+  `strict`; and the Responses bridge writes `"strict": null` on every tool sent without the key, so on a bridged route
+  today's bytes are `strict: null`, not an absent key. ELSPETH's gateway rejects both `strict: true` and
+  `strict: false` (appended rows in `tests/integration/web/composer/test_composer_against_gateway.py`). The matrix
+  asserts the local cost map before every row. That held only by accident: `configure_litellm_pricing()` ran because
+  `tests/unit/web/conftest.py` happened to import ELSPETH pricing before LiteLLM, and a test module outside that tree
+  that imported LiteLLM first got the remote map (measured: `source` was `remote`). The root conftest now calls it
+  after its imports, none of which loads LiteLLM (measured). Lesson: a precondition that holds only through import
+  order in an unrelated conftest is not a precondition — set it where every test inherits it, and assert it where it
+  is relied on.
+  See [CONTRIBUTING: Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates).
+
+- **2026-09-23 — advisor blocker retry copy now follows the cause it names; the note never swaps a finding for a CLEAN
+  sub-heading** (elspeth-032ec69c41 self-review; the withheld-sentence defect from the same review landed separately as
+  1809379f6). Pinned in `tests/unit/web/composer/test_advisor_checkpoint.py`. (1) `_ADVISOR_NOTE_VERDICT_LEAD_RE`
+  matched CLEAN although a note is built only on the FLAGGED arm: a mid-line verdict let a later `**Clean:**` line win
+  the scan, and a blocked pipeline's note read "the source and sink are fine". The lead is now FLAGGED-only, and the
+  body is rejoined from `splitlines()` on every path so U+2028/U+2029 stay line breaks. (2) 41aeaeac0 made advisor
+  decisions persist on unchanged turns, which falsified two retry promises written for the old rule: the
+  ABSENT-preflight flag notice said "on your next message" (the next unchanged turn now skips), and a message
+  rejection's `detail` said "Review the pipeline; … after your next pipeline change" beside "reword … then resend" —
+  it now carries `_ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER`. Retry copy is tested against
+  `advisor_block_covers_unchanged_graph` itself rather than against strings, and the `test_no_tool_policy_segments.py`
+  notice lists are grouped by cause, not by whether the turn moved the graph. Lesson: a comment that justifies copy
+  with a persistence invariant ("such a block persists nothing") is a claim a later commit can falsify silently — pin
+  the copy to the mechanism.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
+- **2026-09-23 — the advisor blocker's `detail` stopped claiming the composer's reply was withheld; the dead withheld
+  notices are deleted** (operator request after the reply-withholding self-review; branch `fix/withheld-notice-cleanup`)
+  Since the 2026-09-22 ruling a blocked turn publishes the composer's reply, but `_advisor_signoff_blocked_wording`
+  still defaulted to `_ADVISOR_SIGNOFF_PENDING_NOTICE` and the unverified builder passed
+  `_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE` — the WITHHELD forms. So every FLAGGED block's durable blocker, shown in the
+  DecisionPanel, said "ELSPETH withheld the composer's own summary" beside the published summary (`unavailable` and
+  `malformed` were clean: their arms do not embed the notice). Both now use the `_PUBLISHED_` notices, pinned by
+  `test_advisor_blocker_detail_never_claims_the_composer_reply_was_withheld` over all five reasons and all three
+  builders. A stored gate fact's `detail` is parsed only as a non-empty string, so no epoch bump: a block persisted
+  before this change keeps its old sentence until the graph changes. Deleted with the operator's go-ahead: the
+  withheld form of nine blocked-notice families (their notice/footer, bare suffix, wrapped template, recognizer arm and
+  segment-test case) and the `prose_withheld` parameter of the nine composers that only the END gate calls. Kept:
+  the withheld sign-off-pending and pending-handoff forms, which the advisor-repair replacer still produces, so
+  `compose_advisor_signoff_pending_message` and `compose_advisor_pending_handoff_message` still take the required
+  flag. Rule rewritten in
+  [CONTRIBUTING: Gate: wire-shape templates](../../CONTRIBUTING.md#gate-wire-shape-templates).
+
+- **2026-09-22 — the advisory reviewer's own words reach the user, as a bounded `note` on the advisor blocker; session epoch 65** (elspeth-032ec69c41 ruling; 351a15b6e, 6a34007fb, d8a6e2902, 37fc43c00, 539121b17, b5e458d1d, 9e13ef830)
+  R2-F13 is NARROWED, not lifted. A FLAGGED verdict now parses into
+  `AdvisorCheckpointVerdict.category` (closed set, `ADVISOR_FINDING_CATEGORIES`), `.affected_step_ids` (RAW) and `.note`
+  (`_advisor_note_text`: verdict token, CATEGORY/STEPS lines, fence sentinels and control characters stripped, capped at
+  `ADVISOR_NOTE_MAX_CHARS`). The blocker's `detail` gains a BACKEND-authored header — one fixed sentence per category
+  plus the step ids `_validated_advisor_step_ids` kept after checking them against the state — and the advisor's words
+  ride `ValidationReadinessBlocker.note` and nowhere else: not `detail`, not `suggestion`, not the check text, not the
+  chat message, not the question the DecisionPanel's Ask button drafts. A backend-authored pre-scan finding gets no
+  header and no note. `note` is REQUIRED (nullable) on the wire model, in `AdvisorSignoffGateDict`/`Fact` and in the
+  Tier-1 parser, so a builder cannot forget the decision and a drifted envelope fails closed — which is why
+  `SESSION_SCHEMA_EPOCH` is 65 and `_COORDINATION_HARD_CUT_EPOCH` moved with it (`schema.py` checks the two for exact
+  equality). Adding a required field to `ValidationReadinessBlocker` costs 12 src + 35 test constructors and 28 frontend
+  fixture literals; the panel's own `DecisionRow` is a SEPARATE type that also needed it, and `note` is deliberately not
+  part of `decisionId`, so every pinned row id is unchanged. The note renders as a React text child under a
+  "not verified by ELSPETH" label — never markdown, never `dangerouslySetInnerHTML`.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
+- **2026-09-22 — the END advisor gate stands aside only for a classified graph rejection** (elspeth-032ec69c41;
+  ruling on session 6990d39f). `_evaluate_terminal_no_tool_advisor_gate` returns `fall_through` when the turn changed
+  nothing AND the prior state row's `completion_gates` fact is `graph_rejected` for this exact graph
+  (`advisor_block_covers_unchanged_graph` in `web/execution/completion_gates.py`); the finalize tail then folds the
+  same durable fact back into the turn's preflight with `merge_completion_gates`. Decided on `state.version` and the
+  persisted fact only, never on user text. `completion_gates=None` always reviews, so an omitting caller fails toward
+  reviewing; a new caller of `compose()` that holds a state row should pass `parse_completion_gates(record.composer_meta)`
+  (Tier 1: parse it outside every `try`). Unavailable, malformed and message-scoped failures are reviewed again on a
+  later turn. `ComposerResult.advisor_gate_decision` is the explicit authority to replace a fact; a green runtime
+  preflight alone cannot clear it. Both routes save changed review outcomes in a new fenced snapshot even when the
+  graph is unchanged. Gate envelopes require schema version 2 and a cause; no old-format compatibility is provided.
+  Blocked-turn copy follows the cause: graph rejection requires a pipeline change, transient failures permit retry,
+  and message rejection asks for rewording (`tests/unit/web/composer/test_no_tool_policy_segments.py`).
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-09-07 — auto-gc was deadlocked by its own warning file: `.git/gc.log` blocked every `--auto` run, and the two-week default prune expiry could never clear it**
   `git gc --auto` had done no housekeeping for weeks. `.git/gc.log` held `warning: There are too many unreachable loose
   objects; run 'git prune' to remove them.`, and git prints that file and exits **0** instead of running whenever the
@@ -45,6 +202,24 @@ the same commit; the rules live there, the history lives here.
   worktrees and concurrent agent sessions.
   See [CONTRIBUTING: Convention: repository and process hygiene](../../CONTRIBUTING.md#convention-repository-and-process-hygiene).
 
+- **2026-09-22 — a turn blocked by the END advisor gate publishes the composer's reply; the `advisor_terminal_block` withheld row is gone, the `advisor_signoff_withheld` disclosure row is written on EVERY block** (elspeth-032ec69c41 ruling; f776a8a8d, 21dd1bd64, 1658d77de + the review fix pass)
+  `_advisor_blocked_result` no longer takes `advisor_repair_context_introduced`: the notice composers select their
+  `_PUBLISHED_` twins and `assistant_message=None` is empty prose under the same notice. Dead with the withholding and
+  removed in the same commit: the `advisor_terminal_block` `WithheldReplyOrigin` and the flag's forwarding parameter
+  through `_classify_and_budget_turn`, `_try_terminate_no_tools` and the gate. NOT dead: the user-role
+  `advisor_signoff_withheld` control row (`_ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE`) — its job changed from standing in
+  for withheld prose to asserting, in the backend's voice, that completion was withheld whatever the published prose
+  claims, so the gate now writes it unconditionally (both cohorts) ahead of the publication row. Measured limit: the
+  control envelope's hash binds content only, so swapping one registered user-role origin for another replays cleanly.
+  Nine `prose_withheld=True` composer arms in `no_tool_policy.py` had no producer (only case 5 withholds); the
+  operator ruled them deleted on 2026-09-23 (see that entry). Case 5 (`_replace_advisor_repair_public_result`, the
+  CLEAN-after-repair replacement) still withholds and still reads `advisor_repair_context_introduced` in
+  `_compose_loop`; do not "align" it — and because of it the repair-continue clauses name the exit ("make no change:
+  tell the user what blocks you … That reply ends the turn.") without promising the user sees the reply. The coalesce
+  `on_error` rejection states the measured `require_all` consequence (the whole group fails, arrived branches recorded
+  failed) and describes `best_effort`, `quorum` and `first` separately.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-09-01 — secret wiring is deny-by-default at three seams, and collectors use the transform policy vocabulary** (elspeth-f3c1aafd25; 9da1b39b8, c163b6366)
   `WebSettings.secret_wiring_allowlist` authorizes only an exact
   `(secret, component_type, plugin, option_key)` match; an empty policy denies every wiring. The policy vocabulary is
@@ -63,7 +238,7 @@ the same commit; the rules live there, the history lives here.
   Add or edit a skill under `.agents/skills/` only; a real directory under `.claude/skills/` is a regression. Pin paths in
   tests, scripts and `per-file-ignores` at `.agents/skills/...` and `design/...`. Git never sees a path *through* a
   symlink (`git check-ignore` says "beyond a symbolic link"), so the installer's write to
-  `.claude/skills/loomweave-workflow/SKILL.md` lands at `.agents/skills/loomweave-workflow/SKILL.md`, which `.gitignore`
+  archived tool reference lands at archived tool reference, which `.gitignore`
   already covers. `Path.glob("**")` on Python 3.13 and the shared `iter_python_files` walker (`followlinks=False`) both
   refuse to descend into the symlinks, so nothing is double-counted; glob `.agents/skills` only. The 2026-08-29 item
   below now reads `.agents/skills/**/*.py`.
@@ -76,7 +251,8 @@ the same commit; the rules live there, the history lives here.
   `elspeth-lints --root src/elspeth` tier gate. Ruff `T20` (print) is ignored there
   by `per-file-ignores`, the same treatment as `scripts/`. First occupant:
   `.claude/skills/lane-manager/` (hub-side lane orchestration; state under
-  `.claude/lanes/`, tests in `tests/unit/test_lane_manager_skill.py`).
+  `.claude/lanes/`). Agent tooling is not tested in this repo — it carries no
+  suite under `tests/`.
   See [CONTRIBUTING: Gate walker and scratch directory](../../CONTRIBUTING.md#gate-walker-and-scratch-directory).
 
 - **2026-08-29 — five tier_model precision classes are FIXED; do not reshape code around them or expect the pre-fix finding sets** (elspeth-8d46db34ff, ae34b48b3, df3463583)
@@ -227,7 +403,7 @@ the same commit; the rules live there, the history lives here.
   skip assertions (int, `None`, nested mapping, absent key) to the named test, which rotated the
   fingerprint. Same both-arms rule as the frozen-input pins in W2 brief item 15, applied to
   boundary metadata.
-  See [CONTRIBUTING: Why a green scoped run proves nothing](../../CONTRIBUTING.md#why-a-green-scoped-run-proves-nothing).
+  See [CONTRIBUTING: Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates).
 
 - **2026-08-29 — tier_model R5 carries a HARD-CODED per-file exemption map in the rule (`_R5_NAMED_BOUNDARY_CONTEXTS`), so "the identical `isinstance` chain fires in my file but not in that one" is not evidence of a reproducible structural exemption** (elspeth-0bd4fb6042)
   Measured in B61 on `web/sessions/_auto_title.py`, whose `_auto_title_exception_class` runs four
@@ -1712,7 +1888,7 @@ the same commit; the rules live there, the history lives here.
   7. A rebuild-and-compare check passes hardest when it did nothing. Twice in one lane `git add` failed silently on an index lock, so the index still equalled HEAD, the generated patch was 0 bytes, and `cmp` printed MATCH. Such a procedure must assert its own preconditions before comparing: the patch must be non-empty, and the index must differ from HEAD. Re-verify against the CURRENT HEAD too — HEAD can move while you wait on a lock.
   8. Removing a value can blind a nearby assertion while the test stays green. A guided fixture carried `{"tier": "'high'"}` in the predecessor and `{"tier": "'priority'"}` in the replanned candidate; repairing the incoherent pair out of both sides left the two mappings identical, so the re-keyed `mapping == {"amount": "amount"}` passed whether the binder carried the replan through or restored the predecessor wholesale. When a repair removes a value, check whether that value was the only thing making a nearby assertion discriminate; prefer the whole-object assertion (fixed at `b06c5f6dc`; the vacuous form shipped in `fe8b0cc4c`).
   The unifying rule: confirmations are where this happens, because the search is for agreement rather than for a result. Prefer stating "not traced" over a green that cannot be accounted for.
-  See [CONTRIBUTING: Why a green scoped run proves nothing](../../CONTRIBUTING.md#why-a-green-scoped-run-proves-nothing).
+  See [CONTRIBUTING: Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates).
 
 - **2026-08-26 — editing any plugin source file moves frozen corpus bytes; a whole-tree trap with no local symptom** (elspeth-e6e552ce34)
   Every plugin declares a `source_file_hash` line, the node audit record carries that byte, and `docs/architecture/dag/scenario-corpus/v1/manifest.yaml` pins the audit records LITERALLY. A one-line edit under `src/elspeth/plugins/` — even a pure declaration such as adding a class attribute — bumps its hash and turns the DAG scenario corpus red, with nothing in the plugin's own suite to warn. elspeth-e6e552ce34 cost 32 reds in `tests/integration/core/dag` this way (csv_source + passthrough).
@@ -1744,7 +1920,7 @@ the same commit; the rules live there, the history lives here.
   See [CONTRIBUTING: Gate: declared oracles pin output bytes](../../CONTRIBUTING.md#gate-declared-oracles-pin-output-bytes).
 
 - **2026-08-26 — a row_union-released token's resume authority is the SCHEDULER JOURNAL; the workset's mint-frame projection is a known-divergent artifact** (elspeth-54edda5699)
-  Pinned by `tests/e2e/recovery/test_row_union_released_token_resume.py`. `get_resume_workset` rebuilds `IncompleteTokenSpec.lineage_path` from MINT frames, so a released token's spec silently regains the FORK frame the union popped; dispatching it would re-run the whole branch into a released barrier (measured under mutation: the scheduler's incompatible-work-item guard fail-closes at the union, attempt 1). The healer is `run_resume_processing_loop`'s drain-first precedence: journal rows carry the popped `lineage_path_json` byte-exactly, and after `drain_scheduled_work` the row-replay set is DISCARDED (`unprocessed_rows = ()`), with mixed journal coverage refused as AuditIntegrityError. Do not "fix" the workset projection to re-pop frames, and do not weaken the drain-first / coverage-refusal pair; the pin test kills either mutation.
+  (Superseded 2026-09-28: `get_resume_workset`, `IncompleteTokenSpec` and the row-replay set were deleted with source-row replay — resume re-drives only scheduler work; see the ADR-025 amendment.) Pinned by `tests/e2e/recovery/test_row_union_released_token_resume.py`. `get_resume_workset` rebuilds `IncompleteTokenSpec.lineage_path` from MINT frames, so a released token's spec silently regains the FORK frame the union popped; dispatching it would re-run the whole branch into a released barrier (measured under mutation: the scheduler's incompatible-work-item guard fail-closes at the union, attempt 1). The healer is `run_resume_processing_loop`'s drain-first precedence: journal rows carry the popped `lineage_path_json` byte-exactly, and after `drain_scheduled_work` the row-replay set is DISCARDED (`unprocessed_rows = ()`), with mixed journal coverage refused as AuditIntegrityError. Do not "fix" the workset projection to re-pop frames, and do not weaken the drain-first / coverage-refusal pair; the pin test kills either mutation. **Superseded 2026-09-28 (QR):** the workset projection and the source-row replay arm are deleted; resume re-drives only the journal, so the mint-frame hazard has no reader left. The pin test now asserts the journal-served, exactly-once healing on a real process death.
   See [CONTRIBUTING: Convention: audit and lineage recording](../../CONTRIBUTING.md#convention-audit-and-lineage-recording).
 
 - **2026-08-26 — the guided deferral surface is PLURAL end to end: one resolution plus 1..K retains per reply** (elspeth-3a21f09f09)
@@ -1840,19 +2016,19 @@ the same commit; the rules live there, the history lives here.
 
 - **2026-08-22 — WS1b Phase A lifts the read restriction for `IncompleteTokenSpec.lineage_path` and `token_lineage_frames`, NOT for `TokenInfo.lineage_path`** (Tasks 4/5, branch feature/unified-lineage)
   `TokenInfo.lineage_path` stays write-only until the flip. Two NEW sanctioned reads landed alongside, each scoped to its own field/table:
-  1. `engine/processor.py::classify_resume_start` and `resume_incomplete_token` read `IncompleteTokenSpec.lineage_path` (spec §4.1a) to select the resume-start dispatch arm. PINNED order is merged (join) first, then innermost-EXPAND, then innermost-FORK, then raise; the fork-child branch identity is the innermost FORK frame's `member_key`, never `spec.branch_name` directly.
+  1. (Deleted 2026-09-28 with source-row replay, see the ADR-025 amendment.) `engine/processor.py::classify_resume_start` and `resume_incomplete_token` read `IncompleteTokenSpec.lineage_path` (spec §4.1a) to select the resume-start dispatch arm. PINNED order is merged (join) first, then innermost-EXPAND, then innermost-FORK, then raise; the fork-child branch identity is the innermost FORK frame's `member_key`, never `spec.branch_name` directly.
   2. MCP read surfaces (`mcp/analyzers/queries.py::list_tokens`, `mcp/analyzers/reports.py::get_outcome_analysis`'s fork/join counts) batch-load `token_lineage_frames` via `DataFlowRepository.load_lineage_paths` / the newly-added `DataFlowReadRepository.load_lineage_paths` forwarder (`core/landscape/factory.py`) and project `branch_name`/`fork_group_id`/`expand_group_id` as DERIVED values via `contracts.identity.path_branch_name`/`path_fork_group_id`/`path_expand_group_id` — never a stored-column read (ruling 21, ratified 2026-08-22: the legacy wire names stay, the mechanism underneath changes).
   `DataFlowReadRepository` (the read-only port `RecorderFactory.read_only()` returns, which is what the real `elspeth-landscape` MCP server runs on) did NOT forward `load_lineage_paths` before this; only the writable `DataFlowRepository` had it. A test built against a writable `RecorderFactory` stays green without the forwarder, so the gap is invisible until the real read-only MCP server is exercised.
   See [CONTRIBUTING: Convention: audit and lineage recording](../../CONTRIBUTING.md#convention-audit-and-lineage-recording).
 
 - **2026-08-21 — repair advice must be executed, not just re-validated: a transform's `schema` block is BOTH the composer contract and the runtime INPUT model**
-  Rule C's remedies each cleared `validate()` and were pinned there, and two of them left a node whose fixed-mode pydantic input model (`extra_forbidden`, checked in `_run_preflight` BEFORE `process()`) rejected the very field the mapping reads: the nested read's top-level container (`user` for `user.name`), or the normalized key (`name`) a row actually arrives under for a non-fixed-point mapping source (`Name`). A third remedy ("remove the target from `schema.fields`") hit `FieldMapperConfig`'s at-least-one-field invariant in the single-field shape, and "make upstream guarantee the literal" can NEVER clear because `_mapping_target_is_guaranteed` abstains for every non-fixed-point source, strict or not. Measured repairs: nested read -> `strict: true` PLUS `schema.mode: flexible`; non-fixed-point source -> target optional (`name: type?`) PLUS `schema.mode: flexible`, or upstream rename to the stable spelling PLUS rewriting the mapping key to that same spelling. Truth-pin advice by running it through the executor-shaped chain (`input_schema.model_validate(strict=True)` -> `process()` -> `verify_schema_config_mode`), not only through `validate()`; see `_run_field_mapper_as_the_executor_would` in `tests/unit/web/composer/test_state.py`.
+  Rule C's remedies each cleared `validate()` and were pinned there, and two of them left a node whose fixed-mode pydantic input model (`extra_forbidden`, checked in `_run_preflight` BEFORE `process()`) rejected the very field the mapping reads: the nested read's top-level container (`user` for `user.name`), or the normalized key (`name`) a row actually arrives under for a non-fixed-point mapping source (`Name`). A third remedy ("remove the target from `schema.fields`") hit `FieldMapperConfig`'s at-least-one-field invariant in the single-field shape, and "make upstream guarantee the literal" can NEVER clear because `_mapping_target_is_guaranteed` abstains for every non-fixed-point source, strict or not. Measured repairs: nested read -> `strict: true` PLUS `schema.mode: flexible` [superseded 2026-09-28: `strict` is retired and refused; declare the dotted source's top-level root instead — see the 2026-09-28 item]; non-fixed-point source -> target optional (`name: type?`) PLUS `schema.mode: flexible`, or upstream rename to the stable spelling PLUS rewriting the mapping key to that same spelling. Truth-pin advice by running it through the executor-shaped chain (`input_schema.model_validate(strict=True)` -> `process()` -> `verify_schema_config_mode`), not only through `validate()`; see `_run_field_mapper_as_the_executor_would` in `tests/unit/web/composer/test_state.py`.
   See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
 
 - **2026-08-21 — a config-time DECLARATION check compares two name spaces, and the shortfall may be UNDECLARABLE** (elspeth-a9ba80cb0b)
   A single-prompt `llm` node could declare `required_input_fields: ["case_study_1"]` while its template read `{{ row.case_study }}`: presence was checked, agreement never was, and the edge contract was satisfied by the DECLARATION, so every row raised `UndefinedError` at render. Multi-query already had this check; the single-prompt branch did not. Five traps, all measured:
   1. Do NOT copy the multi-query message. A query renders a SYNTHETIC context (`input_fields` + `source_row`), so an unbound `row.<name>` provably raises; single-prompt binds `row` to the WHOLE row, so an undeclared reference raises only when that column is in fact absent. "Fails for every row" is FALSE here. It is a CONTRACT check: the reference escapes the set the DAG checks against upstream guarantees, and `verify_declared_required_fields` re-checks per row.
-  2. Coverage is EXACT, and a `normalize_field_name` bridge is UNSOUND in the obvious direction. `SchemaContract.find_name` matches a field's `normalized_name` OR its `original_name` — two exact spellings, and config time knows neither. Measured with `required_input_fields: ["a_b"]` against a row whose one column is `a_b`, TWELVE declarable spellings (`A_B`, `a__b`, `A_B_`, `row["a b"]`, ...) are accepted and only ONE renders. The one sound inference runs the other way: a literal that is not a legal declaration entry (`"Original Header"`, `"class"`) can never BE a `normalized_name`, so it can only be an `original_name` and its canonical form IS the row key. Bridge those, and REPORT them when that canonical name is not declared; drop only a literal with no declarable form at all (`"!!!"`). `undeclared_row_fields` / `declarable_field_name` / `describe_undeclared_row_fields` (`plugins/sources/field_normalization.py`) single-own this, and live beside `normalize_field_name` deliberately: the first version put them in `core/templates.py` and drew the third-ever `L1: Upward import` finding in the tree.
+  2. [superseded 2026-09-28 by ADR-051 (b) / S-02: a header spelling of a DECLARED field is now covered at config, which cannot see the header; the build and the composer refuse one no arriving row can carry — a field with no source header behind it on any path (`field_spelling.HeaderCarriers`: created by a node, emitted by a reductive batch output, a headerless column, a mapping or rename target), or a header renamed away — with `field_name_lookup_unreachable` (`field_spelling.unreachable_spelled_lookups`)] Coverage is EXACT, and a `normalize_field_name` bridge is UNSOUND in the obvious direction. `SchemaContract.find_name` matches a field's `normalized_name` OR its `original_name` — two exact spellings, and config time knows neither. Measured with `required_input_fields: ["a_b"]` against a row whose one column is `a_b`, TWELVE declarable spellings (`A_B`, `a__b`, `A_B_`, `row["a b"]`, ...) are accepted and only ONE renders. The one sound inference runs the other way: a literal that is not a legal declaration entry (`"Original Header"`, `"class"`) can never BE a `normalized_name`, so it can only be an `original_name` and its canonical form IS the row key. Bridge those, and REPORT them when that canonical name is not declared; drop only a literal with no declarable form at all (`"!!!"`). `undeclared_row_fields` / `declarable_field_name` / `describe_undeclared_row_fields` (`plugins/sources/field_normalization.py`) single-own this, and live beside `normalize_field_name` deliberately: the first version put them in `core/templates.py` and drew the third-ever `L1: Upward import` finding in the tree.
   3. Leading a rejection with "declare what you read" HANDS THE PLANNER A REPAIR THAT BREAKS THE RUN. `verify_declared_required_fields` is a plain set difference over ROW KEYS with no dual-name limb, so declaring a read name the producer does not guarantee is accepted at config time and then raises `DeclaredRequiredInputFieldsViolation` on EVERY row (measured for `{{ row.Name }}` + `["name"]` and for a `field_mapper` rename leaving a stale `original_name`). The remedy must LEAD with rewrite-the-reference and qualify add-the-name as correct only when the producer guarantees that exact spelling; it must also name the DECLARABLE form of a bracket literal — `'Original Header' (declare as 'original_header')`.
   4. Do NOT attempt guard analysis. Measured through the real `PromptTemplate`: `{% if row.x is defined %}`, `{{ row.x | default('') }}`, `{% if 'x' in row %}` and `{{ row.get('x','') }}` RENDER when the column is absent, while `{% if row.x %}`, `{{ row.x if row.x else '' }}`, `{{ row.x or 'n/a' }}` and `{{ '' if row.x is none else row.x }}` RAISE — one token apart. A genuinely optional guarded read has no honest repair, and ZERO exist in the tree (the one that looks like a guard, `examples/chroma_rag_qa`'s `{% if row.sci__rag_context %}`, is a FAKE guard that raises and whose declaration is load-bearing).
   5. The composer twin is REQUIRED, not redundant. The composer's probes DO construct the node and DO see the plugin's rejection — three times inside one `validate()` (`_semantic_validator._instantiate_consumer`, `_probe_transform_declared_inputs`, `_probe_transform_declared_output_fields`) — and every one swallows it through `_is_config_probe_exception`, deliberate and test-pinned so a draft never crashes validation. Stage 2 preflight rejects only via `preview_pipeline`, and codelessly (`error_code=None`, matched by 0 of the 115 `_VALIDATION_ERROR_PATTERNS`).
@@ -1926,7 +2102,7 @@ the same commit; the rules live there, the history lives here.
   Two ways a whole-tree measurement lies.
   1. `pytest tests/` takes ~18 minutes; four sibling commits landed inside one such window on 2026-08-17 and the run reported 456 failures across engine/pipeline/e2e that did not exist before or after (a representative slice re-run immediately after: 22 passed). Record `git rev-parse HEAD` BEFORE and AFTER a long run; if they differ, a red result is uninterpretable — re-run rather than diagnose.
   2. Running the A/B side in a `git worktree` silently changes what is collected: `evals/*` is git-ignored except for tracked re-includes, so a fresh worktree has no `evals/composer-rgr`, `composer-harness`, and every suite that GLOBS those assets collects fewer tests there (measured: `test_convergence_scenarios.py` 11 vs 32, `test_paths.py` 22 vs 40, `test_execution_repository.py` 148 vs 161). A worktree test-count delta is therefore NOT attributable to the change under test. To attribute a count honestly, diff per-file collected counts (`pytest --collect-only -q | sed 's/::.*//' | uniq -c`) between the two trees and read the per-file rows, not the total. Worktree e2e recovery tests also fail on capture-root binding, so a worktree pass/fail is its own instrument.
-  See [CONTRIBUTING: Why a green scoped run proves nothing](../../CONTRIBUTING.md#why-a-green-scoped-run-proves-nothing).
+  See [CONTRIBUTING: Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates).
 
 - **2026-08-17 — a directory-scoped test `conftest.py` that mutates `sys.path` is PROCESS-GLOBAL, not directory-scoped**
   `tests/unit/evals/composer_battery/
@@ -2002,7 +2178,7 @@ the same commit; the rules live there, the history lives here.
   3. Baseline entries bind a sorted `probe_shapes` fingerprint for every occurrence, not only `(path, qualname, kind)` and a count, so a one-for-one rewrite (literal field to dynamic reflection, receiver/default change, imported alias rebinding) deliberately fires `probe-shape-drift` even when key and count are unchanged. Refresh with `python -m elspeth_lints.rules.masquerade.seed_baseline`, which preserves an existing classification/justification only when key, count, and shapes all still match and resets changed or new subjects to `unadjudicated`. Do not hand-edit the fingerprints.
   4. Probe classification resolves `builtins.getattr` / `builtins.hasattr` and `inspect.getattr_static` through imports, lexical shadowing, reassignment, comprehensions, possible-target control-flow joins, and deferred module bindings. Abrupt-only paths do not pollute the reachable binding, but any reachable builtin target is still inventoried; aliasing a builtin is not an escape hatch, and a rebound `@trust_boundary` source parameter no longer receives boundary amnesty.
   5. Assignment targets are executable syntax: attribute receivers, subscript containers and indices (including slices), and target-side named expressions must be inventoried for ordinary/annotated assignments, `for`/`async for`, `with`/`async with`, and comprehensions. Preserve CPython order with the shared target walkers; for chained or destructured assignment, freeze RHS binding/source evidence once before the first target store, because re-resolving after a target-side walrus creates paired false positives and false negatives.
-  Do NOT rewrite the probe resolver — decided 2026-08-09, re-walked by accident and re-confirmed 2026-08-16. Two full attempts were built and rejected by independent review: a partial-CPython state model (Freezes 1-5, 5,216 lines, never merged) and a sparse-SSA definition/phi/value-graph solver (Freeze 6, whose rejection found late-global, try/match, annotation-timing, loop-header, star-import and callee/argument misses plus non-monotone `PROJECT` output and `CALL_RESULT` role collision, while its adversarial scaling was fine). The systems review classified Freezes 1-5 as a Fixes-that-Fail / Limits-to-Growth loop. `inventory.py` is the single authority, and the standing stop rules (elspeth-02cd60d8cd) are: no CFG/SSA/history/replay/lazy-cache/object-emulator growth, and <=2.5x runtime per input doubling. New semantic coverage lands as narrow, ticket-level RED tests against the existing visitor — open siblings elspeth-682e0c6581 (definition-header replay), elspeth-f1def53d38 (PEP 695/696 scopes), elspeth-2a72512454 (destructured RHS alias evidence). That entire history exists ONLY in `filigree get-comments elspeth-de6f571887` (a CLOSED issue); read that comment stream before touching resolution.
+  Do NOT rewrite the probe resolver — decided 2026-08-09, re-walked by accident and re-confirmed 2026-08-16. Two full attempts were built and rejected by independent review: a partial-CPython state model (Freezes 1-5, 5,216 lines, never merged) and a sparse-SSA definition/phi/value-graph solver (Freeze 6, whose rejection found late-global, try/match, annotation-timing, loop-header, star-import and callee/argument misses plus non-monotone `PROJECT` output and `CALL_RESULT` role collision, while its adversarial scaling was fine). The systems review classified Freezes 1-5 as a Fixes-that-Fail / Limits-to-Growth loop. `inventory.py` is the single authority, and the standing stop rules (elspeth-02cd60d8cd) are: no CFG/SSA/history/replay/lazy-cache/object-emulator growth, and <=2.5x runtime per input doubling. New semantic coverage lands as narrow, ticket-level RED tests against the existing visitor — open siblings elspeth-682e0c6581 (definition-header replay), elspeth-f1def53d38 (PEP 695/696 scopes), elspeth-2a72512454 (destructured RHS alias evidence). That entire history exists ONLY in archived tool command for `elspeth-de6f571887` (a CLOSED issue); read that comment stream before touching resolution.
   See [CONTRIBUTING: Gate: masquerade sites](../../CONTRIBUTING.md#gate-masquerade-sites-tests-included).
 
 - **2026-08-16 — Corpus agreement cannot validate a probe-resolver change**

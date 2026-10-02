@@ -126,7 +126,7 @@ external effect happened only once.
   recovery sweep tolerates (so it can recover), but the schema's
   `ck_token_work_items_lease_owner_required_when_leased` CHECK
   constraint refuses new writes that create the wedge
-  (`filigree elspeth-9990c81e14`, schema epoch 14). If you see a wedge
+  (`legacy-tracker elspeth-9990c81e14`, schema epoch 14). If you see a wedge
   row, it predates the constraint or arrived through a path that bypassed
   it — treat it as Tier-1 evidence corruption.
 

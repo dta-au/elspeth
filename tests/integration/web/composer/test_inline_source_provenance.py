@@ -40,6 +40,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import _prepare_blob_create, execute_tool
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
@@ -49,6 +50,8 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.session_fences import fenced_operation_context
 
 # ─────────────────────────────────────────────────────────────────────────
 # Test fixtures
@@ -87,6 +90,8 @@ def _session_with_user_message() -> tuple[Any, str, str]:
         connect_args={"check_same_thread": False},
     )
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     session_id = str(uuid4())
     user_message_id = str(uuid4())
     now = datetime.now(UTC)
@@ -159,18 +164,21 @@ def test_verbatim_blob_records_creation_modality_and_message_id(tmp_path: Path) 
     args = _minimal_inline_blob_args("name,score\nada,42\n")
     catalog = _trained_operator_catalog()
 
-    result = execute_tool(
-        "set_pipeline",
-        args,
-        _empty_state(),
-        catalog,
-        plugin_snapshot=catalog.snapshot,
-        data_dir=str(tmp_path),
-        session_engine=engine,
-        session_id=session_id,
-        user_message_id=user_message_id,
-        user_message_content=_USER_MESSAGE_CONTENT,
-    )
+    with fenced_operation_context(engine, session_id) as context:
+        result = execute_tool(
+            "set_pipeline",
+            args,
+            _empty_state(),
+            catalog,
+            plugin_snapshot=catalog.snapshot,
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            user_message_id=user_message_id,
+            user_message_content=_USER_MESSAGE_CONTENT,
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+        )
     assert result.success is True, result.data
 
     with engine.begin() as conn:
@@ -188,6 +196,42 @@ def test_verbatim_blob_records_creation_modality_and_message_id(tmp_path: Path) 
 # ─────────────────────────────────────────────────────────────────────────
 # Test 2 — LLM-provenance round-trips through _prepare_blob_create
 # ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("description", [None, "Authored input description"])
+def test_create_blob_persists_authored_filename_and_description(tmp_path: Path, description: str | None) -> None:
+    engine, session_id, user_message_id = _session_with_user_message()
+    catalog = _trained_operator_catalog()
+    arguments: dict[str, Any] = {
+        "filename": "authored-input.csv",
+        "mime_type": "text/csv",
+        "content": "name,score\nada,42\n",
+    }
+    if description is not None:
+        arguments["description"] = description
+    with fenced_operation_context(engine, session_id) as context:
+        result = execute_tool(
+            "create_blob",
+            arguments,
+            _empty_state(),
+            catalog,
+            plugin_snapshot=catalog.snapshot,
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            user_message_id=user_message_id,
+            user_message_content=_USER_MESSAGE_CONTENT,
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+        )
+    assert result.success is True, result.data
+    with engine.connect() as conn:
+        row = conn.execute(select(blobs_table).where(blobs_table.c.session_id == session_id)).one()
+    assert row.filename == "authored-input.csv"
+    assert row.source_description == description
+    assert row.mime_type == "text/csv"
+    assert Path(row.storage_path).name == f"{row.id}_authored-input.csv"
+    assert Path(row.storage_path).read_bytes() == b"name,score\nada,42\n"
 
 
 def test_llm_generated_blob_carries_llm_provenance(tmp_path: Path) -> None:
@@ -208,11 +252,9 @@ def test_llm_generated_blob_carries_llm_provenance(tmp_path: Path) -> None:
     engine, session_id, user_message_id = _session_with_user_message()
 
     prepared = _prepare_blob_create(
-        {
-            "filename": "generated.csv",
-            "mime_type": "text/csv",
-            "content": "score\n42\n",
-        },
+        filename="generated.csv",
+        mime_type="text/csv",
+        content="score\n42\n",
         data_dir=str(tmp_path),
         session_id=session_id,
         creation_modality=CreationModality.LLM_GENERATED,
@@ -223,11 +265,14 @@ def test_llm_generated_blob_carries_llm_provenance(tmp_path: Path) -> None:
         creating_composer_skill_hash="cafebabe" + "0" * 56,
         creating_arguments_hash="deadbeef" + "0" * 56,
     )
-    quota_error = _persist_prepared_blob_create(
-        prepared,
-        session_engine=engine,
-        session_id=session_id,
-    )
+    with fenced_operation_context(engine, session_id) as context:
+        quota_error = _persist_prepared_blob_create(
+            prepared,
+            session_engine=engine,
+            session_id=session_id,
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+        )
     assert quota_error is None
 
     with engine.begin() as conn:
@@ -248,11 +293,9 @@ def test_llm_generated_blob_requires_message_anchor(tmp_path: Path) -> None:
 
     with pytest.raises(AuditIntegrityError, match="created_from_message_id"):
         _prepare_blob_create(
-            {
-                "filename": "generated.csv",
-                "mime_type": "text/csv",
-                "content": "score\n42\n",
-            },
+            filename="generated.csv",
+            mime_type="text/csv",
+            content="score\n42\n",
             data_dir=str(tmp_path),
             session_id=session_id,
             creation_modality=CreationModality.LLM_GENERATED,
@@ -287,6 +330,7 @@ def test_cross_session_message_id_rejected(tmp_path: Path) -> None:
     session_b_message_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="bob")
         conn.execute(
             insert(sessions_table).values(
                 id=session_b_id,
@@ -317,21 +361,21 @@ def test_cross_session_message_id_rejected(tmp_path: Path) -> None:
     # Try to persist a blob in session A whose created_from_message_id
     # references session B's message.  The composite FK must reject this.
     prepared = _prepare_blob_create(
-        {
-            "filename": "cross.csv",
-            "mime_type": "text/csv",
-            "content": "x\n",
-        },
+        filename="cross.csv",
+        mime_type="text/csv",
+        content="x\n",
         data_dir=str(tmp_path),
         session_id=session_a_id,
         creation_modality=CreationModality.VERBATIM,
         created_from_message_id=session_b_message_id,
     )
-    with pytest.raises(IntegrityError):
+    with fenced_operation_context(engine, session_a_id) as context, pytest.raises(IntegrityError):
         _persist_prepared_blob_create(
             prepared,
             session_engine=engine,
             session_id=session_a_id,
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
         )
 
 
@@ -381,11 +425,9 @@ def test_non_utf8_content_raises_tool_argument_error(tmp_path: Path) -> None:
 
     with pytest.raises(ToolArgumentError) as exc_info:
         _prepare_blob_create(
-            {
-                "filename": "bad.txt",
-                "mime_type": "text/plain",
-                "content": surrogate_content,
-            },
+            filename="bad.txt",
+            mime_type="text/plain",
+            content=surrogate_content,
             data_dir=str(tmp_path),
             session_id=session_id,
             creation_modality=CreationModality.VERBATIM,

@@ -233,18 +233,87 @@ class TestBatchOutlierAnnotator:
         assert result.reason["operation"] == "float_conversion"
         assert not result.retryable
 
-    def test_non_numeric_values_raise_type_error(self, ctx: PluginContext) -> None:
+    def test_non_numeric_values_fail_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
+        """A present non-numeric value fails the BATCH; it is never skipped or coerced.
+
+        The None and non-finite branches either side keep skip-and-report
+        (elspeth-d5034647f0); a wrong type is neither, and no annotation is
+        published over the surviving rows.
+        """
         from elspeth.plugins.transforms.batch_outlier_annotator import BatchOutlierAnnotator
 
         transform = BatchOutlierAnnotator({"schema": DYNAMIC_SCHEMA, "value_field": "score"})
 
         rows = [
             _make_row({"id": 1, "score": 10.0}),
-            _make_row({"id": 2, "score": "large"}),
+            _make_row({"id": 2, "score": None}),
+            _make_row({"id": 3, "score": "SENTINEL-large-4c1e"}),
+            _make_row({"id": 4, "score": 12.0}),
         ]
 
-        with pytest.raises(TypeError, match="must be numeric"):
-            transform.process(rows, ctx)
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "score"
+        assert result.reason["expected"] == "numeric (int or float)"
+        assert result.reason["actual_type"] == "str"
+        # The BATCH index of the offending row, past the skipped None at 1.
+        assert result.reason["error"] == "must be numeric (int or float), got str in row 2"
+        # The offending VALUE is row content and must not reach the audit trail.
+        assert "SENTINEL-large-4c1e" not in repr(sorted(result.reason.items()))
+
+    def test_runtime_annotation_field_collision_fails_the_whole_batch(self, ctx: PluginContext) -> None:
+        """A buffered row already carrying an annotation field fails the batch.
+
+        Under an observed upstream only the row data decides whether such a
+        field arrives, so the collision is a row fault routed like any failed
+        batch (ruling on elspeth-d90495084c), not a run abort. The reason names
+        the batch row and the colliding field names, never the row's value.
+        """
+        from elspeth.plugins.transforms.batch_outlier_annotator import BatchOutlierAnnotator
+
+        transform = BatchOutlierAnnotator({"schema": DYNAMIC_SCHEMA, "value_field": "score"})
+
+        rows = [
+            _make_row({"id": 1, "score": 10.0}),
+            _make_row({"id": 2, "score": 11.0, "outlier_z_score": "SENTINEL-prior-z-77", "outlier_mean": 0.5}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "field_collision"
+        assert result.reason["collisions"] == ["outlier_mean", "outlier_z_score"]
+        assert result.reason["error"] == "would overwrite existing input fields ['outlier_mean', 'outlier_z_score'] in row 1"
+        reason_text = repr(sorted(result.reason.items()))
+        assert "SENTINEL-prior-z-77" not in reason_text
+        assert "0.5" not in reason_text
+
+    def test_collision_is_reported_before_a_wrong_type_in_the_same_batch(self, ctx: PluginContext) -> None:
+        """Collision is checked across the batch first, so its reason wins."""
+        from elspeth.plugins.transforms.batch_outlier_annotator import BatchOutlierAnnotator
+
+        transform = BatchOutlierAnnotator({"schema": DYNAMIC_SCHEMA, "value_field": "score"})
+
+        rows = [
+            _make_row({"id": 1, "score": "not-a-number"}),
+            _make_row({"id": 2, "score": 11.0, "outlier_value": 3}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "field_collision"
+        assert result.reason["collisions"] == ["outlier_value"]
 
     def test_empty_batch_returns_error(self, ctx: PluginContext) -> None:
         from elspeth.plugins.transforms.batch_outlier_annotator import BatchOutlierAnnotator

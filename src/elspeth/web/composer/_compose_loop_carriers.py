@@ -40,6 +40,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
@@ -47,6 +48,7 @@ from elspeth.contracts.token_usage import TokenUsage
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
 
 _ToolOutcomeResponse = ToolResult | Mapping[str, Any] | None
 
@@ -99,6 +101,7 @@ class _AdmittedLLMProviderMetadata:
     reasoning_content: str | None
     reasoning_details: Any | None
     thinking_blocks: Any | None
+    provider_served: str | None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "reasoning_details", "thinking_blocks")
@@ -155,6 +158,33 @@ _AdvisorCallOutcome = _AdvisorCallSuccess | _AdvisorProviderFailure | _AdvisorFi
 
 
 @dataclass(frozen=True, slots=True)
+class AdvisorArgumentRejection:
+    """Local ``request_advisor_hint`` argument rejection, before any provider call.
+
+    ``error_class`` names the exception class raised (or constructed) by the
+    validator; ``category`` is its closed :class:`ToolArgumentErrorCategory`.
+    ``error`` is the operator-authored message sent back to the planner.
+    """
+
+    error: str
+    error_class: str
+    category: ToolArgumentErrorCategory
+
+    def __post_init__(self) -> None:
+        if type(self.category) is not ToolArgumentErrorCategory:
+            raise TypeError("AdvisorArgumentRejection.category must be a ToolArgumentErrorCategory")
+
+    def to_payload(self) -> dict[str, str]:
+        """The ARG_ERROR tool message and audit payload for this rejection."""
+        return {
+            "status": "ARG_ERROR",
+            "error": self.error,
+            "error_class": self.error_class,
+            "error_category": self.category.value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class _ToolOutcome:
     """Result of one tool call within a compose turn.
 
@@ -171,18 +201,40 @@ class _ToolOutcome:
     * ``None`` for argument-error and plugin-crash paths, where
       ``error_class`` / ``error_message`` carry the outcome.
 
+    ``error_category`` is the closed :class:`ToolArgumentErrorCategory` of an
+    argument error and ``None`` otherwise; an outcome that carries one must
+    also carry the ``error_class`` that was raised.
+
     ``call`` is the ELSPETH-owned tool-call projection admitted before the raw
     provider response is discarded.
+
+    ``strict_sent`` / ``wire_conformant`` are the call's wire facts, with the
+    meanings of the same fields on ``ComposerToolInvocation``. P4 writes them
+    beside ``function`` on the redacted assistant ``tool_calls`` entry.
+    ``run_tool_batch`` always passes both; the defaults serve direct test
+    constructions only.
     """
 
     call: _AdmittedToolCall
     response: _ToolOutcomeResponse
     error_class: str | None
+    error_category: ToolArgumentErrorCategory | None
     error_message: str | None
     pre_version: int
     post_version: int
+    strict_sent: bool | None = None
+    wire_conformant: bool | None = None
 
     def __post_init__(self) -> None:
+        if self.error_category is not None:
+            if type(self.error_category) is not ToolArgumentErrorCategory:
+                raise TypeError("_ToolOutcome.error_category must be a ToolArgumentErrorCategory")
+            if self.error_class is None:
+                raise ValueError("_ToolOutcome with an error_category must carry the error_class that was raised")
+        if self.strict_sent is not None and type(self.strict_sent) is not bool:
+            raise TypeError("_ToolOutcome.strict_sent must be bool or None")
+        if self.wire_conformant is not None and type(self.wire_conformant) is not bool:
+            raise TypeError("_ToolOutcome.wire_conformant must be bool or None")
         freeze_fields(self, "call", "response")
 
 
@@ -248,7 +300,8 @@ class _DispatchOutcome:
     ``plugin_crash`` is set when a tool handler raised an exception
     other than ``ToolArgumentError``. The carrier carries it forward;
     the driver propagates after P4 has had a chance to persist the
-    pre-crash mutations (CLAUDE.md "partial_state" discipline).
+    pre-crash mutations, so state the loop already committed is not
+    silently dropped from the state history.
     """
 
     # State at end of dispatch
@@ -291,8 +344,7 @@ class _DispatchOutcome:
     # accumulator.
     mutation_success_observed: bool
 
-    # pre_state_id captured at the start of the dispatch turn — written to
-    # the ``self._phase3_last_expected_current_state_id`` test-hook by P3.
+    # State identity at the start of this dispatch turn.
     pre_state_id: str | None
 
     def __post_init__(self) -> None:
@@ -332,8 +384,12 @@ class _PersistOutcome:
     persisted_assistant_matches_current_dispatch: bool
     unwind_audit_failed: bool
     failed_turn: FailedTurnMetadata | None
+    redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...]
+    redacted_tool_rows: tuple[RedactedToolRow, ...]
+    audit_outcome: AuditOutcome | None
 
     def __post_init__(self) -> None:
+        freeze_fields(self, "redacted_assistant_tool_calls", "redacted_tool_rows")
         # Biconditional, not a one-way check: the id names a row and the
         # content is what that row holds, so one without the other is a
         # half-threaded state. Setting the id alone is the dangerous

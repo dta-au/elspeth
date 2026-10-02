@@ -1,7 +1,8 @@
 """Pydantic response models for execution endpoints.
 
-All models in this module serialize **system-owned data** (Tier 1 in the
-Data Manifesto).  They use strict validation and forbid extra fields so
+All models in this module serialize **system-owned data** (Tier 1 in
+docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model).
+They use strict validation and forbid extra fields so
 that internal type drift crashes loudly instead of silently coercing
 values or dropping unknown fields.
 """
@@ -11,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, ClassVar, Final, Literal, Self, TypeAliasType, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from elspeth.contracts import OPERATION_TYPE_VALUES, NodeStateStatus, Operation, OperationType, TerminalOutcome
 from elspeth.web.sessions.protocol import (
@@ -43,7 +44,6 @@ ValidationCheckName = Literal[
     "batch_transform_options",
     "interpretation_review",
     "blob_inline_refs",
-    "managed_identity_policy",
     "llm_retry_budget_policy",
     "llm_base_url_policy",
     "llm_tracing_policy",
@@ -76,7 +76,6 @@ CHECK_SEMANTIC_CONTRACTS: Final[ValidationCheckName] = "semantic_contracts"
 CHECK_BATCH_TRANSFORM_OPTIONS: Final[ValidationCheckName] = "batch_transform_options"
 CHECK_INTERPRETATION_REVIEW: Final[ValidationCheckName] = "interpretation_review"
 CHECK_BLOB_INLINE_REFS: Final[ValidationCheckName] = "blob_inline_refs"
-CHECK_MANAGED_IDENTITY_POLICY: Final[ValidationCheckName] = "managed_identity_policy"
 CHECK_LLM_RETRY_BUDGET_POLICY: Final[ValidationCheckName] = "llm_retry_budget_policy"
 CHECK_LLM_BASE_URL_POLICY: Final[ValidationCheckName] = "llm_base_url_policy"
 CHECK_LLM_TRACING_POLICY: Final[ValidationCheckName] = "llm_tracing_policy"
@@ -113,7 +112,6 @@ VALIDATION_BLOCKING_CHECK_NAMES: tuple[ValidationCheckName, ...] = (
     CHECK_BATCH_TRANSFORM_OPTIONS,
     CHECK_INTERPRETATION_REVIEW,
     CHECK_BLOB_INLINE_REFS,
-    CHECK_MANAGED_IDENTITY_POLICY,
     CHECK_LLM_RETRY_BUDGET_POLICY,
     CHECK_LLM_BASE_URL_POLICY,
     CHECK_LLM_TRACING_POLICY,
@@ -190,8 +188,8 @@ class ValidationCheck(_StrictResponse):
     detail: str
     # Structured field: node ids affected by this check (e.g. identity-node
     # advisories). Populated by the producer (validation.py) in the same
-    # commit that adds this field — no compat-shim default per CLAUDE.md
-    # No-Legacy policy.
+    # commit that adds this field — no compat-shim default, per
+    # CONTRIBUTING.md §Code Standards.
     affected_nodes: tuple[str, ...]
     # Machine-readable producer signal for checks whose detail is display prose.
     # Required-but-nullable: every construction site must either record a
@@ -214,8 +212,8 @@ class ValidationError(_StrictResponse):
     suggestion: str | None
     # Structured discriminant for semantic error routing (e.g.
     # "missing_secret_ref", "fabricated_secret"). Populated at every
-    # construction site — no compat-shim default per CLAUDE.md No-Legacy
-    # policy. Sites that have no semantic code pass None explicitly.
+    # construction site — no compat-shim default, per CONTRIBUTING.md §Code
+    # Standards. Sites that have no semantic code pass None explicitly.
     error_code: str | None
 
 
@@ -257,6 +255,11 @@ class ValidationReadinessBlocker(_StrictResponse):
     component_id: str | None
     component_type: str | None
     detail: str
+    suggestion: str | None
+    # elspeth-032ec69c41: the advisor's own words, bounded and labelled, on the
+    # ``advisor_signoff_blocked`` row only. Every other blocker sets None.
+    # REQUIRED (no default) so a builder cannot forget the decision.
+    note: str | None
 
 
 class ValidationReadiness(_StrictResponse):
@@ -309,9 +312,10 @@ class ProgressData(_StrictResponse):
     All six counter fields are REQUIRED with no defaults.  The engine's
     ``ProgressEvent`` (contracts/cli.py) always carries real counter values
     at emission time; defaulting any of them to ``0`` on the wire would
-    fabricate "we don't know" as "definitely zero" — violating the CLAUDE.md
-    fabrication test.  Mid-run, an operator must be able to distinguish
-    "no rows have succeeded yet" from "the field was never populated".
+    fabricate "we don't know" as "definitely zero": absence is evidence, and a
+    fabricated zero is indistinguishable from a measured zero.  Mid-run, an
+    operator must be able to distinguish "no rows have succeeded yet" from
+    "the field was never populated".
 
     The old ``rows_*`` names mixed source rows and materialized token outcomes.
     Progress events are still best-known live counters, not terminal
@@ -461,6 +465,7 @@ class RunAccounting(_StrictResponse):
     sources: dict[str, RunAccountingSource] = Field(default_factory=dict)
     tokens: RunAccountingTokens
     routing: RunAccountingRouting
+    collector_groups_failed: int = Field(default=0, ge=0)
     integrity: RunAccountingIntegrity
 
     @model_validator(mode="after")
@@ -556,6 +561,8 @@ def _check_status_accounting_invariant(status: str, accounting: RunAccounting | 
             raise ValueError("status='completed' requires tokens.succeeded > 0")
         if accounting.tokens.failed != 0:
             raise ValueError("status='completed' requires tokens.failed == 0")
+        if accounting.collector_groups_failed != 0:
+            raise ValueError("status='completed' requires collector_groups_failed == 0")
         return
 
     if status == "completed_with_failures":
@@ -569,8 +576,8 @@ def _check_status_accounting_invariant(status: str, accounting: RunAccounting | 
             raise ValueError(
                 "status='completed_with_failures' requires a clean terminal indicator (tokens.succeeded > 0 or routing.quarantined > 0)"
             )
-        if accounting.tokens.failed <= 0:
-            raise ValueError("status='completed_with_failures' requires tokens.failed > 0")
+        if accounting.tokens.failed <= 0 and accounting.collector_groups_failed <= 0:
+            raise ValueError("status='completed_with_failures' requires tokens.failed > 0 or collector_groups_failed > 0")
         return
 
     if status == "failed":
@@ -584,6 +591,8 @@ def _check_status_accounting_invariant(status: str, accounting: RunAccounting | 
             raise ValueError(f"status='empty' requires accounting.source.rows_processed == 0, got {accounting.source.rows_processed}")
         if accounting.tokens.emitted != 0:
             raise ValueError(f"status='empty' requires accounting.tokens.emitted == 0, got {accounting.tokens.emitted}")
+        if accounting.collector_groups_failed != 0:
+            raise ValueError("status='empty' requires collector_groups_failed == 0")
         return
 
     raise ValueError(f"Unknown status {status!r}")
@@ -648,26 +657,21 @@ class RunEvent(_StrictResponse):
     event_type/data types crashes immediately (offensive programming).
     """
 
-    _event_sequence: int | None = PrivateAttr(default=None)
+    event_sequence: int | None = Field(default=None, ge=1, exclude_if=lambda value: value is None)
 
     run_id: str
     timestamp: datetime = Field(strict=False)
     # NOTE: Fast pipelines may produce identical timestamps.
-    # Event ordering is guaranteed by the asyncio.Queue FIFO, not by timestamp.
+    # Durable sequence defines replay order; timestamps need not be unique.
     # Frontend must NOT sort by timestamp — use arrival order instead.
     event_type: RunEventType
     data: ProgressData | ErrorData | CompletedData | CancelledData | FailedData
 
-    @property
-    def event_sequence(self) -> int | None:
-        """Internal durable replay cursor; never part of websocket JSON/schema."""
-        return self._event_sequence
-
     def with_event_sequence(self, sequence: int) -> Self:
-        if sequence < 1:
+        if type(sequence) is not int or sequence < 1:
             raise ValueError(f"event sequence must be >= 1, got {sequence}")
         clone = self.model_copy()
-        clone._event_sequence = sequence
+        clone.event_sequence = sequence
         return clone
 
     @field_validator("timestamp", mode="before")
@@ -752,8 +756,10 @@ class DiscardSummary(_StrictResponse):
     """Counts routed to the virtual ``discard`` sink.
 
     The backing records live in four audit surfaces:
-    ``validation_errors.destination='discard'``,
-    ``transform_errors.destination='discard'``, terminal
+    ``validation_errors.destination='discard'``, tokens whose terminal
+    outcome is a transform-error failure decided by a
+    ``transform_errors.destination='discard'`` row (one per token, at the
+    deciding node, never a failed attempt a resumed retry superseded), terminal
     ``token_outcomes.path='gate_error_discarded'`` rows attributed to their
     failed gate node states, and terminal
     ``token_outcomes.sink_name='__discard__'`` rows for sink-write
@@ -1116,8 +1122,10 @@ class RunDiagnosticDiscard(_StrictResponse):
     ``tokens``.
 
     ``error`` is already boundary-scrubbed at the recording site
-    (``plugins/sources/_safe_validation_errors.py``, elspeth-a300402c58):
-    loc/msg/type only, input echo dropped — so it is projected verbatim with
+    (``contracts/safe_validation_errors.py``, elspeth-a300402c58): a
+    top-level field the validated schema declares (else a placeholder) and
+    pydantic's type code only — no input echo, no free-text message, no row
+    key — so it is projected verbatim with
     no second scrubber.  ``row_data_json`` is audit material and is never
     projected (module rule, ``web/execution/diagnostics.py``).  The structured
     violation columns (``violation_type`` etc.) are None on the

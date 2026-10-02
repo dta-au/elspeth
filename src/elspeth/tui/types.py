@@ -11,6 +11,8 @@ Error and artifact display types follow the Tier 1 trust model:
 
 from typing import Any, Literal, Required, TypedDict
 
+from elspeth.contracts.audit import CallVerification
+
 
 class NodeInfo(TypedDict):
     """Information about a single pipeline node."""
@@ -194,6 +196,7 @@ class SelectionDetailInfo(TypedDict, total=False):
     detail_kind: Required[Literal["run", "token", "edge", "outcome", "status"]]
     title: Required[str]
     run_id: str
+    verification_decisions: tuple[CallVerification, ...]
     token_id: str
     row_id: str
     sink: str

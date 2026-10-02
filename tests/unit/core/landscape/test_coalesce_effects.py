@@ -24,7 +24,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from tests.fixtures.group_lineage import ensure_fork_group_record
-from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
 
 _RUN_ID = "run-1"
 _COALESCE_NODE_ID = "coalesce-0"
@@ -40,14 +40,16 @@ def _setup():
         node_type=NodeType.COALESCE,
         plugin_name="coalesce",
     )
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    row, _source_token = setup.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         source_node_id=setup.source_node_id,
         row_index=0,
         source_row_index=0,
         ingest_sequence=0,
         data={"source": True},
     )
+    # The admitted source token remains separate from the crafted siblings;
+    # only coalesce writes contribute terminal evidence in this fixture.
     # Crafted siblings sharing one FORK lineage frame (the shape a real
     # fork_token would have produced), via the create_token(..., lineage_path=)
     # seam — coalesce_tokens' durable strict pop requires an innermost shared
@@ -56,6 +58,7 @@ def _setup():
     parents = [
         setup.data_flow.create_token(
             row.row_id,
+            coordination_token=leader_coordination_token(setup.factory, setup.run_id),
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="coalesce-effects-fork-grp", member_key=branch),),
         )
         for branch in ("a", "b")
@@ -69,7 +72,7 @@ def _setup():
         state = setup.execution.begin_node_state(
             token_id=ref.token_id,
             node_id=_COALESCE_NODE_ID,
-            run_id=setup.run_id,
+            member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
             step_index=4,
             input_data={"ordinal": ordinal},
         )
@@ -86,6 +89,7 @@ def _setup():
 
 def _materialize(setup, row, refs, completions=None):
     return setup.data_flow.coalesce_tokens(
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         parent_refs=list(refs),
         row_id=row.row_id,
         coalesce_node_id=_COALESCE_NODE_ID,
@@ -103,6 +107,7 @@ def _setup_sibling_group(setup, row, *, group_id: str, branches: tuple[str, str]
     parents = [
         setup.data_flow.create_token(
             row.row_id,
+            coordination_token=leader_coordination_token(setup.factory, setup.run_id),
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=group_id, member_key=branch),),
         )
         for branch in branches
@@ -114,7 +119,7 @@ def _setup_sibling_group(setup, row, *, group_id: str, branches: tuple[str, str]
         state = setup.execution.begin_node_state(
             token_id=ref.token_id,
             node_id=_COALESCE_NODE_ID,
-            run_id=setup.run_id,
+            member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
             step_index=4,
             input_data={"ordinal": ordinal},
         )
@@ -161,8 +166,12 @@ def test_finalization_atomically_completes_states_outcomes_and_effect() -> None:
     setup, row, refs, completions = _setup()
     merged = _materialize(setup, row, refs, completions)
 
-    setup.data_flow.finalize_coalesce_effect(merged=merged, parent_completions=completions)
-    setup.data_flow.finalize_coalesce_effect(merged=merged, parent_completions=completions)
+    setup.data_flow.finalize_coalesce_effect(
+        merged=merged, parent_completions=completions, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+    )
+    setup.data_flow.finalize_coalesce_effect(
+        merged=merged, parent_completions=completions, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+    )
 
     with setup.db.connection() as conn:
         effect = conn.execute(select(coalesce_effects_table)).mappings().one()
@@ -192,21 +201,18 @@ def test_finalization_atomically_completes_states_outcomes_and_effect() -> None:
 def test_failed_finalization_rolls_back_all_terminal_evidence_and_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     setup, row, refs, completions = _setup()
     merged = _materialize(setup, row, refs, completions)
-    original = setup.data_flow.outcomes.record_token_outcome
-    calls = 0
+    original = setup.data_flow.outcomes.record_parent_outcomes_on
 
-    def fail_after_first_outcome(*args, **kwargs):
-        nonlocal calls
-        outcome_id = original(*args, **kwargs)
-        calls += 1
-        if calls == 1:
-            raise RuntimeError("injected coalesce finalization failure")
-        return outcome_id
+    def fail_after_first_outcome(conn, *, run_id, dispositions):
+        original(conn, run_id=run_id, dispositions=dispositions[:1])
+        raise RuntimeError("injected coalesce finalization failure")
 
-    monkeypatch.setattr(setup.data_flow.outcomes, "record_token_outcome", fail_after_first_outcome)
+    monkeypatch.setattr(setup.data_flow.outcomes, "record_parent_outcomes_on", fail_after_first_outcome)
 
     with pytest.raises(AuditIntegrityError, match="finalization failure"):
-        setup.data_flow.finalize_coalesce_effect(merged=merged, parent_completions=completions)
+        setup.data_flow.finalize_coalesce_effect(
+            merged=merged, parent_completions=completions, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+        )
 
     with setup.db.connection() as conn:
         effect_status = conn.execute(select(coalesce_effects_table.c.status)).scalar_one()
@@ -222,8 +228,10 @@ def test_failed_finalization_rolls_back_all_terminal_evidence_and_retries(monkey
     assert set(state_statuses) == {NodeStateStatus.OPEN.value}
     assert outcome_count == 0
 
-    monkeypatch.setattr(setup.data_flow.outcomes, "record_token_outcome", original)
-    setup.data_flow.finalize_coalesce_effect(merged=merged, parent_completions=completions)
+    monkeypatch.setattr(setup.data_flow.outcomes, "record_parent_outcomes_on", original)
+    setup.data_flow.finalize_coalesce_effect(
+        merged=merged, parent_completions=completions, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+    )
 
     with setup.db.connection() as conn:
         assert conn.execute(select(coalesce_effects_table.c.status)).scalar_one() == "completed"
@@ -243,7 +251,9 @@ def test_same_parent_set_with_different_order_or_state_mapping_fails_closed() ->
     )
     merged = _materialize(setup, row, refs, completions)
     with pytest.raises(AuditIntegrityError, match="parent/state membership"):
-        setup.data_flow.finalize_coalesce_effect(merged=merged, parent_completions=forged)
+        setup.data_flow.finalize_coalesce_effect(
+            merged=merged, parent_completions=forged, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+        )
 
 
 def test_effect_result_and_member_evidence_are_mechanically_constrained() -> None:
@@ -307,8 +317,8 @@ def test_sibling_fork_groups_sharing_row_id_commit_independent_residuals() -> No
         node_type=NodeType.COALESCE,
         plugin_name="coalesce",
     )
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    row, _source_token = setup.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         source_node_id=setup.source_node_id,
         row_index=0,
         source_row_index=0,
@@ -319,6 +329,7 @@ def test_sibling_fork_groups_sharing_row_id_commit_independent_residuals() -> No
     b_refs, b_completions = _setup_sibling_group(setup, row, group_id="g-b", branches=("b-left", "b-right"))
 
     merged_a = setup.data_flow.coalesce_tokens(
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         parent_refs=list(a_refs),
         row_id=row.row_id,
         coalesce_node_id=_COALESCE_NODE_ID,
@@ -328,6 +339,7 @@ def test_sibling_fork_groups_sharing_row_id_commit_independent_residuals() -> No
         step_in_pipeline=4,
     )
     merged_b = setup.data_flow.coalesce_tokens(
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         parent_refs=list(b_refs),
         row_id=row.row_id,
         coalesce_node_id=_COALESCE_NODE_ID,
@@ -336,8 +348,12 @@ def test_sibling_fork_groups_sharing_row_id_commit_independent_residuals() -> No
         merged_contract=_CONTRACT,
         step_in_pipeline=4,
     )
-    setup.data_flow.finalize_coalesce_effect(merged=merged_a, parent_completions=a_completions)
-    setup.data_flow.finalize_coalesce_effect(merged=merged_b, parent_completions=b_completions)
+    setup.data_flow.finalize_coalesce_effect(
+        merged=merged_a, parent_completions=a_completions, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+    )
+    setup.data_flow.finalize_coalesce_effect(
+        merged=merged_b, parent_completions=b_completions, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+    )
 
     with setup.db.connection() as conn:
         effects_by_group = {str(effect["group_id"]): effect for effect in conn.execute(select(coalesce_effects_table)).mappings().all()}
@@ -395,8 +411,8 @@ def test_nested_fork_effect_records_the_closing_group_not_the_enclosing_one() ->
         node_type=NodeType.COALESCE,
         plugin_name="coalesce",
     )
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    row, _source_token = setup.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         source_node_id=setup.source_node_id,
         row_index=0,
         source_row_index=0,
@@ -407,6 +423,7 @@ def test_nested_fork_effect_records_the_closing_group_not_the_enclosing_one() ->
     parents = [
         setup.data_flow.create_token(
             row.row_id,
+            coordination_token=leader_coordination_token(setup.factory, setup.run_id),
             lineage_path=(enclosing, LineageFrame(kind=FrameKind.FORK, group_id="g-inner", member_key=branch)),
         )
         for branch in ("inner-a", "inner-b")
@@ -418,13 +435,14 @@ def test_nested_fork_effect_records_the_closing_group_not_the_enclosing_one() ->
         state = setup.execution.begin_node_state(
             token_id=ref.token_id,
             node_id=_COALESCE_NODE_ID,
-            run_id=setup.run_id,
+            member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
             step_index=4,
             input_data={"ordinal": ordinal},
         )
         completions.append(CoalesceParentCompletion(parent_ref=ref, state_id=state.state_id, duration_ms=1.0, context_after=None))
 
     merged = setup.data_flow.coalesce_tokens(
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         parent_refs=list(refs),
         row_id=row.row_id,
         coalesce_node_id=_COALESCE_NODE_ID,
@@ -433,7 +451,9 @@ def test_nested_fork_effect_records_the_closing_group_not_the_enclosing_one() ->
         merged_contract=_CONTRACT,
         step_in_pipeline=4,
     )
-    setup.data_flow.finalize_coalesce_effect(merged=merged, parent_completions=tuple(completions))
+    setup.data_flow.finalize_coalesce_effect(
+        merged=merged, parent_completions=tuple(completions), coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+    )
 
     # The closer popped exactly its own frame: the merged token now sits
     # directly inside the enclosing fork group.

@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from elspeth.contracts.errors import RunMembershipLostError
 from elspeth.contracts.preflight import CommencementGateResult, DependencyRunResult, PreflightResult
 from elspeth.core.dependency_config import CommencementGateConfig
 from elspeth.core.landscape import LandscapeDB
@@ -176,6 +177,27 @@ class TestRecordPreflightResults:
 
 
 class TestRecordReadinessCheck:
+    def test_follower_readiness_is_attributed_and_departed_members_are_refused(self, factory) -> None:
+        fac, run_id, db = factory
+        run = fac.run_lifecycle.get_run(run_id)
+        assert run is not None
+        member = fac.run_coordination.admit_follower(
+            run_id=run_id, worker_id="readiness-follower", config_hash=run.config_hash, window_seconds=60
+        )
+        fac.run_lifecycle.record_readiness_check(
+            name="follower-probe", collection="docs", reachable=True, count=2, message="ready", member_token=member
+        )
+        fac.run_coordination.depart_worker(member_token=member)
+        with pytest.raises(RunMembershipLostError):
+            fac.run_lifecycle.record_readiness_check(
+                name="departed-probe", collection="docs", reachable=True, count=2, message="ready", member_token=member
+            )
+        with db.connection() as conn:
+            rows = conn.execute(preflight_results_table.select().where(preflight_results_table.c.run_id == run_id)).fetchall()
+        assert len(rows) == 1
+        assert rows[0].name == "follower-probe"
+        assert json.loads(rows[0].result_json)["worker_id"] == "readiness-follower"
+
     def test_readiness_check_recorded_and_readable(self, factory) -> None:
         """Readiness check result persists in the preflight_results table."""
         fac, run_id, db = factory
@@ -186,7 +208,7 @@ class TestRecordReadinessCheck:
             reachable=True,
             count=42,
             message="Collection 'test-index' has 42 documents",
-            coordination_token=leader_coordination_token(fac, run_id),
+            member_token=leader_coordination_token(fac, run_id).membership,
         )
 
         with db.connection() as conn:
@@ -201,6 +223,7 @@ class TestRecordReadinessCheck:
         assert data["reachable"] is True
         assert data["count"] == 42
         assert "42 documents" in data["message"]
+        assert data["worker_id"] == leader_coordination_token(fac, run_id).worker_id
 
     def test_readiness_json_is_canonical(self, factory) -> None:
         """result_json must use canonical JSON for deterministic hashing."""
@@ -212,7 +235,7 @@ class TestRecordReadinessCheck:
             reachable=True,
             count=1,
             message="m",
-            coordination_token=leader_coordination_token(fac, run_id),
+            member_token=leader_coordination_token(fac, run_id).membership,
         )
 
         with db.connection() as conn:
@@ -220,7 +243,8 @@ class TestRecordReadinessCheck:
 
         result_json = rows[0].result_json
         # Canonical JSON (RFC 8785) sorts keys
-        assert result_json == '{"collection":"c","count":1,"message":"m","reachable":true}'
+        worker_id = leader_coordination_token(fac, run_id).worker_id
+        assert result_json == f'{{"collection":"c","count":1,"message":"m","reachable":true,"worker_id":"{worker_id}"}}'
 
 
 class TestPreflightResult:

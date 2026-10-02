@@ -13,7 +13,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -178,6 +178,16 @@
         "kind": "number-int",
         "label": "Maximum page bytes",
         "name": "max_page_bytes",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": 104857600,
+        "description": "Refuse the whole document and immediately delete partial output when cumulative encoded PNG bytes exceed this limit. May be reduced but never raised above 500 MiB.",
+        "kind": "number-int",
+        "label": "Maximum total rendered bytes",
+        "name": "max_total_bytes",
         "nullable": false,
         "required": false,
         "tier": "common"

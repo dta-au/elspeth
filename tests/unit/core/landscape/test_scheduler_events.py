@@ -8,14 +8,14 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
-from sqlalchemy import insert, select, update
+from sqlalchemy import event, insert, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 
 import elspeth.core.landscape.database as database_module
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
-from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
-from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError, SchedulerLeaseLostError
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError, RunMembershipLostError, SchedulerLeaseLostError
 from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
@@ -34,10 +34,12 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_error_hash, fake_sha256
 from tests.fixtures.landscape import (
     assert_stamped_between,
     expire_lease,
     landscape_database_now,
+    leader_coordination_token,
     make_recorder_with_run,
     on_fresh_database_second,
     register_test_node,
@@ -49,7 +51,7 @@ if TYPE_CHECKING:
 # Epoch-1 coordination seat token for the "run-1" test run.
 # The ratcheted verbs (mark_pending_sink_terminal*, terminalize_pending_sinks*)
 # require a non-None token; _insert_scheduler_prerequisites seeds the matching row.
-_COORD_TOKEN = CoordinationToken(run_id="run-1", worker_id="test-leader", leader_epoch=1)
+_COORD_TOKEN = CoordinationToken(run_id="run-1", worker_id="worker-b", leader_epoch=1)
 
 # Replay order of scheduler events: the epoch-38 AUTOINCREMENT ``seq`` the
 # production readers order by. recorded_at is whole-second database time
@@ -140,7 +142,7 @@ def test_enqueue_ready_records_single_idempotent_scheduler_event() -> None:
     payload = _insert_scheduler_prerequisites(engine, now=now)
 
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -149,7 +151,7 @@ def test_enqueue_ready_records_single_idempotent_scheduler_event() -> None:
         row_payload_json=payload,
     )
     duplicate = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -187,7 +189,7 @@ def test_enqueue_ready_mismatch_diagnostics_redact_row_payload_values() -> None:
     )
 
     repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -198,7 +200,7 @@ def test_enqueue_ready_mismatch_diagnostics_redact_row_payload_values() -> None:
 
     with pytest.raises(LandscapeRecordError) as exc_info:
         repo.enqueue_ready(
-            run_id="run-1",
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
             token_id="token-1",
             row_id="row-1",
             node_id="normalize",
@@ -225,8 +227,8 @@ def test_enqueue_ready_claimed_records_enqueue_and_claim_events_in_one_operation
     payload = _insert_scheduler_prerequisites(engine, now=now)
 
     before_claim = landscape_database_now(engine)
-    claimed = repo.enqueue_ready_claimed_legacy_unfenced(
-        run_id="run-1",
+    claimed = repo.enqueue_ready_claimed(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -277,7 +279,7 @@ def test_claim_and_terminal_events_record_status_and_lease_ownership() -> None:
     payload = _insert_scheduler_prerequisites(engine, now=now)
 
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -286,11 +288,17 @@ def test_claim_and_terminal_events_record_status_and_lease_ownership() -> None:
         row_payload_json=payload,
     )
     before_claim = landscape_database_now(engine)
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30
+    )
     after_claim = landscape_database_now(engine)
     assert claimed is not None
     assert_stamped_between(claimed.lease_expires_at, start=before_claim, end=after_claim, offset=timedelta(seconds=30))
-    repo.mark_terminal(work_item_id=item.work_item_id, expected_lease_owner="worker-a")
+    repo.mark_terminal(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
+        work_item_id=item.work_item_id,
+        expected_lease_owner="worker-a",
+    )
 
     events = _scheduler_events(engine)
     assert [event.event_type for event in events] == [
@@ -330,7 +338,7 @@ def test_recover_expired_leases_records_attempt_bump_and_previous_work_item() ->
     payload = _insert_scheduler_prerequisites(engine, now=now)
 
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -338,13 +346,15 @@ def test_recover_expired_leases_records_attempt_bump_and_previous_work_item() ->
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30
+    )
     assert claimed is not None
     expired_at = expire_lease(engine, item.work_item_id)
 
-    recovered = repo.recover_expired_leases_legacy_unfenced(
-        run_id="run-1",
-        caller_owner="worker-b",
+    recovered = repo.recover_expired_leases(
+        stall_budget_seconds=0,
+        coordination_token=_COORD_TOKEN,
     )
 
     events = _scheduler_events(engine)
@@ -375,7 +385,7 @@ def test_heartbeat_lease_lost_records_event_when_current_row_is_peer_owned() -> 
     payload = _insert_scheduler_prerequisites(engine, now=now)
 
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -383,7 +393,9 @@ def test_heartbeat_lease_lost_records_event_when_current_row_is_peer_owned() -> 
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30
+    )
     assert claimed is not None
 
     with engine.begin() as conn:
@@ -399,11 +411,10 @@ def test_heartbeat_lease_lost_records_event_when_current_row_is_peer_owned() -> 
 
     with pytest.raises(SchedulerLeaseLostError):
         repo.heartbeat_lease(
-            run_id="run-1",
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
             work_item_id=item.work_item_id,
             lease_owner="worker-a",
             lease_seconds=30,
-            membership_fenced=False,
         )
 
     event = _scheduler_events(engine)[-1]
@@ -429,7 +440,7 @@ def test_heartbeat_lease_lost_records_event_when_expired_lease_was_recovered() -
     payload = _insert_scheduler_prerequisites(engine, now=now)
 
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -437,22 +448,23 @@ def test_heartbeat_lease_lost_records_event_when_expired_lease_was_recovered() -
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30
+    )
     assert claimed is not None
     expired_at = expire_lease(engine, item.work_item_id)
-    recovered = repo.recover_expired_leases_legacy_unfenced(
-        run_id="run-1",
-        caller_owner="worker-b",
+    recovered = repo.recover_expired_leases(
+        stall_budget_seconds=0,
+        coordination_token=_COORD_TOKEN,
     )
     assert recovered == 1
 
     with pytest.raises(SchedulerLeaseLostError):
         repo.heartbeat_lease(
-            run_id="run-1",
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
             work_item_id=item.work_item_id,
             lease_owner="worker-a",
             lease_seconds=30,
-            membership_fenced=False,
         )
 
     events = _scheduler_events(engine)
@@ -482,8 +494,8 @@ def test_heartbeat_after_two_same_second_recoveries_attributes_each_loss_to_its_
 
     ``heartbeat_lease`` is the one production caller of
     ``recovery_event_for_previous_work_item``, which walks recovery events
-    newest-first by ``seq``. Two recoveries of one token inside one database
-    second tie on ``recorded_at``; each lapsed owner's heartbeat must still be
+    newest-first by ``seq``. Two recoveries of one token with deliberately
+    tied forensic ``recorded_at`` values must each leave the lapsed heartbeat
     attributed to the recovery that rotated ITS work item, and the newest
     recovery must be the first the reader yields.
     """
@@ -493,9 +505,10 @@ def test_heartbeat_after_two_same_second_recoveries_attributes_each_loss_to_its_
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
     now = landscape_database_now(engine)
-    payload = _insert_scheduler_prerequisites(engine, now=now)
+    payload = _insert_scheduler_prerequisites(engine, now=now, leader_worker_id="reaper")
+    leader = CoordinationToken(run_id="run-1", worker_id="reaper", leader_epoch=1)
     first = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -505,16 +518,45 @@ def test_heartbeat_after_two_same_second_recoveries_attributes_each_loss_to_its_
     )
 
     def two_recoveries_inside_one_second(_database_now: datetime) -> tuple[str, str]:
-        assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
+        assert (
+            repo.claim_ready(
+                member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30
+            )
+            is not None
+        )
         expire_lease(engine, first.work_item_id)
-        assert repo.recover_expired_leases_legacy_unfenced(run_id="run-1", caller_owner="reaper") == 1
-        second_claim = repo.claim_ready(run_id="run-1", lease_owner="worker-b", lease_seconds=30)
+        assert (
+            repo.recover_expired_leases(
+                stall_budget_seconds=0,
+                coordination_token=leader,
+            )
+            == 1
+        )
+        second_claim = repo.claim_ready(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-b"), lease_owner="worker-b", lease_seconds=30
+        )
         assert second_claim is not None and second_claim.work_item_id != first.work_item_id
         expire_lease(engine, second_claim.work_item_id)
-        assert repo.recover_expired_leases_legacy_unfenced(run_id="run-1", caller_owner="reaper") == 1
+        assert (
+            repo.recover_expired_leases(
+                stall_budget_seconds=0,
+                coordination_token=leader,
+            )
+            == 1
+        )
         return first.work_item_id, second_claim.work_item_id
 
     first_item_id, second_item_id = on_fresh_database_second(engine, two_recoveries_inside_one_second)
+    # Fresh decisions now carry milliseconds. Model a forensic timestamp tie
+    # explicitly without freezing lease eligibility, issuance or deadlines.
+    # recorded_at is excluded from the event's content identity.
+    with engine.begin() as conn:
+        conn.execute(
+            update(scheduler_events_table)
+            .where(scheduler_events_table.c.run_id == "run-1")
+            .where(scheduler_events_table.c.event_type == SchedulerEventType.RECOVER_EXPIRED_LEASE.value)
+            .values(recorded_at=now)
+        )
     recoveries = [event for event in _scheduler_events(engine) if event.event_type == SchedulerEventType.RECOVER_EXPIRED_LEASE.value]
     assert len(recoveries) == 2
     assert recoveries[0].recorded_at == recoveries[1].recorded_at
@@ -537,7 +579,12 @@ def test_heartbeat_after_two_same_second_recoveries_attributes_each_loss_to_its_
 
     for owner, item_id, recovery in (("worker-a", first_item_id, first_recovery), ("worker-b", second_item_id, second_recovery)):
         with pytest.raises(SchedulerLeaseLostError):
-            repo.heartbeat_lease(run_id="run-1", work_item_id=item_id, lease_owner=owner, lease_seconds=30, membership_fenced=False)
+            repo.heartbeat_lease(
+                member_token=WorkerMembershipToken(run_id="run-1", worker_id=owner),
+                work_item_id=item_id,
+                lease_owner=owner,
+                lease_seconds=30,
+            )
         lease_lost = _scheduler_events(engine)[-1]
         assert lease_lost.event_type == SchedulerEventType.LEASE_LOST.value
         assert lease_lost.work_item_id == item_id
@@ -558,7 +605,7 @@ def test_mark_blocked_and_mark_failed_record_transition_events() -> None:
     now = landscape_database_now(engine)
     payload = _insert_scheduler_prerequisites(engine, now=now)
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -566,10 +613,15 @@ def test_mark_blocked_and_mark_failed_record_transition_events() -> None:
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30)
+        is not None
+    )
 
     blocked = repo.mark_blocked(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key="queue-a",
         barrier_key=None,
         expected_lease_owner="worker-a",
@@ -589,7 +641,7 @@ def test_mark_blocked_and_mark_failed_record_transition_events() -> None:
     repo = TokenSchedulerRepository(engine)
     payload = _insert_scheduler_prerequisites(engine, now=now)
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -597,8 +649,15 @@ def test_mark_blocked_and_mark_failed_record_transition_events() -> None:
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
-    failed = repo.mark_failed(work_item_id=item.work_item_id, expected_lease_owner="worker-a")
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30)
+        is not None
+    )
+    failed = repo.mark_failed(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
+        work_item_id=item.work_item_id,
+        expected_lease_owner="worker-a",
+    )
 
     events = _scheduler_events(engine)
     assert failed.status is TokenWorkStatus.FAILED
@@ -620,7 +679,7 @@ def test_pending_sink_claim_and_terminalization_record_transition_events() -> No
     now = landscape_database_now(engine)
     payload = _insert_scheduler_prerequisites(engine, now=now)
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -628,8 +687,12 @@ def test_pending_sink_claim_and_terminalization_record_transition_events() -> No
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30)
+        is not None
+    )
     repo.mark_pending_sink(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         work_item_id=item.work_item_id,
         row_payload_json=payload,
         sink_name="sink-a",
@@ -639,10 +702,9 @@ def test_pending_sink_claim_and_terminalization_record_transition_events() -> No
         error_message=None,
         expected_lease_owner="worker-a",
     )
-    assert repo.claim_pending_sink(run_id="run-1", lease_owner="worker-b", lease_seconds=30) is not None
+    assert repo.claim_pending_sink(coordination_token=_COORD_TOKEN, lease_owner="worker-b", lease_seconds=30) is not None
     _insert_terminal_outcome(engine, token_id="token-1", now=now + timedelta(seconds=4))
     terminalized = repo.mark_pending_sink_terminal(
-        run_id="run-1",
         token_id="token-1",
         expected_lease_owner="worker-b",
         coordination_token=_COORD_TOKEN,
@@ -679,7 +741,7 @@ def test_normal_dispositions_refuse_reclaimed_sink_redrive_without_mutation(verb
     payload = _insert_scheduler_prerequisites(engine, now=now)
     item = _make_pending_sink(repo, run_id="run-1", token_id="token-1", row_id="row-1", payload=payload)
     reclaimed = repo.claim_pending_sink(
-        run_id="run-1",
+        coordination_token=_COORD_TOKEN,
         lease_owner="worker-b",
         lease_seconds=30,
     )
@@ -762,13 +824,22 @@ def test_transform_disposition_truth_table_commits_exact_row_event_and_branch_lo
     assert work_item["lease_expires_at"] is None
 
     if expected_status is TokenWorkStatus.BLOCKED:
-        assert work_item["row_payload_json"] == payload
+        # The hold records the token as held, as a PENDING_SINK park does: a
+        # claim may have run transforms since the READY enqueue.
+        assert work_item["row_payload_json"] == replacement_payload
         assert work_item["queue_key"] == "queue-a"
         assert work_item["barrier_key"] is None
         assert work_item["barrier_blocked_at"] == work_item["updated_at"]
         assert work_item["lease_owner"] is None
-    elif expected_status in (TokenWorkStatus.TERMINAL, TokenWorkStatus.FAILED):
+    elif expected_status is TokenWorkStatus.TERMINAL:
         assert work_item["row_payload_json"] == scrubbed_row_payload_json(item.work_item_id)
+        assert work_item["lease_owner"] is None
+        assert work_item["pending_sink_name"] is None
+    elif expected_status is TokenWorkStatus.FAILED:
+        # No outcome is recorded for this token, so the row is undecided: the
+        # FAILED image keeps the claim-start payload resume re-drives from.
+        # A decided token's FAILED item is purged (test_resume_requeue_failed_work).
+        assert work_item["row_payload_json"] == payload
         assert work_item["lease_owner"] is None
         assert work_item["pending_sink_name"] is None
     else:
@@ -776,7 +847,7 @@ def test_transform_disposition_truth_table_commits_exact_row_event_and_branch_lo
         assert work_item["pending_sink_name"] == "replacement-sink"
         assert work_item["pending_outcome"] == TerminalOutcome.FAILURE.value
         assert work_item["pending_path"] == TerminalPath.ON_ERROR_ROUTED.value
-        assert work_item["pending_error_hash"] == "replacement-error-hash"
+        assert work_item["pending_error_hash"] == fake_error_hash("replacement-error-hash")
         assert work_item["pending_error_message"] == "replacement error"
         assert work_item["lease_owner"] == "worker-b"
 
@@ -857,10 +928,9 @@ def test_transform_disposition_truth_table_refuses_departed_member_without_mutat
     item = _make_transform_lease(repo, payload=payload)
     with engine.begin() as conn:
         conn.execute(
-            insert(run_workers_table).values(
-                worker_id="worker-b",
-                run_id="run-1",
-                role="follower",
+            update(run_workers_table)
+            .where(run_workers_table.c.worker_id == "worker-b")
+            .values(
                 status="departed",
                 registered_at=now,
                 heartbeat_expires_at=now + timedelta(hours=1),
@@ -870,7 +940,7 @@ def test_transform_disposition_truth_table_refuses_departed_member_without_mutat
     before = _disposition_state_snapshot(engine, work_item_id=item.work_item_id)
     group_loss = _branch_loss_for(verb) if supports_branch_loss else None
 
-    with pytest.raises(RunWorkerEvictedError, match="worker-b"):
+    with pytest.raises(RunMembershipLostError, match="worker-b"):
         _invoke_normal_disposition(
             repo,
             verb=verb,
@@ -940,7 +1010,7 @@ def test_branch_loss_failure_rolls_back_disposition_row_and_event(monkeypatch: p
         del args, kwargs
         raise LandscapeRecordError(f"forced {verb} branch-loss failure")
 
-    monkeypatch.setattr(dispositions_module, "record_group_loss", fail_branch_loss)
+    monkeypatch.setattr(dispositions_module, "record_group_losses", fail_branch_loss)
 
     with pytest.raises(LandscapeRecordError, match=f"forced {verb} branch-loss failure"):
         _invoke_normal_disposition(
@@ -967,7 +1037,9 @@ def test_mark_blocked_refuses_missing_release_key_without_mutation() -> None:
 
     with pytest.raises(AuditIntegrityError, match="without a queue_key or barrier_key"):
         repo.mark_blocked(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-b"),
             work_item_id=item.work_item_id,
+            row_payload_json=item.row_payload_json,
             queue_key=None,
             barrier_key=None,
             expected_lease_owner="worker-b",
@@ -995,7 +1067,7 @@ def test_mark_blocked_refuses_missing_release_key_without_mutation() -> None:
             {
                 "outcome": "success",
                 "path": "default_flow",
-                "error_hash": "unexpected-error-hash",
+                "error_hash": fake_error_hash("unexpected-error-hash"),
                 "error_message": None,
             },
             "error evidence",
@@ -1020,7 +1092,7 @@ def test_mark_pending_sink_rejects_incomplete_bundle_without_mutation(bundle_ove
     now = landscape_database_now(engine)
     payload = _insert_scheduler_prerequisites(engine, now=now)
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1028,7 +1100,10 @@ def test_mark_pending_sink_rejects_incomplete_bundle_without_mutation(bundle_ove
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-b", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-b"), lease_owner="worker-b", lease_seconds=30)
+        is not None
+    )
     before = _disposition_state_snapshot(engine, work_item_id=item.work_item_id)
     bundle: dict[str, object] = {
         "row_payload_json": payload,
@@ -1042,6 +1117,7 @@ def test_mark_pending_sink_rejects_incomplete_bundle_without_mutation(bundle_ove
 
     with pytest.raises(AuditIntegrityError, match=expected_reason):
         repo.mark_pending_sink(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-b"),
             work_item_id=item.work_item_id,
             expected_lease_owner="worker-b",
             **bundle,
@@ -1062,7 +1138,7 @@ def test_dedicated_sink_redrive_terminalizers_still_accept_reclaimed_sink_leases
     payload = _insert_scheduler_prerequisites(engine, now=now)
     item = _make_pending_sink(repo, run_id="run-1", token_id="token-1", row_id="row-1", payload=payload)
     reclaimed = repo.claim_pending_sink(
-        run_id="run-1",
+        coordination_token=_COORD_TOKEN,
         lease_owner="worker-b",
         lease_seconds=30,
     )
@@ -1073,14 +1149,12 @@ def test_dedicated_sink_redrive_terminalizers_still_accept_reclaimed_sink_leases
 
     if verb == "mark_pending_sink_terminal":
         terminalized = repo.mark_pending_sink_terminal(
-            run_id="run-1",
             token_id="token-1",
             expected_lease_owner="worker-b",
             coordination_token=_COORD_TOKEN,
         )
     else:
         terminalized = repo.mark_pending_sink_terminal_many(
-            run_id="run-1",
             token_ids=("token-1",),
             expected_lease_owner="worker-b",
             coordination_token=_COORD_TOKEN,
@@ -1104,7 +1178,7 @@ def test_normal_disposition_rolls_back_when_scheduler_event_insert_fails(monkeyp
     now = landscape_database_now(engine)
     payload = _insert_scheduler_prerequisites(engine, now=now)
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1112,7 +1186,10 @@ def test_normal_disposition_rolls_back_when_scheduler_event_insert_fails(monkeyp
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30)
+        is not None
+    )
     before = _disposition_state_snapshot(engine, work_item_id=item.work_item_id)
     original_record_scheduler_event = repo.events.record
 
@@ -1125,6 +1202,7 @@ def test_normal_disposition_rolls_back_when_scheduler_event_insert_fails(monkeyp
 
     with pytest.raises(LandscapeRecordError, match="forced disposition event failure"):
         repo.mark_failed(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
             work_item_id=item.work_item_id,
             expected_lease_owner="worker-a",
             group_losses=(
@@ -1158,7 +1236,6 @@ def test_ts11_pending_sink_terminal_rolls_back_when_scheduler_event_insert_fails
 
     with pytest.raises(LandscapeRecordError, match="forced scheduler event failure"):
         repo.mark_pending_sink_terminal(
-            run_id="run-1",
             token_id="token-1",
             expected_lease_owner="worker-a",
             coordination_token=_COORD_TOKEN,
@@ -1179,7 +1256,7 @@ def test_ts12_reclaimed_sink_lease_terminal_rolls_back_when_scheduler_event_inse
     payload = _insert_scheduler_prerequisites(engine, now=now)
     _make_pending_sink(repo, run_id="run-1", token_id="token-1", row_id="row-1", payload=payload)
     reclaimed = repo.claim_pending_sink(
-        run_id="run-1",
+        coordination_token=_COORD_TOKEN,
         lease_owner="worker-b",
         lease_seconds=30,
     )
@@ -1191,7 +1268,6 @@ def test_ts12_reclaimed_sink_lease_terminal_rolls_back_when_scheduler_event_inse
 
     with pytest.raises(LandscapeRecordError, match="forced scheduler event failure"):
         repo.mark_pending_sink_terminal(
-            run_id="run-1",
             token_id="token-1",
             expected_lease_owner="worker-b",
             coordination_token=_COORD_TOKEN,
@@ -1209,7 +1285,8 @@ def test_ts13_mixed_pending_and_reclaimed_batch_rolls_back_on_second_event_inser
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
     now = landscape_database_now(engine)
-    payload = _insert_scheduler_prerequisites(engine, now=now)
+    payload = _insert_scheduler_prerequisites(engine, now=now, leader_worker_id="worker-a")
+    leader = CoordinationToken(run_id="run-1", worker_id="worker-a", leader_epoch=1)
     _insert_second_scheduler_token(engine, now=now)
     _make_pending_sink(repo, run_id="run-1", token_id="token-1", row_id="row-1", payload=payload)
     _make_pending_sink(
@@ -1221,7 +1298,7 @@ def test_ts13_mixed_pending_and_reclaimed_batch_rolls_back_on_second_event_inser
         ingest_sequence=1,
     )
     reclaimed = repo.claim_pending_sink(
-        run_id="run-1",
+        coordination_token=leader,
         lease_owner="worker-a",
         lease_seconds=30,
     )
@@ -1240,10 +1317,9 @@ def test_ts13_mixed_pending_and_reclaimed_batch_rolls_back_on_second_event_inser
 
     with pytest.raises(LandscapeRecordError, match="forced scheduler event failure"):
         repo.mark_pending_sink_terminal_many(
-            run_id="run-1",
             token_ids=("token-1", "token-2"),
             expected_lease_owner="worker-a",
-            coordination_token=_COORD_TOKEN,
+            coordination_token=leader,
         )
 
     assert _scheduler_terminalization_state_snapshot(engine) == before
@@ -1266,7 +1342,6 @@ def test_ts14_outcome_witness_repair_rolls_back_when_scheduler_event_insert_fail
 
     with pytest.raises(LandscapeRecordError, match="forced scheduler event failure"):
         repo.terminalize_pending_sinks_with_terminal_outcomes(
-            run_id="run-1",
             caller_owner="resume-repair",
             coordination_token=_COORD_TOKEN,
         )
@@ -1291,7 +1366,7 @@ def test_pending_sink_batch_terminalization_records_per_token_events() -> None:
                 row_index=1,
                 source_row_index=1,
                 ingest_sequence=1,
-                source_data_hash="hash-row-2",
+                source_data_hash=fake_sha256("hash-row-2"),
                 created_at=now,
             )
         )
@@ -1305,7 +1380,7 @@ def test_pending_sink_batch_terminalization_records_per_token_events() -> None:
         )
 
     first = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1314,7 +1389,7 @@ def test_pending_sink_batch_terminalization_records_per_token_events() -> None:
         row_payload_json=payload,
     )
     second = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-2",
         row_id="row-2",
         node_id="normalize",
@@ -1322,8 +1397,12 @@ def test_pending_sink_batch_terminalization_records_per_token_events() -> None:
         ingest_sequence=1,
         row_payload_json=payload,
     )
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30)
+        is not None
+    )
     repo.mark_pending_sink(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         work_item_id=first.work_item_id,
         row_payload_json=payload,
         sink_name="sink-a",
@@ -1333,8 +1412,12 @@ def test_pending_sink_batch_terminalization_records_per_token_events() -> None:
         error_message=None,
         expected_lease_owner="worker-a",
     )
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30)
+        is not None
+    )
     repo.mark_pending_sink(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         work_item_id=second.work_item_id,
         row_payload_json=payload,
         sink_name="sink-a",
@@ -1348,7 +1431,6 @@ def test_pending_sink_batch_terminalization_records_per_token_events() -> None:
     _insert_terminal_outcome(engine, token_id="token-2", now=now + timedelta(seconds=5))
 
     terminalized = repo.mark_pending_sink_terminal_many(
-        run_id="run-1",
         token_ids=("token-1", "token-2"),
         expected_lease_owner="worker-a",
         coordination_token=_COORD_TOKEN,
@@ -1376,7 +1458,6 @@ def test_pending_sink_batch_terminalization_rejects_duplicate_token_ids() -> Non
 
     with pytest.raises(AuditIntegrityError, match="duplicate token_id"):
         repo.mark_pending_sink_terminal_many(
-            run_id="run-1",
             token_ids=(item.token_id, item.token_id),
             expected_lease_owner="worker-a",
             coordination_token=_COORD_TOKEN,
@@ -1397,7 +1478,6 @@ def test_pending_sink_batch_terminalization_requires_every_requested_token() -> 
 
     with pytest.raises(AuditIntegrityError, match="missing token_id"):
         repo.mark_pending_sink_terminal_many(
-            run_id="run-1",
             token_ids=(item.token_id, "token-missing"),
             expected_lease_owner="worker-a",
             coordination_token=_COORD_TOKEN,
@@ -1434,7 +1514,6 @@ def test_f08_pending_sink_batch_refuses_foreign_run_member_without_mutation() ->
 
     with pytest.raises(AuditIntegrityError, match="missing token_id='token-foreign'"):
         repo.mark_pending_sink_terminal_many(
-            run_id="run-1",
             token_ids=(local.token_id, foreign.token_id),
             expected_lease_owner="worker-a",
             coordination_token=_COORD_TOKEN,
@@ -1471,7 +1550,6 @@ def test_f08_pending_sink_batch_refuses_incomplete_member_without_mutating_valid
 
     with pytest.raises(AuditIntegrityError, match="complete durable sink bundle"):
         repo.mark_pending_sink_terminal_many(
-            run_id="run-1",
             token_ids=(valid.token_id, incomplete.token_id),
             expected_lease_owner="worker-a",
             coordination_token=_COORD_TOKEN,
@@ -1480,9 +1558,7 @@ def test_f08_pending_sink_batch_refuses_incomplete_member_without_mutating_valid
     assert _scheduler_terminalization_state_snapshot(engine) == before
 
 
-def test_f08_pending_sink_batch_revalidates_completeness_after_first_event(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_f08_pending_sink_batch_revalidates_completeness_before_batch_update() -> None:
     """A member invalidated after prevalidation aborts the full batch CAS."""
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 
@@ -1503,29 +1579,24 @@ def test_f08_pending_sink_batch_revalidates_completeness_after_first_event(
     _insert_terminal_outcome(engine, token_id=first.token_id, now=now + timedelta(seconds=3))
     _insert_terminal_outcome(engine, token_id=second.token_id, now=now + timedelta(seconds=3))
     before = _scheduler_terminalization_state_snapshot(engine)
-    original_record_scheduler_event = repo.events.record
     invalidation_injected = False
 
-    def record_first_event_then_invalidate_second(conn, *, event_type, **kwargs):
+    def invalidate_before_cas(conn, cursor, statement, parameters, context, executemany):
         nonlocal invalidation_injected
-        original_record_scheduler_event(conn, event_type=event_type, **kwargs)
-        if event_type is SchedulerEventType.MARK_PENDING_SINK_TERMINAL and not invalidation_injected:
-            result = conn.execute(
-                update(token_work_items_table).where(token_work_items_table.c.work_item_id == second.work_item_id).values(pending_path=None)
-            )
-            assert result.rowcount == 1
-            invalidation_injected = True
+        if invalidation_injected or not statement.lstrip().upper().startswith("UPDATE TOKEN_WORK_ITEMS"):
+            return
+        invalidation_injected = True
+        cursor.execute("UPDATE token_work_items SET pending_path=NULL WHERE work_item_id=?", (second.work_item_id,))
 
-    monkeypatch.setattr(repo.events, "record", record_first_event_then_invalidate_second)
-
-    with pytest.raises(AuditIntegrityError, match="expected exactly 1 complete owner-matched member"):
+    event.listen(engine, "before_cursor_execute", invalidate_before_cas)
+    with pytest.raises(AuditIntegrityError, match="CAS missed a complete owner-matched member"):
         repo.mark_pending_sink_terminal_many(
-            run_id="run-1",
             token_ids=(first.token_id, second.token_id),
             expected_lease_owner="worker-a",
             coordination_token=_COORD_TOKEN,
         )
 
+    event.remove(engine, "before_cursor_execute", invalidate_before_cas)
     assert invalidation_injected
     assert _scheduler_terminalization_state_snapshot(engine) == before
 
@@ -1552,7 +1623,6 @@ def test_f08_repeating_successful_sink_batch_refuses_without_duplicate_events() 
     _insert_terminal_outcome(engine, token_id=second.token_id, now=now + timedelta(seconds=3))
 
     terminalized = repo.mark_pending_sink_terminal_many(
-        run_id="run-1",
         token_ids=(first.token_id, second.token_id),
         expected_lease_owner="worker-a",
         coordination_token=_COORD_TOKEN,
@@ -1561,7 +1631,6 @@ def test_f08_repeating_successful_sink_batch_refuses_without_duplicate_events() 
 
     with pytest.raises(AuditIntegrityError, match="missing token_id='token-1'"):
         repo.mark_pending_sink_terminal_many(
-            run_id="run-1",
             token_ids=(first.token_id, second.token_id),
             expected_lease_owner="worker-a",
             coordination_token=_COORD_TOKEN,
@@ -1584,7 +1653,7 @@ def test_pending_sink_batch_terminalization_rejects_wrong_lease_owner() -> None:
     payload = _insert_scheduler_prerequisites(engine, now=now)
     _make_pending_sink(repo, run_id="run-1", token_id="token-1", row_id="row-1", payload=payload)
     claimed = repo.claim_pending_sink(
-        run_id="run-1",
+        coordination_token=_COORD_TOKEN,
         lease_owner="worker-b",
         lease_seconds=30,
     )
@@ -1593,7 +1662,6 @@ def test_pending_sink_batch_terminalization_rejects_wrong_lease_owner() -> None:
 
     with pytest.raises(AuditIntegrityError, match="lease_owner"):
         repo.mark_pending_sink_terminal_many(
-            run_id="run-1",
             token_ids=("token-1",),
             expected_lease_owner="worker-a",
             coordination_token=_COORD_TOKEN,
@@ -1626,13 +1694,12 @@ def test_pending_sink_with_terminal_outcome_is_repaired_without_reclaiming_sink(
         )
 
     terminalized = repo.terminalize_pending_sinks_with_terminal_outcomes(
-        run_id="run-1",
         caller_owner="resume-repair",
         coordination_token=_COORD_TOKEN,
     )
 
     assert terminalized == 1
-    assert repo.claim_pending_sink(run_id="run-1", lease_owner="worker-b", lease_seconds=30) is None
+    assert repo.claim_pending_sink(coordination_token=_COORD_TOKEN, lease_owner="worker-b", lease_seconds=30) is None
     with engine.connect() as conn:
         status = conn.execute(
             select(token_work_items_table.c.status).where(token_work_items_table.c.work_item_id == item.work_item_id)
@@ -1660,7 +1727,6 @@ def test_ts14_outcome_repair_without_witness_only_refreshes_the_leader_fence() -
     now + timedelta(seconds=3)
     database_before = landscape_database_now(engine)
     terminalized = repo.terminalize_pending_sinks_with_terminal_outcomes(
-        run_id="run-1",
         caller_owner="resume-repair",
         coordination_token=_COORD_TOKEN,
     )
@@ -1698,7 +1764,7 @@ def test_blocked_barrier_terminalization_records_transition_event() -> None:
     now = landscape_database_now(engine)
     payload = _insert_scheduler_prerequisites(engine, now=now)
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1706,15 +1772,19 @@ def test_blocked_barrier_terminalization_records_transition_event() -> None:
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30)
+        is not None
+    )
     blocked = repo.mark_blocked(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=None,
         barrier_key="join:1",
         expected_lease_owner="worker-a",
     )
     terminalized = repo.mark_blocked_barrier_terminal(
-        run_id="run-1",
         barrier_key="join:1",
         token_ids=("token-1",),
         coordination_token=_COORD_TOKEN,
@@ -1743,7 +1813,7 @@ def test_blocked_barrier_pending_sink_handoff_records_state_and_event() -> None:
     now = landscape_database_now(engine)
     payload = _insert_scheduler_prerequisites(engine, now=now)
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1751,9 +1821,14 @@ def test_blocked_barrier_pending_sink_handoff_records_state_and_event() -> None:
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30)
+        is not None
+    )
     repo.mark_blocked(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=None,
         barrier_key="agg-1",
         expected_lease_owner="worker-a",
@@ -1763,7 +1838,6 @@ def test_blocked_barrier_pending_sink_handoff_records_state_and_event() -> None:
     )
 
     transitioned = repo.mark_blocked_barrier_pending_sink_many(
-        run_id="run-1",
         barrier_key="agg-1",
         handoffs={
             "token-1": BlockedPendingSinkHandoff(
@@ -1820,7 +1894,7 @@ def test_claim_ready_rolls_back_work_item_update_when_scheduler_event_insert_fai
     now = landscape_database_now(engine)
     payload = _insert_scheduler_prerequisites(engine, now=now)
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1841,7 +1915,7 @@ def test_claim_ready_rolls_back_work_item_update_when_scheduler_event_insert_fai
     monkeypatch.setattr(repo.events, "record", fail_claim_event)
 
     with pytest.raises(LandscapeRecordError, match="forced scheduler event failure"):
-        repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30)
 
     with engine.connect() as conn:
         row = conn.execute(
@@ -1860,28 +1934,19 @@ def test_query_repository_lists_scheduler_events_by_token_history() -> None:
     setup = make_recorder_with_run(run_id="run-1", source_node_id="source-0", source_plugin_name="csv")
     db, factory = setup.db, setup.factory
     register_test_node(factory.data_flow, "run-1", "normalize", plugin_name="identity")
-    factory.data_flow.create_row(
-        "run-1",
+    factory.data_flow.create_row_with_token(
         "source-0",
         0,
         {"id": 1},
         row_id="row-1",
         source_row_index=0,
         ingest_sequence=0,
+        token_id="token-1",
+        coordination_token=leader_coordination_token(factory, "run-1"),
     )
-    factory.data_flow.create_token("row-1", token_id="token-1")
     now = landscape_database_now(db.engine)
     payload = factory.scheduler.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
 
-    factory.scheduler.enqueue_ready(
-        run_id="run-1",
-        token_id="token-1",
-        row_id="row-1",
-        node_id="normalize",
-        step_index=1,
-        ingest_sequence=0,
-        row_payload_json=payload,
-    )
     with db.engine.begin() as conn:
         conn.execute(
             insert(run_workers_table).values(
@@ -1893,8 +1958,17 @@ def test_query_repository_lists_scheduler_events_by_token_history() -> None:
                 heartbeat_expires_at=now + timedelta(hours=1),
             )
         )
+    factory.scheduler.enqueue_ready(
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
+        token_id="token-1",
+        row_id="row-1",
+        node_id="normalize",
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=payload,
+    )
     factory.scheduler.claim_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         lease_owner="worker-a",
         lease_seconds=30,
     )
@@ -1975,16 +2049,16 @@ def test_claim_written_after_mark_terminal_in_one_database_second_replays_after_
     db, factory = setup.db, setup.factory
     register_test_node(factory.data_flow, "run-1", "normalize", plugin_name="identity")
     for index in (1, 2):
-        factory.data_flow.create_row(
-            "run-1",
+        factory.data_flow.create_row_with_token(
             "source-0",
             index - 1,
             {"id": index},
             row_id=f"row-{index}",
             source_row_index=index - 1,
             ingest_sequence=index - 1,
+            token_id=f"token-{index}",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.create_token(f"row-{index}", token_id=f"token-{index}")
     seeded_at = landscape_database_now(db.engine)
     with db.engine.begin() as conn:
         conn.execute(
@@ -2001,7 +2075,7 @@ def test_claim_written_after_mark_terminal_in_one_database_second_replays_after_
 
     def enqueue(token_id: str, row_id: str, ingest_sequence: int) -> None:
         factory.scheduler.enqueue_ready(
-            run_id="run-1",
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
             token_id=token_id,
             row_id=row_id,
             node_id="normalize",
@@ -2012,14 +2086,19 @@ def test_claim_written_after_mark_terminal_in_one_database_second_replays_after_
 
     def transitions_inside_one_second(database_now: datetime) -> None:
         enqueue("token-1", "row-1", 0)
-        first = factory.scheduler.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+        first = factory.scheduler.claim_ready(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30
+        )
         assert first is not None and first.token_id == "token-1"
         factory.scheduler.mark_terminal(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
             work_item_id=first.work_item_id,
             expected_lease_owner="worker-a",
         )
         enqueue("token-2", "row-2", 1)
-        second = factory.scheduler.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+        second = factory.scheduler.claim_ready(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30
+        )
         assert second is not None and second.token_id == "token-2"
 
     on_fresh_database_second(db.engine, transitions_inside_one_second)
@@ -2057,38 +2136,39 @@ def _invoke_normal_disposition(
     group_losses = () if group_loss is None else (group_loss,)
     if verb == "mark_terminal":
         return repo.mark_terminal(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id=expected_lease_owner),
             work_item_id=work_item_id,
             expected_lease_owner=expected_lease_owner,
             group_losses=group_losses,
-            worker_id=worker_id,
         )
     if verb == "mark_failed":
         return repo.mark_failed(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id=expected_lease_owner),
             work_item_id=work_item_id,
             expected_lease_owner=expected_lease_owner,
             group_losses=group_losses,
-            worker_id=worker_id,
         )
     if verb == "mark_blocked":
         return repo.mark_blocked(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id=expected_lease_owner),
             work_item_id=work_item_id,
+            row_payload_json=payload,
             queue_key="queue-a",
             barrier_key=None,
             expected_lease_owner=expected_lease_owner,
-            worker_id=worker_id,
         )
     if verb == "mark_pending_sink":
         return repo.mark_pending_sink(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id=expected_lease_owner),
             work_item_id=work_item_id,
             row_payload_json=payload,
             sink_name="replacement-sink",
             outcome=TerminalOutcome.FAILURE.value,
             path=TerminalPath.ON_ERROR_ROUTED.value,
-            error_hash="replacement-error-hash",
+            error_hash=fake_error_hash("replacement-error-hash"),
             error_message="replacement error",
             expected_lease_owner=expected_lease_owner,
             group_losses=group_losses,
-            worker_id=worker_id,
         )
     raise AssertionError(f"unknown normal disposition {verb!r}")
 
@@ -2172,6 +2252,22 @@ def _fail_scheduler_event(
                 raise LandscapeRecordError("forced scheduler event failure")
         return original_record_scheduler_event(conn, event_type=event_type, **kwargs)
 
+    original_many = repo.events.record_many
+
+    def fail_selected_batch(conn, *, records):
+        nonlocal matching_calls
+        prefix = []
+        for record in records:
+            if record.event_type is event_type_to_fail:
+                matching_calls += 1
+                if matching_calls == occurrence:
+                    if prefix:
+                        original_many(conn, records=prefix)
+                    raise LandscapeRecordError("forced scheduler event failure")
+            prefix.append(record)
+        original_many(conn, records=records)
+
+    monkeypatch.setattr(repo.events, "record_many", fail_selected_batch)
     event_type_to_fail = event_type
     monkeypatch.setattr(repo.events, "record", fail_selected_event)
 
@@ -2186,7 +2282,7 @@ def _make_scheduler_engine() -> Tier1Engine:
     return Tier1Engine(engine)
 
 
-def _insert_scheduler_prerequisites(engine: Tier1Engine, *, now: datetime) -> str:
+def _insert_scheduler_prerequisites(engine: Tier1Engine, *, now: datetime, leader_worker_id: str = "worker-b") -> str:
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 
     row_payload_json = TokenSchedulerRepository.serialize_row_payload(
@@ -2197,7 +2293,7 @@ def _insert_scheduler_prerequisites(engine: Tier1Engine, *, now: datetime) -> st
             insert(runs_table).values(
                 run_id="run-1",
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -2213,7 +2309,7 @@ def _insert_scheduler_prerequisites(engine: Tier1Engine, *, now: datetime) -> st
                 node_type=NodeType.SOURCE.value,
                 plugin_version="1.0",
                 determinism="deterministic",
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 config_json="{}",
                 registered_at=now,
             )
@@ -2226,7 +2322,7 @@ def _insert_scheduler_prerequisites(engine: Tier1Engine, *, now: datetime) -> st
                 node_type=NodeType.TRANSFORM.value,
                 plugin_version="1.0",
                 determinism="deterministic",
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 config_json="{}",
                 registered_at=now,
             )
@@ -2239,7 +2335,7 @@ def _insert_scheduler_prerequisites(engine: Tier1Engine, *, now: datetime) -> st
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="hash-row-1",
+                source_data_hash=fake_sha256("hash-row-1"),
                 created_at=now,
             )
         )
@@ -2256,12 +2352,23 @@ def _insert_scheduler_prerequisites(engine: Tier1Engine, *, now: datetime) -> st
         conn.execute(
             insert(run_coordination_table).values(
                 run_id="run-1",
-                leader_worker_id="test-leader",
+                leader_worker_id=leader_worker_id,
                 leader_epoch=1,
                 leader_heartbeat_expires_at=now + timedelta(hours=1),
                 updated_at=now,
             )
         )
+        for worker_id in ("worker-a", "worker-b", "stale-worker", "reaper"):
+            conn.execute(
+                insert(run_workers_table).values(
+                    worker_id=worker_id,
+                    run_id="run-1",
+                    role="leader" if worker_id == leader_worker_id else "follower",
+                    status="active",
+                    registered_at=now,
+                    heartbeat_expires_at=now + timedelta(hours=1),
+                )
+            )
     return row_payload_json
 
 
@@ -2276,7 +2383,7 @@ def _insert_foreign_scheduler_prerequisites(engine: Tier1Engine, *, now: datetim
             insert(runs_table).values(
                 run_id="run-foreign",
                 started_at=now,
-                config_hash="config-foreign",
+                config_hash=fake_sha256("config-foreign"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -2296,7 +2403,7 @@ def _insert_foreign_scheduler_prerequisites(engine: Tier1Engine, *, now: datetim
                     node_type=node_type.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="config-foreign",
+                    config_hash=fake_sha256("config-foreign"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -2309,7 +2416,7 @@ def _insert_foreign_scheduler_prerequisites(engine: Tier1Engine, *, now: datetim
                 row_index=0,
                 source_row_index=0,
                 ingest_sequence=0,
-                source_data_hash="hash-row-foreign",
+                source_data_hash=fake_sha256("hash-row-foreign"),
                 created_at=now,
             )
         )
@@ -2330,6 +2437,16 @@ def _insert_foreign_scheduler_prerequisites(engine: Tier1Engine, *, now: datetim
                 updated_at=now,
             )
         )
+        conn.execute(
+            insert(run_workers_table).values(
+                worker_id="foreign-leader",
+                run_id="run-foreign",
+                role="leader",
+                status="active",
+                registered_at=now,
+                heartbeat_expires_at=now + timedelta(hours=1),
+            )
+        )
     return row_payload_json
 
 
@@ -2343,7 +2460,7 @@ def _insert_second_scheduler_token(engine: Tier1Engine, *, now: datetime) -> Non
                 row_index=1,
                 source_row_index=1,
                 ingest_sequence=1,
-                source_data_hash="hash-row-2",
+                source_data_hash=fake_sha256("hash-row-2"),
                 created_at=now,
             )
         )
@@ -2388,8 +2505,9 @@ def _make_pending_sink(
     payload: str,
     ingest_sequence: int = 0,
 ):
+    member = WorkerMembershipToken(run_id=run_id, worker_id="worker-a" if run_id == "run-1" else "foreign-leader")
     item = repo.enqueue_ready(
-        run_id=run_id,
+        member_token=member,
         token_id=token_id,
         row_id=row_id,
         node_id="normalize",
@@ -2397,8 +2515,9 @@ def _make_pending_sink(
         ingest_sequence=ingest_sequence,
         row_payload_json=payload,
     )
-    assert repo.claim_ready(run_id=run_id, lease_owner="worker-a", lease_seconds=30) is not None
+    assert repo.claim_ready(member_token=member, lease_owner=member.worker_id, lease_seconds=30) is not None
     repo.mark_pending_sink(
+        member_token=member,
         work_item_id=item.work_item_id,
         row_payload_json=payload,
         sink_name="sink-a",
@@ -2406,14 +2525,14 @@ def _make_pending_sink(
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        expected_lease_owner="worker-a",
+        expected_lease_owner=member.worker_id,
     )
     return item
 
 
 def _make_transform_lease(repo, *, payload: str):
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -2422,7 +2541,7 @@ def _make_transform_lease(repo, *, payload: str):
         row_payload_json=payload,
     )
     claimed = repo.claim_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="worker-b"),
         lease_owner="worker-b",
         lease_seconds=30,
     )

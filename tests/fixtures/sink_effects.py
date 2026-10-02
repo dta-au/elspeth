@@ -36,6 +36,11 @@ class DuplicateObservableTarget:
 class DuplicateObservableSink:
     """Naive publisher whose coordinator must prevent duplicate calls."""
 
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
+
     name = "duplicate-observable"
     effect_call_type = CallType.FILESYSTEM
     declared_required_fields = frozenset()

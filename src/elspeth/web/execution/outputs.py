@@ -9,8 +9,9 @@ Audience: the eval harness (``finalize_scenario.sh``), retroactive
 backfill tooling, and any downstream evidence-retrieval flow that must
 not silently drop artefacts beyond a UI preview cap.
 
-Tier 1 read discipline (CLAUDE.md): the ``artifacts`` table is full-trust
-data — read fields directly, no coercion. Filesystem state (``exists_now``)
+Tier 1 read discipline (docs/guides/data-trust-and-error-handling.md §The
+Three-Tier Trust Model): the ``artifacts`` table is full-trust data — read
+fields directly, no coercion. Filesystem state (``exists_now``)
 is checked at endpoint-call time and is allowed to be ``False``: a purged
 or moved file is a fact, not an error.
 """

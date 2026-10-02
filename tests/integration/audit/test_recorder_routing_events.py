@@ -31,6 +31,7 @@ from elspeth.core.landscape.schema import (
 )
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 from tests.fixtures.pipeline import build_production_graph
 from tests.fixtures.plugins import CollectSink, ConditionalErrorTransform, ListSource
 
@@ -48,9 +49,10 @@ class TestRecorderFactoryRouting:
         db = LandscapeDB.in_memory()
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        authority = leader_coordination_token(factory, run.run_id)
 
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=authority,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -58,7 +60,7 @@ class TestRecorderFactoryRouting:
             schema_config=DYNAMIC_SCHEMA,
         )
         gate = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=authority,
             plugin_name="gate",
             node_type=NodeType.GATE,
             plugin_version="1.0",
@@ -66,7 +68,7 @@ class TestRecorderFactoryRouting:
             schema_config=DYNAMIC_SCHEMA,
         )
         sink = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=authority,
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -74,31 +76,31 @@ class TestRecorderFactoryRouting:
             schema_config=DYNAMIC_SCHEMA,
         )
         edge = factory.data_flow.register_edge(
-            run_id=run.run_id,
+            coordination_token=authority,
             from_node_id=gate.node_id,
             to_node_id=sink.node_id,
             label="high_value",
             mode=RoutingMode.MOVE,
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=authority,
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=gate.node_id,
-            run_id=run.run_id,
+            member_token=authority.membership,
             step_index=0,
             input_data={},
         )
 
         event = factory.execution.record_routing_event(
+            member_token=authority.membership,
             state_id=state.state_id,
             edge_id=edge.edge_id,
             mode=RoutingMode.MOVE,
@@ -118,9 +120,10 @@ class TestRecorderFactoryRouting:
         db = LandscapeDB.in_memory()
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        authority = leader_coordination_token(factory, run.run_id)
 
         gate = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=authority,
             plugin_name="gate",
             node_type=NodeType.GATE,
             plugin_version="1.0",
@@ -128,7 +131,7 @@ class TestRecorderFactoryRouting:
             schema_config=DYNAMIC_SCHEMA,
         )
         sink_a = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=authority,
             plugin_name="sink_a",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -136,7 +139,7 @@ class TestRecorderFactoryRouting:
             schema_config=DYNAMIC_SCHEMA,
         )
         sink_b = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=authority,
             plugin_name="sink_b",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -144,39 +147,41 @@ class TestRecorderFactoryRouting:
             schema_config=DYNAMIC_SCHEMA,
         )
         edge_a = factory.data_flow.register_edge(
-            run_id=run.run_id,
+            coordination_token=authority,
             from_node_id=gate.node_id,
             to_node_id=sink_a.node_id,
             label="path_a",
             mode=RoutingMode.COPY,
         )
         edge_b = factory.data_flow.register_edge(
-            run_id=run.run_id,
+            coordination_token=authority,
             from_node_id=gate.node_id,
             to_node_id=sink_b.node_id,
             label="path_b",
             mode=RoutingMode.COPY,
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=authority,
             source_node_id=gate.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=gate.node_id,
-            run_id=run.run_id,
+            member_token=authority.membership,
             step_index=0,
             input_data={},
         )
 
         # Fork to both paths using batch method
+        work_item = claim_test_work_item(factory, member_token=authority.membership, token_id=token.token_id, node_id=gate.node_id)
         events = factory.execution.record_routing_events(
+            member_token=authority.membership,
+            work_item=work_item,
             state_id=state.state_id,
             routes=[
                 RoutingSpec(edge_id=edge_a.edge_id, mode=RoutingMode.COPY),
@@ -204,9 +209,10 @@ class TestRecorderFactoryRouting:
             payload_store = FilesystemPayloadStore(Path(tmp_dir))
             factory = RecorderFactory(db, payload_store=payload_store)
             run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+            authority = leader_coordination_token(factory, run.run_id)
 
             source = factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=authority,
                 plugin_name="source",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0",
@@ -214,7 +220,7 @@ class TestRecorderFactoryRouting:
                 schema_config=DYNAMIC_SCHEMA,
             )
             gate = factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=authority,
                 plugin_name="gate",
                 node_type=NodeType.GATE,
                 plugin_version="1.0",
@@ -222,7 +228,7 @@ class TestRecorderFactoryRouting:
                 schema_config=DYNAMIC_SCHEMA,
             )
             sink = factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=authority,
                 plugin_name="sink",
                 node_type=NodeType.SINK,
                 plugin_version="1.0",
@@ -230,32 +236,32 @@ class TestRecorderFactoryRouting:
                 schema_config=DYNAMIC_SCHEMA,
             )
             edge = factory.data_flow.register_edge(
-                run_id=run.run_id,
+                coordination_token=authority,
                 from_node_id=gate.node_id,
                 to_node_id=sink.node_id,
                 label="high_value",
                 mode=RoutingMode.MOVE,
             )
 
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
+                coordination_token=authority,
                 source_node_id=source.node_id,
                 row_index=0,
                 data={},
                 source_row_index=0,
                 ingest_sequence=0,
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             state = factory.execution.begin_node_state(
                 token_id=token.token_id,
                 node_id=gate.node_id,
-                run_id=run.run_id,
+                member_token=authority.membership,
                 step_index=0,
                 input_data={},
             )
 
             reason: ConfigGateReason = {"condition": "value > 1000", "result": "true"}
             event = factory.execution.record_routing_event(
+                member_token=authority.membership,
                 state_id=state.state_id,
                 edge_id=edge.edge_id,
                 mode=RoutingMode.MOVE,
@@ -284,9 +290,10 @@ class TestRecorderFactoryRouting:
             payload_store = FilesystemPayloadStore(Path(tmp_dir))
             factory = RecorderFactory(db, payload_store=payload_store)
             run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+            authority = leader_coordination_token(factory, run.run_id)
 
             gate = factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=authority,
                 plugin_name="gate",
                 node_type=NodeType.GATE,
                 plugin_version="1.0",
@@ -294,7 +301,7 @@ class TestRecorderFactoryRouting:
                 schema_config=DYNAMIC_SCHEMA,
             )
             sink_a = factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=authority,
                 plugin_name="sink_a",
                 node_type=NodeType.SINK,
                 plugin_version="1.0",
@@ -302,7 +309,7 @@ class TestRecorderFactoryRouting:
                 schema_config=DYNAMIC_SCHEMA,
             )
             sink_b = factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=authority,
                 plugin_name="sink_b",
                 node_type=NodeType.SINK,
                 plugin_version="1.0",
@@ -310,39 +317,41 @@ class TestRecorderFactoryRouting:
                 schema_config=DYNAMIC_SCHEMA,
             )
             edge_a = factory.data_flow.register_edge(
-                run_id=run.run_id,
+                coordination_token=authority,
                 from_node_id=gate.node_id,
                 to_node_id=sink_a.node_id,
                 label="path_a",
                 mode=RoutingMode.COPY,
             )
             edge_b = factory.data_flow.register_edge(
-                run_id=run.run_id,
+                coordination_token=authority,
                 from_node_id=gate.node_id,
                 to_node_id=sink_b.node_id,
                 label="path_b",
                 mode=RoutingMode.COPY,
             )
 
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
+                coordination_token=authority,
                 source_node_id=gate.node_id,
                 row_index=0,
                 data={},
                 source_row_index=0,
                 ingest_sequence=0,
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             state = factory.execution.begin_node_state(
                 token_id=token.token_id,
                 node_id=gate.node_id,
-                run_id=run.run_id,
+                member_token=authority.membership,
                 step_index=0,
                 input_data={},
             )
 
             reason: ConfigGateReason = {"condition": "fork_to_paths", "result": "path_a,path_b"}
+            work_item = claim_test_work_item(factory, member_token=authority.membership, token_id=token.token_id, node_id=gate.node_id)
             events = factory.execution.record_routing_events(
+                member_token=authority.membership,
+                work_item=work_item,
                 state_id=state.state_id,
                 routes=[
                     RoutingSpec(edge_id=edge_a.edge_id, mode=RoutingMode.COPY),
@@ -607,38 +616,40 @@ class TestRoutingEventDistinguishability:
         """
         factory = RecorderFactory(landscape_db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        authority = leader_coordination_token(factory, run.run_id)
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=authority,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=authority,
             source_node_id=source.node_id,
             row_index=0,
             data={"id": 1, "fail": True},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         ref = TokenRef(token_id=token.token_id, run_id=run.run_id)
 
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref,
             TerminalOutcome.FAILURE,
             TerminalPath.ON_ERROR_ROUTED,
+            coordination_token=authority,
             sink_name="error_sink",
             error_hash="0123456789abcdef",
         )
 
         with pytest.raises(LandscapeRecordError, match="database rejected audit write: IntegrityError") as exc_info:
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
                 ref,
                 TerminalOutcome.SUCCESS,
                 TerminalPath.DEFAULT_FLOW,
+                coordination_token=authority,
                 sink_name="default",
             )
         assert isinstance(exc_info.value.__cause__, IntegrityError)

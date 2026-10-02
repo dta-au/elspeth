@@ -112,3 +112,28 @@ async def test_stale_schema_status_tool_returns_mcp_error_result(tmp_path: Path)
     assert "Landscape database schema is outdated" in message
     assert "token_outcomes.completed" in message
     assert "docs/operator/migrations/adr-019.md" in message
+
+
+@pytest.mark.asyncio
+async def test_attempt_evidence_is_labelled_in_the_tool_list_a_client_reads(tmp_path: Path) -> None:
+    """A run with no failed token can still return transform-error rows: failed ATTEMPTS a retry recovered.
+
+    The two tools that list those rows say so where an MCP client reads it,
+    the served tool list; the TypedDict docstrings never reach the wire.
+    """
+    db_path = tmp_path / "audit.db"
+    LandscapeDB(f"sqlite:///{db_path}").close()
+    server = create_server(f"sqlite:///{db_path}")
+
+    tools_response = await server.request_handlers[ListToolsRequest](ListToolsRequest(method="tools/list"))
+    assert isinstance(tools_response.root, ListToolsResult)
+    descriptions = {tool.name: tool.description for tool in tools_response.root.tools}
+
+    error_analysis = descriptions["get_error_analysis"]
+    assert error_analysis is not None
+    assert "sample_details are raw transform-error ATTEMPT records" in error_analysis
+    assert "never a failure count" in error_analysis
+    failure_context = descriptions["get_failure_context"]
+    assert failure_context is not None
+    assert "transform_errors lists transform-error ATTEMPT records" in failure_context
+    assert "never failed-token counts" in failure_context

@@ -17,13 +17,13 @@ from unittest.mock import patch
 
 import pytest
 
-from elspeth.contracts import Checkpoint, PluginSchema, ResumedRow, ResumePoint, RunStatus
+from elspeth.contracts import Checkpoint, PluginSchema, ResumePoint, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError, OrchestrationInvariantError
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
-from elspeth.contracts.types import NodeID
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.base_classes import as_sink, as_source
 from tests.fixtures.landscape import expire_leader_seat
 from tests.fixtures.pipeline import build_production_graph
@@ -69,7 +69,7 @@ def _make_resume_point(run_id: str) -> ResumePoint:
         run_id=run_id,
         sequence_number=0,
         created_at=datetime.now(UTC),
-        upstream_topology_hash="topology-hash",
+        upstream_topology_hash=fake_sha256("topology-hash"),
         format_version=Checkpoint.CURRENT_FORMAT_VERSION,
     )
     return ResumePoint(
@@ -127,7 +127,6 @@ def _create_failed_run(
     """
     from elspeth.contracts import NodeType
     from elspeth.contracts.contract_records import ContractAuditRecord
-    from elspeth.contracts.enums import Determinism
     from elspeth.core.landscape.schema import nodes_table, run_sources_table
 
     run = factory.run_lifecycle.begin_run(
@@ -140,32 +139,44 @@ def _create_failed_run(
     # crashed leader never releases it, so lapse it deterministically — the
     # post-window image resume's takeover CAS requires (vacant-or-expired).
     expire_leader_seat(factory.run_lifecycle._db, run.run_id)
+    config, graph = _build_pipeline()
+    source_node_id = graph.get_sources()[0]
+    sink_node_id = graph.get_sink_id_map()["default"]
+    now = datetime.now(UTC)
+    # Persist the exact implementation baseline even for an early source failure;
+    # only the source lifecycle/contract record is absent in that scenario.
+    with factory.run_lifecycle._db.write_connection() as conn:
+        for node_id, plugin, node_type in [
+            (source_node_id, config.sources["primary"], NodeType.SOURCE),
+            (sink_node_id, config.sinks["default"], NodeType.SINK),
+        ]:
+            conn.execute(
+                nodes_table.insert().values(
+                    node_id=node_id,
+                    run_id=run.run_id,
+                    plugin_name=plugin.name,
+                    node_type=node_type,
+                    plugin_version=plugin.plugin_version,
+                    determinism=plugin.determinism,
+                    source_file_hash=plugin.source_file_hash,
+                    config_hash=fake_sha256("resume-guardrails"),
+                    config_json="{}",
+                    registered_at=now,
+                )
+            )
     if include_contract:
         contract = _make_schema_contract()
         audit_record = ContractAuditRecord.from_contract(contract)
         now = datetime.now(UTC)
         with factory.run_lifecycle._db.write_connection() as conn:
             conn.execute(
-                nodes_table.insert().values(
-                    node_id="source-node",
-                    run_id=run.run_id,
-                    plugin_name="list_source",
-                    node_type=NodeType.SOURCE,
-                    plugin_version="1.0.0",
-                    determinism=Determinism.DETERMINISTIC,
-                    config_hash="resume-guardrails",
-                    config_json="{}",
-                    registered_at=now,
-                )
-            )
-            conn.execute(
                 run_sources_table.insert().values(
                     run_id=run.run_id,
-                    source_node_id="source-node",
+                    source_node_id=source_node_id,
                     source_name="primary",
                     plugin_name="list_source",
                     lifecycle_state="loaded",
-                    config_hash="resume-guardrails",
+                    config_hash=fake_sha256("resume-guardrails"),
                     schema_json=json.dumps(_ResumeSourceSchema.model_json_schema()),
                     schema_contract_json=audit_record.to_json(),
                     schema_contract_hash=contract.version_hash(),
@@ -229,13 +240,7 @@ class TestResumeGuardrails:
         )
         config, graph = _build_pipeline()
 
-        with (
-            patch(
-                "elspeth.core.checkpoint.recovery.RecoveryManager.get_unprocessed_row_data",
-                return_value=[],
-            ) as mock_get_unprocessed,
-            pytest.raises(EmptyResumeStateError) as exc_info,
-        ):
+        with pytest.raises(EmptyResumeStateError) as exc_info:
             orchestrator.resume(
                 resume_point=_persist_resume_point(resume_test_env, run_id, graph),
                 config=config,
@@ -243,7 +248,6 @@ class TestResumeGuardrails:
                 payload_store=resume_test_env["payload_store"],
             )
 
-        mock_get_unprocessed.assert_not_called()
         assert exc_info.value.run_id == run_id
         # ADR-025 §3 Decision 5 (G6): the singleton ``schema_contract_json``
         # column was deleted. The empty-resume-state precondition now keys on
@@ -263,20 +267,12 @@ class TestResumeGuardrails:
         )
         config, graph = _build_pipeline()
 
-        # ADR-025 §3 Decision 5 (G6): resume now reconstructs unprocessed
-        # rows via ``get_unprocessed_row_data_by_source``. Patching the
-        # legacy ``get_unprocessed_row_data`` would silently no-op.
+        # Active scheduler work puts the resume on the processing path, where
+        # the resume graph is rebuilt from the recorded edges.
         with (
             patch(
-                "elspeth.core.checkpoint.recovery.RecoveryManager.get_unprocessed_row_data_by_source",
-                return_value=(
-                    ResumedRow(
-                        row_id="row-1",
-                        row_index=0,
-                        source_node_id=NodeID("source-node"),
-                        row_data={"id": 1, "value": "alpha"},
-                    ),
-                ),
+                "elspeth.core.landscape.scheduler_repository.TokenSchedulerRepository.count_active_work",
+                return_value=1,
             ),
             pytest.raises(AuditIntegrityError, match="has no edges registered") as exc_info,
         ):
@@ -308,10 +304,6 @@ class TestResumeGuardrails:
                     "tier_1_errors": [],
                 },
             ),
-            patch(
-                "elspeth.core.checkpoint.recovery.RecoveryManager.get_unprocessed_row_data",
-                return_value=[],
-            ) as mock_get_unprocessed,
             pytest.raises(OrchestrationInvariantError, match="runtime VAL manifest") as exc_info,
         ):
             orchestrator.resume(
@@ -321,7 +313,6 @@ class TestResumeGuardrails:
                 payload_store=resume_test_env["payload_store"],
             )
 
-        mock_get_unprocessed.assert_not_called()
         assert run_id in str(exc_info.value)
         assert "contract registry" in str(exc_info.value).lower()
 
@@ -342,9 +333,8 @@ class TestResumeGuardrails:
         The genuine "early-exit on empty rows" success path is
         exercised in
         ``tests/unit/engine/orchestrator/test_resume_failure.py::test_resume_treats_empty_journal_as_all_rows_processed``,
-        which constructs ``ResumeState`` directly with a non-empty
-        contract map (the RC6 shape: run_sources records present,
-        unprocessed_rows empty).
+        which constructs ``ResumeState`` directly with run_sources records
+        present and no scheduler work.
         """
         run_id = _create_failed_run(resume_test_env["factory"], include_contract=False)
         orchestrator = Orchestrator(
@@ -353,13 +343,7 @@ class TestResumeGuardrails:
         )
         config, graph = _build_pipeline()
 
-        with (
-            patch(
-                "elspeth.core.checkpoint.recovery.RecoveryManager.get_unprocessed_row_data_by_source",
-                return_value=(),
-            ),
-            pytest.raises(EmptyResumeStateError) as exc_info,
-        ):
+        with pytest.raises(EmptyResumeStateError) as exc_info:
             orchestrator.resume(
                 resume_point=_persist_resume_point(resume_test_env, run_id, graph),
                 config=config,

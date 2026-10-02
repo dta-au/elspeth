@@ -35,9 +35,8 @@ Good support requests include:
 
 Maintainers cannot provide:
 
-- agency-specific authority-to-operate approval;
-- formal IRAP, PSPF, ISM, Essential Eight, Digital Service Standard, AGDS, or
-  WCAG certification;
+- deployment approval or formal certification against a regulatory, security,
+  accessibility, or service standard;
 - guarantees about third-party providers such as Azure OpenAI, OpenRouter,
   Microsoft Entra, ChromaDB, Dataverse, GitHub, or Azure infrastructure;
 - support for production use without a separately agreed operational model.

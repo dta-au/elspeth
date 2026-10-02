@@ -140,9 +140,9 @@ class PassThroughDeclarationContract(DeclarationContract):
     violation_class: ClassVar[type[PassThroughContractViolation]] = PassThroughContractViolation
 
     def applies_to(self, plugin: Any) -> bool:
-        # Direct attribute access, NOT getattr with default (CLAUDE.md
-        # §Offensive Programming). A plugin missing passes_through_input
-        # is a framework bug — let it crash.
+        # Direct attribute access, NOT getattr with default (see the
+        # engine-patterns-reference skill §Offensive Programming Examples).
+        # A plugin missing passes_through_input is a framework bug — let it crash.
         return _require_bool_flag(
             plugin,
             attr_name="passes_through_input",
@@ -157,9 +157,10 @@ class PassThroughDeclarationContract(DeclarationContract):
     ) -> None:
         """Single-token path (TransformExecutor).
 
-        ``inputs.effective_input_fields`` is caller-derived from
-        ``input_row.contract.fields`` — contracts do NOT re-derive
-        (panel F1 resolution).
+        ``inputs.effective_input_fields`` is derived by the caller with
+        ``derive_effective_input_fields`` (the contract fields the input
+        row's payload carries) — contracts do NOT re-derive (panel F1
+        resolution).
         """
         transform_node_id = inputs.plugin.node_id
         if transform_node_id is None:
@@ -188,9 +189,14 @@ class PassThroughDeclarationContract(DeclarationContract):
     ) -> None:
         """Batch-flush TRANSFORM mode (ADR-009 §Clause 2).
 
-        ``inputs.effective_input_fields`` is the caller-computed INTERSECTION
-        of every buffered token's contract — the weakest shared guarantee
-        every emitted row must preserve.
+        ``inputs.effective_input_fields`` is the caller-computed weakest
+        shared guarantee that every emitted row must preserve (see
+        ``BatchFlushInputs``). In TRANSFORM mode with a non-empty emission, it
+        is the INTERSECTION of the effective input fields (contract fields the
+        payload carries) of the buffered tokens NOT in the engine-validated
+        in-batch quarantine set. With a zero emission, it is the intersection
+        over every buffered token. In a PASSTHROUGH pair, it is that one
+        input's own fields.
         """
         transform_node_id = inputs.plugin.node_id
         if transform_node_id is None:

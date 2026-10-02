@@ -70,7 +70,49 @@ class TestBatchThresholdSummary:
         assert summaries["poor"]["match_count"] == 1
         assert summaries["poor"]["non_match_count"] == 2
 
-    def test_non_numeric_value_raises_type_error(self, ctx: PluginContext) -> None:
+    def test_non_numeric_value_fails_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
+        """A wrong-typed value fails the BATCH with a value-free reason (no coercion).
+
+        elspeth-d5034647f0: the bad row is not skipped and no summary is published
+        over the survivors. The reason names the batch row, the field, and the
+        expected and found types, never the row value.
+        """
+        from elspeth.plugins.transforms.batch_threshold_summary import BatchThresholdSummary
+
+        transform = BatchThresholdSummary(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "value_field": "score",
+                "thresholds": [{"name": "good", "operator": ">=", "value": 0.8}],
+            }
+        )
+        # A missing value before the bad row: the reported index is the BATCH
+        # index, not a position among the valid values.
+        rows = [
+            _make_row({"score": None}),
+            _make_row({"score": 0.9}),
+            _make_row({"score": "high-7f3a"}),
+            _make_row({"score": 0.4}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "score"
+        assert result.reason["expected"] == "numeric (int or float)"
+        assert result.reason["actual_type"] == "str"
+        assert "in row 2" in result.reason["error"]
+        assert "must be numeric (int or float), got str" in result.reason["error"]
+        # The offending VALUE is row content and must not reach the audit trail.
+        assert "high-7f3a" not in repr(sorted(result.reason.items()))
+
+    def test_bool_value_fails_the_whole_batch(self, ctx: PluginContext) -> None:
+        """bool is an int subclass but not a number here: the type() guard rejects it."""
         from elspeth.plugins.transforms.batch_threshold_summary import BatchThresholdSummary
 
         transform = BatchThresholdSummary(
@@ -81,8 +123,14 @@ class TestBatchThresholdSummary:
             }
         )
 
-        with pytest.raises(TypeError, match="must be numeric"):
-            transform.process([_make_row({"score": "high"})], ctx)
+        result = transform.process([_make_row({"score": 0.9}), _make_row({"score": True})], ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason is not None
+        assert result.reason["field"] == "score"
+        assert result.reason["actual_type"] == "bool"
+        assert "in row 1" in result.reason["error"]
 
 
 class TestBatchThresholdSummaryConfig:

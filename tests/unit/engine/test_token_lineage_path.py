@@ -21,6 +21,7 @@ from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.engine.tokens import TokenManager
 from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.unit.engine.conftest import claim_token_for_manager, token_manager_leader
 
 _CONTRACT = SchemaContract(mode="OBSERVED", fields=(), locked=True)
 
@@ -37,12 +38,12 @@ def _root(manager: TokenManager, run_id: str) -> TokenInfo:
 
     source_row = SourceRow.valid({"col": "v"}, contract=_CONTRACT, source_row_index=0)
     return manager.create_initial_token(
-        run_id=run_id,
         source_node_id="source-0",
         row_index=0,
         source_row=source_row,
         source_row_index=0,
         ingest_sequence=0,
+        coordination_token=token_manager_leader(manager, run_id),
     )
 
 
@@ -50,7 +51,13 @@ class TestForkPush:
     def test_fork_children_stack_a_fork_frame(self) -> None:
         manager, run_id = _manager()
         root = _root(manager, run_id)
-        children, fork_group_id = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), run_id)
+        children, fork_group_id = manager.fork_token(
+            root,
+            ["a", "b"],
+            NodeID("gate-0"),
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, root, run_id),
+        )
         for child, branch in zip(children, ["a", "b"], strict=True):
             assert child.lineage_path == (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=branch),)
             assert child.branch_name == branch
@@ -61,13 +68,15 @@ class TestExpandPush:
     def test_expand_inside_fork_branch_stacks_and_accessors_read_the_full_path(self) -> None:
         manager, run_id = _manager()
         root = _root(manager, run_id)
-        (child_a, _child_b), fork_group_id = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), run_id)
-        grandchildren, expand_group_id = manager.expand_token(
-            child_a,
-            [{"v": 1}, {"v": 2}],
-            _CONTRACT,
+        (child_a, _child_b), fork_group_id = manager.fork_token(
+            root,
+            ["a", "b"],
             NodeID("gate-0"),
-            run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, root, run_id),
+        )
+        grandchildren, expand_group_id = manager.expand_token(
+            child_a, [{"v": 1}, {"v": 2}], _CONTRACT, NodeID("gate-0"), member_token=token_manager_leader(manager, run_id).membership
         )
         for grandchild in grandchildren:
             assert grandchild.lineage_path == (
@@ -88,8 +97,16 @@ class TestCoalesceStrictPop:
     def test_merge_pops_exactly_the_shared_fork_frame(self) -> None:
         manager, run_id = _manager()
         root = _root(manager, run_id)
-        children, _fork_group_id = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), run_id)
-        merged, join_group_id = manager.coalesce_tokens(children, PipelineRow({"v": 1}, _CONTRACT), NodeID("gate-0"), run_id)
+        children, _fork_group_id = manager.fork_token(
+            root,
+            ["a", "b"],
+            NodeID("gate-0"),
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, root, run_id),
+        )
+        merged, join_group_id = manager.coalesce_tokens(
+            children, PipelineRow({"v": 1}, _CONTRACT), NodeID("gate-0"), coordination_token=token_manager_leader(manager, run_id)
+        )
         assert merged.lineage_path == ()
         # join_group_id is a merge-event carrier (ruling 20): the tuple's second
         # element is the only in-memory truth — TokenInfo no longer stores it.
@@ -98,10 +115,21 @@ class TestCoalesceStrictPop:
     def test_merge_refuses_a_parent_with_no_fork_frame(self) -> None:
         manager, run_id = _manager()
         root = _root(manager, run_id)
-        children, _fg = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), run_id)
+        children, _fg = manager.fork_token(
+            root,
+            ["a", "b"],
+            NodeID("gate-0"),
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, root, run_id),
+        )
         stray = root  # lineage_path == ()
         with pytest.raises(OrchestrationInvariantError, match="innermost FORK"):
-            manager.coalesce_tokens([children[0], stray], PipelineRow({"v": 1}, _CONTRACT), NodeID("gate-0"), run_id)
+            manager.coalesce_tokens(
+                [children[0], stray],
+                PipelineRow({"v": 1}, _CONTRACT),
+                NodeID("gate-0"),
+                coordination_token=token_manager_leader(manager, run_id),
+            )
 
 
 class TestMemoryDurableConsistency:
@@ -114,8 +142,16 @@ class TestMemoryDurableConsistency:
         register_test_node(setup.data_flow, "run-1", "gate-0", node_type=NodeType.TRANSFORM, plugin_name="passthrough")
         manager = TokenManager(setup.factory.data_flow, step_resolver=lambda node_id: 1)
         root = _root(manager, "run-1")
-        children, _fg = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), "run-1")
-        grandchildren, _eg = manager.expand_token(children[1], [{"v": 1}], _CONTRACT, NodeID("gate-0"), "run-1")
+        children, _fg = manager.fork_token(
+            root,
+            ["a", "b"],
+            NodeID("gate-0"),
+            member_token=token_manager_leader(manager, "run-1").membership,
+            work_item=claim_token_for_manager(manager, root, "run-1"),
+        )
+        grandchildren, _eg = manager.expand_token(
+            children[1], [{"v": 1}], _CONTRACT, NodeID("gate-0"), member_token=token_manager_leader(manager, "run-1").membership
+        )
         for token in (root, *children, *grandchildren):
             with setup.db.engine.connect() as conn:
                 rows = conn.execute(
@@ -134,8 +170,16 @@ class TestJoinCarriers:
     def test_coalesce_tokens_returns_merged_token_and_join_group_id(self) -> None:
         manager, run_id = _manager()
         root = _root(manager, run_id)
-        children, _fg = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), run_id)
-        merged, join_group_id = manager.coalesce_tokens(children, PipelineRow({"v": 1}, _CONTRACT), NodeID("gate-0"), run_id)
+        children, _fg = manager.fork_token(
+            root,
+            ["a", "b"],
+            NodeID("gate-0"),
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, root, run_id),
+        )
+        merged, join_group_id = manager.coalesce_tokens(
+            children, PipelineRow({"v": 1}, _CONTRACT), NodeID("gate-0"), coordination_token=token_manager_leader(manager, run_id)
+        )
         assert merged.token_id
         # join_group_id is a merge-event carrier (ruling 20): the tuple's second
         # element is the only in-memory truth — TokenInfo no longer stores it.
@@ -191,7 +235,13 @@ class TestRowUnionReleasePop:
 
         manager, run_id = _manager()
         root = _root(manager, run_id)
-        children, fork_group_id = manager.fork_token(root, ["a", "b"], NodeID("gate-0"), run_id)
+        children, fork_group_id = manager.fork_token(
+            root,
+            ["a", "b"],
+            NodeID("gate-0"),
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, root, run_id),
+        )
         for child in children:
             assert child.lineage_path == (LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key=child.branch_name),)
 
@@ -211,7 +261,9 @@ class TestRowUnionReleasePop:
 
         manager, run_id = _manager()
         root = _root(manager, run_id)
-        grandchildren, _eg = manager.expand_token(root, [{"v": 1}], _CONTRACT, NodeID("gate-0"), run_id)
+        grandchildren, _eg = manager.expand_token(
+            root, [{"v": 1}], _CONTRACT, NodeID("gate-0"), member_token=token_manager_leader(manager, run_id).membership
+        )
         with pytest.raises(OrchestrationInvariantError, match="no FORK frame"):
             RowUnionExecutor._pop_released_group(list(grandchildren))
 
@@ -224,8 +276,16 @@ class TestRowUnionReleasePop:
 
         manager, run_id = _manager()
         root = _root(manager, run_id)
-        (control, treatment), fork_group_id = manager.fork_token(root, ["control", "treatment"], NodeID("gate-0"), run_id)
-        (treatment_child,), expand_group_id = manager.expand_token(treatment, [{"v": 1}], _CONTRACT, NodeID("gate-0"), run_id)
+        (control, treatment), fork_group_id = manager.fork_token(
+            root,
+            ["control", "treatment"],
+            NodeID("gate-0"),
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, root, run_id),
+        )
+        (treatment_child,), expand_group_id = manager.expand_token(
+            treatment, [{"v": 1}], _CONTRACT, NodeID("gate-0"), member_token=token_manager_leader(manager, run_id).membership
+        )
         assert treatment_child.lineage_path == (
             LineageFrame(kind=FrameKind.FORK, group_id=fork_group_id, member_key="treatment"),
             LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=treatment_child.token_id),

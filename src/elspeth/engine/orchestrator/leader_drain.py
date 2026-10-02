@@ -1,6 +1,6 @@
 """LeaderDrainCoordinator: fresh-run phase sequencing for the leader worker.
 
-Extracted from ``Orchestrator._execute_run`` (filigree elspeth-9e71ae82a4).
+Extracted from ``Orchestrator._execute_run`` (archived issue elspeth-9e71ae82a4).
 The facade keeps a thin ``_execute_run`` delegator (characterization tests
 drive it directly) and injects ``register_graph_nodes_and_edges`` per call as
 a bound method, so tests that stub that method on the orchestrator instance
@@ -27,7 +27,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-from elspeth.contracts import RunStatus
+from elspeth.contracts import RunMode, RunStatus
 from elspeth.contracts.cli import ProgressEvent
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.errors import (
@@ -36,6 +36,7 @@ from elspeth.contracts.errors import (
 )
 from elspeth.contracts.events import PhaseCompleted, PipelinePhase
 from elspeth.contracts.types import NodeID
+from elspeth.engine.executors.replay_sink_effect import verify_virtual_sink_members
 from elspeth.engine.orchestrator.aggregation import flush_remaining_aggregation_buffers
 from elspeth.engine.orchestrator.cleanup import cleanup_plugins
 from elspeth.engine.orchestrator.leader_follower_drain import LeaderFollowerDrain
@@ -110,6 +111,7 @@ class LeaderDrainCoordinator:
         shutdown_event: threading.Event | None = None,
         coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
+        before_plugin_effects: Callable[[], None] | None = None,
         register_graph_nodes_and_edges: RegisterGraphNodesAndEdges,
     ) -> RunResult:
         """Execute the run using the execution graph.
@@ -148,6 +150,8 @@ class LeaderDrainCoordinator:
         artifacts = register_graph_nodes_and_edges(factory, run_id, config, graph, coordination_token)
 
         # 2. Initialize context + processor
+        if before_plugin_effects is not None:
+            before_plugin_effects()
         run_ctx = self._context_factory.initialize_run_context(
             factory,
             run_id,
@@ -355,6 +359,15 @@ class LeaderDrainCoordinator:
 
                 _leader_follower_drain.drain_pending_sink_work(_drain_and_flush)
 
+                if loop_ctx.ctx.run_mode is not RunMode.LIVE:
+                    source_run_id = loop_ctx.ctx.replay_from
+                    if source_run_id is None:
+                        raise OrchestrationInvariantError("replay sink verification requires a source run")
+                    verify_virtual_sink_members(factory, source_run_id=source_run_id, current_run_id=run_id, mode=loop_ctx.ctx.run_mode)
+                    if loop_ctx.ctx.call_mode_session is None:
+                        raise OrchestrationInvariantError("replay/verify call session is missing at run completion")
+                    loop_ctx.ctx.call_mode_session.assert_complete()
+
             # ADR-019 Phase 4: deferred cross-table invariant sweep.
             #
             # AUDIT-TRAIL DURABILITY CONTRACT:
@@ -529,7 +542,16 @@ def run_end_of_input_barrier_flush(
         # roster settles through intake (arrival or loss replay); a group
         # that never settles is the non-convergence below, named as such.
         if not processor.has_blocked_barrier_work():
-            return
+            if collector_executor is not None:
+                # An EOF aggregation flush can emit a zero-member scope after
+                # this round's first intake. No child has a BLOCKED row, so
+                # the ordinary loop predicate cannot detect that pending
+                # group. One final intake discovers its durable opener record
+                # before terminal run accounting, including on resume.
+                intake_results = processor.run_barrier_intake(ctx)
+                accumulate_row_outcomes(intake_results, counters, pending_tokens)
+            if not processor.has_blocked_barrier_work():
+                return
 
     collector_detail = ""
     if collector_executor is not None:

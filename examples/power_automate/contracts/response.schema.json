@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elspeth.dev/schemas/power-automate/v1/response",
+  "description": "Exact v1 response variants. not_applied is status-only. UTF-8 identifier byte limits, maximum JSON depth 64, requested page size and expected delivery identities are supplementary runtime checks; x-maxUtf8Bytes is an annotation. Read rows are arbitrary JSON candidates admitted individually by source row policy.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "elspeth.power-automate.v1"
+        },
+        "snapshot_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "x-maxUtf8Bytes": 256,
+          "pattern": "\\S"
+        },
+        "rows": {
+          "type": "array",
+          "items": {},
+          "maxItems": 1000
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "x-maxUtf8Bytes": 4096,
+              "pattern": "\\S"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "protocol",
+        "snapshot_id",
+        "rows",
+        "next_cursor"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "elspeth.power-automate.v1"
+        },
+        "delivery_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "payload_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "state": {
+          "const": "applied"
+        },
+        "receipt_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "x-maxUtf8Bytes": 256,
+          "pattern": "\\S"
+        },
+        "flow_run_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "x-maxUtf8Bytes": 256,
+          "pattern": "\\S"
+        }
+      },
+      "required": [
+        "protocol",
+        "delivery_id",
+        "payload_sha256",
+        "state",
+        "receipt_id",
+        "flow_run_id"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "elspeth.power-automate.v1"
+        },
+        "delivery_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "payload_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "state": {
+          "const": "not_applied"
+        }
+      },
+      "required": [
+        "protocol",
+        "delivery_id",
+        "payload_sha256",
+        "state"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "elspeth.power-automate.v1"
+        },
+        "delivery_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "payload_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "state": {
+          "const": "unknown"
+        }
+      },
+      "required": [
+        "protocol",
+        "delivery_id",
+        "payload_sha256",
+        "state"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "elspeth.power-automate.v1"
+        },
+        "delivery_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "payload_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "state": {
+          "const": "rejected"
+        },
+        "reason_code": {
+          "enum": [
+            "validation_failed",
+            "policy_denied",
+            "target_conflict"
+          ]
+        }
+      },
+      "required": [
+        "protocol",
+        "delivery_id",
+        "payload_sha256",
+        "state",
+        "reason_code"
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

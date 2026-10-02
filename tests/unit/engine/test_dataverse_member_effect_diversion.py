@@ -32,7 +32,7 @@ from elspeth.engine.executors.sink_effects import (
 from elspeth.plugins.infrastructure.clients.dataverse import DataverseClientError, DataversePageResponse
 from elspeth.plugins.sinks.dataverse import DataverseSink
 from tests.fixtures.base_classes import inject_write_failure
-from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, leader_token_for, make_factory, make_landscape_db, register_test_node
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_request
 
 _CONFIG: dict[str, Any] = {
@@ -102,19 +102,18 @@ def _build_request(factory, run_id: str, source_id: str, sink_id: str) -> SinkEf
     ]
     candidates: list[SinkEffectMemberCandidate] = []
     for ordinal, payload in enumerate(rows):
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run_id),
             source_node_id=source_id,
             row_index=ordinal,
             data=payload,
             source_row_index=ordinal,
             ingest_sequence=ordinal,
         )
-        token = factory.data_flow.create_token(row.row_id)
         factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink_id,
-            run_id=run_id,
+            member_token=leader_coordination_token(factory, run_id).membership,
             step_index=0,
             input_data=payload,
         )

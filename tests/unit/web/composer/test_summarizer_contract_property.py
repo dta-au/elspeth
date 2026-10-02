@@ -29,7 +29,7 @@ class of test (settings(max_examples=50, deadline=None)).
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, get_type_hints
 
 import pytest
@@ -118,6 +118,23 @@ def _collect_summarizer_call_sites() -> list[tuple[str, str, Callable[[Any], str
 
 _SUMMARIZER_CALL_SITES = _collect_summarizer_call_sites()
 
+# The open argument/repair leaves originate in decoded JSON. ``from_type(object)``
+# explores arbitrary registered Python types (including the process environment
+# and unrelated model constructors), which are not reachable wire values.
+_JSON_VALUES = st.recursive(
+    st.none() | st.booleans() | st.integers() | st.floats(allow_nan=False, allow_infinity=False) | st.text(),
+    lambda children: st.lists(children, max_size=5) | st.dictionaries(st.text(), children, max_size=5),
+    max_leaves=20,
+)
+
+
+def _summarizer_inputs(input_type: type | object) -> st.SearchStrategy[Any]:
+    if input_type is object:
+        return _JSON_VALUES
+    if input_type in (dict[str, Any], Mapping[str, object]):
+        return st.dictionaries(st.text(), _JSON_VALUES, max_size=5)
+    return st.from_type(input_type)
+
 
 @pytest.mark.parametrize(
     ("label", "surface", "summarizer", "input_type"),
@@ -138,7 +155,7 @@ def test_summarizer_returns_str_and_does_not_raise(
     summarizer, surface, and label.
     """
 
-    @given(value=st.from_type(input_type))  # type: ignore[arg-type]
+    @given(value=_summarizer_inputs(input_type))
     @settings(max_examples=50, deadline=None)
     def check(value: Any) -> None:
         result = summarizer(value)

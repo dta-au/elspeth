@@ -14,7 +14,7 @@ from elspeth.contracts import NodeType
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.factory import RecorderFactory
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 
 
 @pytest.fixture
@@ -32,7 +32,7 @@ def factory() -> RecorderFactory:
 
     # Register source_node to satisfy FK constraint on validation_errors
     fac.data_flow.register_node(
-        run_id="test-run",
+        coordination_token=leader_coordination_token(fac, "test-run"),
         plugin_name="test_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -57,7 +57,12 @@ class TestValidationErrorNonCanonical:
 
         from elspeth.core.canonical import stable_hash
 
-        ctx = make_context(run_id="test-run", node_id="source_node", landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            run_id="test-run",
+            node_id="source_node",
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         row_value = 42
         error_msg = "Expected dict, got int"
@@ -102,7 +107,12 @@ class TestValidationErrorNonCanonical:
 
         from elspeth.contracts.hashing import repr_hash
 
-        ctx = make_context(run_id="test-run", node_id="source_node", landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            run_id="test-run",
+            node_id="source_node",
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         row_value = {"value": float("nan")}
         error_msg = "Row contains NaN"
@@ -134,7 +144,12 @@ class TestValidationErrorNonCanonical:
 
     def test_multiple_non_canonical_rows(self, factory: RecorderFactory) -> None:
         """Multiple non-canonical rows should all be recorded."""
-        ctx = make_context(run_id="test-run", node_id="source_node", landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            run_id="test-run",
+            node_id="source_node",
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         tokens = []
         test_rows = [

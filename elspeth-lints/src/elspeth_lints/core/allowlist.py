@@ -1149,6 +1149,57 @@ def verify_entry_binding_against_finding(entry: AllowlistEntry, *, file_path: st
             )
 
 
+def validate_persisted_judge_verdicts(
+    judge_verdict: JudgeVerdict | None,
+    judge_model_verdict: JudgeVerdict | None,
+    *,
+    context: str,
+) -> None:
+    """Enforce the verdict invariants shared by allowlists and counter snapshots.
+
+    Pre-judge entries' other metadata is checked by the atomic validator.
+    A BLOCKED model verdict is persistable only with an operator override;
+    the operator action itself can never be a model verdict.
+    """
+    if judge_verdict is JudgeVerdict.BLOCKED:
+        raise ValueError(
+            f"{context}: judge_verdict is BLOCKED; BLOCKED is an in-memory runtime "
+            "verdict that means the entry was rejected and NOT written. A persisted "
+            "BLOCKED entry is corruption (botched hand-edit, partial revert, tampering)."
+        )
+    if judge_model_verdict is JudgeVerdict.BLOCKED and judge_verdict is not JudgeVerdict.OVERRIDDEN_BY_OPERATOR:
+        raise ValueError(
+            f"{context}: judge_model_verdict is BLOCKED but judge_verdict is "
+            f"{judge_verdict.value if judge_verdict is not None else 'None'!r}; "
+            "BLOCKED on judge_model_verdict is only valid when the entry is "
+            "OVERRIDDEN_BY_OPERATOR (recording what the model said pre-override)."
+        )
+    if judge_model_verdict is JudgeVerdict.OVERRIDDEN_BY_OPERATOR:
+        raise ValueError(
+            f"{context}: judge_model_verdict is OVERRIDDEN_BY_OPERATOR; the model verdict "
+            "may be ACCEPTED or BLOCKED but never the operator override action."
+        )
+    if judge_verdict is None:
+        return
+    if judge_verdict is JudgeVerdict.OVERRIDDEN_BY_OPERATOR:
+        if judge_model_verdict is None:
+            raise ValueError(
+                f"{context}: judge_verdict is OVERRIDDEN_BY_OPERATOR but "
+                "judge_model_verdict is absent; override entries must record what the "
+                "underlying model said so override-rate-by-underlying-verdict remains "
+                "queryable. An override with no recorded model verdict is fabrication."
+            )
+    elif judge_model_verdict is not None:
+        raise ValueError(
+            f"{context}: judge_verdict is {judge_verdict.value!r} (non-"
+            f"override) but judge_model_verdict is set "
+            f"({judge_model_verdict.value!r}); for non-override entries the "
+            "model's verdict and the entry's verdict are identical by "
+            "construction, so recording a separate judge_model_verdict "
+            "fabricates a divergence that doesn't exist."
+        )
+
+
 def _validate_judge_metadata_atomic(entry: AllowlistEntry, *, context: str) -> None:
     """Crash if an entry's judge-metadata cluster is internally inconsistent.
 
@@ -1192,8 +1243,9 @@ def _validate_judge_metadata_atomic(entry: AllowlistEntry, *, context: str) -> N
        is also None — a pre-judge-era entry MUST NOT carry stray model
        metadata or binding fields; that would be evidence of partial
        revert / merge corruption.
-    5. ``judge_verdict`` and ``judge_model_verdict`` must never be
-       ``BLOCKED``. ``BLOCKED`` is the in-memory runtime verdict the
+    5. ``judge_verdict`` must never be ``BLOCKED``; ``judge_model_verdict``
+       may be ``BLOCKED`` only on an override and must never itself be
+       ``OVERRIDDEN_BY_OPERATOR``. ``BLOCKED`` is the runtime verdict the
        cicd-judge gate uses to reject a candidate suppression; by
        contract, a ``BLOCKED`` verdict means the entry was NOT written.
        Defense-in-depth against ``_optional_judge_verdict``: even if the
@@ -1245,26 +1297,7 @@ def _validate_judge_metadata_atomic(entry: AllowlistEntry, *, context: str) -> N
     cluster: a pre-judge entry must not carry a stray signature, and a
     present signature must have a v1 or v2 prefix + 64-hex digest shape.
     """
-    # Invariant 5 (defense-in-depth vs _optional_judge_verdict): neither
-    # judge_verdict nor judge_model_verdict may be BLOCKED on a persisted
-    # entry. BLOCKED is an in-memory runtime verdict; persisted BLOCKED
-    # is corruption.
-    if entry.judge_verdict is JudgeVerdict.BLOCKED:
-        raise ValueError(
-            f"{context}: judge_verdict is BLOCKED; BLOCKED is an in-memory runtime "
-            "verdict that means the entry was rejected and NOT written. A persisted "
-            "BLOCKED entry is corruption (botched hand-edit, partial revert, tampering)."
-        )
-    if entry.judge_model_verdict is JudgeVerdict.BLOCKED and entry.judge_verdict is not JudgeVerdict.OVERRIDDEN_BY_OPERATOR:
-        # An override entry legitimately carries judge_model_verdict=BLOCKED
-        # to record what the model originally said before the operator
-        # overrode. Outside that one shape, a BLOCKED in this field is corrupt.
-        raise ValueError(
-            f"{context}: judge_model_verdict is BLOCKED but judge_verdict is "
-            f"{entry.judge_verdict.value if entry.judge_verdict is not None else 'None'!r}; "
-            "BLOCKED on judge_model_verdict is only valid when the entry is "
-            "OVERRIDDEN_BY_OPERATOR (recording what the model said pre-override)."
-        )
+    validate_persisted_judge_verdicts(entry.judge_verdict, entry.judge_model_verdict, context=context)
 
     # Invariant 4: pre-judge entries are fully empty in the judge cluster
     # AND must not carry binding fields (file_fingerprint / ast_path).
@@ -1401,27 +1434,6 @@ def _validate_judge_metadata_atomic(entry: AllowlistEntry, *, context: str) -> N
         )
     if entry.judge_confidence is not None and not 0.0 <= entry.judge_confidence <= 1.0:
         raise ValueError(f"{context}: judge_confidence must be between 0.0 and 1.0; got {entry.judge_confidence!r}")
-
-    # Invariants 1 and 2: judge_model_verdict's presence is gated by
-    # whether this is an override entry.
-    if entry.judge_verdict is JudgeVerdict.OVERRIDDEN_BY_OPERATOR:
-        if entry.judge_model_verdict is None:
-            raise ValueError(
-                f"{context}: judge_verdict is OVERRIDDEN_BY_OPERATOR but "
-                "judge_model_verdict is absent; override entries must record what the "
-                "underlying model said so override-rate-by-underlying-verdict remains "
-                "queryable. An override with no recorded model verdict is fabrication."
-            )
-    else:
-        if entry.judge_model_verdict is not None:
-            raise ValueError(
-                f"{context}: judge_verdict is {entry.judge_verdict.value!r} (non-"
-                f"override) but judge_model_verdict is set "
-                f"({entry.judge_model_verdict.value!r}); for non-override entries the "
-                "model's verdict and the entry's verdict are identical by "
-                "construction, so recording a separate judge_model_verdict "
-                "fabricates a divergence that doesn't exist."
-            )
 
 
 def _validate_audit_review_context(entry: AllowlistEntry, *, context: str) -> None:

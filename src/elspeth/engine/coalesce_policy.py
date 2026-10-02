@@ -1,6 +1,6 @@
 """Coalesce policy matrix: the single source of merge/fail/wait verdicts.
 
-Extracted from ``CoalesceExecutor`` (filigree elspeth-2d43291212). The
+Extracted from ``CoalesceExecutor`` (archived issue elspeth-2d43291212). The
 executor used to dispatch on ``settings.policy`` in three independent
 places, each re-expressing the same threshold matrix:
 

@@ -43,7 +43,7 @@ function pendingEvent(id: string): InterpretationEvent {
     hash_domain_version: null,
     runtime_model_identifier_at_resolve: null,
     runtime_model_version_at_resolve: null,
-    resolved_prompt_template_hash: null,
+    approved_prompt_artifact_hash: null,
   };
 }
 
@@ -139,28 +139,6 @@ describe("useCollapsedAuthoringStatus", () => {
       tone: "error",
     });
   });
-
-  it.each(["guidedChatPending", "guidedResponsePending"] as const)(
-    "shows busy while %s is true",
-    (field) => {
-      const { result, rerender } = renderHook(
-        ({ collapsed }) =>
-          useCollapsedAuthoringStatus({
-            activeSessionId: SESSION_A,
-            authoringCollapsed: collapsed,
-          }),
-        { initialProps: { collapsed: false } },
-      );
-      rerender({ collapsed: true });
-
-      act(() => useSessionStore.setState({ [field]: true }));
-
-      expect(result.current).toEqual({
-        text: "Authoring in progress",
-        tone: "busy",
-      });
-    },
-  );
 
   it("reports new messages and acknowledgements received while collapsed", () => {
     const { result, rerender } = renderHook(

@@ -5,6 +5,9 @@ Task 4 of Phase 1: Core Contracts Implementation.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
+import numpy as np
 import pytest
 
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
@@ -426,7 +429,8 @@ class TestSchemaContractMutation:
     def test_with_field_unlocked_rejects_duplicate(self) -> None:
         """with_field() rejects duplicate field even when unlocked.
 
-        Per CLAUDE.md: Adding duplicate is a bug in caller code.
+        Per docs/guides/data-trust-and-error-handling.md §The Decision Test:
+        adding a duplicate is a bug in caller code, so let it crash.
         Prevents broken O(1) lookup invariant from duplicate fields.
         """
         fc = make_field("amount", int, original_name="'Amount'", required=True, source="declared")
@@ -513,6 +517,72 @@ class TestSchemaContractValidation:
         )
         violations = contract.validate({"count": np.int64(42)})
         assert violations == []  # np.int64 normalizes to int
+
+    @pytest.mark.parametrize(
+        ("declared", "value", "admitted"),
+        [
+            pytest.param(float, 3, True, id="int-satisfies-float"),
+            pytest.param(float, np.int64(3), True, id="numpy-int-satisfies-float"),
+            pytest.param(float, 3.5, True, id="float-satisfies-float"),
+            pytest.param(float, True, False, id="bool-never-satisfies-float"),
+            pytest.param(float, np.bool_(True), False, id="numpy-bool-never-satisfies-float"),
+            pytest.param(int, True, False, id="bool-never-satisfies-int"),
+            pytest.param(int, 3.0, False, id="float-never-satisfies-int"),
+            pytest.param(float, Decimal("1.5"), False, id="decimal-under-float-stays-open"),
+        ],
+    )
+    def test_validate_admits_an_int_for_a_float_declaration_and_nothing_else_widens(self, declared, value, admitted) -> None:
+        """The ONE admission rule (ruling 2026-09-25, C3): exact type, except an int satisfies float.
+
+        This matches pydantic strict for int; bool stays excluded (pydantic
+        strict admits numpy.bool_ for float, this rule does not), and the
+        value is never converted.
+        """
+        from elspeth.contracts.errors import TypeMismatchViolation
+        from elspeth.contracts.schema_contract import declared_type_admits
+
+        row = {"x": value}
+        contract = SchemaContract(
+            mode="FIXED",
+            fields=(make_field("x", declared, original_name="X", required=True, source="declared"),),
+            locked=True,
+        )
+        violations = contract.validate(row)
+        if admitted:
+            assert violations == []
+            assert row["x"] is value
+        else:
+            [violation] = violations
+            assert type(violation) is TypeMismatchViolation
+            assert violation.expected_type is declared
+        assert declared_type_admits(float, int) is True
+        assert declared_type_admits(int, float) is False
+
+    @pytest.mark.parametrize(
+        ("declared", "actual", "admitted"),
+        [
+            pytest.param("float", "int", True, id="int-under-float"),
+            pytest.param("float", "float", True, id="exact"),
+            pytest.param("float", "bool", False, id="bool-under-float"),
+            pytest.param("int", "bool", False, id="bool-under-int"),
+            pytest.param("int", "float", False, id="float-under-int"),
+            pytest.param("str", "int", False, id="int-under-str"),
+        ],
+    )
+    def test_the_type_name_twin_is_the_same_rule(self, declared: str, actual: str, admitted: bool) -> None:
+        """``declared_type_name_admits`` answers the composer's type-NAME question with the value rule itself."""
+        from elspeth.contracts.schema_contract import declared_type_admits, declared_type_name_admits
+        from elspeth.contracts.type_normalization import CONTRACT_TYPE_MAP
+
+        assert declared_type_name_admits(declared, actual) is admitted
+        assert declared_type_admits(CONTRACT_TYPE_MAP[declared], CONTRACT_TYPE_MAP[actual]) is admitted
+
+    def test_the_type_name_twin_refuses_a_name_the_caller_should_have_abstained_on(self) -> None:
+        """A schema DSL ``any`` is an abstention the caller makes before asking; asking anyway is a bug."""
+        from elspeth.contracts.schema_contract import declared_type_name_admits
+
+        with pytest.raises(KeyError):
+            declared_type_name_admits("float", "any")
 
     def test_validate_none_matches_nonetype(self) -> None:
         """None value matches type(None) contract."""
@@ -727,7 +797,8 @@ class TestSchemaContractCheckpoint:
     def test_from_checkpoint_missing_hash_crashes(self, sample_contract: SchemaContract) -> None:
         """from_checkpoint() crashes on missing version_hash (Tier 1 integrity).
 
-        Per CLAUDE.md Tier 1: "Bad data in the audit trail = crash immediately."
+        Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model, Tier 1: "Bad data in the audit trail = crash immediately."
         to_checkpoint_format() ALWAYS writes version_hash, so if it's missing
         that's corruption - not an older format to silently accept.
         """
@@ -799,7 +870,8 @@ class TestSchemaContractCheckpoint:
     def test_from_checkpoint_detects_locked_tampering(self) -> None:
         """from_checkpoint() detects tampering with 'locked' flag.
 
-        Per CLAUDE.md Tier 1: integrity hash must cover ALL serialized state.
+        Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model, Tier 1: the integrity hash must cover ALL serialized state.
         Flipping locked=False could allow type inference on resume.
         """
         contract = SchemaContract(
@@ -820,7 +892,8 @@ class TestSchemaContractCheckpoint:
     def test_from_checkpoint_detects_source_tampering(self) -> None:
         """from_checkpoint() detects tampering with field 'source'.
 
-        Per CLAUDE.md Tier 1: integrity hash must cover ALL serialized state.
+        Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        Model, Tier 1: the integrity hash must cover ALL serialized state.
         Changing source could falsify audit trail (declared vs inferred).
         """
         from elspeth.contracts.errors import AuditIntegrityError
@@ -873,18 +946,19 @@ class TestSchemaContractCheckpoint:
 class TestSchemaContractMergeForBatch:
     """Test merge_for_batch: describing a heterogeneous batch of sibling contracts.
 
-    merge_for_batch produces a single contract that truthfully describes N
-    sibling row contracts bound for one sink (possibly from different pipeline
-    branches/paths). AND-required and exclusive-field forcing are the correct
-    intersection semantics here: nothing guarantees which siblings appear in a
-    batch. Coalesce union merges use the policy-aware merge_union_contracts
-    instead.
+    merge_for_batch is the J1 description join (ADR-050): a single contract
+    that truthfully describes N sibling row contracts bound for one sink
+    (possibly from different sources, branches or paths). AND-required and
+    exclusive-field forcing are the correct intersection semantics here:
+    nothing guarantees which siblings appear in a batch. A field the
+    producers type differently is described as ``object``; the join never
+    raises. Coalesce union merges use the policy-aware, RAISING
+    merge_union_contracts instead, and a node's own recorded contract folds
+    through the raising merge_for_node_evolution.
     """
 
     def test_merge_same_field_same_type(self) -> None:
         """Same field, same type merges successfully."""
-        from elspeth.contracts.errors import ContractMergeError  # noqa: F401 - imported for test setup
-
         c1 = SchemaContract(
             mode="FLEXIBLE",
             fields=(make_field("x", int, original_name="X", required=True, source="declared"),),
@@ -900,10 +974,13 @@ class TestSchemaContractMergeForBatch:
         assert len(merged.fields) == 1
         assert merged.fields[0].python_type is int
 
-    def test_merge_different_types_raises(self) -> None:
-        """Different types raise ContractMergeError."""
-        from elspeth.contracts.errors import ContractMergeError
+    def test_merge_different_types_describes_the_field_as_object(self) -> None:
+        """Two producers typing one field differently: the batch description is ``object`` (J1, ADR-050).
 
+        Before ADR-050 this raised ContractMergeError, and the sink turned it
+        into a FrameworkBugError that ended the run — two observed sources
+        disagreeing on ``id`` could not share a sink.
+        """
         c1 = SchemaContract(
             mode="FLEXIBLE",
             fields=(make_field("x", int, original_name="X", required=True, source="declared"),),
@@ -914,8 +991,54 @@ class TestSchemaContractMergeForBatch:
             fields=(make_field("x", str, original_name="X", required=True, source="declared"),),
             locked=True,
         )
+        merged = c1.merge_for_batch(c2)
+
+        field = merged.get_field("x")
+        assert field.python_type is object
+        assert field.required is True
+        assert field.nullable is False
+        assert field.original_name == "X"
+        # Sound: every contributing row validates against the join.
+        assert merged.validate({"x": 1}) == []
+        assert merged.validate({"x": "one"}) == []
+
+    def test_merge_int_and_float_or_bool_and_int_are_different_types(self) -> None:
+        """``int ⊔ float`` and ``bool ⊔ int`` are ``object``: validate() compares exact types."""
+        for type_a, type_b in ((int, float), (bool, int)):
+            c1 = SchemaContract(mode="OBSERVED", fields=(make_field("x", type_a),), locked=True)
+            c2 = SchemaContract(mode="OBSERVED", fields=(make_field("x", type_b),), locked=True)
+            assert c1.merge_for_batch(c2).get_field("x").python_type is object
+
+    def test_merge_original_name_disagreement_falls_back_to_identity(self) -> None:
+        """Carriers spelling the original header differently: identity, whichever arrives first."""
+        c1 = SchemaContract(mode="OBSERVED", fields=(make_field("x", int, original_name="X"),), locked=True)
+        c2 = SchemaContract(mode="OBSERVED", fields=(make_field("x", int, original_name="x_raw"),), locked=True)
+        assert c1.merge_for_batch(c2).get_field("x").original_name == "x"
+        assert c2.merge_for_batch(c1).get_field("x").original_name == "x"
+        assert c1.merge_for_batch(c2).version_hash() == c2.merge_for_batch(c1).version_hash()
+
+    def test_merge_for_node_evolution_raises_on_a_type_conflict(self) -> None:
+        """A node's own record never joins types: a conflict is ContractMergeError (the writer re-raises FrameworkBugError)."""
+        from elspeth.contracts.errors import ContractMergeError
+
+        recorded = SchemaContract(mode="OBSERVED", fields=(make_field("x", int),), locked=True)
+        emitted = SchemaContract(mode="OBSERVED", fields=(make_field("x", str),), locked=True)
         with pytest.raises(ContractMergeError, match="conflicting types"):
-            c1.merge_for_batch(c2)
+            recorded.merge_for_node_evolution(emitted)
+
+    def test_merge_for_node_evolution_unions_the_field_set(self) -> None:
+        """A field absent from one emission folds in as optional and nullable; a shared field keeps its type."""
+        recorded = SchemaContract(mode="OBSERVED", fields=(make_field("x", int, required=True),), locked=True)
+        emitted = SchemaContract(
+            mode="OBSERVED",
+            fields=(make_field("x", int, required=True), make_field("y", str, required=True)),
+            locked=True,
+        )
+        evolved = recorded.merge_for_node_evolution(emitted)
+        assert evolved.get_field("x").python_type is int
+        assert evolved.get_field("x").required is True
+        assert evolved.get_field("y").required is False
+        assert evolved.get_field("y").nullable is True
 
     def test_merge_field_only_in_one_path_becomes_optional(self) -> None:
         """Field in only one path becomes optional (required=False)."""

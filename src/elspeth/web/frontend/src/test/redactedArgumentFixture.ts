@@ -30,6 +30,8 @@ export interface RedactedArgumentCase {
   arguments: Record<string, unknown>;
   /** What `redact_tool_call_arguments` returned — what the UI really gets. */
   redacted: Record<string, unknown>;
+  /** The real proposal builder's summary, independently of assistant prose. */
+  proposal_summary: string;
 }
 
 interface RedactedArgumentFixture {

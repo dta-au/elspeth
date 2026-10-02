@@ -9,6 +9,7 @@ B5: Pipeline diff/change summary tool
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -38,10 +39,13 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools import (
     execute_tool as _execute_tool,
 )
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.session_fences import fenced_operation_context
 
 EXPECTED_REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
 
@@ -174,7 +178,7 @@ def execute_tool(
 
 
 @pytest.fixture()
-def blob_env(tmp_path: Path) -> dict[str, Any]:
+def blob_env(tmp_path: Path) -> Iterator[dict[str, Any]]:
     """Create a temporary session database and data directory for blob tests.
 
     Inserts a real ``sessions`` row so FK-enforced blob inserts succeed.
@@ -188,8 +192,12 @@ def blob_env(tmp_path: Path) -> dict[str, Any]:
 
     engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
+        ensure_test_identity(conn, identity_id="other-user")
 
-    session_id = "test-session-001"
+    session_id = str(uuid4())
+    other_session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
@@ -202,15 +210,33 @@ def blob_env(tmp_path: Path) -> dict[str, Any]:
                 updated_at=now,
             )
         )
+        conn.execute(
+            sessions_table.insert().values(
+                id=other_session_id,
+                user_id="other-user",
+                auth_provider_type="local",
+                title="Other Session",
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     (data_dir / "blobs").mkdir()
-    return {
-        "engine": engine,
-        "data_dir": str(data_dir),
-        "session_id": session_id,
-    }
+    with (
+        fenced_operation_context(engine, session_id) as operation,
+        fenced_operation_context(engine, other_session_id) as other_operation,
+    ):
+        yield {
+            "engine": engine,
+            "data_dir": str(data_dir),
+            "session_id": session_id,
+            "operation": operation,
+            "authority": SQLiteLocalSessionOperationAuthority(engine),
+            "other_session_id": other_session_id,
+            "other_operation": other_operation,
+        }
 
 
 # ── B1: Blob CRUD ──────────────────────────────────────────────────────
@@ -228,6 +254,8 @@ class TestCreateBlob:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert result.success is True
         assert result.data["filename"] == "urls.csv"
@@ -258,6 +286,8 @@ class TestCreateBlob:
                 data_dir=blob_env["data_dir"],
                 session_engine=blob_env["engine"],
                 session_id=blob_env["session_id"],
+                session_operation_context=blob_env["operation"],
+                session_operation_authority=blob_env["authority"],
             )
         assert exc_info.value.argument == "mime_type"
         assert "one of:" in exc_info.value.expected
@@ -274,7 +304,7 @@ class TestCreateBlob:
             catalog,
         )
         assert result.success is False
-        assert "session context" in result.data["error"]
+        assert "session context" in result.validation.errors[0].message
 
     def test_writes_file_to_disk(self, blob_env: dict[str, Any]) -> None:
         state = _empty_state()
@@ -288,6 +318,8 @@ class TestCreateBlob:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         blob_id = result.data["blob_id"]
         # Verify file exists on disk under session subdirectory
@@ -311,6 +343,8 @@ class TestUpdateBlob:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         blob_id = create_result.data["blob_id"]
         # Update
@@ -319,8 +353,11 @@ class TestUpdateBlob:
             {"blob_id": blob_id, "content": "new content"},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert update_result.success is True
         assert update_result.data["size_bytes"] == len(b"new content")
@@ -334,14 +371,17 @@ class TestUpdateBlob:
             {"blob_id": "nonexistent", "content": "x"},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert result.success is False
         # update_blob validates blob_id as a canonical UUID at the Tier-3
         # boundary before the row lookup, so a non-UUID literal surfaces the
         # more specific "not a valid UUID" repair hint rather than "not found".
-        assert "is not a valid UUID" in result.data["error"]
+        assert "is not a valid UUID" in result.validation.errors[0].message
 
 
 class TestDeleteBlob:
@@ -357,6 +397,8 @@ class TestDeleteBlob:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         blob_id = create_result.data["blob_id"]
         # Delete
@@ -365,8 +407,11 @@ class TestDeleteBlob:
             {"blob_id": blob_id},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert delete_result.success is True
         assert delete_result.data["deleted"] is True
@@ -392,6 +437,8 @@ class TestGetBlobContent:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         blob_id = create_result.data["blob_id"]
         get_result = execute_tool(
@@ -399,8 +446,11 @@ class TestGetBlobContent:
             {"blob_id": blob_id},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert get_result.success is True
         assert get_result.data["content"] == content
@@ -414,8 +464,11 @@ class TestGetBlobContent:
             {"blob_id": "ghost"},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert result.success is False
 
@@ -676,10 +729,9 @@ class TestDiffPipelineTool:
         catalog = _mock_catalog()
         result = execute_tool("diff_pipeline", {}, state, catalog)
         assert result.success is False
-        assert "No baseline" in result.data["error"]
-        assert result.data["error_code"] == "diff_baseline_unavailable"
-        assert "current_version" not in result.data
+        assert "No baseline" in result.validation.errors[0].message
         assert result.validation.errors[0].error_code == "diff_baseline_unavailable"
+        assert result.data is None
 
     def test_returns_changes_with_baseline(self) -> None:
         s1 = _empty_state()
@@ -722,6 +774,8 @@ class TestCreateBlobSecurity:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert result.success is True
         # Sanitized filename should be just the basename
@@ -743,6 +797,8 @@ class TestCreateBlobSecurity:
                 data_dir=blob_env["data_dir"],
                 session_engine=blob_env["engine"],
                 session_id=blob_env["session_id"],
+                session_operation_context=blob_env["operation"],
+                session_operation_authority=blob_env["authority"],
             )
         assert exc_info.value.argument == "filename"
         # The original sanitize_filename ValueError is preserved on __cause__.
@@ -760,6 +816,8 @@ class TestCreateBlobSecurity:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert len(result.data["content_hash"]) == 64
 
@@ -777,6 +835,8 @@ class TestCreateBlobSecurity:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         # Should be parseable as a standard UUID (36-char with hyphens)
         UUID(result.data["blob_id"])
@@ -795,14 +855,19 @@ class TestGetBlobContentTruncation:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         get_result = execute_tool(
             "get_blob_content",
             {"blob_id": create_result.data["blob_id"]},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert get_result.success is True
         assert get_result.data["truncated"] is True
@@ -821,6 +886,8 @@ class TestUpdateBlobFileOnDisk:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         blob_id = create_result.data["blob_id"]
         execute_tool(
@@ -828,8 +895,11 @@ class TestUpdateBlobFileOnDisk:
             {"blob_id": blob_id, "content": "new content"},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         # Verify file on disk was actually overwritten
         with blob_env["engine"].connect() as conn:
@@ -849,6 +919,8 @@ class TestDeleteBlobMissingFile:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         blob_id = create_result.data["blob_id"]
         # Manually delete the file before calling delete_blob
@@ -861,8 +933,11 @@ class TestDeleteBlobMissingFile:
             {"blob_id": blob_id},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert result.success is True
 
@@ -879,6 +954,8 @@ class TestCrossSessionIsolation:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         blob_id = create_result.data["blob_id"]
         # Try to access from a different session
@@ -887,11 +964,14 @@ class TestCrossSessionIsolation:
             {"blob_id": blob_id},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
-            session_id="other-session-999",
+            session_id=blob_env["other_session_id"],
+            session_operation_context=blob_env["other_operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert result.success is False
-        assert "not found" in result.data["error"]
+        assert "not found" in result.validation.errors[0].message
 
     def test_delete_scoped_to_session(self, blob_env: dict[str, Any]) -> None:
         state = _empty_state()
@@ -904,6 +984,8 @@ class TestCrossSessionIsolation:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         blob_id = create_result.data["blob_id"]
         # Try to delete from a different session — should fail (not found)
@@ -912,8 +994,11 @@ class TestCrossSessionIsolation:
             {"blob_id": blob_id},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
-            session_id="other-session-999",
+            session_id=blob_env["other_session_id"],
+            session_operation_context=blob_env["other_operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert result.success is False
 
@@ -1009,6 +1094,8 @@ class TestSetSourceFromBlob:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         blob_id = create_result.data["blob_id"]
         result = execute_tool(
@@ -1016,8 +1103,11 @@ class TestSetSourceFromBlob:
             {"blob_id": blob_id, "on_success": "step1", "options": {"schema": {"mode": "observed"}}},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert result.success is True
         source = result.updated_state.sources["source"]
@@ -1032,8 +1122,11 @@ class TestSetSourceFromBlob:
             {"blob_id": "nonexistent", "on_success": "step1"},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert result.success is False
 
@@ -1074,8 +1167,11 @@ class TestSetSourceFromBlob:
                 {"blob_id": exotic_blob_id, "on_success": "step1"},
                 state,
                 catalog,
+                data_dir=blob_env["data_dir"],
                 session_engine=blob_env["engine"],
                 session_id=blob_env["session_id"],
+                session_operation_context=blob_env["operation"],
+                session_operation_authority=blob_env["authority"],
             )
 
 
@@ -1096,6 +1192,8 @@ class TestCreateBlobToSetSourceEndToEnd:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert create_result.success is True
         blob_id = create_result.data["blob_id"]
@@ -1106,8 +1204,11 @@ class TestCreateBlobToSetSourceEndToEnd:
             {"blob_id": blob_id, "on_success": "transform1", "options": {"schema": {"mode": "observed"}}},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert source_result.success is True
 
@@ -1133,8 +1234,11 @@ class TestListBlobsAndMetadata:
             {},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert result.success is True
         assert len(result.data) == 0
@@ -1150,14 +1254,19 @@ class TestListBlobsAndMetadata:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         result = execute_tool(
             "list_blobs",
             {},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert len(result.data) == 1
         # storage_path should NOT be in list response
@@ -1174,14 +1283,19 @@ class TestListBlobsAndMetadata:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         result = execute_tool(
             "get_blob_metadata",
             {"blob_id": create_result.data["blob_id"]},
             state,
             catalog,
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         assert result.success is True
         assert "storage_path" not in result.data

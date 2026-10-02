@@ -13,7 +13,7 @@ from elspeth.contracts.contract_builder import ContractBuilder
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 
 if TYPE_CHECKING:
-    from elspeth.contracts.schema import SchemaConfig
+    from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 
 
 # Type mapping from SchemaConfig field types to Python types
@@ -24,6 +24,33 @@ _FIELD_TYPE_MAP: dict[str, type] = {
     "bool": bool,
     "any": object,  # 'any' accepts anything - use object as base type
 }
+
+
+def field_definition_python_type(definition: FieldDefinition) -> type:
+    """The contract ``python_type`` a ``FieldDefinition``'s ``field_type`` names.
+
+    The one mapping from the schema DSL's type tokens to contract types, shared
+    by ``create_contract_from_config`` and the transform declaration stamp
+    (``BaseTransform._stamped_output_field_contracts``) so a plugin-declared
+    created field and an operator-declared one cannot map differently.
+    """
+    return _FIELD_TYPE_MAP[definition.field_type]
+
+
+_FIELD_TYPE_NAMES: dict[type, str] = {python_type: name for name, python_type in _FIELD_TYPE_MAP.items()}
+
+
+def field_type_name(python_type: type) -> str:
+    """The schema-DSL type token for a DECLARED contract's ``python_type`` (``object`` is ``any``).
+
+    The inverse of ``field_definition_python_type``. Total over every declared
+    contract, because a declared contract's type is only ever built through
+    that one mapping (``create_contract_from_config``, the transform
+    declaration stamp); a type outside it (an INFERRED ``datetime`` or
+    ``NoneType``) is not a declaration, and asking is a caller bug, so it
+    raises ``KeyError``.
+    """
+    return _FIELD_TYPE_NAMES[python_type]
 
 
 def map_schema_mode(
@@ -58,7 +85,7 @@ def expected_runtime_output_contract(
     Both the producer alignment (``BaseTransform._align_output_contract``) and
     the engine verifier (``verify_schema_config_mode``) derive their
     expectation from here so mode/lock-policy changes cannot drift apart
-    (filigree elspeth-986cfb43e5).
+    (archived issue elspeth-986cfb43e5).
     """
     return map_schema_mode(config.mode), True
 
@@ -119,7 +146,7 @@ def create_contract_from_config(
             fc = FieldContract(
                 normalized_name=fd.name,
                 original_name=original,
-                python_type=_FIELD_TYPE_MAP[fd.field_type],
+                python_type=field_definition_python_type(fd),
                 required=fd.required,
                 source="declared",
                 nullable=fd.nullable,

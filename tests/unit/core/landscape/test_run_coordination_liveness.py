@@ -61,6 +61,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
 )
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import assert_stamped_between, landscape_database_now, member_token_for
 from tests.helpers.run_coordination import register_run_leader
 
@@ -92,7 +93,7 @@ def _seed_run(engine: Tier1Engine, *, run_id: str = RUN_ID, status: str = "runni
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=NOW,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status=status,
@@ -168,8 +169,8 @@ class _StubRepo:
             raise result
         return result
 
-    def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None:
-        self.degraded_calls.append({"run_id": run_id, "worker_id": worker_id, "failures": failures})
+    def record_heartbeat_degraded(self, *, member_token: WorkerMembershipToken, failures: int, now: datetime) -> None:
+        self.degraded_calls.append({"member_token": member_token, "failures": failures})
         if self.degraded_raise is not None:
             raise self.degraded_raise
 
@@ -296,7 +297,7 @@ class TestBusyToleranceNeverEvicts:
         repo = RunCoordinationRepository(engine)
         _seed_run(engine)
         leader = register_run_leader(repo, run_id=RUN_ID, worker_id="leader", window_seconds=WINDOW)
-        member = repo.admit_follower(run_id=RUN_ID, worker_id="follower", config_hash="config", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id="follower", config_hash=fake_sha256("config"), window_seconds=WINDOW)
         repo.depart_worker(member_token=member)
         refusal_written = False
         attempted_reads: list[str] = []
@@ -342,7 +343,7 @@ class TestBusyToleranceNeverEvicts:
         repo = RunCoordinationRepository(engine)
         _seed_run(engine)
         register_run_leader(repo, run_id=RUN_ID, worker_id="leader", window_seconds=WINDOW)
-        member = repo.admit_follower(run_id=RUN_ID, worker_id="follower", config_hash="config", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id="follower", config_hash=fake_sha256("config"), window_seconds=WINDOW)
         repo.depart_worker(member_token=member)
 
         result = repo.worker_heartbeat(member_token=member, window_seconds=WINDOW)
@@ -436,8 +437,8 @@ class TestHeartbeatDegradedEvent:
             def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> CoordinationSnapshot:
                 raise OperationalError("stmt", {}, Exception("database is locked"))
 
-            def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None:
-                repo.record_heartbeat_degraded(run_id=run_id, worker_id=worker_id, failures=failures, now=now)
+            def record_heartbeat_degraded(self, *, member_token: WorkerMembershipToken, failures: int, now: datetime) -> None:
+                repo.record_heartbeat_degraded(member_token=member_token, failures=failures, now=now)
 
         k = 3
         thread = RunHeartbeatThread(
@@ -467,6 +468,21 @@ class TestHeartbeatDegradedEvent:
         # leader_epoch is None for degraded events (best-effort, no fence).
         assert evt["leader_epoch"] is None
         assert not thread._coordination_lost_event.is_set(), "k busy ticks: latch must still be False"
+
+    def test_degraded_event_retains_departed_worker_identity_without_membership_fence(self) -> None:
+        engine = _make_engine()
+        repo = RunCoordinationRepository(engine)
+        _seed_run(engine)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+        repo.depart_worker(member_token=token.membership)
+
+        repo.record_heartbeat_degraded(member_token=token.membership, failures=3, now=NOW)
+
+        (event,) = _coordination_events(engine, "heartbeat_degraded")
+        assert event["run_id"] == token.run_id
+        assert event["worker_id"] == token.worker_id
+        assert event["leader_epoch"] is None
+        assert json.loads(str(event["context_json"])) == {"consecutive_busy_failures": 3}
 
     def test_degraded_event_error_does_not_propagate(self) -> None:
         """An unwritable degraded event (record_heartbeat_degraded raises) must

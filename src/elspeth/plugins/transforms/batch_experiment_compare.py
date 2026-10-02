@@ -20,42 +20,57 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import RowErrorEntry, TransformErrorReason
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowTypeError, require_scalar_group_key
 from elspeth.plugins.transforms._scalar_buckets import same_scalar_bucket_value
 
 type BatchExperimentComparisonRow = dict[str, object]
 
-_COMPARISON_OUTPUT_FIELDS = frozenset(
-    {
-        "baseline_count",
-        "baseline_mean",
-        "baseline_missing_count",
-        "baseline_non_finite_count",
-        "baseline_stdev",
-        "baseline_total_count",
-        "baseline_variant",
-        "batch_size",
-        "confidence_95_high",
-        "confidence_95_low",
-        "mean_delta",
-        "relative_lift",
-        "score_field",
-        "standard_error",
-        "variant",
-        "variant_count",
-        "variant_field",
-        "variant_mean",
-        "variant_missing_count",
-        "variant_non_finite_count",
-        "variant_stdev",
-        "variant_total_count",
-        "z_score",
-    }
+# Every output field with the type the plugin's code fixes (ADR-050). The
+# field names are configured strings and the counts are ints. The variant
+# labels are the values as they appear in the rows, carried from the data, so
+# they are ``any``. Only int and float scores reach the arithmetic
+# (``_stats_for_group`` fails the batch on any other type), so the means and
+# the delta are true-division floats. Each statistic that can be undefined is
+# emitted None then, never a fabricated 0.0 (B4.5): a stdev at n=1, the
+# relative lift over a zero baseline mean, and the standard error, z-score and
+# confidence bounds when an arm's variance is undefined or the standard error
+# is zero. The ``*_indices`` lists are written only when a row of that group
+# was skipped (optional) and are lists the schema DSL has no type for.
+_COMPARISON_CREATED_FIELDS: tuple[FieldDefinition, ...] = (
+    FieldDefinition("baseline_count", "int"),
+    FieldDefinition("baseline_mean", "float"),
+    FieldDefinition("baseline_missing_count", "int"),
+    FieldDefinition("baseline_non_finite_count", "int"),
+    FieldDefinition("baseline_stdev", "float", nullable=True),
+    FieldDefinition("baseline_total_count", "int"),
+    FieldDefinition("baseline_variant", "any"),
+    FieldDefinition("batch_size", "int"),
+    FieldDefinition("confidence_95_high", "float", nullable=True),
+    FieldDefinition("confidence_95_low", "float", nullable=True),
+    FieldDefinition("mean_delta", "float"),
+    FieldDefinition("relative_lift", "float", nullable=True),
+    FieldDefinition("score_field", "str"),
+    FieldDefinition("standard_error", "float", nullable=True),
+    FieldDefinition("variant", "any"),
+    FieldDefinition("variant_count", "int"),
+    FieldDefinition("variant_field", "str"),
+    FieldDefinition("variant_mean", "float"),
+    FieldDefinition("variant_missing_count", "int"),
+    FieldDefinition("variant_non_finite_count", "int"),
+    FieldDefinition("variant_stdev", "float", nullable=True),
+    FieldDefinition("variant_total_count", "int"),
+    FieldDefinition("z_score", "float", nullable=True),
+    FieldDefinition("baseline_missing_indices", "any", required=False),
+    FieldDefinition("baseline_non_finite_indices", "any", required=False),
+    FieldDefinition("variant_missing_indices", "any", required=False),
+    FieldDefinition("variant_non_finite_indices", "any", required=False),
 )
+_COMPARISON_OUTPUT_FIELDS = frozenset(field.name for field in _COMPARISON_CREATED_FIELDS if field.required)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,9 +138,11 @@ class BatchExperimentCompare(BaseTransform):
     name = "batch_experiment_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:bbd0ab934c88a808"
+    source_file_hash: str | None = "sha256:8e0f4b88f764ee55"
     config_model = BatchExperimentCompareConfig
     is_batch_aware = True
+    # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use for an unpaired mean, lift, z-score, and normal-bound comparison of numeric experiment variants within one flushed batch."
     )
@@ -158,9 +175,11 @@ class BatchExperimentCompare(BaseTransform):
                 issue_code=None,
                 summary="Compares treatment or prompt variants by mean score over an aggregation batch.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_experiment_compare under aggregations with a trigger; it emits one row per non-baseline variant.",
                     "variant_field and score_field must differ; baseline_variant defaults to the first-seen variant.",
-                    "score_field must be numeric; rows with missing or non-finite scores are counted in the comparison metadata.",
+                    "score_field must be numeric; rows with missing or non-finite scores are counted in the comparison metadata, "
+                    "and a present non-numeric score fails the whole batch.",
                     "Output fields are experiment metrics such as mean_delta, relative_lift, and confidence bounds.",
                 ),
             )
@@ -215,6 +234,10 @@ class BatchExperimentCompare(BaseTransform):
             audit_fields=None,
         )
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """The typed table above: the same fields on every comparison row (ADR-050)."""
+        return _COMPARISON_CREATED_FIELDS
+
     def backward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Exercise the comparison output path for the backward invariant."""
         baseline = self._augment_invariant_probe_row(
@@ -268,6 +291,7 @@ class BatchExperimentCompare(BaseTransform):
         groups: list[tuple[Any, list[tuple[int, PipelineRow]]]] = []
         for row_index, row in enumerate(rows):
             variant_value = row[self._variant_field]
+            require_scalar_group_key(variant_value, field=self._variant_field, row_index=row_index)
             for existing_value, grouped_rows in groups:
                 if same_scalar_bucket_value(variant_value, existing_value):
                     grouped_rows.append((row_index, row))
@@ -288,11 +312,18 @@ class BatchExperimentCompare(BaseTransform):
                 missing_indices.append(row_index)
                 continue
 
+            # A present non-numeric score fails the WHOLE batch; it is neither
+            # skipped nor coerced (a str that is not a number is not a number).
+            # The None branch above and the non-finite branch below keep
+            # skip-and-report (elspeth-d5034647f0). This helper returns values,
+            # so it raises and `process` converts the error once. `row_index`
+            # is the BATCH index (`_group_rows` carries it), not a group-local one.
             if type(raw_value) not in (int, float):
-                raise TypeError(
-                    f"Field '{self._score_field}' must be numeric (int or float), "
-                    f"got {type(raw_value).__name__} in row {row_index}. "
-                    f"This indicates an upstream validation bug - check source schema or prior transforms."
+                raise BatchRowTypeError(
+                    field=self._score_field,
+                    row_index=row_index,
+                    expected="numeric (int or float)",
+                    found=type(raw_value).__name__,
                 )
 
             if type(raw_value) is float and not math.isfinite(raw_value):
@@ -315,10 +346,14 @@ class BatchExperimentCompare(BaseTransform):
             row_errors.append({"row_index": row_index, "reason": "missing_value"})
         for row_index in stats.non_finite_indices:
             row_errors.append({"row_index": row_index, "reason": "non_finite_value"})
+        # The variant label is row content, so the reason names the grouping
+        # and score FIELDS; `row_errors` carries the batch indices that
+        # identify the group.
         reason: TransformErrorReason = {
             "reason": "validation_failed",
             "cause": "baseline_has_no_finite_scores" if baseline else "variant_has_no_finite_scores",
-            "group_value": stats.value,
+            "group_by": self._variant_field,
+            "field": self._score_field,
             "total_count": stats.total_count,
             "valid_count": 0,
             "skipped_count": stats.missing_count + stats.non_finite_count,
@@ -389,11 +424,12 @@ class BatchExperimentCompare(BaseTransform):
                     confidence_95_low = self._require_finite(mean_delta - 1.96 * standard_error, operation="confidence_95_low")
                     confidence_95_high = self._require_finite(mean_delta + 1.96 * standard_error, operation="confidence_95_high")
         except OverflowError as exc:
+            # Value-free: the variant labels are row content.
             reason: TransformErrorReason = {
                 "reason": "float_overflow",
                 "operation": str(exc) or "experiment_compare",
-                "group_value": variant.value,
-                "value": str(baseline.value),
+                "group_by": self._variant_field,
+                "field": self._score_field,
             }
             return {}, TransformResult.error(reason, retryable=False)
 
@@ -434,22 +470,6 @@ class BatchExperimentCompare(BaseTransform):
 
         return result, None
 
-    def _output_contract_for(self, results: list[BatchExperimentComparisonRow]) -> SchemaContract:
-        """Build one shared output contract for comparison result rows."""
-        field_names = list(dict.fromkeys(key for result in results for key in result))
-        fields = tuple(
-            FieldContract(
-                normalized_name=key,
-                original_name=key,
-                python_type=object,
-                required=False,
-                source="inferred",
-            )
-            for key in field_names
-        )
-        output_contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
-        return self._align_output_contract(output_contract)
-
     def process(  # type: ignore[override] # Batch signature: list[PipelineRow] instead of PipelineRow
         self, rows: list[PipelineRow], ctx: TransformContext
     ) -> TransformResult:
@@ -461,24 +481,44 @@ class BatchExperimentCompare(BaseTransform):
         if non_finite_error is not None:
             return non_finite_error
 
-        grouped = self._group_rows(rows)
-        stats_by_variant: list[_VariantStats] = [
-            self._stats_for_group(variant_value, grouped_rows) for variant_value, grouped_rows in grouped
-        ]
+        try:
+            grouped = self._group_rows(rows)
+            stats_by_variant: list[_VariantStats] = [
+                self._stats_for_group(variant_value, grouped_rows) for variant_value, grouped_rows in grouped
+            ]
+        except BatchRowTypeError as exc:
+            # A wrongly-typed score fails the WHOLE batch with a value-free
+            # reason naming the field, the expected and found types and the
+            # batch row index. The structural caller owns disposition: an
+            # aggregation applies its declared on_error
+            # (AggregationExecutor._complete_error_flush records the reason and
+            # the DIVERT; RowProcessor.handle_timeout_flush sends every buffered
+            # row to the on_error sink, or records it discarded), while a
+            # collector turns this into a whole-group failure.
+            return TransformResult.error(exc.as_reason(), retryable=False)
 
-        if self._baseline_variant is not None and not any(
-            same_scalar_bucket_value(stats.value, self._baseline_variant) for stats in stats_by_variant
-        ):
-            return TransformResult.error(
-                {
-                    "reason": "validation_failed",
-                    "cause": "baseline_variant_missing",
-                    "expected": str(self._baseline_variant),
-                    "message": f"Baseline variant {self._baseline_variant!r} was not present in the batch.",
-                    "errors": [str(stats.value) for stats in stats_by_variant],
-                },
-                retryable=False,
+        if self._baseline_variant is None:
+            # The first-seen variant is the baseline.
+            baseline = stats_by_variant[0]
+        else:
+            configured_baseline = next(
+                (stats for stats in stats_by_variant if same_scalar_bucket_value(stats.value, self._baseline_variant)),
+                None,
             )
+            if configured_baseline is None:
+                # `expected` is the CONFIGURED label; the labels the batch did
+                # carry are row content and stay out of the reason.
+                return TransformResult.error(
+                    {
+                        "reason": "validation_failed",
+                        "cause": "baseline_variant_missing",
+                        "group_by": self._variant_field,
+                        "expected": self._baseline_variant,
+                        "message": f"Baseline variant {self._baseline_variant!r} was not present in the batch.",
+                    },
+                    retryable=False,
+                )
+            baseline = configured_baseline
 
         if len(grouped) < 2:
             return TransformResult.error(
@@ -490,19 +530,6 @@ class BatchExperimentCompare(BaseTransform):
                 retryable=False,
             )
 
-        baseline_value = self._baseline_variant if self._baseline_variant is not None else stats_by_variant[0].value
-        baseline = next((stats for stats in stats_by_variant if same_scalar_bucket_value(stats.value, baseline_value)), None)
-        if baseline is None:
-            return TransformResult.error(
-                {
-                    "reason": "validation_failed",
-                    "cause": "baseline_variant_missing",
-                    "expected": str(baseline_value),
-                    "message": f"Baseline variant {baseline_value!r} was not present in the batch.",
-                    "errors": [str(stats.value) for stats in stats_by_variant],
-                },
-                retryable=False,
-            )
         if baseline.count == 0:
             return self._no_finite_score_error(baseline, baseline=True)
 
@@ -517,7 +544,7 @@ class BatchExperimentCompare(BaseTransform):
                 return error
             results.append(comparison)
 
-        output_contract = self._output_contract_for(results)
+        output_contract = self._batch_output_contract(key for result in results for key in result)
         fields_added = [field.normalized_name for field in output_contract.fields]
         pipeline_rows = [PipelineRow(result, output_contract) for result in results]
 

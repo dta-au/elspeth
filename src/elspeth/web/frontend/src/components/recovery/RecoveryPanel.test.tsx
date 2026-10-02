@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -93,6 +93,29 @@ function Harness({
 
 describe("RecoveryPanel", () => {
   beforeEach(() => resetStore(usePreferencesStore));
+
+  it.each([
+    { label: "failed persistence", id: "state-3", saveFailed: true },
+    { label: "missing saved identity", id: "", saveFailed: false },
+    { label: "blank saved identity", id: "   ", saveFailed: false },
+  ])("explains $label inside the dialog and offers only discard", async ({ id, saveFailed }) => {
+    const user = userEvent.setup();
+    const recoveryError = makeRecoveryError();
+    recoveryError.partial_state.id = id;
+    recoveryError.partial_state_save_failed = saveFailed;
+    const { props } = renderPanel({ recoveryError });
+    const dialog = within(screen.getByRole("dialog"));
+
+    expect(dialog.getByRole("alert")).toHaveTextContent(
+      "The partial draft was not saved on the server. Discard recovery and retry the composer step.",
+    );
+    expect(dialog.queryByRole("button", { name: "Apply partial draft" })).not.toBeInTheDocument();
+    expect(dialog.queryByRole("button", { name: "Apply anyway" })).not.toBeInTheDocument();
+    await waitFor(() => expect(dialog.getByRole("button", { name: "Discard recovery" })).toHaveFocus());
+    await user.keyboard("{Enter}");
+    expect(props.onDiscard).toHaveBeenCalledTimes(1);
+    expect(props.onApply).not.toHaveBeenCalled();
+  });
 
   it("renders headline reason evidence diff transcript and controls", () => {
     usePreferencesStore.setState({ showAdvanced: true });

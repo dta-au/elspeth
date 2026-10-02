@@ -10,21 +10,24 @@ import pytest
 
 from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
-from elspeth.contracts.enums import BatchStatus, Determinism, NodeStateStatus, RoutingMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import BatchStatus, NodeStateStatus, RoutingMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, GracefulShutdownError
+from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
 from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.core.canonical import canonical_json
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig, prepare_for_run
 from elspeth.engine.orchestrator.resume import ResumeCoordinator
 from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
 from elspeth.engine.orchestrator.source_iteration import SourceIterationDriver
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
-from tests.fixtures.landscape import insert_crashed_leader_seat
+from tests.fixtures.landscape import expire_leader_seat, leader_coordination_token
 from tests.fixtures.pipeline import build_linear_pipeline
-from tests.fixtures.plugins import CollectSink, PassTransform
+from tests.fixtures.plugins import CollectSink
 from tests.fixtures.stores import MockPayloadStore
 from tests.helpers.checkpoint import create_checkpoint
 
@@ -53,32 +56,36 @@ def _plant_orphan_fork_parent(
     *,
     row_index: int = 900,
     complete_row_for_resume: bool = False,
+    source_node_id: str | None = None,
 ) -> str:
-    source = factory.data_flow.register_node(
-        run_id=run_id,
-        plugin_name=f"durability_source_{row_index}",
-        node_type=NodeType.SOURCE,
-        plugin_version="1.0",
-        config={},
-        schema_config=_DYNAMIC_SCHEMA,
-    )
-    row = factory.data_flow.create_row(
-        run_id=run_id,
-        source_node_id=source.node_id,
+    if source_node_id is None:
+        source = factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, run_id),
+            plugin_name=f"durability_source_{row_index}",
+            node_type=NodeType.SOURCE,
+            plugin_version="1.0",
+            config={},
+            schema_config=_DYNAMIC_SCHEMA,
+        )
+        source_node_id = source.node_id
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run_id),
+        source_node_id=source_node_id,
         row_index=row_index,
         data={"planted": True},
         source_row_index=row_index,
         ingest_sequence=row_index,
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
-    factory.data_flow.record_token_outcome(
+    factory.data_flow.record_token_outcome_leader(
+        coordination_token=leader_coordination_token(factory, run_id),
         ref=TokenRef(token_id=token.token_id, run_id=run_id),
         outcome=TerminalOutcome.TRANSIENT,
         path=TerminalPath.FORK_PARENT,
     )
     if complete_row_for_resume:
-        sibling = factory.data_flow.create_token(row_id=row.row_id)
-        factory.data_flow.record_token_outcome(
+        sibling = factory.data_flow.create_token(row_id=row.row_id, coordination_token=leader_coordination_token(factory, run_id))
+        factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(factory, run_id),
             ref=TokenRef(token_id=sibling.token_id, run_id=run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
@@ -93,32 +100,35 @@ def _plant_orphan_batch_consumed(
     *,
     row_index: int = 901,
     complete_row_for_resume: bool = False,
+    source_node_id: str | None = None,
 ) -> str:
     del complete_row_for_resume
-    source = factory.data_flow.register_node(
-        run_id=run_id,
-        plugin_name=f"durability_batch_source_{row_index}",
-        node_type=NodeType.SOURCE,
-        plugin_version="1.0",
-        config={},
-        schema_config=_DYNAMIC_SCHEMA,
-    )
-    row = factory.data_flow.create_row(
-        run_id=run_id,
-        source_node_id=source.node_id,
+    if source_node_id is None:
+        source = factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, run_id),
+            plugin_name=f"durability_batch_source_{row_index}",
+            node_type=NodeType.SOURCE,
+            plugin_version="1.0",
+            config={},
+            schema_config=_DYNAMIC_SCHEMA,
+        )
+        source_node_id = source.node_id
+    _row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run_id),
+        source_node_id=source_node_id,
         row_index=row_index,
         data={"planted_i1b": True},
         source_row_index=row_index,
         ingest_sequence=row_index,
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
     batch_id = f"batch_durability_{row_index}"
     factory.execution.create_batch(
-        run_id=run_id,
-        aggregation_node_id=source.node_id,
+        coordination_token=leader_coordination_token(factory, run_id),
+        aggregation_node_id=source_node_id,
         batch_id=batch_id,
     )
-    factory.data_flow.record_token_outcome(
+    factory.data_flow.record_token_outcome_leader(
+        coordination_token=leader_coordination_token(factory, run_id),
         ref=TokenRef(token_id=token.token_id, run_id=run_id),
         outcome=TerminalOutcome.TRANSIENT,
         path=TerminalPath.BATCH_CONSUMED,
@@ -183,6 +193,8 @@ def test_fresh_run_sweep_crash_finalizes_failed_and_preserves_evidence(
         openrouter_catalog_sha256: str = "0" * 64,
         openrouter_catalog_source: str = "bundled",
         web_plugin_policy_evidence=None,
+        run_start_permit: RunStartPermitBinding | None = None,
+        pre_effect_guard: Callable[[], None] | None = None,
     ):
         # Epoch 21: _initialize_database_phase returns the CoordinationToken
         # minted with the run's leader seat alongside (factory, run).
@@ -197,6 +209,8 @@ def test_fresh_run_sweep_crash_finalizes_failed_and_preserves_evidence(
             openrouter_catalog_sha256=openrouter_catalog_sha256,
             openrouter_catalog_source=openrouter_catalog_source,
             web_plugin_policy_evidence=web_plugin_policy_evidence,
+            run_start_permit=run_start_permit,
+            pre_effect_guard=pre_effect_guard,
         )
         captured["run_id"] = run.run_id
         captured["token_id"] = plant(factory, run.run_id)
@@ -224,16 +238,38 @@ def _setup_adr019_failed_resume_run(
     num_rows: int,
     processed_count: int,
 ):
-    from sqlalchemy import insert
+    from sqlalchemy import insert, update
 
     from elspeth.contracts.contract_records import ContractAuditRecord
     from elspeth.core.checkpoint import CheckpointManager
+    from elspeth.core.config import SourceSettings
+    from elspeth.core.dag import ExecutionGraph
     from elspeth.core.landscape.schema import edges_table, nodes_table, rows_table, run_sources_table, runs_table, tokens_table
+    from elspeth.plugins.sources.null_source import NullSource
+    from elspeth.plugins.transforms.passthrough import PassThrough
+    from tests.fixtures.factories import wire_transforms
 
     now = datetime.now(UTC)
-    source_data = [{"value": i} for i in range(num_rows)]
-    transform = PassTransform()
-    _, _, _, graph = build_linear_pipeline(source_data, transforms=[as_transform(transform)])
+    # Build and resume with the same plugin instances so immutable implementation
+    # evidence describes the executed graph, independently of the planted defect.
+    source = NullSource({})
+    source.on_success = "primary_out"
+    transform = PassThrough({"schema": {"mode": "observed"}})
+    transform.on_error = "discard"
+    sink = CollectSink()
+    config = PipelineConfig(
+        sources={"primary": as_source(source)},
+        transforms=[as_transform(transform)],
+        sinks={"default": as_sink(sink)},
+    )
+    graph = ExecutionGraph.from_plugin_instances(
+        sources=config.sources,
+        source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="primary_out", options={})},
+        transforms=wire_transforms([as_transform(transform)], source_connection="primary_out", final_sink="default"),
+        sinks=config.sinks,
+        aggregations={},
+        gates=[],
+    )
 
     source_nid = graph.get_sources()[0]
     assert source_nid is not None
@@ -257,38 +293,39 @@ def _setup_adr019_failed_resume_run(
     )
     audit_record = ContractAuditRecord.from_contract(contract)
 
+    factory = RecorderFactory(db)
+    factory.run_lifecycle.begin_run(
+        config={},
+        canonical_version="v1",
+        run_id=run_id,
+        source_schema_json=json.dumps({"properties": {"value": {"type": "integer"}}, "required": ["value"]}),
+        openrouter_catalog_sha256="0" * 64,
+        openrouter_catalog_source="bundled",
+    )
+    authority = leader_coordination_token(factory, run_id)
     with db.engine.begin() as conn:
         conn.execute(
-            insert(runs_table).values(
-                run_id=run_id,
-                started_at=now,
-                config_hash="test",
-                settings_json="{}",
-                canonical_version="v1",
-                status=RunStatus.FAILED,
-                source_schema_json=json.dumps({"properties": {"value": {"type": "integer"}}, "required": ["value"]}),
+            update(runs_table)
+            .where(runs_table.c.run_id == run_id)
+            .values(
                 runtime_val_manifest_json=_runtime_val_manifest_json(),
-                openrouter_catalog_sha256="0" * 64,
-                openrouter_catalog_source="bundled",
             )
         )
-        # Epoch 21 (ADR-030): the crashed-run image includes the expired
-        # leader seat begin_run would have minted atomically with the run.
-        insert_crashed_leader_seat(conn, run_id=run_id)
-        for node_id, plugin_name, node_type in [
-            (source_nid, "list_source", NodeType.SOURCE),
-            (xform_nid, "passthrough", NodeType.TRANSFORM),
-            (sink_nid, "collect_sink", NodeType.SINK),
+        for node_id, plugin, node_type in [
+            (source_nid, source, NodeType.SOURCE),
+            (xform_nid, transform, NodeType.TRANSFORM),
+            (sink_nid, sink, NodeType.SINK),
         ]:
             conn.execute(
                 insert(nodes_table).values(
                     node_id=node_id,
                     run_id=run_id,
-                    plugin_name=plugin_name,
+                    plugin_name=plugin.name,
                     node_type=node_type,
-                    plugin_version="1.0.0",
-                    determinism=Determinism.DETERMINISTIC if node_type != NodeType.SINK else Determinism.IO_WRITE,
-                    config_hash="test",
+                    plugin_version=plugin.plugin_version,
+                    determinism=plugin.determinism,
+                    source_file_hash=plugin.source_file_hash,
+                    config_hash=fake_sha256("test"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -321,10 +358,10 @@ def _setup_adr019_failed_resume_run(
             insert(run_sources_table).values(
                 run_id=run_id,
                 source_node_id=source_nid,
-                source_name="source",
-                plugin_name="list_source",
+                source_name="primary",
+                plugin_name=source.name,
                 lifecycle_state="loaded",
-                config_hash="test",
+                config_hash=fake_sha256("test"),
                 schema_json=json.dumps({"properties": {"value": {"type": "integer"}}, "required": ["value"]}),
                 schema_contract_json=audit_record.to_json(),
                 schema_contract_hash=contract.version_hash(),
@@ -343,7 +380,7 @@ def _setup_adr019_failed_resume_run(
                     row_index=i,
                     source_row_index=i,
                     ingest_sequence=i,
-                    source_data_hash=f"h{i}",
+                    source_data_hash=fake_sha256(f"h{i}"),
                     source_data_ref=ref,
                     created_at=now,
                 )
@@ -357,13 +394,27 @@ def _setup_adr019_failed_resume_run(
                 )
             )
 
-    factory = RecorderFactory(db)
     for i in range(processed_count):
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
+            coordination_token=authority,
             ref=TokenRef(token_id=f"t{i}", run_id=run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="default",
+        )
+
+    # An unprocessed row is durable READY work at the transform, the image real
+    # ingest leaves: resume re-drives scheduler work and never re-derives a
+    # source row (QR), so a bare outcomeless token would be refused instead.
+    for i in range(processed_count, num_rows):
+        factory.scheduler.enqueue_ready(
+            token_id=f"t{i}",
+            row_id=f"r{i}",
+            node_id=xform_nid,
+            step_index=graph.get_node_step_map()[xform_nid],
+            ingest_sequence=i,
+            row_payload_json=factory.scheduler.serialize_row_payload(PipelineRow({"value": i}, contract)),
+            member_token=authority.membership,
         )
 
     if processed_count > 0:
@@ -377,9 +428,12 @@ def _setup_adr019_failed_resume_run(
             sequence_number=processed_count - 1,
             barrier_scalars=None,
             graph=graph,
+            coordination_token=authority,
         )
 
-    return graph
+    factory.run_lifecycle.update_run_status(status=RunStatus.FAILED, coordination_token=authority)
+    expire_leader_seat(db, run_id)
+    return graph, config
 
 
 def _build_resume_environment(run_id: str, *, num_rows: int, processed_count: int):
@@ -387,14 +441,12 @@ def _build_resume_environment(run_id: str, *, num_rows: int, processed_count: in
     from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
     from elspeth.core.config import CheckpointSettings
     from elspeth.core.landscape.database import LandscapeDB
-    from elspeth.plugins.sources.null_source import NullSource
-    from elspeth.plugins.transforms.passthrough import PassThrough
 
     db = LandscapeDB.in_memory()
     payload_store = MockPayloadStore()
     checkpoint_mgr = CheckpointManager(db)
     checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
-    graph = _setup_adr019_failed_resume_run(
+    graph, config = _setup_adr019_failed_resume_run(
         db,
         payload_store,
         run_id,
@@ -405,17 +457,6 @@ def _build_resume_environment(run_id: str, *, num_rows: int, processed_count: in
     resume_point = RecoveryManager(db, checkpoint_mgr).get_resume_point(run_id, graph)
     assert resume_point is not None
 
-    transform = PassThrough({"schema": {"mode": "observed"}})
-    transform.on_success = "default"
-    transform.on_error = "discard"
-    source = NullSource({})
-    source.on_success = "default"
-    sink = CollectSink()
-    config = PipelineConfig(
-        sources={"primary": as_source(source)},
-        transforms=[as_transform(transform)],
-        sinks={"default": as_sink(sink)},
-    )
     orchestrator = Orchestrator(
         db=db,
         checkpoint_manager=checkpoint_mgr,
@@ -443,7 +484,8 @@ def test_resume_sweep_crash_finalizes_failed_and_preserves_evidence(
         processed_count=2,
     )
     factory = RecorderFactory(db)
-    token_id = plant(factory, run_id, complete_row_for_resume=True)
+    token_id = plant(factory, run_id, complete_row_for_resume=True, source_node_id=graph.get_sources()[0])
+    expire_leader_seat(db, run_id)
 
     with pytest.raises(AuditIntegrityError, match=label):
         orchestrator.resume(
@@ -476,7 +518,8 @@ def test_resume_no_work_sweep_crash_finalizes_failed_and_preserves_evidence(
         processed_count=2,
     )
     factory = RecorderFactory(db)
-    token_id = plant(factory, run_id, complete_row_for_resume=True)
+    token_id = plant(factory, run_id, complete_row_for_resume=True, source_node_id=graph.get_sources()[0])
+    expire_leader_seat(db, run_id)
 
     process_calls: list[str] = []
 
@@ -527,31 +570,31 @@ def test_realtime_invariant_crash_finalizes_failed_and_preserves_witnesses(
     ):
         captured["run_id"] = run_id
         sink = factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=coordination_token,
             plugin_name=f"corrupt_{kind.lower()}_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             schema_config=_DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=coordination_token,
             source_node_id=source_id,
             row_index=700 if kind == "I1c" else 701,
             data={"corrupt": kind},
             source_row_index=700 if kind == "I1c" else 701,
             ingest_sequence=700 if kind == "I1c" else 701,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         captured["token_id"] = token.token_id
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink.node_id,
-            run_id=run_id,
+            member_token=coordination_token.membership,
             step_index=0,
             input_data={},
         )
         factory.execution.complete_node_state(
+            member_token=coordination_token.membership,
             state_id=state.state_id,
             status=NodeStateStatus.COMPLETED,
             output_data={"written": True},
@@ -559,24 +602,29 @@ def test_realtime_invariant_crash_finalizes_failed_and_preserves_witnesses(
         )
         if kind == "I1c":
             sibling = factory.data_flow.register_node(
-                run_id=run_id,
+                coordination_token=coordination_token,
                 plugin_name="wrong_failsink",
                 node_type=NodeType.SINK,
                 plugin_version="1.0",
                 config={},
                 schema_config=_DYNAMIC_SCHEMA,
             )
-            artifact = factory.execution.register_artifact(
-                run_id=run_id,
-                state_id=state.state_id,
-                sink_node_id=sink.node_id,
-                artifact_type="test",
-                path="memory://wrong-failsink",
-                content_hash="deadbeef" * 8,
-                size_bytes=0,
-            )
+            with fenced_leader_transaction(
+                factory.data_flow._db.engine, token=coordination_token, window_seconds=80.0, verb="register_artifact"
+            ) as conn:
+                artifact = factory.execution.artifacts.register_artifact(
+                    run_id=run_id,
+                    state_id=state.state_id,
+                    sink_node_id=sink.node_id,
+                    artifact_type="test",
+                    path="memory://wrong-failsink",
+                    content_hash="deadbeef" * 8,
+                    size_bytes=0,
+                    conn=conn,
+                )
             captured["artifact_id"] = artifact.artifact_id
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
+                coordination_token=coordination_token,
                 ref=TokenRef(token_id=token.token_id, run_id=run_id),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
@@ -586,7 +634,8 @@ def test_realtime_invariant_crash_finalizes_failed_and_preserves_witnesses(
                 error_hash=_ERROR_HASH,
             )
         else:
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
+                coordination_token=coordination_token,
                 ref=TokenRef(token_id=token.token_id, run_id=run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.SINK_DISCARDED,

@@ -18,13 +18,15 @@ from pydantic import Field, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
-from elspeth.contracts.errors import PluginContractViolation, TransformSuccessReason
+from elspeth.contracts.errors import TransformSuccessReason
 from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.transforms._batch_row_types import BatchRowFieldCollisionError, BatchRowTypeError
 
 # The one field this transform creates. Named once so the emission site, the
 # declared output contract, and the config-time guard cannot drift apart into
@@ -129,16 +131,18 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e55a79ce73d7c917"
+    source_file_hash: str | None = "sha256:a00352057226befe"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
+    # Not passthrough-capable: each row asks for its own number of copies.
+    flush_emits_one_row_per_buffered_row = False
     usage_when_to_use: str = (
         "Use for bounded per-row copy expansion. A missing copies_field uses default_copies, while a valid integer "
         "count controls the emitted copies and optional copy indexes."
     )
     usage_when_not_to_use: str = (
-        "Not for random sampling or unbounded fan-out. A present non-integer count raises TypeError; only integer "
-        "counts outside 1..max_copies are quarantined."
+        "Not for random sampling or unbounded fan-out. A present non-integer count (including null) fails the whole "
+        "batch with a recorded reason; only integer counts outside 1..max_copies are quarantined."
     )
     example_use: str = """aggregations:
   - name: replicate_rows
@@ -160,14 +164,12 @@ class BatchReplicate(BaseTransform):
     capability_tags: tuple[str, ...] = ("batch", "deaggregation", "row-expansion")
 
     # Every emitted row deep-copies its originating input before adding
-    # copy_index. Mixed-validity batches may quarantine inputs, but the
-    # pass-through contract applies to emitted rows and batch verification uses
-    # the fields shared by every buffered input (ADR-009 Clause 2).
+    # copy_index.
     passes_through_input = True
 
     # Sound because process() deep-copies each input row and only ADDS
-    # copy_index — a row already carrying copy_index raises
-    # PluginContractViolation rather than being overwritten, so no forwarded
+    # copy_index — a row already carrying copy_index fails the whole batch
+    # (a field_collision error) rather than being overwritten, so no forwarded
     # value is ever rewritten (elspeth-48aeea6ad9).
     preserves_input_values = True
 
@@ -179,9 +181,10 @@ class BatchReplicate(BaseTransform):
                 issue_code=None,
                 summary="Replicates rows within an aggregation batch based on a copy-count field.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_replicate under aggregations with output_mode=transform so emitted copies become new tokens.",
-                    "copies_field must be an int when present; missing values use default_copies and values outside 1..max_copies are quarantined.",
-                    "include_copy_index=True adds copy_index, so avoid input fields with that name or disable it.",
+                    "copies_field must be an int when present: a row without the field uses default_copies, a present non-int value (null included) fails the whole batch, and integers outside 1..max_copies are quarantined.",
+                    "include_copy_index=True adds copy_index and an input row already carrying copy_index fails the whole batch, so avoid input fields with that name or disable it.",
                     "This expands row count and can drop invalid source rows from the successful output.",
                 ),
             )
@@ -232,6 +235,12 @@ class BatchReplicate(BaseTransform):
         # by neither.
         self._reject_input_options_naming_created_fields({"copies_field": cfg.copies_field})
 
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """``copy_index`` is the replica's ordinal, an ``int`` fixed by the loop that emits it (ADR-050)."""
+        if not self._include_copy_index:
+            return ()
+        return (FieldDefinition(COPY_INDEX_FIELD, "int"),)
+
     def _reject_explicit_copy_index_collision(self, cfg: BatchReplicateConfig) -> None:
         """Reject explicit schemas that would always collide with copy_index emission."""
         if not cfg.include_copy_index or cfg.schema_config.fields is None:
@@ -265,7 +274,9 @@ class BatchReplicate(BaseTransform):
             ctx: Plugin context
 
         Returns:
-            TransformResult.success_multi() with replicated rows
+            TransformResult.success_multi() with replicated rows, or a
+            batch-level TransformResult.error when a row carries a non-int
+            copies value or already carries copy_index
         """
         if not rows:
             # Empty batch is an anomaly — return error, not fabricated data.
@@ -289,28 +300,37 @@ class BatchReplicate(BaseTransform):
             else:
                 raw_copies = row[self._copies_field]
 
-                # Contract enforcement: copies_field must be int if present
-                # Tier 2 pipeline data - wrong types indicate upstream bug
-                # Use `type(x) is int` instead of `isinstance(x, int)` because
-                # bool is a subclass of int in Python, so isinstance(True, int)
-                # returns True. We must reject bool values explicitly.
+                # A present copies value must be an int — no coercion: a str
+                # that is not a number is not a number. A wrong type (None
+                # included: there is no missing-value branch here, the absent
+                # FIELD is the missing case) fails the WHOLE batch with a
+                # recorded, value-free reason (elspeth-d5034647f0). The caller
+                # owns disposition: an aggregation's on_error receives every
+                # buffered row, a collector fails the group.
+                # `type(x) is int`, not isinstance: bool is an int subclass and
+                # True/False must not pass as 1/0 copies.
                 if type(raw_copies) is not int:
-                    raise TypeError(
-                        f"Field '{self._copies_field}' must be int, got {type(raw_copies).__name__}. "
-                        f"This indicates an upstream validation bug - check source schema or prior transforms."
+                    return TransformResult.error(
+                        BatchRowTypeError(
+                            field=self._copies_field,
+                            row_index=row_index,
+                            expected="int",
+                            found=type(raw_copies).__name__,
+                        ).as_reason(),
+                        retryable=False,
                     )
 
                 # Value-level validation: copies must be >= 1 and <= max_copies
                 # Tier 2 operation safety - type is correct but value is unsafe
                 if raw_copies < 1 or raw_copies > self._max_copies:
-                    # Record the row INDEX for traceability, never the row body:
-                    # row.to_dict() is Tier-2/3 content and must not leak into the
-                    # audit success_reason (prior row-content-leak bug family).
+                    # Record the row INDEX and field NAME for traceability, never
+                    # a row value: neither row.to_dict() nor the copies count
+                    # itself may leak into the audit success_reason (prior
+                    # row-content-leak bug family).
                     quarantined.append(
                         {
                             "reason": "invalid_copies",
                             "field": self._copies_field,
-                            "value": raw_copies,
                             "row_index": row_index,
                         }
                     )
@@ -322,10 +342,14 @@ class BatchReplicate(BaseTransform):
             if self.declared_output_fields:
                 collisions = detect_field_collisions(set(row.keys()), self.declared_output_fields)
                 if collisions is not None:
-                    raise PluginContractViolation(
-                        f"Transform '{self.name}' would overwrite existing input fields "
-                        f"{collisions}. This is a pipeline configuration error — the transform's "
-                        f"output fields collide with fields already present in the row."
+                    # Under an observed upstream only the row data decides
+                    # whether copy_index arrives, so this is a row fault: the
+                    # whole batch fails with a value-free reason (ruling on
+                    # elspeth-d90495084c). The certain case, an explicit schema
+                    # declaring copy_index, is refused at construction.
+                    return TransformResult.error(
+                        BatchRowFieldCollisionError(row_index=row_index, collisions=collisions).as_reason(),
+                        retryable=False,
                     )
 
             # Create copies of this row
@@ -365,12 +389,14 @@ class BatchReplicate(BaseTransform):
                 if fc.normalized_name not in merged_fields:
                     merged_fields[fc.normalized_name] = fc
 
-        # Add copy_index as a new inferred field if configured
+        # copy_index enters as a placeholder; the ONE stamp rewrites it to the
+        # plugin's declaration (``int``, ADR-050) and the batch postflight
+        # checks that declaration against the emitted value.
         if self._include_copy_index:
             merged_fields[COPY_INDEX_FIELD] = FieldContract(
                 normalized_name=COPY_INDEX_FIELD,
                 original_name=COPY_INDEX_FIELD,
-                python_type=int,
+                python_type=object,
                 required=False,
                 source="inferred",
             )
@@ -380,7 +406,7 @@ class BatchReplicate(BaseTransform):
             fields=tuple(merged_fields.values()),
             locked=True,
         )
-        output_contract = self._align_output_contract(output_contract)
+        output_contract = self._align_output_contract(self._apply_declared_output_field_contracts(output_contract))
 
         success_reason: TransformSuccessReason = {
             "action": "processed",

@@ -189,13 +189,20 @@ class TestBatchExperimentCompare:
             }
         )
 
-        result = transform.process([_make_row({"variant": "treatment", "score": 1.0})], ctx)
+        result = transform.process([_make_row({"variant": "treatment-SENTINEL-4c1e", "score": 1.0})], ctx)
 
         assert result.status == "error"
-        assert result.reason is not None
-        assert result.reason["reason"] == "validation_failed"
-        assert result.reason["cause"] == "baseline_variant_missing"
-        assert result.reason["expected"] == "control"
+        assert result.retryable is False
+        assert result.reason == {
+            "reason": "validation_failed",
+            "cause": "baseline_variant_missing",
+            "group_by": "variant",
+            # The CONFIGURED label (config, not row content).
+            "expected": "control",
+            "message": "Baseline variant 'control' was not present in the batch.",
+        }
+        # The labels the batch DID carry are row content and stay out of the audit reason.
+        assert "SENTINEL-4c1e" not in repr(sorted(result.reason.items()))
 
     def test_insufficient_variants_returns_error(self, ctx: PluginContext) -> None:
         from elspeth.plugins.transforms.batch_experiment_compare import BatchExperimentCompare
@@ -217,8 +224,8 @@ class TestBatchExperimentCompare:
 
         rows = [
             _make_row({"variant": "A", "score": 1.0}),
-            _make_row({"variant": "B", "score": None}),
-            _make_row({"variant": "B", "score": float("inf")}),
+            _make_row({"variant": "B-SENTINEL-9d27", "score": None}),
+            _make_row({"variant": "B-SENTINEL-9d27", "score": float("inf")}),
         ]
 
         result = transform.process(rows, ctx)
@@ -227,24 +234,93 @@ class TestBatchExperimentCompare:
         assert result.reason is not None
         assert result.reason["reason"] == "validation_failed"
         assert result.reason["cause"] == "variant_has_no_finite_scores"
-        assert result.reason["group_value"] == "B"
+        # The group is identified by its FIELD and the batch row indices below,
+        # never by its label: the label is row content.
+        assert result.reason["group_by"] == "variant"
+        assert result.reason["field"] == "score"
+        assert "group_value" not in result.reason
         assert result.reason["row_errors"] == [
             {"row_index": 1, "reason": "missing_value"},
             {"row_index": 2, "reason": "non_finite_value"},
         ]
+        assert "SENTINEL-9d27" not in repr(sorted(result.reason.items()))
 
-    def test_non_numeric_scores_raise_type_error(self, ctx: PluginContext) -> None:
+    def test_float_overflow_reason_names_fields_not_variant_labels(self, ctx: PluginContext) -> None:
+        from elspeth.plugins.transforms.batch_experiment_compare import BatchExperimentCompare
+
+        transform = BatchExperimentCompare({"schema": DYNAMIC_SCHEMA, "variant_field": "variant", "score_field": "score"})
+
+        rows = [
+            _make_row({"variant": "control-SENTINEL-51b0", "score": 1e308}),
+            _make_row({"variant": "control-SENTINEL-51b0", "score": 1e308}),
+            _make_row({"variant": "treatment-SENTINEL-51b0", "score": 1.0}),
+            _make_row({"variant": "treatment-SENTINEL-51b0", "score": 2.0}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason == {
+            "reason": "float_overflow",
+            "operation": "baseline_mean",
+            "group_by": "variant",
+            "field": "score",
+        }
+        assert "SENTINEL-51b0" not in repr(sorted(result.reason.items()))
+
+    def test_non_numeric_score_fails_the_whole_batch_with_a_recorded_reason(self, ctx: PluginContext) -> None:
+        """A present non-numeric score fails the WHOLE batch (elspeth-d5034647f0).
+
+        It is neither skipped nor coerced, and the run does not abort: the plugin
+        returns a batch-level error the aggregation routes via its on_error. The
+        bad row sits at BATCH index 3 but is the second row of its variant group,
+        so a group-local index ("in row 1") would name the wrong row.
+        """
         from elspeth.plugins.transforms.batch_experiment_compare import BatchExperimentCompare
 
         transform = BatchExperimentCompare({"schema": DYNAMIC_SCHEMA, "variant_field": "variant", "score_field": "score"})
 
         rows = [
             _make_row({"variant": "A", "score": 1.0}),
-            _make_row({"variant": "B", "score": "not_a_number"}),
+            _make_row({"variant": "B", "score": 2.0}),
+            _make_row({"variant": "A", "score": 3.0}),
+            _make_row({"variant": "B", "score": "not_a_number"}),  # Fails the BATCH, never skipped
         ]
 
-        with pytest.raises(TypeError, match="must be numeric"):
-            transform.process(rows, ctx)
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.rows is None and result.row is None
+        assert result.reason is not None
+        assert result.reason["reason"] == "invalid_input"
+        assert result.reason["error_type"] == "wrong_type"
+        assert result.reason["field"] == "score"
+        assert result.reason["expected"] == "numeric (int or float)"
+        assert result.reason["actual_type"] == "str"
+        assert result.reason["error"] == "must be numeric (int or float), got str in row 3"
+        # The offending VALUE is row content and must not reach the audit trail.
+        assert "not_a_number" not in repr(sorted(result.reason.items()))
+
+    def test_bool_score_is_not_numeric_and_fails_the_batch(self, ctx: PluginContext) -> None:
+        """bool subclasses int, but a boolean is not a score: no coercion."""
+        from elspeth.plugins.transforms.batch_experiment_compare import BatchExperimentCompare
+
+        transform = BatchExperimentCompare({"schema": DYNAMIC_SCHEMA, "variant_field": "variant", "score_field": "score"})
+
+        rows = [
+            _make_row({"variant": "A", "score": True}),
+            _make_row({"variant": "B", "score": 2.0}),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert result.status == "error"
+        assert result.retryable is False
+        assert result.reason is not None
+        assert result.reason["actual_type"] == "bool"
+        assert result.reason["error"] == "must be numeric (int or float), got bool in row 0"
 
     def test_empty_batch_returns_error(self, ctx: PluginContext) -> None:
         from elspeth.plugins.transforms.batch_experiment_compare import BatchExperimentCompare

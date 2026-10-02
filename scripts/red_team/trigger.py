@@ -6,19 +6,15 @@ Deterministic core (unit-tested in tests/unit/scripts/test_red_team_trigger.py):
 - ``classify_paths``     — which security-seam categories a commit touches
 - ``select_attack_angles`` — 2-3 adversarial angles for those categories
 - ``parse_findings``     — fail-closed extraction of agent JSON findings
-- ``route_finding``      — auto-file vs review-log severity routing
-- ``file_issue_argv`` / ``build_agent_argv`` — argv construction (no shell)
+- ``build_agent_argv``   — argv construction (no shell)
 
 Orchestration (thin, subprocess-based): ``main`` with ``classify`` and ``run``
 subcommands. Exit codes are deliberately distinct — 0 = seam matched /
 run completed, 3 = no seam matched — so callers never conflate "nothing to
 do" with "failed" (the exact conflation bug the red-team agent hunts).
 
-Findings routing: severity in {critical, high} AND confidence == confirmed
-auto-files a Filigree bug; everything else — including any finding with an
-unrecognised severity or confidence — appends to the review log. Unknown
-vocabulary fails closed to the *quiet* side because the pipeline's contract
-is zero-noise auto-filing.
+All findings and parsing errors append to the local review log for operator
+triage. This automatic post-commit review never publishes issues.
 """
 
 from __future__ import annotations
@@ -129,11 +125,6 @@ _ESCAPE_CATEGORIES = frozenset({"auth", "secrets", "security", "policy_gate", "c
 _STATE_CATEGORIES = frozenset({"state_machine"})
 _MAX_ANGLES = 3
 
-_AUTO_FILE_SEVERITIES = frozenset({"critical", "high"})
-_KNOWN_SEVERITIES = frozenset({"critical", "high", "medium", "low"})
-_KNOWN_CONFIDENCES = frozenset({"confirmed", "probable", "speculative"})
-_PRIORITY_BY_SEVERITY = {"critical": "0", "high": "1"}
-
 _REQUIRED_FINDING_FIELDS = ("title", "severity", "confidence", "files", "repro", "detail")
 
 _JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
@@ -222,50 +213,6 @@ def parse_findings(text: str, angle: str, commit: str) -> tuple[list[Finding], l
                 )
             )
     return findings, errors
-
-
-def route_finding(finding: Finding) -> str:
-    """Return ``"file"`` to auto-file a tracker issue, ``"log"`` otherwise.
-
-    Unknown severity or confidence vocabulary routes to the log: the
-    auto-file path only fires on values it positively recognises.
-    """
-    if finding.severity not in _KNOWN_SEVERITIES:
-        return "log"
-    if finding.confidence not in _KNOWN_CONFIDENCES:
-        return "log"
-    if finding.severity in _AUTO_FILE_SEVERITIES and finding.confidence == "confirmed":
-        return "file"
-    return "log"
-
-
-def file_issue_argv(finding: Finding) -> list[str]:
-    """Build the ``filigree create`` argv for an auto-filed finding."""
-    description = (
-        f"Red-team finding (angle: {finding.angle}, commit: {finding.commit}, "
-        f"confidence: {finding.confidence}).\n\n"
-        f"{finding.detail}\n\n"
-        f"Files: {', '.join(finding.files)}\n\n"
-        f"Reproduction:\n{finding.repro}\n"
-    )
-    return [
-        "filigree",
-        "create",
-        finding.title,
-        "--type",
-        "bug",
-        "-p",
-        _PRIORITY_BY_SEVERITY[finding.severity],
-        "-d",
-        description,
-        "--label",
-        "red-team",
-        "--label",
-        f"red-team-angle:{finding.angle}",
-        "--actor",
-        "red-team",
-        "--json",
-    ]
 
 
 def build_agent_prompt(commit: str, angle: AttackAngle) -> str:
@@ -401,28 +348,8 @@ def run_red_team(commit: str, repo_root: Path, dry_run: bool) -> int:
         all_findings.extend(findings)
         all_errors.extend(errors)
 
-    filed: list[str] = []
-    logged: list[Finding] = []
-    for finding in all_findings:
-        if route_finding(finding) == "file":
-            result = subprocess.run(
-                file_issue_argv(finding),
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                filed.append(finding.title)
-            else:
-                all_errors.append(f"filigree create failed for '{finding.title}': {result.stderr[-300:]}")
-                logged.append(finding)
-        else:
-            logged.append(finding)
-
-    log_path = append_review_log(repo_root, logged, all_errors)
-    print(f"{sha[:12]}: {len(filed)} issue(s) filed, {len(logged)} finding(s) logged to {log_path}, {len(all_errors)} error(s)")
-    for title in filed:
-        print(f"  filed: {title}")
+    log_path = append_review_log(repo_root, all_findings, all_errors)
+    print(f"{sha[:12]}: {len(all_findings)} finding(s) logged to {log_path}, {len(all_errors)} error(s)")
     return _EXIT_SEAM_MATCHED
 
 

@@ -10,10 +10,9 @@ Handles the "infer-and-lock" pattern for OBSERVED and FLEXIBLE modes:
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any
 
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
-from elspeth.contracts.type_normalization import UNSUPPORTED_CONTRACT_TYPE, normalize_type_for_contract
 
 _MAX_INFERRED_CONTRACT_FIELDS = 1024
 
@@ -65,35 +64,6 @@ class ContractBuilder:
             normalized_to_original[norm] = orig
         return normalized_to_original
 
-    @staticmethod
-    def _inferred_field(normalized_name: str, original_name: str, value: Any) -> FieldContract:
-        """Infer one field contract from an observed row value."""
-        normalized_type = normalize_type_for_contract(value)
-        python_type: type
-        if normalized_type is UNSUPPORTED_CONTRACT_TYPE:
-            python_type = object
-        else:
-            python_type = cast(type, normalized_type)
-
-        # Null-like values (None, pd.NA, pd.NaT) normalize to type(None), but
-        # for inference that means "type unknown, field is nullable" — not
-        # "field is always NoneType". Use object+nullable to avoid locking the
-        # field to NoneType and causing false violations on subsequent rows
-        # with real values.
-        nullable = False
-        if python_type is type(None):
-            python_type = object
-            nullable = True
-
-        return FieldContract(
-            normalized_name=normalized_name,
-            original_name=original_name,
-            python_type=python_type,
-            required=False,
-            source="inferred",
-            nullable=nullable,
-        )
-
     def _infer_missing_fields(
         self,
         row: dict[str, Any],
@@ -124,11 +94,12 @@ class ContractBuilder:
             if normalized_name in declared_names:
                 continue
 
-            # Per CLAUDE.md: No silent fallback - if field is in the row but not
-            # in resolution, that's a bug in the source plugin. KeyError is
-            # correct.
+            # No silent fallback - if field is in the row but not in
+            # resolution, that's a bug in the source plugin, and plugins are
+            # system code (see docs/guides/data-trust-and-error-handling.md
+            # §Plugin Ownership). KeyError is correct.
             original_name = normalized_to_original[normalized_name]
-            new_field = self._inferred_field(normalized_name, original_name, value)
+            new_field = FieldContract.inferred(normalized_name, original_name, value)
             updated = SchemaContract(
                 mode=updated.mode,
                 fields=(*updated.fields, new_field),
@@ -138,6 +109,29 @@ class ContractBuilder:
 
         self._contract = updated
         return updated
+
+    def refuse_uninferable_width(self, field_names: tuple[str, ...], *, subject: str) -> None:
+        """Refuse, before any row is read, a record width inference cannot hold.
+
+        A locked contract (``mode: fixed``) infers nothing and has no cap. An
+        unlocked one (observed, flexible) infers every field of the first valid
+        row, so a record shape wider than the cap would otherwise fail there,
+        after earlier rows were already ingested. Only counts are named: the
+        message carries no field name or value.
+
+        Raises:
+            ContractFieldLimitExceeded: The unlocked contract would infer more
+                than the cap.
+        """
+        if self._contract.locked:
+            return
+        width = len({f.normalized_name for f in self._contract.fields} | set(field_names))
+        if width > _MAX_INFERRED_CONTRACT_FIELDS:
+            raise ContractFieldLimitExceeded(
+                f"{subject} has {width} fields; observed and flexible schemas infer at most "
+                f"{_MAX_INFERRED_CONTRACT_FIELDS}. Declare the schema with mode: fixed and list every one of "
+                f"the {width} fields (a fixed schema rejects undeclared fields), or remove fields before ingest."
+            )
 
     def process_first_row(
         self,

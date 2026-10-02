@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import insert
 
+from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.sessions.models import chat_messages_table, composition_states_table
 from tests.unit.web.conftest import _make_session
 
@@ -122,7 +123,12 @@ def _seed_compose_turn_with_outcomes(test_client: TestClient) -> dict[str, Any]:
                     "id": str(uuid4()),
                     "session_id": session_id,
                     "role": "tool",
-                    "content": json.dumps({"success": False, "validation": {"errors": ["bad options"]}}),
+                    "content": json.dumps(
+                        {
+                            "success": False,
+                            "validation": {"errors": [{"error_code": "plugin_options_invalid", "message": "<redacted-response-text>"}]},
+                        }
+                    ),
                     "raw_content": None,
                     "tool_calls": None,
                     "tool_call_id": "call_reject",
@@ -157,6 +163,26 @@ async def test_conversation_view_stamps_outcomes_on_assistant_envelopes(
     assert by_id["call_read"]["applied_state_version"] is None
     assert by_id["call_reject"]["outcome"] == "rejected"
     assert by_id["call_reject"]["applied_state_version"] is None
+
+
+@pytest.mark.asyncio
+async def test_normal_conversation_resync_keeps_public_rejection_guidance_without_audit_opt_in(test_client: TestClient) -> None:
+    seeded = _seed_compose_turn_with_outcomes(test_client)
+    session_id = seeded["session_id"]
+
+    for _ in range(2):
+        response = await _get(test_client, f"/api/sessions/{session_id}/messages")
+        assert response.status_code == 200
+        rows = response.json()
+        assert [row["role"] for row in rows] == ["user", "assistant"]
+        assistant = rows[1]
+        assert [call["id"] for call in assistant["tool_calls"]] == ["call_mutate", "call_read", "call_reject"]
+        assert assistant["tool_calls"][2]["rejection"] == {
+            "error_code": "plugin_options_invalid",
+            "guidance": list(explain_validation_code("plugin_options_invalid")),
+        }
+        assert all(row["rejection"] is None for row in rows)
+        assert "<redacted-response-text>" not in response.text
 
 
 @pytest.mark.asyncio

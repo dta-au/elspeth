@@ -15,7 +15,8 @@ and must NOT rewrite sequence 0.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import threading
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -173,7 +174,7 @@ class TestRunStartCheckpoint:
         finally:
             db.close()
 
-    def test_resume_does_not_rewrite_sequence_zero(self) -> None:
+    def test_resume_does_not_rewrite_sequence_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Crash after start, resume: exactly one sequence-0 row survives.
 
         The resume path rebases onto the persisted sequence
@@ -200,7 +201,24 @@ class TestRunStartCheckpoint:
             # that lease (default TTL five minutes). Waiting goes through the
             # orchestrator clock: a controlled clock advances instead of
             # blocking the test for the whole TTL.
-            clock = MockClock(start=datetime.now(UTC).timestamp())
+            database_now = datetime.now(UTC)
+            monkeypatch.setattr(
+                "elspeth.core.landscape.execution.sink_effect_lifecycle.read_landscape_decision_time",
+                lambda conn: database_now,
+            )
+            clock = MockClock(start=database_now.timestamp())
+            sleeps: list[float] = []
+
+            def record_sleep(seconds: float) -> None:
+                sleeps.append(seconds)
+                clock.advance(seconds)
+
+            def forbid_wall_wait(timeout: float | None = None) -> bool:
+                pytest.fail("sink lease wait used wall time instead of the orchestrator clock")
+
+            monkeypatch.setattr(clock, "sleep", record_sleep)
+            shutdown_event = threading.Event()
+            monkeypatch.setattr(shutdown_event, "wait", forbid_wall_wait)
             orchestrator = Orchestrator(
                 db=db,
                 checkpoint_manager=checkpoint_mgr,
@@ -229,13 +247,17 @@ class TestRunStartCheckpoint:
                 resume_calls.append(kwargs)
                 return original_create(*args, **kwargs)
 
-            checkpoint_mgr.create_checkpoint = tracking_create  # type: ignore[method-assign]
+            monkeypatch.setattr(checkpoint_mgr, "create_checkpoint", tracking_create)
 
             # The replay outcome itself is NOT this test's contract (the sink
             # still fails, and mid-flight token replay is Task 4.x territory) —
             # what Task 3.3 pins is the resume ENTRY: rebase onto the persisted
             # sequence, never a second run-start write.
             resume_error: Exception | None = None
+            # A live foreign lease has already aged before resume begins.
+            # Database validity and the pacing clock are separate authorities.
+            database_now += timedelta(seconds=2)
+            sleeps.clear()
             resume_started_at = clock.monotonic()
             try:
                 orchestrator.resume(
@@ -243,16 +265,17 @@ class TestRunStartCheckpoint:
                     config=config,
                     graph=graph,
                     payload_store=payload_store,
+                    shutdown_event=shutdown_event,
                 )
             except Exception as exc:  # any replay failure shape is acceptable here
                 resume_error = exc
 
-            # Mechanism pin: the foreign-lease wait consumed CONTROLLED time,
-            # not wall time. If the sink executor ever stops threading the
-            # orchestrator clock into its lease waits, the mock clock stays
-            # still and this fails long before the five-minute real sleep
-            # would have finished.
-            assert clock.monotonic() - resume_started_at >= 300.0, "resume lease wait must sleep on the orchestrator clock"
+            # Pin the mechanism, not a fresh lease's TTL: database time has
+            # already consumed part of that TTL. The Event.wait sentinel above
+            # fails immediately if clock plumbing regresses to a wall wait.
+            assert sleeps, "resume lease wait must sleep on the orchestrator clock"
+            assert all(seconds > 0.0 for seconds in sleeps)
+            assert clock.monotonic() - resume_started_at == pytest.approx(sum(sleeps))
             assert all(call["sequence_number"] != 0 for call in resume_calls), (
                 f"Resume must never rewrite the sequence-0 baseline; saw writes at {[c['sequence_number'] for c in resume_calls]}"
             )

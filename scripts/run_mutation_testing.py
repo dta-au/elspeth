@@ -32,10 +32,9 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import contextlib
-import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # Module paths relative to src/elspeth/core/
@@ -59,10 +58,10 @@ CACHE_PATH = Path(".mutmut-cache")
 
 
 def clean_cache() -> None:
-    """Remove the mutmut cache directory."""
+    """Remove the mutmut 2.x SQLite cache file."""
     if CACHE_PATH.exists():
         print(f"🧹 Cleaning {CACHE_PATH}...")
-        shutil.rmtree(CACHE_PATH)
+        CACHE_PATH.unlink()
 
 
 def run_mutmut(module_path: str, timeout_minutes: int = 120) -> int:
@@ -119,69 +118,80 @@ def show_results() -> int:
     return result.returncode
 
 
-def show_survivors() -> None:
+def show_survivors() -> int:
     """Show details of survived mutants."""
     print("\n🔍 Survived Mutants (tests didn't catch these bugs):")
     print("-" * 50)
 
     # Get list of survived mutant IDs
-    cmd = [sys.executable, "-m", "mutmut", "results"]
+    cmd = [sys.executable, "-m", "mutmut", "result-ids", "survived"]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        print("❌ Could not read survived mutant IDs")
+        return 1
+    try:
+        ids = [int(value) for value in result.stdout.split()]
+    except ValueError:
+        print("❌ Invalid survived mutant IDs")
+        return 1
+    if len(ids) != len(set(ids)) or any(mutant_id <= 0 for mutant_id in ids):
+        print("❌ Invalid survived mutant IDs")
+        return 1
+    if not ids:
+        print("No surviving mutants recorded; see results above for other mutant statuses.")
+        return 0
 
-    if "Survived" not in result.stdout:
-        print("✅ No survivors - all mutants were killed!")
-        return
-
-    # Parse survivor count and show first few
+    print("Surviving mutant IDs: " + " ".join(map(str, ids)))
     print("\nUse 'python -m mutmut show <id>' to inspect specific mutants")
     print("Use 'python -m mutmut html' to generate an HTML report\n")
+    return 0
 
 
-def calculate_score() -> tuple[int, int, float] | None:
-    """Calculate mutation score from results.
+def calculate_score(module_path: str) -> tuple[int, int, float] | None:
+    """Score one module using mutmut 2.x's machine-readable reports.
 
-    Returns:
-        Tuple of (killed, total, score_percent) or None if can't parse
+    JUnit inventories every mutant, including skipped ones, but does not mark
+    skipped mutants as failures. Only ``result-ids killed`` proves a kill.
+    Filtering by testcase file prevents cached results for other modules from
+    inflating the score in --all and --no-clean runs. All non-killed mutants
+    remain in the denominator. Missing or malformed reports are not a score.
     """
-    cmd = [sys.executable, "-m", "mutmut", "results"]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-
-    # Parse output - mutmut 2.x format varies
-    # Try to extract from the summary line
-    output = result.stdout + result.stderr
-
-    killed = 0
-    survived = 0
-    timeout = 0
-
-    for line in output.split("\n"):
-        line_lower = line.lower()
-        if "killed" in line_lower:
-            # Try to find number before "killed"
-            parts = line.split()
-            for i, part in enumerate(parts):
-                if "killed" in part.lower() and i > 0:
-                    with contextlib.suppress(ValueError):
-                        killed = int(parts[i - 1])
-        if "survived" in line_lower:
-            parts = line.split()
-            for i, part in enumerate(parts):
-                if "survived" in part.lower() and i > 0:
-                    with contextlib.suppress(ValueError):
-                        survived = int(parts[i - 1])
-        if "timeout" in line_lower:
-            parts = line.split()
-            for i, part in enumerate(parts):
-                if "timeout" in part.lower() and i > 0:
-                    with contextlib.suppress(ValueError):
-                        timeout = int(parts[i - 1])
-
-    total = killed + survived + timeout
-    if total == 0:
+    result = subprocess.run([sys.executable, "-m", "mutmut", "junitxml"], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
         return None
-
-    score = (killed / total) * 100
-    return killed, total, score
+    try:
+        root = ET.fromstring(result.stdout)
+        if root.tag != "testsuites":
+            return None
+        all_ids: set[int] = set()
+        module_ids: set[int] = set()
+        target = (CORE_PATH / module_path).resolve()
+        for case in root.findall("./testsuite/testcase"):
+            name = case.attrib["name"]
+            if not name.startswith("Mutant #"):
+                return None
+            mutant_id = int(name.removeprefix("Mutant #"))
+            if mutant_id <= 0 or mutant_id in all_ids:
+                return None
+            all_ids.add(mutant_id)
+            if Path(case.attrib["file"]).resolve() == target:
+                module_ids.add(mutant_id)
+        if not module_ids:
+            return None
+        killed_result = subprocess.run(
+            [sys.executable, "-m", "mutmut", "result-ids", "killed"], capture_output=True, text=True, check=False
+        )
+        if killed_result.returncode != 0:
+            return None
+        killed_list = [int(value) for value in killed_result.stdout.split()]
+        killed_ids = set(killed_list)
+        if len(killed_ids) != len(killed_list) or not killed_ids <= all_ids:
+            return None
+    except (ET.ParseError, KeyError, ValueError):
+        return None
+    killed = len(killed_ids & module_ids)
+    total = len(module_ids)
+    return killed, total, killed / total * 100
 
 
 def main() -> int:
@@ -205,7 +215,7 @@ def main() -> int:
     parser.add_argument(
         "--no-clean",
         action="store_true",
-        help="Don't clean cache before running",
+        help="Reuse cached exploratory results (incompatible with --strict)",
     )
     parser.add_argument(
         "--show-survivors",
@@ -226,11 +236,15 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    if args.strict and args.no_clean:
+        print("❌ --strict requires fresh results; remove --no-clean (cached kills may predate changes to tests)")
+        return 1
+
     # Show survivors and exit
     if args.show_survivors:
-        show_results()
-        show_survivors()
-        return 0
+        if show_results() != 0:
+            return 1
+        return show_survivors()
 
     # Clean cache unless --no-clean
     if not args.no_clean:
@@ -246,21 +260,29 @@ def main() -> int:
 
     # Run mutation testing
     exit_code = 0
+    thresholds_by_path = {(CORE_PATH / path).resolve(): threshold for path, threshold in THRESHOLDS.items()}
     for module in modules:
         result = run_mutmut(module, timeout_minutes=args.timeout)
-        if result != 0:
-            # mutmut returns non-zero even on success sometimes
-            pass
+        # mutmut 2.x ORs survivor (2), timeout (4), and suspicious (8) bits.
+        # Fatal errors set bit 1; signals and unknown statuses are errors too.
+        if result not in (0, 2, 4, 6, 8, 10, 12, 14):
+            print(f"❌ Mutation testing failed for {module} (exit {result})")
+            return 1
 
         # Show results
-        show_results()
+        if show_results() != 0:
+            print("❌ Could not read mutation results")
+            return 1
 
         # Check threshold if strict mode
         if args.strict:
-            score_data = calculate_score()
-            if score_data:
+            score_data = calculate_score(module)
+            if score_data is None:
+                print(f"❌ Missing or invalid mutation score for {module}")
+                return 1
+            else:
                 killed, total, score = score_data
-                threshold = THRESHOLDS.get(module, 80)
+                threshold = thresholds_by_path.get((CORE_PATH / module).resolve(), 80)
                 print(f"\n📈 Score: {score:.1f}% ({killed}/{total} killed)")
                 print(f"📊 Threshold: {threshold}%")
                 if score < threshold:

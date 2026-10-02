@@ -3,14 +3,14 @@
 
 ``elspeth-lints check`` is deliberately fail-closed: it exits 1 whenever the
 standing finding corpus is non-empty, and that corpus stays non-empty until the
-operator signs the package (AGENTS.md, "Judge-signature stage"). Used directly
+operator signs the package (AGENTS.md, "Operator signature verification"). Used directly
 as a pre-commit entry it therefore refuses every commit that touches its
 trigger paths, including commits that strictly shrink the corpus. This script
 is the hook's entry instead. It runs the same rule with the same arguments and
 environment twice -- over the tree pre-commit is about to commit and over
 ``git archive HEAD`` -- and fails only when the commit would ADD a failing
-finding that HEAD does not already carry. The CLI gate itself is untouched and
-CI still runs it fail-closed.
+finding that HEAD does not already carry. The CLI remains available for
+operator verification; CI does not run the signed trust-tier check.
 
 Findings are compared as a multiset of line-insensitive keys
 ``(path, rule id, message)``. Line and column numbers move under unrelated

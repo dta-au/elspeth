@@ -22,7 +22,11 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from elspeth.core.security.web import SSRFSafeRequest
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
+from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest, parse_http_origin
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 
 @pytest.fixture
@@ -50,6 +54,8 @@ class RecordedCall:
     latency_ms: float | None = None
     request_ref: str | None = None
     response_ref: str | None = None
+    token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE
+    source_call_id: str | None = None
 
 
 @dataclass
@@ -58,7 +64,7 @@ class FakeCallRecorder:
     _next_state_call_index: int = 0
     _next_operation_call_index: int = 0
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         self._next_state_call_index += 1
         return self._next_state_call_index
 
@@ -77,11 +83,17 @@ class FakeCallRecorder:
         error: object | None = None,
         latency_ms: float | None = None,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> RecordedCall:
-        del resolved_prompt_template_hash
+        assert source_call_id is None
+        del approved_prompt_artifact_hash
+        assert token_usage == UNKNOWN_TOKEN_USAGE
         call = RecordedCall(
             state_id=state_id,
             operation_id=None,
@@ -94,6 +106,8 @@ class FakeCallRecorder:
             latency_ms=latency_ms,
             request_ref=request_ref or f"request-{call_index}",
             response_ref=response_ref or f"response-{call_index}",
+            token_usage=token_usage,
+            source_call_id=source_call_id,
         )
         self.calls.append(call)
         return call
@@ -111,9 +125,13 @@ class FakeCallRecorder:
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
-        resolved_prompt_template_hash: str | None = None,
+        approved_prompt_artifact_hash: str | None = None,
+        token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
+        source_call_id: str | None = None,
     ) -> RecordedCall:
-        del resolved_prompt_template_hash
+        assert source_call_id is None
+        del approved_prompt_artifact_hash
+        assert token_usage == UNKNOWN_TOKEN_USAGE
         index = call_index if call_index is not None else self.allocate_operation_call_index(operation_id)
         call = RecordedCall(
             state_id=None,
@@ -127,6 +145,8 @@ class FakeCallRecorder:
             latency_ms=latency_ms,
             request_ref=request_ref or f"operation-request-{index}",
             response_ref=response_ref or f"operation-response-{index}",
+            token_usage=token_usage,
+            source_call_id=source_call_id,
         )
         self.calls.append(call)
         return call
@@ -213,6 +233,7 @@ class TestRedirectAllowedRangesThreading:
         )
 
         client = AuditedHTTPClient(
+            **mock_item_audit_authority("test-run"),
             execution=fake_execution,
             state_id="test-state",
             run_id="test-run",
@@ -258,6 +279,50 @@ class TestRedirectAllowedRangesThreading:
         finally:
             client.close()
 
+    def test_unapproved_redirect_is_audited_and_refused_before_dns(self, fake_execution, telemetry_sink) -> None:
+        from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
+
+        initial_request = SSRFSafeRequest(
+            original_url="https://example.gov.au/start",
+            resolved_ip="203.0.113.10",
+            host_header="example.gov.au",
+            port=443,
+            path="/start",
+            scheme="https",
+            bare_hostname="example.gov.au",
+        )
+        redirect_response = httpx.Response(
+            302,
+            headers={"location": "https://other.gov.au/search"},
+            request=httpx.Request("GET", "https://203.0.113.10:443/start"),
+        )
+        factory = FakeHTTPClientFactory([redirect_response])
+        client = AuditedHTTPClient(
+            **mock_item_audit_authority("test-run"),
+            execution=fake_execution,
+            state_id="test-state",
+            run_id="test-run",
+            telemetry_emit=telemetry_sink,
+        )
+        try:
+            with (
+                patch("elspeth.plugins.infrastructure.clients.http.validate_url_for_ssrf") as dns_validate,
+                patch("httpx.Client", new=factory),
+                pytest.raises(SSRFBlockedError, match="origin") as exc,
+            ):
+                client.get_ssrf_safe(
+                    initial_request,
+                    follow_redirects=True,
+                    allowed_origins=(parse_http_origin("https://example.gov.au"),),
+                )
+            assert exc.value.kind == "origin_not_allowed"
+            dns_validate.assert_not_called()
+            assert len(factory.clients) == 1
+            assert [call.call_type.value for call in fake_execution.calls] == ["http_redirect", "http"]
+            assert all(call.status.value == "error" for call in fake_execution.calls)
+        finally:
+            client.close()
+
     def test_empty_allowed_ranges_default_preserved_in_redirect(self, fake_execution, telemetry_sink) -> None:
         """When no allowed_ranges is passed to get_ssrf_safe, redirect hops get default ()."""
         from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
@@ -283,6 +348,7 @@ class TestRedirectAllowedRangesThreading:
         )
 
         client = AuditedHTTPClient(
+            **mock_item_audit_authority("test-run"),
             execution=fake_execution,
             state_id="test-state",
             run_id="test-run",
@@ -340,6 +406,7 @@ class TestRedirectAllowedRangesThreading:
         )
 
         client = AuditedHTTPClient(
+            **mock_item_audit_authority("test-run"),
             execution=fake_execution,
             state_id="test-state",
             run_id="test-run",

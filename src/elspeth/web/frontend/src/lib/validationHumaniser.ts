@@ -1,19 +1,3 @@
-// ============================================================================
-// validationHumaniser — plain-language rendering of backend validation dumps.
-//
-// Relocated out of components/chat/guided/PipelineValidationSummary.tsx
-// (elspeth-d9e5d157cb) so NON-component layers can share it. The chat
-// validation-failure injection lives in a store (stores/subscriptions.ts) and
-// could not reach the humaniser while it lived in the component tree, so it
-// leaked raw engine dumps + a "[type] id:" internal-id prefix into chat. This
-// pure module (no React, no store) is importable by the store, the audit panel
-// (ReadinessRowDetail), and the chat components alike — so all four
-// novice-register surfaces name steps and phrase failures identically.
-//
-// Depends only on pure leaves (pipelineGloss, interpretationStepLabel,
-// catalog/pluginDisplayName) + types/utils — none of them import React, a
-// store, or this module, so there is no import cycle.
-// ============================================================================
 
 import {
   buildPlainPhraseMap,
@@ -31,52 +15,25 @@ import {
   WRITE_CSV_PHRASE,
   WRITE_JSON_PHRASE,
   WRITE_RESULTS_PHRASE,
-} from "@/components/chat/guided/pipelineGloss";
+} from "@/components/chat/pipelineGloss";
 import {
   descriptionLabel,
   isPluginDerivedId,
 } from "@/components/chat/interpretationStepLabel";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
-import type { CompositionState, NodeSpec, NodeType } from "@/types/index";
+import type {
+  CompositionState,
+  CompositionValidationError,
+  ValidationError,
+  ValidationWarning,
+  ValidationEntryDTO,
+  NodeSpec,
+  NodeType,
+} from "@/types/index";
 import {
   sortedSourceEntries,
   sourceComponentId,
 } from "@/utils/compositionState";
-
-/**
- * Match the engineer-grade contract-violation dumps that reach the validation
- * surfaces. Three backend producers write them (all egress verbatim via the
- * validation endpoint's `message=str(exc)`):
- *   - composer authoring (web/composer/state.py):
- *     "Schema contract violation: 'producer' -> 'consumer'. …"
- *     "Transform contract violation: node 'producer' (plugin). …"
- *     "Transform output guarantee violation: node 'producer' (plugin). …"
- *   - DAG runtime preflight (core/dag/graph.py) — the live-verified format:
- *     "Schema contract violation: edge 'producer' → 'consumer'\n  Consumer …"
- *   - edge-contract preflight (web/execution/validation.py):
- *     "Edge contract violation between producer node 'X' (schema 'S') and
- *      consumer node 'Y' (schema 'T'):\n…"
- * Capture groups: [1] = producer id, [2] = consumer id (optional).
- */
-const CONTRACT_VIOLATION_RES: readonly RegExp[] = [
-  /^(?:Schema|Semantic|Transform) contract violation: (?:(?:edge|node) )?'([^']+)'(?: (?:->|→) '([^']+)')?/,
-  // Rule C's own headline since elspeth-920bd88299: it was split off
-  // "Transform contract violation" so the two rules stop sharing one
-  // error_code, and with it one set of repair advice.
-  /^Transform output guarantee violation: node '([^']+)'/,
-  /^Edge contract violation between producer node '([^']+)' \(schema '[^']*'\) and consumer node '([^']+)'/,
-];
-
-/**
- * Match the interpretation-review-pending dumps that reach this surface
- * verbatim from `_format_interpretation_site` (web/execution/validation.py):
- *   "pipeline_decision review pending for transform 'guided_xform_1': drop_raw_html_fields"
- * Capture group: [1] = component id. The kind / component_type / user_term are
- * engineer detail — they stay in the raw dump behind the expander
- * (elspeth-016f463ff0).
- */
-const INTERPRETATION_REVIEW_PENDING_RE =
-  /^[a-z_]+ review pending for [a-z_]+ '([^']+)': /;
 
 export interface HumanisedFinding {
   /** Plain-language headline safe for a role="status" announcement. */
@@ -97,58 +54,90 @@ export interface HumanisedFinding {
   namedSteps: "self" | readonly string[];
 }
 
-/**
- * Humanise one validation message. Contract-violation dumps become a
- * plain-language headline ("Two steps aren't connected correctly: …") with the
- * raw dump preserved for the expander; interpretation-review-pending dumps
- * become "The <step> step is waiting for your review." (elspeth-016f463ff0)
- * using the SAME step-label mapping the acknowledgement cards render, when the
- * caller supplies `stepLabelFor`; anything else passes through untouched.
- * Exported for tests.
- */
+/** Render error identity from structured fields only; prose remains detail. */
 export function humaniseValidationMessage(
-  message: string,
+  error: CompositionValidationError,
   phraseFor: (componentId: string | null) => string,
   stepLabelFor?: (componentId: string) => string | null,
 ): HumanisedFinding {
-  const pendingMatch = INTERPRETATION_REVIEW_PENDING_RE.exec(message);
-  if (pendingMatch !== null && stepLabelFor !== undefined) {
-    const stepLabel = stepLabelFor(pendingMatch[1]);
+  const { message, error_code, component } = error;
+  if (error_code === "interpretation_review_pending") {
+    const label = component !== null && stepLabelFor !== undefined
+      ? stepLabelFor(component)
+      : null;
     return {
-      // A null step label (component absent from the composition) falls back
-      // to a generic phrase — never the raw internal id.
-      headline:
-        stepLabel !== null
-          ? `The ${stepLabel} step is waiting for your review.`
-          : "A step is waiting for your review.",
+      headline: label !== null
+        ? `The ${label} step is waiting for your review.`
+        : "A step is waiting for your review.",
       raw: message,
       namedSteps: "self",
     };
   }
-  let match: RegExpExecArray | null = null;
-  for (const pattern of CONTRACT_VIOLATION_RES) {
-    match = pattern.exec(message);
-    if (match !== null) break;
+  switch (error_code) {
+    case "schema_contract_violation":
+    case "semantic_contract_violation":
+    case "sink_contract_violation":
+    case "transform_contract_violation":
+    case "transform_declared_output_not_guaranteed": {
+      const phrase = component !== null
+        ? phraseFor(component)
+        : UNKNOWN_COMPONENT_PHRASE;
+      const named = phrase !== UNKNOWN_COMPONENT_PHRASE;
+      return {
+        headline: named
+          ? `A step has incompatible data: "${phrase}".`
+          : "The pipeline has incompatible data between steps.",
+        raw: message,
+        namedSteps: named ? [phrase] : [],
+      };
+    }
+    default:
+      return { headline: message, raw: null, namedSteps: [] };
   }
-  if (match === null) {
-    return { headline: message, raw: null, namedSteps: [] };
-  }
-  const producerPhrase = phraseFor(match[1] ?? null);
-  const consumerPhrase = match[2] !== undefined ? phraseFor(match[2]) : null;
-  const headline =
-    consumerPhrase !== null
-      ? `Two steps aren't connected correctly: the "${producerPhrase}" step's output doesn't match what "${consumerPhrase}" expects.`
-      : `A step isn't connected correctly: "${producerPhrase}" doesn't match what the next step expects.`;
-  const namedSteps = [producerPhrase, consumerPhrase].filter(
-    (phrase): phrase is string =>
-      phrase !== null && phrase !== UNKNOWN_COMPONENT_PHRASE,
+}
+
+/** Stage-2 errors carry component_id and an optional code, not session records. */
+export function humaniseExecutionError(
+  error: ValidationError,
+  phraseFor: (componentId: string | null) => string,
+  stepLabelFor?: (componentId: string) => string | null,
+): HumanisedFinding {
+  return humaniseValidationMessage(
+    {
+      message: error.message,
+      error_code: error.error_code ?? null,
+      component: error.component_id,
+    },
+    phraseFor,
+    stepLabelFor,
   );
-  return { headline, raw: message, namedSteps };
+}
+
+/** Warnings have no error code; never classify their prose as an error. */
+export function humaniseValidationWarning(warning: ValidationWarning): HumanisedFinding {
+  return { headline: warning.message, raw: null, namedSteps: [] };
+}
+
+/** Suggestions retain the ValidationEntryDTO component/code contract. */
+export function humaniseValidationSuggestion(
+  suggestion: ValidationEntryDTO,
+  phraseFor: (componentId: string | null) => string,
+  stepLabelFor?: (componentId: string) => string | null,
+): HumanisedFinding {
+  return humaniseValidationMessage(
+    {
+      message: suggestion.message,
+      error_code: suggestion.error_code ?? null,
+      component: suggestion.component,
+    },
+    phraseFor,
+    stepLabelFor,
+  );
 }
 
 /**
- * Component-id → plain-phrase resolver over the pipeline gloss. Contract dumps
- * prefix node ids ("node:rater") while the gloss map keys on the bare id, so
+ * Component-id → plain-phrase resolver over the pipeline gloss. Structured
+ * components may prefix node ids ("node:rater") while the gloss map uses the bare id, so
  * the resolver tries verbatim first, then the stripped form. Shared by the
  * summary headline, the wire-stage blockers list (ChatPanel), the audit panel
  * and the chat injection so every surface names steps identically.
@@ -530,21 +519,4 @@ export function formatFindingBody(
   return prefix !== null
     ? `${count} ${label} — '${prefix}': ${finding.headline}`
     : `${count} ${label} — ${finding.headline}`;
-}
-
-/** Closed status `_guided_persisted_validity` stamps on every guided
- *  pre-commit checkpoint: under deferred guided commit the composition
- *  state stays empty until Confirm wiring commits the accepted proposal,
- *  so this status describes the placeholder that the confirm action itself
- *  replaces — never a defect the user can act on. Gating the wire-stage
- *  Confirm on it deadlocks guided authoring (elspeth-859e2702dd); the wire
- *  turn's own server-computed `can_confirm`/`blockers` — validated against
- *  the proposal candidate — remain the authoritative confirm gate. */
-export const GUIDED_DEFERRED_COMMIT_STATUS = "guided_composition_invalid";
-
-/** Persisted composition errors that should gate the wire-stage Confirm
- *  client-side (elspeth-3b35abf148 variant 3), with the guided
- *  deferred-commit placeholder excluded. */
-export function clientWireBlockerMessages(messages: readonly string[]): string[] {
-  return messages.filter((message) => message !== GUIDED_DEFERRED_COMMIT_STATUS);
 }

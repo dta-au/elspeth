@@ -5,6 +5,9 @@ known resolved IP, then mock respx to match the IP-based URL that
 get_ssrf_safe() actually sends.
 """
 
+import base64
+import hashlib
+import os
 import socket
 from datetime import UTC, datetime
 from typing import Any
@@ -16,19 +19,22 @@ import respx
 
 from elspeth.contracts import CallStatus, CallType, check_compatibility
 from elspeth.contracts.audit import Call
+from elspeth.contracts.call_data import HTTPCallRequest, MultipartPart, multipart_min_body_size
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
+from elspeth.plugins.transforms.web_scrape import WebScrapeConfig, WebScrapeTransform
 from elspeth.plugins.transforms.web_scrape_errors import (
     NetworkError,
     RateLimitError,
     ServerError,
 )
 from elspeth.testing import make_field, make_pipeline_row, make_row
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 # Stable test IP used for all DNS resolution mocks
 _TEST_IP = "104.18.27.120"
@@ -120,6 +126,7 @@ def mock_ctx():
     # Create context
     ctx = PluginContext(
         run_id="test-run-456",
+        **mock_item_audit_authority("test-run-456"),
         config={},
         landscape=landscape,
         payload_store=payload_store,
@@ -189,6 +196,604 @@ def test_web_scrape_success_markdown(mock_ctx):
     assert result.row["page_fingerprint"] is not None
     assert len(result.row["page_fingerprint"]) == 64  # SHA-256
     assert result.row["fetch_status"] == 200
+
+
+def _make_basic_transform_options() -> dict[str, Any]:
+    return {
+        "schema": {"mode": "observed"},
+        "url_field": "url",
+        "content_field": "response_text",
+        "fingerprint_field": "response_fingerprint",
+        "format": "raw",
+        "http": {
+            "abuse_contact": "test@example.com",
+            "scraping_reason": "Read-only public data retrieval",
+        },
+    }
+
+
+def _make_post_transform(*, format: str = "raw", max_request_body_bytes: int = 1024) -> WebScrapeTransform:
+    options = _make_basic_transform_options()
+    options["format"] = format
+    options["method"] = "POST"
+    options["request_json_field"] = "query_body"
+    options["http"]["max_request_body_bytes"] = max_request_body_bytes
+    return WebScrapeTransform(options)
+
+
+@pytest.mark.parametrize(
+    ("scheme", "credential", "header_name", "expected_name", "expected_value"),
+    [
+        ("basic", "operator:password", None, "Authorization", "Basic " + base64.b64encode(b"operator:password").decode("ascii")),
+        ("bearer", "token-123", None, "Authorization", "Bearer token-123"),
+        ("api_key", "key-123", "X-Subscription", "X-Subscription", "key-123"),
+    ],
+)
+def test_web_scrape_auth_header_builder_and_audit_fingerprint(
+    scheme: str,
+    credential: str,
+    header_name: str | None,
+    expected_name: str,
+    expected_value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers
+    from elspeth.plugins.transforms.web_scrape_auth import WebScrapeAuthConfig
+
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key-for-fingerprinting")
+    config = WebScrapeAuthConfig(scheme=scheme, origin="https://example.com", credential=credential, header_name=header_name)
+    name, value = config.header()
+    assert (name, value) == (expected_name, expected_value)
+    safe_headers = fingerprint_headers({name: value}, force_fingerprint_names=frozenset({name.casefold()}))
+    assert credential not in repr(config)
+    assert credential not in repr(safe_headers)
+    assert expected_value not in repr(safe_headers)
+    assert "fingerprint:" in repr(safe_headers)
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        {"scheme": "bearer", "origin": "http://example.com", "credential": "token"},
+        {"scheme": "bearer", "origin": "https://other.example", "credential": "token"},
+        {"scheme": "api_key", "origin": "https://example.com", "credential": "key", "header_name": "Host"},
+        {"scheme": "api_key", "origin": "https://example.com", "credential": "key", "header_name": "Cookie"},
+        {"scheme": "api_key", "origin": "https://example.com", "credential": "key", "header_name": "Accept"},
+    ],
+)
+def test_web_scrape_auth_config_refuses_unsafe_binding(auth: dict[str, str]) -> None:
+    options = _make_basic_transform_options()
+    options["url_field"] = None
+    options["url"] = "https://example.com/page"
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    options["auth"] = auth
+    with pytest.raises(PluginConfigError):
+        WebScrapeTransform(options)
+
+
+def test_web_scrape_auth_secret_ref_preflight_and_literal_policy() -> None:
+    from elspeth.core.secrets import (
+        collect_credential_field_violations,
+        collect_disallowed_secret_ref_markers,
+        redact_secret_refs_for_validation,
+    )
+
+    options = _make_basic_transform_options()
+    options["auth"] = {
+        "scheme": "bearer",
+        "origin": "https://example.com",
+        "credential": {"secret_ref": "WEB_SEARCH_TOKEN"},
+    }
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    assert collect_credential_field_violations(options) == []
+    assert collect_disallowed_secret_ref_markers(options) == []
+    redacted = redact_secret_refs_for_validation({"options": options})["options"]
+    WebScrapeTransform(redacted)
+    options["auth"]["credential"] = "literal-token"
+    assert collect_credential_field_violations(options) == ["credential"]
+
+
+def test_web_scrape_basic_auth_accepts_printable_password_space() -> None:
+    from elspeth.plugins.transforms.web_scrape_auth import WebScrapeAuthConfig
+
+    auth = WebScrapeAuthConfig(scheme="basic", origin="https://example.com", credential="operator:pass phrase")
+    assert auth.header() == ("Authorization", "Basic " + base64.b64encode(b"operator:pass phrase").decode("ascii"))
+
+
+@respx.mock
+def test_web_scrape_auth_remains_closed_until_response_evidence_is_secret_safe(mock_ctx) -> None:
+    route = respx.get(f"https://{_TEST_IP}:443/page").mock(return_value=httpx.Response(200, text="result"))
+    options = _make_basic_transform_options()
+    options["auth"] = {"scheme": "bearer", "origin": "https://example.com", "credential": "token"}
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/page"}), mock_ctx)
+    assert result.status == "error"
+    assert result.reason["reason"] == "validation_failed"
+    assert "response evidence is secret safe" in result.reason["error"]
+    assert route.call_count == 0
+    assert mock_ctx.landscape.record_call.call_count == 0
+
+
+def test_web_scrape_auth_is_hidden_from_composer_catalog() -> None:
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.web.catalog.service import CatalogServiceImpl
+
+    info = CatalogServiceImpl(get_shared_plugin_manager())._schema_cache[("transform", "web_scrape")]
+    assert "auth" not in {field["name"] for field in info.knob_schema["fields"]}
+
+
+@pytest.mark.parametrize("invalid_auth", [{"origin": "http://example.com"}, {"scheme": "api_key", "header_name": "Host"}])
+def test_auth_validation_diagnostics_hide_resolved_credential(invalid_auth: dict[str, str]) -> None:
+    from pydantic import ValidationError
+
+    from elspeth.plugins.infrastructure.validation import validate_transform_config
+    from elspeth.plugins.transforms.web_scrape_auth import WebScrapeAuthConfig
+
+    credential = "CUSTODY42"
+    # Keep the short credential last so Pydantic's abbreviated input rendering
+    # cannot make the negative control pass by truncating the offending value.
+    auth = {"scheme": "bearer", "origin": "https://x.test", **invalid_auth, "credential": credential}
+    with pytest.raises(ValidationError) as standalone:
+        WebScrapeAuthConfig.model_validate(auth)
+    assert credential not in str(standalone.value)
+    assert credential not in repr(standalone.value)
+    assert credential not in repr(standalone.value.errors(include_input=False))
+
+    options = _make_basic_transform_options()
+    options["auth"] = auth
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    with pytest.raises(ValidationError) as parent:
+        WebScrapeConfig.model_validate(options)
+    assert credential not in str(parent.value)
+    assert credential not in repr(parent.value)
+    with pytest.raises(PluginConfigError) as production:
+        WebScrapeTransform(options)
+    assert credential not in str(production.value)
+    assert credential not in repr(production.value)
+    assert credential not in str(production.value.__cause__)
+    projected = validate_transform_config("web_scrape", options)
+    assert projected
+    assert credential not in repr(projected)
+    assert all(error.value is None for error in projected)
+
+
+def test_parent_auth_validation_error_hides_resolved_credential_on_unrelated_failure() -> None:
+    from pydantic import ValidationError
+
+    from elspeth.plugins.infrastructure.validation import validate_transform_config
+
+    credential = "CUSTODY42"
+    options = _make_basic_transform_options()
+    options["auth"] = {"scheme": "bearer", "origin": "https://example.com", "credential": credential}
+    options["http"]["allowed_origins"] = []
+    with pytest.raises(ValidationError) as parent:
+        WebScrapeConfig.model_validate(options)
+    assert credential not in str(parent.value)
+    assert credential not in repr(parent.value)
+    with pytest.raises(PluginConfigError) as production:
+        WebScrapeTransform(options)
+    assert credential not in str(production.value)
+    assert credential not in str(production.value.__cause__)
+    projected = validate_transform_config("web_scrape", options)
+    assert projected
+    assert credential not in repr(projected)
+    assert all(error.value is None for error in projected)
+
+
+@pytest.mark.parametrize("schema", [None, {"mode": "invalid"}])
+def test_wrapped_schema_diagnostics_omit_resolved_auth_input(schema: object) -> None:
+    from elspeth.plugins.infrastructure.validation import validate_transform_config
+
+    credential = "CUSTODY42"
+    options = _make_basic_transform_options()
+    options["schema"] = schema
+    options["auth"] = {"scheme": "bearer", "origin": "https://example.com", "credential": credential}
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    projected = validate_transform_config("web_scrape", options)
+    assert projected
+    assert credential not in repr(projected)
+    assert all(error.value is None for error in projected)
+
+
+def test_web_scrape_post_requires_body_field() -> None:
+    options = _make_basic_transform_options()
+    options["method"] = "POST"
+    with pytest.raises(PluginConfigError, match="request_json_field"):
+        WebScrapeTransform(options)
+
+
+def test_web_scrape_post_declares_body_field_and_probes_it(mock_ctx) -> None:
+    transform = _make_post_transform()
+    assert "query_body" in transform.declared_input_fields
+    probe_rows = transform.forward_invariant_probe_rows(make_pipeline_row({"unrelated": "value"}))
+    probe = probe_rows[0]
+    assert probe["query_body"] == {}
+    result = transform.execute_forward_invariant_probe(probe_rows, mock_ctx)
+    assert result.status == "success"
+    assert result.row["unrelated"] == "value"
+
+
+def test_web_scrape_post_rejects_body_field_created_by_transform() -> None:
+    options = _make_basic_transform_options()
+    options["method"] = "POST"
+    options["request_json_field"] = "fetch_status"
+    with pytest.raises(PluginConfigError, match="request_json_field names 'fetch_status'"):
+        WebScrapeTransform(options)
+
+
+def test_web_scrape_post_rejects_body_field_used_as_url() -> None:
+    options = _make_basic_transform_options()
+    options["method"] = "POST"
+    options["request_json_field"] = "url"
+    with pytest.raises(PluginConfigError, match="request_json_field and url_field must differ"):
+        WebScrapeTransform(options)
+
+
+def test_web_scrape_post_rejects_body_option_name_in_schema_columns() -> None:
+    options = _make_basic_transform_options()
+    options["method"] = "POST"
+    options["request_json_field"] = "query_body"
+    options["schema"] = {"mode": "observed", "guaranteed_fields": ["request_json_field"]}
+    with pytest.raises(PluginConfigError, match="request_json_field"):
+        WebScrapeTransform(options)
+
+
+def test_web_scrape_get_rejects_body_field() -> None:
+    options = _make_basic_transform_options()
+    options["request_json_field"] = "query_body"
+    with pytest.raises(PluginConfigError, match="request_json_field"):
+        WebScrapeTransform(options)
+
+
+@respx.mock
+def test_web_scrape_multipart_sends_ordered_text_and_blob_parts(mock_ctx: PluginContext, tmp_path) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/upload").mock(
+        return_value=httpx.Response(200, text="<main>received</main>", headers={"content-type": "text/html"})
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update({"url": "https://example.com/upload", "method": "POST", "request_multipart_field": "parts", "format": "raw"})
+    options["http"]["max_request_body_bytes"] = 4096
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    store = FilesystemPayloadStore(base_path=tmp_path)
+    blob = b"%PDF-1.7\r\ncontent"
+    ref = store.store(blob)
+    transform._payload_store = store
+    row = make_pipeline_row(
+        {
+            "parts": [
+                {"name": "q", "value": "A B"},
+                {"name": "document", "blob_ref": ref, "filename": "form.pdf", "content_type": "application/pdf"},
+                {"name": "q", "value": "Café"},
+            ]
+        }
+    )
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(row, mock_ctx)
+
+    assert result.status == "success"
+    assert endpoint.call_count == 1
+    request = endpoint.calls[0].request
+    assert request.headers["content-type"].startswith("multipart/form-data; boundary=elspeth-")
+    assert request.content.index(b"A B") < request.content.index(blob) < request.content.index("Café".encode())
+    assert request.content.count(b'name="q"') == 2
+
+
+def test_web_scrape_multipart_oversized_blob_refused_before_dns(mock_ctx: PluginContext, tmp_path) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update({"url": "https://example.com/upload", "method": "POST", "request_multipart_field": "parts"})
+    options["http"]["max_request_body_bytes"] = 128
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    store = FilesystemPayloadStore(base_path=tmp_path)
+    ref = store.store(b"x" * 1024)
+    transform._payload_store = store
+
+    with patch("socket.getaddrinfo") as resolve:
+        result = transform.process(
+            make_pipeline_row(
+                {"parts": [{"name": "file", "blob_ref": ref, "filename": "data.bin", "content_type": "application/octet-stream"}]}
+            ),
+            mock_ctx,
+        )
+
+    resolve.assert_not_called()
+    assert result.status == "error"
+    assert result.reason is not None and "max_request_body_bytes" in str(result.reason)
+
+
+def test_web_scrape_multipart_uses_one_aggregate_file_budget_before_dns(mock_ctx: PluginContext, tmp_path) -> None:
+    first = b"a" * 64
+    second = b"b" * 64
+    first_ref = hashlib.sha256(first).hexdigest()
+    second_ref = hashlib.sha256(second).hexdigest()
+    parts = (
+        MultipartPart(name="first", blob_ref=first_ref, filename="a.bin", content_type="application/octet-stream"),
+        MultipartPart(name="second", blob_ref=second_ref, filename="b.bin", content_type="application/octet-stream"),
+    )
+    limit = multipart_min_body_size(parts, max_body_bytes=4096) + 100
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update({"url": "https://example.com/upload", "method": "POST", "request_multipart_field": "parts"})
+    options["http"]["max_request_body_bytes"] = limit
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    store = FilesystemPayloadStore(base_path=tmp_path)
+    assert store.store(first) == first_ref
+    assert store.store(second) == second_ref
+    transform._payload_store = store
+
+    with patch.object(store, "retrieve_bounded", wraps=store.retrieve_bounded) as read, patch("socket.getaddrinfo") as resolve:
+        result = transform.process(make_pipeline_row({"parts": [part.to_dict() for part in parts]}), mock_ctx)
+
+    resolve.assert_not_called()
+    assert [call.kwargs["max_bytes"] for call in read.call_args_list] == [100, 36]
+    assert result.status == "error"
+    assert result.reason is not None and "max_request_body_bytes" in str(result.reason)
+
+
+@respx.mock
+def test_web_scrape_post_sends_row_json_and_returns_raw_json(mock_ctx) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(
+        return_value=httpx.Response(200, text='{"items":["found"]}', headers={"content-type": "application/json"})
+    )
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {"term": "found"}}), mock_ctx)
+
+    assert result.status == "success"
+    assert endpoint.call_count == 1
+    assert endpoint.calls[0].request.method == "POST"
+    assert endpoint.calls[0].request.headers["content-type"] == "application/json"
+    assert endpoint.calls[0].request.content == b'{"term":"found"}'
+    assert result.row["response_text"] == '{"items":["found"]}'
+    assert result.row["fetch_status"] == 200
+
+
+@respx.mock
+def test_web_scrape_post_sends_ordered_urlencoded_form_to_fixed_url(mock_ctx: PluginContext) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update(url="https://example.com/search", method="POST", request_form_field="search_form")
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(
+            make_pipeline_row({"company_id": "1", "search_form": [{"name": "q", "value": "A B"}, {"name": "q", "value": "Café"}]}),
+            mock_ctx,
+        )
+
+    assert result.status == "success"
+    assert endpoint.call_count == 1
+    request = endpoint.calls[0].request
+    assert request.headers["content-type"] == "application/x-www-form-urlencoded; charset=utf-8"
+    assert request.content == b"q=A+B&q=Caf%C3%A9"
+    assert result.row is not None
+    assert result.row["company_id"] == "1"
+    assert result.row["fetch_url_final"] == "https://example.com/search"
+
+
+def test_web_scrape_post_rejects_malformed_form_before_dns(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.update(method="POST", request_form_field="search_form")
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(
+            make_pipeline_row({"url": "https://example.com/search", "search_form": {"q": "secret-example"}}), mock_ctx
+        )
+
+    assert result.status == "error"
+    assert result.retryable is False
+    assert "secret-example" not in str(result.reason)
+
+
+def test_web_scrape_rejects_multiple_post_body_sources() -> None:
+    options = _make_basic_transform_options()
+    options.update(method="POST", request_json_field="query_body", request_form_field="search_form")
+    with pytest.raises(PluginConfigError, match=r"exactly one.*request_json_field.*request_form_field"):
+        WebScrapeTransform(options)
+
+
+@respx.mock
+def test_web_scrape_post_invalid_body_refuses_before_dns_or_http(mock_ctx) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="ok"))
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": ["secret-example"]}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.retryable is False
+    assert "secret-example" not in str(result.reason)
+    assert endpoint.call_count == 0
+
+
+def test_web_scrape_post_missing_row_body_refuses_before_dns(mock_ctx) -> None:
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search"}), mock_ctx)
+    assert result.status == "error"
+    assert result.retryable is False
+    assert result.reason["reason"] == "validation_failed"
+
+
+@respx.mock
+def test_web_scrape_post_oversized_body_refuses_before_dns_or_http(mock_ctx) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="ok"))
+    transform = _make_post_transform(max_request_body_bytes=16)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {"term": "too long"}}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.retryable is False
+    assert endpoint.call_count == 0
+
+
+@pytest.mark.parametrize("body", [{"items": [float("nan")]}, {1: "not a string key"}, {"item": b"not JSON"}])
+def test_web_scrape_post_rejects_non_json_values_before_dns(mock_ctx, body: object) -> None:
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": body}), mock_ctx)
+    assert result.status == "error"
+    assert result.retryable is False
+    assert "not a string key" not in str(result.reason)
+
+
+@respx.mock
+def test_web_scrape_post_redirect_is_not_followed(mock_ctx) -> None:
+    first = respx.post(f"https://{_TEST_IP}:443/search").mock(
+        return_value=httpx.Response(307, headers={"location": "http://127.0.0.1/admin"})
+    )
+    next_hop = respx.get("http://127.0.0.1/admin").mock(return_value=httpx.Response(200, text="wrong"))
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {}}), mock_ctx)
+    assert result.status == "error"
+    assert result.retryable is False
+    assert first.call_count == 1
+    assert next_hop.call_count == 0
+
+
+@pytest.mark.parametrize("status", [408, 429, 503])
+@respx.mock
+def test_web_scrape_post_server_error_is_not_retried(mock_ctx, status: int) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(status))
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {}}), mock_ctx)
+    assert result.status == "error"
+    assert result.retryable is False
+    assert endpoint.call_count == 1
+
+
+@respx.mock
+def test_web_scrape_post_connection_failure_is_not_retried_or_leaked(mock_ctx) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(side_effect=httpx.ConnectError("remote unavailable"))
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(
+            make_pipeline_row({"url": "https://example.com/search", "query_body": {"token": "secret-example"}}), mock_ctx
+        )
+    assert result.status == "error"
+    assert result.retryable is False
+    assert endpoint.call_count == 1
+    assert "secret-example" not in str(result.reason)
+
+
+@respx.mock
+def test_web_scrape_post_html_response_uses_existing_extraction(mock_ctx) -> None:
+    respx.post(f"https://{_TEST_IP}:443/search").mock(
+        return_value=httpx.Response(200, text="<html><body><h1>Found</h1></body></html>", headers={"content-type": "text/html"})
+    )
+    transform = _make_post_transform(format="markdown")
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {"q": "Found"}}), mock_ctx)
+    assert result.status == "success"
+    assert "# Found" in result.row["response_text"]
+
+
+@respx.mock
+def test_web_scrape_post_json_requires_raw_format(mock_ctx) -> None:
+    respx.post(f"https://{_TEST_IP}:443/search").mock(
+        return_value=httpx.Response(200, text='{"items":[]}', headers={"content-type": "application/json"})
+    )
+    transform = _make_post_transform(format="text")
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {}}), mock_ctx)
+    assert result.status == "error"
+    assert result.reason["reason"] == "non_text_content_type"
+
+
+@respx.mock
+def test_web_scrape_strict_json_mode_rejects_invalid_document_before_fingerprint(mock_ctx) -> None:
+    respx.get(f"https://{_TEST_IP}:443/data").mock(
+        return_value=httpx.Response(200, content=b'{"value":NaN}', headers={"content-type": "application/json"})
+    )
+    options = _make_basic_transform_options()
+    options["response_mode"] = "json"
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/data"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "invalid_json"
+    assert result.row is None
+
+
+@respx.mock
+def test_web_scrape_json_records_refuse_invalid_unicode_before_fingerprint(mock_ctx) -> None:
+    respx.get(f"https://{_TEST_IP}:443/data").mock(
+        return_value=httpx.Response(200, content=b'[{"x":"\\ud800"}]', headers={"content-type": "application/json"})
+    )
+    options = _make_basic_transform_options()
+    options["response_mode"] = "json"
+    options["records"] = {"field": "records", "columns": [{"field": "x", "path": ["x"]}]}
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/data"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "content_extraction_failed"
+    assert result.reason["error"] == "JSON record column contains an invalid Unicode scalar"
+    assert result.row is None
+
+
+@respx.mock
+def test_web_scrape_xml_mode_accepts_well_formed_document(mock_ctx) -> None:
+    xml = b"<results><name>Example</name></results>"
+    respx.get(f"https://{_TEST_IP}:443/data").mock(
+        return_value=httpx.Response(200, content=xml, headers={"content-type": "application/xml; charset=utf-8"})
+    )
+    options = _make_basic_transform_options()
+    options["response_mode"] = "xml"
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/data"}), mock_ctx)
+
+    assert result.status == "success"
+    assert result.row["response_text"] == xml.decode()
+
+
+@respx.mock
+def test_web_scrape_post_binary_response_is_rejected(mock_ctx) -> None:
+    respx.post(f"https://{_TEST_IP}:443/search").mock(
+        return_value=httpx.Response(200, content=b"\x00\x01", headers={"content-type": "application/octet-stream"})
+    )
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {}}), mock_ctx)
+    assert result.status == "error"
+    assert result.retryable is False
+    assert result.reason["reason"] == "non_text_content_type"
 
 
 @respx.mock
@@ -870,7 +1475,9 @@ def test_web_scrape_extract_content_exception_returns_error(mock_ctx):
     assert result.reason["reason"] == "content_extraction_failed"
     assert "html2text internal error" in result.reason["error"]
     assert result.reason["error_type"] == "RuntimeError"
-    assert result.reason["url"] == "https://example.com/bad"
+    # The URL is row data: the reason never names it (C3).
+    assert "url" not in result.reason
+    assert "example.com" not in repr(result.reason)
 
 
 @respx.mock
@@ -1251,6 +1858,579 @@ class TestWebScrapeDeclaredInputFields:
         transform = WebScrapeTransform(_base_config(required_input_fields=["tenant_id"]))
 
         assert transform.declared_input_fields == frozenset({"url", "tenant_id"})
+
+
+@respx.mock
+def test_fixed_url_search_uses_row_data_without_url_column(mock_ctx: PluginContext) -> None:
+    fixed_url = "https://example.com/search"
+    route = respx.get(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = fixed_url
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"company_query": "Acme"}), mock_ctx)
+
+    assert transform.declared_input_fields == frozenset()
+    assert route.call_count == 1
+    assert result.status == "success"
+    assert result.row is not None
+    assert result.row["company_query"] == "Acme"
+    assert result.row["fetch_url_final"] == fixed_url
+
+
+@respx.mock
+def test_fixed_url_search_maps_row_field_to_query_parameter(mock_ctx: PluginContext) -> None:
+    route = respx.get(f"https://{_TEST_IP}:443/Search/ResultsActive?SearchText=ACME+%26+Co").mock(
+        return_value=httpx.Response(200, text="<main>Matching names</main>")
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/Search/ResultsActive"
+    options["query_fields"] = {"SearchText": "company_query"}
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"company_query": "ACME & Co"}), mock_ctx)
+
+    assert transform.declared_input_fields == frozenset({"company_query"})
+    assert route.call_count == 1
+    assert result.status == "success"
+    assert result.row is not None
+    assert result.row["fetch_url_final"] == "https://example.com/Search/ResultsActive?SearchText=ACME+%26+Co"
+
+
+@respx.mock
+def test_fixed_site_search_extracts_bounded_candidate_records(mock_ctx: PluginContext) -> None:
+    respx.get(f"https://{_TEST_IP}:443/directory?q=Shared+Name").mock(
+        return_value=httpx.Response(
+            200,
+            text='<main><ul><li><a href="/one" class="office primary">Agency One</a><span class="state">ACT</span></li>'
+            '<li><a href="/two">Agency Two</a></li></ul></main>',
+            headers={"content-type": "text/html"},
+        )
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/directory"
+    options["query_fields"] = {"q": "search_text"}
+    options["records"] = {
+        "field": "candidates",
+        "selector": "main li",
+        "max_records": 10,
+        "columns": [
+            {"field": "name", "selector": "a", "required": True},
+            {"field": "detail_path", "selector": "a", "attribute": "href", "required": True},
+            {"field": "tags", "selector": "a", "attribute": "class"},
+            {"field": "state", "selector": ".state"},
+        ],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"search_text": "Shared Name"}), mock_ctx)
+
+    assert result.status == "success"
+    assert result.row is not None
+    assert result.row.to_dict()["candidates"] == [
+        {"name": "Agency One", "detail_path": "/one", "tags": "office primary", "state": "ACT"},
+        {"name": "Agency Two", "detail_path": "/two", "tags": None, "state": None},
+    ]
+    assert "candidates" in transform.declared_output_fields
+
+
+@respx.mock
+def test_structured_records_emit_separate_sanitized_provenance(mock_ctx: PluginContext) -> None:
+    respx.get(f"https://{_TEST_IP}:443/directory").mock(
+        return_value=httpx.Response(
+            200,
+            text='<main><a href="/one">Agency One</a><a href="/two">Agency Two</a></main>',
+            headers={"content-type": "text/html"},
+        )
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/directory"
+    options["records"] = {
+        "field": "candidates",
+        "provenance_field": "candidate_sources",
+        "selector": "main",
+        "columns": [{"field": "links", "selector": "a", "attribute": "href", "multiple": "all", "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    assert {"candidates", "candidate_sources"} <= transform.declared_output_fields
+    assert transform._output_schema_config is not None
+    assert {"candidates", "candidate_sources"} <= set(transform._output_schema_config.guaranteed_fields or ())
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"search_text": "Agency"}), mock_ctx)
+
+    assert result.status == "success"
+    assert result.row is not None
+    emitted = result.row.to_dict()
+    assert emitted["candidates"] == [{"links": ["/one", "/two"]}]
+    assert emitted["candidate_sources"] == [
+        {
+            "links": {
+                "source_url": emitted["fetch_url_final"],
+                "record_selector": "main",
+                "selector": "a",
+                "attribute": "href",
+                "match_policy": "all",
+                "selected_count": 2,
+            }
+        }
+    ]
+    assert result.success_reason is not None
+    assert "candidate_sources" in result.success_reason["fields_added"]
+
+
+def test_structured_provenance_fingerprints_sensitive_final_url(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/directory"
+    options["records"] = {
+        "field": "candidates",
+        "provenance_field": "candidate_sources",
+        "selector": "main",
+        "columns": [{"field": "name", "selector": "a", "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    response = httpx.Response(
+        200,
+        text="<main><a>Agency</a></main>",
+        headers={"content-type": "text/html"},
+        request=httpx.Request("GET", f"https://{_TEST_IP}:443/final"),
+    )
+    final_url = "https://example.com/final?access_token=secret-value"
+    call = mock_ctx.landscape.record_call.return_value
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()), patch.object(transform, "_fetch_url", return_value=(response, final_url, call)):
+        result = transform.process(make_pipeline_row({"search_text": "Agency"}), mock_ctx)
+
+    assert result.status == "success"
+    assert result.row is not None
+    emitted = result.row.to_dict()
+    assert "secret-value" not in repr(emitted)
+    assert emitted["candidate_sources"][0]["name"]["source_url"] == emitted["fetch_url_final"]
+
+
+def test_structured_provenance_field_rejects_output_collision() -> None:
+    options = _make_basic_transform_options()
+    options["records"] = {
+        "field": "candidates",
+        "provenance_field": "fetch_status",
+        "selector": "main",
+        "columns": [{"field": "name"}],
+    }
+    with pytest.raises(PluginConfigError, match="provenance_field"):
+        WebScrapeTransform(options)
+
+
+def test_resolved_record_links_require_exact_origin_configuration() -> None:
+    options = _make_basic_transform_options()
+    options["records"] = {
+        "field": "candidates",
+        "selector": "main a",
+        "columns": [{"field": "detail_url", "attribute": "href", "resolve_url": True}],
+    }
+    with pytest.raises(PluginConfigError, match="allowed_origins"):
+        WebScrapeTransform(options)
+
+
+def test_resolved_record_link_uses_redirect_final_url_and_keeps_provenance_safe(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/start"
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    options["records"] = {
+        "field": "candidates",
+        "provenance_field": "candidate_sources",
+        "selector": "main a",
+        "columns": [{"field": "detail_url", "attribute": "href", "resolve_url": True, "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    response = httpx.Response(
+        200,
+        text='<main><a href="../detail/42">Company</a></main>',
+        headers={"content-type": "text/html"},
+        request=httpx.Request("GET", f"https://{_TEST_IP}:443/search/results/page"),
+    )
+    final_url = "https://example.com/search/results/page?access_token=secret-value"
+    call = mock_ctx.landscape.record_call.return_value
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()), patch.object(transform, "_fetch_url", return_value=(response, final_url, call)):
+        result = transform.process(make_pipeline_row({"search_text": "Company"}), mock_ctx)
+    assert result.status == "success"
+    assert result.row is not None
+    emitted = result.row.to_dict()
+    assert emitted["candidates"] == [{"detail_url": "https://example.com/search/detail/42"}]
+    assert "secret-value" not in repr(emitted)
+    assert emitted["candidate_sources"][0]["detail_url"]["source_url"] == emitted["fetch_url_final"]
+
+
+def test_resolved_record_link_refusal_is_value_free(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/start"
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    options["records"] = {
+        "field": "candidates",
+        "selector": "main a",
+        "columns": [{"field": "detail_url", "attribute": "href", "resolve_url": True, "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    response = httpx.Response(
+        200,
+        text='<main><a href="/detail/42?access_token=secret-value">Company</a></main>',
+        headers={"content-type": "text/html"},
+        request=httpx.Request("GET", f"https://{_TEST_IP}:443/search/results"),
+    )
+    call = mock_ctx.landscape.record_call.return_value
+    with (
+        patch("socket.getaddrinfo", _mock_getaddrinfo()),
+        patch.object(transform, "_fetch_url", return_value=(response, "https://example.com/search/results", call)),
+    ):
+        result = transform.process(make_pipeline_row({"search_text": "Company"}), mock_ctx)
+    assert result.status == "error"
+    assert "secret-value" not in repr(result.reason)
+
+
+@respx.mock
+def test_search_candidate_limit_refuses_unreported_matches(mock_ctx: PluginContext) -> None:
+    respx.get(f"https://{_TEST_IP}:443/directory").mock(
+        return_value=httpx.Response(200, text="<main><li>One</li><li>Two</li></main>", headers={"content-type": "text/html"})
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/directory"
+    options["records"] = {
+        "field": "candidates",
+        "selector": "main li",
+        "max_records": 1,
+        "columns": [{"field": "name", "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"search_text": "Shared Name"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "content_extraction_failed"
+
+
+@respx.mock
+def test_search_required_column_refuses_incomplete_candidate(mock_ctx: PluginContext) -> None:
+    respx.get(f"https://{_TEST_IP}:443/directory").mock(
+        return_value=httpx.Response(200, text="<main><li>No link</li></main>", headers={"content-type": "text/html"})
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/directory"
+    options["records"] = {
+        "field": "candidates",
+        "selector": "main li",
+        "columns": [{"field": "detail_path", "selector": "a", "attribute": "href", "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"search_text": "Shared Name"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "content_extraction_failed"
+
+
+def test_search_record_selector_is_validated_at_config_time() -> None:
+    options = _make_basic_transform_options()
+    options["records"] = {
+        "field": "candidates",
+        "selector": "[",
+        "columns": [{"field": "name", "selector": "a"}],
+    }
+    with pytest.raises(PluginConfigError, match="selector"):
+        WebScrapeTransform(options)
+
+
+def test_query_field_invalid_value_is_row_error_before_dns(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/search"
+    options["query_fields"] = {"SearchText": "company_query"}
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS should not be reached")):
+        result = transform.process(make_pipeline_row({"company_query": ["not", "a", "string"]}), mock_ctx)
+
+    assert result.status == "error"
+
+
+def test_query_options_reject_sensitive_names_and_duplicate_bindings() -> None:
+    options = _make_basic_transform_options()
+    options["query_fields"] = {"token": "company_query"}
+    with pytest.raises(PluginConfigError, match="query"):
+        WebScrapeTransform(options)
+
+    options["query_fields"] = {"SearchText": "company_query"}
+    options["query"] = {"SearchText": "static"}
+    with pytest.raises(PluginConfigError, match="SearchText"):
+        WebScrapeTransform(options)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Host",
+        "content-length",
+        "Transfer-Encoding",
+        "Connection",
+        "Cookie",
+        "Authorization",
+        "Proxy-Authorization",
+        "TE",
+        "Upgrade",
+        "Content-Type",
+        "X-Abuse-Contact",
+        "X-Custom",
+    ],
+)
+def test_request_header_policy_rejects_unsafe_names_at_config_time(name: str) -> None:
+    options = _make_basic_transform_options()
+    options["headers"] = {name: "value"}
+    with pytest.raises(PluginConfigError, match="header"):
+        WebScrapeTransform(options)
+
+
+def test_request_header_policy_rejects_case_insensitive_duplicates() -> None:
+    options = _make_basic_transform_options()
+    options["headers"] = {"Accept": "text/html"}
+    options["header_fields"] = {"aCcEpT": "accept_value"}
+    with pytest.raises(PluginConfigError, match="header"):
+        WebScrapeTransform(options)
+
+
+@pytest.mark.parametrize("value", ["", "value\r\nX-Injected: yes", "café", "a" * 1025, ["text/html"]])
+def test_request_header_field_invalid_value_is_row_error_before_dns(mock_ctx: PluginContext, value: object) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/search"
+    options["header_fields"] = {"Accept": "accept_value"}
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS should not be reached")):
+        result = transform.process(make_pipeline_row({"accept_value": value}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "validation_failed"
+    assert "value" not in str(result.reason)
+
+
+@respx.mock
+def test_request_headers_static_and_row_fields_reach_get_without_credentials(
+    mock_ctx: PluginContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key-for-fingerprinting")
+    route = respx.get(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/search"
+    options["headers"] = {"Accept": "text/html"}
+    options["header_fields"] = {"Accept-Language": "language"}
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"language": "en-AU"}), mock_ctx)
+
+    assert result.status == "success"
+    assert transform.declared_input_fields == frozenset({"language"})
+    assert route.calls[0].request.headers["accept"] == "text/html"
+    assert route.calls[0].request.headers["accept-language"] == "en-AU"
+
+
+@respx.mock
+def test_request_header_audit_binds_wire_value_without_recording_plaintext(mock_ctx: PluginContext) -> None:
+    respx.get(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update(url="https://example.com/search", header_fields={"Accept-Language": "language"})
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    archived_requests: list[dict[str, object]] = []
+    original_record_call = mock_ctx.landscape.record_call
+
+    def capture_record_call(**kwargs: object) -> Call:
+        request_data = kwargs["request_data"]
+        assert isinstance(request_data, HTTPCallRequest)
+        archived_requests.append(request_data.to_dict())
+        return original_record_call(**kwargs)
+
+    mock_ctx.landscape.record_call = capture_record_call
+    env = dict(os.environ)
+    env["ELSPETH_FINGERPRINT_KEY"] = "test-key-for-fingerprinting"
+    env.pop("ELSPETH_ALLOW_RAW_SECRETS", None)
+    with patch.dict(os.environ, env, clear=True), patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        first = transform.process(make_pipeline_row({"language": "en-AU"}), mock_ctx)
+        second = transform.process(make_pipeline_row({"language": "en-NZ"}), mock_ctx)
+
+    assert first.status == second.status == "success"
+    assert len(archived_requests) == 2
+    assert archived_requests[0]["headers"]["Accept-Language"].startswith("<fingerprint:")
+    assert archived_requests[0]["headers"]["Accept-Language"] != archived_requests[1]["headers"]["Accept-Language"]
+    assert "en-AU" not in str(archived_requests)
+    assert "en-NZ" not in str(archived_requests)
+
+
+@respx.mock
+def test_request_headers_reach_post_form(mock_ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key-for-fingerprinting")
+    route = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update(url="https://example.com/search", method="POST", request_form_field="form", headers={"Accept": "text/html"})
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"form": [{"name": "q", "value": "Acme"}]}), mock_ctx)
+
+    assert result.status == "success"
+    assert route.calls[0].request.headers["accept"] == "text/html"
+    assert route.calls[0].request.headers["content-type"] == "application/x-www-form-urlencoded; charset=utf-8"
+
+
+@pytest.mark.parametrize(
+    "redirect_url",
+    ["https://other.example/final", "http://source.example/final", "https://source.example:8443/final"],
+)
+@respx.mock
+def test_row_header_rejects_cross_origin_redirect_before_dns_or_dispatch(mock_ctx: PluginContext, redirect_url: str) -> None:
+    first = respx.get(f"https://{_TEST_IP}:443/start").mock(return_value=httpx.Response(302, headers={"Location": redirect_url}))
+    other = respx.get(f"https://{_TEST_IP}:443/final").mock(return_value=httpx.Response(200, text="other origin"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update(url="https://source.example/start", header_fields={"X-Requested-With": "request_kind"})
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    calls: list[tuple[CallType, HTTPCallRequest]] = []
+    original_record_call = mock_ctx.landscape.record_call
+
+    def record_call(**kwargs: object) -> Call:
+        call_type = kwargs["call_type"]
+        request_data = kwargs["request_data"]
+        assert isinstance(call_type, CallType)
+        assert isinstance(request_data, HTTPCallRequest)
+        calls.append((call_type, request_data))
+        return original_record_call(**kwargs)
+
+    mock_ctx.landscape.record_call = record_call
+    resolved_hosts: list[str] = []
+
+    def resolve_initial_only(host: str, *_args: object, **_kwargs: object) -> list[tuple[Any, ...]]:
+        resolved_hosts.append(host)
+        assert host == "source.example"
+        return _mock_getaddrinfo()(host, 443)
+
+    env = dict(os.environ)
+    env["ELSPETH_FINGERPRINT_KEY"] = "test-key-for-fingerprinting"
+    env.pop("ELSPETH_ALLOW_RAW_SECRETS", None)
+    with patch.dict(os.environ, env, clear=True), patch("socket.getaddrinfo", resolve_initial_only):
+        result = transform.process(make_pipeline_row({"request_kind": "canary-sensitive-value"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["error_type"] == "SSRFBlockedError"
+    assert first.call_count == 1
+    assert other.call_count == 0
+    assert resolved_hosts == ["source.example"]
+    redirect_requests = [request for call_type, request in calls if call_type is CallType.HTTP_REDIRECT]
+    assert len(redirect_requests) == 1
+    assert "X-Requested-With" not in redirect_requests[0].headers
+    assert "canary-sensitive-value" not in str(redirect_requests[0].to_dict())
+
+
+@respx.mock
+def test_row_header_remains_on_same_origin_redirect(mock_ctx: PluginContext) -> None:
+    first = respx.get(f"https://{_TEST_IP}:443/start").mock(
+        return_value=httpx.Response(302, headers={"Location": "https://source.example/final"})
+    )
+    second = respx.get(f"https://{_TEST_IP}:443/final").mock(return_value=httpx.Response(200, text="same origin"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update(url="https://source.example/start", header_fields={"X-Requested-With": "request_kind"})
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    env = dict(os.environ)
+    env["ELSPETH_FINGERPRINT_KEY"] = "test-key-for-fingerprinting"
+    env.pop("ELSPETH_ALLOW_RAW_SECRETS", None)
+    with patch.dict(os.environ, env, clear=True), patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"request_kind": "public-search"}), mock_ctx)
+
+    assert result.status == "success"
+    assert first.call_count == second.call_count == 1
+    assert first.calls[0].request.headers["x-requested-with"] == "public-search"
+    assert second.calls[0].request.headers["x-requested-with"] == "public-search"
+
+
+def test_fixed_url_invariant_probe_is_offline_and_restores_configured_url(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.invalid/search"
+    transform = WebScrapeTransform(options)
+    rows = transform.forward_invariant_probe_rows(make_pipeline_row({"company_query": "Acme"}))
+
+    def _probe_ip_only(host: str, *_args: Any, **_kwargs: Any) -> list[tuple[Any, ...]]:
+        assert host == "93.184.216.34", "probe must not resolve the configured hostname"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, 0))]
+
+    with patch("socket.getaddrinfo", _probe_ip_only):
+        result = transform.execute_forward_invariant_probe(rows, mock_ctx)
+
+    assert result.status == "success"
+    assert transform._url == "https://example.invalid/search"
+
+
+@pytest.mark.parametrize(
+    ("url", "include_url_field"),
+    [(None, False), ("https://example.com/search", True)],
+)
+def test_web_scrape_requires_exactly_one_url_source(url: str | None, include_url_field: bool) -> None:
+    options = _make_basic_transform_options()
+    if not include_url_field:
+        options.pop("url_field")
+    if url is not None:
+        options["url"] = url
+
+    with pytest.raises(PluginConfigError, match=r"url.*url_field"):
+        WebScrapeTransform(options)
+
+
+@pytest.mark.parametrize("url", ["ftp://example.com/file", "https://169.254.169.254/latest", "https://example.com:0/"])
+def test_web_scrape_rejects_unsafe_fixed_url_before_dns(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _dns_forbidden(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("configuration must not resolve DNS")
+
+    monkeypatch.setattr("socket.getaddrinfo", _dns_forbidden)
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = url
+
+    with pytest.raises(PluginConfigError, match="url"):
+        WebScrapeTransform(options)
 
 
 class TestUrlFieldMustNotNameACreatedField:

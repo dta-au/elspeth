@@ -17,6 +17,66 @@ Resume a pipeline that crashed or was interrupted.
 - Access to the audit database
 - Access to the configuration file used for the original run
 - The `state/` directory from the original run (contains checkpoints)
+- The original payload store, including any sealed source snapshot and row
+  payloads. Retain it together with the audit database and checkpoints.
+
+---
+
+## Opt-in Source Snapshots
+
+For a finite, single-source CSV or JSON pipeline, set
+`snapshot_for_resume: true` in the source options **before the original run**.
+For example, this source section routes accepted rows to an existing sink named
+`output`:
+
+```yaml
+sources:
+  primary:
+    plugin: csv
+    on_success: output
+    options:
+      path: input.csv
+      snapshot_for_resume: true
+      schema:
+        mode: observed
+      on_validation_failure: discard
+```
+
+The flag defaults to `false`. It is supported by the `csv` and `json` source
+plugins, including the JSON plugin's JSONL format, for normal live execution.
+A pipeline with multiple sources refuses this option.
+
+Snapshot mode parses and validates the entire finite source and seals its
+emitted rows in the payload store before any row reaches a downstream
+transform or sink. The serialized snapshot is limited to **64 MiB**; this is
+a spool-size limit, not a RAM limit or an input-file-size limit. Parsing and
+holding the snapshot can use more memory, and downstream processing starts
+only after sealing completes. An oversized snapshot fails before downstream
+row processing.
+
+Once the snapshot and completed source lifecycle are recorded, resume can
+process the remaining sealed emissions even if the original file has changed
+or been deleted. It uses the original row contracts, source row indexes,
+quarantine decisions and validation-error identities; it does not reopen the
+file or rerun source validation. Source rows discarded during validation stay
+discarded.
+
+Keep the original source options and the rest of the compatible configuration
+for the resume attempt. Check eligibility first, then execute:
+
+```bash
+elspeth resume <RUN_ID> --settings pipeline.yaml --database ./runs/audit.db
+elspeth resume <RUN_ID> --settings pipeline.yaml --database ./runs/audit.db --execute
+```
+
+A crash before sealing and source-lifecycle completion still leaves the source
+incomplete and resume refuses. Missing or corrupt snapshot references,
+metadata or payload bytes also refuse recovery; the current input file is not
+a fallback. The usual checkpoint, authority and sink-effect checks still
+apply. In particular, a pipeline containing `web_scrape` with a non-GET method
+(including POST search) refuses automatic resume because the prior remote
+request may have succeeded without its audit call being recorded. A sealed
+source does not resolve that uncertainty.
 
 ---
 
@@ -166,12 +226,61 @@ The checkpoint was corrupted or source data changed. Options:
 2. Preserve the failed run's audit database and checkpoint files if they are
    needed for incident evidence.
 
+### A row raised an unexpected error
+
+The run stopped with a traceback from a transform (a plugin bug or an ELSPETH
+failure, on the leader or on an `elspeth join` follower), not with a routed
+row error. The row's work item is left `failed` with no outcome, and the run
+cannot be recorded as completed while it is: a finalization over it is
+refused with `FAILED scheduler work whose token has no terminal outcome`.
+
+In ordinary streaming mode (`snapshot_for_resume: false`), resume can process
+the row again only if the run had finished reading its source before it
+stopped. For example, the error came after an aggregation or
+collector that holds rows until the end of the source, or on a follower while
+the leader finished reading. If the source was still being read, as in a
+single-process run where a transform raised mid-stream, resume refuses with
+`source lifecycle is incomplete (…) — resume replays only persisted row
+payloads, so unread source rows may exist; start a fresh run`. That refusal
+comes before any row is requeued. Fix the cause and start a fresh run.
+
+With [snapshot mode](#opt-in-source-snapshots), the finite source is already
+sealed and recorded complete before downstream rows start. A downstream
+failure can therefore leave both failed scheduler work and unprocessed sealed
+emissions for resume. Recovery still requires the retained snapshot, compatible
+checkpoint and the other resume gates described above.
+
+Otherwise:
+
+1. Fix the cause.
+2. Run `elspeth resume <RUN_ID> --execute`. Resume returns each such row to
+   the queue, records a `resume_requeue_failed` scheduler event for it, and
+   processes it again from the node where its work started, under a new
+   attempt number. A row that already has an outcome, including one routed to
+   `on_error`, is not processed again.
+
+Notes:
+
+- The row is processed at least once more: an external call the failed
+  attempt made before it raised may be made again, as when a crashed worker's
+  row is taken over.
+- If the cause is not fixed, resume fails the same way, the run stays
+  `failed` and nothing is recorded as completed. Resume again after the fix.
+  If that failed resume had already taken a row waiting for its sink, the row
+  is held until its item lease (300 seconds) lapses; a resume before then
+  processes the requeued row but stops with `residual scheduler work`, and a
+  later resume finishes the run.
+- `elspeth abandon` refuses a `failed` run as resumable. To give up on the
+  run instead, start a fresh one.
+
 ### "source lifecycle is incomplete" on a run that is still `running`
 
 The run's leader died (crash, SIGKILL, evicted replica) before its source was
 recorded `exhausted`, and the run is stuck `running` with an expired seat.
-Resume refuses because it replays only persisted rows and cannot prove that
-no unread source rows exist. No resume can recover such a run; finalize it
+Resume refuses because it cannot prove that all source emissions were
+retained. This covers ordinary streaming runs interrupted before source
+completion and snapshot runs interrupted before sealing/lifecycle completion.
+No resume can recover such an incomplete source; finalize the run
 honestly instead:
 
 ```bash

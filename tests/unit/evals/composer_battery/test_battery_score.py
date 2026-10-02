@@ -572,8 +572,182 @@ def test_score_json_round_trip_and_capture_error(tmp_path: Path) -> None:
         "terminal_missing",
         "transport",
         "capture",
+        "approval_unobservable",
     }
     (tmp_path / "meta.json").write_text("{}")  # no messages.json
     s2 = score_from_disk(tmp_path, SC)
     assert s2.excluded == "capture" and s2.exclusion_evidence
     assert path_from_disk(tmp_path).excluded == "capture" and path_from_disk(tmp_path).excluded_by_instrument
+
+
+@pytest.mark.parametrize("evidence", ["redacted", "absent", "completed", "applied", "approval"])
+def test_mutation_observability_uses_persisted_redaction_and_durable_delta(evidence: str) -> None:
+    from elspeth.web.composer.redaction import redact_tool_call_response
+    from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+    from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationSummary
+    from elspeth.web.composer.tools._common import ToolResult
+
+    rows = tg.ideal_thread(ARGS)
+    mutation = rows[-1]
+    mutation["composition_state_id"] = None
+    mutation["tool_calls"] = None
+    state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=2)
+    payload = ToolResult(
+        success=True,
+        updated_state=state,
+        validation=ValidationSummary(is_valid=True, errors=()),
+        affected_nodes=(),
+        data={"status": "APPLIED"} if evidence == "applied" else {"status": "APPROVAL_REQUIRED", "proposal_id": "proposal-canary"},
+    ).to_dict()
+    if evidence != "approval":
+        payload = redact_tool_call_response("set_pipeline", payload, telemetry=NoopRedactionTelemetry())
+        assert "APPROVAL_REQUIRED" not in json.dumps(payload)
+        assert "proposal-canary" not in json.dumps(payload)
+    if evidence == "absent":
+        payload.pop("data", None)
+    mutation["content"] = json.dumps(payload)
+    if evidence in {"applied", "completed"}:
+        mutation["tool_calls"] = [
+            {
+                "_kind": "audit",
+                "invocation": {
+                    "status": "success",
+                    "version_before": 2,
+                    "version_after": 3 if evidence == "applied" else 2,
+                },
+            }
+        ]
+    cap = tg.capture(rows, state=ARGS)
+    path = score_path(cap)
+    score = score_run(cap, SC)
+    assert path.applied_any is (evidence == "applied")
+    assert path.applied_mutation_calls == int(evidence == "applied")
+    assert path.approval_pending_calls == int(evidence == "approval")
+    unknown = evidence not in {"applied", "approval"}
+    assert path.approval_unknown_calls == int(unknown)
+    assert score.to_dict()["approval_unknown_calls"] == int(unknown)
+    if unknown:
+        assert score.excluded == "approval_unobservable"
+        assert not score.green and not score.clean and not score.optimal
+        assert not path.excluded_by_instrument
+        assert path.schema_read_before_first_mutation is None
+    else:
+        assert score.excluded is None
+
+
+@pytest.mark.parametrize("corruption", ["missing_row", "missing_id", "malformed_id", "duplicate_row", "duplicate_call", "wrong_parent"])
+def test_ambiguous_mutation_correlation_cannot_prove_application(corruption: str) -> None:
+    rows = tg.ideal_thread(ARGS)
+    if corruption == "missing_row":
+        rows.pop()
+    elif corruption == "missing_id":
+        rows[-1].pop("tool_call_id")
+    elif corruption == "malformed_id":
+        rows[-1]["tool_call_id"] = 42
+    elif corruption == "duplicate_row":
+        rows.append(copy.deepcopy(rows[-1]))
+    elif corruption == "duplicate_call":
+        rows[-2]["tool_calls"].append(copy.deepcopy(rows[-2]["tool_calls"][0]))
+    else:
+        rows[-1]["parent_assistant_id"] = "other-assistant"
+    path = score_path(tg.capture(rows, state=ARGS))
+    assert not path.applied_any
+    assert path.approval_unknown_calls > 0
+    assert path.excluded == "approval_unobservable"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "pending_state",
+        "inner_id",
+        "inner_name",
+        "failed_delta",
+        "negative_delta",
+        "early_row",
+        "wrong_kind",
+        "multiple_envelopes",
+        "unknown_status",
+        "missing_status",
+        "rejected_content",
+    ],
+)
+def test_conflicting_capture_evidence_never_certifies_clean_application(corruption: str) -> None:
+    rows = tg.ideal_thread(ARGS)
+    row = rows[-1]
+    if corruption == "pending_state":
+        row["content"] = json.dumps({"success": True, "data": {"status": "APPROVAL_REQUIRED"}})
+    elif corruption == "early_row":
+        row["sequence_no"] = 0
+    else:
+        invocation = {"status": "success", "version_before": 1, "version_after": 2}
+        if corruption == "inner_id":
+            invocation["tool_call_id"] = "another-call"
+        elif corruption == "inner_name":
+            invocation["tool_name"] = "set_source"
+        elif corruption == "failed_delta":
+            invocation["status"] = "arg_error"
+        elif corruption == "unknown_status":
+            invocation["status"] = "banana"
+        elif corruption == "missing_status":
+            invocation.pop("status")
+        elif corruption == "rejected_content":
+            row["content"] = json.dumps({"success": False})
+        elif corruption == "negative_delta":
+            invocation.update(version_before=-2, version_after=-1)
+        row["tool_calls"] = [{"_kind": "unrelated" if corruption == "wrong_kind" else "audit", "invocation": invocation}]
+        if corruption == "multiple_envelopes":
+            row["tool_calls"].append({"_kind": "audit", "invocation": {"status": "arg_error"}})
+    path = score_path(tg.capture(rows, state=ARGS))
+    score = score_run(tg.capture(rows, state=ARGS), SC)
+    assert not path.applied_any and path.applied_mutation_calls == 0
+    assert not score.clean and not score.optimal
+    if corruption == "pending_state":
+        assert path.approval_pending_calls == 1 and path.approval_unknown_calls == 0
+    elif corruption in {"failed_delta", "rejected_content"}:
+        assert "abandoned_mutation" in _classes(score)
+    else:
+        assert path.approval_unknown_calls == 1 and not score.green
+
+
+def test_shared_cohort_state_id_does_not_transfer_application_between_calls() -> None:
+    rows = tg.ideal_thread(ARGS)
+    rows.extend(
+        [
+            tg.audit_row(20),
+            tg.assistant_row(21, [tg.call("unknown", "set_pipeline", ARGS)]),
+            tg.tool_row(22, "unknown", "as21", state_id=rows[-1]["composition_state_id"]),
+        ]
+    )
+    rows[-1].pop("tool_calls")
+    path = score_path(tg.capture(rows, state=ARGS))
+    assert path.applied_mutation_calls == 1
+    assert path.approval_unknown_calls == 1
+    assert path.excluded == "approval_unobservable"
+    assert not any(d.cls == "backtrack" for d in path.deviations)
+    assert not score_run(tg.capture(rows, state=ARGS), SC).green
+
+
+@pytest.mark.parametrize("envelope", ["missing", [], {}, {"bad": True}, [None], "bad"])
+def test_only_explicit_null_can_use_primary_per_call_state_evidence(envelope: object) -> None:
+    rows = tg.ideal_thread(ARGS)
+    if envelope == "missing":
+        rows[-1].pop("tool_calls")
+    else:
+        rows[-1]["tool_calls"] = envelope
+    path = score_path(tg.capture(rows, state=ARGS))
+    assert not path.applied_any and path.approval_unknown_calls == 1
+
+
+def test_unknown_approval_is_excluded_from_actual_report_denominator() -> None:
+    from evals.lib.battery_report import _rates
+
+    rows = tg.ideal_thread(ARGS)
+    rows[-1]["composition_state_id"] = None
+    unknown = score_run(tg.capture(rows, state=ARGS), SC)
+    rates = _rates([score_run(_ideal(), SC), unknown])
+    assert rates["n"] == 1 and rates["clean"] == 1
+    assert rates["excluded_measurement"] == 1 and rates["excluded_instrument"] == 0
+    assert rates["clean_rate"] == 1.0
+    only_unknown = _rates([unknown])
+    assert only_unknown["n"] == 0 and only_unknown["clean_rate"] is None

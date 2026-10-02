@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
+from tests.fixtures.factories import make_context
 
-from elspeth.contracts import AuditCharacteristic, Determinism
+from elspeth.contracts import AuditCharacteristic, CallType, Determinism, RunMode
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentity, textract_profiled_binding_fingerprint
+from elspeth.contracts.call_mode import CallModeSession, SourceCallParentIdentity
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.engine.executors.declared_output_types import verify_produced_output_types
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.transforms.aws.replay_sdk import DeferredAWSClient, ReplayOnlySDK
 from elspeth.plugins.transforms.aws.textract_bucket_region import (
     BucketRegionProof,
     BucketRegionUnverifiedError,
@@ -218,6 +224,24 @@ def test_positive_bounds_reject_zero(field: str) -> None:
         _load(**{field: 0})
 
 
+@pytest.mark.parametrize(
+    ("field", "ceiling", "over"),
+    [
+        ("poll_timeout_seconds", 3600.0, 3600.5),
+        ("batch_wait_timeout_seconds", 3900.0, 3900.5),
+        ("max_result_pages", 1000, 1001),
+        ("max_blocks", 200_000, 200_001),
+        ("max_result_bytes", 50_000_000, 50_000_001),
+    ],
+)
+def test_worker_occupancy_and_retention_bounds_have_hard_ceilings(field: str, ceiling: float, over: float) -> None:
+    """An author may lower, never raise, how long one row can hold the shared
+    execution worker or how much result it retains (#231)."""
+    assert _load(**{field: ceiling}).model_dump()[field] == ceiling
+    with pytest.raises(PluginConfigError, match=field):
+        _load(**{field: over})
+
+
 def test_poll_backoff_multiplier_must_be_at_least_one() -> None:
     with pytest.raises(PluginConfigError, match="poll_backoff_multiplier"):
         _load(poll_backoff_multiplier=0.5)
@@ -394,6 +418,7 @@ def _run(transform: AWSTextractDocumentAnalysis, row: PipelineRow | None = None)
     return transform._process_single_with_state(
         _row() if row is None else row,
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -739,7 +764,7 @@ def _all_facet_blocks() -> list[dict[str, object]]:
 
 
 def test_all_configured_projections_are_emitted_only_after_complete_pagination() -> None:
-    first = _page(blocks=_basic_blocks(page=1, text="Page one"), next_token="page-2", page_count=2)
+    first = _page(blocks=_basic_blocks(page=1, text="Page one"), next_token="opaque-pagination-secret", page_count=2)
     second = _page(blocks=_basic_blocks(page=2, text="Page two"), page_count=2)
     client = FakeTextractClient(pages=[first, second])
     transform = _transform_for_client(
@@ -761,10 +786,62 @@ def test_all_configured_projections_are_emitted_only_after_complete_pagination()
     assert output["textract_metadata"]["block_count"] == 4
     assert len(output["textract_pages"]) == 2
     assert output["textract_result"]["DocumentMetadata"] == {"Pages": 2}
+    # ADR-050: the text and page count carry the plugin's concrete types and the
+    # engine's value check passes on the real emission; the provider-shaped
+    # mappings and facet lists are ``any``.
+    declared = {name: contract.python_type for name, contract in transform._stamped_output_field_contracts().items()}
+    assert {
+        name: declared[name] for name in ("textract_text", "textract_page_count", "textract_metadata", "textract_result", "textract_pages")
+    } == {
+        "textract_text": str,
+        "textract_page_count": int,
+        "textract_metadata": object,
+        "textract_result": object,
+        "textract_pages": object,
+    }
+    verify_produced_output_types(transform=transform, input_row=_row(), emitted_rows=[result.row])
+    assert "opaque-pagination-secret" not in repr(output)
+    assert "opaque-pagination-secret" not in repr(result.success_reason)
     assert client.get_calls == [
         {"job_id": "job-1", "next_token": None},
-        {"job_id": "job-1", "next_token": "page-2"},
+        {"job_id": "job-1", "next_token": "opaque-pagination-secret"},
     ]
+
+
+def test_start_lookup_fingerprint_uses_source_run_parent_and_token() -> None:
+    client = FakeTextractClient(pages=[_page(blocks=_basic_blocks())])
+    transform = _transform_for_client(client)
+
+    class SourceIdentitySession:
+        source_run_id = "source-run"
+
+        def source_parent_identity(
+            self, *, call_type: object, current_state_id: str | None, current_operation_id: str | None
+        ) -> SourceCallParentIdentity:
+            assert call_type is CallType.HTTP
+            assert current_state_id == "state-1"
+            assert current_operation_id is None
+            return SourceCallParentIdentity(
+                source_run_id="source-run",
+                source_node_id="source-node",
+                source_state_id="source-state",
+                source_operation_id=None,
+                source_token_id="source-token",
+            )
+
+    context = make_context(run_id="run-1")
+    context.call_mode_session = cast(CallModeSession, SourceIdentitySession())
+    result = transform._process_single_with_state(_row(), "state-1", ctx=context, token_id="token-1")
+    assert result.status == "success"
+    source_token = transform._client_request_token(
+        run_id="source-run",
+        node_id="source-node",
+        token_id="source-token",
+        bucket="docs",
+        key="invoice.pdf",
+        version=None,
+    )
+    assert client.start_calls[0]["source_client_request_token_fingerprint"] == hashlib.sha256(source_token.encode()).hexdigest()
 
 
 def test_all_normalized_facet_outputs_are_projected() -> None:
@@ -1032,6 +1109,7 @@ def test_on_start_requires_landscape() -> None:
         telemetry_emit=lambda _event: None,
         rate_limit_registry=None,
         shutdown_event=None,
+        run_mode=RunMode.LIVE,
     )
 
     with pytest.raises(FrameworkBugError, match="Landscape"):
@@ -1086,6 +1164,7 @@ def test_on_start_builds_with_resolved_secrets_and_close_closes_sdk_once(monkeyp
         telemetry_emit=lambda _event: None,
         rate_limit_registry=registry,
         shutdown_event=None,
+        run_mode=RunMode.LIVE,
     )
 
     transform.on_start(ctx)
@@ -1127,6 +1206,7 @@ def test_on_start_closes_s3_when_textract_client_construction_fails(monkeypatch:
         telemetry_emit=lambda _event: None,
         rate_limit_registry=None,
         shutdown_event=None,
+        run_mode=RunMode.LIVE,
     )
 
     with pytest.raises(RuntimeError, match="construction failed"):
@@ -1135,6 +1215,50 @@ def test_on_start_closes_s3_when_textract_client_construction_fails(monkeypatch:
     assert s3_sdk.close_count == 1
     assert transform._s3_sdk_client is None
     assert transform._sdk_client is None
+
+
+def test_replay_start_constructs_no_aws_clients(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden_build(**_kwargs: object) -> object:
+        raise AssertionError("AWS client constructed in replay")
+
+    monkeypatch.setattr("elspeth.plugins.transforms.aws.textract_document_analysis.build_s3_head_bucket_sdk_client", forbidden_build)
+    monkeypatch.setattr("elspeth.plugins.transforms.aws.textract_document_analysis.build_textract_sdk_client", forbidden_build)
+    transform = AWSTextractDocumentAnalysis(_config())
+    ctx = SimpleNamespace(
+        landscape=object(),
+        node_id="node-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        rate_limit_registry=None,
+        shutdown_event=None,
+        run_mode=RunMode.REPLAY,
+    )
+    transform.on_start(ctx)
+    assert isinstance(transform._sdk_client, ReplayOnlySDK)
+    assert isinstance(transform._s3_sdk_client, ReplayOnlySDK)
+    transform.close()
+
+
+def test_verify_start_defers_both_aws_clients_until_admitted_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden_build(**_kwargs: object) -> object:
+        raise AssertionError("AWS client constructed before verify admission")
+
+    monkeypatch.setattr("elspeth.plugins.transforms.aws.textract_document_analysis.build_s3_head_bucket_sdk_client", forbidden_build)
+    monkeypatch.setattr("elspeth.plugins.transforms.aws.textract_document_analysis.build_textract_sdk_client", forbidden_build)
+    transform = AWSTextractDocumentAnalysis(_config())
+    ctx = SimpleNamespace(
+        landscape=object(),
+        node_id="node-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        rate_limit_registry=None,
+        shutdown_event=None,
+        run_mode=RunMode.VERIFY,
+    )
+    transform.on_start(ctx)
+    assert isinstance(transform._sdk_client, DeferredAWSClient)
+    assert isinstance(transform._s3_sdk_client, DeferredAWSClient)
+    transform.close()
 
 
 def test_assistance_distinguishes_async_s3_and_secret_refs_from_inline_plugin() -> None:
@@ -1267,6 +1391,7 @@ def test_bucket_mode_joins_row_key_under_prefix() -> None:
     result = transform._process_single_with_state(
         make_pipeline_row({"document_key": "invoice.pdf"}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -1282,6 +1407,7 @@ def test_bucket_mode_without_prefix_uses_row_key_directly() -> None:
     result = transform._process_single_with_state(
         make_pipeline_row({"document_key": "invoice.pdf"}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -1319,6 +1445,7 @@ def test_bucket_mode_rejects_non_relative_row_keys(row_key: str) -> None:
     result = transform._process_single_with_state(
         make_pipeline_row({"document_key": row_key}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -1336,6 +1463,7 @@ def test_bucket_mode_rejects_overlong_joined_key() -> None:
     result = transform._process_single_with_state(
         make_pipeline_row({"document_key": "k" * 30}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -1353,6 +1481,7 @@ def test_bucket_mode_does_not_require_a_bucket_column_and_missing_key_fails() ->
     result = transform._process_single_with_state(
         make_pipeline_row({"unrelated": "value"}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -1393,6 +1522,7 @@ def test_profiled_bind_projects_call_record_identity_with_relative_key() -> None
     result = transform._process_single_with_state(
         make_pipeline_row({"document_key": "invoice.pdf"}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 

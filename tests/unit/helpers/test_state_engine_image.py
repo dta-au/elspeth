@@ -9,8 +9,9 @@ from enum import StrEnum
 from pathlib import Path
 
 import pytest
-from sqlalchemy import update
-from tests.fixtures.landscape import landscape_database_now, leader_coordination_token
+from sqlalchemy import insert, update
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.fixtures.landscape import landscape_database_now, leader_coordination_token, leader_token_for, member_token_for
 from tests.helpers.state_engine import (
     EXCLUDED_STATE_ENGINE_TABLES,
     STATE_ENGINE_TABLES,
@@ -23,7 +24,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import metadata, token_work_items_table
+from elspeth.core.landscape.schema import metadata, run_start_admissions_table, token_work_items_table
 
 _OBSERVED_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 _CATALOG_SHA256 = "0" * 64
@@ -59,7 +60,6 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         leader_worker_id=worker_id,
     )
     source = factory.data_flow.register_node(
-        run_id=run.run_id,
         plugin_name="test_source",
         node_type=NodeType.SOURCE,
         plugin_version="1",
@@ -67,9 +67,9 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         node_id="source",
         sequence=0,
         schema_config=_OBSERVED_SCHEMA,
+        coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
     )
     transform = factory.data_flow.register_node(
-        run_id=run.run_id,
         plugin_name="test_transform",
         node_type=NodeType.TRANSFORM,
         plugin_version="1",
@@ -77,27 +77,26 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         node_id="transform",
         sequence=1,
         schema_config=_OBSERVED_SCHEMA,
+        coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
     )
     factory.run_lifecycle.record_run_source(
         source_node_id=source.node_id,
         source_name="primary",
         plugin_name="test_source",
-        config_hash="source-config",
+        config_hash=fake_sha256("source-config"),
         lifecycle_state="loaded",
         coordination_token=leader_coordination_token(factory, run.run_id),
     )
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run.run_id),
         source_node_id=source.node_id,
         row_index=0,
         source_row_index=0,
         ingest_sequence=0,
         data={"id": 1},
     )
-    token = factory.data_flow.create_token(row.row_id)
     now = landscape_database_now(db.engine)
     item = factory.scheduler.enqueue_ready(
-        run_id=run.run_id,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=transform.node_id,
@@ -106,11 +105,12 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         row_payload_json=factory.scheduler.serialize_row_payload(
             PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
         ),
+        member_token=member_token_for(db.engine, worker_id=worker_id, run_id=run.run_id),
     )
     claimed = factory.scheduler.claim_ready(
-        run_id=run.run_id,
         lease_owner=worker_id,
         lease_seconds=30,
+        member_token=member_token_for(factory.scheduler._engine, worker_id=worker_id, run_id=run.run_id),
     )
     assert claimed is not None and claimed.work_item_id == item.work_item_id
 
@@ -131,7 +131,7 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
 
 def test_state_engine_table_inventory_covers_every_run_owned_table() -> None:
     assert set(STATE_ENGINE_TABLES) == set(metadata.tables) - set(EXCLUDED_STATE_ENGINE_TABLES)
-    assert len(STATE_ENGINE_TABLES) == 43
+    assert len(STATE_ENGINE_TABLES) == 46
 
 
 def test_canonicalize_state_value_normalizes_temporal_enum_and_binary_values() -> None:
@@ -169,11 +169,10 @@ def test_durable_image_reports_only_allowlisted_delta(seeded_run: _SeededRun) ->
         )
     before = capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id)
     seeded_run.factory.scheduler.heartbeat_lease(
-        run_id=seeded_run.run_id,
+        member_token=member_token_for(seeded_run.db.engine, worker_id=seeded_run.worker_id, run_id=seeded_run.run_id),
         work_item_id=seeded_run.work_item_id,
         lease_owner=seeded_run.worker_id,
         lease_seconds=60,
-        membership_fenced=True,
     )
     after = capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id)
 
@@ -196,6 +195,27 @@ def test_capture_excludes_rows_owned_by_another_run(seeded_run: _SeededRun) -> N
         leader_worker_id="worker:foreign:leader",
     )
 
+    with seeded_run.db.engine.begin() as connection:
+        connection.execute(
+            insert(run_start_admissions_table),
+            [
+                {"run_id": run_id, "permit_id": f"permit:{run_id}", "permit_epoch": 1, "subject_hash": "a" * 64, "state": "prepared"}
+                for run_id in (seeded_run.run_id, "run-foreign")
+            ],
+        )
     image = capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id)
 
     assert [row["run_id"] for row in image.tables["runs"]] == [seeded_run.run_id]
+    assert [row["run_id"] for row in image.tables["run_start_admissions"]] == [seeded_run.run_id]
+    with seeded_run.db.engine.begin() as connection:
+        connection.execute(
+            update(run_start_admissions_table).where(run_start_admissions_table.c.run_id == "run-foreign").values(state="executing")
+        )
+    assert capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id) == image
+    with seeded_run.db.engine.begin() as connection:
+        connection.execute(
+            update(run_start_admissions_table).where(run_start_admissions_table.c.run_id == seeded_run.run_id).values(state="executing")
+        )
+    changed = capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id)
+    assert changed.tables["run_start_admissions"][0]["state"] == "executing"
+    assert image.diff(changed).changed_columns == {"run_start_admissions": {"state"}}

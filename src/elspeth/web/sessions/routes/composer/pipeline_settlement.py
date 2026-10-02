@@ -15,6 +15,7 @@ import structlog
 
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.compartments import ChatIngressInput, compartment_ingress_record
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_commit import (
     PipelineCommitConfig,
@@ -22,7 +23,6 @@ from elspeth.web.composer.pipeline_commit import (
     RecoveredPipelineCommit,
     prepare_pipeline_proposal_commit,
 )
-from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
 from elspeth.web.composer.protocol import PipelineCommitIntent
 from elspeth.web.composer.state import ValidationSummary
 from elspeth.web.sessions.protocol import (
@@ -31,7 +31,6 @@ from elspeth.web.sessions.protocol import (
     CompositionProposalRecord,
     PipelineProposalRejectionReason,
     PipelineProposalSettlementResult,
-    TransitionAssistantDraft,
     TrustModeAutoCommitRevokedError,
 )
 
@@ -40,15 +39,14 @@ from .._helpers import (
     Request,
     SessionServiceProtocol,
     UserIdentity,
-    _initial_composition_state_with_guided_session,
+    _chat_ingress_inputs,
+    _initial_composition_state,
     _persist_tool_invocations,
     _state_data_from_composer_state,
     _state_from_record,
     asyncio,
+    merge_composer_meta_updates,
 )
-
-_GUIDED_ATOMIC_SETTLEMENT_COMPLETED = "_elspeth_guided_atomic_settlement_completed"
-_GUIDED_ATOMIC_SETTLEMENT_FAILURE = "_elspeth_guided_atomic_settlement_failure"
 
 slog = structlog.get_logger()
 
@@ -62,43 +60,6 @@ class _DeferredCancellationState:
 class PipelineRouteSettlement:
     settlement: PipelineProposalSettlementResult
     validation: ValidationSummary | None
-
-
-async def _await_guided_atomic_settlement[T](awaitable: Awaitable[T]) -> T:
-    """Drain a submitted guided settlement before preserving request cancellation."""
-
-    settlement_task = asyncio.ensure_future(awaitable)
-    caller_task = asyncio.current_task()
-    cancellation: asyncio.CancelledError | None = None
-    while True:
-        try:
-            result = await asyncio.shield(settlement_task)
-        except asyncio.CancelledError as exc:
-            if settlement_task.done() and settlement_task.cancelled():
-                if cancellation is not None:
-                    cancellation.__dict__[_GUIDED_ATOMIC_SETTLEMENT_FAILURE] = exc
-                    raise cancellation from exc
-                raise
-            if caller_task is None or caller_task.cancelling() == 0:
-                raise
-            if cancellation is None:
-                cancellation = exc
-            if not settlement_task.done():
-                continue
-            try:
-                result = settlement_task.result()
-            except BaseException as failure:
-                cancellation.__dict__[_GUIDED_ATOMIC_SETTLEMENT_FAILURE] = failure
-                raise cancellation from failure
-        except Exception as failure:
-            if cancellation is None:
-                raise
-            cancellation.__dict__[_GUIDED_ATOMIC_SETTLEMENT_FAILURE] = failure
-            raise cancellation from failure
-        if cancellation is not None:
-            cancellation.__dict__[_GUIDED_ATOMIC_SETTLEMENT_COMPLETED] = True
-            raise cancellation
-        return result
 
 
 async def _await_with_deferred_cancellation[T](
@@ -149,6 +110,24 @@ async def _proposal_user_message_content(
     )
 
 
+async def _proposal_chat_ingress_inputs(
+    service: SessionServiceProtocol,
+    proposal: CompositionProposalRecord,
+    *,
+    own_compartment_id: str | None,
+) -> list[ChatIngressInput]:
+    """Retain all durable human inputs through this proposal's originating turn."""
+    if proposal.user_message_id is None:
+        return []
+    messages = await service.get_messages(proposal.session_id, limit=None)
+    for index, message in enumerate(messages):
+        if message.id == proposal.user_message_id:
+            if message.role != "user":
+                raise HTTPException(status_code=409, detail="Stored proposal references a non-user originating message.")
+            return list(_chat_ingress_inputs(messages[: index + 1], own_compartment_id=own_compartment_id))
+    raise HTTPException(status_code=409, detail="Stored proposal references an originating message that could not be recovered.")
+
+
 async def settle_pipeline_proposal_under_compose_lock(
     *,
     request: Request,
@@ -157,9 +136,7 @@ async def settle_pipeline_proposal_under_compose_lock(
     draft_hash: str,
     composer_meta: Mapping[str, object] | None = None,
     telemetry_source: Literal["compose", "recompose"] = "compose",
-    transition_assistant: TransitionAssistantDraft | None = None,
     required_trust_mode: ComposerTrustMode | None = None,
-    require_transition_consumed: bool = True,
     session_operation_context: SessionOperationContext,
 ) -> PipelineRouteSettlement:
     """Settle one exact canonical proposal while the caller holds the lock.
@@ -176,10 +153,6 @@ async def settle_pipeline_proposal_under_compose_lock(
     proposal = authority.row
     if draft_hash != authority.proposal.draft_hash:
         raise HTTPException(status_code=409, detail="The pipeline proposal draft hash is stale or mismatched.")
-    if authority.proposal.surface.value in {"guided_staged", "tutorial_profile"}:
-        raise HTTPException(status_code=409, detail="This pipeline proposal must be accepted through its guided workflow.")
-    if authority.proposal.reviewed_anchor_hash != reviewed_anchor_hash({}):
-        raise HTTPException(status_code=409, detail="The pipeline proposal reviewed anchor is stale or mismatched.")
     if proposal.status == "committed":
         if proposal.committed_state_id is None:
             raise RuntimeError("committed pipeline proposal has no committed state id")
@@ -191,12 +164,16 @@ async def settle_pipeline_proposal_under_compose_lock(
         # closed on interpretation_placeholder_unresolved with nothing the user
         # can resolve. The pass is idempotent, so re-running it here is a no-op
         # when the first attempt already completed it.
-        await request.app.state.composer_service.surface_pending_interpretation_reviews(
-            _state_from_record(state),
-            session_id=str(proposal.session_id),
-            current_state_id=str(state.id),
-            session_operation_context=session_operation_context,
+        _, replay_cancelled = await _await_with_deferred_cancellation(
+            request.app.state.interpretation_surfacing.surface_pending_interpretation_reviews(
+                _state_from_record(state),
+                session_id=str(proposal.session_id),
+                current_state_id=str(state.id),
+                session_operation_context=session_operation_context,
+            )
         )
+        if replay_cancelled:
+            raise asyncio.CancelledError
         return PipelineRouteSettlement(
             settlement=PipelineProposalSettlementResult(proposal=proposal, state=state),
             validation=None,
@@ -205,8 +182,22 @@ async def settle_pipeline_proposal_under_compose_lock(
         raise HTTPException(status_code=409, detail="Only pending proposals can be accepted.")
 
     current_record = await service.get_current_state(proposal.session_id)
-    current_state = _state_from_record(current_record) if current_record is not None else _initial_composition_state_with_guided_session()
+    current_state = _state_from_record(current_record) if current_record is not None else _initial_composition_state()
     user_message_content = await _proposal_user_message_content(service, proposal)
+    if composer_meta is None:
+        previous_meta = current_record.composer_meta if current_record is not None else None
+        chat_ingress_inputs = await _proposal_chat_ingress_inputs(
+            service, proposal, own_compartment_id=request.app.state.settings.compartment_id
+        )
+        composer_meta = merge_composer_meta_updates(
+            previous_meta,
+            {
+                "ingress": compartment_ingress_record(user_message_content, own_compartment_id=request.app.state.settings.compartment_id),
+                "chat_ingress_inputs": chat_ingress_inputs,
+            }
+            if user_message_content is not None
+            else {},
+        )
     plugin_snapshot = request.app.state.plugin_snapshot_factory(user)
     policy_catalog = PolicyCatalogView(
         request.app.state.catalog_service,
@@ -220,7 +211,6 @@ async def settle_pipeline_proposal_under_compose_lock(
         prepared, _ = await _await_with_deferred_cancellation(
             prepare_pipeline_proposal_commit(
                 authority=authority,
-                reviewed_facts={},
                 current_state=current_state,
                 current_state_id=current_record.id if current_record is not None else None,
                 policy_catalog=policy_catalog,
@@ -228,6 +218,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                 config=PipelineCommitConfig(
                     data_dir=str(request.app.state.settings.data_dir),
                     session_engine=request.app.state.session_engine,
+                    session_operation_context=session_operation_context,
+                    session_operation_authority=service.session_operation_authority,
                     secret_service=request.app.state.scoped_secret_resolver,
                     user_id=str(user.user_id),
                     user_message_content=user_message_content,
@@ -237,7 +229,6 @@ async def settle_pipeline_proposal_under_compose_lock(
                 ),
                 recorder=recorder,
                 actor=f"user:{user.user_id}",
-                settlement_surface="generic",
                 recovery_dispatch=recovery.binding if recovery is not None else None,
                 recovery_executor_content_hash=recovery.executor_content_hash if recovery is not None else None,
             ),
@@ -276,7 +267,6 @@ async def settle_pipeline_proposal_under_compose_lock(
                         session_id=proposal.session_id,
                         proposal_id=proposal.id,
                         draft_hash=authority.proposal.draft_hash,
-                        reviewed_facts={},
                         reason=reason,
                         dispatch=persisted_dispatch,
                         actor=f"system:pipeline_commit:user:{user.user_id}",
@@ -290,6 +280,11 @@ async def settle_pipeline_proposal_under_compose_lock(
             raise
         if cancellation_state.requested:
             raise asyncio.CancelledError from exc
+        if exc.code == "TIMEOUT":
+            raise HTTPException(
+                status_code=504,
+                detail="Pipeline preparation timed out. Please retry this proposal.",
+            ) from exc
         status_code = 409 if exc.code in {"BASE_CONFLICT", "NOT_PENDING"} else 422
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except BaseException as exc:
@@ -352,16 +347,13 @@ async def settle_pipeline_proposal_under_compose_lock(
                 session_id=proposal.session_id,
                 proposal_id=proposal.id,
                 draft_hash=draft_hash,
-                reviewed_facts={},
                 state=state_data,
                 candidate_content_hash=prepared.candidate_content_hash,
                 executor_content_hash=prepared.executor_content_hash,
                 final_composer_metadata=state_data.composer_meta,
                 dispatch=bindings[0],
                 actor=f"user:{user.user_id}",
-                transition_assistant=transition_assistant,
                 required_trust_mode=required_trust_mode,
-                require_transition_consumed=require_transition_consumed,
                 session_operation_context=session_operation_context,
             ),
             state=cancellation_state,
@@ -370,8 +362,6 @@ async def settle_pipeline_proposal_under_compose_lock(
         if cancellation_state.requested:
             raise asyncio.CancelledError from exc
         raise
-    if cancellation_state.requested:
-        raise asyncio.CancelledError
     # Surface resolvable interpretation-review EVENTS for every site the
     # committed pipeline created (llm prompt templates etc.). The planner
     # path mints proposals without the compose loop's
@@ -379,15 +369,20 @@ async def settle_pipeline_proposal_under_compose_lock(
     # committed state carries pending interpretation_requirements with no
     # event row — the run gate then fails closed
     # (interpretation_placeholder_unresolved) with nothing the user can
-    # resolve. Mirrors the guided dispatcher's post-commit surfacing pass;
+    # resolve. This is an idempotent post-commit surfacing pass;
     # runs after settlement so events bind to the durable state id.
-    composer = request.app.state.composer_service
-    await composer.surface_pending_interpretation_reviews(
-        prepared.result.updated_state,
-        session_id=str(proposal.session_id),
-        current_state_id=str(settled.state.id),
-        session_operation_context=session_operation_context,
+    interpretation_surfacing = request.app.state.interpretation_surfacing
+    await _await_with_deferred_cancellation(
+        interpretation_surfacing.surface_pending_interpretation_reviews(
+            prepared.result.updated_state,
+            session_id=str(proposal.session_id),
+            current_state_id=str(settled.state.id),
+            session_operation_context=session_operation_context,
+        ),
+        state=cancellation_state,
     )
+    if cancellation_state.requested:
+        raise asyncio.CancelledError
     return PipelineRouteSettlement(settlement=settled, validation=validation)
 
 
@@ -416,7 +411,6 @@ async def settle_auto_commit_intent(
     intent: PipelineCommitIntent,
     composer_meta: Mapping[str, object] | None,
     telemetry_source: Literal["compose", "recompose"],
-    transition_assistant: TransitionAssistantDraft | None,
     session_operation_context: SessionOperationContext,
 ) -> PipelineRouteSettlement | AutoCommitRevoked:
     """Settle a planner-minted auto-commit intent, or report revocation.
@@ -430,7 +424,6 @@ async def settle_auto_commit_intent(
     authority = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=intent.proposal_id,
-        reviewed_facts={},
     )
     try:
         return await settle_pipeline_proposal_under_compose_lock(
@@ -440,7 +433,6 @@ async def settle_auto_commit_intent(
             draft_hash=intent.draft_hash,
             composer_meta=composer_meta,
             telemetry_source=telemetry_source,
-            transition_assistant=transition_assistant,
             required_trust_mode="auto_commit",
             session_operation_context=session_operation_context,
         )

@@ -8,7 +8,7 @@ import { usePluginCatalogStore } from "./pluginCatalogStore";
 import * as shareableReviewsApi from "../api/shareableReviews";
 import * as apiClient from "@/api/client";
 import { resetStore } from "@/test/store-helpers";
-import { GUIDED_RETRY_STORAGE_KEY } from "./guidedOperationRetry";
+import { SESSION_OPERATION_RETRY_STORAGE_KEY } from "./sessionOperationRetry";
 
 vi.mock("@/api/client", () => ({
   fetchCurrentUser: vi.fn(),
@@ -94,7 +94,7 @@ describe("authStore account-scoped store reset", () => {
   });
 
   it("logout clears account-scoped cached stores before another account can reuse them", async () => {
-    sessionStorage.setItem(GUIDED_RETRY_STORAGE_KEY, "stale-retry-custody");
+    sessionStorage.setItem(SESSION_OPERATION_RETRY_STORAGE_KEY, "stale-retry-custody");
     useAuthStore.setState({
       token: "token-for-alice",
       user: {
@@ -109,11 +109,10 @@ describe("authStore account-scoped store reset", () => {
     });
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "freeform",
-      bannerDismissedAt: "2026-05-16T00:00:00Z",
       tutorialCompletedAt: "2026-05-19T00:00:00Z",
       tutorialCompleted: true,
-      optedOutAtSessionId: "alice-session",
+      bootstrapError: "old bootstrap error",
+      writeError: "old write error",
     });
     useBlobStore.setState({
       blobs: [
@@ -162,7 +161,7 @@ describe("authStore account-scoped store reset", () => {
 
     await useAuthStore.getState().logout();
 
-    expect(sessionStorage.getItem(GUIDED_RETRY_STORAGE_KEY)).toBeNull();
+    expect(sessionStorage.getItem(SESSION_OPERATION_RETRY_STORAGE_KEY)).toBeNull();
 
     expect(useBlobStore.getState()).toMatchObject({
       blobs: [],
@@ -171,11 +170,9 @@ describe("authStore account-scoped store reset", () => {
     });
     expect(usePreferencesStore.getState()).toMatchObject({
       loaded: false,
-      defaultMode: null,
-      bannerDismissedAt: null,
       tutorialCompletedAt: null,
       tutorialCompleted: false,
-      optedOutAtSessionId: null,
+      bootstrapError: null,
       writeError: null,
     });
     expect(useSecretsStore.getState()).toMatchObject({

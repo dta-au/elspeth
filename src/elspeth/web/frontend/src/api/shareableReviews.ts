@@ -1,3 +1,4 @@
+import { authFetch } from "./authSession";
 /**
  * API client for the shareable-reviews endpoints (Phase 6A backend, Phase 6B frontend).
  *
@@ -139,10 +140,8 @@ function validateSharedInspectResponse(body: unknown, status: number): SharedIns
     !isCompositionSnapshot(body.composition_snapshot) ||
     typeof body.yaml !== "string" ||
     typeof body.created_by_user_id !== "string" ||
-    // Nullable on the wire: the backend sends null for snapshots minted
-    // before it froze the username into the blob. The key itself is always
-    // present, so an absent key is still a shape rejection.
-    !(typeof body.created_by_username === "string" || body.created_by_username === null) ||
+    typeof body.created_by_username !== "string" ||
+    body.created_by_username.trim().length === 0 ||
     typeof body.created_at !== "string" ||
     typeof body.expires_at !== "string"
   ) {
@@ -181,7 +180,7 @@ export async function markReadyForReview(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<MarkReadyForReviewResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/mark-ready-for-review`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/mark-ready-for-review`, {
     method: "POST",
     headers: authHeaders(),
     signal,
@@ -194,7 +193,7 @@ export async function fetchShareableLink(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<ShareableLinkResponse> {
-  const response = await fetch(`/api/sessions/${sessionId}/shareable-link`, {
+  const response = await authFetch(`/api/sessions/${sessionId}/shareable-link`, {
     method: "GET",
     headers: authHeaders(),
     signal,
@@ -207,7 +206,7 @@ export async function fetchSharedInspect(
   token: string,
   signal?: AbortSignal,
 ): Promise<SharedInspectResponse> {
-  const response = await fetch(`/api/sessions/shared/${encodeURIComponent(token)}`, {
+  const response = await authFetch(`/api/sessions/shared/${encodeURIComponent(token)}`, {
     method: "GET",
     headers: authHeaders(),
     signal,

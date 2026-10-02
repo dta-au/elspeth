@@ -1,4 +1,4 @@
-"""Batch-flush dispatcher routing regression (filigree issue elspeth-ef8d5d92ff).
+"""Batch-flush dispatcher routing regression (archived issue elspeth-ef8d5d92ff).
 
 Post-H2 (ADR-010 §Semantics amendment 2026-04-20): ``_cross_check_flush_output``
 calls ``run_batch_flush_checks`` on its own dispatch site (not the post-
@@ -40,7 +40,7 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.config import AggregationSettings, TriggerConfig
 from elspeth.engine.processor import _FlushContext
 from elspeth.testing import make_contract, make_token_info
-from tests.fixtures.landscape import make_recorder_with_run
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 # ---------------------------------------------------------------------------
 # Counting contract: records each batch-flush dispatcher invocation's
@@ -154,7 +154,6 @@ def _make_fctx(
         settings=settings,
         buffered_tokens=tuple(tokens),
         batch_id="batch-1",
-        error_msg="batch failed",
         expand_parent_token=tokens[0],
         triggering_token=tokens[-1],
         coalesce_node_id=None,
@@ -187,6 +186,7 @@ def _make_processor() -> Any:
         source_on_success="default",
         traversal=traversal,
         scheduler=setup.factory.scheduler,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
     )
 
 

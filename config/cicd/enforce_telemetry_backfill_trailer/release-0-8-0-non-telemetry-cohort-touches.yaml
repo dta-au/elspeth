@@ -1,0 +1,35 @@
+entries:
+  - commit_sha: 9fa971fc1968df58cba48a20b893145690186a83
+    cohort: b2
+    reason: |
+      Touches cohort (b2) audit_readiness with three lines in
+      src/elspeth/web/audit_readiness/boundary_expectations.py: one
+      EXPECTED_TRANSFORM_DETERMINISMS entry registering the new
+      reference_join transform as DETERMINISTIC, plus the two-line comment
+      recording why it is not IO_READ. The commit registers reference_join
+      across every whole-tree gate surface; the audit_readiness edit is an
+      inventory registration required by those gates, not a telemetry
+      counter emit. No telemetry-backfill trailer applies because no
+      backfilled counter belongs to an earlier feature cohort here — this
+      is exactly the README's "refactor that naturally touches a cohort
+      directory" escape valve. Rewriting history is not available: the
+      commit is published on release/0.8.0, which carries 3662 commits
+      under an open PR.
+    owner: tachyon-beep
+    expires: 2026-12-31
+  - commit_sha: 7c9ba237931310fedbc8baf5d2dd8d139adc3ee7
+    cohort: a
+    reason: |
+      Touches cohort (a) shareable_reviews with five inserted and seven
+      deleted lines in src/elspeth/web/shareable_reviews/routes.py: a
+      ComposerRateLimiter / get_rate_limiter / get_write_rate_limiter
+      import block, and removal of trailing blank lines at end of file.
+      The commit is stage 2 of the deferred-platform recovery, threading
+      session-operation authority through the recovered routes and the
+      composer loop (elspeth-4d6c0dd0f5). The shareable_reviews edit is
+      import plumbing for that fencing work and emits no telemetry, so no
+      telemetry-backfill cohort attribution exists to record. Rewriting
+      history is not available: the commit is published on release/0.8.0,
+      which carries 3662 commits under an open PR.
+    owner: tachyon-beep
+    expires: 2026-12-31

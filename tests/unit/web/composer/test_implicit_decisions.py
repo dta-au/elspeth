@@ -4,14 +4,13 @@ elspeth-b5180a9630 (R2-F11): ``build_implicit_decisions_report`` flattens every
 source option verbatim into ``composer_meta.implicit_decisions.entries[].value``.
 For a blob-backed source that meant the absolute ``/var/lib/elspeth/blobs/...``
 storage path entered ``composer_meta`` at WRITE time, downstream of the
-``sources``-keyed ``redact_source_storage_path`` projection and outside the
-guided-only ``private_path_projections`` pass — so every state response and the
+``sources``-keyed ``redact_source_storage_path`` projection — so every state response and the
 convergence-422 body disclosed it.
 
 The fix is a can't-regress boundary rather than another outbound projection:
 when a source's options carry the structural ``blob_ref`` marker, the
 storage-path carrier keys are recorded as the ``blob:<blob_ref>`` wire sentinel
-(the guided schema_form precedent, ``BLOB_REF_PATH_PREFIX``). A raw path never
+(``BLOB_REF_PATH_PREFIX``). A raw path never
 enters ``composer_meta``, so no outbound serializer can regress field-by-field.
 """
 
@@ -22,7 +21,7 @@ import json
 import pytest
 
 from elspeth.contracts.freeze import deep_freeze
-from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report
+from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report, merge_implicit_decisions_meta
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.source_demand import build_source_data_contract_draft, source_data_contract_artifact_hash
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
@@ -50,6 +49,49 @@ def _state_with_source_options(options: dict[str, object], *, plugin: str = "csv
 def _entries_by_path(state: CompositionState) -> dict[str, dict[str, object]]:
     report = build_implicit_decisions_report(state)
     return {str(entry["path"]): dict(entry) for entry in report["entries"]}
+
+
+def test_report_discloses_state_decisions_without_claiming_normalization_history() -> None:
+    """A state projection cannot claim that no normalization events occurred."""
+    report = build_implicit_decisions_report(_state_with_source_options({"path": "data/input.csv"}))
+
+    assert set(report) == {"schema_version", "entries"}
+    assert report["schema_version"] == 2
+    assert {entry["path"]: entry["value"] for entry in report["entries"]} == {
+        "source.path": "data/input.csv",
+        "source.on_validation_failure": "discard",
+    }
+
+
+def test_report_merge_replaces_prior_disclosure_without_mutating_prior_metadata() -> None:
+    """A new save must replace the old report, including its vestigial fields."""
+    prior_meta = deep_freeze(
+        {
+            "repair_turns_used": 1,
+            "implicit_decisions": {"schema_version": 1, "entries": [], "normalization_events": []},
+        }
+    )
+
+    merged = merge_implicit_decisions_meta(prior_meta, _state_with_source_options({"path": "data/input.csv"}))
+
+    assert merged == {
+        "repair_turns_used": 1,
+        "implicit_decisions": {
+            "schema_version": 2,
+            "entries": [
+                {"path": "source.path", "value": "data/input.csv", "category": "source", "provenance": "composer_selected"},
+                {
+                    "path": "source.on_validation_failure",
+                    "value": "discard",
+                    "category": "error_routing",
+                    "provenance": "default",
+                    "candidate_alternatives": ["discard", "named_sink"],
+                },
+            ],
+        },
+    }
+    assert prior_meta["implicit_decisions"]["schema_version"] == 1
+    assert "normalization_events" in prior_meta["implicit_decisions"]
 
 
 def test_blob_backed_source_path_records_blob_ref_sentinel() -> None:
@@ -135,8 +177,8 @@ def test_blob_ref_that_is_not_a_canonical_uuid_degrades_to_the_generic_sentinel(
     """``options`` is composer/LLM-authored (Tier 3): validate, then degrade.
 
     A ``str`` check alone is NOT sufficient. Every other consumer of this marker
-    requires a canonical UUID (the YAML-export guard, the guided reviewed-source
-    reader), and a path-shaped ``blob_ref`` passed through a bare ``str`` check
+    requires a canonical UUID (including the YAML-export guard), and a
+    path-shaped ``blob_ref`` passed through a bare ``str`` check
     would ride out as ``blob:/var/lib/elspeth/blobs/...`` — the leak reopened
     inside the sentinel that exists to close it. Anything failing validation
     must degrade to the generic sentinel rather than be interpolated.
@@ -153,9 +195,8 @@ def test_blob_ref_that_is_not_a_canonical_uuid_degrades_to_the_generic_sentinel(
 def test_named_sources_each_project_their_own_blob_ref() -> None:
     """Multiple blob-backed sources collapse onto ``source.path`` by design.
 
-    ``_source_entries`` hard-codes the ``source.`` prefix (the guided
-    projection at ``redaction.py`` keys on exactly ``source.path`` /
-    ``source.file``). Whichever entry wins, neither may be a raw path.
+    ``_source_entries`` hard-codes the ``source.`` prefix. Whichever entry
+    wins, neither may be a raw path.
     """
     other_ref = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
     state = CompositionState(
@@ -464,14 +505,14 @@ def test_server_stamped_source_metadata_attributes_to_the_server() -> None:
     assert by_path["source.source_authoring.content_hash"]["provenance"] == "server_stamped"
     assert by_path["source.interpretation_requirements"]["provenance"] == "server_stamped"
     # The path/file sentinel entries keep being emitted verbatim —
-    # ``redact_guided_snapshot_storage_paths`` keys on those exact paths.
+    # The report retains the source option's stable path key.
     assert by_path["source.path"]["value"] == f"blob:{_BLOB_REF}"
     # Sibling ordinary options are untouched.
     assert by_path["source.delimiter"]["provenance"] == "composer_selected"
 
 
 def test_server_stamped_node_metadata_attributes_to_the_server() -> None:
-    """The node-side server-owned keys (``resolved_prompt_template_hash``,
+    """The node-side server-owned keys (``approved_prompt_artifact_hash``,
     ``prompt_template_parts``) attribute honestly too, and only when rooted at
     the TOP-LEVEL options segment."""
     state = CompositionState(
@@ -487,9 +528,9 @@ def test_server_stamped_node_metadata_attributes_to_the_server() -> None:
                 options=deep_freeze(
                     {
                         "prompt_template": "Tone: warm",
-                        "resolved_prompt_template_hash": "b" * 64,
+                        "approved_prompt_artifact_hash": "b" * 64,
                         "prompt_template_parts": [{"kind": "text", "text": "Tone: warm"}],
-                        "nested": {"resolved_prompt_template_hash": "not-server-owned"},
+                        "nested": {"approved_prompt_artifact_hash": "not-server-owned"},
                         "schema": {"mode": "observed"},
                     }
                 ),
@@ -509,9 +550,9 @@ def test_server_stamped_node_metadata_attributes_to_the_server() -> None:
     report = build_implicit_decisions_report(state)
     by_path = {str(entry["path"]): dict(entry) for entry in report["entries"]}
 
-    assert by_path["node.model.options.resolved_prompt_template_hash"]["provenance"] == "server_stamped"
+    assert by_path["node.model.options.approved_prompt_artifact_hash"]["provenance"] == "server_stamped"
     assert by_path["node.model.options.prompt_template_parts"]["provenance"] == "server_stamped"
     # A NESTED key that merely reuses a server-owned name is an ordinary
     # plugin option — the stamp applies to the top-level options segment only.
-    assert by_path["node.model.options.nested.resolved_prompt_template_hash"]["provenance"] == "composer_selected"
+    assert by_path["node.model.options.nested.approved_prompt_artifact_hash"]["provenance"] == "composer_selected"
     assert by_path["node.model.options.prompt_template"]["provenance"] == "composer_selected"

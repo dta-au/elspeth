@@ -8,11 +8,12 @@ persisted quarantine rows, and the error read models.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, get_args
 
 from sqlalchemy import select
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import (
     TransformErrorReason,
@@ -21,7 +22,9 @@ from elspeth.contracts import (
     ValidationErrorWithContract,
 )
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError, TransformErrorCategory
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
@@ -31,14 +34,106 @@ from elspeth.core.landscape.data_flow.serialization import (
     canonical_or_recorded_hash,
     canonical_or_recorded_json,
 )
+from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.model_loaders import TransformErrorLoader, ValidationErrorLoader
+from elspeth.core.landscape.ports import LandscapeConnectionProvider
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import rows_table, transform_errors_table, validation_errors_table
 
 if TYPE_CHECKING:
     from elspeth.contracts.errors import ContractViolation
     from elspeth.contracts.schema_contract import PipelineRow
 
-__all__ = ["ErrorAuditRepository"]
+__all__ = ["ErrorAuditRepository", "insert_batch_transform_errors_on"]
+
+
+def _require_transform_error_category(error_details: TransformErrorReason) -> None:
+    """Refuse a transform error whose reason is not a known TransformErrorCategory.
+
+    Tier 1 write guard shared by the per-row and batch writers. TypedDict has
+    zero runtime enforcement — the Literal annotation only helps at compile
+    time. Invalid reasons must crash before persisting.
+    """
+    reason = error_details["reason"]
+    valid_reasons = get_args(TransformErrorCategory)
+    if reason not in valid_reasons:
+        raise AuditIntegrityError(
+            f"Invalid TransformErrorCategory '{reason}' at Tier 1 write boundary. "
+            f"This is a plugin bug — transforms must use a valid error category. "
+            f"Valid categories: {sorted(valid_reasons)}"
+        )
+
+
+def insert_batch_transform_errors_on(
+    conn: Connection,
+    *,
+    run_id: str,
+    members: Sequence[tuple[TokenRef, PipelineRow]],
+    transform_id: str,
+    error_details: TransformErrorReason,
+    destination: str,
+) -> tuple[str, ...]:
+    """Insert one transform error per member of a FAILED aggregation batch, on ``conn``.
+
+    The batch-level twin of :meth:`ErrorAuditRepository.record_transform_error`
+    (operator ruling B5). A batch transform that returns
+    ``TransformResult.error`` fails the WHOLE batch, so every buffered member
+    gets its own ``transform_errors`` row carrying its own row and the one
+    (already scrubbed) batch reason, with the ``destination`` the per-row seam
+    records (the ``on_error`` sink name, or ``"discard"``). ONE executemany
+    INSERT, so no crash leaves a partially attributed batch.
+
+    Deliberately a connection-level helper with no transaction of its own:
+    the rows are part of the batch's recorded FAILED verdict, which
+    ``ExecutionRepository.complete_aggregation_failure`` writes in ONE
+    leader-fenced transaction with the flush node_state, the batch row and
+    the DIVERT routing_event. Whether that verdict exists is then never a
+    matter of crash timing.
+
+    Returns:
+        The error_ids, in member order.
+
+    Raises:
+        AuditIntegrityError: The member set is empty, a member belongs to
+            another run, or the reason category is not a known
+            TransformErrorCategory.
+        LandscapeRecordError: The database rejected the write or wrote fewer
+            rows than members.
+    """
+    if not members:
+        raise AuditIntegrityError("insert_batch_transform_errors_on: a failed batch has at least one member")
+    if any(ref.run_id != run_id for ref, _row_data in members):
+        raise AuditIntegrityError("insert_batch_transform_errors_on: token reference does not belong to the authority's run")
+    _require_transform_error_category(error_details)
+
+    # Coerce-and-record exactly as record_transform_error does: the reason
+    # and each member's row are canonicalised before the INSERT runs.
+    error_details_json = canonical_or_recorded_error_details_json(error_details)
+    created_at = now()
+    values = [
+        {
+            "error_id": f"terr_{generate_id()[:12]}",
+            "run_id": run_id,
+            "token_id": ref.token_id,
+            "transform_id": transform_id,
+            "row_hash": canonical_or_recorded_hash(row_data),
+            "row_data_json": canonical_or_recorded_json(row_data),
+            "error_details_json": error_details_json,
+            "destination": destination,
+            "created_at": created_at,
+        }
+        for ref, row_data in members
+    ]
+    try:
+        result = conn.execute(transform_errors_table.insert().returning(transform_errors_table.c.error_id), values)
+    except SQLAlchemyError as exc:
+        raise LandscapeRecordError(
+            f"insert_batch_transform_errors_on failed — database rejected audit write: {type(exc).__name__}"
+        ) from exc
+    if len(result.fetchall()) != len(values):
+        raise LandscapeRecordError("insert_batch_transform_errors_on: incomplete batch — audit write failed")
+    return tuple(str(value["error_id"]) for value in values)
 
 
 class ErrorAuditRepository:
@@ -46,12 +141,14 @@ class ErrorAuditRepository:
 
     def __init__(
         self,
+        db: LandscapeConnectionProvider,
         ops: DatabaseOps,
         *,
         validation_error_loader: ValidationErrorLoader,
         transform_error_loader: TransformErrorLoader,
         ownership: RowTokenOwnership,
     ) -> None:
+        self._db = db
         self._ops = ops
         self._validation_error_loader = validation_error_loader
         self._transform_error_loader = transform_error_loader
@@ -59,13 +156,13 @@ class ErrorAuditRepository:
 
     def record_validation_error(
         self,
-        run_id: str,
         node_id: str | None,
         row_data: Any,
         error: str,
         schema_mode: str,
         destination: str,
         *,
+        coordination_token: CoordinationToken,
         row_id: str | None = None,
         contract_violation: ContractViolation | None = None,
     ) -> str:
@@ -87,6 +184,7 @@ class ErrorAuditRepository:
         Returns:
             error_id for tracking
         """
+        run_id = coordination_token.run_id
         error_id = f"verr_{generate_id()[:12]}"
 
         if row_id is not None:
@@ -118,41 +216,31 @@ class ErrorAuditRepository:
             expected_type = violation_record.expected_type
             actual_type = violation_record.actual_type
 
-        self._ops.execute_insert(
-            validation_errors_table.insert().values(
-                error_id=error_id,
-                run_id=run_id,
-                node_id=node_id,
-                row_id=row_id,
-                row_hash=row_hash,
-                row_data_json=row_data_json,
-                error=error,
-                schema_mode=schema_mode,
-                destination=destination,
-                created_at=now(),
-                violation_type=violation_type,
-                normalized_field_name=normalized_field_name,
-                original_field_name=original_field_name,
-                expected_type=expected_type,
-                actual_type=actual_type,
+        with fenced_leader_transaction(
+            self._db.engine, token=coordination_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="record_validation_error"
+        ) as conn:
+            self._ops.execute_insert_on(
+                conn,
+                validation_errors_table.insert().values(
+                    error_id=error_id,
+                    run_id=coordination_token.run_id,
+                    node_id=node_id,
+                    row_id=row_id,
+                    row_hash=row_hash,
+                    row_data_json=row_data_json,
+                    error=error,
+                    schema_mode=schema_mode,
+                    destination=destination,
+                    created_at=now(),
+                    violation_type=violation_type,
+                    normalized_field_name=normalized_field_name,
+                    original_field_name=original_field_name,
+                    expected_type=expected_type,
+                    actual_type=actual_type,
+                ),
             )
-        )
 
         return error_id
-
-    def link_validation_error_to_row(
-        self,
-        *,
-        run_id: str,
-        error_id: str,
-        row_id: str,
-    ) -> None:
-        """Attach a persisted quarantine row to an existing validation error."""
-        # The ownership reads, row lock, and NULL->row_id CAS are one write
-        # transaction.  Splitting the read and update allowed two same-run
-        # linkers to observe NULL and silently overwrite one another.
-        with self._ops.write_connection() as conn:
-            self.link_validation_error_to_row_on(conn, run_id=run_id, error_id=error_id, row_id=row_id)
 
     def link_validation_error_to_row_on(
         self,
@@ -227,6 +315,9 @@ class ErrorAuditRepository:
         row_data: Mapping[str, object] | PipelineRow,
         error_details: TransformErrorReason,
         destination: str,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> str:
         """Record a transform processing error in the audit trail.
 
@@ -252,21 +343,7 @@ class ErrorAuditRepository:
         # Validate token belongs to the specified run (Tier 1 invariant)
         self._ownership.validate_token_run_ownership(ref)
 
-        # Validate reason is a known TransformErrorCategory (Tier 1 write guard).
-        # TypedDict has zero runtime enforcement — the Literal annotation only
-        # helps at compile time. Invalid reasons must crash before persisting.
-        from typing import get_args
-
-        from elspeth.contracts.errors import TransformErrorCategory
-
-        reason = error_details["reason"]
-        valid_reasons = get_args(TransformErrorCategory)
-        if reason not in valid_reasons:
-            raise AuditIntegrityError(
-                f"Invalid TransformErrorCategory '{reason}' at Tier 1 write boundary. "
-                f"This is a plugin bug — transforms must use a valid error category. "
-                f"Valid categories: {sorted(valid_reasons)}"
-            )
+        _require_transform_error_category(error_details)
 
         error_id = f"terr_{generate_id()[:12]}"
 
@@ -284,19 +361,25 @@ class ErrorAuditRepository:
         row_hash = canonical_or_recorded_hash(row_data)
         row_data_json = canonical_or_recorded_json(row_data)
 
-        self._ops.execute_insert(
-            transform_errors_table.insert().values(
-                error_id=error_id,
-                run_id=ref.run_id,
-                token_id=ref.token_id,
-                transform_id=transform_id,
-                row_hash=row_hash,
-                row_data_json=row_data_json,
-                error_details_json=error_details_json,
-                destination=destination,
-                created_at=now(),
+        if ref.run_id != member_token.run_id or ref.token_id != work_item.token_id:
+            raise AuditIntegrityError("record_transform_error: token reference does not belong to the claimed work item")
+        with fenced_item_transaction(
+            self._db.engine, member_token=member_token, work_item=work_item, verb="record_transform_error"
+        ) as conn:
+            self._ops.execute_insert_on(
+                conn,
+                transform_errors_table.insert().values(
+                    error_id=error_id,
+                    run_id=member_token.run_id,
+                    token_id=ref.token_id,
+                    transform_id=transform_id,
+                    row_hash=row_hash,
+                    row_data_json=row_data_json,
+                    error_details_json=error_details_json,
+                    destination=destination,
+                    created_at=now(),
+                ),
             )
-        )
 
         return error_id
 

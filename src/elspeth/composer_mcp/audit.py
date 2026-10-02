@@ -168,7 +168,8 @@ class JsonlEventRecorder(ComposerToolRecorder):
 
         fsync after each batch — audit primacy: the dispatch must not
         report success to the LLM without the audit record durable on
-        disk. CLAUDE.md: "if it's not recorded, it didn't happen".
+        disk. See the logging-telemetry-policy skill §The Primacy Test:
+        audit always fires first, synchronously.
         """
         path = events_sidecar_path(self._dir, session_id)
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -14,7 +14,6 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import TokenInfo, TransformResult
-from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
@@ -33,7 +32,13 @@ from elspeth.engine.token_traversal import _TransformTerminal
 from elspeth.engine.work_items import WorkItem
 from elspeth.testing import make_contract, make_row, make_token_info
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import RecorderSetup, leader_coordination_token, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import (
+    RecorderSetup,
+    claim_test_work_item,
+    leader_coordination_token,
+    make_recorder_with_run,
+    register_test_node,
+)
 from tests.unit.engine.test_processor import (
     _make_factory,
     _make_mock_transform,
@@ -92,6 +97,18 @@ def _build(
     register_test_node(setup.data_flow, setup.run_id, COLLECTOR_NODE)
     clock = MockClock(start=1_750_000_000.0)
     leader = mode is ProcessorMode.LEADER
+    run = setup.run_lifecycle.get_run(setup.run_id)
+    assert run is not None
+    follower = (
+        None
+        if leader
+        else setup.factory.run_coordination.admit_follower(
+            run_id=setup.run_id,
+            worker_id="follower-1",
+            config_hash=run.config_hash,
+            window_seconds=80,
+        )
+    )
     if with_union_before_collector:
         register_test_node(setup.data_flow, setup.run_id, UNION_NODE)
         register_test_node(setup.data_flow, setup.run_id, AFTER_UNION)
@@ -127,9 +144,10 @@ def _build(
         traversal=traversal,
         group_bindings=group_bindings,
         scheduler=setup.factory.scheduler,
+        barrier_restore_reads=setup.factory.barrier_restore,
         scheduler_lease_owner=LEADER_OWNER if leader else "follower-1",
         coordination_token=leader_coordination_token(setup.factory, setup.run_id) if leader else None,
-        member_token=None if leader else WorkerMembershipToken(run_id=setup.run_id, worker_id="follower-1"),
+        member_token=follower,
         clock=clock,
         mode=mode,
         collector_executor=cast(Any, executor),
@@ -145,7 +163,7 @@ def _expand_member(setup: RecorderSetup, *, sequence: int) -> TokenInfo:
     from elspeth.contracts.audit import TokenRef
 
     row, parent = setup.data_flow.create_row_with_token(
-        run_id=setup.run_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         source_node_id=setup.source_node_id,
         row_index=sequence,
         data={"id": sequence},
@@ -154,6 +172,7 @@ def _expand_member(setup: RecorderSetup, *, sequence: int) -> TokenInfo:
     )
     contract = make_contract()
     [child], _group_id = setup.data_flow.expand_token(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
         parent_ref=TokenRef(token_id=parent.token_id, run_id=setup.run_id),
         row_id=row.row_id,
         child_payloads=[{"id": sequence}],
@@ -169,7 +188,9 @@ def _group_of(token: TokenInfo) -> str:
 
 
 def _ctx(setup: RecorderSetup) -> PluginContext:
-    return PluginContext(run_id=setup.run_id, config={}, landscape=None)
+    return PluginContext(
+        run_id=setup.run_id, config={}, landscape=None, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+    )
 
 
 class TestArrivalHoldIsTheDurableWriter:
@@ -207,8 +228,14 @@ class TestArrivalHoldIsTheDurableWriter:
         assert [(token_id, name) for token_id, name, _ctx in executor.accepted] == [(token.token_id, "stitch")]
         assert executor.accepted[0][2] is ctx
 
-    def test_follower_holds_without_a_stash_and_still_derives_the_compound_key(self) -> None:
-        """Verification obligation 3: the collector_executor is None path."""
+    def test_follower_records_the_arrival_under_the_compound_key(self) -> None:
+        """Verification obligation 3: the collector_executor is None path.
+
+        The follower records its arrival exactly as the leader does
+        (elspeth-5887fb7928 AC-R4): the drain persists the BLOCKED row's
+        barrier_key and held row from it, so the leader adopts the member as
+        it arrived, not as it was enqueued.
+        """
         processor, setup, _clock = _build(mode=ProcessorMode.FOLLOWER, executor=None)
         assert processor.collector_executor is None
         token = _expand_member(setup, sequence=2)
@@ -216,10 +243,35 @@ class TestArrivalHoldIsTheDurableWriter:
         handled, result = processor._maybe_collector_token(token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=STITCH)
 
         assert (handled, result) == (True, None)
-        assert processor._live_barrier_holds == {}
+        assert set(processor._live_barrier_holds) == {token.token_id}
+        hold = processor._live_barrier_holds[token.token_id]
+        assert hold.token is token
+        assert hold.barrier_key == collector_barrier_key("stitch", _group_of(token))
         item = WorkItem(token=token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=STITCH)
         assert processor._barrier_key_for_blocked_item(item) == collector_barrier_key("stitch", _group_of(token))
         assert processor._queue_key_for_blocked_item(item) is None
+
+    def test_follower_drain_persists_the_recorded_arrival_and_then_drops_it(self) -> None:
+        """No intake runs on a follower, so its drain consumes the recorded arrival.
+
+        The BLOCKED row carries the recorded barrier_key and the arriving row, and
+        the in-memory record is gone once that row is durable. Nothing else would
+        ever pop it on a follower.
+        """
+        processor, setup, _clock = _build(mode=ProcessorMode.FOLLOWER, executor=None)
+        token = _expand_member(setup, sequence=4)
+        item = WorkItem(token=token, current_node_id=NodeID(COLLECTOR_NODE), collector_name=STITCH)
+        ctx = PluginContext(run_id=setup.run_id, config={}, landscape=None, member_token=processor._member_token)
+
+        results = processor._drain_durable_work_queue(item, ctx)
+
+        assert results == []
+        assert processor._live_barrier_holds == {}
+        blocked = setup.factory.scheduler.list_blocked_barrier_items(run_id=setup.run_id)
+        assert [(row.token_id, row.barrier_key, row.barrier_adopted_epoch) for row in blocked] == [
+            (token.token_id, collector_barrier_key("stitch", _group_of(token)), None),
+        ]
+        assert blocked[0].row_payload_json == setup.factory.scheduler.serialize_row_payload(token.row_data)
 
     def test_arrival_elsewhere_is_not_a_collector_hold(self) -> None:
         processor, setup, _clock = _build(mode=ProcessorMode.LEADER, executor=_HoldingCollectorExecutor())
@@ -234,10 +286,24 @@ class TestArrivalHoldIsTheDurableWriter:
         # A REAL fork child (minted FORK frame): the walk finds a non-release
         # frame that is not EXPAND and refuses.
         row, parent = setup.data_flow.create_row_with_token(
-            run_id=setup.run_id, source_node_id=setup.source_node_id, row_index=9, data={"id": 9}, source_row_index=9, ingest_sequence=9
+            coordination_token=leader_coordination_token(setup.factory, setup.run_id),
+            source_node_id=setup.source_node_id,
+            row_index=9,
+            data={"id": 9},
+            source_row_index=9,
+            ingest_sequence=9,
         )
         [branch, _other], _fg = setup.data_flow.fork_token(
-            parent_ref=TokenRef(token_id=parent.token_id, run_id=setup.run_id), row_id=row.row_id, branches=["a", "b"]
+            member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
+            work_item=claim_test_work_item(
+                setup.factory,
+                member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
+                token_id=parent.token_id,
+                node_id=COLLECTOR_NODE,
+            ),
+            parent_ref=TokenRef(token_id=parent.token_id, run_id=setup.run_id),
+            row_id=row.row_id,
+            branches=["a", "b"],
         )
         token = make_token_info(row_id=row.row_id, token_id=branch.token_id, data={"id": 9}, lineage_path=branch.lineage_path)
         with pytest.raises(OrchestrationInvariantError, match="without an innermost EXPAND frame"):
@@ -291,12 +357,15 @@ class TestOpenerChildrenCarryTheCollectorCursor:
             outcome = processor._handle_transform_node(
                 transform=transform,
                 current_token=token,
-                ctx=make_context(),
+                ctx=make_context(
+                    run_id="test-run", landscape=factory.data_flow, coordination_token=leader_coordination_token(factory, "test-run")
+                ),
                 node_id=opener_node,
                 child_items=child_items,
                 coalesce_node_id=None,
                 coalesce_name=None,
                 current_on_success_sink="default",
+                attempt_offset=0,
             )
 
         assert isinstance(outcome, _TransformTerminal)
@@ -405,8 +474,14 @@ class TestReleaseCursorWalk:
 
     @staticmethod
     def _seed_root(factory: Any, *, run_id: str = "test-run") -> tuple[str, str]:
-        row = factory.data_flow.create_row(run_id, "source-0", 1, {"seed": 1}, source_row_index=1, ingest_sequence=1)
-        root = factory.data_flow.create_token(row_id=row.row_id)
+        row, root = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run_id),
+            source_node_id="source-0",
+            row_index=1,
+            data={"seed": 1},
+            source_row_index=1,
+            ingest_sequence=1,
+        )
         return row.row_id, root.token_id
 
     @staticmethod
@@ -418,12 +493,14 @@ class TestReleaseCursorWalk:
 
         contract = make_contract()
         children, scope_gid = factory.data_flow.expand_token(
+            member_token=leader_coordination_token(factory, run_id).membership,
             parent_ref=TokenRef(token_id=scope_parent_id, run_id=run_id),
             row_id=row_id,
             child_payloads=[{"v": 1}],
             output_contract=contract,
         )
         committed = factory.data_flow.collect_tokens(
+            coordination_token=leader_coordination_token(factory, run_id),
             member_refs=[TokenRef(token_id=children[0].token_id, run_id=run_id)],
             group_id=scope_gid,
             collector_node_id=COLLECTOR_NODE,
@@ -445,7 +522,15 @@ class TestReleaseCursorWalk:
             group_bindings=self._registry(),
         )
         row_id, root_id = self._seed_root(factory)
-        forked, _fork_gid = factory.data_flow.fork_token(TokenRef(token_id=root_id, run_id="test-run"), row_id, ["path_a", "path_b"])
+        forked, _fork_gid = factory.data_flow.fork_token(
+            TokenRef(token_id=root_id, run_id="test-run"),
+            row_id,
+            ["path_a", "path_b"],
+            member_token=leader_coordination_token(factory, "test-run").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "test-run").membership, token_id=root_id, node_id="source-0"
+            ),
+        )
         release = self._collect_release(factory, scope_parent_id=forked[0].token_id, row_id=row_id)
 
         # The release's innermost frame is its OWN release-group frame — the
@@ -462,6 +547,7 @@ class TestReleaseCursorWalk:
         from elspeth.contracts.audit import TokenRef
 
         outer_members, outer_gid = factory.data_flow.expand_token(
+            member_token=leader_coordination_token(factory, "test-run").membership,
             parent_ref=TokenRef(token_id=root_id, run_id="test-run"),
             row_id=row_id,
             child_payloads=[{"page": 1}],
@@ -484,6 +570,7 @@ class TestReleaseCursorWalk:
         processor = _make_processor(factory, group_bindings=registry)
         row_id, root_id = self._seed_root(factory)
         outer_members, outer_gid = factory.data_flow.expand_token(
+            member_token=leader_coordination_token(factory, "test-run").membership,
             parent_ref=TokenRef(token_id=root_id, run_id="test-run"),
             row_id=row_id,
             child_payloads=[{"page": 1}],
@@ -491,7 +578,16 @@ class TestReleaseCursorWalk:
         )
         registry.register_expand_group(outer_gid, opener_name="outer_explode")
         forked, _fork_gid = factory.data_flow.fork_token(
-            TokenRef(token_id=outer_members[0].token_id, run_id="test-run"), row_id, ["path_x", "path_y"]
+            TokenRef(token_id=outer_members[0].token_id, run_id="test-run"),
+            row_id,
+            ["path_x", "path_y"],
+            member_token=leader_coordination_token(factory, "test-run").membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, "test-run").membership,
+                token_id=outer_members[0].token_id,
+                node_id="source-0",
+            ),
         )
         release = self._collect_release(factory, scope_parent_id=forked[0].token_id, row_id=row_id)
 
@@ -592,7 +688,9 @@ class TestNestedReleaseCursor:
                 consumed_tokens=(),
                 merged_token=merged,
                 coalesce_node_id=NodeID("coalesce::merge"),
-                ctx=make_context(),
+                ctx=make_context(
+                    run_id="test-run", landscape=factory.data_flow, coordination_token=leader_coordination_token(factory, "test-run")
+                ),
             )
         [item] = captured
         if in_scope:
@@ -608,8 +706,6 @@ class TestNestedReleaseCursor:
         """The coordinator's fire path consumes the processor's derivation:
         the READY emission written by complete_barrier carries the collector
         cursor for an in-scope merge."""
-        from types import SimpleNamespace
-
         from elspeth.engine.coalesce_executor import CoalesceOutcome
 
         _db, factory = _make_factory()
@@ -618,11 +714,8 @@ class TestNestedReleaseCursor:
         _persist_token_for_scheduler(factory, merged)
         outcome = CoalesceOutcome(held=False, merged_token=merged, consumed_tokens=(), coalesce_name="merge", join_group_id="jg-1")
         emitted: list[Any] = []
-        with (
-            patch.object(processor, "_require_coordination_token", return_value=SimpleNamespace(worker_id="leader", epoch=1)),
-            patch.object(
-                processor._scheduler, "complete_barrier", side_effect=lambda **kwargs: emitted.extend(kwargs["emitted_ready"]) or 0
-            ),
+        with patch.object(
+            processor._scheduler, "complete_barrier", side_effect=lambda **kwargs: emitted.extend(kwargs["emitted_ready"]) or 0
         ):
             disposition = processor._barrier_intake._fire_coalesce_merge(CoalesceName("merge"), outcome, scope_row_id="row-1")
         assert disposition.child_items[0].collector_name == CollectorName("outer_stitch")
@@ -643,7 +736,9 @@ class TestCollectorCursorLookup:
         with pytest.raises(AuditIntegrityError, match="cursor names collector 'ghost'"):
             processor.route_collector_release(collector_name=CollectorName("ghost"), released_tokens=(token,))
         with pytest.raises(AuditIntegrityError, match="cursor names collector 'ghost'"):
-            processor._process_single_token(token, _ctx(setup), NodeID(COLLECTOR_NODE), collector_name=CollectorName("ghost"))
+            processor._process_single_token(
+                token, _ctx(setup), NodeID(COLLECTOR_NODE), collector_name=CollectorName("ghost"), attempt_offset=0
+            )
 
 
 class TestDepthTwoReleaseHoldsAtTheCollector:

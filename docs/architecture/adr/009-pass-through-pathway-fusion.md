@@ -12,6 +12,84 @@
 > Normative in this ADR: all four Clauses for `passes_through_input`.
 > Extended: §Clause 4 invariant-harness design now covers ALL registered contracts via the ADR-010 `negative_example` requirement, not only `passes_through_input`.
 
+> **Amended by [ADR-012](012-can-drop-rows-contract.md) on 2026-04-20.**
+> §Clause 3's empty-emission carve-out is retired mechanically, not only in
+> documentation. `verify_pass_through`
+> (`src/elspeth/engine/executors/pass_through.py`) no longer treats zero
+> emission as an unconditional no-op: measured 2026-09-11, an empty emission
+> returns early only when the transform declares `can_drop_rows=True` or there
+> were no input fields to preserve, and otherwise raises
+> `PassThroughContractViolation` (ADR-012 §Clause-3 retirement). The `can_drop_rows`
+> declaration that §Clause 3 and §Negative Consequences forward-reference as
+> Track 2 work is delivered by ADR-012's `CanDropRowsContract`; zero-emission
+> governance is owned there, not by the carve-out recorded below.
+
+> **Implementation note (2026-09-26, elspeth-5887fb7928 S4).** §Batch-mode
+> semantics below says "buffered input contracts" and "input token's contract
+> fields". Both batch modes now derive each buffered token's input fields with
+> `derive_effective_input_fields`, the helper the single-token path has used
+> since `08b6d4e27`: the fields the token's contract declares AND its payload
+> carries. Before this note the flush site read the contract alone, so a
+> batch mixing rows with and without an optional field (the source records it
+> `required: false`) counted that field as an input of the row that lacked
+> it. `batch_replicate` then aborted the run with a Tier-1
+> `PassThroughContractViolation` for a field it never received.
+> What the check still catches: a dropped field that every emitting buffered
+> row carried (TRANSFORM mode) or that the paired row carried (PASSTHROUGH
+> mode) raises, required or optional.
+> In TRANSFORM mode the check is the intersection over the inputs that
+> produced output (inputs the plugin quarantined in-batch are excluded, since
+> they emit nothing and are recorded FAILURE); a field carried by only some of
+> those inputs is outside it, and a drop of it passes this site. Detecting that
+> needs output→input attribution, which §Alternatives #2 rejected. It affects
+> only fields no declaration names (source-inferred, `required: false`);
+> declared fields, optional ones included, are present on every row and stay
+> checked, and no guarantee propagated through `passes_through_input` covers a
+> gap field.
+> The exclusion is engine-side: the flush cross-check validates the plugin's
+> `quarantined_indices` once (`validated_quarantined_indices`) and routing
+> consumes the same set. Before it, a quarantined input lacking a field shrank
+> the intersection, so a plugin could strip that field from every output
+> although every emitting input carried it (measured with `batch_replicate`:
+> exit 1, `tag` gone from both outputs; now exit 4,
+> `PassThroughContractViolation`). A non-empty emission with every input
+> quarantined raises `OrchestrationInvariantError`; a zero-row emission keeps
+> the intersection over every buffered input (`can_drop_rows` governs it). The
+> resume re-check of a committed aggregation output applies the same rule.
+> The quarantine set has to be validated before the declaration dispatch,
+> because the intersection is computed over it. Its two contradictions
+> (malformed `quarantined_indices`, and a non-empty emission with every input
+> quarantined) therefore pre-empt any declaration violation in the same
+> output. Both raise `BatchQuarantineContradictionError`, an
+> `AuditEvidenceBase` subclass of the Tier-1 `OrchestrationInvariantError`.
+> As with a declaration violation at this site, every buffered token is first
+> recorded FAILURE / UNROUTED with its value-free `to_audit_dict` (kind,
+> identities and counts, never the metadata). The resume re-check records
+> nothing.
+> 2026-09-27: the PASSTHROUGH shape is checked at the same site, before the
+> per-pair dispatch: a `success_multi` of exactly one row per buffered token
+> (or of none) and no `quarantined_indices`. Build admits a PASSTHROUGH
+> aggregation only for a plugin declaring
+> `flush_emits_one_row_per_buffered_row`, so any other shape is that plugin
+> breaking its declaration. It raises `BatchPassthroughShapeError`, recorded
+> on every buffered token the same way; routing no longer re-checks the count.
+> A union-existence check (every field some input carried must appear on some
+> output) was prototyped and not adopted. Taken over every buffered input it
+> has a measured Tier-1 false positive: an honest `batch_replicate` run aborts
+> (exit 4) when a field's only carrier is quarantined in-batch. Excluding
+> quarantined inputs removes that case, but the check still misses partial
+> drops and adds an obligation nothing declares (every non-quarantined input
+> yields at least one output), which a legitimate N→fewer pass-through
+> transform would trip. For `batch_replicate`, preservation of a field only
+> some rows carry is pinned by exact-row tests
+> (`tests/integration/pipeline/test_pass_through_flush_optional_field.py`,
+> `test_mixed_batch_keeps_the_optional_copies_field_optional`), not by this
+> check or the Clause 4 harness, which drives single-row batches.
+> Under the contract-only derivation the partial-carrier shape raised only
+> through the same path that aborted every honest mixed batch. Read
+> §Batch-mode semantics' "must preserve what every input contributed" as
+> "must preserve every field that every emitting buffered input carried".
+
 ## Context
 
 ADR-007 (pass-through contract propagation) and ADR-008 (runtime contract cross-check) shipped as a partial landing. Two limitations were documented at landing time and are now closed:
@@ -54,9 +132,9 @@ Invoked from two sites:
 **Batch-mode semantics.** Two output modes require distinct handling:
 
 - **`OutputMode.TRANSFORM` (batch-homogeneous intersection).** `input_fields` is the intersection of all buffered input contracts (ADR-007 table line 53). Every emitted row must preserve the intersection — the weakest shared guarantee across the batch. A transform claiming `passes_through_input=True` must preserve what every input contributed.
-- **`OutputMode.PASSTHROUGH` (1:1 pairing).** Tokens are 1:1 with outputs (routing enforces the count match). Each `(input_token, output_row)` pair is checked independently using that specific input token's contract fields. Using the batch intersection for passthrough would create a correctness hole on heterogeneous batches — a field present on only one input token could be silently dropped on its corresponding output token.
+- **`OutputMode.PASSTHROUGH` (1:1 pairing).** Tokens are 1:1 with outputs (the cross-check enforces the shape first; see the 2026-09-27 note). Each `(input_token, output_row)` pair is checked independently using that specific input token's contract fields. Using the batch intersection for passthrough would create a correctness hole on heterogeneous batches — a field present on only one input token could be silently dropped on its corresponding output token.
 
-**Call-site placement (critical).** `_cross_check_flush_output` MUST run BEFORE `_emit_transform_completed` and the `_route_*` methods. A failed cross-check must not follow a COMPLETED (telemetry) or CONSUMED_IN_BATCH (Landscape) terminal-state emission on any token, or the audit trail would contain both terminal states for the same token — violating CLAUDE.md's "every row reaches exactly one terminal state" invariant.
+**Call-site placement (critical).** `_cross_check_flush_output` MUST run BEFORE `_emit_transform_completed` and the `_route_*` methods. A failed cross-check must not follow a COMPLETED (telemetry) or CONSUMED_IN_BATCH (Landscape) terminal-state emission on any token, or the audit trail would contain both terminal states for the same token — violating the "every row reaches exactly one terminal state" invariant (stated over tokens at docs/contracts/system-operations.md §Complete Token State Diagram: "Every token reaches exactly one terminal state — no silent drops.").
 
 **Violation recording.** On `PassThroughContractViolation`, `_record_flush_violation` writes per-token FAILED audit entries for every buffered token. The per-token context payload is rebuilt inside the loop so `$.context.token_id` matches each row's own token, not the triggering token's — triage queries of the form `WHERE exception_type = 'PassThroughContractViolation'` expect every affected token to resolve to its own identifier.
 
@@ -68,13 +146,13 @@ Invoked from two sites:
 
 **Track 2 SLA trigger.** The carve-out is not semantically airtight: a filter that always emits zero rows can carry the annotation without ever being checked. Track 2 will introduce a separate `can_drop_rows: bool = False` declaration; transforms with `can_drop_rows=False` emitting zero rows will raise a new `UnexpectedEmptyEmission` violation. Track 1 does not ship `can_drop_rows` — the declaration is part of a wider framework pattern that deserves its own ADR with multiple concrete declarations to inform its shape.
 
-**Hard trigger:** Track 2's `can_drop_rows` declaration MUST land within 90 days of Track 1 merge, OR upon registration of a second `passes_through_input=True` transform with external-call dependencies (LLM, HTTP, DB), whichever is sooner. File the trigger as a filigree dependency on the Track 2 epic; the Eroding Goals risk is real and the SLA is the safeguard.
+**Hard trigger:** Track 2's `can_drop_rows` declaration MUST land within 90 days of Track 1 merge, OR upon registration of a second `passes_through_input=True` transform with external-call dependencies (LLM, HTTP, DB), whichever is sooner. File the trigger as a legacy issue tracker dependency on the Track 2 epic; the Eroding Goals risk is real and the SLA is the safeguard.
 
 ### Clause 4 — Invariant harness (delivers ADR-007 §Neutral Consequences line 83)
 
 `tests/invariants/` is the governance home for declarative-annotation tests. Forward invariant (`test_annotated_transforms_preserve_input_fields`) discovers every registered `passes_through_input=True` transform and asserts on Hypothesis-generated probe rows that every emitted row preserves every input field. Backward invariant (`test_non_pass_through_transforms_do_drop_fields`) fails CI when a non-annotated transform that opted into probing (i.e., implements `probe_config()`) preserves every input field across 15 scalar probes — remediation is either adding the annotation or teaching `probe_config()` to return a shape that exercises the drop path. Non-annotated transforms without `probe_config()` are skipped: the backward invariant only gates transforms that explicitly opted into probing.
 
-Side-effectful governance channels (e.g., firing filigree observations from pytest) are rejected: pytest's contract is pass/fail, and a shell-out to a best-effort CLI suppresses errors behind `check=False` — the "diagnostic, does not fail CI" design documented in an earlier draft of this ADR was governance theatre the harness would never actually exercise. Converting the backward invariant to a hard failure gives it real teeth without creating false positives on the currently-registered plugin set (no non-annotated transform implements `probe_config()` today, so the failure fires only on deliberate future declarations).
+Side-effectful governance channels (e.g., firing legacy issue tracker observations from pytest) are rejected: pytest's contract is pass/fail, and a shell-out to a best-effort CLI suppresses errors behind `check=False` — the "diagnostic, does not fail CI" design documented in an earlier draft of this ADR was governance theatre the harness would never actually exercise. Converting the backward invariant to a hard failure gives it real teeth without creating false positives on the currently-registered plugin set (no non-annotated transform implements `probe_config()` today, so the failure fires only on deliberate future declarations).
 
 Probe instantiation uses a new `BaseTransform.probe_config()` classmethod. Every `passes_through_input=True` transform MUST implement `probe_config()` to declare how it should be instantiated in isolation. A companion `test_harness_skip_rate_budget` asserts `skip_rate ≤ 25%` across the annotated plugin set; Track 2 additions that slip the budget must implement `probe_config()` rather than raising the threshold.
 
@@ -96,7 +174,7 @@ Probe instantiation uses a new `BaseTransform.probe_config()` classmethod. Every
 
 **Neutral:**
 
-- Filigree observations with 14-day TTL are the governance channel for backward-invariant signals. Named owner must be specified in the filigree issue when an observation is promoted.
+- legacy issue tracker observations with 14-day TTL are the governance channel for backward-invariant signals. Named owner must be specified in the legacy issue tracker issue when an observation is promoted.
 - `pytest.skip` for unprobeable transforms is bounded by the skip-rate budget test; coverage gaps surface loudly.
 
 ## Alternatives Considered
@@ -112,5 +190,5 @@ Probe instantiation uses a new `BaseTransform.probe_config()` classmethod. Every
 - [ADR-007: Pass-through contract propagation](007-pass-through-contract-propagation.md) — amended by this ADR § Clauses 1, 3, 4.
 - [ADR-008: Runtime contract cross-check](008-runtime-contract-cross-check.md) — amended by this ADR § Clause 2.
 - Track 2 declaration-framework epic: `elspeth-300abf520d`; see ADR-010.
-- CLAUDE.md §Three-Tier Trust Model, §Plugin Ownership, §"No Legacy Code Policy".
+- docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model, §Plugin Ownership: System Code, Not User Code; CONTRIBUTING.md §Code Standards (no legacy shims or backwards compatibility).
 - Implementation and regression evidence: commits `2ba34c2b6` and `09fad40f9`.

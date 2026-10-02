@@ -111,6 +111,8 @@ class TestRunLoader:
             "settings_json": "{}",
             "canonical_version": "v2",
             "status": "running",
+            "run_mode": "live",
+            "replay_from_run_id": None,
             "completed_at": None,
             "reproducibility_grade": None,
             "export_status": None,
@@ -254,7 +256,6 @@ class TestNodeLoader:
             "config_hash": "cfg123",
             "config_json": "{}",
             "registered_at": NOW,
-            "schema_hash": None,
             "sequence_in_pipeline": 0,
             "schema_mode": None,
             "schema_fields_json": None,
@@ -267,7 +268,6 @@ class TestNodeLoader:
         sa_row = self._make_node_row(
             node_type="transform",
             determinism="non_deterministic",
-            schema_hash="sch123",
             sequence_in_pipeline=3,
             schema_mode="fixed",
             schema_fields_json=json.dumps(schema_fields),
@@ -278,7 +278,6 @@ class TestNodeLoader:
         assert isinstance(result, Node)
         assert result.node_type == NodeType.TRANSFORM
         assert result.determinism == Determinism.NON_DETERMINISTIC
-        assert result.schema_hash == "sch123"
         assert result.sequence_in_pipeline == 3
         assert result.schema_mode == "fixed"
         assert result.schema_fields == tuple(schema_fields)
@@ -432,6 +431,7 @@ class TestRowLoader:
             "source_data_hash": "hash123",
             "created_at": NOW,
             "source_data_ref": "ref://payload/abc",
+            "source_contract_json": "{}",
         }
         defaults.update(overrides)
         return _make_sa_row(**defaults)
@@ -448,6 +448,7 @@ class TestRowLoader:
         assert result.ingest_sequence == 17
         assert result.source_data_hash == "hash123"
         assert result.source_data_ref == "ref://payload/abc"
+        assert result.source_contract_json == "{}"
 
     def test_valid_load_with_none_ref(self) -> None:
         sa_row = self._make_row_row(source_data_ref=None)
@@ -580,9 +581,14 @@ class TestCallLoader:
             "request_ref": None,
             "response_hash": None,
             "response_ref": None,
+            "source_call_id": None,
             "error_json": None,
             "latency_ms": None,
-            "resolved_prompt_template_hash": None,
+            "approved_prompt_artifact_hash": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "cached_prompt_tokens": None,
+            "reasoning_tokens": None,
         }
         defaults.update(overrides)
         return _make_sa_row(**defaults)
@@ -598,12 +604,18 @@ class TestCallLoader:
         assert result.state_id == "state-1"
         assert result.operation_id is None
 
-    def test_maps_resolved_prompt_template_hash(self) -> None:
+    def test_maps_approved_prompt_artifact_hash(self) -> None:
         """CallLoader must carry the cross-DB prompt-hash anchor (elspeth-543ee35ed3)."""
         digest = "a" * 64
-        sa_row = self._make_call_row(call_type="llm", resolved_prompt_template_hash=digest)
+        sa_row = self._make_call_row(call_type="llm", approved_prompt_artifact_hash=digest)
         result = CallLoader().load(sa_row)
-        assert result.resolved_prompt_template_hash == digest
+        assert result.approved_prompt_artifact_hash == digest
+
+    @pytest.mark.parametrize("field", ["prompt_tokens", "completion_tokens", "cached_prompt_tokens", "reasoning_tokens"])
+    @pytest.mark.parametrize("value", [-1, True, "3", 1.5])
+    def test_rejects_corrupt_persisted_usage(self, field: str, value: object) -> None:
+        with pytest.raises((TypeError, ValueError)):
+            CallLoader().load(self._make_call_row(**{field: value}))
 
     def test_valid_load_operation_parented(self) -> None:
         sa_row = self._make_call_row(
@@ -858,10 +870,13 @@ class TestNodeStateLoader:
 
         load_source = inspect.getsource(NodeStateLoader.load)
         complete_source = inspect.getsource(NodeStateRepository.complete_node_state)
+        completion_writer_source = inspect.getsource(NodeStateRepository.complete_node_state_on)
 
         assert "validate_node_state_persisted_fields" in load_source
-        assert "validate_node_state_completion_fields" in complete_source
+        assert "self.complete_node_state_on(" in complete_source
+        assert "validate_node_state_completion_fields" in completion_writer_source
         assert "mirror" not in complete_source.lower()
+        assert "mirror" not in completion_writer_source.lower()
 
     # === OPEN variant ===
 
@@ -1674,6 +1689,7 @@ class TestOperationLoader:
             "run_id": "run-1",
             "node_id": "node-1",
             "operation_type": "source_load",
+            "occurrence_index": None,
             "sink_effect_id": None,
             "started_at": NOW,
             "status": "open",

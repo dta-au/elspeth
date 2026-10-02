@@ -31,14 +31,14 @@ guesses a schema from record shape or silently falls back to a current catalog.
 ## Assessment sequence
 
 1. Fix the code baseline and capture the complete worktree identity.
-2. Verify Loomweave freshness and record structural-query limitations.
+2. Inspect the assessed source tree and record structural-query limitations.
 3. Load the exact catalog version and verify all 73 legs are present.
 4. Discover production writers, callers, read models, external-effect
    boundaries, and cross-transaction seams.
-5. Reconcile live Filigree issues without treating issue closure as proof.
+5. Reconcile live GitHub Issues without treating issue closure as proof.
 6. Execute evidence from production boundary inward.
 7. Attach evidence only to the cases its assertions establish.
-8. Classify remaining cases and create or update Filigree issues for coherent
+8. Classify remaining cases and create or update GitHub Issues for coherent
    actionable gap themes, not one issue per unknown cell.
 9. Run independent architecture, evidence, and future-agent reviews.
 10. Resolve material findings, rerun affected evidence, and publish the new

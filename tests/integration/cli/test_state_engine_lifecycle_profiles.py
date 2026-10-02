@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock, create_autospec
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -21,8 +21,11 @@ from typer.testing import CliRunner
 
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import FrameworkBugError, RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.core.config import RateLimitSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -42,13 +45,15 @@ from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.plugins.sinks.json_sink import JSONSink
 from elspeth.plugins.transforms.passthrough import PassThrough
+from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, WebPluginPolicy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-from elspeth.web.sessions.protocol import CompositionStateRecord, SessionServiceProtocol
+from elspeth.web.sessions.protocol import CompositionStateRecord
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.e2e.recovery.test_follower_join_and_drain import (
     _GUARD_LIVE_SEAT_WINDOW_SECONDS,
@@ -57,7 +62,7 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seed_real_follower_ready_item,
     _work_item,
 )
-from tests.helpers.session_fences import execute_lease
+from tests.helpers.web_cli_profile import create_profile_session
 
 if TYPE_CHECKING:
     from scripts.state_engine_profile_reporter import RuntimeProfileReporter
@@ -184,28 +189,15 @@ payload_store:
         composer_meta=None,
     )
 
-    session_service = create_autospec(SessionServiceProtocol, instance=True)
-    session_service.get_active_run.return_value = None
-    session_service.get_current_state.return_value = state_record
-    session_service.create_run.return_value = SimpleNamespace(id=run_uuid)
-    session_service.get_run.return_value = SimpleNamespace(status="running", session_id=session_id)
-    session_service.update_run_status.return_value = None
-    event_sequence = 0
-
-    async def append_run_event(**_kwargs: Any) -> SimpleNamespace:
-        nonlocal event_sequence
-        event_sequence += 1
-        return SimpleNamespace(sequence=event_sequence)
-
-    session_service.append_run_event.side_effect = append_run_event
-
     web_settings = SimpleNamespace(
         deployment_target="default",
         deployment_state_mode="sqlite-single",
+        workflow_governance="off",
         landscape_url=settings.landscape.url,
         landscape_passphrase=None,
         payload_store_path=settings.payload_store.base_path,
         data_dir=tmp_path,
+        execution_rate_limit=RateLimitSettings(),
         get_landscape_url=lambda: settings.landscape.url,
         get_payload_store_path=lambda: settings.payload_store.base_path,
         get_session_db_url=lambda: f"sqlite:///{tmp_path / 'sessions.db'}",
@@ -213,6 +205,13 @@ payload_store:
     )
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    session_engine, session_service, session_id = await create_profile_session(
+        tmp_path,
+        state=state_record,
+        run_id=run_uuid,
+        snapshot=snapshot,
+        user_id="task10-web-user",
+    )
     web_policy = WebPluginPolicy(
         schema_version=1,
         required=snapshot.available,
@@ -221,6 +220,7 @@ payload_store:
         preferences=(),
         control_modes=snapshot.control_modes,
         plugin_code_identities=(),
+        power_automate_allowed_origins=snapshot.power_automate_allowed_origins,
         policy_hash=snapshot.policy_hash,
     )
     loop = asyncio.get_running_loop()
@@ -296,11 +296,12 @@ payload_store:
     def pause_leader_before_second_claim(
         self: TokenSchedulerRepository,
         *,
-        run_id: str,
+        member_token: WorkerMembershipToken,
         lease_owner: str,
         lease_seconds: int,
     ) -> Any:
         nonlocal leader_thread_id
+        run_id = member_token.run_id
         with self._engine.connect() as conn:
             role = conn.execute(
                 select(run_workers_table.c.role).where(
@@ -323,7 +324,7 @@ payload_store:
             assert leader_release.wait(30), "web leader was never released after follower hand-off"
         return real_claim_ready(
             self,
-            run_id=run_id,
+            member_token=member_token,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
         )
@@ -340,14 +341,16 @@ payload_store:
 
     monkeypatch.setattr(service._executor, "submit", capture_submit)
 
-    # ``execute`` takes an exact EXECUTE lease and the run keeps reproving it
-    # from its worker threads until the leader's future resolves, so the lease
-    # is held on an exit stack and released with the service in the cleanup
-    # block below. The helper acquires through ``SessionOperationLease.acquire``
-    # over a recording authority; the session service here is an autospec and
-    # mints no authority of its own.
+    # The leader and session writes share the real durable EXECUTE authority.
     lease_stack = contextlib.AsyncExitStack()
-    session_operation_lease = await lease_stack.enter_async_context(execute_lease(session_id, lease_seconds=120))
+    session_operation_lease = await SessionOperationLease.acquire(
+        session_service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        lease_seconds=300,
+    )
+    lease_stack.push_async_callback(session_operation_lease.close)
     try:
         launched_run_id = await service.execute(
             session_id,
@@ -358,7 +361,7 @@ payload_store:
         run_id = str(launched_run_id)
         assert launched_run_id == run_uuid
         assert len(submitted) == 1
-        assert await asyncio.to_thread(leader_blocked.wait, 10), "ExecutionService leader never paused before a fork-branch claim"
+        assert await run_sync_in_worker(leader_blocked.wait, 10), "ExecutionService leader never paused before a fork-branch claim"
 
         db = LandscapeDB.from_url(settings.landscape.url)
     except BaseException:
@@ -389,14 +392,14 @@ payload_store:
             output_b_path: output_b_path.read_bytes() if output_b_path.exists() else b"",
         }
         cli_task = asyncio.create_task(
-            asyncio.to_thread(
+            run_sync_in_worker(
                 CliRunner().invoke,
                 app,
                 [
                     "join",
                     run_id,
                     "--settings",
-                    str(settings_path),
+                    str(session_service.profile_settings_path),
                     "--database",
                     str(tmp_path / "real-follower-audit.db"),
                     "--format",
@@ -583,22 +586,15 @@ payload_store:
         assert [json.loads(line) for line in output_a_path.read_text(encoding="utf-8").splitlines()] == [{"id": 1, "value": 10}]
         assert [json.loads(line) for line in output_b_path.read_text(encoding="utf-8").splitlines()] == [{"id": 1, "value": 10}]
 
-        status_calls = [call.kwargs for call in session_service.update_run_status.await_args_list]
-        assert [call["status"] for call in status_calls] == ["running", "completed"]
-        # Every status write is fenced by the exact context the EXECUTE lease
-        # minted at launch, so a run can never report completion under
-        # someone else's authority.
-        assert status_calls[-1] == {
-            "status": "completed",
-            "error": None,
-            "rows_processed": 1,
-            "rows_succeeded": 2,
-            "rows_failed": 0,
-            "rows_routed_success": 0,
-            "rows_routed_failure": 0,
-            "rows_quarantined": 0,
-            "session_operation_context": session_operation_lease.context,
-        }
+        persisted_run = await session_service.get_run(run_uuid)
+        assert persisted_run.status == "completed"
+        assert persisted_run.error is None
+        assert persisted_run.rows_processed == 1
+        assert persisted_run.rows_succeeded == 2
+        assert persisted_run.rows_failed == 0
+        assert persisted_run.rows_routed_success == 0
+        assert persisted_run.rows_routed_failure == 0
+        assert persisted_run.rows_quarantined == 0
 
         if request.config.pluginmanager.hasplugin("scripts.state_engine_profile_reporter"):
             reporter = cast("RuntimeProfileReporter", request.getfixturevalue("state_engine_profile"))
@@ -619,6 +615,7 @@ payload_store:
         await service.shutdown()
         db.close()
         await lease_stack.aclose()
+        session_engine.dispose()
 
 
 @pytest.mark.timeout(120)
@@ -651,6 +648,13 @@ transforms:
     result = Orchestrator(db).run(config, graph=graph, settings=settings, payload_store=payload_store)
     run_id = result.run_id
     factory = RecorderFactory(db, payload_store=payload_store)
+    with db.engine.begin() as conn:
+        conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value, completed_at=None))
+    factory.run_coordination.acquire_run_leadership(
+        run_id=run_id,
+        worker_id=f"worker:{run_id}:exceptional-leader",
+        window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+    )
     target_node_id = graph.get_next_node(graph.get_sources()[0])
     assert target_node_id is not None
     token_id = _seed_real_follower_ready_item(
@@ -660,13 +664,6 @@ transforms:
         row_data={"id": 5, "value": 50},
         target_node_id=str(target_node_id),
         target_step_index=graph.get_node_step_map()[target_node_id],
-    )
-    with db.engine.begin() as conn:
-        conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value, completed_at=None))
-    factory.run_coordination.acquire_run_leadership(
-        run_id=run_id,
-        worker_id=f"worker:{run_id}:exceptional-leader",
-        window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
     )
 
     lifecycle: list[str] = []

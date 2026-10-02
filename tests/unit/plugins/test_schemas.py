@@ -315,14 +315,15 @@ class TestSchemaCompatibility:
         assert "Type mismatches" in error
         assert "Extra fields forbidden" in error
 
-    def test_strict_schema_rejects_int_to_float_coercion(self) -> None:
-        """Strict schemas should reject int->float coercion.
+    def test_strict_schema_admits_an_int_for_a_float(self) -> None:
+        """A strict consumer's ``float`` is satisfied by an ``int`` producer (ruling C3, 2026-09-25).
 
-        Bug: P2-2026-01-31-schema-compatibility-ignores-strictness
-
-        Per Data Manifesto: transforms/sinks with strict=True must NOT coerce.
-        When consumer has strict=True, int->float should be rejected at DAG
-        construction time, not allowed to fail at runtime.
+        P2-2026-01-31-schema-compatibility-ignores-strictness pinned the
+        opposite (a strict consumer refuses int -> float at DAG construction).
+        Ruling C3 made an int satisfy a float declaration at every value check,
+        with no value converted: ``SchemaContract.validate`` and pydantic strict
+        both admit it, so the build refused rows every check would pass. The
+        build now applies the same one rule (``declared_type_admits``).
         """
         from pydantic import ConfigDict
 
@@ -336,17 +337,32 @@ class TestSchemaCompatibility:
             value: float
 
         result = check_compatibility(Producer, StrictConsumer)
+        assert result.compatible is True
+        assert result.type_mismatches == ()
+        # The value check a row meets at this consumer admits it.
+        StrictConsumer.model_validate({"value": 3}, strict=True)
+
+    def test_strict_schema_rejects_a_bool_for_a_float(self) -> None:
+        """``bool`` is not a number for a declaration: refused at build, as at the value check."""
+        from pydantic import ConfigDict
+
+        from elspeth.contracts import PluginSchema, check_compatibility
+
+        class Producer(PluginSchema):
+            value: bool
+
+        class StrictConsumer(PluginSchema):
+            model_config = ConfigDict(strict=True)
+            value: float
+
+        result = check_compatibility(Producer, StrictConsumer)
         assert result.compatible is False
-        assert len(result.type_mismatches) == 1
-        assert result.type_mismatches[0][0] == "value"
-        assert result.type_mismatches[0][1] == "float"  # expected
-        assert result.type_mismatches[0][2] == "int"  # actual
+        assert result.type_mismatches == (("value", "float", "bool"),)
 
     def test_non_strict_schema_allows_int_to_float_coercion(self) -> None:
-        """Non-strict schemas should allow int->float coercion (default behavior).
+        """Non-strict schemas allow int -> float (default behavior), exactly as strict ones do.
 
-        This is the counterpart to test_strict_schema_rejects_int_to_float_coercion.
-        Default PluginSchema (strict=False) should allow numeric coercion.
+        Default PluginSchema (strict=False).
         """
         from elspeth.contracts import PluginSchema, check_compatibility
 
@@ -361,22 +377,23 @@ class TestSchemaCompatibility:
         assert result.compatible is True
         assert result.type_mismatches == ()
 
-    def test_strict_schema_rejects_int_to_optional_float(self) -> None:
-        """Strict schemas should reject int->Optional[float] coercion too.
-
-        Strictness applies to union members as well.
-        """
+    def test_strict_schema_admits_an_int_for_an_optional_float(self) -> None:
+        """The same rule applies to union members: an int satisfies ``float | None``, a bool does not."""
         from pydantic import ConfigDict
 
         from elspeth.contracts import PluginSchema, check_compatibility
 
-        class Producer(PluginSchema):
+        class IntProducer(PluginSchema):
             value: int
+
+        class BoolProducer(PluginSchema):
+            value: bool
 
         class StrictConsumer(PluginSchema):
             model_config = ConfigDict(strict=True)
             value: float | None
 
-        result = check_compatibility(Producer, StrictConsumer)
+        assert check_compatibility(IntProducer, StrictConsumer).compatible is True
+        result = check_compatibility(BoolProducer, StrictConsumer)
         assert result.compatible is False
         assert len(result.type_mismatches) == 1

@@ -8,8 +8,11 @@ from typing import Any
 
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 from elspeth.contracts import CallStatus
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.transforms.aws.textract_client import (
     TextractClient,
     TextractIdempotencyInvariantError,
@@ -27,7 +30,7 @@ class FakeExecution:
     order: list[str] = field(default_factory=list)
     fail_record: bool = False
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         assert state_id == "state-1"
         return len(self.calls)
 
@@ -93,6 +96,7 @@ def _client(
     events: list[Any] = []
     limiter = FakeLimiter()
     client = TextractClient(
+        **mock_item_audit_authority("run-1"),
         execution=execution,
         state_id="state-1",
         run_id="run-1",
@@ -192,7 +196,7 @@ def test_start_sorts_features_and_builds_queries_config() -> None:
     ]
 
 
-def test_get_replaces_raw_next_token_with_fingerprint_in_audit() -> None:
+def test_get_retains_next_token_for_replay_only_in_protected_call_response(caplog: pytest.LogCaptureFixture) -> None:
     marker = "provider-document-text"
     sdk = FakeSDK(
         get_responses=[
@@ -217,8 +221,11 @@ def test_get_replaces_raw_next_token_with_fingerprint_in_audit() -> None:
     audited = recorder.calls[0]["response_data"].to_dict()
     assert audited["attempts"] == 3
     assert audited["next_token_present"] is True
+    assert audited["next_token"] == "opaque-next-token"
     assert audited["next_token_fingerprint"]
-    assert "opaque-next-token" not in repr(audited)
+    assert "opaque-next-token" not in repr(recorder.calls[0]["request_data"].to_dict())
+    assert "opaque-next-token" not in repr(events)
+    assert "opaque-next-token" not in caplog.text
     assert marker in repr(audited)
     assert marker not in repr(events)
     assert "provider-header" not in repr(audited)

@@ -8,8 +8,8 @@ guess.
 
 Scope: the top level and one level down where it aids placement. The internal
 layout of `src/elspeth/` and `tests/` is intentionally *not* repeated here — see
-the [Repository Architecture](../README.md#repository-architecture) section of
-the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
+the [architecture code boundaries](../ARCHITECTURE.md#code-boundaries) for the
+source tree.
 
 ## Purpose categories
 
@@ -31,7 +31,7 @@ the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
 | Marketing / landing site | `website/` | Standalone static site (HTML/CSS/JS), built and served independently of the app frontend. |
 | Design system | `design/` | The ELSPETH design system pack — tokens, guidelines, components, UI kits, and assets distilled from the app frontend so design agents can build on-brand interfaces and mocks. Reference material; never built or imported by `src/`. |
 | Runtime / working data | `data/` | App working data and the system databases, the audit database among them (see [§ Working-state](#working-state-where-runtime-data-lives)). Mostly gitignored. |
-| Local tool/runtime state | the gitignored dot-dirs | `.venv`, `.ruff_cache`, `.mypy_cache`, `.pytest_cache`, `.hypothesis`, `.uv-cache`, `node_modules`, `.loomweave`, `.filigree`, `.weft`, `.clarion`, `.codex`, `.superpowers`, `.worktrees`, `scratch/`, … — never shipped, never relied on by tracked code. One bucket; do not itemise. `.agents/` and `.claude/` are **not** in this bucket (see the note below). |
+| Local tool/runtime state | the gitignored dot-dirs | `.venv`, `.ruff_cache`, `.mypy_cache`, `.pytest_cache`, `.hypothesis`, `.uv-cache`, `node_modules`, `.weft`, `.clarion`, `.codex`, `.superpowers`, `.worktrees`, `scratch/`, … — never shipped, never relied on by tracked code. One bucket; do not itemise. `.agents/` and `.claude/` are **not** in this bucket (see the note below). |
 | Root metadata & manifests | root files | Governance/community docs (`LICENSE`, `GOVERNANCE.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `SUPPORT.md`), product docs (`README.md`, `ARCHITECTURE.md`, `PLUGIN.md`, `CHANGELOG.md`), and build/tooling config (`pyproject.toml`, `uv.lock`, `package*.json`, `Dockerfile`, `.pre-commit-config.yaml`, `.mcp.json`, dot-config). |
 
 > Agent-instruction files (`CLAUDE.md`, `AGENTS.md`) are **tracked** in git (as
@@ -55,8 +55,8 @@ the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
 - **`docs/`** → see its own [index](README.md); plans/specs that are implemented are removed from active docs and may be preserved by maintainers in the ignored local archive.
 - **`deploy/`** → `compose/` (PostgreSQL and web Compose overlays),
   `aws-ecs/terraform/` (disposable single-replica AWS cold-install source),
-  `azure-container-apps/` (Container Apps Bicep source; the platform is not a
-  supported target in this release), and `linux-systemd/` (portable
+  `azure-container-apps/` (Container Apps Bicep source; desktop acceptance for
+  Single/sticky; runtime evidence is local PostgreSQL), and `linux-systemd/` (portable
   native-Linux service and environment example). Kubernetes remains BYO and has
   no shipped directory in this release.
 
@@ -109,8 +109,9 @@ tool; a helper that lints, tests, deploys, or generates fixtures is a script.
 
 ✓ Distinct by *target*: `deploy/compose/` = maintained database/web overlays;
 `deploy/aws-ecs/terraform/` = maintained disposable AWS ECS infrastructure;
-`deploy/azure-container-apps/` = Container Apps Bicep source (the platform is not
-a supported target in this release); `deploy/linux-systemd/` = portable host
+`deploy/azure-container-apps/` = Container Apps Bicep source (desktop acceptance
+for Single/sticky; no live cloud acceptance claimed);
+`deploy/linux-systemd/` = portable host
 service and environment example; root `Dockerfile`/`docker-compose.yaml` =
 container image and CLI-oriented base;
 `scripts/deploy-vm.sh` + `validate_deployment.py` = automation that drives a

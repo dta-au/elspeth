@@ -14,7 +14,7 @@ These tests verify:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import groupby
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -46,6 +46,7 @@ class _SinkFake:
 class _PipelineConfigFake:
     sinks: dict[str, _SinkFake]
     sink_effect_modes: dict[str, str]
+    sink_effect_bindings: dict[str, object] = field(default_factory=dict)
 
 
 def _recorder_factory_fake() -> _RecorderFactoryFake:
@@ -57,7 +58,7 @@ def _recorder_factory_fake() -> _RecorderFactoryFake:
 # =============================================================================
 
 
-def _pending_sort_key(pair: tuple[TokenInfo, PendingOutcome | None]) -> tuple[bool, str, str, str, bool]:
+def _pending_sort_key(pair: tuple[TokenInfo, PendingOutcome | None]) -> tuple[bool, str, str, str]:
     """Replica of the pending_sort_key closure from write_pending_to_sinks.
 
     This must stay in sync with the production code. If the production sort key
@@ -65,9 +66,9 @@ def _pending_sort_key(pair: tuple[TokenInfo, PendingOutcome | None]) -> tuple[bo
     """
     pending = pair[1]
     if pending is None:
-        return (True, "", "", "", False)
+        return (True, "", "", "")
     outcome_value = pending.outcome.value if pending.outcome is not None else ""
-    return (False, outcome_value, pending.path.value, pending.error_hash or "", pending.scheduler_pending_sink)
+    return (False, outcome_value, pending.path.value, pending.error_hash or "")
 
 
 def _completed_pending() -> PendingOutcome:
@@ -151,25 +152,17 @@ class TestPendingSortKey:
 
         assert key_routed != key_completed
 
-    def test_scheduler_handoff_sorts_separately(self) -> None:
-        """Scheduler-backed and generated sink tokens must not share a callback group."""
-        tok_scheduler = make_token_info(token_id="tok-scheduler")
-        tok_generated = make_token_info(token_id="tok-generated")
+    def test_coalesced_tokens_of_different_merges_share_a_callback_group(self) -> None:
+        """Every sink-bound token has a durable handoff, so no handoff flag splits a batch:
+        two coalesced tokens differing only in merge identity share one group (and one
+        terminalization callback); the join_group_id travels per token, not in the key."""
+        tok_a = make_token_info(token_id="tok-a")
+        tok_b = make_token_info(token_id="tok-b")
 
-        scheduler_pending = PendingOutcome(
-            outcome=TerminalOutcome.SUCCESS,
-            path=TerminalPath.COALESCED,
-            scheduler_pending_sink=True,
-            join_group_id="join-1",
-        )
-        generated_pending = PendingOutcome(
-            outcome=TerminalOutcome.SUCCESS,
-            path=TerminalPath.COALESCED,
-            scheduler_pending_sink=False,
-            join_group_id="join-1",
-        )
+        pending_a = PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.COALESCED, join_group_id="join-1")
+        pending_b = PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.COALESCED, join_group_id="join-2")
 
-        assert _pending_sort_key((tok_scheduler, scheduler_pending)) != _pending_sort_key((tok_generated, generated_pending))
+        assert _pending_sort_key((tok_a, pending_a)) == _pending_sort_key((tok_b, pending_b))
 
     def test_same_outcome_same_error_hash_produces_equal_keys(self) -> None:
         """Two QUARANTINED tokens with the same error_hash should have equal sort keys."""

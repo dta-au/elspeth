@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.plugin_context import PluginContext
 from tests.fixtures.factories import make_context, make_source_context
 
@@ -224,7 +225,8 @@ class TestJSONSource:
     def test_has_plugin_version(self) -> None:
         """JSONSource has explicit plugin_version for audit trail.
 
-        Per CLAUDE.md auditability standard: every decision must be traceable
+        Per the auditability principle (ARCHITECTURE.md §Design Principles):
+        every decision must be traceable
         to source data, configuration, AND code version. The plugin_version
         attribute is recorded in the Landscape audit trail's nodes table.
         """
@@ -497,7 +499,8 @@ class TestJSONSourceQuarantineYielding:
 class TestJSONSourceParseErrors:
     """Tests for JSON source handling of parse/decode errors.
 
-    Per CLAUDE.md Three-Tier Trust Model, external data (Tier 3) should be
+    Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    Model, external data (Tier 3) should be
     quarantined on parse errors, not crash the pipeline.
     """
 
@@ -785,7 +788,8 @@ class TestJSONSourceParseErrors:
 class TestJSONSourceNonFiniteConstants:
     """Tests for JSON source rejection of NaN/Infinity constants.
 
-    Per CLAUDE.md Three-Tier Trust Model and canonical JSON policy:
+    Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust Model
+    and the ``engine-patterns-reference`` skill §Canonical JSON:
     - NaN/Infinity are non-standard JSON constants
     - Python's json module accepts them by default
     - They must be rejected at the source boundary (Tier 3)
@@ -957,7 +961,8 @@ class TestJSONSourceNonFiniteConstants:
 class TestJSONSourceDataKeyStructuralErrors:
     """Tests for JSON source handling of data_key structural mismatches.
 
-    Per CLAUDE.md Three-Tier Trust Model (Tier 3 - external data):
+    Per docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+    Model (Tier 3 - external data):
     - If data_key is configured but JSON root is a list, quarantine don't crash
     - If data_key is configured but key doesn't exist in JSON object, quarantine
     - If data_key extraction results in non-list, quarantine don't crash
@@ -1107,6 +1112,7 @@ class TestJSONSourceDataKeyStructuralErrors:
         setup = make_recorder_with_run(source_plugin_name="json")
         ctx = PluginContext(
             run_id=setup.run_id,
+            coordination_token=setup.coordination_token,
             node_id=setup.source_node_id,
             config={},
             landscape=setup.factory.plugin_audit_writer(),
@@ -1150,6 +1156,7 @@ class TestJSONSourceDataKeyStructuralErrors:
             run_id="test-run",
             node_id="source_json",
             landscape=landscape,
+            coordination_token=CoordinationToken(run_id="test-run", worker_id="mock-worker", leader_epoch=1),
         )
 
         source = JSONSource(
@@ -1270,6 +1277,7 @@ class TestJSONSourceArrayModeUnicodeDecodeError:
             run_id="test-run",
             node_id="source_json",
             landscape=landscape,
+            coordination_token=CoordinationToken(run_id="test-run", worker_id="mock-worker", leader_epoch=1),
         )
 
         source = JSONSource(

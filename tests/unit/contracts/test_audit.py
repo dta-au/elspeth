@@ -238,7 +238,7 @@ class TestCall:
         assert call.response_hash == "def456"
         assert call.latency_ms == 150.5
 
-    def test_llm_call_accepts_resolved_prompt_template_hash(self) -> None:
+    def test_llm_call_accepts_approved_prompt_artifact_hash(self) -> None:
         """LLM calls may carry the cross-DB resolved-prompt hash anchor."""
         call = Call(
             call_id="call-123",
@@ -248,14 +248,14 @@ class TestCall:
             status=CallStatus.SUCCESS,
             request_hash="abc123",
             created_at=datetime.now(UTC),
-            resolved_prompt_template_hash="a" * 64,
+            approved_prompt_artifact_hash="a" * 64,
         )
 
-        assert call.resolved_prompt_template_hash == "a" * 64
+        assert call.approved_prompt_artifact_hash == "a" * 64
 
-    def test_non_llm_call_rejects_resolved_prompt_template_hash(self) -> None:
+    def test_non_llm_call_rejects_approved_prompt_artifact_hash(self) -> None:
         """Only LLM calls may carry the resolved-prompt hash anchor."""
-        with pytest.raises(ValueError, match=r"resolved_prompt_template_hash.*CallType.LLM"):
+        with pytest.raises(ValueError, match=r"approved_prompt_artifact_hash.*CallType.LLM"):
             Call(
                 call_id="call-123",
                 state_id="state-456",
@@ -264,22 +264,22 @@ class TestCall:
                 status=CallStatus.SUCCESS,
                 request_hash="abc123",
                 created_at=datetime.now(UTC),
-                resolved_prompt_template_hash="a" * 64,
+                approved_prompt_artifact_hash="a" * 64,
             )
 
     @pytest.mark.parametrize(
-        "resolved_prompt_template_hash",
+        "approved_prompt_artifact_hash",
         [
             "a" * 63,
             "g" * 64,
         ],
     )
-    def test_resolved_prompt_template_hash_must_be_64_char_hex(
+    def test_approved_prompt_artifact_hash_must_be_64_char_hex(
         self,
-        resolved_prompt_template_hash: str,
+        approved_prompt_artifact_hash: str,
     ) -> None:
-        """Non-null resolved_prompt_template_hash is a 64-character hex digest."""
-        with pytest.raises(ValueError, match=r"resolved_prompt_template_hash.*64.*hex"):
+        """Non-null approved_prompt_artifact_hash is a 64-character hex digest."""
+        with pytest.raises(ValueError, match=r"approved_prompt_artifact_hash.*64.*hex"):
             Call(
                 call_id="call-123",
                 state_id="state-456",
@@ -288,7 +288,7 @@ class TestCall:
                 status=CallStatus.SUCCESS,
                 request_hash="abc123",
                 created_at=datetime.now(UTC),
-                resolved_prompt_template_hash=resolved_prompt_template_hash,
+                approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             )
 
 
@@ -1427,7 +1427,7 @@ class TestHashFields:
         assert len(row.source_data_hash) == 64
 
     def test_node_hashes_consistent_format(self) -> None:
-        """Node config_hash and schema_hash follow consistent format."""
+        """Node config_hash follows the consistent format."""
         node = Node(
             node_id="node-1",
             run_id="run-1",
@@ -1438,10 +1438,8 @@ class TestHashFields:
             config_hash=self.VALID_SHA256,
             config_json="{}",
             registered_at=datetime.now(UTC),
-            schema_hash=self.VALID_SHA256_REAL,
         )
         assert len(node.config_hash) == 64
-        assert len(node.schema_hash) == 64  # type: ignore[arg-type] # schema_hash may be None
 
     def test_node_state_input_hash_present(self) -> None:
         """NodeState variants require input_hash for traceability."""

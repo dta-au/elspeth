@@ -19,6 +19,10 @@ import { useSessionStore } from "@/stores/sessionStore";
 
 export function ModelChip() {
   const model = useSessionStore((s) => s.composerModel);
+  // The advisor model that gates completion, published by the same health
+  // poll. Shown beside the composer model once that poll has published it;
+  // it is operator configuration, never advisor output text.
+  const advisorModel = useSessionStore((s) => s.composerAdvisorModel);
 
   if (model === null) return null;
 
@@ -32,9 +36,20 @@ export function ModelChip() {
   // would make the children presentational, so the display name would stop
   // being separately readable). The raw id stays in `title`.
   return (
-    <span className="chat-model-chip" title={model}>
-      <span className="chat-model-chip-label">Composer:</span>{" "}
-      {modelDisplayName(model)}
-    </span>
+    <>
+      <span className="chat-model-chip" title={model}>
+        <span className="chat-model-chip-label">Composer:</span>{" "}
+        {modelDisplayName(model)}
+      </span>
+      {advisorModel !== null && (
+        <>
+          {" "}
+          <span className="chat-model-chip" title={advisorModel}>
+            <span className="chat-model-chip-label">Advisor:</span>{" "}
+            {modelDisplayName(advisorModel)}
+          </span>
+        </>
+      )}
+    </>
   );
 }

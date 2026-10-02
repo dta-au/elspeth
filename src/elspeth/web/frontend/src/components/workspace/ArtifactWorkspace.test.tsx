@@ -11,6 +11,8 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
+  type JSX,
+  type ButtonHTMLAttributes,
   type ReactNode,
   Suspense,
   startTransition,
@@ -22,12 +24,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "@/api/client";
 import * as auditApi from "@/api/auditReadiness";
+import { DecisionPanel } from "@/components/chat/DecisionPanel";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { useExecutionStore } from "@/stores/executionStore";
-import { EMPTY_GUIDED_REVIEWED_COMPONENTS } from "@/stores/guidedReviewedComponents";
 import { useSessionStore } from "@/stores/sessionStore";
 import { makeComposition, makeValidationResult } from "@/test/composerFixtures";
-import type { TurnPayload } from "@/types/guided";
 import { useHashRouter } from "@/hooks/useHashRouter";
 import {
   OPEN_CATALOG_EVENT,
@@ -42,7 +43,6 @@ import {
   ArtifactWorkspaceSurface,
 } from "./ArtifactWorkspace";
 import { WorkspacePaneProvider } from "./WorkspacePaneContext";
-import { WorkspaceInspector } from "./WorkspaceInspector";
 
 vi.mock("@xyflow/react", () => ({
   MarkerType: { ArrowClosed: "arrowclosed" },
@@ -52,7 +52,12 @@ vi.mock("@xyflow/react", () => ({
   BaseEdge: () => null,
   Handle: () => null,
   Background: () => null,
-  Controls: () => null,
+  // Children render so the Workflow canvas's Fullscreen control (a
+  // ControlButton inside Controls) is reachable, as it is in the browser.
+  Controls: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  ControlButton: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button type="button" {...props}>{children}</button>
+  ),
   MiniMap: () => null,
 }));
 vi.mock("@xyflow/react/dist/style.css", () => ({}));
@@ -65,7 +70,7 @@ class PassiveResizeObserver implements ResizeObserver {
 }
 
 interface RenderArtifactWorkspaceOptions {
-  inspector?: ReactNode;
+  probe?: ReactNode;
   runAvailable?: boolean;
   catalogAvailable?: boolean;
 }
@@ -82,10 +87,7 @@ function renderArtifactWorkspace(
           catalogAvailable={options.catalogAvailable}
         />
       }
-      inspector={
-        options.inspector ?? <button type="button">Validation status</button>
-      }
-      actionBar={<button type="button">Run pipeline</button>}
+      actionBar={<><button type="button">Run pipeline</button>{options.probe}</>}
     />,
   );
 }
@@ -156,8 +158,6 @@ describe("ArtifactWorkspace", () => {
       staleProposalIds: [],
       exportedYamlBlobBinding: null,
       selectedNodeId: null,
-      guidedNextTurn: null,
-      guidedReviewedComponents: EMPTY_GUIDED_REVIEWED_COMPONENTS,
     });
     useExecutionStore.setState({
       activeRunId: null,
@@ -223,19 +223,20 @@ describe("ArtifactWorkspace", () => {
     const tablist = screen.getByRole("tablist", {
       name: "Pipeline artifacts",
     });
-    const graph = within(tablist).getByRole("tab", { name: "Graph" });
+    const graph = within(tablist).getByRole("tab", { name: "Workflow" });
     expect(graph).toHaveAttribute("id", "artifact-tab-graph");
     expect(graph).toHaveAttribute("aria-selected", "true");
     expect(graph).toHaveAttribute("aria-controls", "artifact-panel-graph");
     expect(graph).toHaveAttribute("tabindex", "0");
-    const panel = screen.getByRole("tabpanel", { name: "Graph" });
+    const panel = screen.getByRole("tabpanel", { name: "Workflow" });
     expect(panel).toHaveAttribute("id", "artifact-panel-graph");
     expect(panel).toHaveAttribute("aria-labelledby", "artifact-tab-graph");
     expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
-    expect(screen.getAllByRole("tabpanel", { hidden: true })).toHaveLength(5);
-    for (const tab of ["graph", "spec", "yaml", "checks", "run"] as const) {
+    expect(screen.getAllByRole("tabpanel", { hidden: true })).toHaveLength(6);
+    for (const tab of ["graph", "approvals", "spec", "yaml", "checks", "run"] as const) {
       const tabElement = screen.getByRole("tab", {
-        name: tab === "yaml" ? "YAML" : `${tab[0]!.toUpperCase()}${tab.slice(1)}`,
+        // The "graph" tab id is labelled "Workflow"; the id is the stable key.
+        name: tab === "yaml" ? "YAML" : tab === "graph" ? "Workflow" : `${tab[0]!.toUpperCase()}${tab.slice(1)}`,
       });
       const controlledId = tabElement.getAttribute("aria-controls");
       expect(controlledId).toBe(`artifact-panel-${tab}`);
@@ -256,65 +257,10 @@ describe("ArtifactWorkspace", () => {
     );
   });
 
-  it("draws a pending guided proposal in the Graph panel while the composition is empty (elspeth-9f0873426a)", () => {
-    // Guided mode keeps the composition empty until Confirm wiring; the
-    // learner still has to see the structure they are approving, and this
-    // pane — not the chat column — is where it belongs (review IA-1/V-1).
-    const SOURCE_ID = "00000000-0000-4000-8000-000000000912";
-    const OUTPUT_ID = "00000000-0000-4000-8000-000000000914";
-    const proposalTurn: TurnPayload = {
-      type: "propose_pipeline",
-      step_index: 2,
-      turn_token: "c".repeat(64),
-      payload: {
-        proposal_id: "00000000-0000-4000-8000-000000000911",
-        draft_hash: "d".repeat(64),
-        supersedes_draft_hash: null,
-        summary: "guided.proposal.summary.full_graph.v1",
-        rationale: "guided.proposal.rationale.review_required.v1",
-        component_counts: { sources: 1, nodes: 0, edges: 1, outputs: 1 },
-        blockers: [],
-        graph: {
-          sources: [
-            { stable_id: SOURCE_ID, label: "source-1", plugin: { kind: "source", id: "csv" } },
-          ],
-          edges: [
-            {
-              stable_id: "00000000-0000-4000-8000-000000000915",
-              from_endpoint: { kind: "source", stable_id: SOURCE_ID },
-              to_endpoint: { kind: "output", stable_id: OUTPUT_ID },
-              flow: { kind: "source_success", branch: null },
-            },
-          ],
-        },
-        nodes: [],
-        outputs: [
-          { stable_id: OUTPUT_ID, label: "output-1", plugin: { kind: "sink", id: "json" } },
-        ],
-        edit_targets: [],
-      },
-    };
-    useSessionStore.setState({ guidedNextTurn: proposalTurn });
-    renderArtifactWorkspace();
-
-    const panel = screen.getByRole("tabpanel");
-    expect(
-      within(panel).getByRole("img", {
-        name: "Pipeline proposal graph with 2 components and 1 routes",
-      }),
-    ).toBeInTheDocument();
-    expect(
-      within(panel).getByText(
-        "Proposed pipeline, not yet committed. Confirm the wiring to commit it.",
-      ),
-    ).toBeInTheDocument();
-    expect(panel).not.toHaveTextContent("No pipeline to visualise.");
-  });
-
   it("disables Spec, YAML, and Checks without composition content but keeps Graph and Run available", () => {
     renderArtifactWorkspace();
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toBeEnabled();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toBeEnabled();
     expect(screen.getByRole("tab", { name: "Spec" })).toBeDisabled();
     expect(screen.getByRole("tab", { name: "YAML" })).toBeDisabled();
     expect(screen.getByRole("tab", { name: "Checks" })).toBeDisabled();
@@ -377,11 +323,11 @@ describe("ArtifactWorkspace", () => {
       "No runs yet.",
     );
     await user.keyboard("{ArrowRight}");
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
     await user.keyboard("{ArrowLeft}");
     expect(screen.getByRole("tab", { name: "Run" })).toHaveFocus();
     await user.keyboard("{Home}");
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
   });
 
   it("keeps a newer direct Run selection after an older deferred Spec hash loads", async () => {
@@ -392,7 +338,7 @@ describe("ArtifactWorkspace", () => {
     } as never);
     window.history.replaceState(null, "", "#/session-1/spec");
     const user = userEvent.setup();
-    renderArtifactWorkspace({ inspector: <HashRouterProbe /> });
+    renderArtifactWorkspace({ probe: <HashRouterProbe /> });
 
     await user.click(screen.getByRole("tab", { name: "Run" }));
     act(() => {
@@ -417,7 +363,7 @@ describe("ArtifactWorkspace", () => {
       sessions: [{ id: "session-1", title: "Session 1" }],
     } as never);
     window.history.replaceState(null, "", "#/session-1/spec");
-    renderArtifactWorkspace({ inspector: <HashRouterProbe /> });
+    renderArtifactWorkspace({ probe: <HashRouterProbe /> });
 
     // The palette's Export YAML command and the Ctrl+Shift+Y shortcut both
     // publish this exact intent; dispatch it directly.
@@ -446,23 +392,23 @@ describe("ArtifactWorkspace", () => {
     } as never);
     window.history.replaceState(null, "", "#/session-1/spec");
     const user = userEvent.setup();
-    renderArtifactWorkspace({ inspector: <HashRouterProbe /> });
+    renderArtifactWorkspace({ probe: <HashRouterProbe /> });
 
-    await user.click(screen.getByRole("button", { name: "Focus graph" }));
+    await user.click(screen.getByRole("button", { name: "Fullscreen" }));
     act(() => useSessionStore.setState({ compositionStateLoaded: true }));
     await act(async () => Promise.resolve());
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
   });
 
   it("skips disabled tabs while roving in an empty composition", async () => {
     const user = userEvent.setup();
     renderArtifactWorkspace();
-    screen.getByRole("tab", { name: "Graph" }).focus();
+    screen.getByRole("tab", { name: "Workflow" }).focus();
 
     await user.keyboard("{ArrowRight}");
 
@@ -506,7 +452,7 @@ describe("ArtifactWorkspace", () => {
         sessionId: "another-session",
       });
     });
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -525,10 +471,84 @@ describe("ArtifactWorkspace", () => {
     );
   });
 
+  it("opens visible Checks from the decision panel on a narrow viewport and moves keyboard focus", async () => {
+    class NarrowResizeObserver implements ResizeObserver {
+      constructor(private callback: ResizeObserverCallback) {}
+
+      observe(target: Element): void {
+        this.callback(
+          [{ target, contentRect: { width: 375 } } as ResizeObserverEntry],
+          this,
+        );
+      }
+
+      unobserve(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal("ResizeObserver", NarrowResizeObserver);
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    const user = userEvent.setup();
+    render(
+      <ComposerWorkspace
+        authoring={
+          <DecisionPanel
+            rows={[{
+              kind: "blocker",
+              id: "blocked",
+              code: "advisor",
+              componentId: null,
+              detail: "Review is required.",
+              suggestion: null,
+              note: null,
+            }]}
+            blockedVerbs={["save_for_review"]}
+            count={1}
+            proposals={[]}
+            staleProposalIds={[]}
+            proposalActionPendingIds={[]}
+            isComposing={false}
+            applyDisabled={false}
+            applyDisabledReason={null}
+            phraseFor={() => "Pipeline"}
+            stepLabelFor={() => null}
+            onApplySuggestion={vi.fn()}
+            onOpenChecks={() => dispatchArtifactViewIntent({
+              tab: "checks",
+              focusMode: false,
+              sessionId: "session-1",
+            })}
+            onAcceptProposal={vi.fn()}
+            onRejectProposal={vi.fn()}
+          />
+        }
+        artifact={<ArtifactWorkspace />}
+        actionBar={null}
+      />,
+    );
+
+    expect(screen.getByRole("tab", { name: "Compose" })).toHaveAttribute(
+      "aria-selected", "true",
+    );
+    expect(screen.queryByRole("tab", { name: /^Checks/ })).not.toBeInTheDocument();
+    screen.getByRole("button", { name: "Open checks" }).focus();
+    await user.keyboard("{Enter}");
+
+    expect(screen.getByRole("tab", { name: "Pipeline" })).toHaveAttribute(
+      "aria-selected", "true",
+    );
+    const checks = screen.getByRole("tab", { name: /^Checks/ });
+    expect(checks).toHaveAttribute("aria-selected", "true");
+    expect(checks).toHaveFocus();
+    expect(screen.getByRole("tabpanel", { name: /^Checks/ })).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Open checks" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("routes a new-session request from the first committed layout effect", () => {
     useSessionStore.setState({ compositionState: makeComposition(1) });
     renderArtifactWorkspace({
-      inspector: <CommitRequestProbe watch="session" tab="spec" />,
+      probe: <CommitRequestProbe watch="session" tab="spec" />,
     });
 
     act(() => {
@@ -550,7 +570,7 @@ describe("ArtifactWorkspace", () => {
 
   it("uses newly committed availability when content becomes available", async () => {
     renderArtifactWorkspace({
-      inspector: <CommitRequestProbe watch="availability" tab="yaml" />,
+      probe: <CommitRequestProbe watch="availability" tab="yaml" />,
     });
 
     act(() => {
@@ -572,7 +592,7 @@ describe("ArtifactWorkspace", () => {
     useSessionStore.setState({ compositionState: makeComposition(1) });
     const user = userEvent.setup();
     renderArtifactWorkspace({
-      inspector: <CommitRequestProbe watch="availability" tab="yaml" />,
+      probe: <CommitRequestProbe watch="availability" tab="yaml" />,
     });
     await user.click(screen.getByRole("tab", { name: "Spec" }));
 
@@ -580,10 +600,10 @@ describe("ArtifactWorkspace", () => {
       useSessionStore.setState({ compositionState: null });
     });
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
     expect(screen.getByRole("tab", { name: "YAML" })).toBeDisabled();
     expect(screen.getByRole("status")).toHaveTextContent(
-      "YAML is unavailable. Showing Graph.",
+      "YAML is unavailable. Showing Workflow.",
     );
   });
 
@@ -736,7 +756,7 @@ describe("ArtifactWorkspace", () => {
       }).not.toThrow();
 
       expect(authorControl).toHaveFocus();
-      expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+      expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
         "aria-selected",
         "true",
       );
@@ -779,9 +799,9 @@ describe("ArtifactWorkspace", () => {
       });
     });
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
     expect(screen.getByRole("status")).toHaveTextContent(
-      "YAML is unavailable. Showing Graph.",
+      "YAML is unavailable. Showing Workflow.",
     );
   });
 
@@ -795,13 +815,13 @@ describe("ArtifactWorkspace", () => {
       useSessionStore.setState({ compositionState: null });
     });
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
     expect(screen.getByRole("status")).toHaveTextContent(
-      "Spec is unavailable. Showing Graph.",
+      "Spec is unavailable. Showing Workflow.",
     );
   });
 
@@ -822,7 +842,7 @@ describe("ArtifactWorkspace", () => {
       });
     });
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
     expect(
       document.querySelector(".artifact-workspace > [role='status']"),
     ).toBeEmptyDOMElement();
@@ -849,7 +869,7 @@ describe("ArtifactWorkspace", () => {
       });
     });
 
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveFocus();
     expect(
       document.querySelector(".artifact-workspace > [role='status']"),
     ).toBeEmptyDOMElement();
@@ -878,10 +898,10 @@ describe("ArtifactWorkspace", () => {
     useSessionStore.setState({ compositionState: makeComposition(1) });
     const user = userEvent.setup();
     renderArtifactWorkspace();
-    await user.click(screen.getByRole("tab", { name: "Spec" }));
+    // Fullscreen lives on the Workflow tab, so the request starts there.
     const observations: Array<{ focused: Element | null; selected: string | null }> = [];
     const listener = () => {
-      const graph = screen.getByRole("tab", { name: "Graph" });
+      const graph = screen.getByRole("tab", { name: "Workflow" });
       observations.push({
         focused: document.activeElement,
         selected: graph.getAttribute("aria-selected"),
@@ -889,16 +909,16 @@ describe("ArtifactWorkspace", () => {
     };
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
-    await user.click(screen.getByRole("button", { name: "Focus graph" }));
+    await user.click(screen.getByRole("button", { name: "Fullscreen" }));
 
     await waitFor(() => expect(observations).toHaveLength(1));
     await Promise.resolve();
     expect(observations).toHaveLength(1);
     expect(observations[0]).toEqual({
-      focused: screen.getByRole("tab", { name: "Graph" }),
+      focused: screen.getByRole("tab", { name: "Workflow" }),
       selected: "true",
     });
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -906,6 +926,8 @@ describe("ArtifactWorkspace", () => {
   });
 
   it("suppresses a queued Graph modal after a committed session switch", () => {
+    // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     renderArtifactWorkspace();
     let modalCount = 0;
     const listener = () => {
@@ -914,7 +936,7 @@ describe("ArtifactWorkspace", () => {
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
     act(() => {
-      fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
+      fireEvent.click(screen.getByRole("button", { name: "Fullscreen" }));
       useSessionStore.setState({ activeSessionId: "session-2" });
     });
 
@@ -929,7 +951,7 @@ describe("ArtifactWorkspace", () => {
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
 
     act(() => {
-      fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
+      fireEvent.click(screen.getByRole("button", { name: "Fullscreen" }));
       fireEvent.click(screen.getByRole("tab", { name: "Run" }));
     });
     await act(async () => Promise.resolve());
@@ -944,6 +966,8 @@ describe("ArtifactWorkspace", () => {
   });
 
   it("suppresses a queued Graph modal after unmount", () => {
+    // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     const view = renderArtifactWorkspace();
     let modalCount = 0;
     const listener = () => {
@@ -952,7 +976,7 @@ describe("ArtifactWorkspace", () => {
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
     act(() => {
-      fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
+      fireEvent.click(screen.getByRole("button", { name: "Fullscreen" }));
       view.unmount();
     });
 
@@ -975,14 +999,10 @@ describe("ArtifactWorkspace", () => {
             authoringCollapsed: false,
             availableArtifactTabs: ["graph", "spec", "yaml", "run"],
             activeArtifactTab: "graph",
-            activeInspectorTab: null,
-            inspectorOpen: false,
             resizeTransient: vi.fn(),
             commitResize: vi.fn(),
             setAuthoringCollapsed: vi.fn(),
             selectArtifactTab,
-            openInspector: vi.fn(),
-            closeInspector: vi.fn(),
           } as never
         }
       >
@@ -991,7 +1011,7 @@ describe("ArtifactWorkspace", () => {
       </WorkspacePaneProvider>,
     );
     let workspaceFocusCount = 0;
-    screen.getByRole("tab", { name: "Graph" }).addEventListener("focus", () => {
+    screen.getByRole("tab", { name: "Workflow" }).addEventListener("focus", () => {
       workspaceFocusCount += 1;
     });
     outside.focus();
@@ -1005,6 +1025,8 @@ describe("ArtifactWorkspace", () => {
   });
 
   it("does not let a suspended speculative session render poison a queued modal", async () => {
+    // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     const never = new Promise<void>(() => {});
     function SuspendAfterArtifact({
       sessionId,
@@ -1032,7 +1054,6 @@ describe("ArtifactWorkspace", () => {
             artifact={
               <ArtifactWorkspaceSurface activeSessionId={sessionId} />
             }
-            inspector={<button type="button">Validation status</button>}
             actionBar={<button type="button">Run pipeline</button>}
           />
           <SuspendAfterArtifact sessionId={sessionId} />
@@ -1046,7 +1067,7 @@ describe("ArtifactWorkspace", () => {
     };
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
-    fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
+    fireEvent.click(screen.getByRole("button", { name: "Fullscreen" }));
     fireEvent.click(
       screen.getByRole("button", { name: "Switch speculative session" }),
     );
@@ -1076,7 +1097,7 @@ describe("ArtifactWorkspace", () => {
     await waitFor(() => expect(observations).toHaveLength(1));
     await Promise.resolve();
     expect(observations).toHaveLength(1);
-    expect(observations[0]).toBe(screen.getByRole("tab", { name: "Graph" }));
+    expect(observations[0]).toBe(screen.getByRole("tab", { name: "Workflow" }));
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
   });
 
@@ -1122,11 +1143,12 @@ describe("ArtifactWorkspace", () => {
       "Spec artifact encountered an error",
     );
     expect(screen.getByRole("tablist", { name: "Pipeline artifacts" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Focus graph" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Validation status" })).toBeEnabled();
+    // Fullscreen belongs to the Workflow tab's panel, not the shared toolbar.
+    expect(screen.queryByRole("button", { name: "Fullscreen" })).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /^Checks/ })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Run pipeline" })).toBeEnabled();
 
-    await user.click(screen.getByRole("tab", { name: "Graph" }));
+    await user.click(screen.getByRole("tab", { name: "Workflow" }));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     await user.click(screen.getByRole("tab", { name: "Spec" }));
     expect(screen.getByRole("alert")).toHaveTextContent(
@@ -1142,7 +1164,7 @@ describe("ArtifactWorkspace", () => {
         }),
       });
     });
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -1322,14 +1344,10 @@ describe("ArtifactWorkspace", () => {
               authoringCollapsed: false,
               availableArtifactTabs: ["graph", "spec", "yaml", "run"],
               activeArtifactTab: "run",
-              activeInspectorTab: null,
-              inspectorOpen: false,
               resizeTransient: vi.fn(),
               commitResize: vi.fn(),
               setAuthoringCollapsed: vi.fn(),
               selectArtifactTab: vi.fn(),
-              openInspector: vi.fn(),
-              closeInspector: vi.fn(),
             } as never
           }
         >
@@ -1396,7 +1414,7 @@ describe("ArtifactWorkspace", () => {
   });
 
   // The OMITTED-prop arm, pinned separately from the explicit-false arm.
-  // TutorialGuidedShell does not pass runAvailable at all, so the tutorial's
+  // The tutorial shell does not pass runAvailable at all, so the tutorial's
   // freedom from a dead Run control rests entirely on this default — which
   // means a future `runAvailable = true` default would silently enable it
   // there while every tutorial test still passed.
@@ -1433,7 +1451,7 @@ describe("ArtifactWorkspace", () => {
     act(() => vi.advanceTimersByTime(3000));
     expect(loadRuns).toHaveBeenCalledTimes(2);
 
-    fireEvent.click(screen.getByRole("tab", { name: "Graph" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Workflow" }));
     act(() => vi.advanceTimersByTime(6000));
     expect(loadRuns).toHaveBeenCalledTimes(2);
 
@@ -1450,7 +1468,7 @@ describe("ArtifactWorkspace", () => {
         }),
       });
     });
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: "Workflow" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -1472,30 +1490,40 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
     vi.unstubAllGlobals();
   });
 
-  it("mounts Plugin catalog before Focus graph in DOM order when admitted", () => {
+  it("keeps Plugin catalog in the toolbar and Fullscreen inside the Workflow panel", () => {
+    // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     renderArtifactWorkspace({ catalogAvailable: true });
 
     const catalog = screen.getByRole("button", { name: "Plugin catalog" });
-    const focusGraph = screen.getByRole("button", { name: "Focus graph" });
-    // WCAG 2.4.3: visual order IS tab order — catalog precedes Focus graph
-    // in the DOM, no CSS `order` on interactive controls. Focus graph keeps
-    // the terminal edge whether or not the catalog renders.
+    const fullscreen = screen.getByRole("button", { name: "Fullscreen" });
+    // WCAG 2.4.3: visual order IS tab order — the toolbar precedes the panel
+    // in the DOM, no CSS `order` on interactive controls.
     expect(
-      catalog.compareDocumentPosition(focusGraph) &
+      catalog.compareDocumentPosition(fullscreen) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(catalog.parentElement).toBe(focusGraph.parentElement);
+    expect(screen.getByRole("tabpanel", { name: "Workflow" })).toContainElement(fullscreen);
+    expect(catalog.parentElement).not.toContainElement(fullscreen);
   });
 
-  it("omits the catalog trigger by default (tutorial/guided mounts)", () => {
+  it("offers no Fullscreen control while there is no pipeline to draw", () => {
+    renderArtifactWorkspace();
+    expect(screen.getByRole("tabpanel", { name: "Workflow" })).toHaveTextContent("No pipeline to visualise.");
+    expect(screen.queryByRole("button", { name: "Fullscreen" })).not.toBeInTheDocument();
+  });
+
+  it("omits the catalog trigger by default (tutorial mounts)", () => {
+    // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     renderArtifactWorkspace();
     expect(
       screen.queryByRole("button", { name: "Plugin catalog" }),
     ).toBeNull();
-    // Focus graph is unconditional: it is the only keyboard-operable
-    // GraphModal trigger (palette/Ctrl+Shift+G pass focusMode:false).
+    // Fullscreen needs no catalog: it is the only keyboard-operable GraphModal
+    // trigger (palette and Ctrl+Shift+G pass focusMode:false).
     expect(
-      screen.getByRole("button", { name: "Focus graph" }),
+      screen.getByRole("button", { name: "Fullscreen" }),
     ).toBeInTheDocument();
   });
 
@@ -1561,6 +1589,7 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
       ).getAllByRole("tab");
       expect(tabs.map((tab) => tab.id)).toEqual([
         "artifact-tab-graph",
+        "artifact-tab-approvals",
         "artifact-tab-spec",
         "artifact-tab-yaml",
         "artifact-tab-checks",
@@ -1575,7 +1604,7 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
       expect(await within(panel).findByText(/Audit ready/)).toBeInTheDocument();
     });
 
-    it("announces the merged all-clear in the tab name with a non-color glyph badge", () => {
+    it("announces the merged all-clear with a fixed vector mark", () => {
       renderArtifactWorkspace();
 
       const checks = screen.getByRole("tab", { name: "Checks: Ready" });
@@ -1583,7 +1612,13 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
       expect(badge).not.toBeNull();
       expect(badge).toHaveAttribute("data-tone", "success");
       expect(badge).toHaveAttribute("aria-hidden", "true");
-      expect(badge).toHaveTextContent("✓");
+      const mark = badge?.querySelector("svg");
+      expect(mark).not.toBeNull();
+      expect(mark).toHaveAttribute("viewBox", "0 0 16 16");
+      expect(mark?.querySelector("path")).toHaveAttribute(
+        "d",
+        "M3 8l3.2 3.2L13 4.5",
+      );
     });
 
     it("sums validation errors and audit issues into the badge count and tab name", () => {
@@ -1649,61 +1684,4 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
     });
   });
 
-  describe("history trigger", () => {
-    function guidedSessionWithHistory() {
-      return {
-        step: "step_3_transforms" as const,
-        history: [
-          {
-            step: "step_1_source" as const,
-            turn_type: "single_select" as const,
-            payload_hash: "payload",
-            response_hash: "response",
-            summary: "Use a CSV source",
-            emitter: "server" as const,
-          },
-        ],
-        terminal: null,
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      };
-    }
-
-    it("omits the trigger without completed guided history", () => {
-      renderArtifactWorkspace();
-      expect(screen.queryByRole("button", { name: "History" })).toBeNull();
-    });
-
-    it("mounts the trigger before the terminal-edge Focus graph control", () => {
-      useSessionStore.setState({
-        guidedSession: guidedSessionWithHistory(),
-      } as never);
-      renderArtifactWorkspace({ catalogAvailable: true });
-
-      const history = screen.getByRole("button", { name: "History" });
-      expect(history).toHaveAttribute("id", "artifact-history-trigger");
-      const focusGraph = screen.getByRole("button", { name: "Focus graph" });
-      expect(history.parentElement).toBe(focusGraph.parentElement);
-      expect(
-        history.compareDocumentPosition(focusGraph) &
-          Node.DOCUMENT_POSITION_FOLLOWING,
-      ).toBeTruthy();
-    });
-
-    it("opens the history drawer from the trigger", async () => {
-      useSessionStore.setState({
-        guidedSession: guidedSessionWithHistory(),
-      } as never);
-      const user = userEvent.setup();
-      renderArtifactWorkspace({ inspector: <WorkspaceInspector /> });
-
-      await user.click(screen.getByRole("button", { name: "History" }));
-
-      expect(
-        screen.getByRole("complementary", { name: "History" }),
-      ).toBeVisible();
-    });
-  });
 });

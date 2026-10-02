@@ -211,6 +211,11 @@ def test_upstream_failure_forbids_extra():
 # --- ErrorClassification / CLASSIFIABLE_CODES --------------------------------
 
 
+def test_error_classification_rejects_retryability_conflicting_with_code():
+    with pytest.raises(ValidationError):
+        ErrorClassification(code="upstream_response_invalid", retryable=True)
+
+
 def test_classifiable_codes_literal_value():
     assert {
         "context_length_exceeded",
@@ -218,6 +223,7 @@ def test_classifiable_codes_literal_value():
         "upstream_rate_limited",
         "upstream_timeout",
         "upstream_unavailable",
+        "upstream_request_rejected",
         "upstream_response_invalid",
     } == CLASSIFIABLE_CODES
 
@@ -228,7 +234,8 @@ def test_classifiable_codes_is_frozenset():
 
 @pytest.mark.parametrize("code", sorted(CLASSIFIABLE_CODES))
 def test_error_classification_accepts_classifiable_codes(code):
-    classification = ErrorClassification(code=code, retryable=True)
+    retryable = code in {"upstream_rate_limited", "upstream_timeout", "upstream_unavailable"}
+    classification = ErrorClassification(code=code, retryable=retryable)
     assert classification.code == code
 
 

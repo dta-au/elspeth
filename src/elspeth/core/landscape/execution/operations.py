@@ -13,10 +13,11 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
-from sqlalchemy import bindparam, select
+from sqlalchemy import bindparam, func, select
 from sqlalchemy.engine import Connection
 
 from elspeth.contracts import FrameworkBugError, Operation, OperationType
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.landscape._database_ops import DatabaseOps
@@ -24,6 +25,7 @@ from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapePostCommitError
 from elspeth.core.landscape.model_loaders import OperationLoader
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import operations_table
 
 if TYPE_CHECKING:
@@ -57,10 +59,10 @@ class OperationRepository:
 
     def begin_operation(
         self,
-        run_id: str,
         node_id: str,
         operation_type: OperationType,
         *,
+        coordination_token: CoordinationToken,
         input_data: Mapping[str, object] | None = None,
         sink_effect_id: str | None = None,
     ) -> Operation:
@@ -92,19 +94,33 @@ class OperationRepository:
                 input_ref = self._payload_store.store(input_bytes)
 
         timestamp = now()
-        operation = Operation(
-            operation_id=operation_id,
-            run_id=run_id,
-            node_id=node_id,
-            operation_type=operation_type,
-            started_at=timestamp,
-            status="open",
-            sink_effect_id=sink_effect_id,
-            input_data_ref=input_ref,
-            input_data_hash=input_hash,
-        )
-
-        self._ops.execute_insert(operations_table.insert().values(**operation.to_dict()))
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="begin_operation",
+        ) as conn:
+            previous_index = conn.execute(
+                select(func.max(operations_table.c.occurrence_index)).where(
+                    operations_table.c.run_id == coordination_token.run_id,
+                    operations_table.c.node_id == node_id,
+                    operations_table.c.operation_type == operation_type,
+                )
+            ).scalar_one()
+            occurrence_index = 0 if previous_index is None else previous_index + 1
+            operation = Operation(
+                operation_id=operation_id,
+                run_id=coordination_token.run_id,
+                node_id=node_id,
+                operation_type=operation_type,
+                occurrence_index=occurrence_index,
+                started_at=timestamp,
+                status="open",
+                sink_effect_id=sink_effect_id,
+                input_data_ref=input_ref,
+                input_data_hash=input_hash,
+            )
+            self._ops.execute_insert_on(conn, operations_table.insert().values(**operation.to_dict()))
         return operation
 
     def complete_operation(
@@ -112,6 +128,7 @@ class OperationRepository:
         operation_id: str,
         status: Literal["completed", "failed"],
         *,
+        coordination_token: CoordinationToken,
         output_data: Mapping[str, object] | None = None,
         error: str | None = None,
         duration_ms: float | None = None,
@@ -154,6 +171,7 @@ class OperationRepository:
         stmt = (
             operations_table.update()
             .where((operations_table.c.operation_id == operation_id) & (operations_table.c.status == "open"))
+            .where(operations_table.c.run_id == coordination_token.run_id)
             .values(
                 completed_at=timestamp,
                 status=status,
@@ -162,13 +180,22 @@ class OperationRepository:
                 output_data_hash=output_hash,
             )
         )
-        with self._db.write_connection() as conn:
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="complete_operation",
+        ) as conn:
             result = conn.execute(stmt)
             if result.rowcount == 0:
                 # Distinguish "doesn't exist" from "already completed" for diagnostics
-                check = conn.execute(select(operations_table.c.status).where(operations_table.c.operation_id == operation_id)).fetchone()
+                check = conn.execute(
+                    select(operations_table.c.status, operations_table.c.run_id).where(operations_table.c.operation_id == operation_id)
+                ).fetchone()
                 if check is None:
                     raise FrameworkBugError(f"Completing non-existent operation: {operation_id}")
+                if check.run_id != coordination_token.run_id:
+                    raise AuditIntegrityError("Cannot complete an operation belonging to a foreign run")
                 raise FrameworkBugError(
                     f"Completing already-completed operation {operation_id}: current status={check.status}, new status={status}"
                 )

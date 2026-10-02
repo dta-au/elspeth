@@ -2,30 +2,40 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secrets import SecretInventoryItem, SecretScope, SecretUnavailabilityReason
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.redaction import _OmittableString
+from elspeth.web.composer.response_contracts import SelectedResponseContract
 from elspeth.web.composer.state import (
     CompositionState,
 )
 from elspeth.web.composer.tools._common import (
+    EmptyToolArgumentsModel,
     ToolContext,
     ToolResult,
+    _composition_canonical_interpretation_requirement_error,
     _discovery_result,
     _failure_result,
     _mutation_result,
     _secret_ref_placement_error,
+    _validate_mutation_arguments,
+    review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
 )
+from elspeth.web.interpretation_state import reconcile_authoritative_reviews
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 from elspeth.web.secrets.wiring_policy import secret_wiring_authorization_error
 
@@ -81,7 +91,7 @@ class _WireSecretRefArgumentsModel(BaseModel):
 
     name: str
     target: Literal["source", "node", "output"]
-    target_id: str | None = None
+    target_id: _OmittableString = None
     option_key: str
 
     model_config = ConfigDict(extra="forbid")
@@ -105,6 +115,76 @@ def _inventory_item_payload(item: SecretInventoryItem) -> _SecretInventoryItemPa
     }
 
 
+_SECRET_SCOPE_ADAPTER: TypeAdapter[SecretScope] = TypeAdapter(SecretScope)
+_SECRET_REASON_ADAPTER: TypeAdapter[SecretUnavailabilityReason | None] = TypeAdapter(SecretUnavailabilityReason | None)
+
+
+@dataclass(frozen=True, slots=True)
+class _UnlistedSecretRefStatus:
+    name: str
+    available: bool
+
+
+def _admit_secret_inventory_item(value: object) -> SecretInventoryItem:
+    """Reconstruct immutable metadata after checking every owned field."""
+    if type(value) is SecretInventoryItem:
+        name, scope, available, source_kind, reason = value.name, value.scope, value.available, value.source_kind, value.reason
+    elif isinstance(value, (dict, MappingProxyType)) and set(value) == _SecretInventoryItemPayload.__required_keys__:
+        name, scope, available, source_kind, reason = (
+            value["name"],
+            value["scope"],
+            value["available"],
+            value["source_kind"],
+            value["reason"],
+        )
+    else:
+        raise FrameworkBugError("Malformed secret inventory response")
+    if type(name) is not str or type(available) is not bool or type(source_kind) is not str:
+        raise FrameworkBugError("Malformed secret inventory response")
+    try:
+        admitted_scope = _SECRET_SCOPE_ADAPTER.validate_python(scope, strict=True)
+        admitted_reason = _SECRET_REASON_ADAPTER.validate_python(reason, strict=True)
+        return SecretInventoryItem(name, admitted_scope, available, source_kind, admitted_reason)
+    except (PydanticValidationError, ValueError):
+        raise FrameworkBugError("Malformed secret inventory response") from None
+
+
+def _admit_secret_inventory(value: object) -> tuple[SecretInventoryItem, ...]:
+    if type(value) is not list and type(value) is not tuple:
+        raise FrameworkBugError("Malformed secret inventory response")
+    return tuple(_admit_secret_inventory_item(item) for item in value)
+
+
+def _admit_secret_status(value: object) -> SecretInventoryItem | _UnlistedSecretRefStatus:
+    if type(value) is _UnlistedSecretRefStatus:
+        name, available = value.name, value.available
+    elif isinstance(value, (dict, MappingProxyType)) and set(value) == {"name", "available"}:
+        name, available = value["name"], value["available"]
+    else:
+        return _admit_secret_inventory_item(value)
+    if type(name) is not str or type(available) is not bool:
+        raise FrameworkBugError("Malformed secret reference response")
+    return _UnlistedSecretRefStatus(name, available)
+
+
+def _encode_secret_inventory_item(item: SecretInventoryItem) -> JsonValue:
+    return {"name": item.name, "scope": item.scope, "available": item.available, "source_kind": item.source_kind, "reason": item.reason}
+
+
+def _encode_secret_inventory(items: tuple[SecretInventoryItem, ...]) -> JsonValue:
+    return [_encode_secret_inventory_item(item) for item in items]
+
+
+def _encode_secret_status(item: SecretInventoryItem | _UnlistedSecretRefStatus) -> JsonValue:
+    if type(item) is SecretInventoryItem:
+        return _encode_secret_inventory_item(item)
+    return {"name": item.name, "available": item.available}
+
+
+_SECRET_INVENTORY_RESPONSE = SelectedResponseContract(_admit_secret_inventory, _encode_secret_inventory)
+_SECRET_STATUS_RESPONSE = SelectedResponseContract(_admit_secret_status, _encode_secret_status)
+
+
 def _live_validation_failure_reason(item: SecretInventoryItem) -> SecretUnavailabilityReason:
     if item.reason is not None:
         return item.reason
@@ -118,6 +198,7 @@ def _handle_list_secret_refs(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
+    _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_secret_refs arguments")
     if context.secret_service is None or context.user_id is None:
         return _failure_result(state, "Secret tools require secret service context.")
     items = context.secret_service.list_refs(context.user_id)
@@ -130,8 +211,9 @@ _LIST_SECRET_REFS_DECLARATION = ToolDeclaration(
     name="list_secret_refs",
     handler=_handle_list_secret_refs,
     kind=ToolKind.SECRET_DISCOVERY,
+    response_contract=_SECRET_INVENTORY_RESPONSE,
     description=(
-        "List available secret references (API keys, credentials). Each entry carries the reference name, its "
+        "List available secret references (API keys, credentials). Each entry carries the reference `name`, its "
         "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
         "does not); never values."
     ),
@@ -153,6 +235,7 @@ def _handle_validate_secret_ref(
             argument="validate_secret_ref arguments",
             expected="object conforming to _ValidateSecretRefArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
     name = validated.name
     matching_item: SecretInventoryItem | None = None
@@ -174,9 +257,11 @@ _VALIDATE_SECRET_REF_DECLARATION = ToolDeclaration(
     name="validate_secret_ref",
     handler=_handle_validate_secret_ref,
     kind=ToolKind.SECRET_DISCOVERY,
+    response_contract=_SECRET_STATUS_RESPONSE,
     description=(
-        "Check if a secret reference exists and is accessible to the current user. Returns `available` (true when "
-        "it resolves for you) with its `scope` and `source_kind`, or `reason` when it does not."
+        "Check if a secret reference exists and is accessible to the current user. Returns the checked reference `name` "
+        "and `available` (true when it resolves for you). When the reference appears in your inventory, also returns "
+        "its `scope`, `source_kind`, and `reason` (null when available; otherwise the reason it cannot resolve)."
     ),
     json_schema={
         "type": "object",
@@ -187,6 +272,40 @@ _VALIDATE_SECRET_REF_DECLARATION = ToolDeclaration(
         "additionalProperties": False,
     },
 )
+
+
+def _reconciled_secret_wire_result(
+    state: CompositionState,
+    new_state: CompositionState,
+    affected: tuple[str, ...],
+) -> ToolResult:
+    """Publish a secret wire only after authoritative review reconciliation.
+
+    The wire rewrites a component's options in place, so it owes the same
+    post-mutation invariant as splice_transform and the option patchers: a
+    resolved review whose evidence no longer matches the component reopens,
+    or the edit is refused here with ``review_reconciliation_failed`` instead
+    of being accepted and failing at Execute with a bare drift ValueError.
+    """
+    try:
+        reconciled = reconcile_authoritative_reviews(state, new_state)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
+            error_code="review_reconciliation_failed",
+        )
+    canonical_error = _composition_canonical_interpretation_requirement_error(
+        reconciled,
+        tool_name="wire_secret_ref",
+    )
+    if canonical_error is not None:
+        return _failure_result(
+            state,
+            canonical_error,
+            error_code="interpretation_requirements_invalid",
+        )
+    return _mutation_result(reconciled, affected)
 
 
 def _execute_wire_secret_ref(
@@ -204,6 +323,7 @@ def _execute_wire_secret_ref(
             argument="wire_secret_ref arguments",
             expected="object conforming to _WireSecretRefArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
 
     name = validated.name
@@ -250,7 +370,7 @@ def _execute_wire_secret_ref(
         new_source = replace(source, options=patched_options)
         new_state = state.with_named_source(source_name, new_source)
         affected = "source" if source_name == "source" else f"source:{source_name}"
-        return _mutation_result(new_state, (affected,))
+        return _reconciled_secret_wire_result(state, new_state, (affected,))
 
     elif target == "node":
         if target_id is None:
@@ -282,7 +402,7 @@ def _execute_wire_secret_ref(
             return _failure_result(state, placement_error)
         new_node = replace(node, options=patched_options)
         new_state = state.with_node(new_node)
-        return _mutation_result(new_state, (target_id,))
+        return _reconciled_secret_wire_result(state, new_state, (target_id,))
 
     else:
         # ``target == "output"`` — Pydantic ``Literal["source", "node", "output"]``
@@ -312,7 +432,7 @@ def _execute_wire_secret_ref(
             return _failure_result(state, placement_error)
         new_output = replace(output, options=patched_options)
         new_state = state.with_output(new_output)
-        return _mutation_result(new_state, (target_id,))
+        return _reconciled_secret_wire_result(state, new_state, (target_id,))
 
 
 _WIRE_SECRET_REF_DECLARATION = ToolDeclaration(

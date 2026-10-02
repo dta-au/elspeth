@@ -5,9 +5,20 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, cast
 
+from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS
 from elspeth.core.secrets import redact_secret_refs_for_validation
+
+
+class DeferredBlobContractProbe(Exception):
+    """A constructor needs blob bytes unavailable to a resolver-free probe."""
+
+
+def is_inline_content_reference(value: object) -> bool:
+    """Recognize an unresolved value only when it is a valid inline marker."""
+    marker = is_widened_blob_ref(value)
+    return marker is not None and marker.mode == "inline_content"
 
 
 def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str | None) -> dict[str, Any]:
@@ -48,14 +59,18 @@ def prepare_validation_probe_options(options: Mapping[str, Any], *, plugin: str 
     thawed = cast(dict[str, Any], deep_thaw(options))
     runtime_options = strip_authoring_options(thawed)
     prepared = redact_secret_refs_for_validation(runtime_options)
-    if plugin == "llm" and "profile" in prepared and not set(prepared).intersection(LLM_PROFILE_PRIVATE_FIELDS):
+    # Approval evidence is server-stamped after review and is retained by the
+    # runtime config. It is not a private provider binding: its presence must
+    # not disable the same contract probe that worked before approval.
+    binding_fields = LLM_PROFILE_PRIVATE_FIELDS - {"approved_prompt_artifact_hash"}
+    if plugin == "llm" and "profile" in prepared and not set(prepared).intersection(binding_fields):
         from elspeth.plugins.llm.config_validation import GATEWAY_SUPPORTED_CAPABILITIES
 
         # ``profile`` is public authoring input, not executable plugin config;
         # trusted lowering consumes it before writing the private provider and
-        # model binding. The branch arms only when every private field is
-        # absent: a malformed profile-plus-private-field draft stays malformed
-        # and fails closed instead of borrowing this stub.
+        # model binding. The branch arms only when every private provider-binding
+        # field is absent; approval evidence is retained and validated. A malformed
+        # profile-plus-private-binding draft still fails closed.
         del prepared["profile"]
         prepared["provider"] = "gateway"
         prepared["model"] = "validation-probe-model"

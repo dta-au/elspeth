@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -21,7 +22,6 @@ from elspeth.web.execution._validation_materialization import (
     validate_llm_base_url_policy,
     validate_llm_retry_budget_policy,
     validate_llm_tracing_policy,
-    validate_managed_identity_policy,
 )
 from elspeth.web.execution._validation_model import (
     AuthoredValidatedState,
@@ -35,7 +35,8 @@ from elspeth.web.execution.schemas import SemanticEdgeContractResponse
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 
 _BLOB_ID = UUID("5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b")
-_BLOB_HASH = "a" * 64
+_BLOB_CONTENT = b"prompt text"
+_BLOB_HASH = hashlib.sha256(_BLOB_CONTENT).hexdigest()
 
 
 class _YamlGenerator:
@@ -168,7 +169,7 @@ def _ready_blob() -> BlobRecord:
         session_id=UUID("8cf34f4c-27c3-4c51-953a-f679852516a2"),
         filename="prompt.txt",
         mime_type="text/plain",
-        size_bytes=32,
+        size_bytes=len(_BLOB_CONTENT),
         content_hash=_BLOB_HASH,
         storage_path="/tmp/prompt.txt",
         created_at=datetime.now(UTC),
@@ -244,7 +245,7 @@ def test_provider_pass_through_retains_detached_materialized_semantic_evidence()
     )
     assert isinstance(materialization, PhaseReport)
 
-    provider_report = validate_managed_identity_policy(materialization.artifact)
+    provider_report = validate_llm_retry_budget_policy(materialization.artifact)
     assert isinstance(provider_report, PhaseReport)
     interpretation.authored.semantic_contracts[0].outcome = "conflict"
 
@@ -287,15 +288,99 @@ def test_materialization_validates_blob_metadata_and_substitutes_exact_yaml() ->
         data_dir=Path("/tmp/test_data"),
         session_id="test-session",
         blob_get_metadata=get_metadata,
+        blob_get_content=lambda _blob_id: (_ready_blob(), _BLOB_CONTENT),
         load_yaml=lambda pipeline_yaml: config,
     )
 
     assert isinstance(result, PhaseReport)
     expected_config = _blob_config()
-    expected_config["transforms"][0]["options"]["prompt_template"] = "validated blob-backed inline content placeholder"  # type: ignore[index]
+    expected_config["transforms"][0]["options"]["prompt_template"] = "prompt text"  # type: ignore[index]
     assert result.artifact.pipeline_yaml == yaml.dump(expected_config, default_flow_style=False)
-    assert result.checks[0].detail == "All inline-content blob references are valid"
+    assert result.checks[0].detail == "All inline-content blob references and bytes are valid"
     assert requested == [_BLOB_ID]
+
+
+@pytest.mark.parametrize("metadata_available", [False, True])
+@pytest.mark.parametrize("content_available", [False, True])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"prompt_template": "Explain blob_ref and inline_content in {{ row.text }}"},
+        {"reference": "blob_ref,inline_content\ncolumn name,literal data\n"},
+    ],
+    ids=["literal-prompt", "reference-table"],
+)
+def test_materialization_without_discovered_refs_needs_no_blob_readers(
+    options: dict[str, object], metadata_available: bool, content_available: bool
+) -> None:
+    config = {"transforms": [{"name": "node", "options": options}]}
+    pipeline_yaml = yaml.safe_dump(config)
+
+    def unexpected_metadata_read(blob_id: UUID) -> BlobRecord:
+        pytest.fail(f"No reference should request metadata for {blob_id}")
+
+    def unexpected_content_read(blob_id: UUID) -> tuple[BlobRecord, bytes]:
+        pytest.fail(f"No reference should request content for {blob_id}")
+
+    result = materialize_validation_yaml(
+        _interpretation(_state(), contracts=(_contract(),)),
+        yaml_generator=_YamlGenerator(pipeline_yaml),
+        data_dir=Path("/tmp/test_data"),
+        session_id="test-session",
+        blob_get_metadata=unexpected_metadata_read if metadata_available else None,
+        blob_get_content=unexpected_content_read if content_available else None,
+        load_yaml=yaml.safe_load,
+    )
+
+    assert isinstance(result, PhaseReport)
+    assert result.artifact.pipeline_yaml == pipeline_yaml
+    assert result.artifact.authored.semantic_contracts == (_contract(),)
+    assert [(check.name, check.passed, check.detail) for check in result.checks] == [
+        ("blob_inline_refs", True, "No inline-content blob references found")
+    ]
+
+
+@pytest.mark.parametrize("metadata_available", [False, True])
+def test_materialization_discovered_ref_still_requires_blob_readers(metadata_available: bool) -> None:
+    result = materialize_validation_yaml(
+        _interpretation(_state()),
+        yaml_generator=_YamlGenerator(yaml.safe_dump(_blob_config())),
+        data_dir=Path("/tmp/test_data"),
+        session_id="test-session",
+        blob_get_metadata=(lambda _blob_id: _ready_blob()) if metadata_available else None,
+        load_yaml=yaml.safe_load,
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.detail == "node:node.options.prompt_template: not_ready"
+    assert len(result.errors) == 1
+    assert result.errors[0].error_code == "not_ready_inline_blob_content"
+    reader = "content" if metadata_available else "metadata"
+    assert f"authorized blob {reader} read is unavailable" in result.errors[0].message
+
+
+def test_materialization_malformed_marker_is_not_treated_as_no_references() -> None:
+    config = {
+        "transforms": [
+            {
+                "name": "node",
+                "options": {"prompt_template": {"blob_ref": "invalid-uuid", "mode": "inline_content", "sha256": _BLOB_HASH}},
+            }
+        ]
+    }
+    result = materialize_validation_yaml(
+        _interpretation(_state()),
+        yaml_generator=_YamlGenerator(yaml.safe_dump(config)),
+        data_dir=Path("/tmp/test_data"),
+        session_id="test-session",
+        blob_get_metadata=None,
+        load_yaml=yaml.safe_load,
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.detail == "node:node.options.prompt_template: malformed"
+    assert len(result.errors) == 1
+    assert result.errors[0].error_code == "malformed_inline_blob_content"
 
 
 def test_materialization_blob_failure_preserves_diagnostics_and_semantic_evidence() -> None:
@@ -360,21 +445,46 @@ def test_materialization_rejects_non_dict_yaml_as_an_uncaught_invariant() -> Non
 
 
 @pytest.mark.parametrize(
+    ("source_name", "component_id"),
+    [("source", "source"), ("orders", "source:orders"), ("7", "source:7"), (7, "source:<invalid>"), (None, "source:<invalid>")],
+)
+@pytest.mark.parametrize("policy_case", ["aws_endpoint", "aws_source", "llm_base_url"])
+def test_provider_policy_source_component_ids(source_name: object, component_id: str, policy_case: str) -> None:
+    source = (
+        _source(plugin="llm", options={"base_url": "https://provider.example/v1"})
+        if policy_case == "llm_base_url"
+        else _source(plugin="aws_s3", options={"endpoint_url": "https://storage.example"})
+    )
+    state = CompositionState(
+        sources={cast(str, source_name): source},
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    artifact = _materialized(state)
+    if policy_case == "aws_endpoint":
+        result = validate_aws_s3_endpoint_url_policy(artifact, plugin_snapshot=_web_snapshot())
+        error_code = "aws_s3_endpoint_url_not_allowed"
+    elif policy_case == "aws_source":
+        result = validate_aws_s3_source_policy(artifact, plugin_snapshot=_web_snapshot())
+        error_code = "aws_s3_source_profile_required"
+    else:
+        result = validate_llm_base_url_policy(artifact)
+        error_code = "llm_base_url_not_allowed"
+
+    assert isinstance(result, PhaseFailure)
+    assert [(error.component_id, error.component_type, error.error_code) for error in result.errors] == [
+        (component_id, "source", error_code)
+    ]
+    assert result.failed_check.affected_nodes == (component_id,)
+    assert result.readiness.blockers[0].component_id == component_id
+
+
+@pytest.mark.parametrize(
     ("phase_name", "policy_state", "check_name", "error_code"),
     [
-        (
-            "managed",
-            _state(
-                nodes=(
-                    _node(
-                        plugin="rag_retrieval",
-                        options={"provider": "azure_search", "provider_config": {"use_managed_identity": True}},
-                    ),
-                )
-            ),
-            "managed_identity_policy",
-            None,
-        ),
         ("retry", _state(nodes=(_node(plugin="llm", options={"queries": [{}]}),)), "llm_retry_budget_policy", None),
         (
             "base_url",
@@ -405,9 +515,7 @@ def test_provider_policy_phases_read_authored_policy_and_preserve_failure_eviden
 ) -> None:
     artifact = _materialized(policy_state, materialized_state=_state())
     snapshot = _web_snapshot()
-    if phase_name == "managed":
-        result = validate_managed_identity_policy(artifact)
-    elif phase_name == "retry":
+    if phase_name == "retry":
         result = validate_llm_retry_budget_policy(artifact)
     elif phase_name == "base_url":
         result = validate_llm_base_url_policy(artifact)
@@ -430,7 +538,6 @@ def test_provider_policy_phases_read_authored_policy_and_preserve_failure_eviden
 @pytest.mark.parametrize(
     ("phase_name", "check_name"),
     [
-        ("managed", "managed_identity_policy"),
         ("retry", "llm_retry_budget_policy"),
         ("base_url", "llm_base_url_policy"),
         ("tracing", "llm_tracing_policy"),
@@ -441,9 +548,7 @@ def test_provider_policy_phases_read_authored_policy_and_preserve_failure_eviden
 def test_provider_policy_successes_detach_materialized_semantic_evidence(phase_name: str, check_name: str) -> None:
     artifact = _materialized(_state())
     snapshot = _web_snapshot()
-    if phase_name == "managed":
-        result = validate_managed_identity_policy(artifact)
-    elif phase_name == "retry":
+    if phase_name == "retry":
         result = validate_llm_retry_budget_policy(artifact)
     elif phase_name == "base_url":
         result = validate_llm_base_url_policy(artifact)
@@ -491,14 +596,11 @@ def test_s3_source_policy_accepts_profile_lowered_source_evidence() -> None:
 # Node-kind widening of the materialization-phase gates
 # (elspeth-df8082552d, sites a / a2 / a3).
 #
-# All three pre-filtered to ``node_type == "transform"``. Two distinct
-# shapes, and only one of them is latent:
+# These pre-filtered to ``node_type == "transform"``. The option-shaped
+# managed-identity gate that shared the defect is gone: Azure AI Search is
+# reached only through an operator profile, and that requirement's own
+# node-kind sweep lives in ``tests/unit/web/plugin_policy/test_validation.py``.
 #
-#   - ``validate_managed_identity_policy`` is OPTION-shaped (it reads
-#     ``options["provider"]`` / ``options["provider_config"]`` and never the
-#     plugin name), so ``node_type`` was its ONLY limiter. Measured before
-#     the fix, with a transform control: transform FIRES, aggregation and
-#     collector SILENT.
 #   - ``_llm_policy_components`` feeds the base-URL and tracing egress gates.
 #     Its collector half is unreachable for today's builtin ``llm`` (which is
 #     not batch-aware), but the helper must keep node-kind and capability
@@ -507,11 +609,6 @@ def test_s3_source_policy_accepts_profile_lowered_source_evidence() -> None:
 #     subject tests for alternate plugin names live in
 #     ``test_llm_capability_security_gates.py`` (elspeth-c7626ae109).
 # ---------------------------------------------------------------------------
-
-_MANAGED_IDENTITY_OPTIONS: dict[str, object] = {
-    "provider": "azure_search",
-    "provider_config": {"use_managed_identity": True},
-}
 
 
 def _kind_node(node_type: str, *, plugin: str, options: dict[str, object]) -> NodeSpec:
@@ -530,31 +627,6 @@ def _kind_node(node_type: str, *, plugin: str, options: dict[str, object]) -> No
         policy=None,
         merge=None,
     )
-
-
-@pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])
-def test_managed_identity_gate_fires_on_every_plugin_bearing_node_kind(node_type: str) -> None:
-    """Credential-egress gate. ``transform`` is the control."""
-    plugin = "rag_retrieval" if node_type == "transform" else "batch_stats"
-    state = _state(nodes=(_kind_node(node_type, plugin=plugin, options=_MANAGED_IDENTITY_OPTIONS),))
-
-    result = validate_managed_identity_policy(_materialized(state))
-
-    assert isinstance(result, PhaseFailure)
-    assert result.failed_check.name == "managed_identity_policy"
-    assert result.errors[0].component_id == "n1"
-    assert node_type in result.failed_check.detail.lower()
-
-
-def test_managed_identity_gate_skips_plugin_less_structural_nodes() -> None:
-    """Subject set is ``node.plugin is not None``. A gate's options are inert
-    — nothing resolves a plugin for it, so nothing can act on the value.
-    """
-    gate_node = _kind_node("gate", plugin=cast(Any, None), options=_MANAGED_IDENTITY_OPTIONS)
-
-    result = validate_managed_identity_policy(_materialized(_state(nodes=(gate_node,))))
-
-    assert isinstance(result, PhaseReport)
 
 
 @pytest.mark.parametrize("node_type", ["transform", "aggregation", "collector"])

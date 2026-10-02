@@ -48,9 +48,40 @@ function isApiError(value: unknown): value is ApiError {
   );
 }
 
+// The run-outputs routes (execution/routes.py) raise these with a
+// dict `detail` carrying only `error_type` (plus non-human fields like
+// `path_or_uri`) — no human-readable string. The global HTTP exception
+// handler (app.py's `_structured_error_envelope`) only adds `request_id`
+// to that dict, so `ApiError.detail` lands on `response.statusText`
+// ("Not Found", "Forbidden", "Service Unavailable" — or "" over HTTP/2,
+// which is empty and falsy). Branch on the structured `error_type` first,
+// the same way the `artifact_purged_or_moved` race already does below,
+// rather than showing the operator a bare HTTP reason phrase.
+const RUN_OUTPUTS_ERROR_COPY: Readonly<Record<string, string>> = {
+  run_outputs_audit_unavailable:
+    "This run's audit trail is unavailable right now. Refresh once the Landscape audit store is back online.",
+  artifact_not_found:
+    "This artifact is no longer listed in the run's output manifest.",
+  output_path_outside_allowlist:
+    "This artifact's stored path is outside the deployment's allowed output directories and cannot be served.",
+  artifact_path_resolution_failed:
+    "The server could not resolve this artifact's file path.",
+  object_store_artifact_not_streamable:
+    "This artifact is stored in an object store with no filesystem mirror and cannot be downloaded from here.",
+  object_store_artifact_not_previewable:
+    "This artifact is stored in an object store with no filesystem mirror and cannot be previewed here.",
+  artifact_content_drift:
+    "This artifact's file on disk no longer matches what the run recorded and cannot be downloaded.",
+  artifact_purged_or_moved:
+    "This artifact's file no longer exists at its recorded location (it may have been purged or moved) and cannot be downloaded.",
+  range_not_satisfiable:
+    "The requested portion of this artifact could not be read.",
+};
+
 function formatError(value: unknown, fallback: string): string {
   if (isApiError(value)) {
-    return value.detail || fallback;
+    const copy = value.error_type ? RUN_OUTPUTS_ERROR_COPY[value.error_type] : undefined;
+    return copy ?? (value.detail || fallback);
   }
   if (value instanceof Error) {
     return value.message;

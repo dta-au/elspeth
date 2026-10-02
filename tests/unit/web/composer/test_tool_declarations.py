@@ -5,7 +5,8 @@ Ticket: elspeth-6c9972ccbf (Composer tools — ToolDeclaration paradigm).
 Step 1 introduces ``ToolDeclaration`` and migrates ``create_blob`` as the
 exemplar. The migration must be byte-identity-preserving — the schema the LLM
 sees pre- and post-migration is identical — and the declaration's invariants
-must crash early when violated (offensive-programming policy, see CLAUDE.md).
+must crash early when violated (see the ``engine-patterns-reference`` skill
+§Offensive Programming Examples).
 
 These tests guard the migration's correctness independent of the import-time
 parity assertions in ``_dispatch.py``: parity asserts the declaration agrees
@@ -51,7 +52,7 @@ _EXPECTED_CREATE_BLOB_DEFINITION: dict[str, object] = {
     "description": (
         "Create a new file (blob) from inline content. "
         "Use this to create seed input files (URLs, JSON, CSV snippets) "
-        "mid-conversation without requiring manual upload. Returns the new blob's `blob_id`, "
+        "mid-conversation without requiring manual upload. Returns the new blob's `blob_id`, `filename`, `mime_type`, "
         "`content_hash`, `size_bytes`, and `originated_in` (`this_tool_call`: the blob was authored by "
         "this call, not uploaded)."
     ),
@@ -86,7 +87,7 @@ _EXPECTED_UPDATE_BLOB_DEFINITION: dict[str, object] = {
     "name": "update_blob",
     "description": (
         "Update the content of an existing blob (file). Overwrites the file content while preserving metadata. "
-        "Returns the new `content_hash` and `size_bytes`."
+        "Returns `blob_id`, `filename`, `mime_type`, and the new `content_hash` and `size_bytes`."
     ),
     "parameters": {
         "type": "object",
@@ -108,7 +109,7 @@ _EXPECTED_UPDATE_BLOB_DEFINITION: dict[str, object] = {
 
 _EXPECTED_DELETE_BLOB_DEFINITION: dict[str, object] = {
     "name": "delete_blob",
-    "description": "Delete a blob (file) and its storage. Returns `deleted`: true.",
+    "description": "Delete a blob (file) and its storage. Returns the deleted `blob_id` and `deleted`: true.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -429,7 +430,9 @@ class TestStep3DiscoveryTierMigration:
                 "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
                 "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
                 "    are also carried on list_sources / list_transforms / list_sinks / "
-                "    get_plugin_schema responses; this tool is the explicit path.)\n"
+                "    get_plugin_schema responses; this tool is the explicit path.) `examples` "
+                "    may also be populated in this mode — it is plugin-defined, not exclusive "
+                "    to failure mode.\n"
                 "  * Pass an ``issue_code`` (validators emit these as requirement_code "
                 "    on semantic_contracts entries) to get failure-time guidance — "
                 "    `summary`, `suggested_fixes`, and `examples` — each a `title` with the "
@@ -487,6 +490,8 @@ class TestStep3DiscoveryTierMigration:
                     "limit": {
                         "type": "integer",
                         "description": "Max models to return (default 50).",
+                        "minimum": 1,
+                        "default": 50,
                     },
                 },
                 "required": [],
@@ -523,7 +528,9 @@ class TestStep3DiscoveryTierMigration:
             "for what it does not cover: a component the change did not touch, or "
             "the whole document. A node or output request returns just `node` or "
             '`output`; `component="source"` returns the `sources` map; '
-            "`set_pipeline_arguments` returns the exact round-trip arguments. A "
+            "`set_pipeline_arguments` returns the flat pipeline document. For the web "
+            'set_pipeline tool, put that document inside {"pipeline": <document>}; do not '
+            "send its source/nodes/edges/outputs fields at the top level. A "
             "full-state read (no component, or an alias) returns the whole document "
             "with an `inspection` block: `requested_component` (what you asked for), "
             "`resolved_component` (always `full` here — the request matched a "
@@ -537,8 +544,9 @@ class TestStep3DiscoveryTierMigration:
                         "description": (
                             "Optional: return only one component — 'source', a node ID, or an output name. "
                             "Accepted full-state aliases: omit component, pass 'full', 'all', 'pipeline', "
-                            "or pass the empty string. Use 'set_pipeline_arguments' for the exact public "
-                            "payload accepted by set_pipeline; ordinary inspection output is diagnostic only."
+                            "or pass the empty string. Use 'set_pipeline_arguments' for the flat authoring document; "
+                            'the web set_pipeline call requires {"pipeline": <document>}. '
+                            "Ordinary inspection output is diagnostic only."
                         ),
                     },
                 },
@@ -569,7 +577,8 @@ class TestStep3DiscoveryTierMigration:
             "`structural_preview` when present (an advisory re-check whose "
             "`is_valid` is not the verdict), and a read-only overview: `sources` "
             "(keyed by source name, each with `plugin`, `on_success` and "
-            "`has_schema_config`), `nodes`, `outputs`, `node_count`, "
+            "`has_schema_config`), `nodes` (each with `id`, `node_type`, `plugin`), "
+            "`outputs` (each with `name`, `plugin`), `node_count`, "
             "`output_count`.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -639,7 +648,12 @@ class TestStep3MutationTierMigration:
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "source_name": {"type": "string", "description": "Source root name to clear. Defaults to 'source'."},
+                    "source_name": {
+                        "type": "string",
+                        "description": "Source root name to clear. Defaults to 'source'.",
+                        "minLength": 1,
+                        "default": "source",
+                    },
                 },
                 "required": [],
                 "additionalProperties": False,
@@ -698,6 +712,7 @@ class TestStep3MutationTierMigration:
                     "patch": {
                         "type": "object",
                         "description": "Partial metadata update. Only included fields are changed.",
+                        "additionalProperties": False,
                         "properties": {
                             "name": {"type": "string"},
                             "description": {"type": "string"},
@@ -894,7 +909,7 @@ class TestStep3BlobDiscoveryTierMigration:
         assert self._get("list_blobs") == {
             "name": "list_blobs",
             "description": (
-                "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, filename, "
+                "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, `filename`, "
                 "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
@@ -917,7 +932,7 @@ class TestStep3BlobDiscoveryTierMigration:
     def test_get_blob_metadata(self) -> None:
         assert self._get("get_blob_metadata") == {
             "name": "get_blob_metadata",
-            "description": "Get metadata for a specific blob (file) by ID: `id`, filename, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
+            "description": "Get metadata for a specific blob (file) by ID: `id`, `filename`, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -932,7 +947,8 @@ class TestStep3BlobDiscoveryTierMigration:
         assert self._get("get_blob_content") == {
             "name": "get_blob_content",
             "description": (
-                "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters "
+                "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`. "
+                "Large files are truncated to 50,000 characters "
                 "(`truncated` is true when so; `size_bytes` is the full size). "
                 "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
                 "`creation_modality` — so content the assistant generated earlier is not mistaken for a discovered file."
@@ -955,12 +971,19 @@ class TestStep3BlobDiscoveryTierMigration:
             "name": "inspect_source",
             "description": (
                 "Return bounded structural facts about a blob-backed source: `source_kind`, "
-                "`observed_headers`, `sample_row_count`, inferred scalar types per column, "
+                "`observed_headers`, `runtime_headers`, `field_name_mapping` (raw CSV labels to runtime row keys), "
+                "`sample_row_count`, `inferred_types` (lexical scalar-type observations per column, not runtime coercions), "
                 "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
                 "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
                 "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
-                "before declaring a fixed CSV/JSON schema — observed headers and inferred types "
-                "tell you which fields the source actually contains and what numeric coercion is "
+                "before declaring a fixed CSV/JSON schema — observed_headers are raw headers. "
+                "For CSV, declare runtime_headers exactly (case_study_ becomes case_study), or the source field_mapping target; "
+                "field_name_mapping preserves the raw-label provenance and headerless columns are carried as written. "
+                "Null runtime_headers means the bounded header could not be resolved reliably because of naming, parsing, "
+                "truncation, or encoding; follow warnings to correct or inspect the input before declaring fields. "
+                "Uploaded/path-bound headers are samples, not guaranteed_fields: use a flexible/fixed schema with "
+                "non-optional fields for a runtime contract, or source_data_contract review and user acknowledgement "
+                "for observed-mode guarantees. Inferred types are lexical observations that tell you what numeric coercion is "
                 "needed before any gate or value_transform numeric op. Never returns raw row "
                 "content; only summary facts."
             ),
@@ -1036,7 +1059,7 @@ class TestStep3SecretTierMigration:
         assert self._get("list_secret_refs") == {
             "name": "list_secret_refs",
             "description": (
-                "List available secret references (API keys, credentials). Each entry carries the reference name, its "
+                "List available secret references (API keys, credentials). Each entry carries the reference `name`, its "
                 "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
                 "does not); never values."
             ),
@@ -1047,8 +1070,9 @@ class TestStep3SecretTierMigration:
         assert self._get("validate_secret_ref") == {
             "name": "validate_secret_ref",
             "description": (
-                "Check if a secret reference exists and is accessible to the current user. Returns `available` (true when "
-                "it resolves for you) with its `scope` and `source_kind`, or `reason` when it does not."
+                "Check if a secret reference exists and is accessible to the current user. Returns the checked reference `name` "
+                "and `available` (true when it resolves for you). When the reference appears in your inventory, also returns "
+                "its `scope`, `source_kind`, and `reason` (null when available; otherwise the reason it cannot resolve)."
             ),
             "parameters": {
                 "type": "object",

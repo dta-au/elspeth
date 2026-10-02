@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, cast
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
@@ -87,7 +88,8 @@ _SET_OUTPUT_DECLARATION = ToolDeclaration(
                 "type": "object",
                 "description": (
                     f"Plugin-specific config. For {FILE_SINK_PLUGIN_SLASH_TEXT} file sinks in runnable web pipelines, "
-                    "include path, schema, and explicit collision_policy." + _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE
+                    "include path, schema, and explicit collision_policy. Sink schema.fields and custom header keys use the carried row names, normally normalized source headers or mapping targets."
+                    + _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
             "on_write_failure": {
@@ -137,7 +139,7 @@ def _execute_set_output(
     context: ToolContext,
 ) -> ToolResult:
     """Add or replace a pipeline output (sink)."""
-    validated = cast(_SetOutputArgumentsModel, _validate_mutation_arguments(_SetOutputArgumentsModel, args, "set_output arguments"))
+    validated = _validate_mutation_arguments(_SetOutputArgumentsModel, args, "set_output arguments")
     plugin = validated.plugin
     sink_options = validated.options
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(plugin, sink_options)
@@ -201,9 +203,7 @@ def _execute_remove_output(
 ) -> ToolResult:
     """Remove a pipeline output (sink) by name."""
     del context  # unused; signature uniformity with the other handlers.
-    validated = cast(
-        _RemoveOutputArgumentsModel, _validate_mutation_arguments(_RemoveOutputArgumentsModel, args, "remove_output arguments")
-    )
+    validated = _validate_mutation_arguments(_RemoveOutputArgumentsModel, args, "remove_output arguments")
     sink_name = validated.sink_name
     new_state = state.without_output(sink_name)
     if new_state is None:
@@ -235,6 +235,7 @@ def _execute_patch_output_options(
             argument="patch_output_options arguments",
             expected="object conforming to PatchOutputOptionsArgumentsModel",
             actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
     sink_name = validated.sink_name
     patch = validated.patch

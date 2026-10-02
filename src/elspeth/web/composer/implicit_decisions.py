@@ -11,13 +11,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, TypedDict
+from uuid import UUID
 
+from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX
 from elspeth.contracts.composer_interpretation import InterpretationKind
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
-from elspeth.web.composer.guided_blob_refs import GUIDED_REVIEWED_BLOB_PATH_KEYS, validate_guided_reviewed_blob_ref
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
 from elspeth.web.interpretation_state import (
@@ -26,6 +25,7 @@ from elspeth.web.interpretation_state import (
     parse_interpretation_requirements,
     resolved_source_data_contract_fields,
 )
+from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
 from elspeth.web.plugin_policy.validation import _PROFILE_LOWERING_METADATA_OPTION_KEYS
 
 DecisionCategory = Literal[
@@ -61,7 +61,6 @@ class ImplicitDecisionEntry(TypedDict, total=False):
 class ImplicitDecisionsReport(TypedDict):
     schema_version: int
     entries: list[ImplicitDecisionEntry]
-    normalization_events: list[dict[str, object]]
 
 
 _FORMAT_ALTERNATIVES = ["html", "markdown", "text"]
@@ -70,13 +69,8 @@ _COLLISION_POLICY_ALTERNATIVES = ["fail", "overwrite", "auto_increment"]
 _ROUTING_ALTERNATIVES = ["discard", "named_sink"]
 _MODEL_PROVIDER_ALTERNATIVES = ["openrouter", "azure_openai"]
 
-# The blob storage-path carriers, shared verbatim with the guided reviewed-source
-# reader and (as of elspeth-b5180a9630) ``redact_source_storage_path``, which
-# previously kept its own ``("path", "file")`` literal: blob ownership detection
-# and the fork rewrite treat ``path`` and ``file`` equivalently, so one carrier
-# list has to serve every masking surface or the surface holding a stale copy
-# leaks a source authored with the other shape.
-_STORAGE_PATH_CARRIER_KEYS = GUIDED_REVIEWED_BLOB_PATH_KEYS
+# The blob ownership and fork-copy paths use the same source carriers.
+_STORAGE_PATH_CARRIER_KEYS = SOURCE_LOCAL_PATH_OPTION_KEYS
 
 
 def build_implicit_decisions_report(state: CompositionState) -> ImplicitDecisionsReport:
@@ -86,6 +80,8 @@ def build_implicit_decisions_report(state: CompositionState) -> ImplicitDecision
     model prose. That means it is conservative about provenance: when the final
     state alone cannot prove whether a value came from the operator or a
     deployment identity record, the entry says ``explicit_source_required``.
+    Schema version 2 omits the unused normalization-event field: final state
+    cannot establish a history of normalization operations.
     """
 
     entries: list[ImplicitDecisionEntry] = []
@@ -97,9 +93,8 @@ def build_implicit_decisions_report(state: CompositionState) -> ImplicitDecision
         entries.extend(_output_entries(output))
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "entries": entries,
-        "normalization_events": [],
     }
 
 
@@ -226,9 +221,7 @@ def _blob_storage_path_sentinel(options: Mapping[str, Any]) -> str | None:
 
     ``options`` is composer/LLM-authored (Tier 3, ADR-032), so the marker's VALUE
     is parsed rather than trusted: it is interpolated only after
-    :func:`validate_guided_reviewed_blob_ref` proves it is a canonical UUID
-    string — the same shape every other consumer requires (the YAML-export guard
-    in ``routes/composer/state.py``, the guided reviewed-source reader). A
+    a strict UUID parse proves it is a canonical UUID string. A
     ``str`` check alone would not be enough: a *path-shaped* ``blob_ref`` would
     then ride out through the sentinel itself as
     ``blob:/var/lib/elspeth/blobs/...``, reopening the leak inside the very
@@ -249,8 +242,10 @@ def _blob_storage_path_sentinel(options: Mapping[str, Any]) -> str | None:
     if "blob_ref" not in options:
         return None
     try:
-        blob_ref = validate_guided_reviewed_blob_ref(options["blob_ref"])
-    except AuditIntegrityError:
+        blob_ref = options["blob_ref"]
+        if type(blob_ref) is not str or str(UUID(blob_ref)) != blob_ref:
+            return REDACTED_BLOB_SOURCE_PATH
+    except ValueError:
         return REDACTED_BLOB_SOURCE_PATH
     return f"{BLOB_REF_PATH_PREFIX}{blob_ref}"
 
@@ -271,18 +266,9 @@ def _flatten_options(
     outbound serializer is what makes THAT class can't-regress: for those
     sources there is no raw path left downstream to forget to mask.
 
-    The claim is scoped to blob_ref-bearing sources on purpose. A guided commit
-    strips ``blob_ref`` from the executable source (it cannot prove
-    ``path == storage_path``), so its raw path DOES still enter
-    ``composer_meta`` and remains protected by the outbound projection in
-    ``redact_guided_snapshot_storage_paths`` (``redaction.py``, the
-    ``private_path_projections`` block). Two mechanisms, two populations —
-    neither subsumes the other, and removing either reopens a leak.
-
     Only ``prefix == ""`` keys are substituted. A nested ``<group>.path`` is an
     unrelated plugin option, not a blob binding — the same top-level-only scope
-    the sibling ``redact_source_storage_path`` uses, and the scope the guided
-    projection's ``{"source.path", "source.file"}`` literals assume.
+    the sibling ``redact_source_storage_path`` uses.
     """
     flattened: list[tuple[str, object]] = []
     for key in sorted(options):
@@ -454,7 +440,7 @@ def _is_server_stamped_option_path(path: str) -> bool:
 
     The key inventory derives from the same constants the write gates and the
     planner projection use (``AUTHORING_METADATA_OPTION_KEYS`` plus the
-    profile-lowering superset carrying ``resolved_prompt_template_hash``) —
+    profile-lowering superset carrying ``approved_prompt_artifact_hash``) —
     never a hand-rolled list. Only the TOP-LEVEL options segment counts:
     source paths are ``source.<key>...``; node/output paths are
     ``<prefix>.options.<key>...``.
@@ -472,7 +458,7 @@ def _is_server_stamped_option_path(path: str) -> bool:
 def _provenance_for_path(path: str, value: object) -> DecisionProvenance:
     if _is_server_stamped_option_path(path):
         # source_authoring.* / interpretation_requirements /
-        # prompt_template_parts / resolved_prompt_template_hash are written by
+        # prompt_template_parts / approved_prompt_artifact_hash are written by
         # ELSPETH's provenance and review machinery, never chosen by the
         # planner — attributing them to the composer misinforms the auditor
         # (elspeth-c67fbbbd83).

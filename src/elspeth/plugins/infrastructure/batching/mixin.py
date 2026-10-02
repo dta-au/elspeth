@@ -220,7 +220,8 @@ class BatchTransformMixin(BatchTransformRuntime):
         if self._batch_shutdown.is_set():
             raise ShutdownError("Batch processing has been shut down")
 
-        # No defensive fallback - ctx.token is required (CLAUDE.md compliance)
+        # No defensive fallback - ctx.token is required
+        # (docs/guides/data-trust-and-error-handling.md §The Defensive Programming Prohibition)
         if ctx.token is None:
             raise ValueError("BatchTransformMixin requires ctx.token to be set. This is a bug in the calling code.")
 
@@ -409,7 +410,8 @@ class BatchTransformMixin(BatchTransformRuntime):
                     # This is an internal invariant violation (e.g., buffer corruption).
                     # Re-raise immediately -- this is our bug, not a row-level error.
                     raise
-                # Output port failure - this is a bug (CLAUDE.md compliance)
+                # Output port failure - this is a bug (docs/guides/data-trust-and-error-handling.md
+                # §Plugin Ownership)
                 # Wrap exception and emit it so the waiter can propagate, rather than hanging
                 tb = traceback.format_exc()
 

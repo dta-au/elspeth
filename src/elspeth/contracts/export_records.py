@@ -10,6 +10,57 @@ from __future__ import annotations
 from typing import Any, Literal, TypedDict
 
 
+class AuditExportPublicConfig(TypedDict):
+    auth_events: Literal["omitted", "deployment_snapshot"]
+    compartment_id: str
+    chunking_algorithm_version: str
+    export_format: str
+    exporter_version: str
+    include_raw_error_rows: bool
+    per_chunk_byte_limit: int
+    per_chunk_record_limit: int
+    serialization_version: str
+    signer_key_id: str
+    signing_mode: Literal["unsigned", "hmac_sha256"]
+
+
+class AuditExportConfigRecord(TypedDict):
+    """Signed public shaping configuration, independently bound to the registry."""
+
+    record_type: Literal["audit_export_config"]
+    public_config: AuditExportPublicConfig
+
+
+class AuthEventCoverageExportRecord(TypedDict):
+    """Signed selection declaration; omission is never an empty history."""
+
+    record_type: Literal["auth_event_coverage"]
+    policy: Literal["omitted", "deployment_snapshot"]
+    selection_cutoff: str | None
+    selection_basis: Literal["visible_rows_at_or_before_run_completion"] | None
+    selected_count: int | None
+    reason: Literal["not_requested", "deployment_snapshot"]
+
+
+class AuthEventExportRecord(TypedDict):
+    """Stored auth evidence without reconstructing missing historical identity."""
+
+    record_type: Literal["auth_event"]
+    event_id: str
+    occurred_at: str
+    event_type: str
+    outcome: str
+    provider: str
+    user_id: str | None
+    username: str | None
+    failure_category: str | None
+    request_id: str | None
+    client_host: str | None
+    user_agent: str | None
+    identity_id: str | None
+    metadata: dict[str, Any]
+
+
 class RunExportRecord(TypedDict):
     record_type: Literal["run"]
     run_id: str
@@ -51,6 +102,8 @@ class WebPluginPolicyExportRecord(TypedDict):
     plugin_code_identities: list[list[str]]
     binding_generation_fingerprint: str
     decision_codes: list[str]
+    admission_decision_json: str | None
+    admission_decision_hash: str | None
 
 
 class NodeExportRecord(TypedDict):
@@ -64,7 +117,6 @@ class NodeExportRecord(TypedDict):
     determinism: str
     config_hash: str
     config: Any  # Resolved config — structure varies by plugin
-    schema_hash: str | None
     schema_mode: str | None
     schema_fields: list[dict[str, object]] | None
     sequence_in_pipeline: int | None
@@ -146,6 +198,19 @@ class TransformErrorExportRecord(TypedDict):
     created_at: str
 
 
+class CallVerificationExportRecord(TypedDict):
+    """Persisted comparison evidence, including unmatched source calls."""
+
+    record_type: Literal["call_verification"]
+    run_id: str
+    current_call_id: str
+    source_run_id: str
+    source_call_id: str | None
+    is_match: bool | None
+    differences_json: str
+    recorded_at: str
+
+
 class CallExportRecord(TypedDict):
     """External call record — parented by either a node_state or an operation.
 
@@ -162,7 +227,11 @@ class CallExportRecord(TypedDict):
     status: str
     request_hash: str | None
     response_hash: str | None
-    resolved_prompt_template_hash: str | None
+    approved_prompt_artifact_hash: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    cached_prompt_tokens: int | None
+    reasoning_tokens: int | None
     latency_ms: float | None
     request_ref: str | None
     response_ref: str | None
@@ -180,6 +249,7 @@ class RowExportRecord(TypedDict):
     source_node_id: str
     source_data_hash: str | None
     source_data_ref: str | None
+    source_contract_json: str | None
     created_at: str
 
 
@@ -223,6 +293,17 @@ class GroupLossExportRecord(TypedDict):
     recorded_by: str
     recorded_at: str
     adopted_epoch: int | None
+
+
+class CollectorGroupFailureExportRecord(TypedDict):
+    """One durable failure verdict per collector group."""
+
+    record_type: Literal["collector_group_failure"]
+    run_id: str
+    group_id: str
+    collector_node_id: str
+    failure_reason: str
+    recorded_at: str
 
 
 class TokenParentExportRecord(TypedDict):
@@ -452,6 +533,9 @@ class SinkEffectAttemptExportRecord(TypedDict):
 
 ExportRecord = (
     RunExportRecord
+    | AuditExportConfigRecord
+    | AuthEventExportRecord
+    | AuthEventCoverageExportRecord
     | WebPluginPolicyExportRecord
     | SecretResolutionExportRecord
     | NodeExportRecord
@@ -460,12 +544,14 @@ ExportRecord = (
     | ValidationErrorExportRecord
     | TransformErrorExportRecord
     | CallExportRecord
+    | CallVerificationExportRecord
     | RowExportRecord
     | TokenExportRecord
     | TokenParentExportRecord
     | TokenOutcomeExportRecord
     | GroupRecordExportRecord
     | GroupLossExportRecord
+    | CollectorGroupFailureExportRecord
     | SchedulerEventExportRecord
     | NodeStateExportRecord
     | RoutingEventExportRecord

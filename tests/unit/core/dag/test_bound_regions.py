@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar, get_args
 
 import pytest
 
 from elspeth.contracts.enums import FrameKind, NodeType, RoutingMode
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.contracts.types import GateName, NodeID, SinkName
 from elspeth.core.config import (
     AggregationSettings,
@@ -46,10 +50,16 @@ class _BoundRegionMockSource:
     on_success = "source_out"
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
 
 
 class _BoundRegionMockSink:
     """A mock sink with a caller-chosen name, for graphs needing >1 sink."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # SinkProtocol spelling surface: this fake declares no schema field names beyond its required fields.
+        return frozenset(self.declared_required_fields)
 
     input_schema = None
     config: ClassVar[dict[str, Any]] = {}
@@ -65,6 +75,24 @@ class _BoundRegionMockSink:
 
 class _BoundRegionTransform:
     input_schema = None
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
     output_schema = None
     on_error: str | None = None
     on_success: str | None = "output"
@@ -76,6 +104,8 @@ class _BoundRegionTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -85,6 +115,23 @@ class _BoundRegionTransform:
 
 class _BoundRegionMultiRowTransform:
     """A creates_tokens=True stub — a scope opener candidate (spec §7 rule 5)."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
 
     input_schema = None
     output_schema = None
@@ -99,6 +146,8 @@ class _BoundRegionMultiRowTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -108,6 +157,27 @@ class _BoundRegionMultiRowTransform:
 
 class _BoundRegionCollectorPlugin:
     """A batch-aware stub — the collector plugin closing a declared scope."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        # BatchTransformProtocol presence requirement: this fake requires no field.
+        return frozenset()
 
     input_schema = None
     output_schema = None
@@ -122,6 +192,8 @@ class _BoundRegionCollectorPlugin:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -131,6 +203,27 @@ class _BoundRegionCollectorPlugin:
 
 class _BoundRegionAggregationTransform:
     """A stub aggregation-node plugin (spec §7 rule 6, ruling 25)."""
+
+    @property
+    def declared_read_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake declares only its declared_input_fields.
+        return frozenset(self.declared_input_fields)
+
+    @property
+    def declared_created_fields(self) -> frozenset[str]:
+        # TransformProtocol spelling surface: this fake creates only its declared_output_fields.
+        return frozenset(self.declared_output_fields)
+
+    def output_field_declarations(self) -> dict[str, OutputFieldDeclaration]:
+        # TransformProtocol stamp table: this fake publishes no declared output types.
+        return {}
+
+    def carried_output_sources(self) -> dict[str, str]:
+        return {}
+
+    def schema_required_input_fields(self) -> frozenset[str]:
+        # BatchTransformProtocol presence requirement: this fake requires no field.
+        return frozenset()
 
     input_schema = None
     output_schema = None
@@ -144,6 +237,8 @@ class _BoundRegionAggregationTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -1153,7 +1248,7 @@ def _build_gate_in_collector_scope(*, escape: str) -> ExecutionGraph:
     Pins why ``handle_gate_node``'s post-JUMP barrier re-validation
     (``token_traversal.py``) needs no collector arm: a gate jump past a
     collector barrier cannot be authored, because rule 4 refuses the escape
-    at build time (filigree elspeth-494491978d).
+    at build time (archived issue elspeth-494491978d).
 
     ``escape="control"``: a genuine TWO-TARGET jump gate. The routes land on
     two DISTINCT in-region legs which converge on the collector through a
@@ -1328,7 +1423,7 @@ def _build_gate_in_collector_scope(*, escape: str) -> ExecutionGraph:
 def _build_collector_region_gate_leg_without_path_to_closer(*, dead_end: bool) -> None:
     """Rule 4's NO-PATH-TO-CLOSER limb, in a COLLECTOR-bound EXPAND region.
 
-    This is the guard that actually holds the line (filigree elspeth-494491978d).
+    This is the guard that actually holds the line (archived issue elspeth-494491978d).
     An adversarial mutation that neutered BOTH the duplicate-producer check and
     rule 4's sink-inside limb still saw every gate escape from a collector scope
     refused — by THIS limb. It was pinned nowhere: the sibling tests in this
@@ -1531,7 +1626,7 @@ class TestSESEWalk:
             _build_onehop_queue_backdoor()
 
     def test_gate_inside_collector_scope_builds(self) -> None:
-        # CONTROL for the escapes below (filigree elspeth-494491978d).
+        # CONTROL for the escapes below (archived issue elspeth-494491978d).
         # A genuine TWO-TARGET jump gate inside a collector-bound EXPAND
         # region is legal, so the rejections that follow track the ESCAPE and
         # not gates-in-scopes as a class. The two-target shape is the whole
@@ -1592,7 +1687,7 @@ class TestSESEWalk:
         # duplicate-producer check and the sink-inside limb neutered, this limb
         # still refuses every gate escape from a collector-bound region — and
         # until now nothing pinned it for an EXPAND/collector region
-        # (filigree elspeth-494491978d). Assert the limb's own message, not the
+        # (archived issue elspeth-494491978d). Assert the limb's own message, not the
         # sink text its siblings assert, so a future change that collapses the
         # two limbs into one cannot pass this silently.
         with pytest.raises(GraphValidationError, match="has no success path to") as exc_info:

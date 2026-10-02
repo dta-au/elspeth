@@ -329,6 +329,34 @@ class GroupSettlementReason(StrEnum):
     ALL_MEMBERS_LOST = "all_members_lost"
 
 
+class CollectorGroupFailureReason(StrEnum):
+    """Closed vocabulary for why a collector group FAILED as a whole.
+
+    The StrEnum IS the vocabulary: ``CollectorExecutor`` names these members,
+    never string literals. ``collector_group_failures.failure_reason`` carries
+    a CHECK over exactly these values (Landscape epoch 45), each member hold's
+    ``CollectorGroupFailure`` context carries the same value, and the counting
+    readers render it as a failure category. A value is an engine-authored
+    code, never row data.
+
+    - ``COLLECTOR_MISSING_MEMBERS``: a ``require_all`` roster closed with lost
+      members; the plugin never ran.
+    - ``COLLECTOR_TRANSFORM_ERROR``: the plugin ran and returned
+      ``TransformResult.error``.
+    - ``COLLECTOR_CONTRACT_VIOLATION``: a Tier-2 ``PluginContractViolation``
+      from the plugin or the engine's pre/postflight checks.
+    - ``EMPTY_EXPANSION``: a zero-member group closed under ``require_all``.
+      It shares its value with :attr:`GroupSettlementReason.EMPTY_EXPANSION`,
+      which names the same closure as a settlement disposition
+      (``closed_without_plugin``).
+    """
+
+    COLLECTOR_MISSING_MEMBERS = "collector_missing_members"
+    COLLECTOR_TRANSFORM_ERROR = "collector_transform_error"
+    COLLECTOR_CONTRACT_VIOLATION = "collector_contract_violation"
+    EMPTY_EXPANSION = "empty_expansion"
+
+
 # Outcome exhaustiveness: every TerminalOutcome value MUST be the lifecycle
 # answer for at least one legal terminal pair.  An unused outcome would mean
 # the enum has dead values that no producer can emit — drift from the ADR.
@@ -442,12 +470,18 @@ class OutputMode(StrEnum):
     Stored in database.
 
     Values:
-        PASSTHROUGH: Emit buffered rows unchanged after flush
+        PASSTHROUGH: Preserve corresponding input identities; output data may be enriched
         TRANSFORM: Emit transformed output from aggregation plugin
     """
 
     PASSTHROUGH = "passthrough"
     TRANSFORM = "transform"
+
+    def expected_output_count_error(self, count: int | None) -> str | None:
+        """Return the intrinsic error for a count unused by this output mode."""
+        if self is OutputMode.PASSTHROUGH and count is not None:
+            return "expected_output_count requires output_mode='transform' (the default); omit expected_output_count for 'passthrough'."
+        return None
 
 
 class AggregationMemberAction(StrEnum):
@@ -528,7 +562,7 @@ type DerivedAuditCharacteristics = tuple[AuditCharacteristic, ...]
 #   (a) a spec amendment documenting the new modality and its audit
 #       semantics;
 #   (b) an integration test exercising the new write/read path;
-#   (c) a Filigree ticket linking the change back to this enum.
+#   (c) a GitHub issue linking the change back to this enum.
 #
 # An auditor calling ``explain(recorder, run_id, token_id)`` reaches the
 # originating blob row's ``creation_modality`` field through the
@@ -578,11 +612,12 @@ def is_llm_authored_creation_modality(modality: CreationModality) -> bool:
 def error_edge_label(producer_id: str) -> str:
     """Canonical label for a processing-node error DIVERT edge.
 
-    Shared between DAG construction and transform/config-gate error-routing
-    audit recording to prevent label drift.
+    Shared between DAG construction and the transform, config-gate and
+    aggregation error-routing audit recording to prevent label drift.
 
     Args:
-        producer_id: Stable transform or config-gate name for error-route labels.
+        producer_id: Stable transform, config-gate or aggregation name for
+            error-route labels.
     """
     return f"__error_{producer_id}__"
 

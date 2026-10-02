@@ -2,12 +2,15 @@
 
 from datetime import UTC, datetime
 
+from sqlalchemy import select
+
 from elspeth.contracts import ExecutionError, NodeStateStatus, NodeType
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.landscape.schema import transform_errors_table, validation_errors_table
 from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
-from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.fixtures.audit_hashing import fake_sha256
+from tests.fixtures.landscape import claim_test_work_item, leader_member_token, make_recorder_with_run, register_test_node
 
 
 def test_discard_summary_counts_discard_path_with_no_sink_state_unattributed() -> None:
@@ -18,21 +21,21 @@ def test_discard_summary_counts_discard_path_with_no_sink_state_unattributed() -
     ``DiscardSummary`` stage/category balance check would then reject.
     """
     setup = make_recorder_with_run(run_id="discard-summary-run", source_node_id="source-0")
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    _row, token = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"id": "drop-me"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = setup.data_flow.create_token(row.row_id)
-    setup.data_flow.record_token_outcome(
+    setup.data_flow.record_token_outcome_leader(
+        coordination_token=setup.coordination_token,
         ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.SINK_DISCARDED,
         sink_name=DISCARD_SINK_NAME,
-        error_hash="a" * 64,
+        error_hash="a" * 16,
     )
 
     summaries = load_discard_summaries_from_db(setup.db, [setup.run_id])
@@ -58,25 +61,25 @@ def test_discard_summary_names_the_sink_node_that_discarded() -> None:
         node_type=NodeType.SINK,
         plugin_name="text",
     )
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    _row, token = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"llm_response": "line one\nline two"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = setup.data_flow.create_token(row.row_id)
     node_state = setup.execution.begin_node_state(
         token.token_id,
         sink_id,
-        setup.run_id,
         0,
         {"llm_response": "line one\nline two"},
+        member_token=setup.coordination_token.membership,
     )
     setup.execution.complete_node_state(
         node_state.state_id,
         NodeStateStatus.FAILED,
+        member_token=setup.coordination_token.membership,
         duration_ms=1.0,
         error=ExecutionError(
             exception="Text values cannot contain CR or LF record separators",
@@ -84,12 +87,13 @@ def test_discard_summary_names_the_sink_node_that_discarded() -> None:
             phase="write",
         ),
     )
-    setup.data_flow.record_token_outcome(
+    setup.data_flow.record_token_outcome_leader(
+        coordination_token=setup.coordination_token,
         ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.SINK_DISCARDED,
         sink_name=DISCARD_SINK_NAME,
-        error_hash="c" * 64,
+        error_hash="c" * 16,
     )
 
     summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
@@ -114,15 +118,14 @@ def test_discard_summary_does_not_double_count_a_token_failed_at_two_sinks() -> 
     ``DiscardSummary``'s balance check.
     """
     setup = make_recorder_with_run(run_id="sink-discard-fanout-run", source_node_id="source-0")
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    _row, token = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"payload": "x"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = setup.data_flow.create_token(row.row_id)
     for step_index, sink_name in enumerate(("sink_first", "sink_second")):
         sink_id = register_test_node(
             setup.data_flow,
@@ -131,19 +134,23 @@ def test_discard_summary_does_not_double_count_a_token_failed_at_two_sinks() -> 
             node_type=NodeType.SINK,
             plugin_name="text",
         )
-        node_state = setup.execution.begin_node_state(token.token_id, sink_id, setup.run_id, step_index, {"payload": "x"})
+        node_state = setup.execution.begin_node_state(
+            token.token_id, sink_id, step_index, {"payload": "x"}, member_token=setup.coordination_token.membership
+        )
         setup.execution.complete_node_state(
             node_state.state_id,
             NodeStateStatus.FAILED,
+            member_token=setup.coordination_token.membership,
             duration_ms=1.0,
             error=ExecutionError(exception="sink refused the row", exception_type="SinkDiscard", phase="write"),
         )
-    setup.data_flow.record_token_outcome(
+    setup.data_flow.record_token_outcome_leader(
+        coordination_token=setup.coordination_token,
         ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.SINK_DISCARDED,
         sink_name=DISCARD_SINK_NAME,
-        error_hash="d" * 64,
+        error_hash="d" * 16,
     )
 
     summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
@@ -164,36 +171,37 @@ def test_discard_summary_counts_gate_evaluation_error_discard_by_gate_node() -> 
         node_type=NodeType.GATE,
         plugin_name="config_gate",
     )
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    _row, token = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"amount": "250.00"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = setup.data_flow.create_token(row.row_id)
     node_state = setup.execution.begin_node_state(
         token.token_id,
         gate_id,
-        setup.run_id,
         0,
         {"amount": "250.00"},
+        member_token=setup.coordination_token.membership,
     )
     setup.execution.complete_node_state(
         node_state.state_id,
         NodeStateStatus.FAILED,
+        member_token=setup.coordination_token.membership,
         duration_ms=1.0,
         error=ExecutionError(
             exception="gate expression evaluation failed: incompatible runtime types",
             exception_type="ExpressionEvaluationError",
         ),
     )
-    setup.data_flow.record_token_outcome(
+    setup.data_flow.record_token_outcome_leader(
+        coordination_token=setup.coordination_token,
         ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.GATE_ERROR_DISCARDED,
-        error_hash="b" * 64,
+        error_hash="b" * 16,
     )
 
     summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
@@ -219,15 +227,14 @@ def test_discard_summary_carries_stage_attribution_for_validation_and_transform_
         node_type=NodeType.TRANSFORM,
         plugin_name="url_normalizer",
     )
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    row, token = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"url": ""},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = setup.data_flow.create_token(row.row_id)
     now = datetime.now(tz=UTC)
     with setup.db.write_connection() as conn:
         conn.execute(
@@ -238,7 +245,7 @@ def test_discard_summary_carries_stage_attribution_for_validation_and_transform_
                     "run_id": setup.run_id,
                     "node_id": setup.source_node_id,
                     "row_id": row.row_id,
-                    "row_hash": "hash-validation-1",
+                    "row_hash": fake_sha256("hash-validation-1"),
                     "row_data_json": "{}",
                     "error": "url field required",
                     "schema_mode": "fixed",
@@ -250,7 +257,7 @@ def test_discard_summary_carries_stage_attribution_for_validation_and_transform_
                     "run_id": setup.run_id,
                     "node_id": setup.source_node_id,
                     "row_id": row.row_id,
-                    "row_hash": "hash-validation-2",
+                    "row_hash": fake_sha256("hash-validation-2"),
                     "row_data_json": "{}",
                     "error": "url field required",
                     "schema_mode": "fixed",
@@ -265,13 +272,21 @@ def test_discard_summary_carries_stage_attribution_for_validation_and_transform_
                 run_id=setup.run_id,
                 token_id=token.token_id,
                 transform_id=transform_id,
-                row_hash="hash-transform",
+                row_hash=fake_sha256("hash-transform"),
                 row_data_json="{}",
                 error_details_json='{"reason":"validation_failed"}',
                 destination="discard",
                 created_at=now,
             )
         )
+    # The transform stage counts tokens whose TERMINAL outcome is that discard.
+    setup.data_flow.record_token_outcome_leader(
+        coordination_token=setup.coordination_token,
+        ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.QUARANTINED_AT_SOURCE,
+        error_hash="a" * 16,
+    )
 
     summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
 
@@ -289,6 +304,57 @@ def test_discard_summary_carries_stage_attribution_for_validation_and_transform_
             "node_id": "normalize_url",
             "count": 1,
         },
+    ]
+
+
+def test_discard_summary_counts_each_token_once_when_a_resumed_attempt_rewrote_its_error() -> None:
+    """Two attempts' transform_errors rows for N tokens count N, not 2N (elspeth-5887fb7928 E8).
+
+    ``transform_errors`` has no ``(token_id, transform_id)`` uniqueness: an
+    error write that committed before a crash is written again by the resumed
+    attempt, through the same writer. Both rows stay as audit evidence; the
+    discard summary counts discarded tokens.
+    """
+    setup = make_recorder_with_run(run_id="discard-two-attempts-run", source_node_id="source-0")
+    transform_id = register_test_node(setup.data_flow, setup.run_id, "batch_sum", node_type=NodeType.TRANSFORM, plugin_name="batch_sum")
+    member = leader_member_token(setup.factory, setup.run_id)
+    for index in range(3):
+        _row, token = setup.data_flow.create_row_with_token(
+            coordination_token=setup.coordination_token,
+            source_node_id=setup.source_node_id,
+            row_index=index,
+            data={"id": index},
+            source_row_index=index,
+            ingest_sequence=index,
+        )
+        work_item = claim_test_work_item(setup.factory, member_token=member, token_id=token.token_id, node_id=transform_id)
+        for _attempt in range(2):
+            setup.data_flow.record_transform_error(
+                ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+                transform_id=transform_id,
+                row_data={"id": index},
+                error_details={"reason": "validation_failed"},
+                destination="discard",
+                member_token=member,
+                work_item=work_item,
+            )
+        setup.data_flow.record_token_outcome_leader(
+            coordination_token=setup.coordination_token,
+            ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.QUARANTINED_AT_SOURCE,
+            error_hash="a" * 16,
+        )
+    with setup.db.connection() as conn:
+        rows = conn.execute(select(transform_errors_table.c.error_id).where(transform_errors_table.c.run_id == setup.run_id)).all()
+    assert len(rows) == 6, "control: both attempts' rows are in the audit trail"
+
+    summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
+
+    assert summary.transform_errors == 3
+    assert summary.total == 3
+    assert [stage.model_dump() for stage in summary.stages] == [
+        {"stage": "transform_validation", "node_id": transform_id, "count": 3},
     ]
 
 

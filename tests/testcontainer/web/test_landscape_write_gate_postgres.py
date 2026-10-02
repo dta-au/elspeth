@@ -18,11 +18,13 @@ from pydantic import SecretBytes
 from sqlalchemy import Engine, create_engine, insert, inspect, select, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ProgrammingError
+from tests.fixtures.audit_hashing import fake_sha256
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.scheduler import GroupLossSpec
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import SchemaCompatibilityError
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler.group_losses import record_group_loss
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -282,13 +284,19 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
                 insert(runs_table).values(
                     run_id="scheduler-postgres-run",
                     started_at=now,
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     settings_json="{}",
                     canonical_version="v1",
                     status="running",
                     openrouter_catalog_sha256="0" * 64,
                     openrouter_catalog_source="bundled",
                 )
+            )
+            leader = RunCoordinationRepository(landscape.engine).register_run_leader_on(
+                conn,
+                run_id="scheduler-postgres-run",
+                worker_id="scheduler-postgres-leader",
+                window_seconds=300,
             )
             conn.execute(
                 insert(nodes_table),
@@ -300,7 +308,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
                         "node_type": NodeType.SOURCE.value,
                         "plugin_version": "1.0",
                         "determinism": "deterministic",
-                        "config_hash": "config",
+                        "config_hash": fake_sha256("config"),
                         "config_json": "{}",
                         "registered_at": now,
                     },
@@ -311,7 +319,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
                         "node_type": NodeType.TRANSFORM.value,
                         "plugin_version": "1.0",
                         "determinism": "nondeterministic",
-                        "config_hash": "config",
+                        "config_hash": fake_sha256("config"),
                         "config_json": "{}",
                         "registered_at": now,
                     },
@@ -325,7 +333,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
                     row_index=0,
                     source_row_index=0,
                     ingest_sequence=0,
-                    source_data_hash="hash-row-1",
+                    source_data_hash=fake_sha256("hash-row-1"),
                     created_at=now,
                 )
             )
@@ -340,7 +348,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
 
         scheduler = TokenSchedulerRepository(landscape.engine)
         item = scheduler.enqueue_ready(
-            run_id="scheduler-postgres-run",
+            member_token=leader.membership,
             token_id="token-1",
             row_id="row-1",
             node_id="transform",
@@ -349,7 +357,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
             row_payload_json=payload,
         )
         duplicate = scheduler.enqueue_ready(
-            run_id="scheduler-postgres-run",
+            member_token=leader.membership,
             token_id="token-1",
             row_id="row-1",
             node_id="transform",
@@ -391,7 +399,7 @@ def test_postgres_group_loss_insert_is_dialect_safe(
                 insert(runs_table).values(
                     run_id="coalesce-loss-postgres-run",
                     started_at=now,
-                    config_hash="config",
+                    config_hash=fake_sha256("config"),
                     settings_json="{}",
                     canonical_version="v1",
                     status="running",
@@ -409,7 +417,7 @@ def test_postgres_group_loss_insert_is_dialect_safe(
                     node_type=NodeType.SOURCE.value,
                     plugin_version="1.0",
                     determinism="deterministic",
-                    config_hash="cfg",
+                    config_hash=fake_sha256("cfg"),
                     config_json="{}",
                     registered_at=now,
                 )
@@ -422,7 +430,7 @@ def test_postgres_group_loss_insert_is_dialect_safe(
                     row_index=0,
                     source_row_index=0,
                     ingest_sequence=0,
-                    source_data_hash="hash-row-1",
+                    source_data_hash=fake_sha256("hash-row-1"),
                     created_at=now,
                 )
             )

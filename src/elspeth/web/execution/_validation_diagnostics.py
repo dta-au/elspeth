@@ -253,6 +253,14 @@ def _edge_patch_target_for_node_id(
     component_type: str | None = None,
 ) -> _EdgePatchTarget:
     """Resolve a DAG node ID to the composer component/tool that can patch it."""
+    if state is not None:
+        if component_type == "source" and dag_node_id in state.sources:
+            return _source_schema_patch_target(dag_node_id, state.sources[dag_node_id].plugin)
+        if component_type == "sink" and any(output.name == dag_node_id for output in state.outputs):
+            return _output_schema_patch_target(dag_node_id)
+        for node in state.nodes:
+            if node.id == dag_node_id:
+                return _node_schema_patch_target(node.id, node.node_type)
     if state is None or graph is None:
         return _node_schema_patch_target(dag_node_id, component_type)
 
@@ -287,8 +295,8 @@ def _format_edge_contract_message(
     truncated (the mcp/analyzers/reports.py precedent: truncation collides).
     The headline template itself is stable: the frontend humaniser parses
     ``producer node '<id>' (schema '<name>')`` positionally, so only the id
-    VALUES change, never the shape. On the graph-BUILD failure path
-    (graph=None) the compiled ids remain in place — there is no map to consult.
+    VALUES change, never the shape. Build failures carry authored endpoint
+    names captured before the factory unwinds.
     """
     result = exc.compatibility_result
     issue_lines: list[str] = []
@@ -311,20 +319,20 @@ def _format_edge_contract_message(
 
     issues_block = "\n".join(issue_lines) if issue_lines else "(no per-field detail available)"
 
-    producer_id = exc.from_node_id
-    consumer_id = exc.to_node_id
+    producer_id = exc.from_config_name if exc.from_config_name is not None else exc.from_node_id
+    consumer_id = exc.to_config_name if exc.to_config_name is not None else exc.to_node_id
     compiled_detail = ""
+    translated = producer_id != exc.from_node_id or consumer_id != exc.to_node_id
     if state is not None and graph is not None:
         targets = _edge_patch_targets_by_dag_id(state, graph)
-        translated = False
         if exc.from_node_id in targets:
             producer_id = targets[exc.from_node_id].component_id
             translated = True
         if exc.to_node_id in targets:
             consumer_id = targets[exc.to_node_id].component_id
             translated = True
-        if translated:
-            compiled_detail = f"\nCompiled DAG node ids: producer '{exc.from_node_id}', consumer '{exc.to_node_id}'."
+    if translated:
+        compiled_detail = f"\nCompiled DAG node ids: producer '{exc.from_node_id}', consumer '{exc.to_node_id}'."
 
     message = (
         f"Edge contract violation between producer node '{producer_id}' "
@@ -442,13 +450,13 @@ def _build_edge_contract_suggestion_with_resolver(
     has_missing = bool(result.missing_fields)
     has_extras = bool(result.extra_fields)
     consumer = resolve_target(
-        exc.to_node_id,
+        exc.to_config_name if exc.to_config_name is not None else exc.to_node_id,
         state=state,
         graph=graph,
         component_type=exc.component_type,
     )
     producer = resolve_target(
-        exc.from_node_id,
+        exc.from_config_name if exc.from_config_name is not None else exc.from_node_id,
         state=state,
         graph=graph,
         # The raise site's producer node type keeps producer-shaped advice

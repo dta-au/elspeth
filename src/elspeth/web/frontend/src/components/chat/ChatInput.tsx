@@ -31,7 +31,7 @@ import type { BlobMetadata } from "@/types/api";
  * upload completes after a session switch.
  */
 export function uploadedBlobPromptSentence(filename: string): string {
-  return `I've uploaded "${filename}"; please use it as the pipeline input.`;
+  return `I've uploaded "${filename}". Please use it for the role I describe, or ask whether it is a pipeline input, reference table, or LLM prompt.`;
 }
 
 /**
@@ -150,10 +150,6 @@ interface ChatInputProps {
   onToggleBlobManager?: () => void;
   showBlobManager?: boolean;
   onOpenSecrets?: () => void;
-  /** Successful upload metadata, retained by guided mode for exact source binding. */
-  onBlobUploaded?: (blob: BlobMetadata) => void;
-  /** Upload request lifecycle, used by guided mode to fence async completions. */
-  onBlobUploadStarted?: (requestId: string, sessionId: string) => void;
   /** Return false to suppress stale candidate publication and filename insertion. */
   onBlobUploadCompleted?: (
     requestId: string,
@@ -162,30 +158,12 @@ interface ChatInputProps {
   ) => boolean;
   /** Return false to suppress stale local and blob-store failure publication. */
   onBlobUploadRejected?: (requestId: string, sessionId: string) => boolean;
-  onBlobUploadSettled?: (requestId: string, sessionId: string) => void;
-  /** Disables only the upload affordance; ordinary text remains independently gated. */
-  uploadDisabled?: boolean;
   /** Controlled mode: external value (use with onChange) */
   value?: string;
   /** Controlled mode: callback when value changes */
   onChange?: (value: string) => void;
-  /** Optional native textarea maxLength, used by guided chat to mirror backend validation. */
   maxLength?: number;
-  /**
-   * Optional placeholder override.  Used by the guided-mode chat input
-   * (Phase A slice 4) to surface a per-step nudge.  Defaults to the
-   * freeform composer wording when absent.
-   */
   placeholder?: string;
-  /**
-   * Tutorial lock: when true the textarea is read-only (the prepopulated
-   * prompt cannot be edited) and the source-composition affordances
-   * (file upload, blob manager, secrets) are hidden. The learner still
-   * presses Send to submit the locked value. Used by the guided tutorial
-   * so the worked-example prompt is prepopulated-and-locked — the learner
-   * steps through the normal flow but types nothing.
-   */
-  readOnly?: boolean;
 }
 
 // This family's glyphs live in the ui Icon primitive (elspeth-2b88e3ca6d
@@ -204,17 +182,12 @@ export function ChatInput({
   onToggleBlobManager,
   showBlobManager,
   onOpenSecrets,
-  onBlobUploaded,
-  onBlobUploadStarted,
   onBlobUploadCompleted,
   onBlobUploadRejected,
-  onBlobUploadSettled,
-  uploadDisabled = false,
   value: controlledValue,
   onChange: controlledOnChange,
   maxLength,
   placeholder,
-  readOnly = false,
 }: ChatInputProps) {
   // Stable id for the keyboard-hint element, wired into the textarea's
   // aria-describedby so screen readers announce "Shift+Enter for new line"
@@ -258,13 +231,6 @@ export function ChatInput({
   const setTextRef = useRef(setText);
   setTextRef.current = setText;
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
-  // Compose-timeout bootstrap gate (elspeth bootstrap race). FALSE until
-  // App.checkHealth has applied the backend wall clock; sending before then
-  // would schedule a compose-abort timer from the stale default ceiling and
-  // could abort a healthy turn before the backend's structured 422. Send is
-  // held closed until readiness with a visible reason (dead-button doctrine —
-  // a silently inert Send reads as a bug). Both freeform and guided render
-  // this input, so this one gate covers both paths.
   const composeTimeoutReady = useSessionStore((s) => s.composeTimeoutReady);
   // Set when the backend is reachable but reported no usable compose timeout,
   // so readiness can never latch. Distinguishes "up but misconfigured" (show a
@@ -316,10 +282,11 @@ export function ChatInput({
       const detail = (e as CustomEvent<string>).detail;
       if (typeof detail !== "string") {
         // System-to-system contract violation (the dispatcher always sends a
-        // string).  Per CLAUDE.md trust-tier model: internal contract
-        // violations crash, not log-and-continue.  This surfaces immediately
-        // in dev / tests / DevTools rather than producing a silent no-op
-        // that a future contributor wouldn't notice.
+        // string).  Per the trust model
+        // (docs/guides/data-trust-and-error-handling.md §The Three-Tier Trust
+        // Model): internal contract violations crash, not log-and-continue.
+        // This surfaces immediately in dev / tests / DevTools rather than
+        // producing a silent no-op that a future contributor wouldn't notice.
         throw new TypeError(
           `[ChatInput] PREFILL_CHAT_INPUT_EVENT: expected string detail, got ${typeof detail}`,
         );
@@ -372,13 +339,12 @@ export function ChatInput({
 
   async function handleFileSelect(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    if (!file || !activeSessionId || uploadDisabled) return;
+    if (!file || !activeSessionId) return;
 
     const uploadRequestId = crypto.randomUUID();
     const uploadSessionId = activeSessionId;
     const input = e.target;
     setUploadStatus(null);
-    onBlobUploadStarted?.(uploadRequestId, uploadSessionId);
     let rejectionAccepted: boolean | null = null;
     try {
       const blob = await uploadBlob(uploadSessionId, file, {
@@ -391,7 +357,6 @@ export function ChatInput({
       const accepted =
         onBlobUploadCompleted?.(uploadRequestId, uploadSessionId, blob) ?? true;
       if (!accepted) return;
-      onBlobUploaded?.(blob);
       // Use ref to get current text (user may have typed during async upload)
       const currentText = textRef.current;
       const newText =
@@ -413,7 +378,6 @@ export function ChatInput({
         setUploadStatus("Upload failed. Check the file manager for details.");
       }
     } finally {
-      onBlobUploadSettled?.(uploadRequestId, uploadSessionId);
       // Reset the file input so the same file can be re-selected
       input.value = "";
     }
@@ -421,61 +385,11 @@ export function ChatInput({
 
   const canSend = !disabled && !awaitingComposeTimeout && text.trim().length > 0;
 
-  // Read-only (tutorial locked prompt) content is static and multi-line (the
-  // worked-example prompt + the sample URLs). A fixed 2-row box clipped it; size
-  // the box to the content (capped) so the whole locked prompt is visible
-  // without an obscure inner scroll.
-  //
-  // Editable mode is 4 rows: raised from 2 to 3 (elspeth-244b8ba932) because
-  // placeholders clipped, then to 4 so multi-line prompts read without an
-  // immediate inner scroll. The placeholder is the
-  // instruction telling the user what to type, and a placeholder produces no
-  // scroll overflow — no scrollbar, no ellipsis — so a placeholder longer than
-  // the box is simply cut mid-word with no cue that anything is missing. Every
-  // shipped placeholder here is a full sentence: the four guided per-step
-  // nudges (ChatPanel.GUIDED_CHAT_PLACEHOLDERS), the empty-state data-priming
-  // line, and the pending-interpretation cue. Two rows clipped them in the
-  // 360px authoring pane, which is the SHIPPED DEFAULT pane width at the
-  // 1280px minimum supported viewport — sizing against the wider 1536px+
-  // default would leave the common case still clipped.
-  //
-  // This is a static row count, not autosizing: nothing here measures
-  // scrollHeight, and autosizing would not help anyway because a placeholder
-  // contributes no scroll height to measure. The `max-height: min(28dvh,
-  // 240px)` ceiling in chat.css still does real work — it bounds the box the
-  // user drags with `resize: vertical`.
-  const rows = readOnly
-    ? Math.min(10, Math.max(4, text.split("\n").length + 1))
-    : 4;
-
-  // Phase 5b Task 8 (extends Phase 5a Task 1) — derive the effective
-  // placeholder.  Precedence (highest wins):
-  //   1. explicit `placeholder` prop (Phase A slice 4 guided-mode nudge)
-  //   2. pending-interpretation cue (Phase 5b Task 8 — when an interpretation
-  //      review widget is awaiting the user's decision and has a non-null
-  //      user_term to echo)
-  //   3. empty-state data-priming wording (Phase 5a — no messages, no
-  //      composition)
-  //   4. canonical "describe the pipeline" wording
-  //
-  // The pending-interpretation cue sits above empty-state because it
-  // describes a *concrete pending decision* the user must address;
-  // empty-state is only a generic prime for first-typed-input.  Both
-  // continue to sit below an explicit prop so guided-mode per-step nudges
-  // (Phase A slice 4) remain authoritative.
   const isEmptyState = messageCount === 0 && compositionVersion === 0;
   const defaultPlaceholder = isEmptyState
     ? "Describe your pipeline, paste a URL, or type a few rows of data to start..."
     : "Describe the pipeline you want to build...";
-  // Directionally neutral (elspeth-eba8820005): the review card renders in a
-  // different column in the guided workspace, so "above" contradicts the
-  // layout at some breakpoints — name the card, not a direction.  The cue
-  // itself is built kind-aware in the store selector above
-  // (interpretationCueText) so its button names interpolate the card's
-  // exported label constants and match the controls the pending card
-  // actually renders (elspeth-0a9f77dd75 + ux-review 2026-08-13).
-  const effectivePlaceholder =
-    placeholder ?? interpretationCuePlaceholder ?? defaultPlaceholder;
+  const effectivePlaceholder = placeholder ?? interpretationCuePlaceholder ?? defaultPlaceholder;
 
   return (
     <div className="chat-input">
@@ -521,10 +435,9 @@ export function ChatInput({
           onKeyDown={handleKeyDown}
           placeholder={effectivePlaceholder}
           maxLength={maxLength}
-          readOnly={readOnly}
           aria-label="Message input"
-          aria-describedby={readOnly ? undefined : hintId}
-          rows={rows}
+          aria-describedby={hintId}
+          rows={4}
           className="chat-input-textarea"
         />
 
@@ -535,12 +448,12 @@ export function ChatInput({
         <span className="chat-input-row-break" aria-hidden="true" />
 
         {/* File upload button — using a visible button that clicks a hidden input */}
-        {!readOnly && (
+        {(
           <>
             <Button
               variant="bare"
               onClick={() => fileInputRef.current?.click()}
-              disabled={!activeSessionId || uploadDisabled}
+              disabled={!activeSessionId}
               className="chat-input-icon-btn chat-input-upload-btn"
               title="Upload file"
               aria-label="Upload file"
@@ -557,7 +470,7 @@ export function ChatInput({
               // picker.
               accept=".csv,.txt,.json,.jsonl,.png,.jpg,.jpeg,.pdf,text/csv,text/plain,application/json,application/x-jsonlines,application/jsonl,text/jsonl,image/png,image/jpeg,application/pdf"
               onChange={handleFileSelect}
-              disabled={!activeSessionId || uploadDisabled}
+              disabled={!activeSessionId}
               style={{ display: "none" }}
               aria-hidden="true"
               tabIndex={-1}
@@ -568,7 +481,7 @@ export function ChatInput({
         {/* Rare-action overflow: file manager + secrets fold behind one
             trigger (IA spec Stage 4 #12/#14 — Upload stays persistent, it is
             the core "give the composer your data" action). */}
-        {!readOnly && (onToggleBlobManager || onOpenSecrets) && (
+        {(onToggleBlobManager || onOpenSecrets) && (
           <div
             ref={moreRef}
             className="chat-input-more"
@@ -662,20 +575,10 @@ export function ChatInput({
             (elspeth-1b7227936c): at ordinary pane widths its flex-basis:100%
             wraps it onto its own full-width line (same visual position as
             the old sibling arrangement), and under the narrow-pane container
-            query it joins the wrapped Upload/More line to fill what was
-            ~344px of dead gutter beside a lone 44px Upload button.
-            Not rendered read-only (the tutorial's frozen prompt): the
-            textarea takes no typed input there, so the hint is a false
-            affordance — and the positioned placement assumes the
-            Upload/More/Send cluster beneath it, which read-only mode
-            reduces to Send alone, leaving the hint's text hanging over the
-            textarea's content. The describedby reference above goes with
-            it. */}
-        {!readOnly && (
-          <div id={hintId} className="chat-input-hint">
-            Shift+Enter for new line
-          </div>
-        )}
+            query it joins the wrapped Upload/More line. */}
+        <div id={hintId} className="chat-input-hint">
+          Shift+Enter for new line
+        </div>
       </div>
     </div>
   );

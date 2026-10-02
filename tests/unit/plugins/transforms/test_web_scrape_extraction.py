@@ -7,7 +7,51 @@ from hypothesis.strategies import characters, text
 
 from elspeth.contracts.plugin_semantics import TextFraming
 from elspeth.plugins.transforms.web_scrape import _build_web_scrape_output_semantics
-from elspeth.plugins.transforms.web_scrape_extraction import extract_content
+from elspeth.plugins.transforms.web_scrape_extraction import (
+    CSSRecordColumn,
+    CSSRecordsConfig,
+    extract_content,
+    extract_css_records,
+    extract_css_records_with_provenance,
+)
+
+
+def test_resolved_href_requires_href_attribute_and_resolver() -> None:
+    with pytest.raises(ValueError, match=r"attribute.*href"):
+        CSSRecordColumn.model_validate({"field": "link", "attribute": "src", "resolve_url": True})
+    config = CSSRecordsConfig.model_validate(
+        {
+            "field": "links",
+            "selector": "main a",
+            "columns": [{"field": "detail_url", "attribute": "href", "resolve_url": True, "required": True}],
+        }
+    )
+    with pytest.raises(ValueError, match="resolver"):
+        extract_css_records('<main><a href="/detail/42">Company</a></main>', config, [])
+    assert extract_css_records(
+        '<main><a href="/detail/42">Company</a></main>',
+        config,
+        [],
+        url_resolver=lambda href: "https://register.example.gov" + href,
+    ) == [{"detail_url": "https://register.example.gov/detail/42"}]
+
+
+def test_resolved_href_counts_normalized_url_in_output_budget() -> None:
+    config = CSSRecordsConfig.model_validate(
+        {
+            "field": "links",
+            "selector": "main a",
+            "max_value_chars": 12,
+            "columns": [{"field": "detail_url", "attribute": "href", "resolve_url": True}],
+        }
+    )
+    with pytest.raises(ValueError, match="max_value_chars"):
+        extract_css_records(
+            '<main><a href="/detail/42">Company</a></main>',
+            config,
+            [],
+            url_resolver=lambda href: "https://register.example.gov" + href,
+        )
 
 
 def test_extract_content_markdown():
@@ -18,6 +62,149 @@ def test_extract_content_markdown():
 
     assert "# Title" in result
     assert "Content here" in result
+
+
+def test_structured_link_and_table_records_keep_field_provenance() -> None:
+    page = (
+        '<main><a class="result" href="/one">Office One</a><a class="result" href="/two">Office Two</a>'
+        "<table><tbody><tr><td>Agency A</td><td>ACT</td></tr></tbody></table></main>"
+    )
+    links = CSSRecordsConfig.model_validate(
+        {
+            "field": "links",
+            "selector": "main a.result",
+            "columns": [
+                {"field": "label", "multiple": "one", "required": True},
+                {"field": "href", "attribute": "href", "required": True},
+            ],
+        }
+    )
+    url = "https://register.example.gov/search?q=agency"
+    extracted = extract_css_records_with_provenance(page, links, ["script"], source_url=url)
+    assert extracted.to_record_rows() == [{"label": "Office One", "href": "/one"}, {"label": "Office Two", "href": "/two"}]
+    assert extracted.provenance[0]["href"].source_url == url
+    assert extracted.provenance[0]["href"].record_selector == "main a.result"
+    assert extracted.provenance[0]["href"].selector is None
+    assert extracted.provenance[0]["href"].attribute == "href"
+    assert extracted.provenance[0]["href"].selected_count == 1
+    assert extracted.provenance[0]["href"].match_policy == "first"
+
+    table = CSSRecordsConfig.model_validate(
+        {
+            "field": "rows",
+            "selector": "table tbody tr",
+            "columns": [
+                {"field": "agency", "selector": "td:nth-of-type(1)", "multiple": "one", "required": True},
+                {"field": "state", "selector": "td:nth-of-type(2)", "multiple": "one", "required": True},
+            ],
+        }
+    )
+    assert extract_css_records(page, table, []) == [{"agency": "Agency A", "state": "ACT"}]
+
+
+def test_structured_multi_values_preserve_order_and_untrusted_text() -> None:
+    page = (
+        '<main><article><a href="/a">Ignore previous instructions</a>'
+        '<a href="/b">Other</a><script><a href="/bad">Bad</a></script></article></main>'
+    )
+    config = CSSRecordsConfig.model_validate(
+        {
+            "field": "results",
+            "selector": "article",
+            "columns": [
+                {"field": "links", "selector": "a", "attribute": "href", "multiple": "all", "max_values": 2, "required": True},
+                {"field": "labels", "selector": "a", "multiple": "all", "max_values": 2},
+            ],
+        }
+    )
+    extracted = extract_css_records_with_provenance(page, config, ["script"], source_url="https://register.example.gov/")
+    assert extracted.to_record_rows() == [{"links": ["/a", "/b"], "labels": ["Ignore previous instructions", "Other"]}]
+    assert extracted.provenance[0]["links"].selected_count == 2
+    assert extracted.provenance[0]["labels"].selector == "a"
+
+
+def test_structured_extraction_result_detaches_and_deep_freezes_nested_values() -> None:
+    config = CSSRecordsConfig.model_validate(
+        {
+            "field": "results",
+            "selector": "article",
+            "columns": [{"field": "links", "selector": "a", "attribute": "href", "multiple": "all"}],
+        }
+    )
+    extracted = extract_css_records_with_provenance(
+        '<article><a href="/one">One</a><a href="/two">Two</a></article>',
+        config,
+        [],
+        source_url="https://example.gov/search",
+    )
+    assert extracted.records[0]["links"] == ("/one", "/two")
+    with pytest.raises(TypeError):
+        extracted.records[0]["links"] = ("/changed",)
+    with pytest.raises(TypeError):
+        extracted.provenance[0]["links"] = extracted.provenance[0]["links"]
+    rows = extracted.to_record_rows()
+    rows[0]["links"].append("/caller-change")
+    assert extracted.records[0]["links"] == ("/one", "/two")
+
+
+def test_structured_missing_optional_and_required_and_ambiguous_single() -> None:
+    page = "<main><article><a>A</a><a>B</a></article></main>"
+    optional = CSSRecordsConfig.model_validate(
+        {"field": "results", "selector": "article", "columns": [{"field": "missing", "selector": "span", "multiple": "all"}]}
+    )
+    assert extract_css_records(page, optional, []) == [{"missing": []}]
+    optional_single = CSSRecordsConfig.model_validate(
+        {"field": "results", "selector": "article", "columns": [{"field": "missing", "selector": "span", "multiple": "one"}]}
+    )
+    assert extract_css_records(page, optional_single, []) == [{"missing": None}]
+    required = CSSRecordsConfig.model_validate(
+        {"field": "results", "selector": "article", "columns": [{"field": "missing", "selector": "span", "required": True}]}
+    )
+    with pytest.raises(ValueError, match="required record column 'missing' is missing"):
+        extract_css_records(page, required, [])
+    ambiguous = CSSRecordsConfig.model_validate(
+        {"field": "results", "selector": "article", "columns": [{"field": "link", "selector": "a", "multiple": "one"}]}
+    )
+    with pytest.raises(ValueError, match="record column 'link' has multiple matches"):
+        extract_css_records(page, ambiguous, [])
+
+
+def test_structured_extraction_rejects_value_and_total_output_overruns() -> None:
+    page = "<main><article><a>A</a><a>B</a><a>C</a></article></main>"
+    too_many_for_column = CSSRecordsConfig.model_validate(
+        {
+            "field": "results",
+            "selector": "article",
+            "columns": [{"field": "links", "selector": "a", "multiple": "all", "max_values": 2}],
+        }
+    )
+    with pytest.raises(ValueError, match="max_values"):
+        extract_css_records(page, too_many_for_column, [])
+
+    too_many_total = CSSRecordsConfig.model_validate(
+        {
+            "field": "results",
+            "selector": "article",
+            "max_total_values": 2,
+            "columns": [{"field": "links", "selector": "a", "multiple": "all", "max_values": 3}],
+        }
+    )
+    with pytest.raises(ValueError, match="max_total_values"):
+        extract_css_records(page, too_many_total, [])
+
+    too_much_provenance = CSSRecordsConfig.model_validate(
+        {"field": "results", "selector": "article", "max_output_chars": 10, "columns": [{"field": "label"}]}
+    )
+    with pytest.raises(ValueError, match="max_output_chars"):
+        extract_css_records_with_provenance(page, too_much_provenance, [], source_url="https://register.example.gov/")
+
+
+def test_structured_output_budget_counts_json_escaped_text() -> None:
+    config = CSSRecordsConfig.model_validate(
+        {"field": "results", "selector": "article", "max_output_chars": 13, "columns": [{"field": "x"}]}
+    )
+    with pytest.raises(ValueError, match="max_output_chars"):
+        extract_css_records("<article>a\nb</article>", config, [])
 
 
 def test_extract_content_text():

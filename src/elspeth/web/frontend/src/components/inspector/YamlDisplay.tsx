@@ -21,7 +21,7 @@
 // the wire `yaml` string.
 // ============================================================================
 
-import { useState, useCallback } from "react";
+import { type JSX, useState, useCallback } from "react";
 import { Highlight, themes } from "prism-react-renderer";
 
 import { Button } from "@/components/ui";

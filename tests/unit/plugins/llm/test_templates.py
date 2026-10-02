@@ -6,6 +6,7 @@ import hashlib
 import pytest
 
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.templates import TemplateError
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.testing import make_field, make_row
@@ -13,6 +14,21 @@ from elspeth.testing import make_field, make_row
 
 class TestPromptTemplate:
     """Tests for PromptTemplate wrapper."""
+
+    def test_constant_power_is_bounded_during_configuration(self) -> None:
+        with pytest.raises(TemplateError, match="Power expressions"):
+            PromptTemplate("{{ (3**(3**15)) % 7 }}")
+
+    def test_row_dependent_string_multiplication_is_bounded_at_render(self) -> None:
+        template = PromptTemplate("{{ row.text * 300000000 }}")
+        with pytest.raises(TemplateError):
+            template.render({"text": "x"})
+
+    def test_nested_no_output_loops_are_bounded_at_render(self) -> None:
+        template = PromptTemplate("{% for a in range(100000) %}{% for b in range(100000) %}{% set x = a + b %}{% endfor %}{% endfor %}")
+        # RLIMIT_CPU (2 s) normally ends it; the 5 s wall clock only on a starved host.
+        with pytest.raises(TemplateError, match=r"^Template exceeded the (CPU|execution time) limit$"):
+            template.render({})
 
     def test_simple_variable_substitution(self) -> None:
         """Basic variable substitution works."""
@@ -106,8 +122,10 @@ Analyze these entries:
         with pytest.raises(TemplateError, match="Template rendering failed"):
             template.render({"zero": 0})
 
-    def test_render_with_metadata_accepts_pipeline_row(self) -> None:
-        """render_with_metadata() accepts PipelineRow inputs directly."""
+    def test_render_with_metadata_accepts_a_projected_row(self) -> None:
+        """A PipelineRow reaches render_with_metadata() projected to the node's declaration (ADR-051)."""
+        from elspeth.plugins.infrastructure.templates import DeclaredFields, TemplateRow
+
         contract = SchemaContract(
             mode="OBSERVED",
             fields=(make_field("prompt_text", str, original_name="Prompt Text"),),
@@ -116,10 +134,55 @@ Analyze these entries:
         row = make_row({"prompt_text": "sample"}, contract=contract)
         template = PromptTemplate("Analyze: {{ row['Prompt Text'] }}")
 
-        result = template.render_with_metadata(row, contract=contract)
+        result = template.render_with_metadata(TemplateRow.project(row, DeclaredFields(frozenset({"prompt_text"}))), contract=contract)
 
         assert result.prompt == "Analyze: sample"
         assert result.variables_hash is not None
+
+    def test_the_variables_hash_of_an_opted_out_fixed_row_with_an_extra_key_is_its_data(self) -> None:
+        """Under ``[]`` a FIXED row's extra key iterates but does not resolve; the hash reads the values, never the Mapping view."""
+        from elspeth.contracts.schema_contract import PipelineRow
+        from elspeth.plugins.infrastructure.templates import ALL_FIELDS, TemplateRow
+
+        contract = SchemaContract(mode="FIXED", fields=(make_field("q", str, required=True, source="declared"),), locked=True)
+        row = TemplateRow.project(PipelineRow({"q": "x", "extra": 1}, contract), ALL_FIELDS)
+
+        result = PromptTemplate("{{ row.q }}").render_with_metadata(row)
+
+        assert result.prompt == "x"
+        assert result.variables_hash == hashlib.sha256(canonical_json({"q": "x", "extra": 1}).encode()).hexdigest()
+
+    def test_a_raw_pipeline_row_is_a_framework_bug(self) -> None:
+        """No caller may hand a template the unprojected row: the packer refuses it."""
+        from elspeth.contracts.errors import FrameworkBugError
+
+        row = make_row({"prompt_text": "sample"})
+        with pytest.raises(FrameworkBugError, match="unprojected PipelineRow"):
+            PromptTemplate("Analyze: {{ row.prompt_text }}").render_with_metadata(row)
+
+    def test_the_variables_hash_covers_exactly_what_the_template_could_see(self) -> None:
+        """ADR-051: the hash is of the projected view, so an undeclared column neither moves it nor can fail it."""
+        from elspeth.plugins.infrastructure.templates import ALL_FIELDS, DeclaredFields, TemplateRow
+
+        template = PromptTemplate("{{ row.a }}")
+        declared = DeclaredFields(frozenset({"a"}))
+        narrow = template.render_with_metadata(TemplateRow.project(make_row({"a": 1}), declared))
+        wide = template.render_with_metadata(TemplateRow.project(make_row({"a": 1, "b": "other", "nan": float("nan")}), declared))
+        whole = template.render_with_metadata(TemplateRow.project(make_row({"a": 1, "b": "other"}), ALL_FIELDS))
+
+        assert narrow.variables_hash == wide.variables_hash
+        assert narrow.variables_hash == hashlib.sha256(canonical_json({"a": 1}).encode()).hexdigest()
+        assert whole.variables_hash == hashlib.sha256(canonical_json({"a": 1, "b": "other"}).encode()).hexdigest()
+
+    def test_variables_hash_failure_names_no_row_value(self) -> None:
+        """The canonicalizer quotes the offending value; only its type is kept (RAG-F1).
+
+        Its message is ``1152921504606859321 exceeds safe integer domain``.
+        """
+        template = PromptTemplate("{{ row.n }}")
+        with pytest.raises(TemplateError) as caught:
+            template.render_with_metadata({"n": 1152921504606859321})
+        assert str(caught.value) == "Cannot compute variables hash: IntegerDomainError (message withheld: it can quote row data)"
 
     def test_undefined_variable_raises_error(self) -> None:
         """Missing required variable raises TemplateError."""
@@ -236,7 +299,8 @@ Analyze these entries:
 
         We distinguish None (no lookup configured) from {} (empty lookup).
         An empty lookup is still a valid configuration that should be auditable.
-        Per CLAUDE.md: "No inference - if it's not recorded, it didn't happen."
+        Per the auditability principle (ARCHITECTURE.md §Design Principles)
+        nothing is inferred: if it is not recorded, it did not happen.
         """
         template = PromptTemplate("Hello, {{ row.name }}!", lookup_data={})
         assert template.lookup_hash is not None  # Empty dict still gets hashed
@@ -396,34 +460,16 @@ class TestSyntheticContextWithFixedContract:
         result = template.render_with_metadata(synthetic_ctx, contract=None)
         assert "sample data" in result.prompt
 
-    def test_synthetic_context_with_fixed_contract_render(self) -> None:
-        """render() with synthetic context and FIXED contract should also work."""
+    def test_a_contract_never_changes_what_a_synthetic_context_renders(self) -> None:
+        """render_with_metadata's contract only feeds contract_hash; it never wraps the context (the FIXED-mode bug)."""
         fixed_contract = SchemaContract(
             mode="FIXED",
             fields=(make_field("amount", int, required=True, source="declared"),),
             locked=True,
         )
         template = PromptTemplate("Amount is {{ row.value }}")
-        synthetic_ctx = {"value": 42}
 
-        # With contract=None, this works
-        result = template.render(synthetic_ctx, contract=None)
-        assert result == "Amount is 42"
+        result = template.render_with_metadata({"value": 42}, contract=fixed_contract)
 
-        # With FIXED contract, this WOULD fail because "value" is not in contract
-        with pytest.raises(TemplateError, match="Undefined variable"):
-            template.render(synthetic_ctx, contract=fixed_contract)
-
-    def test_synthetic_context_with_flexible_contract_works(self) -> None:
-        """FLEXIBLE contract allows synthetic keys (extra fields fall through)."""
-        flexible_contract = SchemaContract(
-            mode="FLEXIBLE",
-            fields=(make_field("cs1_bg", str, required=True, source="declared"),),
-            locked=True,
-        )
-        template = PromptTemplate("Evaluate: {{ row.text_content }}")
-        synthetic_ctx = {"text_content": "sample data"}
-
-        # FLEXIBLE mode allows unknown keys — no bug in this mode
-        result = template.render(synthetic_ctx, contract=flexible_contract)
-        assert "sample data" in result
+        assert result.prompt == "Amount is 42"
+        assert result.contract_hash is not None

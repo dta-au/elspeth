@@ -19,6 +19,7 @@ from typing import cast
 from sqlalchemy import insert, select
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
@@ -26,10 +27,12 @@ from elspeth.core.landscape.schema import (
     metadata,
     nodes_table,
     rows_table,
+    run_workers_table,
     runs_table,
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 
 
@@ -58,7 +61,7 @@ def _seed_run(engine: Tier1Engine, *, run_id: str, tokens: list[tuple[str, str, 
             insert(runs_table).values(
                 run_id=run_id,
                 started_at=now,
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 settings_json="{}",
                 canonical_version="v1",
                 status="running",
@@ -74,7 +77,7 @@ def _seed_run(engine: Tier1Engine, *, run_id: str, tokens: list[tuple[str, str, 
                 node_type=NodeType.SOURCE.value,
                 plugin_version="1.0",
                 determinism="deterministic",
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 config_json="{}",
                 registered_at=now,
             )
@@ -87,7 +90,7 @@ def _seed_run(engine: Tier1Engine, *, run_id: str, tokens: list[tuple[str, str, 
                 node_type=NodeType.TRANSFORM.value,
                 plugin_version="1.0",
                 determinism="deterministic",
-                config_hash="config",
+                config_hash=fake_sha256("config"),
                 config_json="{}",
                 registered_at=now,
             )
@@ -101,7 +104,7 @@ def _seed_run(engine: Tier1Engine, *, run_id: str, tokens: list[tuple[str, str, 
                     row_index=index,
                     source_row_index=index,
                     ingest_sequence=ingest_sequence,
-                    source_data_hash=f"hash-{row_id}",
+                    source_data_hash=fake_sha256(f"hash-{row_id}"),
                     created_at=now,
                 )
             )
@@ -111,6 +114,17 @@ def _seed_run(engine: Tier1Engine, *, run_id: str, tokens: list[tuple[str, str, 
                     row_id=row_id,
                     run_id=run_id,
                     created_at=now,
+                )
+            )
+        for worker_id in (f"{run_id}:w1",):
+            conn.execute(
+                insert(run_workers_table).values(
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    role="follower",
+                    status="active",
+                    registered_at=now,
+                    heartbeat_expires_at=datetime.now(UTC) + timedelta(hours=1),
                 )
             )
     return row_payload_json
@@ -133,7 +147,7 @@ def _enqueue_and_block(
     seeded READY item.
     """
     item = repo.enqueue_ready(
-        run_id=run_id,
+        member_token=WorkerMembershipToken(run_id=run_id, worker_id=f"{run_id}:w1"),
         token_id=token_id,
         row_id=row_id,
         node_id="normalize",
@@ -141,16 +155,20 @@ def _enqueue_and_block(
         ingest_sequence=ingest_sequence,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id=run_id, lease_owner="w1", lease_seconds=30)
+    claimed = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=run_id, worker_id=f"{run_id}:w1"), lease_owner=f"{run_id}:w1", lease_seconds=30
+    )
     assert claimed is not None
     assert claimed.work_item_id == item.work_item_id
     return cast(
         TokenWorkItem,
         repo.mark_blocked(
+            member_token=WorkerMembershipToken(run_id=item.run_id, worker_id=f"{item.run_id}:w1"),
             work_item_id=item.work_item_id,
+            row_payload_json=item.row_payload_json,
             queue_key=queue_key,
             barrier_key=barrier_key,
-            expected_lease_owner="w1",
+            expected_lease_owner=f"{run_id}:w1",
         ),
     )
 
@@ -160,10 +178,11 @@ def test_mark_blocked_stamps_barrier_blocked_at() -> None:
 
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
+    run_id = "run-1"
     now = datetime(2026, 6, 11, 3, 0, tzinfo=UTC)
     payload = _seed_run(engine, run_id="run-1", tokens=[("row-1", "token-1", 0)], now=now)
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="run-1:w1"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -171,17 +190,24 @@ def test_mark_blocked_stamps_barrier_blocked_at() -> None:
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    assert repo.claim_ready(run_id="run-1", lease_owner="w1", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(
+            member_token=WorkerMembershipToken(run_id="run-1", worker_id="run-1:w1"), lease_owner=f"{run_id}:w1", lease_seconds=30
+        )
+        is not None
+    )
 
     # The hold instant is Landscape database time read inside mark_blocked's
     # transaction (ADR-047): the seed instant above is a 2026-06 process
     # value and must not appear on the row.
     blocked_from = landscape_database_now(engine)
     blocked = repo.mark_blocked(
+        member_token=WorkerMembershipToken(run_id=item.run_id, worker_id=f"{item.run_id}:w1"),
         work_item_id=item.work_item_id,
+        row_payload_json=item.row_payload_json,
         queue_key=None,
         barrier_key="agg-1",
-        expected_lease_owner="w1",
+        expected_lease_owner=f"{run_id}:w1",
     )
     blocked_until = landscape_database_now(engine)
 
@@ -270,7 +296,7 @@ def test_list_blocked_barrier_items_returns_only_barrier_blocked_for_run() -> No
     )
     # run-A: one READY item (enqueued last so the claims above stay deterministic).
     repo.enqueue_ready(
-        run_id="run-A",
+        member_token=WorkerMembershipToken(run_id="run-A", worker_id="run-A:w1"),
         token_id="token-a2",
         row_id="row-a2",
         node_id="normalize",
@@ -285,7 +311,6 @@ def test_list_blocked_barrier_items_returns_only_barrier_blocked_for_run() -> No
     assert items[0].token_id == "token-a1"
     assert items[0].barrier_key is not None  # queue-hold NOT swept in
     assert items[0].barrier_blocked_at is not None
-    assert repo.blocked_barrier_token_ids(run_id="run-A") == frozenset({"token-a1"})
     assert repo.count_blocked_barrier_items(run_id="run-A") == 1
     assert repo.count_blocked_barrier_items(run_id="run-B") == 1
     assert repo.count_blocked_barrier_items(run_id="missing-run") == 0

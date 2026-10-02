@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from elspeth.contracts import CallStatus
+from elspeth.contracts.enums import RunMode
 from elspeth.plugins.infrastructure.clients.dataverse import (
     DataverseClient,
     DataversePageResponse,
@@ -46,6 +47,8 @@ class FakeLifecycleContext:
 
     def __init__(self) -> None:
         self.run_id = "integration-test-run"
+        self.run_mode = RunMode.LIVE
+        self.call_mode_session = None
         self.node_id = "test-node"
         self.telemetry_emit = _noop_telemetry_emit
         self.rate_limit_registry = None
@@ -59,6 +62,8 @@ class FakeSourceContext:
 
     def __init__(self) -> None:
         self.run_id = "integration-test-run"
+        self.run_mode = RunMode.LIVE
+        self.call_mode_session = None
         self.node_id = "test-node"
         self.operation_id = "op-001"
         self.landscape = None

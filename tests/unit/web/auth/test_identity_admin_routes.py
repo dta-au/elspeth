@@ -11,20 +11,24 @@ authority's contract, pinned where it lives.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import Engine, event, update
 
 from elspeth.web.auth.identity_admin_routes import create_identity_admin_router
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.routes import create_auth_router
 from elspeth.web.config import WebSettings
-from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, RoleGrant
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 from .conftest import build_local_auth_provider
@@ -90,6 +94,12 @@ class _RecordingAuditWriter:
     def record_relationship_changed(self, request: Request | None, **kwargs: Any) -> None:
         self._note("record_relationship_changed", request, kwargs)
 
+    def record_pending_identities_purged(self, request: Request | None, **kwargs: Any) -> None:
+        self._note("record_pending_identities_purged", request, kwargs)
+
+    def record_quota_exceeded(self, outcome: Any) -> None:
+        return None
+
     def only(self, method: str) -> _AuditCall:
         matches = [call for call in self.calls if call.method == method]
         assert len(matches) == 1, [call.method for call in self.calls]
@@ -102,6 +112,9 @@ class _Harness:
     authority: RepositoryIdentityAuthority
     audit: _RecordingAuditWriter
     root_identity_id: str
+    # The substrate itself, for the one thing no route can do: move a stored
+    # ``last_login_at`` into the past so R9 has something to measure.
+    engine: Engine
 
 
 def _local_claims(username: str) -> IdentityClaims:
@@ -114,7 +127,7 @@ def _build(tmp_path: Path) -> _Harness:
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
-    authority = RepositoryIdentityAuthority(engine)
+    authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
     provider = build_local_auth_provider(tmp_path / "auth.db", session_engine=engine, registration_open=True)
     for username in ("root", "alice", "bob", "carol"):
         provider.create_user(username, "password123", display_name=username.title())
@@ -148,7 +161,7 @@ def _build(tmp_path: Path) -> _Harness:
     app.state.auth_rate_limiter = ComposerRateLimiter(limit=100)
     app.include_router(create_auth_router())
     app.include_router(create_identity_admin_router())
-    return _Harness(app=app, authority=authority, audit=audit, root_identity_id=bootstrapped.record.identity_id)
+    return _Harness(app=app, authority=authority, audit=audit, root_identity_id=bootstrapped.record.identity_id, engine=engine)
 
 
 def _client(app: FastAPI) -> AsyncClient:
@@ -168,8 +181,10 @@ def _pending(harness: _Harness, username: str) -> str:
         activate=False,
         quota_tokens_per_day=None,
         quota_storage_bytes=None,
+        identity_dormancy_days=90,
         record_admission=lambda *_args: None,
         record_rebound=lambda *_args: None,
+        record_dormant=lambda *_args: None,
     )
     assert outcome.record.access_state == "pending"
     return outcome.record.identity_id
@@ -181,8 +196,10 @@ def _active(harness: _Harness, username: str) -> str:
         activate=True,
         quota_tokens_per_day=None,
         quota_storage_bytes=None,
+        identity_dormancy_days=90,
         record_admission=lambda *_args: None,
         record_rebound=lambda *_args: None,
+        record_dormant=lambda *_args: None,
     )
     assert outcome.record.access_state == "active"
     return outcome.record.identity_id
@@ -245,6 +262,42 @@ async def test_console_provenance_from_a_human_is_refused_and_leaves_no_row(harn
 # ── identities ───────────────────────────────────────────────────────────
 
 
+async def test_admin_can_run_the_configured_bounded_pending_purge(harness: _Harness) -> None:
+    stale_id = _pending(harness, "alice")
+    fresh_id = _pending(harness, "bob")
+    with harness.engine.begin() as conn:
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == stale_id)
+            .values(first_seen_at=datetime.now(UTC) - timedelta(days=91))
+        )
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        rejected_override = await client.post(
+            "/api/auth/admin/identities/purge-pending",
+            headers=root,
+            json={"retention_days": 1},
+        )
+        response = await client.post("/api/auth/admin/identities/purge-pending", headers=root, json={})
+        replay = await client.post("/api/auth/admin/identities/purge-pending", headers=root, json={})
+
+    assert rejected_override.status_code == 422
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["retention_days"] == 90
+    assert response.json()["deleted_identity_ids"] == [stale_id]
+    assert response.json()["deleted_count"] == 1
+    assert response.json()["has_more"] is False
+    assert replay.status_code == 200
+    assert replay.json()["deleted_identity_ids"] == []
+    assert harness.authority.read_identity(identity_id=stale_id) is None
+    assert harness.authority.read_identity(identity_id=fresh_id) is not None
+    calls = [call for call in harness.audit.calls if call.method == "record_pending_identities_purged"]
+    assert len(calls) == 2
+    assert calls[0].kwargs["outcome"].identity_ids == (stale_id,)
+    assert calls[1].kwargs["outcome"].identity_ids == ()
+
+
 async def test_the_queue_lists_pending_rows_as_subject_and_organisation_only(harness: _Harness) -> None:
     _pending(harness, "alice")
     async with _client(harness.app) as client:
@@ -261,6 +314,100 @@ async def test_the_queue_lists_pending_rows_as_subject_and_organisation_only(har
     assert row["username"] is None and row["display_name"] is None and row["email"] is None
     assert row["last_login_at"] is None
     assert "raw_claims_json" not in row
+
+
+def _re_pend_for_dormancy(harness: _Harness, identity_id: str, username: str) -> None:
+    """Drive a REAL R9 re-pend: backdate the stored login, then log in again.
+
+    The window is passed as one day and the login moved two days back rather
+    than the clock being mocked: dormancy is measured against the database
+    clock inside the authority's own transaction, and a mocked clock would
+    prove the mock.
+    """
+    with harness.engine.begin() as conn:
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == identity_id)
+            .values(
+                last_login_at=datetime.now(UTC) - timedelta(days=2),
+                activated_at=datetime.now(UTC) - timedelta(days=2),
+            )
+        )
+    outcome = harness.authority.ensure_identity(
+        claims=_local_claims(username),
+        activate=False,
+        quota_tokens_per_day=None,
+        quota_storage_bytes=None,
+        identity_dormancy_days=1,
+        record_admission=lambda *_args: None,
+        record_rebound=lambda *_args: None,
+        record_dormant=lambda *_args: None,
+    )
+    assert outcome.record.access_state == "pending"
+
+
+async def test_a_dormancy_re_pended_row_keeps_the_profile_the_admin_must_act_on(harness: _Harness) -> None:
+    """The rev2.2 blanking is about NEVER-ADMITTED rows, and R9 broke that premise.
+
+    "The list exposes its subject and organisation and nothing else" exists so
+    the queue does not become a directory of everyone who ever TRIED to log
+    in. An R9 re-pend puts a person the container already admitted -- whose
+    profile it therefore already holds, and whose ``activated_at`` is stamped
+    -- back into that queue. Blanking them leaves the administrator deciding
+    whether to re-admit a bare provider ``sub``, and positively asserts
+    ``last_login_at`` is NULL, which everywhere else in this system (R9's own
+    exemption included) means "has never logged in" -- the one fact that
+    would explain why the row is pending.
+
+    Same predicate, same reason, as the ``activated_at IS NULL`` term the
+    lazy purge takes.
+    """
+    alice_id = _active(harness, "alice")
+    _re_pend_for_dormancy(harness, alice_id, "alice")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        listed = await client.get("/api/auth/admin/identities", headers=root)
+        assert listed.status_code == 200, listed.text
+        (row,) = [entry for entry in listed.json()["identities"] if entry["subject"] == "alice"]
+        # A never-admitted row in the same queue, to prove the rule narrowed
+        # rather than lapsed: rev2.2's blanking still holds where its premise
+        # does.
+        _pending(harness, "bob")
+        both = await client.get("/api/auth/admin/identities", headers=root)
+    assert row["access_state"] == "pending"
+    assert row["disable_reason"] == "dormant"
+    assert row["username"] == "alice"
+    assert row["last_login_at"] is not None
+    assert row["activated_at"] is not None
+    (never,) = [entry for entry in both.json()["identities"] if entry["subject"] == "bob"]
+    assert never["username"] is None and never["last_login_at"] is None and never["activated_at"] is None
+
+
+async def test_re_admitting_a_dormant_identity_records_the_access_it_did_not_grant(harness: _Harness) -> None:
+    """``role="none"`` grants nothing and still returns the person to their role.
+
+    The activation route is R9's stated remedy. It must neither collide with
+    the grant the identity kept nor let the trail read as an admission with
+    no authority, so the audit call carries what was retained.
+    """
+    alice_id = _active(harness, "alice")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        granted = await client.post("/api/auth/admin/roles", headers=root, json={"identity_id": alice_id, "role": "user"})
+        assert granted.status_code == 201, granted.text
+        _re_pend_for_dormancy(harness, alice_id, "alice")
+        response = await client.post(
+            f"/api/auth/admin/identities/{alice_id}/activate",
+            headers=root,
+            json={"role": "none", "note": "back from long service leave"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["identity"]["access_state"] == "active"
+    call = harness.audit.only("record_identity_activated")
+    assert call.kwargs["role"] is None and call.kwargs["role_id"] is None
+    # Role AND scope: ``None`` is the deployment-wide grant, which is the one
+    # that would make a re-admitted identity an administrator again.
+    assert call.kwargs["retained_roles"] == (("user", None),)
 
 
 async def test_activation_admits_with_a_role_and_a_quota_and_records_it_before_answering(harness: _Harness) -> None:
@@ -327,6 +474,20 @@ async def test_pre_provision_creates_an_active_row_before_first_login(harness: _
     assert body["role"]["role"] == "reviewer"
     call = harness.audit.only("record_identity_activated")
     assert call.kwargs["cause"] == "pre_provision"
+
+
+async def test_pre_provision_service_provider_is_refused_without_audit_or_identity(harness: _Harness) -> None:
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        response = await client.post(
+            "/api/auth/admin/identities",
+            headers=root,
+            json={"provider": "service", "subject": "svc-example", "role": "approver", "note": "console"},
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["refusal"] == "service_identity_provisioning_unavailable"
+    assert harness.authority.read_identity_by_natural_key(provider="service", subject="svc-example") is None
+    assert harness.audit.calls == []
 
 
 async def test_disable_and_enable_round_trip_with_their_rows(harness: _Harness) -> None:
@@ -472,3 +633,392 @@ async def test_bodies_are_strict(harness: _Harness) -> None:
         empty_note = await client.post("/api/auth/admin/identities/x/activate", headers=root, json={"role": "user", "note": ""})
         assert empty_note.status_code == 422
     assert harness.audit.calls == []
+
+
+# Aware body values whose offset carries their UTC instant past the last, or
+# before the first, instant a datetime can hold. Converting either to UTC for
+# storage raised ``OverflowError``, which reached the client as a 500.
+_PAST_THE_LAST_UTC_INSTANT = "9999-12-31T23:00:00-05:00"
+_BEFORE_THE_FIRST_UTC_INSTANT = "0001-01-01T00:30:00+10:00"
+
+
+@pytest.mark.parametrize("expires_at", [_PAST_THE_LAST_UTC_INSTANT, _BEFORE_THE_FIRST_UTC_INSTANT])
+async def test_an_expiry_outside_the_utc_range_is_refused_as_invalid_input(harness: _Harness, expires_at: str) -> None:
+    bob_id = _active(harness, "bob")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        response = await client.post(
+            "/api/auth/admin/roles", headers=root, json={"identity_id": bob_id, "role": "approver", "expires_at": expires_at}
+        )
+    assert response.status_code == 422, response.text
+    assert [error["loc"] for error in response.json()["detail"]] == [["body", "expires_at"]]
+    assert harness.authority.list_roles(identity_id=bob_id, include_revoked=True, limit=50, offset=0) == ()
+    assert harness.audit.calls == []
+
+
+async def test_an_expiry_at_the_last_utc_instant_is_granted_and_one_microsecond_later_is_not(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        later = await client.post(
+            "/api/auth/admin/roles",
+            headers=root,
+            json={"identity_id": bob_id, "role": "approver", "expires_at": "9999-12-31T19:00:00-05:00"},
+        )
+        last = await client.post(
+            "/api/auth/admin/roles",
+            headers=root,
+            json={"identity_id": bob_id, "role": "approver", "expires_at": "9999-12-31T18:59:59.999999-05:00"},
+        )
+    assert later.status_code == 422, later.text
+    assert last.status_code == 201, last.text
+    (grant,) = harness.authority.list_roles(identity_id=bob_id, include_revoked=True, limit=50, offset=0)
+    assert grant.expires_at == datetime.max.replace(tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    "window",
+    [{"effective_until": _PAST_THE_LAST_UTC_INSTANT}, {"effective_from": _BEFORE_THE_FIRST_UTC_INSTANT}],
+    ids=["effective_until", "effective_from"],
+)
+async def test_a_relationship_window_outside_the_utc_range_is_refused_as_invalid_input(harness: _Harness, window: dict[str, str]) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        response = await client.post(
+            "/api/auth/admin/relationships",
+            headers=root,
+            json={"from_identity_id": bob_id, "to_identity_id": carol_id, "relationship_type": "approver", **window},
+        )
+    assert response.status_code == 422, response.text
+    assert [error["loc"] for error in response.json()["detail"]] == [["body", *window]]
+    assert harness.authority.list_relationships(identity_id=carol_id, include_revoked=True, limit=50, offset=0) == ()
+    assert [call.method for call in harness.audit.calls] == ["record_role_changed"]
+
+
+async def test_a_window_from_the_first_utc_instant_is_asserted_and_one_microsecond_earlier_is_not(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        edge = {"from_identity_id": bob_id, "to_identity_id": carol_id, "relationship_type": "approver"}
+        earlier = await client.post(
+            "/api/auth/admin/relationships", headers=root, json={**edge, "effective_from": "0001-01-01T09:59:59.999999+10:00"}
+        )
+        first = await client.post(
+            "/api/auth/admin/relationships", headers=root, json={**edge, "effective_from": "0001-01-01T10:00:00+10:00"}
+        )
+    assert earlier.status_code == 422, earlier.text
+    assert first.status_code == 201, first.text
+    (asserted,) = harness.authority.list_relationships(identity_id=carol_id, include_revoked=True, limit=50, offset=0)
+    assert asserted.effective_from == datetime.min.replace(tzinfo=UTC)
+
+
+# The database clock decides whether an expiry is in the future, so only the
+# authority can refuse one that is not. It raised ``ValueError``, which no
+# route translates, so the client saw a 500.
+async def test_an_expiry_that_is_not_in_the_future_is_a_refusal_not_a_crash(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        response = await client.post(
+            "/api/auth/admin/roles",
+            headers=root,
+            json={"identity_id": bob_id, "role": "approver", "expires_at": "2001-01-01T00:00:00Z"},
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["refusal"] == "expiry_not_in_future"
+    assert harness.authority.list_roles(identity_id=bob_id, include_revoked=True, limit=50, offset=0) == ()
+    assert harness.audit.calls == []
+
+
+# A window that does not open before it closes is wrong in the body alone, so
+# the request model refuses it. The authority raised ``ValueError`` -- a 500.
+# ``empty`` names one instant in two offsets: the comparison is by instant.
+@pytest.mark.parametrize(
+    "window",
+    [
+        {"effective_from": "2027-01-02T00:00:00Z", "effective_until": "2027-01-01T00:00:00Z"},
+        {"effective_from": "2027-01-01T10:00:00+10:00", "effective_until": "2027-01-01T00:00:00Z"},
+    ],
+    ids=["inverted", "empty"],
+)
+async def test_a_relationship_window_that_does_not_open_before_it_closes_is_refused_as_invalid_input(
+    harness: _Harness, window: dict[str, str]
+) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        response = await client.post(
+            "/api/auth/admin/relationships",
+            headers=root,
+            json={"from_identity_id": bob_id, "to_identity_id": carol_id, "relationship_type": "approver", **window},
+        )
+    assert response.status_code == 422, response.text
+    assert [error["loc"] for error in response.json()["detail"]] == [["body"]]
+    assert harness.authority.list_relationships(identity_id=carol_id, include_revoked=True, limit=50, offset=0) == ()
+    assert [call.method for call in harness.audit.calls] == ["record_role_changed"]
+
+
+async def test_a_relationship_window_one_microsecond_long_is_asserted(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        response = await client.post(
+            "/api/auth/admin/relationships",
+            headers=root,
+            json={
+                "from_identity_id": bob_id,
+                "to_identity_id": carol_id,
+                "relationship_type": "approver",
+                "effective_from": "2027-01-01T00:00:00Z",
+                "effective_until": "2027-01-01T00:00:00.000001Z",
+            },
+        )
+    assert response.status_code == 201, response.text
+    (asserted,) = harness.authority.list_relationships(identity_id=carol_id, include_revoked=True, limit=50, offset=0)
+    assert (asserted.effective_from, asserted.effective_until) == (
+        datetime(2027, 1, 1, tzinfo=UTC),
+        datetime(2027, 1, 1, 0, 0, 0, 1, tzinfo=UTC),
+    )
+
+
+# ── delegated curator administration ────────────────────────────────────
+
+
+def _govern(harness: _Harness) -> None:
+    harness.app.state.settings = harness.app.state.settings.model_copy(update={"registration_mode": "closed", "workflow_governance": "on"})
+
+
+async def _approver_role(client: AsyncClient, root: dict[str, str], identity_id: str) -> str:
+    response = await client.post("/api/auth/admin/roles", headers=root, json={"identity_id": identity_id, "role": "approver"})
+    assert response.status_code == 201, response.text
+    return str(response.json()["role_id"])
+
+
+async def _edge(client: AsyncClient, root: dict[str, str], actor_id: str, target_id: str) -> str:
+    response = await client.post(
+        "/api/auth/admin/relationships",
+        headers=root,
+        json={"from_identity_id": actor_id, "to_identity_id": target_id, "relationship_type": "approver"},
+    )
+    assert response.status_code == 201, response.text
+    return str(response.json()["relationship_id"])
+
+
+def _curator_grants(harness: _Harness, identity_id: str) -> list[RoleGrant]:
+    return [
+        grant
+        for grant in harness.authority.list_roles(identity_id=identity_id, include_revoked=True, limit=50, offset=0)
+        if grant.role == "curator"
+    ]
+
+
+async def test_approver_appoints_curator_over_direct_report_and_records_audit(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+        _govern(harness)
+        response = await client.post(
+            "/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator", "note": "library gate"}
+        )
+    assert response.status_code == 201, response.text
+    assert (response.json()["identity_id"], response.json()["granted_by_identity_id"]) == (carol_id, bob_id)
+    calls = [call for call in harness.audit.calls if call.method == "record_role_changed" and call.kwargs["role"] == "curator"]
+    assert len(calls) == 1
+    assert calls[0].kwargs["actor_identity_id"] == bob_id
+    assert calls[0].request_bound
+
+
+async def test_a_delegated_curator_grant_expiring_in_the_past_is_a_refusal_not_a_crash(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+        _govern(harness)
+        response = await client.post(
+            "/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator", "expires_at": "2001-01-01T00:00:00Z"}
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["refusal"] == "expiry_not_in_future"
+    assert _curator_grants(harness, carol_id) == []
+    assert [call for call in harness.audit.calls if call.method == "record_role_changed" and call.kwargs["role"] == "curator"] == []
+
+
+async def test_delegated_grant_requires_live_direct_edge_and_role(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        role_id = await _approver_role(client, root, bob_id)
+        _govern(harness)
+        missing = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+        edge_id = await _edge(client, root, bob_id, carol_id)
+        revoked = await client.post(f"/api/auth/admin/relationships/{edge_id}/revoke", headers=root, json={})
+        assert revoked.status_code == 200, revoked.text
+        no_edge = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+        await _edge(client, root, bob_id, carol_id)
+        revoked_role = await client.post(f"/api/auth/admin/roles/{role_id}/revoke", headers=root, json={})
+        assert revoked_role.status_code == 200, revoked_role.text
+        no_role = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+    assert (missing.status_code, no_edge.status_code, no_role.status_code) == (404, 404, 404)
+    assert _curator_grants(harness, carol_id) == []
+
+
+async def test_delegated_arm_rejects_other_roles_scope_and_console_provenance(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+        _govern(harness)
+        for body in (
+            {"identity_id": carol_id, "role": "reviewer"},
+            {"identity_id": carol_id, "role": "curator", "scope": "team-a"},
+            {"identity_id": carol_id, "role": "curator", "on_behalf_of": "console"},
+        ):
+            response = await client.post("/api/auth/admin/roles", headers=bob, json=body)
+            assert response.status_code == 404, response.text
+    assert _curator_grants(harness, carol_id) == []
+
+
+async def test_delegated_grant_governance_off_and_no_role_body_validation(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        hidden = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": "x", "role": "not-a-role"})
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+        off = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+    assert hidden.status_code == 404
+    assert off.status_code == 409
+    assert off.json()["detail"]["refusal"] == "workflow_governance_off"
+
+
+async def test_delegated_grant_respects_admin_conflict(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, harness.root_identity_id)
+        _govern(harness)
+        response = await client.post(
+            "/api/auth/admin/roles", headers=bob, json={"identity_id": harness.root_identity_id, "role": "curator"}
+        )
+    assert response.status_code == 409
+    assert response.json()["detail"]["refusal"] == "role_forbidden_for_identity"
+
+
+async def test_delegated_grant_locks_before_reading_database_clock(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+    seen: list[str] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool) -> None:
+        seen.append(statement)
+
+    event.listen(harness.engine, "before_cursor_execute", capture)
+    try:
+        harness.authority.grant_curator_as_approver(
+            actor_identity_id=bob_id, identity_id=carol_id, expires_at=None, note=None, record=lambda _event: None
+        )
+    finally:
+        event.remove(harness.engine, "before_cursor_execute", capture)
+    clocks = [index for index, statement in enumerate(seen) if "CURRENT_TIMESTAMP" in statement]
+    reads = [
+        index for index, statement in enumerate(seen) if statement.lstrip().upper().startswith("SELECT") and "FROM identit" in statement
+    ]
+    assert len(clocks) == 1
+    assert reads and max(reads) < clocks[0], seen
+
+
+async def test_revoked_admin_row_still_takes_population_lock_first(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        admin = await client.post("/api/auth/admin/roles", headers=root, json={"identity_id": carol_id, "role": "admin"})
+        assert admin.status_code == 201, admin.text
+        revoked = await client.post(f"/api/auth/admin/roles/{admin.json()['role_id']}/revoke", headers=root, json={})
+        assert revoked.status_code == 200, revoked.text
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+    seen: list[str] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool) -> None:
+        seen.append(statement)
+
+    event.listen(harness.engine, "before_cursor_execute", capture)
+    try:
+        harness.authority.grant_curator_as_approver(
+            actor_identity_id=bob_id, identity_id=carol_id, expires_at=None, note=None, record=lambda _event: None
+        )
+    finally:
+        event.remove(harness.engine, "before_cursor_execute", capture)
+    population = next((index for index, statement in enumerate(seen) if "FROM identity_roles JOIN identities" in statement), None)
+    first_identity = next(index for index, statement in enumerate(seen) if "FROM identities" in statement and "JOIN" not in statement)
+    assert population is not None and population < first_identity, seen
+
+
+async def test_malformed_service_provider_cannot_delegate_or_receive_curator(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+        _govern(harness)
+        with harness.engine.begin() as conn:
+            conn.execute(update(identities_table).where(identities_table.c.identity_id == bob_id).values(provider="service"))
+        actor = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+        with harness.engine.begin() as conn:
+            conn.execute(update(identities_table).where(identities_table.c.identity_id == bob_id).values(provider="local"))
+            conn.execute(update(identities_table).where(identities_table.c.identity_id == carol_id).values(provider="service"))
+        target = await client.post("/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator"})
+    assert actor.status_code == 404
+    assert target.status_code == 409
+    assert target.json()["detail"]["refusal"] == "role_forbidden_for_identity"
+    assert _curator_grants(harness, carol_id) == []
+
+
+async def test_delegated_curator_audit_failure_rolls_back_grant(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+
+    def reject_audit(_event: Any) -> None:
+        raise RuntimeError("audit unavailable")
+
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        harness.authority.grant_curator_as_approver(
+            actor_identity_id=bob_id, identity_id=carol_id, expires_at=None, note=None, record=reject_audit
+        )
+    assert _curator_grants(harness, carol_id) == []

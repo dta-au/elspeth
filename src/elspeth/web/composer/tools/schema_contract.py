@@ -11,14 +11,28 @@ from collections.abc import Mapping, MutableMapping, Sequence
 from copy import deepcopy
 from typing import Any, Final, cast
 
-from elspeth.core.config import (
-    _MAX_CONNECTION_NAME_LENGTH,
-    _MAX_NODE_NAME_LENGTH,
-    _RESERVED_EDGE_LABELS,
-    _VALID_CONNECTION_NAME_RE,
-    _VALID_NODE_NAME_RE,
-)
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
+from elspeth.web.composer.tools._naming_disclosure import (
+    _disclose_connection_name_constraints,
+    _disclose_node_name_constraints,
+    _disclose_property_name_connection_rule,
+    _disclose_property_name_source_rule,
+    _disclose_route_destination_constraints,
+    _disclose_sink_name_constraints,
+)
+
+
+def assert_tool_model_key_parity(*, tool_name: str, shipped: frozenset[str], model_fields: frozenset[str]) -> None:
+    """Compare names symmetrically after the caller proves actual admission.
+
+    Empty field sets are valid owned models. This checks names only; scalar,
+    requiredness, nullability and nested contracts need behavioral probes.
+    """
+    if shipped != model_fields:
+        raise RuntimeError(
+            f"{tool_name}: MODEL key mismatch: shipped_not_model={sorted(shipped - model_fields)}, "
+            f"model_not_shipped={sorted(model_fields - shipped)}"
+        )
 
 
 def _registered_tool_schema(tool_name: str) -> Mapping[str, Any]:
@@ -149,6 +163,8 @@ def _branch_compatibility_failure(
         return f"{path}: runtime type {runtime_type!r} is not advertised as {advertised_type!r}"
 
     runtime_values: frozenset[object] | None = None
+    if runtime_type == "null":
+        runtime_values = frozenset({None})
     if "enum" in runtime:
         runtime_values = frozenset(_schema_sequence(runtime["enum"], path=f"{path}.enum"))
     advertised_values: frozenset[object] | None = None
@@ -342,134 +358,6 @@ def _without_verified_set_pipeline_source_union(
     return {key: value for key, value in schema.items() if key != "oneOf"}
 
 
-# core/config.py enforces these at settings_load, well after a composer
-# proposal has already been accepted; nothing on the advertised terminal
-# schema told the planner beforehand, so a violation costs a whole repair
-# round-trip (elspeth-2e9df07c69). Every constraint added below restates a
-# rule the runtime already enforces on the same field — disclosure, not a
-# new or relaxed acceptance path (Stage 1 keeps enforcing everything it
-# enforced before; see `_composer_node_id_validation_message` /
-# `_routing_label_errors` in web/composer/state.py, which mirror the same
-# core/config.py functions at proposal time).
-_RESERVED_EDGE_LABEL_EXCLUSION: Mapping[str, Any] = {"enum": sorted(_RESERVED_EDGE_LABELS)}
-
-# The node pattern's first character class (a letter) already makes a "__"
-# prefix unreachable, so `validate_runtime_node_name`'s separate
-# `startswith("__")` check (core/config.py:229) needs no extra "not" arm
-# here. The connection charset's first character class admits "_", so
-# `_validate_connection_or_sink_name`'s identical check (core/config.py:253)
-# — and `validate_sink_name`'s (core/config.py:267) — DOES need a dedicated
-# exclusion; a bare enum exclusion would silently admit "__anything".
-#
-# The "^__" arm carries an explicit "type": "string": JSON Schema's
-# "pattern" keyword is a no-op (vacuously satisfied) against a non-string
-# instance, so a bare {"pattern": "^__"} arm would itself match — and
-# therefore its enclosing "not" would REJECT — every non-string instance,
-# null included. Three of the fields this clause applies to are declared
-# nullable (["string", "null"]) with `SetPipelineArgumentsModel` accepting
-# null on each (the rest are plain strings or object keys, where the guard
-# is a no-op), so an unguarded arm here would advertise a phantom rejection
-# of legal omitted-as-null values (caught by review; see
-# `test_canonical_schema_accepts_null_on_nullable_disclosed_fields`).
-_CONNECTION_NAME_NOT_CLAUSE: Mapping[str, Any] = {"anyOf": [dict(_RESERVED_EDGE_LABEL_EXCLUSION), {"type": "string", "pattern": "^__"}]}
-
-# validate_sink_name (core/config.py:258-269) requires the connection
-# charset (core/config.py:192) PLUS `value == value.lower()`. JSON Schema has
-# no case-insensitivity keyword; restricting the character class to
-# lowercase is the exact regex equivalent, since a string containing no
-# uppercase letter trivially equals its own lowercased form.
-_SINK_NAME_PATTERN = r"^[a-z0-9_][a-z0-9_-]*$"
-
-# validate_sources_not_empty_and_named's FIRST check (core/config.py:2114-2117,
-# mirrored at state.py:454) is lowercase enforcement — source names are
-# node-shaped (charset/length/reserved-label, core/config.py:2118-2124) PLUS
-# lowercase, unlike a plain node name. Restricting the node charset's first
-# character class to lowercase letters is the case-insensitivity equivalent,
-# same reasoning as `_SINK_NAME_PATTERN` above.
-_SOURCE_NAME_PATTERN = r"^[a-z][a-z0-9_-]*$"
-
-# Gate route DESTINATIONS (core/config.py:813-830, mirrored at
-# state.py:288-299): 'fork'/'discard' are literal escapes admitted before
-# any naming check runs, so they never reach the reserved-label exclusion —
-# only 'continue' (explicitly rejected with its own message) and
-# 'on_success' (rejected by the same `_RESERVED_EDGE_LABELS` membership test
-# every other connection-rule field uses) are actually excluded here.
-# 'fork' and 'discard' both already satisfy the plain connection
-# charset/length, so admitting them needs no separate branch — only a
-# narrower "not" than `_CONNECTION_NAME_NOT_CLAUSE`.
-_ROUTE_DESTINATION_NOT_CLAUSE: Mapping[str, Any] = {"anyOf": [{"enum": ["continue", "on_success"]}, {"type": "string", "pattern": "^__"}]}
-
-
-def _disclose_node_name_constraints(schema: MutableMapping[str, Any]) -> None:
-    """Advertise the runtime processing-node identifier rule (core/config.py:187-231)."""
-    schema["pattern"] = _VALID_NODE_NAME_RE.pattern
-    schema["maxLength"] = _MAX_NODE_NAME_LENGTH
-    schema["not"] = dict(_RESERVED_EDGE_LABEL_EXCLUSION)
-
-
-def _disclose_connection_name_constraints(schema: MutableMapping[str, Any]) -> None:
-    """Advertise the runtime connection/route-label rule (core/config.py:189-255).
-
-    Applies unchanged to fields whose only other admitted value is a literal
-    escape hatch ('discard'): 'discard' itself satisfies the connection
-    charset, length cap, and reserved-label exclusion, so disclosing this
-    rule never advertises the escape value as invalid.
-    """
-    schema["pattern"] = _VALID_CONNECTION_NAME_RE.pattern
-    schema["maxLength"] = _MAX_CONNECTION_NAME_LENGTH
-    schema["not"] = deepcopy(cast(dict[str, Any], _CONNECTION_NAME_NOT_CLAUSE))
-
-
-def _disclose_sink_name_constraints(schema: MutableMapping[str, Any]) -> None:
-    """Advertise the runtime sink-name rule (core/config.py:258-269).
-
-    Used for every field the runtime documents as sink-only — `nodes[].id`
-    is NOT one of these (a processing node, never a sink), but
-    `nodes[].on_error` and `outputs[].on_write_failure` are: both are
-    documented as "'discard' or a declared sink name" (tools/sessions.py),
-    and a declared sink's own key is always sink-shaped
-    (`ElspethSettings.validate_sink_names_lowercase` -> `validate_sink_name`),
-    so no legally-resolvable value for either field can ever be wider than
-    this rule even where a field's own syntax-only validator (transform/gate
-    `on_error`) independently permits more.
-    """
-    schema["pattern"] = _SINK_NAME_PATTERN
-    schema["maxLength"] = _MAX_NODE_NAME_LENGTH
-    schema["not"] = deepcopy(cast(dict[str, Any], _CONNECTION_NAME_NOT_CLAUSE))
-
-
-def _disclose_property_name_source_rule(schema: MutableMapping[str, Any]) -> None:
-    """Advertise the source-name rule (core/config.py:2110-2125) against an object's KEYS."""
-    schema["propertyNames"] = {
-        "pattern": _SOURCE_NAME_PATTERN,
-        "maxLength": _MAX_NODE_NAME_LENGTH,
-        "not": dict(_RESERVED_EDGE_LABEL_EXCLUSION),
-    }
-
-
-def _disclose_property_name_connection_rule(schema: MutableMapping[str, Any]) -> None:
-    """Advertise the connection-name rule against an object's KEYS via propertyNames."""
-    schema["propertyNames"] = {
-        "pattern": _VALID_CONNECTION_NAME_RE.pattern,
-        "maxLength": _MAX_CONNECTION_NAME_LENGTH,
-        "not": deepcopy(cast(dict[str, Any], _CONNECTION_NAME_NOT_CLAUSE)),
-    }
-
-
-def _disclose_route_destination_constraints(schema: MutableMapping[str, Any]) -> None:
-    """Advertise the gate route-destination rule (core/config.py:813-830) on VALUES.
-
-    Deliberately not `_disclose_connection_name_constraints`: 'fork' is one
-    of `_RESERVED_EDGE_LABELS` but a legitimate destination here, so this
-    uses the narrower `_ROUTE_DESTINATION_NOT_CLAUSE`, which excludes only
-    'continue' and 'on_success'.
-    """
-    schema["type"] = "string"
-    schema["pattern"] = _VALID_CONNECTION_NAME_RE.pattern
-    schema["maxLength"] = _MAX_CONNECTION_NAME_LENGTH
-    schema["not"] = deepcopy(cast(dict[str, Any], _ROUTE_DESTINATION_NOT_CLAUSE))
-
-
 def _disclose_runtime_naming_constraints(schema: MutableMapping[str, Any]) -> None:
     """Mutate an isolated set_pipeline schema copy to disclose runtime naming rules.
 
@@ -541,59 +429,10 @@ def canonical_set_pipeline_schema() -> dict[str, Any]:
 # schema following — which a per-kind membership assertion never caught.        #
 # --------------------------------------------------------------------------- #
 
-# `upsert_node`'s advertised schema is deliberately STRICTER than
-# `_UpsertNodeArgumentsModel` on these properties. The model types them
-# loosely on purpose so a bad value reaches a purpose-built validator with a
-# repair message instead of being bounced by a bare schema rejection, while
-# the wire schema still teaches the planner the closed vocabulary up front.
-# Each entry earns its place ONLY because the advertised vocabulary equals
-# what the named site enforces ON THE AUTHORING PATH — a rule the author would
-# hit anyway, disclosed earlier. A vocabulary enforced somewhere else (at
-# settings_load, say) does NOT qualify: advertising it here would reject an
-# authoring call the composer itself accepts, which is this ticket's defect
-# wearing an allowlist. Each comment names the call path so the next reader can
-# re-verify the claim without redoing the trace.
-#
-# Note the asymmetry the relaxation creates: once a property is disclosed, the
-# directional walker no longer sees its vocabulary at all (the advertised enum
-# is stripped, a closed object is reopened), so a downstream vocabulary that
-# GROWS cannot fail this contract. What holds each pairing is a named test in
-# tests/unit/web/composer/test_tool_schema_contract.py, one per entry below,
-# asserting the advertised vocabulary against the enforcing type AND that the
-# enforcer refuses a value outside it. Add an entry here and you owe both there.
-_UPSERT_NODE_ADVERTISED_DISCLOSURES: Mapping[str, str] = {
-    # Advertised {count, timeout_seconds, condition} under
-    # additionalProperties:False == `TriggerConfig`'s fields under
-    # extra="forbid". Authoring path, and the strictest of the three — it
-    # REJECTS THE MUTATION rather than reporting an entry:
-    #   transforms.py `_execute_upsert_node` (node_type == "aggregation")
-    #     -> `_common._validate_aggregation_trigger`
-    #     -> `TriggerConfig.model_validate` -> "Invalid aggregation trigger:
-    #        Extra inputs are not permitted"
-    # (the splice path calls the same validator; state.py runs the same model
-    # again on read-back as `aggregation_trigger_invalid`).
-    "trigger": "core/config.py TriggerConfig, via _common._validate_aggregation_trigger",
-    # Advertised ["passthrough", "transform"] == `OutputMode`'s members.
-    # Authoring path, but WEAKER than trigger: the mutation still succeeds and
-    # the bad value lands in state. The code is not in
-    # `_common._MUTATION_BLOCKING_INVARIANT_CODES`, so what the author gets is a
-    # high-severity entry on the validation summary every upsert_node result
-    # carries — the pipeline cannot pass validation, but the call is not
-    # rejected:
-    #   state.py `CompositionState.validate` -> `aggregation_output_mode_invalid`
-    # That enforcer derives its membership test from `OutputMode` directly, so
-    # this pairing binds two vocabularies rather than three. It used to restate
-    # the pair by hand, which would have made a grown enum look like a wire
-    # defect and invited the enum entry to be widened instead (review F1).
-    "output_mode": "web/composer/state.py CompositionState.validate, aggregation_output_mode_invalid",
-    # Advertised ["require_all", "best_effort"] == `_SCOPE_POLICY_VOCABULARY`
-    # (derived from `ScopeSettings.policy`). Authoring path, same weaker shape
-    # as output_mode — a summary entry, not a rejected mutation:
-    #   state.py `CompositionState.validate`
-    #     -> `_collector_intrinsic_errors` -> `collector_scope_policy_invalid`
-    #   "Collector '<id>' scope_policy '<value>' is not a valid policy."
-    "scope_policy": "web/composer/state.py _collector_intrinsic_errors, collector_scope_policy_invalid",
-}
+# All current upsert_node vocabularies and owned records are admitted by its
+# argument model. Keep the existing guarded extension point empty: a future
+# disclosure requires a concrete authoring-path enforcer and dedicated proof.
+_UPSERT_NODE_ADVERTISED_DISCLOSURES: Mapping[str, str] = {}
 
 
 # JSON-Schema composition keywords this traversal does not descend into. A

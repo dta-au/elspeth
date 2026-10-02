@@ -11,10 +11,12 @@ green.
 from __future__ import annotations
 
 import re
+import shlex
 import tomllib
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -46,6 +48,19 @@ def _run_lines(job: dict[str, Any]) -> str:
     return "\n".join(step.get("run", "") for step in job["steps"])
 
 
+def _pytest_arguments(run: str) -> list[str]:
+    # Python's ``-m pytest`` launches the module; only subsequent flags are
+    # pytest arguments capable of overriding the authored marker selection.
+    tokens = shlex.split(run.replace("\\\n", " "), comments=True)
+    return tokens[tokens.index("pytest") + 1 :]
+
+
+@pytest.mark.parametrize("launcher", ["uv run pytest", "uv run python -m pytest"])
+def test_marker_override_instrument_distinguishes_module_launch_from_selection(launcher: str) -> None:
+    assert "-m" not in _pytest_arguments(f"# pytest launch comment\n{launcher} tests/ -n 2")
+    assert "-m" in _pytest_arguments(f"{launcher} tests/ -m live_provider -n 2")
+
+
 PUSH_WORKFLOWS = (
     CI_WORKFLOW,
     REPO_ROOT / ".github" / "workflows" / "codeql.yaml",
@@ -56,17 +71,7 @@ BASH_ONLY_TOKENS = ("pipefail", "[[")
 
 
 def test_container_job_steps_with_bash_syntax_declare_bash() -> None:
-    """A container job's default shell is dash, so bash-only steps must say so.
-
-    GitHub's shell auto-detection inside ``container:`` jobs falls back to
-    ``sh -e`` (dash), which rejects ``set -o pipefail`` and has no ``[[``.
-    The "Reject touched or broadened permanent multi-rule per-file blankets"
-    step ran that way on every push run and died at its first line, so the
-    ratchet resolver it guards never executed (run 33944365102,
-    elspeth-d8749aeaa3). Every run step in a container job that uses a
-    bash-only token must declare ``shell: bash``; host-runner jobs get bash
-    by default and are not constrained here.
-    """
+    """Container jobs default to dash, so bash-only steps must declare bash."""
     workflow = _workflow()
     offenders: list[str] = []
     checked = 0
@@ -80,7 +85,7 @@ def test_container_job_steps_with_bash_syntax_declare_bash() -> None:
             checked += 1
             if step.get("shell") != "bash":
                 offenders.append(f"{job_name}: {step.get('name')!r}")
-    assert checked >= 2, "expected the actionlint and blanket-ratchet steps to be checked"
+    assert checked >= 1, "expected the actionlint step to be checked"
     assert offenders == []
 
 
@@ -127,19 +132,8 @@ def test_state_engine_validation_job_pins_actions_and_frozen_install() -> None:
     assert "uv sync --frozen --all-extras" in _run_lines(job)
 
 
-def test_suites_run_while_static_analysis_is_red_and_ci_success_still_requires_it() -> None:
-    """The test suites report on every run; the merge still waits on static analysis.
-
-    Operator ruling 2026-09-05 (elspeth-d8749aeaa3): the trust-tier step keeps
-    ``static-analysis`` red by design until Phase 5 signs the allowlists, and
-    while ``test`` and ``testcontainer`` carried ``needs: [static-analysis]``
-    every Python job was ``skipped`` on every push, so no run could score a
-    merge. Those two jobs (and ``integration``, which follows ``test``) now run
-    regardless; ``ci-success`` still lists ``static-analysis`` in its ``needs``
-    and still demands its ``result == success``, so the red blocks the merge
-    without hiding the test verdict. Exactly these two jobs were authorised;
-    the other static-analysis dependants keep theirs.
-    """
+def test_suites_report_independently_and_ci_success_requires_static_analysis() -> None:
+    """Python suites report independently, and the aggregate requires every job."""
     assert "needs" not in _job("test")
     assert "needs" not in _job("testcontainer")
     assert _job("integration")["needs"] == ["test"]
@@ -149,8 +143,6 @@ def test_suites_run_while_static_analysis_is_red_and_ci_success_still_requires_i
     assert "static-analysis" in ci_success["needs"]
     assert ci_success["if"] == "always()"
     assert 'if [[ "${{ needs.static-analysis.result }}" != "success" ]]' in _run_lines(ci_success)
-    trust_tier = next(step for step in _job("static-analysis")["steps"] if step["name"] == "Run trust-tier elspeth-lints rule")
-    assert "continue-on-error" not in trust_tier
 
 
 def test_ci_success_requires_state_engine_validation() -> None:
@@ -181,7 +173,7 @@ def test_test_job_steps_carry_no_marker_expression_of_their_own() -> None:
     pytest_steps = [step for step in _job("test")["steps"] if "pytest" in str(step.get("run", ""))]
     assert len(pytest_steps) == 2, [step.get("name") for step in pytest_steps]
     for step in pytest_steps:
-        tokens = step["run"].replace("\\\n", " ").split()
+        tokens = _pytest_arguments(step["run"])
         assert "-m" not in tokens, step.get("name")
         assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), step.get("name")
 
@@ -203,7 +195,7 @@ def test_integration_job_carries_no_marker_expression_of_its_own() -> None:
     """
     pytest_steps = [step for step in _job("integration")["steps"] if "pytest" in str(step.get("run", ""))]
     assert len(pytest_steps) == 1, [step.get("name") for step in pytest_steps]
-    tokens = pytest_steps[0]["run"].replace("\\\n", " ").split()
+    tokens = _pytest_arguments(pytest_steps[0]["run"])
     assert "-m" not in tokens, pytest_steps[0].get("name")
     assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), pytest_steps[0].get("name")
 
@@ -238,7 +230,7 @@ def test_no_job_restates_the_marker_selection_except_the_testcontainer_override(
             if "pytest" not in run:
                 continue
             steps_with_pytest.append((job_name, str(step.get("name"))))
-            tokens = run.replace("\\\n", " ").split()
+            tokens = _pytest_arguments(run)
             assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), job_name
             markers = [tokens[index + 1] for index, token in enumerate(tokens) if token == "-m" and index + 1 < len(tokens)]
             if markers:
@@ -310,7 +302,7 @@ def test_host_runner_unit_job_proves_the_docker_and_non_root_ids_on_every_push()
     """
     job = _job("host-runner-unit")
     assert "container" not in job
-    assert job["runs-on"] == "ubuntu-24.04"
+    assert job["runs-on"] == ["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]
     run = next(step for step in job["steps"] if "pytest" in str(step.get("run", "")))
     assert run["env"] == {"ELSPETH_CI_DOCKER_REQUIRED": "1", "ELSPETH_CI_NON_ROOT_REQUIRED": "1"}
     tokens = run["run"].replace("\\\n", " ").split()

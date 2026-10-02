@@ -57,12 +57,12 @@ local file or a remote service.** The csv/json sink exclusion is gone.
 
 The widening was deliberate but the rationale lived only in inline
 comments inside `boundary_expectations.py`. A compliance-focused
-compliance-focused reviewer now sees
-every local CSV write annotated as "crosses an external boundary" and
-has no discoverable record of why that classification was chosen over
-the prior, narrower one. Without an ADR, the next maintainer asking
-"should this sink be excluded?" has no governance artifact to consult
-and no audit-trail anchor for the decision.
+reviewer now sees every local CSV write annotated as "crosses an
+external boundary" and has no discoverable record of why that
+classification was chosen over the prior, narrower one. Without an
+ADR, the next maintainer asking "should this sink be excluded?" has
+no governance artifact to consult and no audit-trail anchor for the
+decision.
 
 ## Decision
 

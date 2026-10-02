@@ -13,7 +13,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -42,7 +42,7 @@
       },
       {
         "default": null,
-        "description": "Optional template used to build the retrieval query from row fields.",
+        "description": "Optional retrieval query template. Its row holds the query field plus declared required_input_fields; declare every other static row read.",
         "kind": "text",
         "label": "Query Template",
         "name": "query_template",
@@ -58,28 +58,6 @@
         "name": "query_pattern",
         "nullable": true,
         "required": false,
-        "tier": "common"
-      },
-      {
-        "description": "Retrieval provider name registered in the RAG provider catalog.",
-        "enum": [
-          "azure_search",
-          "chroma"
-        ],
-        "kind": "enum",
-        "label": "Provider",
-        "name": "provider",
-        "nullable": false,
-        "required": true,
-        "tier": "common"
-      },
-      {
-        "description": "Provider-specific retrieval configuration passed to the selected provider.",
-        "kind": "json-object",
-        "label": "Provider",
-        "name": "provider_config",
-        "nullable": false,
-        "required": true,
         "tier": "common"
       },
       {
@@ -149,6 +127,27 @@
         "name": "max_context_length",
         "nullable": true,
         "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Retrieval provider name registered in the RAG provider catalog.",
+        "enum": [
+          "chroma"
+        ],
+        "kind": "enum",
+        "label": "Provider",
+        "name": "provider",
+        "nullable": false,
+        "required": true,
+        "tier": "common"
+      },
+      {
+        "description": "Provider-specific retrieval configuration passed to the selected provider.",
+        "kind": "json-object",
+        "label": "Provider",
+        "name": "provider_config",
+        "nullable": false,
+        "required": true,
         "tier": "common"
       }
     ]

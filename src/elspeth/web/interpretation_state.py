@@ -11,17 +11,20 @@ states can be opened and resolved during the migration window.
 
 from __future__ import annotations
 
+import heapq
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from difflib import get_close_matches
 from typing import Any, Final, Literal, NotRequired, TypedDict
 
+from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
@@ -46,6 +49,7 @@ from elspeth.web.composer.state import (
     NodeSpec,
     SourceSpec,
     _coalesce_branch_connections,
+    _well_formed_query_entries,
 )
 from elspeth.web.plugin_policy.coverage import (
     OutputStreamGraph as _OutputStreamGraph,
@@ -60,6 +64,7 @@ INTERPRETATION_REQUIREMENTS_KEY = "interpretation_requirements"
 PROMPT_TEMPLATE_PARTS_KEY = "prompt_template_parts"
 SOURCE_COMPONENT_ID = "source"
 INTERPRETATION_REVIEW_PENDING_CODE = "interpretation_review_pending"
+INTERPRETATION_REVIEW_DRIFT_CODE = "interpretation_review_drift"
 PENDING_INTERPRETATION_AUTHORING_TEXT = "pending interpretation"
 RAW_HTML_CLEANUP_USER_TERM: Final[str] = "drop_raw_html_fields"
 # The CLOSED set of reviewable pipeline-decision terms. Every member must have
@@ -220,6 +225,7 @@ PLANNER_CONTEXT_INTERPRETATION_REQUIREMENT_FIELDS: Final[tuple[str, ...]] = (
     "user_term",
     "draft",
     "status",
+    "display_title",
 )
 
 
@@ -254,6 +260,7 @@ class InterpretationRequirement(TypedDict):
     accepted_value: str | None
     accepted_artifact_hash: str | None
     resolved_prompt_template_hash: str | None
+    display_title: NotRequired[str]
 
 
 ResolvedReviewEvidenceField = Literal[
@@ -336,6 +343,32 @@ class InterpretationReviewPending:
 
     def __post_init__(self) -> None:
         freeze_fields(self, "sites")
+
+
+class InterpretationReviewIntegrityError(ValueError):
+    """Resolved review evidence no longer matches the artifact it attested.
+
+    Raised by the strict execution materializer's drift guards. It carries
+    the component and review kind so callers can build a structured refusal
+    (409 on /execute, a readiness blocker on /validate) without echoing the
+    raw integrity message, which may name hash domains. It subclasses
+    ``ValueError`` so every existing ``except ValueError`` catcher (the
+    reconcile-calling composer tools, the tolerant identity lane) keeps its
+    behaviour; handlers that need the distinction must sit above those arms.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        component_id: str,
+        component_type: Literal["source", "transform"],
+        kind: InterpretationKind,
+    ) -> None:
+        super().__init__(message)
+        self.component_id = component_id
+        self.component_type: Literal["source", "transform"] = component_type
+        self.kind = kind
 
 
 def strip_authoring_options(options: Mapping[str, Any]) -> dict[str, Any]:
@@ -1013,6 +1046,45 @@ def _node_str_option(node: NodeSpec, key: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _node_option_is_non_text(node: NodeSpec, key: str) -> bool:
+    """True when ``key`` is present with a non-null value that is not text.
+
+    The shape an ``inline_content`` blob marker takes in an LLM prompt or
+    model field. Built on :func:`_node_str_option` (the one parse point) plus
+    a membership test, so the execution materializer can tell "no value" from
+    "a value a resolved review cannot have attested" without re-interrogating
+    the option type. An explicit null stays the absent value.
+    """
+    return key in node.options and node.options[key] is not None and _node_str_option(node, key) is None
+
+
+def _refuse_resolved_review_over_non_text(node: NodeSpec, *, option_key: str, kind: InterpretationKind) -> None:
+    """Drift backstop: a RESOLVED prompt/model review over a non-text value.
+
+    A resolved ``llm_prompt_template`` / ``llm_model_choice`` review attested a
+    concrete string. A non-text value in that field (an ``inline_content`` blob
+    marker, substituted only at run time) is not what was reviewed, and the
+    string drift guards never run because there is no string to hash. This is
+    drift, not debt: no card can attest a marker (the surfacer, event writer
+    and resolver all read the option as text), so it is refused here rather
+    than enumerated as a pending site nothing can clear.
+
+    A marker with NO resolved review is not refused: LLM-authored blobs are
+    refused in these fields at wire time and at run admission, so what remains
+    is user-verbatim content (ADR-034) with no composer review to stage.
+    """
+    if not _node_option_is_non_text(node, option_key):
+        return
+    if _resolved_requirement_for_kind(_requirements(node.options), kind) is None:
+        return
+    raise InterpretationReviewIntegrityError(
+        f"llm node {node.id!r} {kind.value} review is resolved but options.{option_key} is no longer text",
+        component_id=node.id,
+        component_type="transform",
+        kind=kind,
+    )
+
+
 def _raw_html_cleanup_requirement(requirements: Sequence[InterpretationRequirement] | None) -> InterpretationRequirement | None:
     if requirements is None:
         return None
@@ -1146,7 +1218,7 @@ def materialize_state_for_execution(
     changed = False
     materialized_sources = dict(state.sources)
     for source_name, source in state.sources.items():
-        materialized_source = _materialize_source_for_execution(source)
+        materialized_source = _materialize_source_for_execution(source, component_id=source_component_id(source_name))
         if materialized_source is not source:
             materialized_sources[source_name] = materialized_source
             changed = True
@@ -1173,7 +1245,7 @@ def _materialize_node_for_authoring(node: NodeSpec) -> NodeSpec:
         prompt = _render_prompt_parts(parts, _requirements_by_id(options), unresolved_text=PENDING_INTERPRETATION_AUTHORING_TEXT)
         return _replace_prompt_if_changed(node, prompt, include_hash=False)
 
-    if "resolved_prompt_template_hash" in options:
+    if "approved_prompt_artifact_hash" in options:
         return node
 
     prompt_template = _node_str_option(node, "prompt_template")
@@ -1193,54 +1265,79 @@ def _materialize_node_for_execution(
     if node.plugin != "llm":
         return node
     model = _node_str_option(node, "model")
+    if not operator_resolved_model:
+        _refuse_resolved_review_over_non_text(node, option_key="model", kind=InterpretationKind.LLM_MODEL_CHOICE)
     if model and not operator_resolved_model:
         _validate_model_choice_review(node, model)
     parts = _prompt_parts(node.options)
     if parts is None:
+        # Structured nodes render prompt_template from their parts, so only a
+        # parts-free node can execute a non-text prompt_template.
+        if multi_query_prompt_surface_from_options(node.options) is None:
+            _refuse_resolved_review_over_non_text(node, option_key="prompt_template", kind=InterpretationKind.LLM_PROMPT_TEMPLATE)
         prompt_template = _node_str_option(node, "prompt_template")
-        if prompt_template:
+        if prompt_template or multi_query_prompt_surface_from_options(node.options) is not None:
             requirement = _prompt_template_review_requirement(node.options)
             if requirement is not None:
                 _validate_prompt_template_review(node, prompt_template)
                 return _ensure_prompt_template_hash(node)
+        if "approved_prompt_artifact_hash" in node.options and approved_prompt_artifact_hash_from_options(node.options) is None:
+            options = dict(node.options)
+            del options["approved_prompt_artifact_hash"]
+            return replace(node, options=options)
         return node
     prompt = _render_prompt_parts(parts, _requirements_by_id(node.options), unresolved_text=None)
     _validate_prompt_template_review(node, prompt)
     return _replace_prompt_if_changed(node, prompt, include_hash=True)
 
 
-def _materialize_source_for_execution(source: SourceSpec) -> SourceSpec:
+def _materialize_source_for_execution(source: SourceSpec, *, component_id: str) -> SourceSpec:
     metadata = _source_authoring_metadata(source.options)
     if metadata is None or not _is_llm_authored_modality(metadata["modality"]):
         return source
     requirements = _requirements(source.options)
     resolved = _resolved_requirement_for_kind(requirements, InterpretationKind.INVENTED_SOURCE)
     if resolved is None:
-        raise ValueError("invented source review requirement is required before execution")
+        raise InterpretationReviewIntegrityError(
+            "invented source review requirement is required before execution",
+            component_id=component_id,
+            component_type="source",
+            kind=InterpretationKind.INVENTED_SOURCE,
+        )
     accepted_hash = resolved["accepted_artifact_hash"]
     if accepted_hash != metadata["content_hash"]:
-        raise ValueError("invented source review drift: reviewed content hash does not match current source content hash")
+        raise InterpretationReviewIntegrityError(
+            "invented source review drift: reviewed content hash does not match current source content hash",
+            component_id=component_id,
+            component_type="source",
+            kind=InterpretationKind.INVENTED_SOURCE,
+        )
     return source
 
 
 def _replace_prompt_if_changed(node: NodeSpec, prompt: str, *, include_hash: bool) -> NodeSpec:
     current = node.options["prompt_template"] if "prompt_template" in node.options else None
-    current_hash = node.options["resolved_prompt_template_hash"] if "resolved_prompt_template_hash" in node.options else None
-    next_hash = stable_hash(prompt) if include_hash else current_hash
-    if current == prompt and current_hash == next_hash:
-        return node
-    options = dict(node.options)
-    options["prompt_template"] = prompt
-    if include_hash:
-        options["resolved_prompt_template_hash"] = next_hash
-    return replace(node, options=options)
+    if current != prompt:
+        node = replace(node, options={**node.options, "prompt_template": prompt})
+    return _ensure_prompt_template_hash(node) if include_hash else node
+
+
+def _is_inline_prompt_blob(value: object) -> bool:
+    marker = is_widened_blob_ref(deep_thaw(value))
+    return marker is not None and marker.mode == "inline_content"
 
 
 def _ensure_prompt_template_hash(node: NodeSpec) -> NodeSpec:
-    prompt_template = _node_str_option(node, "prompt_template")
-    if not prompt_template:
+    artifact_hash = approved_prompt_artifact_hash_from_options(node.options)
+    if artifact_hash is None:
+        if "approved_prompt_artifact_hash" not in node.options:
+            return node
+        options = dict(node.options)
+        del options["approved_prompt_artifact_hash"]
+        return replace(node, options=options)
+    if "approved_prompt_artifact_hash" in node.options and node.options["approved_prompt_artifact_hash"] == artifact_hash:
         return node
-    return _replace_prompt_if_changed(node, prompt_template, include_hash=True)
+    return replace(node, options={**node.options, "approved_prompt_artifact_hash": artifact_hash})
 
 
 def _pending_source_sites(source: SourceSpec, *, component_id: str) -> tuple[InterpretationReviewSite, ...]:
@@ -1531,10 +1628,25 @@ def _legacy_placeholder_sites(node: NodeSpec) -> tuple[InterpretationReviewSite,
 
 
 def _missing_prompt_template_review_sites(node: NodeSpec) -> tuple[InterpretationReviewSite, ...]:
+    """Enumerate prompt-template review debt on an LLM node as pending sites.
+
+    A node with no ``llm_prompt_template`` requirement, or with a pending one,
+    is a site. A RESOLVED review is not: a stored anchor that no longer
+    matches :func:`prompt_review_anchor_hash_from_options` is drift, refused
+    by the materializer (:func:`_validate_prompt_template_review`).
+
+    A present NON-TEXT ``prompt_template`` (an ``inline_content`` blob marker)
+    enumerates no site: the card surfacer, event writer and resolver all read
+    the option as text, so such a site could never become a card. LLM-authored
+    blobs are refused in this field at wire time and at run admission, so a
+    marker with no resolved review is user-verbatim content (ADR-034). A marker
+    under a RESOLVED review is drift, refused by the materializer
+    (:func:`_refuse_resolved_review_over_non_text`).
+    """
     if node.plugin != "llm":
         return ()
     prompt_template = _node_str_option(node, "prompt_template")
-    if not prompt_template:
+    if not prompt_template and multi_query_prompt_surface_from_options(node.options) is None:
         return ()
     requirement = _prompt_template_review_requirement(node.options)
     if requirement is None:
@@ -1572,6 +1684,9 @@ def _missing_model_choice_review_sites(node: NodeSpec) -> tuple[InterpretationRe
     """
     if node.plugin != "llm":
         return ()
+    # A non-text model (a blob marker) reads as absent and enumerates no site,
+    # for the reasons given on :func:`_missing_prompt_template_review_sites`;
+    # a marker under a resolved review is refused by the materializer as drift.
     model = _node_str_option(node, "model")
     if not model:
         return ()
@@ -1703,7 +1818,7 @@ def _coerce_requirement(value: Mapping[str, Any]) -> InterpretationRequirement:
     event_id = value["event_id"] if "event_id" in value else None
     if event_id is not None and not isinstance(event_id, str):
         raise TypeError("interpretation requirement event_id must be a string or None")
-    return InterpretationRequirement(
+    requirement = InterpretationRequirement(
         id=requirement_id,
         kind=kind.value,
         user_term=user_term,
@@ -1714,6 +1829,12 @@ def _coerce_requirement(value: Mapping[str, Any]) -> InterpretationRequirement:
         accepted_artifact_hash=accepted_artifact_hash,
         resolved_prompt_template_hash=resolved_prompt_template_hash,
     )
+    if "display_title" in value:
+        display_title = value["display_title"]
+        if not isinstance(display_title, str) or not display_title.strip() or len(display_title) > 200:
+            raise TypeError("interpretation requirement display_title must be a non-empty string of at most 200 characters")
+        requirement["display_title"] = display_title
+    return requirement
 
 
 @trust_boundary(
@@ -1794,25 +1915,31 @@ def _resolved_requirement_for_kind(
     return requirement
 
 
-def _validate_prompt_template_review(node: NodeSpec, prompt_template: str) -> None:
+def _validate_prompt_template_review(node: NodeSpec, prompt_template: str | None) -> None:
     requirements = _requirements(node.options)
     resolved = _resolved_requirement_for_kind(requirements, InterpretationKind.LLM_PROMPT_TEMPLATE)
     if resolved is None:
         return
-    parts = _prompt_parts(node.options)
-    if parts is not None:
-        # Structured nodes attest the prompt *skeleton*, not the substituted
-        # text. The vague-term slot values are reviewed independently, so the
-        # prompt-template review must be invariant under their resolution —
-        # otherwise resolving a vague term (which rewrites the rendered prompt)
-        # spuriously drifts a prompt-template review the operator already
-        # approved. A genuine edit to a fixed text segment, or re-pointing a
-        # slot to a different requirement, still changes the skeleton and drifts.
-        expected_hash = prompt_structure_hash(parts)
-    else:
-        expected_hash = stable_hash(prompt_template)
-    if resolved["resolved_prompt_template_hash"] != expected_hash:
-        raise ValueError(f"llm node {node.id!r} prompt-template review hash drifted")
+    # Structured nodes attest the prompt *skeleton*, not the substituted
+    # text. The vague-term slot values are reviewed independently, so the
+    # prompt-template review must be invariant under their resolution —
+    # otherwise resolving a vague term (which rewrites the rendered prompt)
+    # spuriously drifts a prompt-template review the operator already
+    # approved. A genuine edit to a fixed text segment, or re-pointing a
+    # slot to a different requirement, still changes the skeleton and drifts.
+    # Multi-query nodes attest the whole prompt SURFACE (per-query templates,
+    # system prompt, node-level template) — see
+    # :func:`prompt_review_anchor_hash_from_options`.
+    anchor_hash = prompt_review_anchor_hash_from_options(node.options)
+    expected_hash = anchor_hash if anchor_hash is not None else stable_hash(prompt_template)
+    stored_hash = resolved["resolved_prompt_template_hash"]
+    if stored_hash != expected_hash:
+        raise InterpretationReviewIntegrityError(
+            f"llm node {node.id!r} prompt-template review hash drifted",
+            component_id=node.id,
+            component_type="transform",
+            kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+        )
 
 
 def _validate_model_choice_review(node: NodeSpec, model: str) -> None:
@@ -1831,7 +1958,12 @@ def _validate_model_choice_review(node: NodeSpec, model: str) -> None:
         return
     expected_hash = model_choice_artifact_hash(model)
     if resolved["resolved_prompt_template_hash"] != expected_hash:
-        raise ValueError(f"llm node {node.id!r} model-choice review hash drifted")
+        raise InterpretationReviewIntegrityError(
+            f"llm node {node.id!r} model-choice review hash drifted",
+            component_id=node.id,
+            component_type="transform",
+            kind=InterpretationKind.LLM_MODEL_CHOICE,
+        )
 
 
 def pipeline_decision_artifact_hash(
@@ -2093,16 +2225,34 @@ def _validate_pipeline_decision_review(node: NodeSpec, all_nodes: Sequence[NodeS
     resolved = _resolved_requirement_for_kind(requirements, InterpretationKind.PIPELINE_DECISION)
     if resolved is None:
         return
-    validate_pipeline_decision_node_semantics(
-        node=node,
-        all_nodes=all_nodes,
-        user_term=resolved["user_term"],
-        draft=resolved["draft"],
-        context="interpretation_state",
-    )
-    expected_hash = pipeline_decision_artifact_hash(node, all_nodes, user_term=resolved["user_term"])
+    # On a RESOLVED row, a node that no longer implements the approved decision
+    # (or no longer yields its artifact at all) is drift of that review, the
+    # same as a changed artifact hash. Both shared helpers raise a plain
+    # ValueError for their staging-time callers, so the refusal is typed here,
+    # message bytes unchanged.
+    try:
+        validate_pipeline_decision_node_semantics(
+            node=node,
+            all_nodes=all_nodes,
+            user_term=resolved["user_term"],
+            draft=resolved["draft"],
+            context="interpretation_state",
+        )
+        expected_hash = pipeline_decision_artifact_hash(node, all_nodes, user_term=resolved["user_term"])
+    except ValueError as exc:
+        raise InterpretationReviewIntegrityError(
+            str(exc),
+            component_id=node.id,
+            component_type="transform",
+            kind=InterpretationKind.PIPELINE_DECISION,
+        ) from exc
     if resolved["accepted_artifact_hash"] != expected_hash:
-        raise ValueError(f"node {node.id!r} pipeline-decision review hash drifted")
+        raise InterpretationReviewIntegrityError(
+            f"node {node.id!r} pipeline-decision review hash drifted",
+            component_id=node.id,
+            component_type="transform",
+            kind=InterpretationKind.PIPELINE_DECISION,
+        )
 
 
 @trust_boundary(
@@ -2179,6 +2329,547 @@ def prompt_structure_hash_from_options(options: Mapping[str, Any]) -> str | None
     if parts is None:
         return None
     return prompt_structure_hash(parts)
+
+
+# Attestation-domain tag hashed into every multi-query prompt-surface anchor so
+# the anchor can never collide with a single-prompt ``stable_hash(prompt_template)``
+# or a ``prompt_structure_hash`` skeleton, and so a future widening of the
+# surface is a visible domain bump rather than a silent redefinition.
+PROMPT_SURFACE_HASH_DOMAIN: Final[str] = "llm_prompt_surface/v1"
+# The ``llm_draft`` wire field is bounded (``sessions/schemas.py``
+# ``InterpretationEventResponse.llm_draft``: 8192 chars). Nothing on the write
+# path checks it — the pending event row is a ``Text`` column — so an
+# over-long draft is stored and then fails the READ projection, taking down
+# ``GET /interpretations`` for the whole session. The review render therefore
+# stays under this bound by per-text shortening and, when that cannot fit,
+# whole-entry omission (``MultiQueryPromptSurface.render_for_review``). The
+# ANCHOR always covers the complete texts — only the display is
+# bounded, and every shortened or omitted template says so inline.
+PROMPT_SURFACE_REVIEW_MAX_CHARS: Final[int] = 8000
+# Inline marker that stands in for the cut tail of a shortened review text
+# (``{cut}`` = how many chars are not shown). Shared by the multi-query
+# per-text shortening and the single-prompt draft bound so every shortened
+# review text reads the same way.
+_PROMPT_REVIEW_SHORTENED_MARKER: Final[str] = " […{cut} more chars not shown; the review attests the full text]"
+_PROMPT_SURFACE_TEMPLATE_DISPLAY_MIN_CHARS: Final[int] = 200
+_PROMPT_SURFACE_NODE_TEMPLATE_USERS_PREFIX: Final[str] = "Node-level prompt_template, used by queries without their own template: "
+_PROMPT_SURFACE_NODE_TEMPLATE_UNUSED_LINE: Final[str] = "Node-level prompt_template: not used (every query supplies its own template)."
+_PROMPT_SURFACE_NODE_TEMPLATE_UNUSED_WITH_INVALID_LINE: Final[str] = "Node-level prompt_template: not used (no query falls back to it)."
+_PROMPT_SURFACE_INVALID_QUERY_TEMPLATE_TEXT: Final[str] = "(template value is not text; plugin validation rejects this node)"
+
+
+@dataclass(frozen=True, slots=True)
+class InvalidQueryTemplate:
+    """A query whose ``template`` is present but is not a string.
+
+    Neither a template (nothing renders as prose) nor a fallback to the
+    node-level ``prompt_template`` (the plugin's ``QueryDefinition`` schema
+    rejects the node before any query runs). Carried as its own owned value in
+    :attr:`MultiQueryPromptSurface.queries` so it can never be confused with a
+    real template text or with the ``None`` fallback.
+    """
+
+    reason: Literal["not_text"] = "not_text"
+
+
+@dataclass(frozen=True, slots=True)
+class MultiQueryPromptSurface:
+    """The complete prompt surface a multi-query LLM node sends the model.
+
+    Session 94f6f00c (2026-09-13): the ``llm_prompt_template`` review card and
+    its anchor covered only the node-level ``prompt_template``. On a
+    multi-query node every query may carry its own ``template`` override, in
+    which case the node-level template never renders — the operator attested
+    dead text while the per-query templates and the shared ``system_prompt``,
+    the prompts that actually run, were never reviewed. This value is what the
+    review approves for that node shape: the node-level template (with its
+    skeleton when structured), the system prompt, and each query's override
+    in authoring order: a ``str`` template, ``None`` (falls back to the
+    node-level template), or :class:`InvalidQueryTemplate` (present but not
+    text — neither rendered nor a node-level-template user).
+    """
+
+    node_prompt_template: str | None
+    node_prompt_structure_hash: str | None
+    system_prompt: str | None
+    queries: tuple[tuple[str, str | InvalidQueryTemplate | None], ...]
+
+    @property
+    def node_template_users(self) -> tuple[str, ...]:
+        return tuple(name for name, override in self.queries if override is None)
+
+    @property
+    def _templated_count(self) -> int:
+        """How many queries carry their own string template."""
+        return sum(1 for _name, override in self.queries if isinstance(override, str))
+
+    @property
+    def _has_invalid_templates(self) -> bool:
+        return any(isinstance(override, InvalidQueryTemplate) for _name, override in self.queries)
+
+    def _node_template_unused_line(self) -> str:
+        if self._has_invalid_templates:
+            return _PROMPT_SURFACE_NODE_TEMPLATE_UNUSED_WITH_INVALID_LINE
+        return _PROMPT_SURFACE_NODE_TEMPLATE_UNUSED_LINE
+
+    def anchor_hash(self) -> str:
+        """Requirement-level attestation anchor over the whole surface.
+
+        The node-level template contributes its skeleton hash when structured
+        (invariant under vague-term resolution, like the single-prompt anchor)
+        and its text otherwise. A query's string template or ``None`` fallback
+        is hashed as itself (so every well-formed surface keeps its anchor);
+        an :class:`InvalidQueryTemplate` is hashed as a mapping, which no
+        string or ``None`` can equal, so repairing it moves the anchor.
+        """
+        return stable_hash(
+            {
+                "domain": PROMPT_SURFACE_HASH_DOMAIN,
+                "node_prompt": self.node_prompt_structure_hash
+                if self.node_prompt_structure_hash is not None
+                else stable_hash(self.node_prompt_template),
+                "system_prompt": self.system_prompt,
+                "queries": [
+                    [name, {"invalid_template": override.reason} if isinstance(override, InvalidQueryTemplate) else override]
+                    for name, override in self.queries
+                ],
+            }
+        )
+
+    def render_for_review(self, *, max_chars: int = PROMPT_SURFACE_REVIEW_MAX_CHARS) -> str:
+        """Human-readable draft of the surface for the review card.
+
+        Fact-register labels ("not used" / "used by"), never editorial: the
+        operator is approving what the model receives, not grading composer
+        hygiene. The anchor is never bounded; only this display is, by two
+        mechanisms applied in order:
+
+        1. **Per-text shortening** (:meth:`_bounded_texts`): the longest texts
+           are halved first, each with an inline marker, down to a floor of
+           about 200 kept chars plus the marker. The floor is a terminal state,
+           so this always terminates, but it cannot fit every surface: many
+           queries each at the floor, or long query names, still exceed
+           ``max_chars``.
+        2. **Whole-entry omission** (:meth:`_render_with_whole_entry_omissions`),
+           engaged ONLY when the mechanism-1 render is longer than
+           ``max_chars`` (so every draft that fits after mechanism 1 is
+           unchanged): query templates are replaced from the end by one
+           fact-register line each, then — if that is still too long —
+           trailing queries stop being listed; count lines say how many of
+           each. If even that does not fit, the most compact form (no query
+           listed) is returned: only the framing, the count lines and the
+           system prompt and node-level template, each either within the
+           mechanism-1 budget or at its floor. That form fits the default
+           ``max_chars``; a caller passing a very small ``max_chars`` (under
+           about a thousand chars) gets no bound.
+        """
+        texts: list[str | None] = [
+            self.system_prompt,
+            *(override if isinstance(override, str) else None for _name, override in self.queries),
+        ]
+        if self.node_template_users:
+            texts.append(self.node_prompt_template)
+        budget = max_chars - self._frame_chars()
+        display = self._bounded_texts(texts, budget)
+        rendered = "\n".join(self._review_lines(display, omitted=frozenset(), listed=len(self.queries)))
+        if len(rendered) <= max_chars:
+            return rendered
+        return self._render_with_whole_entry_omissions(display, max_chars)
+
+    def _review_lines(self, display: list[str | None], *, omitted: frozenset[int], listed: int) -> list[str]:
+        """The draft's lines with the queries at ``omitted`` shown as fact lines
+        and only the first ``listed`` queries listed. ``omitted=frozenset()``
+        with every query listed is the mechanism-1 draft."""
+        lines = self._head_lines(display)
+        for position in range(listed):
+            lines.extend(self._query_lines(display, position, omitted=position in omitted))
+        listed_users = sum(1 for _name, override in self.queries[:listed] if override is None)
+        lines.extend(self._tail_lines(display, omitted_count=len(omitted), listed=listed, listed_users=listed_users))
+        return lines
+
+    @staticmethod
+    def _head_lines(display: list[str | None]) -> list[str]:
+        system_display = display[0]
+        return [
+            "Multi-query LLM node: for every row the model receives one call per query below.",
+            "",
+            "System prompt (sent with every query):",
+            system_display if system_display is not None else "(none)",
+        ]
+
+    def _query_lines(self, display: list[str | None], position: int, *, omitted: bool) -> list[str]:
+        name, override = self.queries[position]
+        if override is None:
+            return ["", f"Query '{name}': uses the node-level prompt_template (below)."]
+        if isinstance(override, InvalidQueryTemplate):
+            return ["", f"Query '{name}': {_PROMPT_SURFACE_INVALID_QUERY_TEMPLATE_TEXT}"]
+        if omitted:
+            return ["", f"Query '{name}': (template of {len(override)} chars not shown; the review attests the full text)"]
+        return ["", f"Query '{name}':", display[position + 1] or ""]
+
+    def _tail_lines(self, display: list[str | None], *, omitted_count: int, listed: int, listed_users: int) -> list[str]:
+        """Count lines (only when something is omitted or unlisted) and the
+        node-level template section. ``listed_users`` is how many of
+        :attr:`node_template_users` fall among the first ``listed`` queries."""
+        lines: list[str] = []
+        users = self.node_template_users
+        count_lines = self._count_lines(omitted_count=omitted_count, templated=self._templated_count, listed=listed)
+        if count_lines:
+            lines.append("")
+            lines.extend(count_lines)
+        lines.append("")
+        if users:
+            names = ", ".join(users[:listed_users]) + self._unlisted_users_suffix(
+                unlisted=len(users) - listed_users, any_listed=listed_users > 0
+            )
+            lines.append(_PROMPT_SURFACE_NODE_TEMPLATE_USERS_PREFIX + names)
+            lines.append(display[len(self.queries) + 1] or "")
+        else:
+            lines.append(self._node_template_unused_line())
+        return lines
+
+    def _count_lines(self, *, omitted_count: int, templated: int, listed: int) -> list[str]:
+        """``templated`` is how many queries carry their own template (passed in
+        so the per-step mechanism-2 sizing stays O(1))."""
+        lines: list[str] = []
+        if omitted_count:
+            lines.append(
+                f"Query templates not shown in this draft: {omitted_count} of {templated}; the review attests every template in full."
+            )
+        unlisted = len(self.queries) - listed
+        if unlisted:
+            lines.append(
+                f"Queries not listed in this draft: the last {unlisted} of {len(self.queries)}; "
+                "the review attests their names and templates in full."
+            )
+        return lines
+
+    @staticmethod
+    def _unlisted_users_suffix(*, unlisted: int, any_listed: bool) -> str:
+        if not unlisted:
+            return ""
+        return f", and {unlisted} more not listed" if any_listed else f"{unlisted} not listed"
+
+    def _render_with_whole_entry_omissions(self, display: list[str | None], max_chars: int) -> str:
+        """Mechanism 2 of :meth:`render_for_review`, for a mechanism-1 draft longer than ``max_chars``.
+
+        Stage 1 replaces query templates from the END with one fact line each
+        (only where that line is shorter than the template it replaces);
+        stage 2 then stops listing queries from the end. Each step is sized
+        incrementally and the first step estimated to fit is rendered and
+        measured, so an estimate can only cost a further step, never an
+        over-long draft. Bounded by ``2 * len(queries)`` steps; returns the
+        most compact form (no query listed) when no step fits.
+        """
+        count = len(self.queries)
+        users = self.node_template_users
+        head_chars = len("\n".join(self._head_lines(display)))
+        full_chars = [_appended_lines_chars(self._query_lines(display, position, omitted=False)) for position in range(count)]
+        omitted_chars = [_appended_lines_chars(self._query_lines(display, position, omitted=True)) for position in range(count)]
+        node_display_chars = len(display[count + 1] or "") if users else 0
+        omitted: set[int] = set()
+        listed = count
+        listed_users = len(users)
+        listed_user_name_chars = sum(len(name) for name in users)
+        query_chars = sum(full_chars)
+        # Every whole-surface property scans ``queries``; read each once here so
+        # the up-to-``2 * count`` sizing steps below stay O(1) each.
+        templated = self._templated_count
+        unused_line_chars = len(self._node_template_unused_line())
+
+        def estimated_tail_chars() -> int:
+            tail_chars = sum(len(line) + 1 for line in self._count_lines(omitted_count=len(omitted), templated=templated, listed=listed))
+            if tail_chars:
+                tail_chars += 1
+            if users:
+                joined = listed_user_name_chars + 2 * (listed_users - 1) if listed_users else 0
+                suffix = self._unlisted_users_suffix(unlisted=len(users) - listed_users, any_listed=listed_users > 0)
+                return tail_chars + 1 + len(_PROMPT_SURFACE_NODE_TEMPLATE_USERS_PREFIX) + joined + len(suffix) + 1 + node_display_chars + 1
+            return tail_chars + 1 + unused_line_chars + 1
+
+        def measured_fit() -> str | None:
+            if head_chars + query_chars + estimated_tail_chars() > max_chars:
+                return None
+            rendered = "\n".join(self._review_lines(display, omitted=frozenset(omitted), listed=listed))
+            return rendered if len(rendered) <= max_chars else None
+
+        for position in reversed(range(count)):
+            if not isinstance(self.queries[position][1], str) or omitted_chars[position] >= full_chars[position]:
+                continue
+            omitted.add(position)
+            query_chars += omitted_chars[position] - full_chars[position]
+            fitted = measured_fit()
+            if fitted is not None:
+                return fitted
+        for position in reversed(range(count)):
+            name, override = self.queries[position]
+            query_chars -= omitted_chars[position] if position in omitted else full_chars[position]
+            omitted.discard(position)
+            listed = position
+            if override is None:
+                listed_users -= 1
+                listed_user_name_chars -= len(name)
+            fitted = measured_fit()
+            if fitted is not None:
+                return fitted
+        return "\n".join(self._review_lines(display, omitted=frozenset(), listed=0))
+
+    def _frame_chars(self) -> int:
+        # Estimate of the fixed framing text, used only to size mechanism 1's
+        # template budget. It is NOT an upper bound (a long query name on a
+        # query that falls back to the node-level template appears twice), so
+        # render_for_review measures the actual draft before returning it and
+        # engages whole-entry omission when it is still too long.
+        return 160 + sum(len(name) + 64 for name, _override in self.queries) + 160
+
+    @staticmethod
+    def _bounded_texts(texts: list[str | None], budget: int) -> list[str | None]:
+        """Shorten the longest texts first until the total fits ``budget`` or nothing can shrink.
+
+        Each step replaces the longest shrinkable text with the first half of
+        its ORIGINAL (at least ``_PROMPT_SURFACE_TEMPLATE_DISPLAY_MIN_CHARS``
+        chars) plus an inline marker. A text whose replacement would not be
+        strictly shorter than what it currently shows is at its floor: it is
+        exhausted and never selected again, and the loop stops when no
+        shrinkable text remains. The total can therefore still exceed
+        ``budget`` on return; :meth:`render_for_review` handles that with
+        whole-entry omission. Every step either strictly shortens a text or
+        exhausts one, so the loop terminates for every input.
+
+        Selection is longest first, lowest index on a tie. A heap keyed
+        ``(-length, index)`` and a running total keep that choice while
+        making the loop ``O(n log n)`` rather than rescanning every text per
+        step. The heap holds exactly one entry per text that is still
+        selectable: a popped text is pushed back only with its new length.
+        """
+        current = list(texts)
+        total = sum(len(text) for text in current if text is not None)
+        heap = [(-len(text), index) for index, text in enumerate(current) if text is not None]
+        heapq.heapify(heap)
+        marker = _PROMPT_REVIEW_SHORTENED_MARKER
+        while total > budget and heap:
+            _negative_length, longest = heapq.heappop(heap)
+            text = current[longest] or ""
+            if len(text) <= _PROMPT_SURFACE_TEMPLATE_DISPLAY_MIN_CHARS:
+                break
+            keep = max(_PROMPT_SURFACE_TEMPLATE_DISPLAY_MIN_CHARS, len(text) // 2)
+            original = texts[longest] or ""
+            replacement = original[:keep] + marker.format(cut=len(original) - keep)
+            if len(replacement) >= len(text):
+                # At its floor: exhausted, and not pushed back, so never selected again.
+                continue
+            current[longest] = replacement
+            total -= len(text) - len(replacement)
+            heapq.heappush(heap, (-len(replacement), longest))
+        return current
+
+
+def _appended_lines_chars(lines: list[str]) -> int:
+    """Chars ``lines`` add to a ``"\\n".join`` that already has a line before them."""
+    return sum(len(line) + 1 for line in lines)
+
+
+@observation_boundary(
+    tier=3,
+    source="web-authored llm node options mapping (untrusted prompt_template, system_prompt and queries values)",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns None unless a string prompt_template sits beside a queries value with at least one "
+        "well-formed entry; otherwise constructs an owned MultiQueryPromptSurface from string values only, "
+        "reading a non-string system_prompt as absent, an absent query template as a fallback to the "
+        "node-level template, and a present non-string query template as an InvalidQueryTemplate that "
+        "is neither a template nor a fallback; raises only the TypeError, ValueError or KeyError that "
+        "prompt_structure_hash_from_options raises on malformed prompt_template_parts"
+    ),
+)
+def multi_query_prompt_surface_from_options(options: Mapping[str, Any]) -> MultiQueryPromptSurface | None:
+    """The prompt surface of a multi-query LLM node, or ``None`` for any other shape.
+
+    Multi-query means: a string ``prompt_template`` beside a ``queries`` option
+    with at least one well-formed entry (:func:`_well_formed_query_entries`,
+    the composer's single reading of the mapping/list forms). Each query's
+    ``template`` is read three ways: a string is its override; an absent (or
+    ``None``) template falls back to the node-level template; a present but
+    non-string template is :class:`InvalidQueryTemplate` — not rendered and not
+    a node-level-template user, because plugin schema validation rejects the
+    node. That matches the binding guard
+    (``state._validate_multi_query_template_variable_bindings``), which skips
+    such a query whole without counting it as a node-level-template user, and
+    the advisor evidence walk (``service._advisor_query_option_values``).
+    Malformed ``prompt_template_parts`` propagate the TypeError, ValueError
+    or KeyError of :func:`prompt_structure_hash_from_options`, exactly as on a
+    single-prompt node; every other shape never raises.
+    """
+    raw_queries = options["queries"] if "queries" in options else None
+    prompt_template = options["prompt_template"] if "prompt_template" in options else None
+    if raw_queries is None:
+        return None
+    entries = _well_formed_query_entries(raw_queries)
+    if not entries:
+        return None
+    if prompt_template is not None and not isinstance(prompt_template, str):
+        marker = is_widened_blob_ref(deep_thaw(prompt_template))
+        if (
+            marker is None
+            or marker.mode != "inline_content"
+            or any("template" not in entry or entry["template"] is None for _, entry in entries)
+        ):
+            return None
+        prompt_template = None
+    raw_system_prompt = options["system_prompt"] if "system_prompt" in options else None
+    queries: list[tuple[str, str | InvalidQueryTemplate | None]] = []
+    for name, entry in entries:
+        override = entry["template"] if "template" in entry else None
+        if override is None or isinstance(override, str):
+            queries.append((name, override))
+        else:
+            queries.append((name, InvalidQueryTemplate()))
+    return MultiQueryPromptSurface(
+        node_prompt_template=prompt_template,
+        node_prompt_structure_hash=prompt_structure_hash_from_options(options),
+        system_prompt=raw_system_prompt if isinstance(raw_system_prompt, str) else None,
+        queries=tuple(queries),
+    )
+
+
+def prompt_review_anchor_hash_from_options(options: Mapping[str, Any]) -> str | None:
+    """Requirement-level anchor for the ``llm_prompt_template`` review.
+
+    ONE derivation for every site that writes or checks that anchor — the
+    review artifact, the pending-event domain, the resolve-time surfacing/live
+    comparison, and the execution-time drift guard — so they cannot diverge:
+
+    * multi-query node → :meth:`MultiQueryPromptSurface.anchor_hash` over the
+      whole prompt surface;
+    * structured single-prompt node → the ``prompt_structure_hash`` skeleton;
+    * unstructured single-prompt node → ``None``; callers use
+      ``stable_hash(prompt_template)``.
+    """
+    surface = multi_query_prompt_surface_from_options(options)
+    if surface is not None:
+        return surface.anchor_hash()
+    structure = prompt_structure_hash_from_options(options)
+    system = options["system_prompt"] if "system_prompt" in options else None
+    if system is None:
+        return structure
+    prompt = options["prompt_template"] if "prompt_template" in options else None
+    return stable_hash(
+        {
+            "domain": "elspeth.single-prompt-review.v1",
+            "node_prompt": structure if structure is not None else stable_hash(prompt),
+            "system_prompt": system,
+        }
+    )
+
+
+@trust_boundary(
+    tier=3,
+    source="Untrusted LLM-authored or YAML-imported prompt/query/system values in node options",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="rejects malformed non-blob prompt/system/query templates with ValueError; returns None for valid unresolved inline blob sources, otherwise hashes effective text",
+    test_ref="tests/unit/web/test_prompt_artifact_boundary.py::test_prompt_artifact_rejects_malformed_options",
+    test_fingerprint="8fa66b482b95e4f28e3a87d6a002972ad57a000eadbd54b167f5d793a436cbbf",
+)
+def approved_prompt_artifact_hash_from_options(options: Mapping[str, Any]) -> str | None:
+    """Hash resolved text, or return no approval link for unresolved blob sources.
+
+    Uploaded content is verified through blob identity, hash and resolution
+    records. It does not acquire full-text approval merely by substituting
+    after a review. Per-site review evidence remains independently enforced.
+    """
+    prompt = options["prompt_template"] if "prompt_template" in options else None
+    system = options["system_prompt"] if "system_prompt" in options else None
+    surface = multi_query_prompt_surface_from_options(options)
+    if surface is not None and not surface.node_template_users:
+        prompt = None
+    if (prompt is not None and not isinstance(prompt, str) and not _is_inline_prompt_blob(prompt)) or (
+        system is not None and not isinstance(system, str) and not _is_inline_prompt_blob(system)
+    ):
+        raise ValueError("Approved prompt artifact requires text prompt and system templates")
+    entries = _well_formed_query_entries(options["queries"]) if "queries" in options else ()
+    if "queries" in options:
+        raw_queries = options["queries"]
+        if raw_queries is not None and not entries and not _is_inline_prompt_blob(raw_queries):
+            raise ValueError("Approved prompt artifact requires query definitions")
+        for name, entry in entries:
+            template = entry["template"] if "template" in entry else None
+            if template is not None and not isinstance(template, str) and not _is_inline_prompt_blob(template):
+                raise ValueError(f"Query {name!r} template is not text or an inline blob source")
+    values = [options[key] for key in ("system_prompt", "queries") if key in options]
+    uses_fallback = not entries or any("template" not in query or query["template"] is None for _name, query in entries)
+    if uses_fallback and "prompt_template" in options:
+        values.append(options["prompt_template"])
+    for _name, query in entries:
+        values.append(query)
+        if "template" in query:
+            values.append(query["template"])
+    if any(_is_inline_prompt_blob(value) for value in values):
+        return None
+    if surface is not None:
+        queries: list[tuple[str, str | None]] = []
+        for name, template in surface.queries:
+            if isinstance(template, InvalidQueryTemplate):
+                raise ValueError(f"Query {name!r} template is not text")
+            queries.append((name, template))
+        return approved_prompt_artifact_hash(
+            prompt_template=surface.node_prompt_template, system_prompt=surface.system_prompt, queries=tuple(queries)
+        )
+    if prompt is None:
+        raise ValueError("Approved prompt artifact requires an effective prompt template")
+    return approved_prompt_artifact_hash(prompt_template=prompt, system_prompt=system)
+
+
+@observation_boundary(
+    tier=3,
+    source="web-authored llm node options mapping (untrusted prompt_template value)",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns the rendered multi-query prompt surface when the options describe one, the string "
+        "prompt_template otherwise (unchanged at or under PROMPT_SURFACE_REVIEW_MAX_CHARS, else its head "
+        "plus an inline shortened-text marker within that bound), and None when prompt_template is absent "
+        "or not a string; never raises"
+    ),
+)
+def prompt_review_draft_from_options(options: Mapping[str, Any]) -> str | None:
+    """The text the operator reviews for an LLM node's prompt-template review.
+
+    Multi-query nodes review the rendered prompt surface; every other shape
+    keeps reviewing ``prompt_template`` itself. ``None`` when the node carries
+    no string ``prompt_template`` (nothing to review yet).
+
+    Both shapes stay within ``PROMPT_SURFACE_REVIEW_MAX_CHARS`` so the draft
+    always fits the bounded ``llm_draft`` wire field. A single-prompt template
+    at or under the bound is returned byte-for-byte; a longer one keeps its
+    head and says inline how many chars are not shown. Only the display is
+    bounded: the review anchor and the node-level
+    ``resolved_prompt_template_hash`` cover the complete template.
+    """
+    surface = multi_query_prompt_surface_from_options(options)
+    if surface is not None:
+        return surface.render_for_review()
+    prompt_template = options["prompt_template"] if "prompt_template" in options else None
+    if not isinstance(prompt_template, str):
+        return None
+    system_prompt = options["system_prompt"] if "system_prompt" in options else None
+    if isinstance(system_prompt, str):
+        frame = "System prompt:\n\n\nPrompt template:\n"
+        section_budget = (PROMPT_SURFACE_REVIEW_MAX_CHARS - len(frame)) // 2
+        system_display = _bounded_single_prompt_review_draft(system_prompt, max_chars=section_budget)
+        prompt_display = _bounded_single_prompt_review_draft(prompt_template, max_chars=section_budget)
+        return f"System prompt:\n{system_display}\n\nPrompt template:\n{prompt_display}"
+    return _bounded_single_prompt_review_draft(prompt_template)
+
+
+def _bounded_single_prompt_review_draft(prompt_template: str, *, max_chars: int = PROMPT_SURFACE_REVIEW_MAX_CHARS) -> str:
+    if len(prompt_template) <= max_chars:
+        return prompt_template
+    # Size the marker with the whole length: the real cut is smaller, so its
+    # digit count can only be equal or fewer and the result stays in bounds.
+    keep = max_chars - len(_PROMPT_REVIEW_SHORTENED_MARKER.format(cut=len(prompt_template)))
+    return prompt_template[:keep] + _PROMPT_REVIEW_SHORTENED_MARKER.format(cut=len(prompt_template) - keep)
 
 
 def _render_prompt_parts(
@@ -2303,7 +2994,7 @@ def vague_term_wiring_count(options: Mapping[str, Any], *, user_term: str) -> in
 
 def _pending_authoring_shell(requirement: InterpretationRequirement) -> InterpretationRequirement:
     """Return the canonical persisted pending row without resolver evidence."""
-    return {
+    shell: InterpretationRequirement = {
         "id": requirement["id"],
         "kind": requirement["kind"],
         "user_term": requirement["user_term"],
@@ -2314,13 +3005,16 @@ def _pending_authoring_shell(requirement: InterpretationRequirement) -> Interpre
         "accepted_artifact_hash": None,
         "resolved_prompt_template_hash": None,
     }
+    if "display_title" in requirement:
+        shell["display_title"] = requirement["display_title"]
+    return shell
 
 
 def serialize_authoring_review_options(options: Mapping[str, Any]) -> dict[str, Any]:
     """Return an audit-safe composer payload with only pending review shells."""
     serialized = dict(options)
-    if "resolved_prompt_template_hash" in serialized:
-        del serialized["resolved_prompt_template_hash"]
+    if "approved_prompt_artifact_hash" in serialized:
+        del serialized["approved_prompt_artifact_hash"]
     if SOURCE_AUTHORING_KEY in serialized:
         del serialized[SOURCE_AUTHORING_KEY]
     review_index = _validated_review_index(options)
@@ -2341,6 +3035,7 @@ def serialize_authoring_review_options(options: Mapping[str, Any]) -> dict[str, 
                 "user_term": requirement["user_term"],
                 "status": "pending",
                 "draft": requirement["draft"],
+                **({"display_title": requirement["display_title"]} if "display_title" in requirement else {}),
             }
             for requirement in requirements
         ]
@@ -2402,9 +3097,9 @@ def _node_review_artifact(
     user_term: str,
 ) -> str:
     if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-        structure_hash = prompt_structure_hash_from_options(node.options)
-        if structure_hash is not None:
-            return structure_hash
+        anchor_hash = prompt_review_anchor_hash_from_options(node.options)
+        if anchor_hash is not None:
+            return anchor_hash
         prompt_template = node.options["prompt_template"] if "prompt_template" in node.options else None
         if type(prompt_template) is not str:
             raise ValueError(f"llm_prompt_template review on node {node.id!r} has no prompt_template")
@@ -2463,9 +3158,19 @@ def _vague_review_is_unchanged(
         unresolved_text=PENDING_INTERPRETATION_AUTHORING_TEXT,
     )
     if rendered_previous != previous_prompt:
-        raise ValueError(f"resolved vague-term review {requirement_id!r} prompt drifted from its parts render")
+        raise InterpretationReviewIntegrityError(
+            f"resolved vague-term review {requirement_id!r} prompt drifted from its parts render",
+            component_id=previous.id,
+            component_type="transform",
+            kind=InterpretationKind.VAGUE_TERM,
+        )
     if _resolved_review_hash(requirement, InterpretationKind.VAGUE_TERM) != stable_hash(requirement["accepted_value"]):
-        raise ValueError(f"resolved vague-term review {requirement_id!r} hash drifted")
+        raise InterpretationReviewIntegrityError(
+            f"resolved vague-term review {requirement_id!r} hash drifted",
+            component_id=previous.id,
+            component_type="transform",
+            kind=InterpretationKind.VAGUE_TERM,
+        )
     return prompt_structure_hash(previous_parts) == prompt_structure_hash(proposed_parts)
 
 
@@ -2480,8 +3185,8 @@ def _reconcile_node_options(
     proposed_index = _validated_review_index(proposed.options)
     previous_index = _validated_review_index(previous.options) if previous is not None and previous.plugin == proposed.plugin else {}
     options = dict(proposed.options)
-    if "resolved_prompt_template_hash" in options:
-        del options["resolved_prompt_template_hash"]
+    if "approved_prompt_artifact_hash" in options:
+        del options["approved_prompt_artifact_hash"]
     reconciled: list[Mapping[str, Any]] = []
     carried_prompt_review = False
 
@@ -2506,10 +3211,27 @@ def _reconcile_node_options(
         elif kind is InterpretationKind.INVENTED_SOURCE:
             raise ValueError("invented_source review cannot target a transform node")
         else:
-            previous_artifact = _node_review_artifact(previous, previous_nodes, kind=kind, user_term=user_term)
+            # The PREVIOUS node carries the resolved row, so a failure to derive
+            # its artifact is drift of that review (the materializer's
+            # pipeline-decision guard types the same failure). The PROPOSED
+            # node's derivation below stays a plain edit refusal.
+            try:
+                previous_artifact = _node_review_artifact(previous, previous_nodes, kind=kind, user_term=user_term)
+            except ValueError as exc:
+                raise InterpretationReviewIntegrityError(
+                    str(exc),
+                    component_id=previous.id,
+                    component_type="transform",
+                    kind=kind,
+                ) from exc
             stored_artifact = _resolved_review_hash(previous_requirement, kind)
             if stored_artifact != previous_artifact:
-                raise ValueError(f"resolved interpretation requirement {requirement_id!r} hash drifted")
+                raise InterpretationReviewIntegrityError(
+                    f"resolved interpretation requirement {requirement_id!r} hash drifted",
+                    component_id=previous.id,
+                    component_type="transform",
+                    kind=kind,
+                )
             proposed_artifact = _node_review_artifact(proposed, proposed_nodes, kind=kind, user_term=user_term)
             unchanged = proposed_artifact == previous_artifact
         if unchanged:
@@ -2536,10 +3258,7 @@ def _reconcile_node_options(
         )
         options["prompt_template"] = rendered
     if carried_prompt_review:
-        prompt_template = options["prompt_template"] if "prompt_template" in options else None
-        if type(prompt_template) is not str:
-            raise ValueError("carried prompt review has no rendered prompt_template")
-        options["resolved_prompt_template_hash"] = stable_hash(prompt_template)
+        options["approved_prompt_artifact_hash"] = approved_prompt_artifact_hash_from_options(options)
     return options
 
 
@@ -2572,7 +3291,12 @@ def _reconcile_source_options(
             _require_resolved_review_coherence(previous_requirement)
             acknowledged_fields = resolved_source_data_contract_fields(previous_requirement)
             if acknowledged_fields is None:
-                raise ValueError(f"resolved interpretation requirement {requirement_id!r} evidence drifted")
+                raise InterpretationReviewIntegrityError(
+                    f"resolved interpretation requirement {requirement_id!r} evidence drifted",
+                    component_id=component_id,
+                    component_type="source",
+                    kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+                )
             proposed_guaranteed_fields = _observed_source_guaranteed_fields(proposed.options)
             if proposed_guaranteed_fields is None or not frozenset(acknowledged_fields) <= proposed_guaranteed_fields:
                 reconciled.append(shell)
@@ -2595,7 +3319,12 @@ def _reconcile_source_options(
             raise ValueError("invented_source review requires reconstructible source_authoring metadata")
         stored_artifact = _resolved_review_hash(previous_requirement, kind)
         if stored_artifact != previous_authoring["content_hash"]:
-            raise ValueError(f"resolved interpretation requirement {requirement_id!r} hash drifted")
+            raise InterpretationReviewIntegrityError(
+                f"resolved interpretation requirement {requirement_id!r} hash drifted",
+                component_id=component_id,
+                component_type="source",
+                kind=InterpretationKind.INVENTED_SOURCE,
+            )
         if proposed_authoring["content_hash"] == previous_authoring["content_hash"]:
             reconciled.append(dict(previous_requirement))
             options[SOURCE_AUTHORING_KEY] = dict(previous_authoring)

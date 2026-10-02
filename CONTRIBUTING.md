@@ -9,7 +9,7 @@ Install Python 3.12 or newer, `uv`, Node.js 24, and npm 11. The repository's
 
 ```bash
 git clone https://github.com/dta-au/elspeth.git && cd elspeth
-uv sync --frozen --extra dev --extra azure
+uv sync --frozen --all-extras
 source .venv/bin/activate
 
 # Azure Blob integration tests require the Azurite emulator
@@ -48,6 +48,25 @@ The root suite is scoped to `testpaths = ["tests"]`, so it does **not** cover
 `gateway/`. That package (`elspeth-llm-gateway`) is standalone, with its own
 `pyproject.toml` and test suite; if you change it, run its tests from
 `gateway/` as well.
+
+GitHub Actions uses self-hosted runners for every workflow. Automated CI,
+release, website and mutation-testing jobs use the local labels
+`self-hosted, Linux, X64, nyx-ci, trusted`; there is no GitHub-hosted fallback.
+Manual live-provider acceptance retains its specialized self-hosted cloud
+runners because it proves ECS execution and managed-identity behavior.
+Pull requests from repository branches run locally. Fork pull requests skip
+jobs that check out code and fail the required `CI Success` check and the
+additional advisory `Judge gates success` status. A maintainer must
+review a fork's code and workflow changes before admitting them onto a
+repository branch. Repository Actions settings must require approval for
+all outside contributors (`all_external_contributors`): a fork can change
+its workflow and remove the YAML admission condition. Approval alone does
+not make fork code safe to execute on the persistent runner host.
+
+Runner slots share one host, so jobs can queue behind other workflows.
+Report a runner or prerequisite failure to the maintainer with the failing
+Actions job URL. Manual live-provider acceptance still needs its GitHub
+environment credentials and remote service access.
 
 ## Code Standards
 
@@ -100,7 +119,7 @@ commit hashes, ticket ids, measured numbers — is kept in
 links back to the headings here. Read this section before writing code; read
 the appendix when you need the history behind a rule.
 
-### Why a green scoped run proves nothing
+### Whole-tree gates
 
 A large share of the test suite asserts over the **entire tree with exact
 expected sets**: the set of dynamic-attribute sites, the set of unadjudicated
@@ -109,9 +128,6 @@ the hash of a plugin's source. A change can be locally green, fully typed, and
 lint-clean and still fail one of these for everyone on the branch, because the
 gate that catches it lives in a test file you did not run.
 
-- Run the full `pytest tests/` (the selection CI's `Test` job runs) before
-  you consider a commit done. At an absolute minimum run every gate listed
-  below whose tree you touched.
 - The default selection deselects the `testcontainer` marker. If you touched
   schema, SQL, session or Landscape persistence, or a lock, also run
   `pytest tests/ -m testcontainer -n 0` (Docker required; serial because the
@@ -122,9 +138,6 @@ gate that catches it lives in a test file you did not run.
   `source_file_hash` check): a green local suite and a green pre-commit hook
   prove nothing about them. Run the CI command yourself; the commands are
   given under each gate.
-- Every whole-tree gate scans `.agents/skills/**/*.py` and `scripts/` as
-  production code. Only `.claude/worktrees/` is excluded. A helper script
-  under those paths obeys the same rules as `src/`.
 - Whole-tree measurements are only evidence when the tree was frozen for the
   duration: on a shared checkout, record `git rev-parse HEAD` and a hash of
   the files you are measuring before and after the run, and discard any run
@@ -132,6 +145,17 @@ gate that catches it lives in a test file you did not run.
 - "Zero findings" from a probe that has never been shown to find anything is
   a failure to look, not a result. Run a positive control alongside every
   negative measurement.
+- The wire fidelity matrix
+  (`tests/unit/web/composer/test_wire_fidelity_matrix.py`) pins what LiteLLM's
+  adapters transmit for the composer's tool lists on each route: whether the
+  `function.strict` stamp arrives, and which schema keywords an adapter
+  rewrites. A LiteLLM upgrade that turns a row red is fixed by re-measuring
+  that route and updating the row with the evidence, never by loosening the
+  row. The matrix asserts that LiteLLM loaded its local cost map, which holds
+  only because the root `tests/conftest.py` calls
+  `configure_litellm_pricing()` before anything imports LiteLLM; a bare
+  `import elspeth` does not load it, so keep that call ahead of any import
+  that could pull in LiteLLM.
 
 ### Gate: attribute contracts (dynamic-attribute sites)
 
@@ -248,9 +272,9 @@ comparison as a test before touching resolution.
 ### Gate: trust-tier lint corpus
 
 **Pins:** the finding corpus of the `elspeth-lints` static-analysis rules over
-`src/elspeth`. The gate is deliberately fail-closed (exit 1 with a standing
-corpus) until the operator signs the package; do not expect zero and do not
-try to clear it during ordinary feature work.
+`src/elspeth`. A keyless scan exits 1 with a standing corpus; do not expect
+zero. CI does not run this signed check. Operator verification of a reviewed
+package is separate from CI.
 
 ```bash
 ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
@@ -302,6 +326,17 @@ Rules for a new backend-authored suffix:
 Shared disclosure text (for example the advisor-cohort withheld-prose
 disclosure) lives as one constant in that module and is appended to every
 message that needs it; never fork a per-message copy.
+
+An END-gate blocked turn publishes the model's reply beside its notice, so
+every blocked notice is a `_PUBLISHED_` form without the withheld-prose
+disclosure, and so is the blocker `detail` built from it. Only the
+advisor-repair replacer (`_replace_advisor_repair_public_result`) withholds
+the model's prose. The two blocked notices it reuses, sign-off pending and
+pending handoff, therefore also exist in a withheld form. That form is
+defined as the published notice plus the disclosure, so edit the published
+one. Only their composers take the required `prose_withheld` flag. A new
+blocked notice needs only the published form, unless the replacer will use it
+too.
 
 ### Gate: declared oracles pin output bytes
 
@@ -391,8 +426,7 @@ JSON-escaped, so grep the bare hex token), then any
 - `src/elspeth/web/audit_readiness/boundary_expectations.py`
   (`EXPECTED_TRANSFORM_DETERMINISMS`); editing it requires the commit trailer
   `telemetry-backfill: audit-readiness`.
-- The Python/TypeScript acronym mirror has no parity test: update both
-  `src/elspeth/web/composer/guided/_display.py::_ACRONYMS` and
+- The frontend plugin-display acronym list lives in
   `src/elspeth/web/frontend/src/components/catalog/pluginDisplayName.ts::ACRONYMS`.
 - Pin `source_file_hash` last.
 
@@ -408,6 +442,86 @@ asserts the widened arm.
 `PYTHONPATH` points at the worktree (see
 [Convention: repository and process hygiene](#convention-repository-and-process-hygiene));
 a count that transiently matches a sibling branch's plugin set was never real.
+
+### Gate: no bare TypeError on a plugin process path
+
+**Pins:** that no explicit `raise TypeError` is reachable, uncaught, from a
+plugin class's `process` through the class's own code.
+For each class under `src/elspeth/plugins` whose `process` is defined in its
+own module (on the class or a same-module base), the gate starts at `process`
+and follows every reference, called or passed as a callback, to a method of
+the class or a same-module base (`self.`/`cls.`/`ClassName.`, and `super().`
+into a same-module ancestor), to a method of another class in the same module
+(`_Checks.numeric`), to a module-level function of that module, and to every
+function a module-level dispatch-table literal holds. A `raise TypeError(...)`,
+or a `raise err` after `err = TypeError(...)` in the same function, reached that
+way fails unless a `try` on the path catches it without re-raising. The
+reviewed expected set is empty.
+
+**Does not see.** A class that inherits `process` from another module is never
+a root (6 of the 38 registered transforms: the Bedrock and Azure safety
+transforms, Azure AI Search and RAG retrieval). The gate does not follow a
+composed helper object (`self._builder.build(...)`), anything imported from
+another module, or dispatch through a class/instance-attribute table or
+`getattr`, and it does not see implicit raises. The RAG query builder's
+two `raise TypeError` sites (`transforms/rag/query.py`), which aborted runs
+until 11f5475d8 fixed them, were outside its reach at 74c0ce0db. Passing
+the gate does not prove a plugin cannot abort the run; the docstring lists
+every blind spot.
+
+```bash
+.venv/bin/python -m pytest tests/unit/plugins/test_process_path_type_error_gate.py -n 0
+```
+
+**Why.** A bare `TypeError` matches no conversion in the engine, so it aborts
+the run instead of routing the row; twelve batch plugins copied that
+convention for wrongly-typed row values from one another (elspeth-5887fb7928).
+A wrongly-typed row value returns `TransformResult.error(...)` naming the field,
+the expected and found type and the row index, never the value; in a batch
+helper that returns a value, raise `BatchRowTypeError`
+(`plugins/transforms/_batch_row_types.py`) and convert it once in `process()`.
+
+**Escape hatch.** When a `TypeError`'s condition genuinely reads no row value,
+prefer raising a Tier-1 exception class. Otherwise add a reviewed entry to
+`REVIEWED_PROCESS_PATH_TYPE_ERRORS` in the gate file in the same change, with
+a comment saying why. The key is `<path>::<function>::TypeError`, never a
+line, and each key admits one site. There is no inline suppression. The gate
+also asserts it rooted at no fewer than `MIN_PROCESS_ROOTS` process methods,
+because a scan that stopped seeing the plugin tree reports the same empty set
+a clean tree does.
+
+### Gate: template renderers and the Tier-1 process-boundary latch
+
+**Pins:** which code can render a row through Jinja. Over every gate-visible
+file under `src/elspeth`, `tests/unit/plugins/infrastructure/test_template_call_sites.py`
+asserts the exact sets of (a) modules importing a Jinja environment or
+`Template` class (the template infrastructure, `core/templates.py`, which only
+parses, and the S3 key template); (b) `SandboxedTemplate(...)` construction
+sites (the LLM and RAG renderers, and RAG's config-time compile); and (c)
+`create_sandboxed_environment()` calls without `value_free=True`, per file,
+with every `render`/`generate`/`stream` call in those files passing only
+`run_id`/`timestamp`.
+
+```bash
+.venv/bin/python -m pytest tests/unit/plugins/infrastructure/test_template_call_sites.py -n 0
+.venv/bin/python -m pytest "tests/unit/engine/test_executors.py::TestReRaiseGuardPattern" -n 0
+```
+
+**Why.** Only `SandboxedTemplate` withholds a row value from a render failure;
+Jinja's and Python's own messages quote it. A new renderer is a new place a row
+value can reach an audit reason, so it is judged, not inherited. Render a row
+through `SandboxedTemplate`; a path or key template that renders run-level
+names only may use `create_sandboxed_environment()` and must be added to the
+expected set in the same change.
+
+**The latch.** `TestReRaiseGuardPattern` refuses an `except TIER_1_ERRORS`
+handler that returns. The template render worker is a spawned child, which
+cannot raise into the parent, and an exception escaping it is printed to the
+inherited stderr. So its render arm replies `render_tier1` with the class name
+and the parent raises `FrameworkBugError`. That handler is exempt through
+`_PROCESS_BOUNDARY_LATCHES`, keyed by `(path, enclosing function)`, never
+through the file-name `_HANDLER_ALLOWLIST`. An entry that no longer matches a
+handler fails the gate.
 
 ### Gate: runtime-rejection parity
 
@@ -527,8 +641,11 @@ most:
   Tier-1 nominal invariant must raise; do not soften it to a warning.
 - **Tier 2 (user data):** quarantine the row, never the run. A transform that
   cannot produce a row returns `TransformResult.error(...)` so the row leaves
-  through `on_error`; a caught exception's tier is the discriminator, and the
-  cheapest way to say so is a narrowed parameter type.
+  through `on_error` (at a batch node the whole batch fails); a caught
+  exception's tier is the discriminator, and the cheapest way to say so is a
+  narrowed parameter type. A wrongly-typed row value is rejected the same way,
+  never coerced and never raised on — see
+  [Gate: no bare TypeError on a plugin process path](#gate-no-bare-typeerror-on-a-plugin-process-path).
 - **Tier 3 (external input):** parse at one declared boundary and construct an
   owned type. Read foreign data through a single named accessor per module
   (for example `_node_str_option(node, key)` in `interpretation_state.py`,
@@ -749,9 +866,8 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
   `src/elspeth/web/composer/skills/pipeline_capabilities.md`, the redaction
   snapshot (`scripts/cicd/bootstrap_redaction_snapshot.py --write`; only
   hashes may move, never `sensitive_path_count`, unless a sensitive path was
-  intended), and the frontend's strict guided wire decoder
-  (`frontend/src/api/guidedDecoder.ts`, `exactRecord` key lists) — a
-  production decoder that rejects unenumerated keys at runtime. Serialise
+  intended), and the frontend API contracts that consume the spec fields.
+  Serialise
   optional spec fields as omitted-when-`None` so persisted
   `composition_content_hash` values stay byte-identical.
 - The CSS barrel rules are under
@@ -763,8 +879,10 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
   a bare `check` exits 2, and a cwd root walks `.venv`. The
   `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing`
   prefix lets a contributor without the operator key run it; shape-only
-  verification cannot detect forged judge metadata, so CI re-verifies with
-  the key before a merge is authoritative.
+  verification cannot detect forged judge metadata. CI never receives the
+  operator key and does not claim signed allowlist clearance. An
+  operator-controlled context must verify the exact reviewed candidate with
+  trusted verifier code before claiming that clearance.
 - The `trust_tier.tier_model` allowlist under `config/cicd/enforce_tier_model/*.yaml`
   seals each judged suppression with an operator-held HMAC signature. A
   signed entry binds by `scope_fingerprint` of the enclosing function, not by

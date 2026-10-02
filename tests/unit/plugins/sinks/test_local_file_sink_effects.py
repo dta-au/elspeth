@@ -222,7 +222,8 @@ def test_json_effect_diverts_a_row_that_cannot_be_encoded(
     assert plan.safe_evidence["accepted_ordinals"] == (0,)
     assert plan.safe_evidence["diverted_ordinals"] == (1,)
     assert _stage_path(plan).read_bytes() == b'{"id": 1}\n'
-    assert sink._get_diversions()[0].reason == f"JSON encoding (utf-8) failed: {encoding_error}"
+    # Value-free: the codec's own text quotes the character it could not encode.
+    assert sink._get_diversions()[0].reason == "JSON encoding (utf-8) failed: UnicodeEncodeError"
     assert plan.safe_evidence["diversion_attribution"] == _expected_diversion_attribution(sink)
 
 
@@ -253,7 +254,7 @@ def test_json_effect_rejects_a_predecessor_row_that_cannot_be_encoded(
 
     monkeypatch.setattr(json, "dumps", fail_encoding_for_predecessor_row)
     second_sink = JSONSink(config)
-    expected_message = f"Predecessor JSON snapshot is incompatible: JSON encoding (utf-8) failed: {encoding_error}"
+    expected_message = "Predecessor JSON snapshot is incompatible: JSON encoding (utf-8) failed: UnicodeEncodeError"
 
     with pytest.raises(ValueError) as exc_info:
         _prepare(
@@ -265,8 +266,23 @@ def test_json_effect_rejects_a_predecessor_row_that_cannot_be_encoded(
         )
 
     assert str(exc_info.value) == expected_message
-    assert isinstance(exc_info.value.__cause__, UnicodeEncodeError)
-    assert exc_info.value.__cause__ is encoding_error
+    # The codec's text (which quotes the row's character) is not chained onto
+    # the abort either, so an uncaught one prints no value to stderr.
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
+
+def test_csv_effect_encoding_diversion_reason_is_value_free(tmp_path: Path) -> None:
+    """A real codec failure: the reason names the codec and failure kind, never the character or the value."""
+    sink = inject_write_failure(CSVSink({"path": str(tmp_path / "out.csv"), "schema": _SCHEMA, "encoding": "ascii"}))
+
+    plan = _prepare(sink, effect_id="b3" * 32, rows=[{"id": 1, "name": "Ada"}, {"id": 2, "name": "SNTL_CSV_é_7731"}])
+
+    assert plan.safe_evidence["diverted_ordinals"] == (1,)
+    reason = sink._get_diversions()[0].reason
+    assert reason == "CSV encoding (ascii) failed: UnicodeEncodeError"
+    for fragment in ("SNTL_CSV", "é", "\\xe9", "position"):
+        assert fragment not in reason
 
 
 def test_csv_effect_thaws_nested_values_before_serialization(tmp_path: Path) -> None:

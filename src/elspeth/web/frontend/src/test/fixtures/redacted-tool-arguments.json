@@ -1,7 +1,176 @@
 {
   "_comment": "GENERATED FILE -- do not hand-edit. Each 'redacted' payload is the output of elspeth.web.composer.redaction.redact_tool_call_arguments for its 'arguments'. Frontend tests read these payloads so they are driven by the real producer; a Python test re-derives them so the two languages cannot drift (elspeth-b1c14dd3c2).",
   "_regenerate": ".venv/bin/python scripts/cicd/bootstrap_proposal_diff_fixture.py --write",
+  "projected_tools": [
+    "set_source",
+    "clear_source",
+    "upsert_node",
+    "remove_node",
+    "upsert_edge",
+    "remove_edge",
+    "set_output",
+    "remove_output",
+    "set_metadata",
+    "patch_source_options",
+    "patch_node_options",
+    "patch_output_options",
+    "set_pipeline"
+  ],
   "cases": {
+    "set_pipeline_explicit_null_inline_blob": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": {},
+          "inline_blob": null
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": []
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+          "inline_blob": null
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": []
+      },
+      "proposal_summary": "Replace the pipeline with 1 input, 0 processing nodes, and 0 outputs."
+    },
+    "set_source_explicit_null_description": {
+      "tool": "set_source",
+      "arguments": {
+        "plugin": "csv",
+        "on_success": "rows",
+        "options": {},
+        "on_validation_failure": "discard",
+        "description": null
+      },
+      "redacted": {
+        "plugin": "csv",
+        "on_success": "rows",
+        "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+        "on_validation_failure": "discard",
+        "description": null
+      },
+      "proposal_summary": "Set the pipeline source to csv."
+    },
+    "set_pipeline_ambiguous_inline_omitted_metadata": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "description": null,
+          "options": {},
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "url\nhttps://a.example\nhttps://b.example\nhttps://c.example\n"
+          }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": []
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+          "description": null,
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "<inline-blob:58-bytes>"
+          }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": []
+      },
+      "proposal_summary": "Replace the pipeline with 1 input, 0 processing nodes, and 0 outputs."
+    },
+    "set_pipeline_ambiguous_inline_empty_options": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "options": {},
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "url\nhttps://a.example\nhttps://b.example\nhttps://c.example\n"
+          }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+        "metadata": {}
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "<inline-blob:58-bytes>"
+          }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+        "metadata": "<metadata-patch:empty>"
+      },
+      "proposal_summary": "Replace the pipeline with 1 input, 0 processing nodes, and 0 outputs."
+    },
+    "set_pipeline_ambiguous_inline_nonempty_options": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "options": {
+            "delimiter": ","
+          },
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "url\nhttps://a.example\nhttps://b.example\nhttps://c.example\n"
+          }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+        "metadata": {}
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "csv_rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+          "inline_blob": {
+            "filename": "chat.csv",
+            "mime_type": "text/csv",
+            "content": "<inline-blob:58-bytes>"
+          }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+        "metadata": "<metadata-patch:empty>"
+      },
+      "proposal_summary": "Replace the pipeline with 1 input, 0 processing nodes, and 0 outputs."
+    },
     "patch_source_options_two_scalars": {
       "tool": "patch_source_options",
       "arguments": {
@@ -14,7 +183,8 @@
       "redacted": {
         "source_name": "source",
         "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":2,\"value_shape_counts\":{\"mapping\":0,\"scalar\":2,\"sequence\":0,\"set\":0}}"
-      }
+      },
+      "proposal_summary": "Update source options."
     },
     "patch_node_options_one_mapping": {
       "tool": "patch_node_options",
@@ -29,7 +199,8 @@
       "redacted": {
         "node_id": "extract",
         "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}"
-      }
+      },
+      "proposal_summary": "Update options for node \"extract\"."
     },
     "patch_node_options_mixed_shapes": {
       "tool": "patch_node_options",
@@ -50,7 +221,8 @@
       "redacted": {
         "node_id": "extract",
         "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":4,\"value_shape_counts\":{\"mapping\":1,\"scalar\":2,\"sequence\":1,\"set\":0}}"
-      }
+      },
+      "proposal_summary": "Update options for node \"extract\"."
     },
     "patch_node_options_empty_patch": {
       "tool": "patch_node_options",
@@ -61,7 +233,8 @@
       "redacted": {
         "node_id": "extract",
         "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}"
-      }
+      },
+      "proposal_summary": "Update options for node \"extract\"."
     },
     "patch_node_options_missing_node": {
       "tool": "patch_node_options",
@@ -74,7 +247,8 @@
       "redacted": {
         "node_id": "ghost",
         "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
-      }
+      },
+      "proposal_summary": "Update options for node \"ghost\"."
     },
     "patch_output_options_one_scalar": {
       "tool": "patch_output_options",
@@ -87,7 +261,8 @@
       "redacted": {
         "sink_name": "results",
         "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
-      }
+      },
+      "proposal_summary": "Update options for output \"results\"."
     },
     "set_metadata_name_and_description": {
       "tool": "set_metadata",
@@ -99,7 +274,8 @@
       },
       "redacted": {
         "patch": "<metadata-patch:description,name>"
-      }
+      },
+      "proposal_summary": "Apply composer tool set_metadata."
     },
     "set_metadata_name_only": {
       "tool": "set_metadata",
@@ -110,7 +286,8 @@
       },
       "redacted": {
         "patch": "<metadata-patch:name>"
-      }
+      },
+      "proposal_summary": "Apply composer tool set_metadata."
     },
     "set_metadata_empty": {
       "tool": "set_metadata",
@@ -119,7 +296,8 @@
       },
       "redacted": {
         "patch": "<metadata-patch:empty>"
-      }
+      },
+      "proposal_summary": "Apply composer tool set_metadata."
     },
     "set_metadata_unknown_key": {
       "tool": "set_metadata",
@@ -131,7 +309,8 @@
       },
       "redacted": {
         "patch": "<metadata-patch:name,unknown>"
-      }
+      },
+      "proposal_summary": "Apply composer tool set_metadata."
     },
     "set_metadata_invalid": {
       "tool": "set_metadata",
@@ -140,7 +319,8 @@
       },
       "redacted": {
         "patch": "<metadata-patch:invalid>"
-      }
+      },
+      "proposal_summary": "Apply composer tool set_metadata."
     },
     "set_metadata_only_unknown_key": {
       "tool": "set_metadata",
@@ -151,12 +331,14 @@
       },
       "redacted": {
         "patch": "<metadata-patch:unknown>"
-      }
+      },
+      "proposal_summary": "Apply composer tool set_metadata."
     },
     "set_metadata_no_arguments": {
       "tool": "set_metadata",
       "arguments": {},
-      "redacted": {}
+      "redacted": {},
+      "proposal_summary": "Apply composer tool set_metadata."
     },
     "set_source_with_options": {
       "tool": "set_source",
@@ -170,13 +352,12 @@
         "on_validation_failure": "discard"
       },
       "redacted": {
-        "source_name": "source",
         "plugin": "csv",
         "on_success": "rows",
         "options": "{\"_option_shape\":\"mapping\",\"entry_count\":2,\"value_shape_counts\":{\"mapping\":0,\"scalar\":2,\"sequence\":0,\"set\":0}}",
-        "on_validation_failure": "discard",
-        "description": null
-      }
+        "on_validation_failure": "discard"
+      },
+      "proposal_summary": "Set the pipeline source to csv."
     },
     "upsert_node_with_options": {
       "tool": "upsert_node",
@@ -195,7 +376,8 @@
         "plugin": "html_extract",
         "input": "rows",
         "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
-      }
+      },
+      "proposal_summary": "Apply composer tool upsert_node."
     },
     "set_output_with_options": {
       "tool": "set_output",
@@ -210,7 +392,8 @@
         "sink_name": "errors",
         "plugin": "csv",
         "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
-      }
+      },
+      "proposal_summary": "Apply composer tool set_output."
     },
     "set_pipeline_replaying_current_state": {
       "tool": "set_pipeline",
@@ -262,11 +445,8 @@
           "plugin": "csv",
           "on_success": "rows",
           "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
-          "on_validation_failure": "discard",
-          "description": null,
-          "blob_id": null
+          "on_validation_failure": "discard"
         },
-        "sources": null,
         "nodes": [
           {
             "id": "extract",
@@ -275,21 +455,7 @@
             "node_type": "transform",
             "input": "rows",
             "plugin": "field_mapper",
-            "on_success": "mapped",
-            "condition": null,
-            "routes": null,
-            "fork_to": null,
-            "branches": null,
-            "policy": null,
-            "merge": null,
-            "trigger": null,
-            "output_mode": null,
-            "expected_output_count": null,
-            "timeout_seconds": null,
-            "description": null,
-            "scope_name": null,
-            "scope_opener": null,
-            "scope_policy": null
+            "on_success": "mapped"
           }
         ],
         "edges": [
@@ -305,13 +471,11 @@
           {
             "sink_name": "results",
             "plugin": "json",
-            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
-            "on_write_failure": null,
-            "description": null
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
           }
-        ],
-        "metadata": "<metadata-patch:invalid>"
-      }
+        ]
+      },
+      "proposal_summary": "Replace the pipeline with 1 input, 1 processing node, and 1 output."
     },
     "set_pipeline_plugin_changed_no_nodes": {
       "tool": "set_pipeline",
@@ -341,24 +505,263 @@
           "plugin": "json",
           "on_success": "rows",
           "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
-          "on_validation_failure": "discard",
-          "description": null,
-          "blob_id": null
+          "on_validation_failure": "discard"
         },
-        "sources": null,
         "nodes": [],
         "edges": [],
         "outputs": [
           {
             "sink_name": "results",
             "plugin": "csv",
-            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
-            "on_write_failure": null,
-            "description": null
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+          }
+        ]
+      },
+      "proposal_summary": "Replace the pipeline with 1 input, 0 processing nodes, and 1 output."
+    },
+    "set_pipeline_presence_omitted": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "options": {
+            "path": "input.csv"
+          },
+          "on_success": "rows",
+          "on_validation_failure": "discard"
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "node_type": "transform",
+            "plugin": "field_mapper",
+            "input": "rows",
+            "on_success": "mapped",
+            "on_error": null,
+            "options": {
+              "mappings": {
+                "a": "b"
+              }
+            }
           }
         ],
-        "metadata": "<metadata-patch:invalid>"
-      }
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": {
+              "path": "out.json"
+            }
+          }
+        ]
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard"
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+            "on_error": null,
+            "node_type": "transform",
+            "input": "rows",
+            "plugin": "field_mapper",
+            "on_success": "mapped"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+          }
+        ]
+      },
+      "proposal_summary": "Replace the pipeline with 1 input, 1 processing node, and 1 output."
+    },
+    "set_pipeline_presence_null": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "options": {
+            "path": "input.csv"
+          },
+          "on_success": "rows",
+          "on_validation_failure": "discard",
+          "description": null
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "node_type": "transform",
+            "plugin": "field_mapper",
+            "input": "rows",
+            "on_success": "mapped",
+            "on_error": null,
+            "options": {
+              "mappings": {
+                "a": "b"
+              }
+            },
+            "timeout_seconds": null
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": {
+              "path": "out.json"
+            },
+            "on_write_failure": null
+          }
+        ]
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard",
+          "description": null
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+            "on_error": null,
+            "node_type": "transform",
+            "input": "rows",
+            "plugin": "field_mapper",
+            "on_success": "mapped",
+            "timeout_seconds": null
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+            "on_write_failure": null
+          }
+        ]
+      },
+      "proposal_summary": "Replace the pipeline with 1 input, 1 processing node, and 1 output."
+    },
+    "set_pipeline_empty_options_replaying_current_state": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "options": {},
+          "on_success": "rows",
+          "on_validation_failure": "discard"
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "node_type": "transform",
+            "plugin": "field_mapper",
+            "input": "rows",
+            "on_success": "mapped",
+            "on_error": null,
+            "options": {}
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": {}
+          }
+        ]
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard"
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+            "on_error": null,
+            "node_type": "transform",
+            "input": "rows",
+            "plugin": "field_mapper",
+            "on_success": "mapped"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}"
+          }
+        ]
+      },
+      "proposal_summary": "Replace the pipeline with 1 input, 1 processing node, and 1 output."
     }
   }
 }

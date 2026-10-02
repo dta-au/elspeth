@@ -80,9 +80,7 @@ class ControllableResizeObserver implements ResizeObserver {
 interface WorkspaceFixtureProps {
   authoring?: ReactNode;
   artifact?: ReactNode;
-  inspector?: ReactNode;
   actionBar?: ReactNode;
-  authoringStatus?: ReactNode;
   collapsedStatus?: {
     text: string;
     tone: "neutral" | "busy" | "error";
@@ -94,9 +92,7 @@ function renderWorkspace(props: WorkspaceFixtureProps = {}) {
     <ComposerWorkspace
       authoring={props.authoring ?? <button type="button">Author control</button>}
       artifact={props.artifact ?? <button type="button">Artifact control</button>}
-      inspector={props.inspector ?? <aside>Inspector content</aside>}
       actionBar={props.actionBar ?? <button type="button">Primary action</button>}
-      authoringStatus={props.authoringStatus}
       collapsedStatus={props.collapsedStatus}
     />,
   );
@@ -129,8 +125,7 @@ describe("ComposerWorkspace", () => {
 
     // The bar row is its own grid item spanning both columns
     // (elspeth-9c94a58500), placed after both panes so the tab sequence
-    // reads chat → separator → artifact → bottom bar → inspector, and
-    // before the inspector so tree order keeps the drawer painted above it.
+    // reads chat → separator → artifact → bottom bar.
     expect([...root.children].map((child) => child.getAttribute("data-workspace-part")))
       .toEqual([
         "view-tabs",
@@ -138,7 +133,6 @@ describe("ComposerWorkspace", () => {
         "separator",
         "artifact",
         "action-bar",
-        "inspector",
       ]);
     expect(
       screen.getAllByRole("region", { name: "Authoring pane", hidden: true }),
@@ -261,7 +255,6 @@ describe("ComposerWorkspace", () => {
     );
     expect(screen.getByText("Artifact control")).toBeInTheDocument();
     expect(screen.getByText("Primary action")).toBeInTheDocument();
-    expect(screen.getByText("Inspector content")).toBeInTheDocument();
     window.removeEventListener("error", preventExpectedWindowError);
     consoleError.mockRestore();
   });
@@ -447,12 +440,16 @@ describe("ComposerWorkspace", () => {
     const cleanup = vi.fn();
     function CustodyProbe() {
       useEffect(() => cleanup, []);
-      return <button type="button">Live draft</button>;
+      return (
+        <>
+          <button type="button">Live draft</button>
+          <div role="status">Authoring ready</div>
+        </>
+      );
     }
 
     renderWorkspace({
       authoring: <CustodyProbe />,
-      authoringStatus: <div role="status">Authoring ready</div>,
       collapsedStatus: { text: "2 unread acknowledgements", tone: "neutral" },
     });
     emitWidth(1280);
@@ -635,7 +632,7 @@ describe("ComposerWorkspace", () => {
 
   it.each([
     ["Waiting for ELSPETH", "busy"],
-    ["Guided decision pending", "busy"],
+    ["Proposal review pending", "busy"],
     ["Authoring failed", "error"],
     ["New response available", "neutral"],
   ] as const)("projects collapsed status updates: %s", async (text, tone) => {
@@ -654,7 +651,6 @@ describe("ComposerWorkspace", () => {
       <ComposerWorkspace
         authoring={<button type="button">Author control</button>}
         artifact={<button type="button">Artifact control</button>}
-        inspector={<aside>Inspector content</aside>}
         actionBar={<button type="button">Primary action</button>}
         collapsedStatus={{ text: `${text} updated`, tone }}
       />,
@@ -665,9 +661,9 @@ describe("ComposerWorkspace", () => {
     ).toHaveAccessibleDescription(`${text} updated`);
   });
 
-  it("preserves authoring, artifact, and inspector subtree identity across layout changes", async () => {
+  it("preserves authoring and artifact subtree identity across layout changes", async () => {
     const user = userEvent.setup();
-    const mounts = { authoring: 0, artifact: 0, inspector: 0 };
+    const mounts = { authoring: 0, artifact: 0 };
     function IdentityProbe({ name }: { name: keyof typeof mounts }) {
       const mounted = useRef(false);
       if (!mounted.current) {
@@ -680,7 +676,6 @@ describe("ComposerWorkspace", () => {
     renderWorkspace({
       authoring: <IdentityProbe name="authoring" />,
       artifact: <IdentityProbe name="artifact" />,
-      inspector: <IdentityProbe name="inspector" />,
     });
     emitWidth(1280);
     await user.click(
@@ -693,7 +688,7 @@ describe("ComposerWorkspace", () => {
     await user.click(screen.getByRole("tab", { name: "Pipeline" }));
     emitWidth(1280);
 
-    expect(mounts).toEqual({ authoring: 1, artifact: 1, inspector: 1 });
+    expect(mounts).toEqual({ authoring: 1, artifact: 1 });
   });
 
   it.each([

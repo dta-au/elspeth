@@ -19,12 +19,15 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.fixtures.identities import ensure_test_identity
 
 
 @pytest.fixture
 def engine():
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
+    with eng.begin() as conn:
+        ensure_test_identity(conn, identity_id="schema-test-user")
     return eng
 
 
@@ -45,7 +48,7 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_53(engine) -> None:
+def test_blob_inline_resolutions_schema_epoch_is_71(engine) -> None:
     # 51: the multi-replica session-operation substrate landed on top of
     # mainline's 50 (elspeth-4d6c0dd0f5).
     # 52: pluggable SSO and the identity substrate (elspeth-07cd19ba73) —
@@ -53,9 +56,23 @@ def test_blob_inline_resolutions_schema_epoch_is_53(engine) -> None:
     # and workflow-governance tables, all in one cutover window.
     # 53: per-admission read records (session_read_admissions,
     # elspeth-f98e0ae8b2).
-    assert SESSION_SCHEMA_EPOCH == 53
+    # 54: durable Composer progress and inflight request records.
+    # 55: identity ownership and approval/admission provenance.
+    # 56: sparse proposal arguments and structured validation errors.
+    # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
+    # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
+    # Epoch 63 gives this table's content_hash the full lowercase SHA-256 CHECK.
+    # Epoch 65: completion_gates.advisor_signoff.note became a required key
+    # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
+    # Epoch 66 rejects v1 control messages whose checksum omitted provenance.
+    # Epoch 67 binds coalesce branch order and sources order in authority hashes.
+    # Epoch 68 adds ordinary proposal checkpoint rebase reasons.
+    # Epoch 69 binds freeform message ingress receipts.
+    # Epoch 70 renames the persisted tutorial Build stage to build.
+    # Epoch 71 adds mode-neutral fork/revert receipts.
+    assert SESSION_SCHEMA_EPOCH == 71
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 53
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 71
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:
@@ -134,6 +151,42 @@ def test_blob_inline_resolutions_encoding_check_rejects_unknown(engine) -> None:
                 byte_length=10,
                 mime_type="text/plain",
                 encoding="ascii",
+                resolved_at=datetime.now(UTC),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "content_hash",
+    [
+        pytest.param("a" * 63, id="too-short"),
+        pytest.param("A" * 64, id="uppercase-hex"),
+        pytest.param("g" * 64, id="non-hex-letter"),
+        pytest.param("a" * 63 + " ", id="trailing-space"),
+    ],
+)
+def test_blob_inline_resolutions_hash_check_rejects_non_lowercase_sha256(engine, content_hash: str) -> None:
+    # The CHECK must carry the whole ``^[a-f0-9]{64}$`` shape the writer-side
+    # ``ResolvedBlobContent`` enforces, not the length alone: a 64-character
+    # value that is not lowercase hex can never equal a real digest, so a row
+    # holding one asserts a resolution nobody can verify (elspeth-f99b16fc2f).
+    run_id = str(uuid4())
+    blob_id = str(uuid4())
+    with (
+        pytest.raises(IntegrityError, match="ck_blob_inline_resolutions_hash_format"),
+        engine.begin() as conn,
+    ):
+        _seed_run_and_blob(conn, run_id=run_id, blob_id=blob_id)
+        conn.execute(
+            insert(blob_inline_resolutions_table).values(
+                run_id=run_id,
+                attempt=1,
+                field_path="source.options.system_prompt",
+                blob_id=blob_id,
+                content_hash=content_hash,
+                byte_length=10,
+                mime_type="text/plain",
+                encoding="utf-8",
                 resolved_at=datetime.now(UTC),
             )
         )

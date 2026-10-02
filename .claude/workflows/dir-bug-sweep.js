@@ -3,7 +3,7 @@
 // Invoke (from the main loop, after deciding scope):
 //   Workflow({ scriptPath: '/abs/path/to/.claude/workflows/dir-bug-sweep.js', args: {
 //     path: 'src/elspeth/contracts',     // dir (or file) to sweep — required in practice
-//     tag: '2806bugsweep',               // Filigree label applied to every lodged issue — required
+//     tag: '2806bugsweep',               // Local report tag for this review — required
 //     glob: '*.py',                      // optional, default '*.py'
 //     lineCap: 1000,                     // optional, max lines an agent may own, default 1000
 //     maxParallel: 6,                    // optional, concurrent agents per wave, default 6
@@ -13,8 +13,8 @@
 //
 // The workflow does: scout (inventory + line counts) -> deterministic first-fit-decreasing
 // bin-pack into <=lineCap bins (oversized files become solo, effort:'high') -> review agents
-// in waves of maxParallel -> return structured results. It does NOT reconcile the tracker;
-// the `bug-sweep` skill owns the post-run authoritative-query / dedup / present step.
+// in waves of maxParallel -> return structured local results. The `bug-sweep` skill
+// owns post-run evidence checks, deduplication and the local report; no issues are published.
 //
 // PRECOMPUTE THE INVENTORY (preferred path): the orchestrator (main loop) should compute the file
 //   list itself in a shell and pass it as args.files — do NOT lean on the in-workflow scout. The
@@ -29,13 +29,13 @@
 // TARGETED RE-RUN ON PARTIAL FAILURE (important):
 //   If some agents die (e.g. a transient server-side rate limit), do NOT resume this run with
 //   resumeFromRunId — resume's cache prefix breaks at the FIRST failure, so every downstream
-//   agent re-runs and re-lodges DUPLICATES. Instead, launch a fresh dir-bug-sweep passing only
+//   agent re-runs and returns DUPLICATES. Instead, launch a fresh dir-bug-sweep passing only
 //   the unreviewed files via `args.files: [{path, lines}, ...]` (scout is skipped). Same tag.
 
 export const meta = {
   name: 'dir-bug-sweep',
-  description: 'Read-only multi-agent bug sweep of a directory; each agent owns <=lineCap lines and lodges findings in Filigree under a sweep tag',
-  whenToUse: 'Auditing a directory or subsystem for bugs, architectural defects, and enhancement opportunities at scale, with one tracker tag per sweep',
+  description: 'Read-only multi-agent bug sweep of a directory; each agent owns <=lineCap lines and returns verified findings for local triage',
+  whenToUse: 'Auditing a directory or subsystem for bugs, architectural defects, and enhancement opportunities at scale, with one local report tag per sweep',
   phases: [
     { title: 'Scout', detail: 'inventory files + line counts' },
     { title: 'Review', detail: 'waves of read-only review agents' },
@@ -185,14 +185,13 @@ const ISSUE_SCHEMA = {
       items: {
         type: 'object', additionalProperties: false,
         properties: {
-          id: { type: 'string', description: 'REAL Filigree issue id from issue_create' },
           title: { type: 'string' },
           severity: { type: 'string', description: 'P0|P1|P2|P3|P4' },
           kind: { type: 'string', description: 'bug|architecture|enhancement|security' },
           file: { type: 'string' },
           summary: { type: 'string' },
         },
-        required: ['id', 'title', 'severity', 'kind', 'file', 'summary'],
+        required: ['title', 'severity', 'kind', 'file', 'summary'],
       },
     },
     notes: { type: 'string' },
@@ -209,10 +208,10 @@ function buildPrompt(bin) {
   return `You are a meticulous READ-ONLY code reviewer running a bug sweep.\n\n` +
 `YOUR OWNED FILES (review EVERY one, in depth — you own these end to end):\n${fileList}\n\n` +
 `WHAT TO HUNT FOR: correctness bugs (None/Optional mishandling, mutable defaults, wrong comparisons, broken (de)serialisation, implicit fabrication via dict.get-with-default where a missing required value should raise); contract-invariant violations (validation theatre — a validator that returns success without validating; fields that permit contradictory states; lifecycle/telemetry invariants only partially enforced); architectural defects (leaky/duplicated boundaries, fail-open / silent-failure, trust-boundary gaps); security (secret/PII egress, unredacted error text, unsafe URL/host handling, weak signing); and concrete enhancement opportunities ONLY where there is a real, named deficiency.\n\n` +
-`THIS IS A READ-ONLY RUN. Do NOT modify any file. Do NOT use Edit/Write/NotebookEdit. Do NOT run any mutating tool (no analyze, no fix, no git writes). The ONLY writes permitted are creating + labelling Filigree issues (below).\n\n` +
-`METHOD: (1) Read each owned file fully. (2) VERIFY each candidate before lodging — roam into callers, referenced classes/functions, and tests and confirm it actually manifests (use Loomweave MCP tools entity_find/entity_callers_list/entity_at/entity_source_get and Grep/Read). A candidate you cannot substantiate does NOT get lodged. (3) Evidence bar per issue: exact file:line, what is wrong, WHY (the invariant/caller expectation it breaks), expected behaviour, and the verification you did. No style nitpicks. A clean file is a valid outcome — report it clean, do NOT force-lodge.\n\n` +
-`LODGING IN FILIGREE (the only permitted writes): (1) FIRST load the deferred tool — ToolSearch query "select:mcp__filigree__issue_create". (2) Create each finding with mcp__filigree__issue_create: type "bug" for defects/architecture/security, "task" for a pure enhancement; title prefixed with the file; priority P0..P3 by real blast radius; description = file:line + evidence + why + expected + your verification; labels: ["${TAG}"] in this same creation call; if it has an actor/assignee field set it to "bug-sweep". The post-run reconciliation queries on this exact label, so it must be committed atomically with the issue. (3) Capture the REAL id returned by issue_create; never invent or narrate one.\n\n` +
-`RETURN (structured): files_reviewed = every owned file; issues = one entry per lodged issue with the REAL id; notes = clean files, cross-file patterns, anything deferred. Empty issues array is fine.` +
+`THIS IS A READ-ONLY RUN. Do NOT modify any file. Do NOT use Edit/Write/NotebookEdit. Do NOT run any mutating tool (no analyze, no fix, no git writes). Do NOT create, label, comment on, or close remote issues.\n\n` +
+`METHOD: (1) Read each owned file fully. (2) VERIFY each candidate — inspect callers, referenced classes/functions, and tests using rg and file reads and confirm it actually manifests. A candidate you cannot substantiate does NOT become a finding. (3) Evidence bar per finding: exact file:line, what is wrong, WHY (the invariant/caller expectation it breaks), expected behaviour, and the verification you did. Put this evidence in summary. No style nitpicks. A clean file is a valid outcome — report it clean.\n\n` +
+`REPORT LOCALLY: Return verified findings to the coordinator for a local report under sweep tag ${JSON.stringify(TAG)}. The operator will triage findings and upload selected issues to GitHub separately. Do not publish or invent issue IDs.\n\n` +
+`RETURN (structured): files_reviewed = every owned file; issues = verified local findings, without remote issue IDs; notes = clean files, cross-file patterns, anything deferred. Empty issues array is fine.` +
 (EXTRA ? `\n\nADDITIONAL GUIDANCE FOR THIS SWEEP:\n${EXTRA}` : ``)
 }
 
@@ -234,7 +233,7 @@ for (let i = 0; i < ordered.length; i += MAX_PARALLEL) {
   allResults.push(...ok)
   const lodged = ok.reduce((n, item) => n + (item.result.issues ? item.result.issues.length : 0), 0)
   const failed = wave.length - ok.length
-  log(`${phaseTitle} done: ${ok.length}/${wave.length} returned${failed ? ` (${failed} FAILED — re-run those files via args.files, NOT resume)` : ''}, ${lodged} issues lodged`)
+  log(`${phaseTitle} done: ${ok.length}/${wave.length} returned${failed ? ` (${failed} FAILED — re-run those files via args.files, NOT resume)` : ''}, ${lodged} findings returned`)
 }
 
 const lodged = allResults.flatMap(item => item.result.issues || [])

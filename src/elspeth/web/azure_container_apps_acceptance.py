@@ -26,6 +26,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict
+from uuid import UUID
 
 from sqlalchemy import Engine, create_engine, text
 
@@ -53,6 +54,7 @@ from ._acceptance_common.replica_probes import (
     decide_lease_takeover,
     decide_run_start,
     record_owner_affine_progress,
+    require_contention_trials,
 )
 from ._acceptance_common.secure_documents import MAX_CONTROL_DOCUMENT_BYTES, _read_protected_document
 from ._azure_container_apps_acceptance.controller import (
@@ -263,6 +265,70 @@ def _seconds_argument(value: str) -> float:
     return seconds
 
 
+def _trials_argument(value: str) -> int:
+    try:
+        return require_contention_trials(int(value))
+    except (ValueError, AcceptanceInputError):
+        raise argparse.ArgumentTypeError(f"trials must be an integer at least {DEFAULT_TRIALS}") from None
+
+
+def _trial_session_ids(path: str, *, trials: int) -> tuple[str, ...]:
+    """Admit the prepared P2 session inventory before any remote request."""
+
+    document = _list_document(path)
+    if type(document) is not list or len(document) != trials:
+        raise AcceptanceInputError("--session-ids must contain exactly one fresh session per trial")
+    sessions: list[str] = []
+    for value in document:
+        if (
+            type(value) is not str
+            or not value
+            or len(value) > 128
+            or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in value)
+        ):
+            raise AcceptanceInputError("--session-ids contains an invalid session identifier")
+        sessions.append(value)
+    if len(set(sessions)) != trials:
+        raise AcceptanceInputError("--session-ids must contain distinct sessions")
+    return tuple(sessions)
+
+
+def _fence_trial_requests(path: str, *, trials: int) -> tuple[tuple[str, object], ...]:
+    """Admit one fresh freeform message request per contention trial."""
+
+    document = _list_document(path)
+    if type(document) is not list or len(document) != trials:
+        raise AcceptanceInputError("--trial-requests must contain one prepared freeform request per trial")
+    requests: list[tuple[str, object]] = []
+    for item in document:
+        if type(item) is not dict or set(item) != {"session_id", "body"} or type(item["body"]) is not dict:
+            raise AcceptanceInputError("--trial-requests requires session_id and body records")
+        session = item["session_id"]
+        if (
+            type(session) is not str
+            or not session
+            or len(session) > 128
+            or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in session)
+        ):
+            raise AcceptanceInputError("--trial-requests contains an invalid session identifier")
+        body = item["body"]
+        if set(body) != {"content", "client_request_id"} or type(body["content"]) is not str or not body["content"].strip():
+            raise AcceptanceInputError("--trial-requests requires a nonempty freeform content body")
+        request_id = body["client_request_id"]
+        if type(request_id) is not str:
+            raise AcceptanceInputError("--trial-requests client_request_id must be a canonical UUID")
+        try:
+            parsed_id = UUID(request_id)
+        except ValueError as exc:
+            raise AcceptanceInputError("--trial-requests client_request_id must be a canonical UUID") from exc
+        if str(parsed_id) != request_id:
+            raise AcceptanceInputError("--trial-requests client_request_id must be a canonical UUID")
+        requests.append((session, body))
+    if len({session for session, _ in requests}) != trials:
+        raise AcceptanceInputError("freeform contention trials require distinct sessions")
+    return tuple(requests)
+
+
 def _binding(args: argparse.Namespace) -> ReplicaBinding:
     return ReplicaBinding(container_app_id=args.container_app_id, revision=args.revision, replica=args.replica)
 
@@ -341,9 +407,9 @@ def probe_topology_check(
     require_even_label_split(project_label_weights(traffic), labels=(first.name, second.name))
     instances: list[str] = []
     for address in (first, second):
-        _status, instance_id, _body = client_factory(address.origin).request_json_with_instance(
-            "GET", PROBE_STATUS_PATH, expected_statuses={200}
-        )
+        with client_factory(address.origin) as client:
+            client.authenticate(register=False)
+            _status, instance_id, _body = client.request_json_with_instance("GET", PROBE_STATUS_PATH, expected_statuses={200})
         if instance_id is None:
             raise AcceptanceCheckError("probe_topology", missing=("X-Elspeth-Instance",))
         instances.append(instance_id)
@@ -439,9 +505,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_binding_arguments(cleanup)
     cleanup.add_argument("--count", required=True, help="`az graph query` JSON")
     cleanup.add_argument("--resource-group", required=True)
-    vault = cleanup.add_mutually_exclusive_group(required=True)
-    vault.add_argument("--key-vault-purged", action="store_true")
-    vault.add_argument("--scheduled-purge-date")
+    runtime_vault = cleanup.add_mutually_exclusive_group(required=True)
+    runtime_vault.add_argument("--runtime-key-vault-purged", action="store_true")
+    runtime_vault.add_argument("--runtime-scheduled-purge-date")
+    owner_vault = cleanup.add_mutually_exclusive_group(required=True)
+    owner_vault.add_argument("--schema-owner-key-vault-purged", action="store_true")
+    owner_vault.add_argument("--schema-owner-scheduled-purge-date")
 
     probes = commands.add_parser("replica-probes")
     _add_binding_arguments(probes)
@@ -451,9 +520,9 @@ def build_parser() -> argparse.ArgumentParser:
     probes.add_argument("--default-domain")
     probes.add_argument("--revision-suffix")
     probes.add_argument("--traffic", help="`az containerapp ingress traffic show` JSON")
-    probes.add_argument("--session-id")
-    probes.add_argument("--body", help="JSON request body file for the guided respond pair")
-    probes.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
+    probes.add_argument("--session-ids", help="JSON array of distinct fresh, executable sessions, one per run-start trial")
+    probes.add_argument("--trial-requests", help="JSON array of distinct sessions and freeform message bodies")
+    probes.add_argument("--trials", type=_trials_argument, default=DEFAULT_TRIALS)
     probes.add_argument("--observation", help="P3 / P4a observation document assembled by the driver")
 
     partition = commands.add_parser("partition-owner")
@@ -487,22 +556,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _run_probe(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[str, ProbeResult, CheckDetails]:
     if args.probe in {"fence-conflict", "run-start"}:
-        if None in (args.resource_group, args.default_domain, args.revision_suffix, args.traffic, args.session_id):
-            raise AcceptanceInputError(
-                "--resource-group, --default-domain, --revision-suffix, --traffic and --session-id are required for a live probe"
-            )
+        require_contention_trials(args.trials)
+        if None in (args.resource_group, args.default_domain, args.revision_suffix, args.traffic):
+            raise AcceptanceInputError("--resource-group, --default-domain, --revision-suffix and --traffic are required for a live probe")
+        session_ids: tuple[str, ...] = ()
+        fence_requests: tuple[tuple[str, object], ...] = ()
+        if args.probe == "run-start":
+            if args.session_ids is None:
+                raise AcceptanceInputError("--session-ids is required for isolated run-start trials")
+            session_ids = _trial_session_ids(args.session_ids, trials=args.trials)
+        else:
+            if args.trial_requests is None:
+                raise AcceptanceInputError("--trial-requests is required for isolated freeform trials")
+            fence_requests = _fence_trial_requests(args.trial_requests, trials=args.trials)
         controller, client_factory = _probe_pair(args, env)
         probe_topology_check(controller, client_factory, traffic=_list_document(args.traffic))
         driver = ReplicaProbeDriver(controller=controller, observer=_observer(env), client_factory=client_factory)
         if args.probe == "fence-conflict":
-            if args.body is None:
-                raise AcceptanceInputError("--body is required for the guided respond pair")
-            request = ProbeRequest("POST", f"/api/sessions/{args.session_id}/guided/respond", _document(args.body))
-            trials = [driver.fence_conflict_trial(args.session_id, request) for _ in range(args.trials)]
+            trials = [
+                driver.fence_conflict_trial(session_id, ProbeRequest("POST", f"/api/sessions/{session_id}/messages", body))
+                for session_id, body in fence_requests
+            ]
             result = decide_fence_conflict(trials, required_trials=args.trials)
             return "replica-fence-conflict", result, result.to_receipt_details()
-        request = ProbeRequest("POST", f"/api/sessions/{args.session_id}/execute", {})
-        run_trials = [driver.run_start_trial(args.session_id, request) for _ in range(args.trials)]
+        run_trials = [
+            driver.run_start_trial(session_id, ProbeRequest("POST", f"/api/sessions/{session_id}/execute", {}))
+            for session_id in session_ids
+        ]
         result = decide_run_start(run_trials, required_trials=args.trials)
         return "replica-run-start", result, result.to_receipt_details()
     if args.observation is None:
@@ -517,7 +597,7 @@ def _run_probe(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[str, P
         "outcome": result.outcome,
         "mechanism": result.mechanism,
         "reasons": list(result.reasons),
-        "evidence": dict(result.evidence),
+        "evidence": result.to_receipt_details()["evidence"],
         "owner_affine": owner_affine.to_receipt_details(),
     }
     return "replica-progress", result, progress
@@ -615,8 +695,14 @@ def _dispatch(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         cleanup_details = resource_graph_cleanup_details(
             resource_group=args.resource_group,
             remaining_resources=project_resource_graph_count(_document(args.count)),
-            key_vault_purged=args.key_vault_purged,
-            scheduled_purge_date=None if args.scheduled_purge_date is None else _timestamp_argument(args.scheduled_purge_date),
+            runtime_key_vault_purged=args.runtime_key_vault_purged,
+            runtime_scheduled_purge_date=None
+            if args.runtime_scheduled_purge_date is None
+            else _timestamp_argument(args.runtime_scheduled_purge_date),
+            schema_owner_key_vault_purged=args.schema_owner_key_vault_purged,
+            schema_owner_scheduled_purge_date=None
+            if args.schema_owner_scheduled_purge_date is None
+            else _timestamp_argument(args.schema_owner_scheduled_purge_date),
         )
         sys.stdout.write(f"{_receipt_line(args, 'resource-graph-cleanup', cleanup_details)}\n")
     elif args.command == "replica-probes":

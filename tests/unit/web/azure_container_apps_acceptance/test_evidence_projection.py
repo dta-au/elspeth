@@ -23,6 +23,7 @@ import pytest
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError, AcceptanceInputError
 from elspeth.web._acceptance_common.replica_probes import ProbeResult, decide_lease_takeover
 from elspeth.web._acceptance_common.testcontainer_run import (
+    REQUIRED_POSTGRES_PROOF_IDS,
     TESTCONTAINER_RUN_RECEIPT_KIND,
     TESTCONTAINER_SELECTION,
     resolve_testcontainer_run_target,
@@ -249,15 +250,51 @@ def test_resource_graph_projection_rejects_malformed_documents() -> None:
 
 def test_resource_graph_cleanup_details_record_exactly_one_vault_fate() -> None:
     tombstoned = resource_graph_cleanup_details(
-        resource_group="rg", remaining_resources=0, key_vault_purged=False, scheduled_purge_date=datetime(2026, 12, 4, 10, tzinfo=UTC)
+        resource_group="rg",
+        remaining_resources=0,
+        runtime_key_vault_purged=False,
+        runtime_scheduled_purge_date=datetime(2026, 12, 4, 10, tzinfo=UTC),
+        schema_owner_key_vault_purged=True,
+        schema_owner_scheduled_purge_date=None,
     )
     assert tombstoned == {**VALID["resource-graph-cleanup"](), "resource_group_sha256": hashlib.sha256(b"rg").hexdigest()}
-    purged = resource_graph_cleanup_details(resource_group="rg", remaining_resources=0, key_vault_purged=True, scheduled_purge_date=None)
-    assert purged["key_vault_purged"] is True and purged["key_vault_tombstoned"] is False and purged["scheduled_purge_date"] is None
+    purged = resource_graph_cleanup_details(
+        resource_group="rg",
+        remaining_resources=0,
+        runtime_key_vault_purged=True,
+        runtime_scheduled_purge_date=None,
+        schema_owner_key_vault_purged=True,
+        schema_owner_scheduled_purge_date=None,
+    )
+    assert purged["runtime_key_vault_purged"] is True
+    assert purged["runtime_key_vault_tombstoned"] is False and purged["runtime_scheduled_purge_date"] is None
     with pytest.raises(AcceptanceCheckError, match="resource_graph_cleanup"):
-        resource_graph_cleanup_details(resource_group="rg", remaining_resources=1, key_vault_purged=True, scheduled_purge_date=None)
+        resource_graph_cleanup_details(
+            resource_group="rg",
+            remaining_resources=1,
+            runtime_key_vault_purged=True,
+            runtime_scheduled_purge_date=None,
+            schema_owner_key_vault_purged=True,
+            schema_owner_scheduled_purge_date=None,
+        )
     with pytest.raises(AcceptanceInputError):
-        resource_graph_cleanup_details(resource_group="rg", remaining_resources=0, key_vault_purged=False, scheduled_purge_date=None)
+        resource_graph_cleanup_details(
+            resource_group="rg",
+            remaining_resources=0,
+            runtime_key_vault_purged=False,
+            runtime_scheduled_purge_date=None,
+            schema_owner_key_vault_purged=True,
+            schema_owner_scheduled_purge_date=None,
+        )
+    with pytest.raises(AcceptanceInputError):
+        resource_graph_cleanup_details(
+            resource_group="rg",
+            remaining_resources=0,
+            runtime_key_vault_purged=True,
+            runtime_scheduled_purge_date=None,
+            schema_owner_key_vault_purged=False,
+            schema_owner_scheduled_purge_date=None,
+        )
 
 
 def test_traffic_projection_rejects_malformed_documents() -> None:
@@ -425,7 +462,7 @@ def test_a_graceful_stop_takeover_is_recorded_as_a_failed_p3_never_a_pass() -> N
     dead = decide_lease_takeover(lease_takeover_observation(_takeover_document()))
     assert lease_takeover_for_receipt(dead) is dead
     with pytest.raises(AcceptanceInputError):
-        lease_takeover_for_receipt(ProbeResult(probe="P1", outcome="pass", mechanism="session_operation_fence"))
+        lease_takeover_for_receipt(ProbeResult(probe="P1", outcome="fail", mechanism="session_operation_fence", reasons=("failed",)))
 
 
 # --------------------------------------------------------------------------- receipt store and bundle
@@ -437,16 +474,19 @@ def _receipt(kind: str) -> dict[str, object]:
     return cast(dict[str, object], json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))))
 
 
-_TARGET = resolve_testcontainer_run_target({})
+_TARGET = resolve_testcontainer_run_target(
+    {"ELSPETH_TEST_POSTGRES_URL": "postgresql://test:fixture@flexible.example.test/proofs"}  # secret-scan: allow-this-line
+)
 
 
 def _testcontainer_run(exit_code: int = 0, junit: str = "d" * 64) -> dict[str, object]:
     return {
-        "schema": "elspeth.azure-container-apps-testcontainer-run.v1",
+        "schema": "elspeth.azure-container-apps-testcontainer-run.v2",
         "kind": TESTCONTAINER_RUN_RECEIPT_KIND,
         "candidate_sha": CANDIDATE,
         "scenario_id": "A",
         "selection": list(TESTCONTAINER_SELECTION),
+        "required_tests_passed": sorted(REQUIRED_POSTGRES_PROOF_IDS),
         "exit_code": exit_code,
         "collected": 40,
         "passed": 40 - (2 if exit_code else 0),
@@ -457,7 +497,7 @@ def _testcontainer_run(exit_code: int = 0, junit: str = "d" * 64) -> dict[str, o
         "recorded_at": "2026-09-05T10:00:00Z",
         # The receipt shape is shared across providers (TestcontainerRunReceipt);
         # only the schema id is Azure's. The database fields come from the same
-        # resolver the CLI uses, here its Docker arm (elspeth-0ec6918940).
+        # resolver the CLI uses, here its provisioned server arm.
         "database": _TARGET.database,
         "database_identity_sha256": _TARGET.database_identity_sha256,
     }
@@ -478,6 +518,25 @@ def _fill_store(store: Path, *, kinds: set[str] = CHECK_KINDS, runs: tuple[dict[
             document=run,
             now=NOW,
         )
+
+
+def test_live_aca_bundle_rejects_local_docker_postgresql_proof(tmp_path: Path) -> None:
+    receipt = _testcontainer_run()
+    target = resolve_testcontainer_run_target({})
+    receipt["database"] = target.database
+    receipt["database_identity_sha256"] = target.database_identity_sha256
+    _fill_store(tmp_path / "store", runs=(receipt,))
+    verdict = bundle_check(tmp_path / "store", candidate_sha=CANDIDATE, scenario_id="A")
+    assert not verdict.passed
+    assert verdict.testcontainer_reason == "testcontainer_run_failed"
+
+
+@pytest.mark.parametrize("missing", ["single-revision-fence-conflict", "single-revision-progress"])
+def test_labelled_bundle_cannot_omit_required_single_revision_proof(tmp_path: Path, missing: str) -> None:
+    _fill_store(tmp_path / "store", kinds=CHECK_KINDS - {missing})
+    verdict = bundle_check(tmp_path / "store", candidate_sha=CANDIDATE, scenario_id="A")
+    assert not verdict.passed
+    assert verdict.missing_kinds == (missing,)
 
 
 def test_receipt_store_persists_canonical_bytes_under_their_hash_and_indexes_them(tmp_path: Path) -> None:
@@ -515,7 +574,7 @@ def test_receipt_store_persists_canonical_bytes_under_their_hash_and_indexes_the
     )
     assert again.receipt_sha256 == stored.receipt_sha256 and read_receipt_index(store) == rows
     conflicting = _receipt("replica-run-start")
-    cast(dict[str, object], conflicting["details"])["evidence"] = {"trials": 19}
+    cast(dict[str, object], conflicting["details"])["evidence"] = {"trials": 21}
     with pytest.raises(AcceptanceCheckError, match="receipt_store_conflict"):
         receipt_store(
             store,
@@ -615,14 +674,15 @@ def test_bundle_check_refuses_missing_kinds_invalid_receipts_and_failed_probes(t
     assert verdict.failed_probes == ("P3",) and not verdict.passed, "an unreachable P3 is not waived"
     # `bundle_check` validates the document before it compares the stored hash,
     # so the two tampers below are refused by different checks. Editing a value
-    # inside the open `evidence` mapping keeps the envelope schema-valid, and
-    # only the content hash catches it.
+    # both the observation and its matching summary keeps the decision valid;
+    # the content hash still catches the replacement evidence.
     tampered = tmp_path / "tampered"
     _fill_store(tampered)
     row = next(row for row in read_receipt_index(tampered) if row["kind"] == "replica-progress")
     path = tampered / f"{row['receipt_sha256']}.json"
     document = json.loads(path.read_text())
     document["details"]["evidence"]["poll_interval_seconds"] = 3.0
+    document["details"]["evidence"]["observation"]["poll_interval_seconds"] = 3.0
     os.chmod(path, 0o600)
     path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")))
     verdict = bundle_check(tampered, candidate_sha=CANDIDATE, scenario_id="A")

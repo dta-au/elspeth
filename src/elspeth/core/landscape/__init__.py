@@ -73,7 +73,6 @@ from elspeth.core.landscape.row_data import CallDataResult, CallDataState, RowDa
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
 from elspeth.core.landscape.run_status_projection import AuditRunStatusProjection
 from elspeth.core.landscape.serialization import dataclass_to_dict, serialize_datetime
-from elspeth.core.landscape.write_repository import LandscapeWriteRepository
 
 __all__ = [
     "Artifact",
@@ -98,7 +97,6 @@ __all__ = [
     "LandscapeExporter",
     "LandscapeReadRepositories",
     "LandscapeWriteRepositories",
-    "LandscapeWriteRepository",
     "LineageResult",
     "LineageTextFormatter",
     "Node",

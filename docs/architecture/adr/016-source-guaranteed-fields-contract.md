@@ -23,9 +23,27 @@ ADR-010.
 - Tier: 1
 - Runtime observation: `row_contract.fields ∩ row_data.keys()`
 - Call posture: run after token creation in `RowProcessor.process_row()`, never
-  on `process_existing_row()`
+  on resume (resume re-drives durable scheduler work and never re-crosses the
+  source boundary; the row-replay entry `process_existing_row()` this line
+  originally named was deleted 2026-09-28, see the ADR-025 amendment)
 - Failure recording: record a terminal `FAILED` token outcome plus a `FAILED`
   source node state before re-raising the Tier 1 exception
+
+### Violation
+
+`SourceGuaranteedFieldsViolation` subclasses
+`DeclarationContractViolation` and is registered Tier 1 via `@tier_1_error`.
+
+Payload schema:
+
+```python
+class SourceGuaranteedFieldsPayload(TypedDict):
+    declared: Required[list[str]]
+    runtime_observed: Required[list[str]]
+    missing: Required[list[str]]
+```
+
+All three fields are sorted lists for canonical audit serialization.
 
 ## Rationale
 
@@ -45,3 +63,16 @@ ADR-010.
 - Source plugins must expose `declared_guaranteed_fields` as a runtime
   attribute derived from effective schema config after any source-local schema
   rewrites.
+
+## Scrubber-audit
+
+Payload keys are structural only:
+
+- `declared`
+- `runtime_observed`
+- `missing`
+
+Each carries field-name lists, not row samples, config dicts, or free-form
+payloads. No scrubber extension is required in this ADR. Forbidden payload
+keys for this contract include `raw_schema_config`, `config_dict`, `options`,
+and `sample_row`.

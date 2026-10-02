@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, final
 from uuid import UUID, uuid4
 
 from sqlalchemy import Engine, func, insert, select, update
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.web.coordination.database_clock import database_now
+from elspeth.web.coordination.quota_authority import llm_call_usage_entries, record_token_usage_on_connection
+from elspeth.web.sessions.audit_checkpoint import uncheckpointed_envelopes
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table, runs_table, sessions_table
 from elspeth.web.sessions.protocol import (
@@ -111,6 +116,43 @@ class RepositoryRunDiagnosticsAuditAuthority:
             if run_row.session_id != sid or run_row.state_id != stid:
                 raise RunDiagnosticsAuthorityLostError(authority, reason="run_rebound")
 
+            replay_records: list[ChatMessageRecord] = []
+            active_rows: list[RunDiagnosticsAuditDraft] = []
+            for row in rows:
+                envelopes = uncheckpointed_envelopes(conn, session_id=sid, envelopes=row.tool_calls or ())
+                if row.tool_calls and not envelopes:
+                    call_ids = {entry.call_id for entry in llm_call_usage_entries(row.tool_calls)}
+                    recorded_ids: set[str | None] = set()
+                    for prior in conn.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == sid)):
+                        prior_ids = {entry.call_id for entry in llm_call_usage_entries(prior.tool_calls or ())}
+                        if not call_ids.intersection(prior_ids):
+                            continue
+                        recorded_ids.update(prior_ids)
+                        replay_records.append(
+                            ChatMessageRecord(
+                                id=UUID(prior.id),
+                                session_id=UUID(sid),
+                                role=prior.role,
+                                content=prior.content,
+                                raw_content=prior.raw_content,
+                                tool_calls=prior.tool_calls,
+                                created_at=prior.created_at if prior.created_at.tzinfo else prior.created_at.replace(tzinfo=UTC),
+                                sequence_no=prior.sequence_no,
+                                writer_principal=prior.writer_principal,
+                                composition_state_id=UUID(prior.composition_state_id) if prior.composition_state_id else None,
+                                tool_call_id=prior.tool_call_id,
+                                parent_assistant_id=prior.parent_assistant_id,
+                            )
+                        )
+                    if not call_ids.issubset(recorded_ids):
+                        raise AuditIntegrityError("Settled diagnostics provider attempt has no audit checkpoint")
+                    continue
+                active_rows.append(replace(row, tool_calls=envelopes) if row.tool_calls else row)
+            rows = tuple(active_rows)
+            if not rows:
+                return tuple(replay_records)
+            message_ids = tuple(uuid4() for _ in rows)
+
             base_sequence = int(
                 conn.execute(
                     select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0) + 1).where(chat_messages_table.c.session_id == sid)
@@ -133,13 +175,20 @@ class RepositoryRunDiagnosticsAuditAuthority:
                         created_at=now,
                     )
                 )
+            entries = llm_call_usage_entries(tuple(envelope for row in rows if row.tool_calls is not None for envelope in row.tool_calls))
+            if entries:
+                # Task I1 Composer adapter (run diagnostics): the explanation's
+                # provider calls are charged with their audit rows.
+                record_token_usage_on_connection(
+                    conn, session_id=sid, source="composer", run_id=None, entries=entries, recorded_at=database_now(conn)
+                )
             updated = conn.execute(
                 update(sessions_table).where(sessions_table.c.id == sid, sessions_table.c.archived_at.is_(None)).values(updated_at=now)
             )
             if updated.rowcount != 1:
                 raise RunDiagnosticsAuthorityLostError(authority, reason="session_archived")
 
-        return tuple(
+        return tuple(replay_records) + tuple(
             ChatMessageRecord(
                 id=message_ids[offset],
                 session_id=authority.session_id,

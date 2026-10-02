@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useState } from "react";
+import { type JSX, useCallback, useEffect, useId, useState } from "react";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
@@ -9,6 +9,7 @@ import { Button, Input } from "@/components/ui";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
 import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import { modelDisplayName } from "@/components/chat/modelDisplayName";
+import { llmBindingLabel } from "@/lib/llmBindingLabel";
 import { componentPhrase } from "@/components/workspace/specRouting";
 import type {
   CompositionState,
@@ -91,44 +92,6 @@ function isLlmNode(node: NodeSpec): boolean {
     typeof node.options?.model === "string" ||
     (node.plugin ?? "").includes("llm")
   );
-}
-
-const SAFE_LLM_PROFILE_ALIAS = /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/;
-const SAFE_LLM_MODEL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,511}$/;
-
-function hasOwnOption(options: Record<string, unknown>, name: string): boolean {
-  return Object.prototype.hasOwnProperty.call(options, name);
-}
-
-/** Return only a safe, author-visible LLM binding label.
- *
- * Web profile lowering deliberately keeps the opaque authored `profile`
- * alias in composition state while provider, model, endpoint, and credential
- * bindings stay operator-private. If profile provenance is present but
- * malformed, fail closed to the generic label instead of falling through to
- * a possibly resolved private model. `profile_alias` and `resolved_model`
- * are executable/audit provenance, never consent-dialog display values.
- */
-function llmSourceBindingLabel(source: SourceSpec): string {
-  const { options } = source;
-  if (hasOwnOption(options, "profile")) {
-    const profile = options.profile;
-    if (typeof profile === "string" && SAFE_LLM_PROFILE_ALIAS.test(profile)) {
-      return `profile ${profile}`;
-    }
-    return "configured LLM";
-  }
-  if (
-    hasOwnOption(options, "profile_alias") ||
-    hasOwnOption(options, "resolved_model")
-  ) {
-    return "configured LLM";
-  }
-  const model = options.model;
-  if (typeof model === "string" && SAFE_LLM_MODEL_IDENTIFIER.test(model)) {
-    return `model ${model}`;
-  }
-  return "configured LLM";
 }
 
 function catalogFlagsLlmSource(
@@ -318,7 +281,7 @@ export function buildRunEgressSummary(
     (list) => `Reads source data: ${list}.`,
   );
 
-  // `llmSourceBindingLabel` is the same in BOTH registers by design: it
+  // `llmBindingLabel` is the same in BOTH registers by design: it
   // establishes egress SAFETY (provider, model, endpoint and credential
   // bindings stay operator-private), and the authored profile alias is the
   // one binding the user may see. Phrasing it would title-case an
@@ -328,7 +291,7 @@ export function buildRunEgressSummary(
     llmSourceEntries.map(([sourceName, source]) =>
       qualified(
         component(sourceComponentId(sourceName)),
-        bothRegisters(llmSourceBindingLabel(source)),
+        bothRegisters(llmBindingLabel(source.options)),
       ),
     ),
     (list) => `Sends one authored prompt to the configured LLM: ${list}.`,
@@ -446,26 +409,28 @@ export function isRunGatingReadinessRow(
   }
 }
 
-/** Which of the (up to) three run-blocking gates is currently active, for
+/** Which run-blocking gate is currently active, for
  *  the plain-language reason text rendered under the button
  *  (elspeth-088bf83922 T-2). Priority order: an in-flight run takes
- *  precedence (nothing else matters until it finishes); pending
- *  interpretation review is next (it also drives the dedicated
+ *  precedence (nothing else matters until it finishes); Composer activity
+ *  and pending interpretation review follow (review also drives the dedicated
  *  aria-disabled/title/aria-describedby treatment below); then no validation
  *  result, structural validation failure, and backend execution-readiness
  *  refusal. Returns null when none apply, i.e. when `canExecute` is true.
  *  Exported for the corresponding test. */
-export type RunBlockReason = "running" | "interpretation" | "validation" | "readiness" | "not_validated";
+export type RunBlockReason = "running" | "composing" | "interpretation" | "validation" | "readiness" | "not_validated";
 
 export function primaryRunBlockReason(input: {
   isExecuting: boolean;
   progressRunning: boolean;
+  composerBusy: boolean;
   isRunBlocked: boolean;
   validationFailing: boolean;
   executionReadinessBlocked: boolean;
   validationNotRun: boolean;
 }): RunBlockReason | null {
   if (input.isExecuting || input.progressRunning) return "running";
+  if (input.composerBusy) return "composing";
   if (input.isRunBlocked) return "interpretation";
   // "not_validated" (no validation result yet — empty composition, or a
   // snapshot still in flight) is distinct from "validation" (a result exists
@@ -485,6 +450,7 @@ export function primaryRunBlockReason(input: {
  *  mouse/some-AT users, this visible line for everyone else). */
 const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
   running: "The pipeline is already running.",
+  composing: "Wait for the composer to finish thinking.",
   interpretation: INTERPRETATION_PENDING_RUN_BLOCK_TITLE,
   validation: "Fix the validation errors shown in the Checks tab before running.",
   readiness: "The backend has not admitted this pipeline for execution.",
@@ -532,8 +498,8 @@ const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
  * panel's rows other than validation/llm_interpretations never block Run —
  * this button previously gave no hint of that distinction. `canExecute`
  * explicitly gates on backend execution readiness, interpretation review,
- * and active-run state; the visible surfaces make those decisions legible:
- *   - when disabled, a one-line reason for an active run, pending
+ * active-run state, and Composer activity; the visible surfaces make those decisions legible:
+ *   - when disabled, a one-line reason for an active run, a busy Composer, pending
  *     interpretation, missing validation, structural validation failure, or
  *     backend readiness refusal renders below the button, driven by
  *     `primaryRunBlockReason`;
@@ -544,10 +510,18 @@ const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
 export function ExecuteButton(): JSX.Element | null {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const compositionState = useSessionStore((s) => s.compositionState);
+  const composerBusy = useSessionStore((s) => s.isComposing);
   const validationResult = useExecutionStore((s) => s.validationResult);
   const isExecuting = useExecutionStore((s) => s.isExecuting);
   const progress = useExecutionStore((s) => s.progress);
   const execute = useExecutionStore((s) => s.execute);
+  // Launch/run failure reason (409, 422 detail, 500, stale readiness, WS
+  // 4004, cancel failure, validation fetch failure). Rendered beside Run so
+  // a failed click is never silent at the control the user clicked
+  // (operator placement ruling 2026-09-13); the Checks-tab banner keeps
+  // its secondary copy of the same field.
+  const executionError = useExecutionStore((s) => s.error);
+  const dismissExecutionError = useExecutionStore((s) => s.dismissError);
   const disclosureAcknowledged = useExecutionStore((s) =>
     activeSessionId ? s.runDisclosureAckBySession[activeSessionId] === true : false,
   );
@@ -606,16 +580,18 @@ export function ExecuteButton(): JSX.Element | null {
   const canExecute =
     activeSessionId !== null &&
     validationResult?.readiness?.execution_ready === true &&
+    !composerBusy &&
     !isExecuting &&
     progress?.status !== "running" &&
     !isRunBlocked;
 
   // Gate legibility (elspeth-088bf83922 T-2) — derived, non-gating. These
-  // three inputs mirror `canExecute`'s own conditions exactly; none of them
+  // inputs mirror `canExecute`'s own conditions exactly; none of them
   // feed back into `canExecute`.
   const blockReason = primaryRunBlockReason({
     isExecuting,
     progressRunning: progress?.status === "running",
+    composerBusy,
     isRunBlocked,
     validationNotRun: validationResult == null,
     validationFailing: validationResult != null && validationResult.is_valid !== true,
@@ -714,33 +690,49 @@ export function ExecuteButton(): JSX.Element | null {
 
           It is emitted BEFORE the button (operator decision, 2026-08-16) so it
           renders to Run's LEFT and vertically centred against it, rather than
-          on a line of its own underneath. DOM order, not CSS `order`: the two
-          <p> variants are mutually exclusive, so exactly one can precede the
-          button, and workspace.css keys the spacing off that adjacency. Using
+          on a line of its own underneath. DOM order, not CSS `order`: the three
+          <p> variants (launch failure, block reason, advisory note) are
+          mutually exclusive, so exactly one can precede the button, and
+          workspace.css keys the spacing off that adjacency. Using
           `order` would have worked visually but the rule against it on
           interactive controls exists precisely so nobody has to re-derive
           whether a given lift is the safe kind — moving the markup keeps
           visual, DOM and tab order identical with nothing to reason about.
           For AT this reads better too: the reason is announced on the way IN
-          to the button rather than after it (WCAG 1.3.2 meaningful sequence). */}
-      {blockReason && (
+          to the button rather than after it (WCAG 1.3.2 meaningful sequence).
+
+          A stored launch/run failure takes the slot first: it is the event
+          the user just triggered, and dismissing it reveals whichever gate
+          reason sits underneath. The text is the stored error verbatim. */}
+      {executionError ? (
+        <p className="side-rail-execute-reason" role="alert" data-run-failure="">
+          {executionError}{" "}
+          <Button
+            variant="bare"
+            className="link-button"
+            aria-label="Dismiss run failure"
+            onClick={dismissExecutionError}
+          >
+            Dismiss
+          </Button>
+        </p>
+      ) : blockReason ? (
         <p
           className="side-rail-execute-reason"
           data-run-block-reason={blockReason}
         >
           {blockReasonText}
         </p>
-      )}
-      {/* Run is enabled, but the audit-readiness panel has a non-green
-          advisory row (plugin trust / provenance / retention / secrets).
-          These rows never gate Run — say so in one line rather than
-          leaving the user to infer it from an amber/red row that did
-          nothing when they ran anyway. */}
-      {!blockReason && advisoryRowsNonGreen && (
+      ) : advisoryRowsNonGreen ? (
+        /* Run is enabled, but the audit-readiness panel has a non-green
+           advisory row (plugin trust / provenance / retention / secrets).
+           These rows never gate Run — say so in one line rather than
+           leaving the user to infer it from an amber/red row that did
+           nothing when they ran anyway. */
         <p className="side-rail-execute-reason side-rail-execute-reason--advisory">
           Advisory checks don't block Run.
         </p>
-      )}
+      ) : null}
       <Button
         // variant="danger" is a DELIBERATE 2026-08-15 operator decision that
         // supersedes the earlier no-emphasis rule (elspeth-0d37694c8c): Run

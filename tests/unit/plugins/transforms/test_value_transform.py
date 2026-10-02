@@ -12,6 +12,8 @@ from tests.fixtures.pipeline import build_linear_pipeline
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_context import PluginContext
+    from elspeth.contracts.schema_contract import PipelineRow
+    from elspeth.plugins.transforms.value_transform import ValueTransform
 
 OBSERVED_SCHEMA_CONFIG = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -92,13 +94,15 @@ class TestValueTransformBehavior:
         assert result.row is not None
         assert result.row["price"] == pytest.approx(110.0)
 
-    def test_overwrite_with_different_type_retypes_output_contract(self, ctx: "PluginContext") -> None:
-        """Overwriting a typed field with a different-typed result retypes the contract.
+    def test_overwrite_with_different_type_emits_the_declared_any(self, ctx: "PluginContext") -> None:
+        """Overwriting a typed field with a different-typed result: the target is declared ``any`` (ADR-050).
 
-        ``price`` is declared int; the expression makes it float. Before this fix
-        ``with_field`` was only called for NEW targets, so the output contract kept
-        python_type=int and the emitted row FAILED its own contract.validate() — a
-        self-contradictory audit record (plugins review Batch 4 item 2).
+        ``price`` arrives int; the expression makes it float. The target's
+        contract is its DECLARATION, not this row's value: an untyped target
+        is ``any`` (nullable) from row 1, so the emitted row satisfies its own
+        contract and a later row computing an int records the same contract.
+        Before ADR-050 the field was retyped per row to the value's type, and
+        two rows disagreeing aborted the run at the node-contract merge.
         """
         from elspeth.contracts.schema_contract import SchemaContract
         from elspeth.plugins.transforms.value_transform import ValueTransform
@@ -121,7 +125,9 @@ class TestValueTransformBehavior:
         assert isinstance(result.row["price"], float)
         out_field = result.row.contract.find_field("price")
         assert out_field is not None
-        assert out_field.python_type is float
+        assert out_field.python_type is object
+        assert out_field.nullable is True
+        assert out_field.source == "declared"
         violations = result.row.contract.validate(result.row.to_dict())
         assert violations == [], f"emitted row must satisfy its own contract, got: {violations}"
 
@@ -192,6 +198,48 @@ class TestValueTransformBehavior:
         assert result.reason is not None
         assert result.reason.get("reason") == "invalid_input"
         assert "missing" in result.reason.get("message", "").lower()
+
+    def test_computed_key_miss_reason_is_value_free(self, ctx: "PluginContext") -> None:
+        """A key computed from the row never reaches the audit reason (C3, review r1 F1)."""
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "operations": [{"target": "region", "expression": "row[row['code']]"}],
+            }
+        )
+        result = transform.process(make_pipeline_row({"code": "CUSTOMER_PRIVATE_739"}), ctx)
+        assert result.status == "error"
+        assert result.reason == {
+            "reason": "invalid_input",
+            "field": "region",
+            "error_type": "missing_key",
+            "message": "Key <a key the expression does not spell out> not found in PipelineRow",
+        }
+
+    def test_format_key_miss_reason_is_value_free(self, ctx: "PluginContext") -> None:
+        """``str % mapping`` names a row-derived key the mapping lacks (C3, review r2).
+
+        Its KeyError used to crash through evaluate() with the key as its text; it
+        is a routable missing-key row error whose reason never names the key.
+        """
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "operations": [{"target": "label", "expression": "row['fmt'] % {'a': 1}"}],
+            }
+        )
+        result = transform.process(make_pipeline_row({"fmt": "%(CUSTOMER_PRIVATE_739)s"}), ctx)
+        assert result.status == "error"
+        assert result.reason == {
+            "reason": "invalid_input",
+            "field": "label",
+            "error_type": "missing_key",
+            "message": "%-format key not found in dict (Mod operation)",
+        }
 
     def test_type_error_in_expression(self, ctx: "PluginContext") -> None:
         from elspeth.plugins.transforms.value_transform import ValueTransform
@@ -312,7 +360,9 @@ class TestValueTransformBehavior:
         # the mode to make the build pass.
         consumer = ValueTransform(
             {
-                "schema": {"mode": "fixed", "fields": ["price: int", "quantity: int", "subtotal: float"]},
+                # Presence is the producer's guarantee; its expression result
+                # type is unknown until explicit normalization or runtime use.
+                "schema": {"mode": "fixed", "fields": ["price: int", "quantity: int", "subtotal: any"]},
                 "required_input_fields": ["subtotal"],
                 "operations": [{"target": "with_tax", "expression": "row['subtotal'] * 1.2"}],
             }
@@ -341,7 +391,7 @@ class TestValueTransformBehavior:
         )
         consumer = ValueTransform(
             {
-                "schema": {"mode": "fixed", "fields": ["subtotal: float"]},
+                "schema": {"mode": "fixed", "fields": ["subtotal: any"]},
                 "required_input_fields": ["subtotal"],
                 "operations": [{"target": "with_tax", "expression": "row['subtotal'] * 1.2"}],
             }
@@ -349,8 +399,8 @@ class TestValueTransformBehavior:
 
         with pytest.raises(EdgeContractError) as exc_info:
             build_linear_pipeline([{"price": 100, "quantity": 2}], transforms=[producer, consumer])
-        message = str(exc_info.value)
-        assert "Extra fields rejected by consumer input contract: ['price', 'quantity']" in message
+        assert exc_info.value.compatibility_result is not None
+        assert exc_info.value.compatibility_result.extra_fields == ("price", "quantity")
 
     def test_unexpected_evaluator_exceptions_propagate(self, ctx: "PluginContext", monkeypatch: pytest.MonkeyPatch) -> None:
         from elspeth.plugins.transforms.value_transform import ValueTransform
@@ -896,3 +946,334 @@ class TestComposerHintsMatchSandboxReality:
         assert "regex" not in hint, "regex extraction has no sandbox-accepted spelling (elspeth-18bcf7dd09)"
         not_achievable_hints = [hint for hint in assistance.composer_hints if hint.startswith("NOT achievable here:")]
         assert len(not_achievable_hints) == 1, "composer_hints must state what the sandbox rejects"
+
+
+class TestValueTransformNestedResults:
+    """A nested result is a value the output contract types ``any`` (elspeth-5887fb7928 AC-R3).
+
+    Every operation target the node's schema does not type is declared ``any``
+    (nullable) before the first row (ADR-050: ``created_output_fields`` and,
+    under fixed/flexible, ``declare_missing_guaranteed_fields``), and the
+    declaration is stamped on every emission. A target the schema DOES type is
+    pinned to that type: see ``TestValueTransformPinsDeclaredTargets``. The
+    per-row contract used to refuse such a value with a raw ``TypeError`` from
+    ``SchemaContract.with_field``, which aborted the run (exit 4) on the
+    ordinary copy of a JSON array or object.
+    """
+
+    @pytest.fixture
+    def ctx(self) -> "PluginContext":
+        return make_source_context()
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("[row['a'], row['b']]", [10, 20]),
+            ("(row['a'], row['b'])", [10, 20]),
+            ("{'k': row['a']}", {"k": 10}),
+            ("row['meta']", {"copies": 2}),
+            ("row['tags']", [1, 2]),
+            ("row['tags'] if row['a'] > 5 else []", [1, 2]),
+        ],
+    )
+    def test_new_target_carries_the_nested_value_typed_any(self, ctx: "PluginContext", expression: str, expected: object) -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform({"schema": DYNAMIC_SCHEMA, "operations": [{"target": "out", "expression": expression}]})
+        row = make_pipeline_row({"a": 10, "b": 20, "meta": {"copies": 2}, "tags": [1, 2]})
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict()["out"] == expected
+        out_field = result.row.contract.find_field("out")
+        assert out_field is not None
+        assert out_field.python_type is object
+        assert out_field.nullable is True
+        assert out_field.required is True
+        assert out_field.source == "declared"
+        assert result.row.contract.validate(result.row.to_dict()) == []
+
+    def test_tuple_and_list_results_hash_identically(self, ctx: "PluginContext") -> None:
+        """A tuple is a JSON array: its emitted row hashes as the list spelling does."""
+        from elspeth.core.canonical import stable_hash
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        row = make_pipeline_row({"a": 10, "b": 20})
+        hashes = set()
+        for expression in ("[row['a'], row['b']]", "(row['a'], row['b'])"):
+            transform = ValueTransform({"schema": DYNAMIC_SCHEMA, "operations": [{"target": "out", "expression": expression}]})
+            result = transform.process(row, ctx)
+            assert result.row is not None
+            hashes.add(stable_hash(result.row))
+        assert len(hashes) == 1
+
+    def test_overwriting_a_typed_field_with_a_nested_value_retypes_it_any(self, ctx: "PluginContext") -> None:
+        from elspeth.contracts.schema_contract import SchemaContract
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+        from elspeth.testing import make_field, make_row
+
+        fields = (make_field("a", int, original_name="A", required=True, source="declared"),)
+        row = make_row({"a": 10}, contract=SchemaContract(mode="OBSERVED", fields=fields, locked=True))
+        transform = ValueTransform({"schema": DYNAMIC_SCHEMA, "operations": [{"target": "a", "expression": "[row['a']]"}]})
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict()["a"] == [10]
+        out_field = result.row.contract.find_field("a")
+        assert out_field is not None
+        assert (out_field.python_type, out_field.required, out_field.source, out_field.original_name) == (object, True, "declared", "A")
+        assert result.row.contract.validate(result.row.to_dict()) == []
+
+    def test_overwriting_a_typed_field_with_null_makes_it_nullable(self, ctx: "PluginContext") -> None:
+        from elspeth.contracts.schema_contract import SchemaContract
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+        from elspeth.testing import make_field, make_row
+
+        fields = (make_field("a", int, original_name="a", required=True, source="declared"),)
+        row = make_row({"a": 10}, contract=SchemaContract(mode="OBSERVED", fields=fields, locked=True))
+        transform = ValueTransform({"schema": DYNAMIC_SCHEMA, "operations": [{"target": "a", "expression": "None"}]})
+
+        result = transform.process(row, ctx)
+
+        assert result.row is not None
+        out_field = result.row.contract.find_field("a")
+        assert out_field is not None
+        assert (out_field.python_type, out_field.nullable, out_field.required) == (object, True, True)
+        assert result.row.contract.validate(result.row.to_dict()) == []
+
+
+class TestValueTransformPinsDeclaredTargets:
+    """A target the node's schema types is pinned to that type on output (elspeth-5887fb7928 AC-R3).
+
+    The authored declaration is carried into the output schema config
+    (``declare_missing_guaranteed_fields`` never modifies it), graph
+    validation resolves the target's type from it, and the ADR-014 output
+    check compares every emitted row against it. A computed value that did
+    not satisfy it used to reach that check and abort the run (exit 4,
+    ``SchemaConfigModeViolation``), in fixed and flexible mode alike. It is
+    now that row's ``type_mismatch`` error, naming the target and the two type
+    names only; a value that satisfies the pin is emitted carrying the
+    declared metadata, which the ADR-014 check accepts.
+    """
+
+    ARRIVING_FIELDS: ClassVar[list[str]] = ["id: int", "a: int", "b: int"]
+
+    @pytest.fixture
+    def ctx(self) -> "PluginContext":
+        return make_source_context()
+
+    @staticmethod
+    def _row() -> "PipelineRow":
+        from elspeth.contracts.schema_contract import SchemaContract
+        from elspeth.testing import make_field
+
+        fields = (
+            make_field("id", int, required=True, source="declared"),
+            make_field("a", int, original_name="A", required=True, source="declared"),
+            make_field("b", int, required=True, source="declared"),
+        )
+        return make_row({"id": 1, "a": 10, "b": 20}, contract=SchemaContract(mode="FIXED", fields=fields, locked=True))
+
+    @staticmethod
+    def _assert_adr014_accepts(transform: "ValueTransform", emitted: "PipelineRow") -> None:
+        from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+
+        assert transform._output_schema_config is not None
+        verify_schema_config_mode(
+            output_schema_config=transform._output_schema_config,
+            emitted_rows=[emitted],
+            plugin_name=transform.name,
+            node_id="node",
+            run_id="run",
+            row_id="row",
+            token_id="token",
+        )
+
+    @pytest.mark.parametrize("mode", ["fixed", "flexible"])
+    @pytest.mark.parametrize(
+        ("expression", "actual"),
+        [
+            ("[row['a']]", "list"),
+            ("{'v': row['a']}", "dict"),
+            ("(row['a'], row['b'])", "tuple"),
+            ("'x'", "str"),
+            ("None", "NoneType"),
+            ("row['a'] / 3", "float"),
+        ],
+    )
+    def test_a_value_that_breaks_the_pin_is_a_value_free_row_error(
+        self, ctx: "PluginContext", mode: str, expression: str, actual: str
+    ) -> None:
+        import json
+
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {"schema": {"mode": mode, "fields": self.ARRIVING_FIELDS}, "operations": [{"target": "a", "expression": expression}]}
+        )
+
+        result = transform.process(self._row(), ctx)
+
+        assert result.status == "error"
+        assert result.reason == {
+            "reason": "type_mismatch",
+            "field": "a",
+            "expected": "int",
+            "actual": actual,
+            "declared_by": "operator",
+            "message": (
+                f"Operation target 'a' computed a value of type {actual}, but this node's schema declares it int. "
+                "Declare the target 'any' (or the scalar type it computes) to store it."
+            ),
+        }
+        # The row's values (a=10, b=20) never reach the audit reason.
+        rendered = json.dumps(result.reason)
+        assert "10" not in rendered
+        assert "20" not in rendered
+
+    def test_an_optional_pin_admits_none_and_names_it_when_broken(self, ctx: "PluginContext") -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        schema = {"mode": "fixed", "fields": ["id: int", "a: int?", "b: int"]}
+        admits = ValueTransform({"schema": schema, "operations": [{"target": "a", "expression": "None"}]})
+        result = admits.process(self._row(), ctx)
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row.to_dict()["a"] is None
+        self._assert_adr014_accepts(admits, result.row)
+
+        breaks = ValueTransform({"schema": schema, "operations": [{"target": "a", "expression": "[row['a']]"}]})
+        broken = breaks.process(self._row(), ctx)
+        assert broken.status == "error"
+        assert broken.reason is not None
+        assert broken.reason["message"] == (
+            "Operation target 'a' computed a value of type list, but this node's schema declares it int (or None). "
+            "Declare the target 'any' (or the scalar type it computes) to store it."
+        )
+
+    @pytest.mark.parametrize(
+        ("fields", "operations", "target", "expected"),
+        [
+            # Same-type overwrite: the arriving int is replaced by an int.
+            (["id: int", "a: int", "b: int"], [{"target": "a", "expression": "row['a'] + 1"}], "a", 11),
+            # A declared CREATED target whose value satisfies its declaration
+            # (previously aborted too: the inferred field was not required).
+            (["id: int", "a: int", "b: int", "total: float"], [{"target": "total", "expression": "row['a'] / 4"}], "total", 2.5),
+            # The pin binds the EMITTED value: a later operation may restore it.
+            (
+                ["id: int", "a: int", "b: int"],
+                [{"target": "a", "expression": "[row['a']]"}, {"target": "a", "expression": "len(row['a'])"}],
+                "a",
+                1,
+            ),
+            # An undeclared target pins nothing, even under mode: fixed.
+            (["id: int", "a: int", "b: int"], [{"target": "pair", "expression": "[row['a'], row['b']]"}], "pair", [10, 20]),
+            # Declared 'any' pins nothing.
+            (["id: int", "a: any", "b: int"], [{"target": "a", "expression": "[row['a']]"}], "a", [10]),
+        ],
+    )
+    def test_a_value_that_satisfies_the_pin_is_emitted_and_passes_the_output_check(
+        self,
+        ctx: "PluginContext",
+        fields: list[str],
+        operations: list[dict[str, str]],
+        target: str,
+        expected: object,
+    ) -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform({"schema": {"mode": "fixed", "fields": fields}, "operations": operations})
+
+        result = transform.process(self._row(), ctx)
+
+        assert result.status == "success", result.reason
+        assert result.row is not None
+        assert result.row.to_dict()[target] == expected
+        self._assert_adr014_accepts(transform, result.row)
+
+    @pytest.mark.parametrize("fields", [["id: int", "a: int", "b: int"], ["id: int", "a: int", "b: int", "maybe: any"]])
+    def test_an_any_target_keeps_its_inferred_nullability(self, ctx: "PluginContext", fields: list[str]) -> None:
+        """An 'any' declaration (authored, or added for an undeclared target) pins nothing.
+
+        Its emitted field keeps the inferred metadata, so a None result stays
+        nullable rather than being stamped with the declaration's defaults.
+        """
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {"schema": {"mode": "fixed", "fields": fields}, "operations": [{"target": "maybe", "expression": "None"}]}
+        )
+
+        result = transform.process(self._row(), ctx)
+
+        assert result.status == "success"
+        assert result.row is not None
+        field = result.row.contract.find_field("maybe")
+        assert field is not None
+        assert (field.python_type, field.nullable) == (object, True)
+        assert result.row.contract.validate(result.row.to_dict()) == []
+
+    def test_the_pinned_field_keeps_its_original_name(self, ctx: "PluginContext") -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {"schema": {"mode": "fixed", "fields": self.ARRIVING_FIELDS}, "operations": [{"target": "a", "expression": "row['a'] * 2"}]}
+        )
+
+        result = transform.process(self._row(), ctx)
+
+        assert result.row is not None
+        field = result.row.contract.find_field("a")
+        assert field is not None
+        assert (field.python_type, field.required, field.nullable, field.original_name) == (int, True, False, "A")
+
+
+class TestValueTransformRejectsSetResults:
+    """A set has no canonical order, so an expression that can store one is refused at construction.
+
+    Measured: a set result frozen into the row thaws back into a list in
+    hash-seed order, so the emitted value and the row's ``stable_hash``
+    differ between processes for identical input.
+    """
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "{row['a'], row['b']}",
+            "row['a'] or {1}",
+            "{1} if row['a'] else 2",
+            "[{row['a']}]",
+            "{'k': {row['a']}}",
+            "{row['a']} - {row['b']}",
+        ],
+    )
+    def test_expression_that_can_store_a_set_is_rejected(self, expression: str) -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransformConfig
+
+        with pytest.raises(ValidationError, match=r"target 'out' can produce a set, which has no canonical order"):
+            ValueTransformConfig(
+                operations=[{"target": "out", "expression": expression}],
+                schema_config=OBSERVED_SCHEMA_CONFIG,
+            )
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "row['a'] in {1, 2}",
+            "len({row['a'], row['b']})",
+            "1 if row['a'] not in {1, 2} else 0",
+            "not {row['a']}",
+        ],
+    )
+    def test_consumed_set_literal_is_accepted(self, expression: str) -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransformConfig
+
+        cfg = ValueTransformConfig(
+            operations=[{"target": "out", "expression": expression}],
+            schema_config=OBSERVED_SCHEMA_CONFIG,
+        )
+        assert cfg.operations[0].expression == expression

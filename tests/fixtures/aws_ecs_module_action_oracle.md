@@ -54,7 +54,7 @@ configured lifecycle field changes.
    Deny. This action-name check does not solve IAM resource/condition semantics;
    add an exact focused assertion for each known condition-context trap.
    An `expected_denies` entry has an exact provider alias, action list,
-   rationale, and live Filigree issue. It records configured provider paths
+   rationale, and linked issue. It records configured provider paths
    that the security design intentionally refuses, plus related actions that
    must remain denied even when the provider no longer needs them. The test
    requires every listed action to remain ungranted and explicitly denied.

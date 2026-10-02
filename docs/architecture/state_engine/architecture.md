@@ -390,6 +390,6 @@ Start future code archaeology from these directories:
 - `src/elspeth/contracts/sink_effects.py` — external-effect protocol;
 - `src/elspeth/core/landscape/schema.py` — persisted state vocabularies.
 
-Use Loomweave for callers, relations, and subsystem navigation only when its
-index is fresh at the assessed commit. Treat current source and executable
-evidence as authoritative when index rows are stale or tombstoned.
+Inspect callers, relations, and subsystem boundaries in the assessed checkout.
+Treat current source and executable evidence as authoritative, and record
+search limitations rather than inferring absence from an empty text search.

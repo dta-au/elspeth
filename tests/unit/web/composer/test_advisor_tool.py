@@ -2,7 +2,7 @@
 escape hatch for the composer LLM.
 
 Covers:
-- Advisor is mandatory: the tool is always exposed by _get_litellm_tools().
+- Advisor is mandatory: the tool is always exposed by composer_loop_tool_definitions().
 - CLI MCP allowlist (_COMPOSER_TOOL_NAMES) excludes it by design — the
   advisor is web-composer-only because the CLI MCP server's allowlist
   is built from _DISCOVERY_TOOLS / _MUTATION_TOOLS, neither of which
@@ -28,17 +28,33 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer._compose_loop_carriers import (
+    AdvisorArgumentRejection,
+    _AdmittedLLMCompletion,
+)
+from elspeth.web.composer.advisor_context import build_advisor_user_message
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.prompts import SYSTEM_PROMPT
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, composer_loop_tool_definitions
+from elspeth.web.composer.service import (
+    ComposerAvailability,
+    ComposerServiceImpl,
+)
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import get_tool_definitions
+from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.config import WebSettings
-from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
+from elspeth.web.credential_guard import CredentialMaterialRefused
+from tests.unit.web.composer._helpers import (
+    _composer_service_with_session,
+    _persisted_tool_responses,
+    _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
+)
 
 # --- Test scaffolding (mirrors test_compose_loop_anti_anchor.py) ---
 
@@ -143,53 +159,57 @@ def _make_advisor_tool_call(
     *,
     problem: str = "stuck on llm config",
     trigger: str = "proactive_security_safety",
-) -> _FakeLLMResponse:
+) -> _AdmittedLLMCompletion:
     args = {
         "trigger": trigger,
         "problem_summary": problem,
         "recent_errors": ["error A", "error A"],
         "attempted_actions": ["set_pipeline with options={}", "checked relevant schema"],
     }
-    return _FakeLLMResponse(
-        choices=[
-            _FakeChoice(
-                message=_FakeMessage(
-                    content=None,
-                    tool_calls=[
-                        _FakeToolCall(
-                            id=call_id,
-                            function=_FakeFunction(
-                                name="request_advisor_hint",
-                                arguments=json.dumps(args),
-                            ),
-                        )
-                    ],
+    return _admit_composer_llm_completion(
+        _FakeLLMResponse(
+            choices=[
+                _FakeChoice(
+                    message=_FakeMessage(
+                        content=None,
+                        tool_calls=[
+                            _FakeToolCall(
+                                id=call_id,
+                                function=_FakeFunction(
+                                    name="request_advisor_hint",
+                                    arguments=json.dumps(args),
+                                ),
+                            )
+                        ],
+                    )
                 )
-            )
-        ]
+            ]
+        )
     )
 
 
-def _make_tool_call(call_id: str, name: str, arguments: dict[str, object]) -> _FakeLLMResponse:
-    return _FakeLLMResponse(
-        choices=[
-            _FakeChoice(
-                message=_FakeMessage(
-                    content=None,
-                    tool_calls=[
-                        _FakeToolCall(
-                            id=call_id,
-                            function=_FakeFunction(name=name, arguments=json.dumps(arguments)),
-                        )
-                    ],
+def _make_tool_call(call_id: str, name: str, arguments: dict[str, object]) -> _AdmittedLLMCompletion:
+    return _admit_composer_llm_completion(
+        _FakeLLMResponse(
+            choices=[
+                _FakeChoice(
+                    message=_FakeMessage(
+                        content=None,
+                        tool_calls=[
+                            _FakeToolCall(
+                                id=call_id,
+                                function=_FakeFunction(name=name, arguments=json.dumps(arguments)),
+                            )
+                        ],
+                    )
                 )
-            )
-        ]
+            ]
+        )
     )
 
 
-def _make_text_only_response(content: str) -> _FakeLLMResponse:
-    return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))])
+def _make_text_only_response(content: str) -> _AdmittedLLMCompletion:
+    return _admit_composer_llm_completion(_FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))]))
 
 
 def _make_advisor_response(text: str = "Try setting `provider: azure` and supplying `deployment`.") -> _FakeLLMResponse:
@@ -202,22 +222,20 @@ def _make_advisor_response(text: str = "Try setting `provider: azure` and supply
 
 @pytest.fixture(autouse=True)
 def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 # --- 1. Advisor is mandatory — the tool is always exposed ---
 
 
 def test_advisor_tool_exposed() -> None:
-    """Advisor is mandatory, so _get_litellm_tools() always includes
+    """Advisor is mandatory, so composer_loop_tool_definitions() always includes
     request_advisor_hint in the LiteLLM function format.
     """
-    catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
-    tools = service._get_litellm_tools()
+    tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
     names = {t["function"]["name"] for t in tools}
     assert "request_advisor_hint" in names
     advisor = next(t for t in tools if t["function"]["name"] == "request_advisor_hint")
@@ -255,7 +273,7 @@ def test_advisor_argument_validation_rejects_unknown_keys() -> None:
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     raw_extra_context = "RAW_EXTRA_CONTEXT: raw traceback and source excerpt"
 
-    payload = service._validate_advisor_arguments(
+    rejection = service._advisor_checkpoint._validate_advisor_arguments(
         {
             "trigger": "proactive_security_safety",
             "problem_summary": "stuck",
@@ -265,10 +283,14 @@ def test_advisor_argument_validation_rejects_unknown_keys() -> None:
         }
     )
 
-    assert payload is not None
+    assert type(rejection) is AdvisorArgumentRejection
+    payload = rejection.to_payload()
     assert payload["status"] == "ARG_ERROR"
-    assert payload["error_class"] == "ValueError"
-    assert "unknown argument" in payload["error"]
+    # The closed-root S gate rejects the extra key before the pydantic model:
+    # an honest ToolArgumentError of category schema_shape (was "ValueError").
+    assert payload["error_class"] == "ToolArgumentError"
+    assert payload["error_category"] == "schema_shape"
+    assert "extra keys" in payload["error"]
     assert "full_context" not in payload["error"]
     assert raw_extra_context not in payload["error"]
 
@@ -279,7 +301,7 @@ def test_reactive_trigger_is_retired() -> None:
     must be rejected as an unknown trigger.
     """
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-    payload = service._validate_advisor_arguments(
+    rejection = service._advisor_checkpoint._validate_advisor_arguments(
         {
             "trigger": "reactive_validation_loop",
             "problem_summary": "stuck",
@@ -287,9 +309,10 @@ def test_reactive_trigger_is_retired() -> None:
             "attempted_actions": ["a1", "a2"],
         }
     )
-    assert payload is not None  # ARG_ERROR
+    assert type(rejection) is AdvisorArgumentRejection
+    payload = rejection.to_payload()
     assert payload["status"] == "ARG_ERROR"
-    assert "must be one of" in payload["error"]
+    assert "published schema" in payload["error"]
     assert "reactive_validation_loop" not in payload["error"]
 
 
@@ -297,7 +320,7 @@ def test_proactive_triggers_still_valid() -> None:
     """The two proactive triggers must still validate cleanly."""
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     for trig in ("proactive_security_safety", "proactive_red_listed_plugin"):
-        payload = service._validate_advisor_arguments(
+        payload = service._advisor_checkpoint._validate_advisor_arguments(
             {
                 "trigger": trig,
                 "problem_summary": "p",
@@ -305,7 +328,7 @@ def test_proactive_triggers_still_valid() -> None:
                 "attempted_actions": [],
             }
         )
-        assert payload is None  # valid
+        assert isinstance(payload, RequestAdvisorHintArgumentsModel)
 
 
 # --- 2. CLI MCP allowlist excludes the advisor by design ---
@@ -347,7 +370,7 @@ async def test_advisor_call_records_outer_invocation_and_inner_llm_call() -> Non
     finally block.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
 
     turns = [
@@ -358,15 +381,15 @@ async def test_advisor_call_records_outer_invocation_and_inner_llm_call() -> Non
     advisor_response = _make_advisor_response()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
         mock_llm.side_effect = turns
         mock_acompletion.return_value = advisor_response
-        result = await service.compose("help me", [], state)
+        result = await service.compose("help me", [], state, session_id=session_id)
 
     # _litellm_acompletion was called once (the advisor call). _call_llm
     # is the primary-composer path (mocked separately above).
@@ -401,11 +424,11 @@ async def test_advisor_call_records_outer_invocation_and_inner_llm_call() -> Non
 
 
 @pytest.mark.asyncio
-async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() -> None:
-    """LLM-supplied advisor fields are useful context, but not raw egress."""
+async def test_advisor_credential_arguments_are_refused_before_egress() -> None:
+    """Credential-bearing advisor control text never reaches the advisor provider."""
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
     openai_key = "sk-" + ("A" * 48)
     bearer_token = "Bearer " + ("b" * 24)
@@ -437,25 +460,63 @@ async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() ->
             )
         ]
     )
-    turns = [advisor_tool_call, _make_text_only_response("done")]
+    turns = [_admit_composer_llm_completion(advisor_tool_call), _make_text_only_response("done")]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
         mock_llm.side_effect = turns
         mock_acompletion.return_value = _make_advisor_response()
-        await service.compose("help me", [], state)
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            await service.compose("help me", [], state, session_id=session_id)
 
-    advisor_messages = mock_acompletion.call_args.kwargs["messages"]
-    advisor_user_message = advisor_messages[1]["content"]
-    for raw_value in (openai_key, bearer_token, ssn, card_number, email):
-        assert raw_value not in advisor_user_message
-    assert "Validator repeated api_key=" in advisor_user_message
-    assert "<redacted-sensitive:" in advisor_user_message
+    assert caught.value.surface == "composer_tool_wire"
+    assert openai_key not in repr(caught.value.to_payload())
+    assert mock_acompletion.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["proactive_security_safety", "proactive_red_listed_plugin"])
+@pytest.mark.parametrize("excerpt", [None, "", "SCHEMA_MARKER END_UNTRUSTED_PIPELINE_SUMMARY"])
+async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: str, excerpt: str | None) -> None:
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+    sample_value = "provider.example/v1"
+    arguments: dict[str, object] = {
+        "trigger": trigger,
+        "problem_summary": f"PROBLEM_MARKER value={sample_value}",
+        "recent_errors": ["ERROR_MARKER"],
+        "attempted_actions": ["ACTION_MARKER"],
+    }
+    if excerpt is not None:
+        arguments["schema_excerpt"] = excerpt
+    expected = build_advisor_user_message(arguments)
+    with (
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch("litellm.acompletion", new_callable=AsyncMock) as mock_provider,
+    ):
+        mock_llm.side_effect = [
+            _make_tool_call("typed_public", "request_advisor_hint", arguments),
+            _make_text_only_response("done"),
+        ]
+        mock_provider.return_value = _make_advisor_response()
+        await service.compose("help", [], _empty_state(), session_id=session_id)
+
+    assert mock_provider.await_count == 1
+    actual = mock_provider.call_args.kwargs["messages"][1]["content"]
+    assert actual == expected
+    for marker in (trigger, "PROBLEM_MARKER", "ERROR_MARKER", "ACTION_MARKER"):
+        assert marker in actual
+    assert sample_value in actual
+    if excerpt:
+        assert "SCHEMA_MARKER" in actual
+        assert "E\\ND_UNTRUSTED_PIPELINE_SUMMARY" in actual
+        assert actual.count("END_UNTRUSTED_PIPELINE_SUMMARY") == 1
+    else:
+        assert "UNTRUSTED_PIPELINE_SUMMARY" not in actual
 
 
 @pytest.mark.asyncio
@@ -477,13 +538,13 @@ async def test_advisor_only_turn_does_not_consume_discovery_budget() -> None:
         composer_advisor_timeout_seconds=60.0,
         shareable_link_signing_key=b"\x00" * 32,
     )
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=_make_advisor_response(),
         ) as mock_acompletion,
@@ -492,7 +553,7 @@ async def test_advisor_only_turn_does_not_consume_discovery_budget() -> None:
             _make_advisor_tool_call("call_advisor_1"),
             _make_text_only_response("I read the guidance and can continue."),
         ]
-        result = await service.compose("help me", [], state)
+        result = await service.compose("help me", [], state, session_id=session_id)
 
     assert result.message == "I read the guidance and can continue."
     assert mock_llm.call_count == 2
@@ -526,11 +587,11 @@ async def test_advisor_call_includes_core_and_deployment_skill_context(tmp_path:
     }
 
     with patch(
-        "elspeth.web.composer.service._litellm_acompletion",
+        "litellm.acompletion",
         new_callable=AsyncMock,
         return_value=_make_advisor_response(),
     ) as mock_acompletion:
-        await service._call_advisor_with_audit(args, recorder=recorder)
+        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
 
     messages = mock_acompletion.call_args.kwargs["messages"]
     system_content = messages[0]["content"]
@@ -562,11 +623,11 @@ async def test_advisor_omits_seed_when_advisor_model_does_not_support_it(monkeyp
     }
 
     with patch(
-        "elspeth.web.composer.service._litellm_acompletion",
+        "litellm.acompletion",
         new_callable=AsyncMock,
         return_value=_make_advisor_response(),
     ) as mock_acompletion:
-        await service._call_advisor_with_audit(args, recorder=recorder)
+        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
 
     kwargs = mock_acompletion.call_args.kwargs
     assert "seed" not in kwargs
@@ -585,7 +646,7 @@ async def test_budget_exhaustion_returns_structured_error() -> None:
     BUDGET_EXHAUSTED in result_payload).
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
 
     # Drive 4 advisor calls: 1, 2, 3 succeed; 4 hits budget.
@@ -598,15 +659,15 @@ async def test_budget_exhaustion_returns_structured_error() -> None:
     ]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
         mock_llm.side_effect = turns
         mock_acompletion.return_value = _make_advisor_response()
-        result = await service.compose("help me", [], state)
+        result = await service.compose("help me", [], state, session_id=session_id)
 
     # Only 3 outbound advisor calls — 4th is short-circuited by budget.
     assert mock_acompletion.call_count == 3, f"expected 3 outbound advisor calls (budget=3), got {mock_acompletion.call_count}"
@@ -647,13 +708,13 @@ async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
         composer_advisor_timeout_seconds=60.0,
         shareable_link_signing_key=b"\x00" * 32,
     )
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
         pytest.raises(ComposerConvergenceError) as exc_info,
@@ -662,14 +723,16 @@ async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
             _make_advisor_tool_call("call_budget_exhausted"),
             _make_text_only_response("would incorrectly continue"),
         ]
-        await service.compose("help me", [], state)
+        await service.compose("help me", [], state, session_id=session_id)
 
+    assert exc_info.value.tool_invocations == ()
+    durable_responses = _persisted_tool_responses(service, session_id)
     assert exc_info.value.budget_exhausted == "discovery"
     assert mock_llm.call_count == 1
     assert mock_acompletion.call_count == 0
-    invocations = [inv for inv in exc_info.value.tool_invocations if inv.tool_name == "request_advisor_hint"]
+    invocations = [inv for inv in durable_responses if inv["tool_name"] == "request_advisor_hint"]
     assert len(invocations) == 1
-    assert "BUDGET_EXHAUSTED" in _result_canonical(invocations[0])
+    assert "BUDGET_EXHAUSTED" in invocations[0]["result_canonical"]
 
 
 # --- 5. Disabled-but-LLM-tries (defense-in-depth) ---
@@ -694,7 +757,7 @@ async def test_advisor_call_failure_records_inner_status_and_outer_error() -> No
     from litellm.exceptions import APIError as LiteLLMAPIError
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
 
     turns = [
@@ -707,15 +770,15 @@ async def test_advisor_call_failure_records_inner_status_and_outer_error() -> No
     api_error = LiteLLMAPIError(status_code=500, message="upstream server error", llm_provider="anthropic", model="claude-sonnet-4-6")
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=api_error,
         ),
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help me", [], state)
+        result = await service.compose("help me", [], state, session_id=session_id)
 
     # Outer ComposerToolInvocation: SUCCESS dispatch (the envelope itself
     # closed cleanly), with ADVISOR_ERROR in result_payload.
@@ -755,7 +818,7 @@ async def test_three_failed_advisor_calls_trigger_anti_anchor_hint() -> None:
     from litellm.exceptions import APIError as LiteLLMAPIError
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=10))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=10))
     state = _empty_state()
 
     # Three identical advisor calls, all fail. Then turn 4 final text.
@@ -768,15 +831,15 @@ async def test_three_failed_advisor_calls_trigger_anti_anchor_hint() -> None:
     api_error = LiteLLMAPIError(status_code=500, message="x", llm_provider="anthropic", model="claude-sonnet-4-6")
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=api_error,
         ),
     ):
         mock_llm.side_effect = turns
-        await service.compose("help me", [], state)
+        await service.compose("help me", [], state, session_id=session_id)
 
     # The 4th LLM call is the post-anchor LLM call. It must contain the
     # [ELSPETH-SYSTEM-HINT] message because three identical failed advisor
@@ -802,7 +865,7 @@ async def test_successful_advisor_call_resets_anti_anchor_failures() -> None:
     from litellm.exceptions import APIError as LiteLLMAPIError
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=10))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=10))
     state = _empty_state()
 
     turns = [
@@ -823,9 +886,9 @@ async def test_successful_advisor_call_resets_anti_anchor_failures() -> None:
     ]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=[
                 api_errors[0],
@@ -836,7 +899,7 @@ async def test_successful_advisor_call_resets_anti_anchor_failures() -> None:
         ),
     ):
         mock_llm.side_effect = turns
-        await service.compose("help me", [], state)
+        await service.compose("help me", [], state, session_id=session_id)
 
     assert mock_llm.call_count == 5
     fifth_call_messages = mock_llm.call_args_list[4].args[0]
@@ -855,7 +918,7 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
     terminates the compose request instead of being returned as ADVISOR_ERROR.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(
+    service, session_id = _composer_service_with_session(
         catalog=catalog,
         settings=_make_settings(
             budget=10,
@@ -866,8 +929,8 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
     state = _empty_state()
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch(
             "elspeth.web.composer.tool_batch._remaining_compose_seconds",
             return_value=5.0,
@@ -881,8 +944,10 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
             _make_text_only_response("would incorrectly continue"),
         ]
         mock_advisor.side_effect = TimeoutError()
-        await service.compose("help me", [], state)
+        await service.compose("help me", [], state, session_id=session_id)
 
+    assert exc_info.value.tool_invocations == ()
+    durable_responses = _persisted_tool_responses(service, session_id)
     assert exc_info.value.budget_exhausted == "timeout"
     assert exc_info.value.max_turns == 2
     assert mock_llm.call_count == 3
@@ -890,25 +955,25 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
     assert advisor_await is not None
     advisor_timeout = advisor_await.kwargs["timeout"]
     assert advisor_timeout == 5.0
-    assert [inv.tool_call_id for inv in exc_info.value.tool_invocations] == [
+    assert [inv["tool_call_id"] for inv in durable_responses] == [
         "call_metadata",
         "call_sources",
         "call_deadline",
     ]
-    assert "COMPOSE_TIMEOUT" in _result_canonical(exc_info.value.tool_invocations[-1])
+    assert "COMPOSE_TIMEOUT" in durable_responses[-1]["result_canonical"]
 
 
 @pytest.mark.asyncio
 async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound_call() -> None:
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     tracker = AntiAnchorTracker()
     tracker.record_failure("set_pipeline", "existing-failure")
     initial_failures = tuple(tracker._failures)
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch("elspeth.web.composer.service.AntiAnchorTracker", return_value=tracker),
         patch(
             "elspeth.web.composer.tool_batch._remaining_compose_seconds",
@@ -922,20 +987,22 @@ async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound
             _make_tool_call("call_transforms", "list_transforms", {}),
             _make_advisor_tool_call("call_zero_remaining"),
         ]
-        await service.compose("help me", [], _empty_state())
+        await service.compose("help me", [], _empty_state(), session_id=session_id)
 
+    assert exc_info.value.tool_invocations == ()
+    durable_responses = _persisted_tool_responses(service, session_id)
     assert exc_info.value.budget_exhausted == "timeout"
     assert exc_info.value.max_turns == 2
     assert mock_advisor.await_count == 0
     assert tuple(tracker._failures) == initial_failures
-    assert [inv.tool_call_id for inv in exc_info.value.tool_invocations] == [
+    assert [inv["tool_call_id"] for inv in durable_responses] == [
         "call_sources",
         "call_transforms",
         "call_zero_remaining",
     ]
-    invocations = [inv for inv in exc_info.value.tool_invocations if inv.tool_name == "request_advisor_hint"]
+    invocations = [inv for inv in durable_responses if inv["tool_name"] == "request_advisor_hint"]
     assert len(invocations) == 1
-    payload = json.loads(_result_canonical(invocations[0]))
+    payload = json.loads(invocations[0]["result_canonical"])
     assert payload["status"] == "COMPOSE_TIMEOUT"
     assert payload["budget_used"] == 0
     assert payload["budget_remaining"] == 3
@@ -946,7 +1013,7 @@ async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound
 @pytest.mark.asyncio
 async def test_advisor_just_below_floor_is_truthful_discovery_without_state_changes() -> None:
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(
+    service, session_id = _composer_service_with_session(
         catalog=catalog,
         settings=_make_settings(budget=3, discovery_turns=1),
     )
@@ -954,9 +1021,11 @@ async def test_advisor_just_below_floor_is_truthful_discovery_without_state_chan
     tracker.record_failure("set_pipeline", "existing-failure")
     initial_failures = tuple(tracker._failures)
 
+    recorder = BufferingRecorder()
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch("elspeth.web.composer.service.BufferingRecorder", return_value=recorder),
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch("elspeth.web.composer.service.AntiAnchorTracker", return_value=tracker),
         patch(
             "elspeth.web.composer.tool_batch._remaining_compose_seconds",
@@ -969,15 +1038,26 @@ async def test_advisor_just_below_floor_is_truthful_discovery_without_state_chan
             _make_advisor_tool_call("call_too_close"),
             _make_text_only_response("must not reach a second model turn"),
         ]
-        await service.compose("help me", [], _empty_state())
+        await service.compose("help me", [], _empty_state(), session_id=session_id)
 
+    assert exc_info.value.tool_invocations == ()
+    durable_responses = _persisted_tool_responses(service, session_id)
     assert exc_info.value.budget_exhausted == "discovery"
     assert mock_llm.call_count == 1
     assert mock_advisor.await_count == 0
     assert tuple(tracker._failures) == initial_failures
-    invocations = [inv for inv in exc_info.value.tool_invocations if inv.tool_name == "request_advisor_hint"]
+    invocations = [inv for inv in durable_responses if inv["tool_name"] == "request_advisor_hint"]
     assert len(invocations) == 1
-    payload = json.loads(_result_canonical(invocations[0]))
+    durable_payload = json.loads(invocations[0]["result_canonical"])
+    recorded = [inv for inv in recorder.invocations if inv.tool_name == "request_advisor_hint"]
+    assert len(recorded) == 1
+    payload = json.loads(_result_canonical(recorded[0]))
+    assert durable_payload == {
+        "budget_remaining": 3,
+        "budget_used": 0,
+        "status": "DEADLINE_TOO_CLOSE",
+        "_unknown_response": "<redacted-unknown-response-key>",
+    }
     assert payload == {
         "budget_remaining": 3,
         "budget_used": 0,
@@ -993,7 +1073,7 @@ async def test_advisor_just_below_floor_is_truthful_discovery_without_state_chan
 @pytest.mark.parametrize("remaining", [5.0, 5.001])
 async def test_advisor_at_or_above_floor_makes_one_bounded_call(remaining: float) -> None:
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(
+    service, session_id = _composer_service_with_session(
         catalog=catalog,
         settings=_make_settings(budget=3, advisor_timeout_seconds=60.0),
     )
@@ -1006,8 +1086,8 @@ async def test_advisor_at_or_above_floor_makes_one_bounded_call(remaining: float
     }
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch(
             "elspeth.web.composer.tool_batch._remaining_compose_seconds",
             return_value=remaining,
@@ -1019,7 +1099,7 @@ async def test_advisor_at_or_above_floor_makes_one_bounded_call(remaining: float
             _make_text_only_response("done"),
         ]
         mock_advisor.return_value = ("Use the dedicated mutation.", advisor_meta)
-        result = await service.compose("help me", [], _empty_state())
+        result = await service.compose("help me", [], _empty_state(), session_id=session_id)
 
     assert mock_advisor.await_count == 1
     advisor_await = mock_advisor.await_args
@@ -1039,7 +1119,7 @@ async def test_missing_advisor_trigger_rejects_without_outbound_call() -> None:
     must not spend an advisor call.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
 
     args = {
@@ -1067,15 +1147,15 @@ async def test_missing_advisor_trigger_rejects_without_outbound_call() -> None:
     )
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=_make_advisor_response(),
         ) as mock_acompletion,
     ):
-        mock_llm.side_effect = [missing_trigger_response, _make_text_only_response("done")]
-        result = await service.compose("help", [], state)
+        mock_llm.side_effect = [_admit_composer_llm_completion(missing_trigger_response), _make_text_only_response("done")]
+        result = await service.compose("help", [], state, session_id=session_id)
 
     assert mock_acompletion.call_count == 0
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
@@ -1102,7 +1182,7 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
     module's own admission helpers inside the same protected block.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
     turns = [_make_advisor_tool_call("call_unclass"), _make_text_only_response("done")]
 
@@ -1110,17 +1190,17 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
     # BadRequest/APIError/MalformedResponse). Without a catch-all, status
     # stays None and the finally block skips record_llm_call.
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch.object(service, "_persist_turn_audit", wraps=service._persist_turn_audit) as mock_persist,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=ValueError("unexpected codec failure"),
         ),
         pytest.raises(ValueError, match="unexpected codec failure") as exc_info,
     ):
         mock_llm.side_effect = turns
-        await service.compose("help me", [], state)
+        await service.compose("help me", [], state, session_id=session_id)
 
     advisor_llm_calls = [c for c in exc_info.value.llm_calls if c.model_requested == "anthropic/claude-sonnet-4-6"]
     assert len(advisor_llm_calls) == 1, (
@@ -1135,7 +1215,7 @@ async def test_f5_advisor_unclassified_exception_still_records_llm_call() -> Non
     assert failed_outcome.call.function.name == "request_advisor_hint"
     assert failed_outcome.error_class == "ValueError"
     assert failed_outcome.error_message == "ValueError"
-    persisted_failure = json.loads(service._phase3_last_redacted_tool_rows[-1].content)
+    persisted_failure = json.loads(_persisted_tool_responses(service, session_id)[-1]["result_canonical"])
     assert persisted_failure["_redaction_status"] == "plugin_crash"
 
 
@@ -1151,19 +1231,19 @@ async def test_transport_failure_still_degrades_into_structured_advisor_feedback
     import httpx
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     turns = [_make_advisor_tool_call("call_transport"), _make_text_only_response("moving on")]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=httpx.ConnectError("connection refused"),
         ),
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help me", [], _empty_state())
+        result = await service.compose("help me", [], _empty_state(), session_id=session_id)
 
     invs = [inv for inv in result.tool_invocations if inv.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
@@ -1180,7 +1260,7 @@ async def test_f4_advisor_empty_content_classified_as_malformed() -> None:
     the composer LLM "you got advice" when no information was produced.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
     turns = [_make_advisor_tool_call("call_empty"), _make_text_only_response("ok")]
     empty_response = _FakeLLMResponse(
@@ -1188,15 +1268,15 @@ async def test_f4_advisor_empty_content_classified_as_malformed() -> None:
     )
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=empty_response,
         ),
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
@@ -1226,7 +1306,7 @@ async def test_advisor_non_string_content_classified_as_malformed(content: objec
     reach the guidance surface; everything else is MALFORMED_RESPONSE.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     state = _empty_state()
     turns = [_make_advisor_tool_call("call_nonstr"), _make_text_only_response("ok")]
     malformed_response = _FakeLLMResponse(
@@ -1234,15 +1314,15 @@ async def test_advisor_non_string_content_classified_as_malformed(content: objec
     )
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             return_value=malformed_response,
         ),
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
@@ -1264,7 +1344,7 @@ async def test_f2_failed_advisor_call_consumes_budget() -> None:
     from litellm.exceptions import APIError as LiteLLMAPIError
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=1))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=1))
     state = _empty_state()
     turns = [
         _make_advisor_tool_call("call_1_fails"),
@@ -1274,15 +1354,15 @@ async def test_f2_failed_advisor_call_consumes_budget() -> None:
     api_error = LiteLLMAPIError(status_code=500, message="x", llm_provider="anthropic", model="claude-sonnet-4-6")
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=api_error,
         ) as mock_acompletion,
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 2
@@ -1296,7 +1376,18 @@ async def test_f2_failed_advisor_call_consumes_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_f3a_advisor_rejects_non_list_recent_errors() -> None:
+@pytest.mark.parametrize("budget", [0, 3])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("recent_errors", "single error string not list"),
+        ("schema_excerpt", None),
+        ("user_message", "secret backend-only value"),
+        ("trigger", "deterministic_early_checkpoint"),
+        ("trigger", "deterministic_end_checkpoint"),
+    ],
+)
+async def test_f3a_advisor_rejects_non_list_recent_errors(budget: int, field: str, value: object) -> None:
     """F3a: recent_errors must be list[str]. _TOOL_REQUIRED_PATHS only
     checks key presence, so a non-list value (LLM bug, prompt injection)
     slips through schema validation. Without local type-check, the
@@ -1304,15 +1395,16 @@ async def test_f3a_advisor_rejects_non_list_recent_errors() -> None:
     a corrupt prompt at full provider cost.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=budget))
     state = _empty_state()
 
     bad_args = {
         "trigger": "proactive_security_safety",
         "problem_summary": "stuck",
-        "recent_errors": "single error string not list",  # WRONG TYPE
+        "recent_errors": [],
         "attempted_actions": ["x"],
     }
+    bad_args[field] = value
     bad_response = _FakeLLMResponse(
         choices=[
             _FakeChoice(
@@ -1331,17 +1423,17 @@ async def test_f3a_advisor_rejects_non_list_recent_errors() -> None:
             )
         ]
     )
-    turns = [bad_response, _make_text_only_response("done")]
+    turns = [_admit_composer_llm_completion(bad_response), _make_text_only_response("done")]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     assert mock_acompletion.call_count == 0, "advisor sent malformed-typed argument to provider — should reject locally"
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
@@ -1350,6 +1442,54 @@ async def test_f3a_advisor_rejects_non_list_recent_errors() -> None:
     assert invs[0].status.name == "ARG_ERROR", (
         "advisor argument rejection must use the audit ARG_ERROR status, not SUCCESS with ARG_ERROR buried inside result_canonical"
     )
+    assert result.state == state
+    assert invs[0].version_before == state.version
+    assert invs[0].version_after is None
+    assert "secret backend-only value" not in _result_canonical(invs[0])
+
+
+@pytest.mark.asyncio
+async def test_invalid_advisor_call_preserves_budget_for_next_valid_call() -> None:
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings(budget=1))
+    state = _empty_state()
+    secret_marker = "PRIVATE_INVALID_ADVISOR_VALUE"
+    invalid = {
+        "trigger": "proactive_security_safety",
+        "problem_summary": "stuck",
+        "recent_errors": [secret_marker],
+        "attempted_actions": [],
+        "user_message": secret_marker,
+    }
+    with (
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch("litellm.acompletion", new_callable=AsyncMock) as mock_provider,
+    ):
+        mock_llm.side_effect = [
+            _make_tool_call("invalid", "request_advisor_hint", invalid),
+            _make_advisor_tool_call("valid"),
+            _make_advisor_tool_call("exhausted"),
+            _make_text_only_response("done"),
+        ]
+        mock_provider.return_value = _make_advisor_response()
+        result = await service.compose("help", [], state, session_id=session_id)
+
+    assert mock_provider.await_count == 1
+    assert result.state == state
+    invocations = [inv for inv in result.tool_invocations if inv.tool_name == "request_advisor_hint"]
+    assert [inv.tool_call_id for inv in invocations] == ["invalid", "valid", "exhausted"]
+    invalid_invocation, valid_invocation, exhausted_invocation = invocations
+    assert invalid_invocation.status.name == "ARG_ERROR"
+    assert invalid_invocation.version_before == state.version
+    assert invalid_invocation.version_after is None
+    invalid_payload = _result_canonical(invalid_invocation)
+    assert json.loads(invalid_payload)["status"] == "ARG_ERROR"
+    assert secret_marker not in invalid_payload
+    assert secret_marker not in (invalid_invocation.error_message or "")
+    assert len(invalid_payload) < 1000
+    assert json.loads(_result_canonical(valid_invocation))["budget_remaining"] == 0
+    assert json.loads(_result_canonical(exhausted_invocation))["status"] == "BUDGET_EXHAUSTED"
+    for invocation in (valid_invocation, exhausted_invocation):
+        assert invocation.version_before == invocation.version_after == state.version
 
 
 @pytest.mark.asyncio
@@ -1370,16 +1510,18 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
         composer_advisor_max_prompt_tokens=1000,  # → ~4000 char cap
         shareable_link_signing_key=b"\x00" * 32,
     )
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
-    huge_string = "X" * 50_000
+    huge_string = "X" * 1500
     big_args = {
         "trigger": "proactive_security_safety",
         "problem_summary": "stuck",
-        "recent_errors": [huge_string],
+        "recent_errors": [huge_string] * 3,
         "attempted_actions": ["x"],
     }
+    RequestAdvisorHintArgumentsModel.model_validate(big_args)
+    assert len(build_advisor_user_message(big_args)) > settings.composer_advisor_max_prompt_tokens * 4
     huge_response = _FakeLLMResponse(
         choices=[
             _FakeChoice(
@@ -1398,29 +1540,31 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
             )
         ]
     )
-    turns = [huge_response, _make_text_only_response("done")]
+    turns = [_admit_composer_llm_completion(huge_response), _make_text_only_response("done")]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
         mock_llm.side_effect = turns
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
     assert mock_acompletion.call_count == 0, "oversized prompt was sent to provider — local cap not enforced"
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
     assert "ARG_ERROR" in _result_canonical(invs[0])
+    assert "prompt size" in _result_canonical(invs[0])
     assert invs[0].status.name == "ARG_ERROR", (
         "advisor oversized prompt rejection must use the audit ARG_ERROR status, not SUCCESS with ARG_ERROR buried inside result_canonical"
     )
 
 
 @pytest.mark.asyncio
-async def test_f3c_advisor_prompt_size_counts_formatting_overhead() -> None:
+@pytest.mark.parametrize("prompt_tokens", [76, 77])
+async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens: int) -> None:
     """F3c: Empty list items still become bullets/newlines in the actual
     advisor prompt. The cap must count that formatted overhead before any
     outbound LiteLLM call.
@@ -1433,18 +1577,22 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead() -> None:
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
         composer_advisor_max_calls_per_compose=3,
-        composer_advisor_max_prompt_tokens=20,  # -> ~80 char variable-prompt cap
+        composer_advisor_max_prompt_tokens=prompt_tokens,
         shareable_link_signing_key=b"\x00" * 32,
     )
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
     state = _empty_state()
 
     overhead_args = {
         "trigger": "proactive_security_safety",
         "problem_summary": "x",
-        "recent_errors": [""] * 60,
-        "attempted_actions": [""] * 60,
+        "recent_errors": [""] * 5,
+        "attempted_actions": [""] * 8,
     }
+    RequestAdvisorHintArgumentsModel.model_validate(overhead_args)
+    # Pin the real formatted baseline: 77 tokens admits exactly 308 chars;
+    # 76 tokens rejects it despite the raw supplied text being just one char.
+    assert len(build_advisor_user_message(overhead_args)) == 308
     overhead_response = _FakeLLMResponse(
         choices=[
             _FakeChoice(
@@ -1463,24 +1611,30 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead() -> None:
             )
         ]
     )
-    turns = [overhead_response, _make_text_only_response("done")]
+    turns = [_admit_composer_llm_completion(overhead_response), _make_text_only_response("done")]
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
         ) as mock_acompletion,
     ):
         mock_llm.side_effect = turns
         mock_acompletion.return_value = _make_advisor_response()
-        result = await service.compose("help", [], state)
+        result = await service.compose("help", [], state, session_id=session_id)
 
-    assert mock_acompletion.call_count == 0, "advisor sent a formatted prompt whose bullet/newline overhead exceeded the local cap"
     invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
     assert len(invs) == 1
-    assert "ARG_ERROR" in _result_canonical(invs[0])
-    assert invs[0].status.name == "ARG_ERROR"
+    assert result.state == state
+    if prompt_tokens == 76:
+        assert mock_acompletion.await_count == 0
+        assert invs[0].status.name == "ARG_ERROR"
+        assert "prompt size" in _result_canonical(invs[0])
+    else:
+        assert mock_acompletion.await_count == 1
+        assert invs[0].status.name == "SUCCESS"
+        assert len(mock_acompletion.call_args.kwargs["messages"][1]["content"]) == 308
 
 
 @pytest.mark.asyncio
@@ -1489,13 +1643,13 @@ async def test_f1_skill_text_always_includes_advisor() -> None:
     mentions request_advisor_hint so the LLM knows when to use it.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
     state = _empty_state()
     turns = [_make_text_only_response("ok")]
 
-    with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
         mock_llm.side_effect = turns
-        await service.compose("hello", [], state)
+        await service.compose("hello", [], state, session_id=session_id)
 
     sent_messages = mock_llm.call_args_list[0].args[0]
     system_msg = next(m["content"] for m in sent_messages if m["role"] == "system")
@@ -1520,13 +1674,13 @@ async def test_advisor_cancelled_error_carries_buffered_llm_calls() -> None:
 
     with (
         patch(
-            "elspeth.web.composer.service._litellm_acompletion",
+            "litellm.acompletion",
             new_callable=AsyncMock,
             side_effect=asyncio.CancelledError(),
         ),
         pytest.raises(asyncio.CancelledError) as exc_info,
     ):
-        await service._call_advisor_with_audit(args, recorder=recorder)
+        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
 
     assert len(recorder.llm_calls) == 1
     assert recorder.llm_calls[0].status.name == "CANCELLED"
@@ -1551,12 +1705,12 @@ async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_prov
     from elspeth.contracts.errors import AuditIntegrityError
 
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     original = AuditIntegrityError("recorder could not seal the advisor call")
 
     with (
-        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-        patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
         patch.object(service, "_persist_turn_audit", wraps=service._persist_turn_audit) as mock_persist,
         pytest.raises(AuditIntegrityError, match="recorder could not seal") as exc_info,
     ):
@@ -1565,7 +1719,7 @@ async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_prov
             _make_text_only_response("would incorrectly continue"),
         ]
         mock_advisor.side_effect = original
-        await service.compose("help me", [], _empty_state())
+        await service.compose("help me", [], _empty_state(), session_id=session_id)
 
     assert exc_info.value is original
     assert mock_persist.await_count == 1
@@ -1574,5 +1728,5 @@ async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_prov
     failed_outcome = persist_kwargs["tool_outcomes"][-1]
     assert failed_outcome.call.function.name == "request_advisor_hint"
     assert failed_outcome.error_class == "AuditIntegrityError"
-    persisted_failure = json.loads(service._phase3_last_redacted_tool_rows[-1].content)
+    persisted_failure = json.loads(_persisted_tool_responses(service, session_id)[-1]["result_canonical"])
     assert persisted_failure["_redaction_status"] == "plugin_crash"

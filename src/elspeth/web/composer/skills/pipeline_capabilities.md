@@ -68,6 +68,7 @@ recipe miss, or an unloaded schema into a capability denial. Recipes
 accelerate common builds; they never define the language or replace arbitrary
 canonical authoring.
 
+<!-- taught:begin tool-data list_sources data.available; tool-data list_sources data.prohibited; tool-data list_transforms data.available; tool-data list_transforms data.prohibited; tool-data list_sinks data.available; tool-data list_sinks data.prohibited -->
 When a user names a specific plugin and asks why it cannot be used, check the
 relevant discovery tool's `prohibited` array before answering. A plugin listed
 there is closed by standing security policy, not by anything an operator can
@@ -76,6 +77,7 @@ guessing, retrying, or silently dropping the question. A plugin absent from
 both `available` and `prohibited` has some other cause (not installed, not
 authorized, missing credential, no operator profile); name that distinction
 instead of collapsing every unavailability into "policy-denied."
+<!-- taught:end -->
 
 Model identifiers come from the supplied model catalog where the request
 provides one, and otherwise only from `list_models`. Read the complete
@@ -131,6 +133,12 @@ component; `row_union` requires an explicit `on_success` connection.
   with `trigger`, `output_mode`, and `expected_output_count` where its contract
   requires them. Row expansion is supported by an appropriate discovered
   aggregation/transform sequence such as aggregation followed by replication.
+  Give an aggregation `output_mode: transform` (the default): `passthrough`
+  carries only a plugin whose flush emits exactly one row per buffered row.
+  The catalogue's `aggregation_output_modes` says which discovered plugins
+  support it. A plugin that reduces, replicates or skips rows is refused under
+  `passthrough`. If a batch fails, `on_error` applies to every buffered row;
+  `discard` records those rows as quarantined.
 - [capability-node:queue] A `queue` is the explicit fan-in point for multiple
   producers entering shared processing. Multiple named sources retain their
   independent schemas and identities.
@@ -195,6 +203,13 @@ to converge.
 
 The terminal schema is authoritative. Its covered structural families are:
 
+`get_pipeline_state` inspection uses these canonical structural field names:
+the full document has the pipeline containers and metadata below. A component
+request returns a single `node` with the node family's fields, or a single
+`output` with the output family's fields (including `sink_name`). These are
+inspection records, not a substitute for exact `set_pipeline_arguments`.
+
+<!-- taught:begin tool-data get_pipeline_state data.source row=pipeline; tool-data get_pipeline_state data.sources row=pipeline; tool-data get_pipeline_state data.nodes row=pipeline; tool-data get_pipeline_state data.edges row=pipeline; tool-data get_pipeline_state data.outputs row=pipeline; tool-data get_pipeline_state data.metadata row=pipeline; tool-data get_pipeline_state data.node.* row=node; tool-data get_pipeline_state data.output.* row=output; tool-data get_pipeline_state data.metadata.* row=metadata -->
 <!-- canonical-field-inventory:start -->
 | Family | Fields |
 | --- | --- |
@@ -208,6 +223,7 @@ The terminal schema is authoritative. Its covered structural families are:
 | output | `sink_name`, `plugin`, `options`, `on_write_failure`, `description` |
 | metadata | `name`, `description` |
 <!-- canonical-field-inventory:end -->
+<!-- taught:end -->
 
 Named sources use the same routing semantics as the singular source without
 inline custody fields.
@@ -259,6 +275,73 @@ field, require that field only when the upstream schema guarantees it. The final
 producer's routing field must exactly match the sink/connection name. Edge
 objects alone do not make a sink receive rows; route through every intervening
 cleanup node and then from the cleanup node to the sink.
+
+### Declared Types And Row Templates
+
+A type you declare is checked on every row and never converted to fit: a row
+whose value has another type goes to `on_error` when the mismatch depends on
+the value; a provable contradiction can be refused at build (an `int`
+satisfies `float`; nothing else is widened). Declare the type the value actually has, and `any`
+for a created field whose type varies. A model node's structured output fields
+bind their row types — `integer` is `int`, `number` is `float`, `boolean` is
+`bool`, `string` and `enum` are `str` — so a node schema type on a field the
+model writes must admit that bound type (validation refuses `int` over `number`), the
+`<response>_usage` field is `any`, and a downstream consumer of a `number`
+field declares `float`.
+
+A row template — an LLM prompt or query template, or a retrieval
+`query_template` — sees only the fields its node declares in
+`required_input_fields` (a retrieval template also sees its query field).
+Declare every field the template reads or tests, an attribute filter's
+(`attr('field')`, `map(attribute='field')`) included, and read each one by a
+fixed name (`row.field`, `row['field']`, a query's `row.source_row.field`): a key
+computed at render (`row[k]`, `row.get(expr)`, or either through
+`row.source_row`) is refused under a declared list; `[]` intentionally allows
+a computed key but gives up provable field coverage. Under a declared list,
+reading or testing any other field fails every row, including `'x' in row`, a row carried through a `set`
+or loop variable, and an undeclared multi-query `row.source_row` column. `[]` shows the
+whole row to supported row operations but proves nothing to a field-scoped prompt-injection control, so
+declare the fields. A single-query prompt or retrieval template that never
+reads `row` declares none: the query field reaches a retrieval template as
+`query` without a declaration, and a declaration the template cannot use is
+refused. `row` has fields and one method, `get`: `row.items` and `row.keys`
+read columns of those names, so a call on a row field or on row data
+(`row.keys()`, `row.items()`, `row['keys']()`, `row.get('note')()`,
+`row.tags[0]()`, `(row.tags | first)()`, `(row.note | upper)()`,
+`row.note.upper()()`, `{% set m = row.tags %}{{ m[0]() }}`), `row.get` without a call
+and the reserved names `row.contract`, `row.to_dict` and
+`row.to_checkpoint_format` are refused
+under every declaration, `[]` included. For the field names use `row | list`,
+for name and value pairs `row | items | list` or `row | dictsort`, for a mapping
+`dict(row)` or `row | tojson`; read a column named like a method or a reserved
+name as `row['contract']`. A method on a field's value (`row.note.upper()`)
+is fine. With `required_input_fields` omitted, a model prompt may not use
+`row` as a whole (`{{ row }}`, `row | dictsort`): declare the fields it shows.
+For a multi-query template, `row.source_row` contains only columns the node
+declares in `required_input_fields`, including query `input_fields` values.
+A multi-query `input_fields` variable may not be named `source_row` or like a
+mapping method (`items`, `keys`, `values`, `get`).
+Besides the names it binds itself, a template reads `row`, `lookup` in a model
+prompt and `query` (the query field's value) in a retrieval `query_template`; a
+name its render context does not define is refused. Template literals must
+work as written: every filter and test name must exist, including inside a
+condition and as the name given to `map`, `select`, `reject`, `selectattr` or
+`rejectattr`; a `truncate` length is an integer literal no shorter than its
+ending; and no number literal may overflow a float.
+
+An expression whose value is stored in a row must not produce a set, which has
+no canonical order: build a list (`[a, b]`); a set used in place
+(`x in {...}`) is fine. A column a node declares as an input, such as a
+conversion's field, must be carried by every row that reaches the node.
+
+A field that two branches of a `merge: union` coalesce both carry must have one
+type on every branch, and `any` is a type of its own there, not a wildcard: a
+value whose expression type cannot be derived from declared inputs, or an
+untyped extracted nested value, is `any`, and meeting a declared `int` on the other branch fails
+every row, so validation refuses the coalesce
+(`coalesce_union_type_incompatible`). Declare the field's type on the schema
+of every branch's last node (`mode: flexible`), or write the computed value
+under a new name.
 
 ### Utility Transforms
 

@@ -22,8 +22,18 @@ export class ComposerPage {
 
   async createSession(_title: string): Promise<void> {
     await this.page.getByRole("button", { name: /session switcher/i }).click();
+    const createdSession = this.page.waitForResponse((response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/api/sessions" &&
+      response.status() === 201,
+    );
     await this.page.getByRole("menuitem", { name: "+ New session" }).click();
+    const session = await (await createdSession).json() as { id: string };
+    // The previous session's chat remains visible during creation. Wait for
+    // the requested session and its focus handoff before another interaction.
+    await this.page.waitForURL((url) => url.hash === `#/${session.id}`);
     await this.waitForChatReady();
+    await this.chatInput().and(this.page.locator(":focus")).waitFor({ state: "visible" });
   }
 
   async sendMessage(content: string): Promise<void> {
@@ -61,7 +71,7 @@ export class ComposerPage {
     return this.page.getByRole("region", { name: "Pipeline artifact" });
   }
 
-  artifactTab(name: "Graph" | "Spec" | "YAML" | "Run"): Locator {
+  artifactTab(name: "Workflow" | "Approvals" | "Spec" | "YAML" | "Run"): Locator {
     return this.page.getByRole("tab", { name, exact: true });
   }
 
@@ -113,7 +123,7 @@ export class ComposerPage {
   }
 
   focusGraph(): Locator {
-    return this.page.getByRole("button", { name: "Focus graph" });
+    return this.page.getByRole("button", { name: "Fullscreen" });
   }
 
   runPipeline(): Locator {
@@ -121,7 +131,7 @@ export class ComposerPage {
   }
 
   saveForReview(): Locator {
-    return this.page.getByRole("button", { name: "Save for review" });
+    return this.page.getByRole("button", { name: "Share inspect link" });
   }
 
   importYaml(): Locator {

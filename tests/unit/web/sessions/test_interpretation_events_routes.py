@@ -983,9 +983,10 @@ def _insert_auto_event(
                 arguments_hash=None,
                 hash_domain_version=None,
                 interpretation_source=source.value,
+                surface_origin=None,
                 runtime_model_identifier_at_resolve=None,
                 runtime_model_version_at_resolve=None,
-                resolved_prompt_template_hash=None,
+                approved_prompt_artifact_hash=None,
                 **provenance,
             )
         )

@@ -50,6 +50,11 @@ from elspeth.plugins.infrastructure.schema_factory import create_schema_from_con
 #: The single name an ``output`` expression may address: the matched entry.
 REFERENCE_ENTRY_NAME = "ref"
 
+#: Upper bound on the materialized row-by-output matrix. The complete matrix
+#: is retained for constant-time joins, so bounding each input independently
+#: would still permit an unsafe Cartesian product.
+MAX_REFERENCE_INDEX_CELLS = 1_000_000
+
 #: Sentinel for an output path that did not resolve against a matched entry.
 #: Distinct from ``None``, which is a legitimate value a reference table may
 #: hold (a JSON ``null``), and which ``on_miss: null`` also produces.
@@ -85,7 +90,10 @@ class ReferenceJoinConfig(TransformDataConfig):
     )
     reference_format: Literal["csv", "json"] = Field(
         ...,
-        description="How to parse reference_content. Never inferred — a blob carries no reliable type.",
+        description=(
+            "How to parse reference_content. Never inferred — a blob carries no reliable type. "
+            "CSV cells remain strings, including numeric-looking cells; JSON numbers retain numeric types."
+        ),
     )
     key_field: str = Field(..., description="Input field whose value is matched against the reference table key.")
     reference_key_name: str = Field(
@@ -99,7 +107,8 @@ class ReferenceJoinConfig(TransformDataConfig):
         ...,
         description=(
             "Map of output field name to an expression over the matched entry, bound as 'ref' "
-            "(for example \"ref['description']\" or \"ref['tax']['rate']\")."
+            "(for example \"ref['description']\" or \"ref['tax']['rate']\"). "
+            "A stored result cannot be a set because it has no canonical order; build a list instead."
         ),
     )
     on_miss: Literal["fail", "null", "default"] = Field(
@@ -167,6 +176,16 @@ class ReferenceTableError(ValueError):
     """The reference table could not be parsed, or is not usable as a table."""
 
 
+def _reject_duplicate_json_object_members(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Preserve each JSON object's member names only when they are unambiguous."""
+    members: dict[str, object] = {}
+    for name, value in pairs:
+        if name in members:
+            raise ReferenceTableError(f"reference table has a duplicate JSON object member {name!r}")
+        members[name] = value
+    return members
+
+
 @dataclass(frozen=True, slots=True)
 class ReferenceIndex:
     """A reference table resolved down to exactly what row processing needs.
@@ -204,6 +223,11 @@ def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, obje
             # "Product SKU" to "product_sku" would break an authored path.
             if not fieldnames:
                 raise ReferenceTableError("reference table is empty: no CSV header row")
+            seen_headers: set[str] = set()
+            for name in fieldnames:
+                if name in seen_headers:
+                    raise ReferenceTableError(f"reference table has a duplicate CSV header {name!r}")
+                seen_headers.add(name)
             csv_entries: list[Mapping[str, object]] = []
             for position, record in enumerate(reader):
                 # DictReader pads a short row with restval and buckets surplus
@@ -231,7 +255,7 @@ def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, obje
         return csv_entries
 
     try:
-        loaded = json.loads(cfg.reference_content)
+        loaded = json.loads(cfg.reference_content, object_pairs_hook=_reject_duplicate_json_object_members)
     except json.JSONDecodeError as exc:
         raise ReferenceTableError(f"reference table is not valid JSON: {exc}") from exc
     # ``json.loads`` yields exact builtins (never a frozen proxy or tuple), so
@@ -260,6 +284,12 @@ def _compile_output_expressions(cfg: ReferenceJoinConfig) -> dict[str, Expressio
                 f"output field {field_name!r} has an invalid expression {expression!r}: {exc}. "
                 f"Address the matched entry as {REFERENCE_ENTRY_NAME!r}, e.g. \"{REFERENCE_ENTRY_NAME}['description']\"."
             ) from exc
+        if compiled[field_name].result_can_be_set():
+            raise ReferenceTableError(
+                f"output field {field_name!r} has an expression {expression!r} that can produce a set, which has no "
+                "canonical order: the joined value, and the row's output hash, would differ between runs of identical "
+                "input. Use a list [...] or tuple (...) literal; a set literal belongs only in a membership test or len()."
+            )
     return compiled
 
 
@@ -277,6 +307,12 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
             "reference table has no entries: every row would miss the join. "
             "A CSV header with no data rows, or a JSON [], is an empty container rather than "
             "sparse data — supply the table, or remove the reference_join node."
+        )
+    cell_count = len(entries) * len(cfg.output)
+    if cell_count > MAX_REFERENCE_INDEX_CELLS:
+        raise ReferenceTableError(
+            f"reference table with {len(entries)} entries and {len(cfg.output)} output fields would materialize "
+            f"{cell_count} values; the limit is {MAX_REFERENCE_INDEX_CELLS}. Reduce the table or output map."
         )
     compiled = _compile_output_expressions(cfg)
 
@@ -299,19 +335,20 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
 
         values: dict[str, Any] = {}
         for field_name, parser in compiled.items():
-            # ExpressionEvaluationError carries two different facts. Chained from
-            # KeyError/IndexError it means the PATH does not fit THIS entry — a
-            # sparse table is legitimate — so that becomes _UNRESOLVED and is
-            # governed by on_miss. Chained from anything else (ZeroDivisionError,
-            # ValueError, a TypeError out of a call or comparison) the expression is
-            # BROKEN for this entry, and swallowing it would hide an author error
-            # behind a miss that on_miss cannot tell apart from sparseness.
+            # ExpressionEvaluationError carries two different facts, told apart by
+            # its value-free ``kind``. ``missing_key`` / ``index_out_of_range``
+            # mean the PATH does not fit THIS entry — a sparse table is
+            # legitimate — so that becomes _UNRESOLVED and is governed by
+            # on_miss. Any other kind (division by zero, an invalid value, a type
+            # error out of a call or comparison) means the expression is BROKEN
+            # for this entry, and swallowing it would hide an author error behind
+            # a miss that on_miss cannot tell apart from sparseness.
             # KeyError/TypeError are deliberately NOT caught: expression_parser
             # re-raises those as evaluator bugs that must crash through.
             try:
                 values[field_name] = parser.evaluate({REFERENCE_ENTRY_NAME: entry})
             except ExpressionEvaluationError as exc:
-                if not isinstance(exc.__cause__, KeyError | IndexError):
+                if exc.kind not in ("missing_key", "index_out_of_range"):
                     raise ReferenceTableError(
                         f"output field {field_name!r} failed to evaluate against reference entry "
                         f"{key!r} (position {position}): {exc}. That is a broken expression rather "
@@ -525,7 +562,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ca3fb9ffcf8366c2"
+    source_file_hash: str | None = "sha256:f6caccc517971b90"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -596,8 +633,17 @@ class ReferenceJoin(BaseTransform):
                 composer_hints=(
                     "The reference table is configuration, not a source: it is fixed when the run starts and is not fetched.",
                     "On the CLI use reference_file: <name>.csv beside settings.yaml; the loader reads it into reference_content.",
-                    "In the composer there is no filesystem: create_blob with the table bytes, then "
-                    "wire_blob_inline_ref at field_path 'node:<node_id>.options.reference_content'. "
+                    "In the composer, discover an uploaded ready table with list_blobs and get_blob_metadata. "
+                    "Wire it with wire_blob_inline_ref at 'node:<node_id>.options.reference_content'.",
+                    "Use create_blob only for table bytes you create. Set reference_format explicitly to csv or json; "
+                    "the blob filename does not infer it.",
+                    "CSV cells remain strings, including numeric-looking cells such as 24. JSON numbers retain numeric types. "
+                    "A field_mapper or sink schema does not convert these values.",
+                    "Keep downstream fields as str when acceptable, or insert type_coerce after the join before a numeric consumer. "
+                    "For example, conversions: [{field: amount, to: int}] converts a joined amount field; "
+                    "its schema declares the arriving str, not the converted int.",
+                    "Never replace a supplied CSV with JSON to repair types. Use a typed JSON table only when the user's data "
+                    "requirements permit that format; otherwise preserve the table and explicitly convert the joined fields.",
                     "Pasting a table as a literal option value hits the inline byte cap.",
                     "Output expressions see ONLY the matched entry as 'ref'. row[...] is not in scope here and is rejected "
                     "at config load, and a bare column name is not an expression — write ref['description'].",
@@ -655,12 +701,13 @@ class ReferenceJoin(BaseTransform):
                     {
                         "reason": "reference_miss",
                         "field": self._key_field,
-                        "reference_key_value": key,
                         "unresolved_fields": missed,
+                        # The join key is row data: it stays in the row carrier,
+                        # never in the reason (the key field is named above).
                         "error": (
-                            f"no reference entry for {key!r}{self._reference_origin}"
+                            f"no reference entry for the row's {self._key_field!r}{self._reference_origin}"
                             if entry is None
-                            else f"reference entry {key!r}{self._reference_origin} did not resolve {missed}"
+                            else f"the reference entry for the row's {self._key_field!r}{self._reference_origin} did not resolve {missed}"
                         ),
                     },
                     retryable=False,

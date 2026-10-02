@@ -22,6 +22,8 @@ import dataclasses
 import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from itertools import count
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -121,9 +123,8 @@ class _FakeReader(SqlReader):
             return self._replicas.epoch
         if "owner_instance_id" in statement:
             return self._replicas.owner
-        if "clock_timestamp" in statement:
-            return datetime(2026, 9, 5, 10, 0, tzinfo=UTC)
-        if "count(*) FROM guided_operations" in statement:
+        if "count(*) FROM message_ingress_receipts" in statement:
+            assert parameters["client_request_id"]
             return 1
         raise AssertionError(statement)
 
@@ -132,7 +133,7 @@ class _FakeReader(SqlReader):
         if statement.startswith("SELECT id FROM runs"):
             return ((f"run-{self._replicas.run_counter}",),) if self._replicas.run_counter else ()
         if "landscape_run_id" in statement:
-            return ((f"landscape-{self._replicas.run_counter}",),)
+            return ((f"landscape-{self._replicas.run_counter}",),) if self._replicas.run_counter else ()
         if statement.startswith("SELECT run_id FROM runs"):
             return () if self.landscape_missing else ((parameters["run_id"],),)
         if "web_instances" in statement:
@@ -200,7 +201,16 @@ def _driver(replicas: _RecordedReplicas) -> tuple[ReplicaProbeDriver, _FakeReade
         )
 
     observer = PostgresEvidenceObserver(sessions=reader, landscape=reader)
-    return ReplicaProbeDriver(controller=_controller(), observer=observer, client_factory=client_factory), reader
+    dispatch_ticks = count()
+    clock_lock = threading.Lock()
+
+    def clock() -> float:
+        # Recorded transports supply deterministic dispatch observations;
+        # operational probes retain the real monotonic clock and 5 ms gate.
+        with clock_lock:
+            return next(dispatch_ticks) / 1024.0
+
+    return ReplicaProbeDriver(controller=_controller(), observer=observer, client_factory=client_factory, clock=clock), reader
 
 
 # --------------------------------------------------------------------------- P1 / P2 against recorded transports
@@ -213,9 +223,13 @@ class TestFenceConflictRecorded:
         trials = []
         for _ in range(20):
             replicas.reset()
+            request_id = str(uuid4())
             trials.append(
                 driver.fence_conflict_trial(
-                    "session-1", ProbeRequest("POST", "/api/sessions/session-1/guided/respond", {"turn_token": "0" * 64})
+                    "session-1",
+                    ProbeRequest(
+                        "POST", "/api/sessions/session-1/messages", {"content": "Build a pipeline", "client_request_id": request_id}
+                    ),
                 )
             )
         for trial in trials:
@@ -232,20 +246,34 @@ class TestFenceConflictRecorded:
     def test_a_double_dispatch_fails_the_probe(self) -> None:
         replicas = _RecordedReplicas(both_win=True)
         driver, _reader = _driver(replicas)
-        trial = driver.fence_conflict_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/guided/respond", {}))
+        trial = driver.fence_conflict_trial(
+            "session-1", ProbeRequest("POST", "/api/sessions/session-1/messages", {"client_request_id": str(uuid4())})
+        )
         assert [response.status for response in trial.responses] == [200, 200]
-        result = decide_fence_conflict([trial], required_trials=1)
+        result = decide_fence_conflict([trial])
         assert result.outcome == "fail" and "trial[0]:not_one_success_and_one_fence_refusal" in result.reasons
 
     def test_two_labels_answered_by_one_instance_fail_the_probe(self) -> None:
         replicas = _RecordedReplicas(same_instance=True)
         driver, _reader = _driver(replicas)
-        trial = driver.fence_conflict_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/guided/respond", {}))
-        result = decide_fence_conflict([trial], required_trials=1)
+        trial = driver.fence_conflict_trial(
+            "session-1", ProbeRequest("POST", "/api/sessions/session-1/messages", {"client_request_id": str(uuid4())})
+        )
+        result = decide_fence_conflict([trial])
         assert "trial[0]:instances_not_distinct" in result.reasons
 
 
 class TestRunStartRecorded:
+    def test_reusing_a_previously_executed_session_is_rejected(self) -> None:
+        replicas = _RecordedReplicas()
+        driver, _reader = _driver(replicas)
+        request = ProbeRequest("POST", "/api/sessions/session-1/execute", {})
+        driver.run_start_trial("session-1", request)
+        replicas.reset()
+        with pytest.raises(AcceptanceCheckError, match="probe_session_not_fresh"):
+            driver.run_start_trial("session-1", request)
+        assert replicas.run_counter == 1
+
     def test_one_run_id_across_both_responses_and_no_permit_row_field(self) -> None:
         replicas = _RecordedReplicas()
         driver, reader = _driver(replicas)
@@ -261,15 +289,17 @@ class TestRunStartRecorded:
             "dispatch_spread_ms",
         }
         assert not any("run_start_permits" in statement for statement in reader.statements)
-        assert decide_run_start([trial], required_trials=1).outcome == "pass"
+        assert decide_run_start([trial]).outcome == "fail", "one trial is insufficient acceptance evidence"
 
     def test_a_landscape_run_that_does_not_exist_is_not_counted(self) -> None:
         replicas = _RecordedReplicas()
         driver, reader = _driver(replicas)
         reader.landscape_missing = True
-        trial = driver.run_start_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/execute", {}))
+        trial = driver.run_start_trial(
+            "session-1", ProbeRequest("POST", "/api/sessions/session-1/execute", {}), observation_timeout_seconds=0
+        )
         assert trial.landscape_run_ids == ()
-        assert "trial[0]:landscape_runs:0!=1" in decide_run_start([trial], required_trials=1).reasons
+        assert "trial[0]:landscape_runs:0!=1" in decide_run_start([trial]).reasons
 
 
 # --------------------------------------------------------------------------- P3 / P4 decision tables
@@ -295,6 +325,14 @@ def _takeover(**overrides: object) -> LeaseTakeoverObservation:
 
 
 class TestLeaseTakeover:
+    def test_before_expiry_refusal_must_come_from_survivor(self) -> None:
+        wrong_instance = replica_response_from_envelope(
+            addressed_to="b", status=409, instance_id="third-instance", body={"detail": SESSION_OPERATION_CONFLICT_DETAIL}
+        )
+        result = decide_lease_takeover(_takeover(before_expiry=wrong_instance))
+        assert result.outcome == "fail"
+        assert "before_expiry_response_not_from_survivor" in result.reasons
+
     def test_a_dead_owner_takeover_after_expiry_passes_and_validates_as_a_receipt(self) -> None:
         result = lease_takeover_for_receipt(decide_lease_takeover(_takeover()))
         assert result.outcome == "pass" and result.mechanism == "role_revocation_lease_expiry"
@@ -448,16 +486,13 @@ class TestController:
 
 
 class TestObserver:
-    def test_guided_operation_rows_needs_the_epoch_reading_taken_before_the_trial(self) -> None:
+    def test_message_ingress_receipt_rows_is_scoped_to_the_exact_request(self) -> None:
         replicas = _RecordedReplicas()
         reader = _FakeReader(replicas)
         observer = PostgresEvidenceObserver(sessions=reader, landscape=reader)
-        with pytest.raises(AcceptanceInputError):
-            observer.guided_operation_rows("session-1", since_epoch=3)
-        assert observer.fence_epoch("session-1") == 3
-        assert observer.guided_operation_rows("session-1", since_epoch=3) == 1
-        with pytest.raises(AcceptanceInputError):
-            observer.guided_operation_rows("session-1", since_epoch=2)
+        request_id = str(uuid4())
+        assert observer.message_ingress_receipt_rows("session-1", client_request_id=request_id) == 1
+        assert any("count(*) FROM message_ingress_receipts" in statement for statement in reader.statements)
 
     def test_membership_row_reads_the_owner_row_or_none(self) -> None:
         reader = _FakeReader(_RecordedReplicas())

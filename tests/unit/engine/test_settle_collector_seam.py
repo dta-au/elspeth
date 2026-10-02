@@ -36,6 +36,7 @@ from elspeth.engine.executors.collector import CollectorOutcome
 from elspeth.engine.processor import CollectorRelease
 from elspeth.engine.work_items import WorkItem, WorkItemFactory
 from elspeth.testing import make_contract, make_token_info
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 from tests.unit.engine.test_barrier_coordination import (
     FakeNav,
     RecordingAggregationExecutor,
@@ -269,6 +270,7 @@ def _coordinator(
     resume_checkpoint_id: str | None = None,
 ) -> BarrierIntakeCoordinator:
     nav = FakeNav(transform=_batch_aware_transform())
+    setup = make_recorder_with_run(run_id="run-1", leader_worker_id="leader-1")
     return BarrierIntakeCoordinator(
         run_id="run-1",
         scheduler=scheduler,
@@ -286,7 +288,7 @@ def _coordinator(
         aggregation_settings={},
         coalesce_node_ids={},
         branch_to_coalesce={},
-        coordination_token=SimpleNamespace(worker_id="leader-1", epoch=1),
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         scheduler_lease_owner="leader-1",
         live_barrier_holds={},
         resume_checkpoint_id=resume_checkpoint_id,
@@ -294,7 +296,7 @@ def _coordinator(
         complete_coalesce_fire=lambda **kwargs: None,
         terminal_coalesce_row_result=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("not reached")),
         emit_token_completed=recorder.emit_token_completed,
-        mark_coalesce_consumed_terminal=lambda *, coalesce_name, consumed_tokens: None,
+        settle_failed_coalesce_group=lambda consumed_tokens, **kwargs: [],
         record_group_member_terminals=recorder.record_group_member_terminals,
         take_pending_group_losses=recorder.take_pending_group_losses,
         collector_executor=executor,  # type: ignore[arg-type]
@@ -400,6 +402,9 @@ class TestDispatchFailure:
                 "child_items": [],
                 "group_failed": True,
                 "frame_kind": FrameKind.EXPAND,
+                # Live: no member carries a prior terminal (a resumed recorded
+                # verdict may; elspeth-5887fb7928 CODEX-R2).
+                "already_terminal": frozenset(),
             }
         ]
         assert scheduler.calls == ["release"]
@@ -692,7 +697,8 @@ class TestCollectorMemberCountersMeta32:
         )
         released = make_token_info(row_id="row-1", token_id="tok-out")
         _persist_token_for_scheduler(factory, released)
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(factory, "test-run"),
             ref=TokenRef(token_id="tok-out", run_id="test-run"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
@@ -752,22 +758,31 @@ class TestSeamTruncatesThroughReleaseFramesMeta38:
 
         factory, proc = _seam_processor()
         run_id = "test-run"
-        row = factory.data_flow.create_row(run_id, "source-0", 1, {"seed": 1}, source_row_index=1, ingest_sequence=1)
-        root = factory.data_flow.create_token(row_id=row.row_id)
+        row, root = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run_id),
+            source_node_id="source-0",
+            row_index=1,
+            data={"seed": 1},
+            source_row_index=1,
+            ingest_sequence=1,
+        )
         contract = make_contract()
         outer_members, outer_gid = factory.data_flow.expand_token(
+            member_token=leader_coordination_token(factory, run_id).membership,
             parent_ref=TokenRef(token_id=root.token_id, run_id=run_id),
             row_id=row.row_id,
             child_payloads=[{"p": 0}],
             output_contract=contract,
         )
         inner_members, inner_gid = factory.data_flow.expand_token(
+            member_token=leader_coordination_token(factory, run_id).membership,
             parent_ref=TokenRef(token_id=outer_members[0].token_id, run_id=run_id),
             row_id=row.row_id,
             child_payloads=[{"s": 0}],
             output_contract=contract,
         )
         committed = factory.data_flow.collect_tokens(
+            coordination_token=leader_coordination_token(factory, run_id),
             member_refs=[TokenRef(token_id=inner_members[0].token_id, run_id=run_id)],
             group_id=inner_gid,
             collector_node_id="collector-inner",

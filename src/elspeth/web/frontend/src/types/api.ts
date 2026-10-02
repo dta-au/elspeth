@@ -80,17 +80,18 @@ export type {
 // (trust_mode / density_default) re-exported above. The name disambiguator is
 // the `User*` prefix — see plan 13 Task 1 review history for the rationale.
 
-export type ComposerMode = "guided" | "freeform";
-
 // First-run tutorial resume stage (elspeth-918f4434b3). Mirrors the
 // backend `TutorialStage` Literal (preferences/models.py) — the frontend
 // TutorialStep union minus "welcome" (never persisted; null is the
 // no-in-progress-tutorial state).
-export type PersistedTutorialStage = "guided" | "run" | "audit" | "graduation";
+export type PersistedTutorialStage = "build" | "run" | "audit" | "graduation";
+
+/** Runtime-served sample pages for the ordinary freeform tutorial brief. */
+export interface TutorialSampleResponse {
+  sample_urls: string[];
+}
 
 export interface UserComposerPreferencesPayload {
-  default_mode: ComposerMode;
-  banner_dismissed_at: string | null;
   freeform_intro_dismissed_at: string | null;
   tutorial_completed_at: string | null;
   // In-progress tutorial resume state; all four null when no tutorial is
@@ -111,8 +112,6 @@ export interface UserComposerPreferencesPayload {
 }
 
 export interface UpdateUserComposerPreferencesPayload {
-  default_mode?: ComposerMode;
-  banner_dismissed_at?: string | null;
   freeform_intro_dismissed_at?: string | null;
   tutorial_completed_at?: string | null;
   // Absent = unchanged; explicit null = clear. Setting (or clearing)
@@ -123,16 +122,20 @@ export interface UpdateUserComposerPreferencesPayload {
   tutorial_run_id?: string | null;
   tutorial_source_data_hash?: string | null;
   show_advanced?: boolean;
-  // Request-only telemetry discriminator: marks a completion write as an
-  // explicit in-tutorial exit (elspeth-61591e64bb). Only valid alongside a
-  // non-null tutorial_completed_at in the same PATCH; never echoed back.
-  tutorial_completed_via?: "exit";
+  // Request-only completion provenance. A non-null completion requires this
+  // discriminator for a non-null completion; never echoed back.
+  tutorial_completed_via?: "complete" | "skip" | "exit";
 }
 
 // ── First-run tutorial (Phase 4) ───────────────────────────────────────────
 
 export interface TutorialRunRequest {
   session_id: string;
+}
+
+/** Read-only admission of the exact saved state that Run will recheck. */
+export interface TutorialReadinessResponse {
+  state_id: string;
 }
 
 /** Response of POST /api/tutorial/cancel. Idempotent best-effort cancel:
@@ -229,16 +232,14 @@ export interface SharedInspectResponse {
   audit_readiness: _AuditReadinessSnapshot;
   /**
    * Opaque identity id of the sharer — what the share token's signature
-   * binds. Not human-readable; do not render it as a name except as the
-   * legacy fallback described on `created_by_username`.
+   * binds. Not human-readable; do not render it as a name.
    */
   created_by_user_id: string;
   /**
    * Human-readable name of the sharer, frozen into the snapshot at
-   * mark-time. `null` for snapshots minted before the backend carried it;
-   * those blobs are immutable signed bytes and cannot be backfilled.
+   * mark-time.
    */
-  created_by_username: string | null;
+  created_by_username: string;
   created_at: string;
   expires_at: string;
 }
