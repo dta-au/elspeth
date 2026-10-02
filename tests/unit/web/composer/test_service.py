@@ -8,11 +8,12 @@ import itertools
 import json
 import threading
 import tracemalloc
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 from uuid import UUID, uuid4
@@ -4586,6 +4587,15 @@ class TestEmptyChoicesValidation:
         assert mock_acomp.call_count == 2
 
 
+@contextlib.contextmanager
+def _mock_composer_retry_sleep() -> Iterator[AsyncMock]:
+    """Observe service backoff without replacing worker or SDK scheduler sleeps."""
+    retry_sleep = AsyncMock(spec=asyncio.sleep)
+    retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep}))
+    with patch("elspeth.web.composer.service.asyncio", new=retry_asyncio):
+        yield retry_sleep
+
+
 class TestComposerAvailabilityAndBadRequest:
     """Readiness and LiteLLM bad-request failures are normalized by the service."""
 
@@ -4798,13 +4808,14 @@ class TestComposerAvailabilityAndBadRequest:
                 new_callable=AsyncMock,
                 side_effect=[transient_error, success],
             ) as mock_llm,
-            patch("elspeth.web.composer.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            _mock_composer_retry_sleep() as mock_sleep,
         ):
             result = await service.compose("Hello", [], state, session_id=session_id)
 
         assert result.message == "Recovered."
         assert mock_llm.call_count == 2
         mock_sleep.assert_awaited_once()
+        mock_sleep.assert_awaited_once_with(1.0)
 
     @pytest.mark.asyncio
     async def test_real_service_unavailable_is_eligible_for_bounded_retry(self) -> None:
@@ -4816,13 +4827,14 @@ class TestComposerAvailabilityAndBadRequest:
             patch(
                 "litellm.acompletion", new_callable=AsyncMock, side_effect=[failure, _make_raw_llm_response(content="Recovered.")]
             ) as mock_llm,
-            patch("elspeth.web.composer.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            _mock_composer_retry_sleep() as mock_sleep,
         ):
             result = await service.compose("Hello", [], _empty_state(), session_id=session_id)
 
         assert result.message == "Recovered."
         assert mock_llm.call_count == 2
         mock_sleep.assert_awaited_once()
+        mock_sleep.assert_awaited_once_with(1.0)
 
     @pytest.mark.asyncio
     async def test_real_bad_gateway_is_not_retried(self) -> None:
@@ -4832,7 +4844,7 @@ class TestComposerAvailabilityAndBadRequest:
         failure = BadGatewayError(message="private upstream response", llm_provider="openrouter", model="openrouter/openai/gpt-5.5")
         with (
             patch("litellm.acompletion", new_callable=AsyncMock, side_effect=failure) as mock_llm,
-            patch("elspeth.web.composer.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            _mock_composer_retry_sleep() as mock_sleep,
             pytest.raises(BadGatewayError),
         ):
             await service.compose("Hello", [], _empty_state(), session_id=session_id)
@@ -4893,7 +4905,7 @@ class TestComposerAvailabilityAndBadRequest:
         failure = LiteLLMTimeout(message="private timeout body", model="openrouter/openai/gpt-5.5", llm_provider="openrouter")
         with (
             patch("litellm.acompletion", new_callable=AsyncMock, side_effect=failure) as mock_llm,
-            patch("elspeth.web.composer.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            _mock_composer_retry_sleep() as mock_sleep,
             pytest.raises(ComposerConvergenceError) as caught,
         ):
             await service.compose("Hello", [], _empty_state(), session_id=session_id)
@@ -4937,7 +4949,7 @@ class TestComposerAvailabilityAndBadRequest:
                 new_callable=AsyncMock,
                 side_effect=bad_request,
             ) as mock_llm,
-            patch("elspeth.web.composer.service.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            _mock_composer_retry_sleep() as mock_sleep,
             pytest.raises(_BadRequestLLMError),
         ):
             await service.compose("Hello", [], state, session_id=session_id)
