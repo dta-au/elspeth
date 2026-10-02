@@ -27,6 +27,10 @@ are critical for audit integrity:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from hypothesis import HealthCheck, given, settings
@@ -43,7 +47,6 @@ from elspeth.engine.processor import MAX_WORK_QUEUE_ITERATIONS
 from elspeth.plugins.transforms.batch_replicate import BatchReplicateConfig
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.plugins import CollectSink, ConditionalErrorTransform, ListSource, PassTransform
 from tests.fixtures.stores import MockPayloadStore
 from tests.strategies.json import MAX_SAFE_INT
@@ -51,6 +54,17 @@ from tests.strategies.json import MAX_SAFE_INT
 # =============================================================================
 # Audit Verification Helpers
 # =============================================================================
+
+
+@contextmanager
+def _pipeline_db() -> Iterator[LandscapeDB]:
+    """Own a file-backed database for each example's live heartbeat."""
+    with TemporaryDirectory(prefix="processor-pipeline-") as directory:
+        db = LandscapeDB.from_url(f"sqlite:///{Path(directory) / 'landscape.db'}")
+        try:
+            yield db
+        finally:
+            db.close()
 
 
 def _build_production_graph(config: PipelineConfig) -> ExecutionGraph:
@@ -247,7 +261,7 @@ class TestWorkQueueConservation:
 
         This is work conservation - no silent drops allowed.
         """
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"id": i, "value": f"row_{i}"} for i in range(num_rows)]
 
@@ -278,7 +292,7 @@ class TestWorkQueueConservation:
     @settings(max_examples=30, deadline=None)
     def test_multi_transform_pipeline_conserves_rows(self, num_rows: int, num_transforms: int) -> None:
         """Property: Row count preserved through N transforms."""
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"id": i} for i in range(num_rows)]
 
@@ -311,7 +325,7 @@ class TestWorkQueueConservation:
         Transform errors don't cause tokens to vanish - they're routed to
         quarantine and recorded with the QUARANTINED outcome.
         """
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             source = ListSource(rows)
             transform = ConditionalErrorTransform()
@@ -358,7 +372,7 @@ class TestWorkQueueConservation:
         """
         from elspeth.core.config import ElspethSettings
 
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"value": i} for i in range(num_rows)]
             source = ListSource(rows, on_success="route_in")
@@ -424,7 +438,7 @@ class TestOrderCorrectnessProperties:
         The step_index values for transforms should be monotonically increasing,
         starting at 1. Note: sink execution may add additional step at the end.
         """
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"id": 0}]  # Single row for clear ordering
 
@@ -481,7 +495,7 @@ class TestOrderCorrectnessProperties:
 
         While the work queue is FIFO, source order determines initial queue order.
         """
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"id": i, "sequence": i} for i in range(num_rows)]
 
@@ -508,7 +522,7 @@ class TestOrderCorrectnessProperties:
     @settings(max_examples=30, deadline=None)
     def test_no_transform_pipeline_preserves_order(self, num_rows: int) -> None:
         """Property: Even with no transforms, source order is preserved."""
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"id": i, "order": i} for i in range(num_rows)]
 
@@ -565,7 +579,7 @@ class TestIterationGuardProperties:
         Even with many rows and transforms, legitimate pipelines should
         stay well under MAX_WORK_QUEUE_ITERATIONS.
         """
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"id": i} for i in range(num_rows)]
 
@@ -595,7 +609,7 @@ class TestIterationGuardProperties:
         """
         from elspeth.core.config import ElspethSettings
 
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"value": i} for i in range(num_rows)]
             source = ListSource(rows, on_success="route_in")
@@ -651,7 +665,7 @@ class TestTokenIdentityProperties:
 
         No two tokens in the same run should have the same token_id.
         """
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"id": i} for i in range(num_rows)]
 
@@ -684,7 +698,7 @@ class TestTokenIdentityProperties:
         """
         from elspeth.core.config import ElspethSettings
 
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"value": i} for i in range(num_rows)]
             source = ListSource(rows, on_success="route_in")
@@ -749,7 +763,7 @@ class TestTokenIdentityProperties:
 
         A token's row_id identifies its source row and should never change.
         """
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"id": i} for i in range(num_rows)]
 
@@ -809,7 +823,7 @@ class TestWorkQueueEdgeCases:
 
     def test_empty_source_no_work_items(self) -> None:
         """Edge case: Empty source creates no work items."""
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             source = ListSource([])  # Empty
             transform = PassTransform()
@@ -837,7 +851,7 @@ class TestWorkQueueEdgeCases:
 
     def test_single_row_single_transform(self) -> None:
         """Edge case: Minimal pipeline (1 row, 1 transform)."""
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"id": 0}]
 
@@ -862,7 +876,7 @@ class TestWorkQueueEdgeCases:
     @settings(max_examples=20, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
     def test_all_rows_error_all_quarantined(self, num_rows: int) -> None:
         """Edge case: When all rows error, all reach QUARANTINED."""
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             # All rows will error
             rows = [{"id": i, "fail": True} for i in range(num_rows)]
@@ -912,7 +926,7 @@ class TestWorkQueueEdgeCases:
         """
         from elspeth.core.config import ElspethSettings
 
-        with make_landscape_db() as db:
+        with _pipeline_db() as db:
             payload_store = MockPayloadStore()
             rows = [{"value": i} for i in range(num_rows)]
             source = ListSource(rows, on_success="default")

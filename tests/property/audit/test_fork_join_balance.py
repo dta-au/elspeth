@@ -20,8 +20,12 @@ Fork terminology:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import fields as dataclass_fields
 from datetime import UTC
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import pytest
@@ -56,6 +60,22 @@ from tests.fixtures.plugins import (
 )
 from tests.fixtures.stores import MockPayloadStore
 from tests.helpers.checkpoint import create_checkpoint
+
+
+@contextmanager
+def _runtime_landscape_db() -> Iterator[LandscapeDB]:
+    """Give each runtime example independent connections for its live heartbeat.
+
+    Keep the database open through final audit queries and recovery, then dispose
+    its connections before removing the example's temporary directory.
+    """
+    with TemporaryDirectory(prefix="elspeth-fork-join-") as directory:
+        db = LandscapeDB(f"sqlite:///{Path(directory) / 'landscape.db'}")
+        try:
+            yield db
+        finally:
+            db.close()
+
 
 # =============================================================================
 # Audit Verification Helpers
@@ -458,79 +478,79 @@ class TestForkJoinRuntimeBalance:
         """
         from elspeth.core.config import ElspethSettings
 
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        rows = [{"value": i} for i in range(n_rows)]
-        source = ListSource(rows, on_success="sink_a")
-        sink_a = CollectSink("sink_a")
-        sink_b = CollectSink("sink_b")
+            rows = [{"value": i} for i in range(n_rows)]
+            source = ListSource(rows, on_success="sink_a")
+            sink_a = CollectSink("sink_a")
+            sink_b = CollectSink("sink_b")
 
-        # Gate that forks all rows to both sinks
-        gate = GateSettings(
-            name="fork_gate",
-            input="gate_in",
-            condition="True",
-            routes={"true": "fork", "false": "sink_a"},
-            fork_to=["sink_a", "sink_b"],
-        )
+            # Gate that forks all rows to both sinks
+            gate = GateSettings(
+                name="fork_gate",
+                input="gate_in",
+                condition="True",
+                routes={"true": "fork", "false": "sink_a"},
+                fork_to=["sink_a", "sink_b"],
+            )
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+            )
 
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(source)},
-            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-            aggregations={},
-            coalesce_settings=[],
-        )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(source)},
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+                aggregations={},
+                coalesce_settings=[],
+            )
 
-        # Settings needed for fork execution
-        settings_obj = ElspethSettings(
-            sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
-            sinks={
-                "sink_a": {"plugin": "test", "on_write_failure": "discard"},
-                "sink_b": {"plugin": "test", "on_write_failure": "discard"},
-            },
-            gates=[gate],
-        )
+            # Settings needed for fork execution
+            settings_obj = ElspethSettings(
+                sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
+                sinks={
+                    "sink_a": {"plugin": "test", "on_write_failure": "discard"},
+                    "sink_b": {"plugin": "test", "on_write_failure": "discard"},
+                },
+                gates=[gate],
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
 
-        # Verify fork audit integrity
-        missing_parents = count_fork_children_missing_parents(db, run.run_id)
-        assert missing_parents == 0, (
-            f"FORK AUDIT VIOLATION: {missing_parents} fork children missing parent links. Rows: {n_rows}. Fork lineage would be incomplete."
-        )
+            # Verify fork audit integrity
+            missing_parents = count_fork_children_missing_parents(db, run.run_id)
+            assert missing_parents == 0, (
+                f"FORK AUDIT VIOLATION: {missing_parents} fork children missing parent links. Rows: {n_rows}. Fork lineage would be incomplete."
+            )
 
-        # Verify FORKED outcomes recorded for parent tokens
-        forked_count = count_forked_outcomes(db, run.run_id)
-        assert forked_count == n_rows, f"Expected {n_rows} FORKED outcomes (one per parent token), got {forked_count}"
+            # Verify FORKED outcomes recorded for parent tokens
+            forked_count = count_forked_outcomes(db, run.run_id)
+            assert forked_count == n_rows, f"Expected {n_rows} FORKED outcomes (one per parent token), got {forked_count}"
 
-        # Verify fork statistics
-        stats = get_fork_group_stats(db, run.run_id)
-        expected_children_per_group = len(gate.fork_to or [])
-        expected_children_total = n_rows * expected_children_per_group
-        assert stats["total_fork_children"] == stats["children_with_parents"], (
-            f"Not all fork children have parents: {stats['children_with_parents']}/{stats['total_fork_children']}"
-        )
-        assert stats["total_fork_children"] == expected_children_total, (
-            f"Expected {expected_children_total} fork children (rows={n_rows}, branches={expected_children_per_group}), "
-            f"got {stats['total_fork_children']}."
-        )
-        assert stats["total_fork_groups"] == n_rows, (
-            f"Expected {n_rows} fork groups (one per parent token), got {stats['total_fork_groups']}."
-        )
-        bad_groups = count_fork_groups_with_unexpected_children(db, run.run_id, expected_children=expected_children_per_group)
-        assert bad_groups == 0, f"{bad_groups} fork groups have unexpected child counts."
+            # Verify fork statistics
+            stats = get_fork_group_stats(db, run.run_id)
+            expected_children_per_group = len(gate.fork_to or [])
+            expected_children_total = n_rows * expected_children_per_group
+            assert stats["total_fork_children"] == stats["children_with_parents"], (
+                f"Not all fork children have parents: {stats['children_with_parents']}/{stats['total_fork_children']}"
+            )
+            assert stats["total_fork_children"] == expected_children_total, (
+                f"Expected {expected_children_total} fork children (rows={n_rows}, branches={expected_children_per_group}), "
+                f"got {stats['total_fork_children']}."
+            )
+            assert stats["total_fork_groups"] == n_rows, (
+                f"Expected {n_rows} fork groups (one per parent token), got {stats['total_fork_groups']}."
+            )
+            bad_groups = count_fork_groups_with_unexpected_children(db, run.run_id, expected_children=expected_children_per_group)
+            assert bad_groups == 0, f"{bad_groups} fork groups have unexpected child counts."
 
 
 class TestForkJoinEnumProperties:
@@ -560,79 +580,79 @@ class TestForkJoinEdgeCases:
 
     def test_no_fork_no_fork_groups(self) -> None:
         """Pipeline without forks should have no fork groups."""
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        source = ListSource([{"value": 1}, {"value": 2}])
-        transform = PassTransform()
-        sink = CollectSink()
+            source = ListSource([{"value": 1}, {"value": 2}])
+            transform = PassTransform()
+            sink = CollectSink()
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(transform)],
-            sinks={"default": as_sink(sink)},
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[as_transform(transform)],
+                sinks={"default": as_sink(sink)},
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
 
-        stats = get_fork_group_stats(db, run.run_id)
-        assert stats["total_fork_groups"] == 0
-        assert stats["total_fork_children"] == 0
+            stats = get_fork_group_stats(db, run.run_id)
+            assert stats["total_fork_groups"] == 0
+            assert stats["total_fork_children"] == 0
 
     def test_empty_source_no_fork_issues(self) -> None:
         """Empty source with fork config should not cause issues."""
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        source = ListSource([], on_success="sink_a")  # Empty
-        sink_a = CollectSink("sink_a")
-        sink_b = CollectSink("sink_b")
+            source = ListSource([], on_success="sink_a")  # Empty
+            sink_a = CollectSink("sink_a")
+            sink_b = CollectSink("sink_b")
 
-        gate = GateSettings(
-            name="fork_gate",
-            input="gate_in",
-            condition="True",
-            routes={"true": "fork", "false": "sink_a"},
-            fork_to=["sink_a", "sink_b"],
-        )
+            gate = GateSettings(
+                name="fork_gate",
+                input="gate_in",
+                condition="True",
+                routes={"true": "fork", "false": "sink_a"},
+                fork_to=["sink_a", "sink_b"],
+            )
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+            )
 
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(source)},
-            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-            aggregations={},
-            coalesce_settings=[],
-        )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(source)},
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+                aggregations={},
+                coalesce_settings=[],
+            )
 
-        from elspeth.core.config import ElspethSettings
+            from elspeth.core.config import ElspethSettings
 
-        settings_obj = ElspethSettings(
-            sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
-            sinks={
-                "sink_a": {"plugin": "test", "on_write_failure": "discard"},
-                "sink_b": {"plugin": "test", "on_write_failure": "discard"},
-            },
-            gates=[gate],
-        )
+            settings_obj = ElspethSettings(
+                sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
+                sinks={
+                    "sink_a": {"plugin": "test", "on_write_failure": "discard"},
+                    "sink_b": {"plugin": "test", "on_write_failure": "discard"},
+                },
+                gates=[gate],
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
 
-        # No rows means no forks
-        stats = get_fork_group_stats(db, run.run_id)
-        assert stats["total_fork_groups"] == 0
-        missing = count_fork_children_missing_parents(db, run.run_id)
-        assert missing == 0
+            # No rows means no forks
+            stats = get_fork_group_stats(db, run.run_id)
+            assert stats["total_fork_groups"] == 0
+            missing = count_fork_children_missing_parents(db, run.run_id)
+            assert missing == 0
 
 
 class TestForkRecoveryInvariant:
@@ -1115,10 +1135,11 @@ class TestForkRecoveryInvariant:
     # ─────────────────────────────────────────────────────────────────────
 
     @staticmethod
+    @contextmanager
     def _build_end_of_source_flush_aggregation(
         n_source_rows: int,
         trigger_count: int | None = None,
-    ) -> tuple[LandscapeDB, PipelineConfig, ExecutionGraph, ElspethSettings]:
+    ) -> Iterator[tuple[LandscapeDB, PipelineConfig, ExecutionGraph, ElspethSettings]]:
         """Build a fresh source(N rows) → batch aggregation → sink pipeline.
 
         ``trigger_count`` is the aggregation's ``count`` trigger. Default
@@ -1176,43 +1197,43 @@ class TestForkRecoveryInvariant:
                 total = sum(r.to_dict().get("value", 0) for r in rows)
                 return TransformResult.success(PipelineRow({"sum": total}, rows[0].contract), success_reason={"action": "sum"})
 
-        db = make_landscape_db()
-        src = ListSource([{"value": i + 1} for i in range(n_source_rows)], name="list_source", on_success="agg_in")
-        out = CollectSink("output")
-        agg = _SumAggregator()
-        agg_settings = AggregationSettings(
-            name="sum_agg",
-            plugin=agg.name,
-            input="agg_in",
-            on_success="output",
-            on_error="discard",
-            # Default count > N → never fires mid-stream → all N rows buffer to
-            # end-of-source. trigger_count=N forces the mid-stream-trigger topology.
-            trigger=TriggerConfig(count=trigger_count if trigger_count is not None else n_source_rows + 1, timeout_seconds=3600),
-            output_mode=OutputMode.TRANSFORM,
-        )
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(src)},
-            source_settings_map={"primary": SourceSettings(plugin=src.name, on_success="agg_in", options={})},
-            transforms=[],
-            sinks={"output": as_sink(out)},
-            aggregations={"sum_agg": (as_transform(agg), agg_settings)},
-            gates=[],
-        )
-        agg_id_map = graph.get_aggregation_id_map()
-        agg_node_id = agg_id_map[next(iter(agg_id_map))]
-        agg.node_id = agg_node_id
-        config = PipelineConfig(
-            sources={"primary": as_source(src)},
-            transforms=[as_transform(agg)],
-            sinks={"output": as_sink(out)},
-            aggregation_settings={agg_node_id: agg_settings},
-        )
-        settings = ElspethSettings(
-            sources={"primary": {"plugin": src.name, "on_success": "agg_in", "options": {}}},
-            sinks={"output": {"plugin": "test", "on_write_failure": "discard"}},
-        )
-        return db, config, graph, settings
+        with _runtime_landscape_db() as db:
+            src = ListSource([{"value": i + 1} for i in range(n_source_rows)], name="list_source", on_success="agg_in")
+            out = CollectSink("output")
+            agg = _SumAggregator()
+            agg_settings = AggregationSettings(
+                name="sum_agg",
+                plugin=agg.name,
+                input="agg_in",
+                on_success="output",
+                on_error="discard",
+                # Default count > N → never fires mid-stream → all N rows buffer to
+                # end-of-source. trigger_count=N forces the mid-stream-trigger topology.
+                trigger=TriggerConfig(count=trigger_count if trigger_count is not None else n_source_rows + 1, timeout_seconds=3600),
+                output_mode=OutputMode.TRANSFORM,
+            )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(src)},
+                source_settings_map={"primary": SourceSettings(plugin=src.name, on_success="agg_in", options={})},
+                transforms=[],
+                sinks={"output": as_sink(out)},
+                aggregations={"sum_agg": (as_transform(agg), agg_settings)},
+                gates=[],
+            )
+            agg_id_map = graph.get_aggregation_id_map()
+            agg_node_id = agg_id_map[next(iter(agg_id_map))]
+            agg.node_id = agg_node_id
+            config = PipelineConfig(
+                sources={"primary": as_source(src)},
+                transforms=[as_transform(agg)],
+                sinks={"output": as_sink(out)},
+                aggregation_settings={agg_node_id: agg_settings},
+            )
+            settings = ElspethSettings(
+                sources={"primary": {"plugin": src.name, "on_success": "agg_in", "options": {}}},
+                sinks={"output": {"plugin": "test", "on_write_failure": "discard"}},
+            )
+            yield db, config, graph, settings
 
     def test_resume_buffered_counter_reconciles_with_uninterrupted_run(self) -> None:
         """A resumed aggregation run reconciles EVERY counter field — including
@@ -1285,81 +1306,81 @@ class TestForkRecoveryInvariant:
         n = 3
 
         # ── Run A (uninterrupted oracle) ──────────────────────────────────────
-        db_a, config_a, graph_a, settings_a = self._build_end_of_source_flush_aggregation(n)
-        run_a = Orchestrator(db_a).run(config_a, graph=graph_a, settings=settings_a, payload_store=MockPayloadStore())
-        assert run_a.status == RunStatus.COMPLETED, run_a.status
-        # Non-vacuity precondition: all N rows buffered → rows_buffered == N >= 1.
-        assert run_a.rows_buffered == n, (
-            f"Run A (uninterrupted end-of-source-flush aggregation of {n} rows) must record "
-            f"rows_buffered={n} (one BUFFERED record per input row); got {run_a.rows_buffered}"
-        )
-        assert run_a.rows_buffered >= 1, "non-vacuity precondition"
-
-        # ── Run B (run-1 + interrupt + resume via the all-terminal branch) ────
-        db, config, graph, settings_obj = self._build_end_of_source_flush_aggregation(n)
-        payload_store = MockPayloadStore()
-        run_b1 = Orchestrator(db).run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
-        run_id = run_b1.run_id
-        assert run_b1.rows_buffered == n, run_b1.rows_buffered
-
-        # Interrupt: checkpoint + mark failed, deleting NO outcomes.  Every token
-        # already has its terminal (or non-completed BUFFERED) record and no
-        # scheduler work remains → the no-work finalize branch
-        # reconstructs the cumulative counters from the intact audit trail.
-        reseat_crashed_leader(db, run_id)
-        checkpoint_mgr = CheckpointManager(db)
-        recovery_mgr = RecoveryManager(db, checkpoint_mgr)
-        create_checkpoint(
-            checkpoint_mgr,
-            run_id=run_id,
-            sequence_number=1,
-            barrier_scalars=None,
-            graph=graph,
-        )
-        with db.engine.connect() as conn:
-            conn.execute(
-                text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
-                {"run_id": run_id},
+        with self._build_end_of_source_flush_aggregation(n) as (db_a, config_a, graph_a, settings_a):
+            run_a = Orchestrator(db_a).run(config_a, graph=graph_a, settings=settings_a, payload_store=MockPayloadStore())
+            assert run_a.status == RunStatus.COMPLETED, run_a.status
+            # Non-vacuity precondition: all N rows buffered → rows_buffered == N >= 1.
+            assert run_a.rows_buffered == n, (
+                f"Run A (uninterrupted end-of-source-flush aggregation of {n} rows) must record "
+                f"rows_buffered={n} (one BUFFERED record per input row); got {run_a.rows_buffered}"
             )
-            conn.commit()
+            assert run_a.rows_buffered >= 1, "non-vacuity precondition"
 
-        check = recovery_mgr.can_resume(run_id, graph)
-        assert check.can_resume, f"cannot resume: {check.reason}"
-        resume_point = recovery_mgr.get_resume_point(run_id, graph)
-        assert resume_point is not None
+            # ── Run B (run-1 + interrupt + resume via the all-terminal branch) ────
+            with self._build_end_of_source_flush_aggregation(n) as (db, config, graph, settings_obj):
+                payload_store = MockPayloadStore()
+                run_b1 = Orchestrator(db).run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+                run_id = run_b1.run_id
+                assert run_b1.rows_buffered == n, run_b1.rows_buffered
 
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
-        resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
-        run_b_resume = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
+                # Interrupt: checkpoint + mark failed, deleting NO outcomes.  Every token
+                # already has its terminal (or non-completed BUFFERED) record and no
+                # scheduler work remains → the no-work finalize branch
+                # reconstructs the cumulative counters from the intact audit trail.
+                reseat_crashed_leader(db, run_id)
+                checkpoint_mgr = CheckpointManager(db)
+                recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+                create_checkpoint(
+                    checkpoint_mgr,
+                    run_id=run_id,
+                    sequence_number=1,
+                    barrier_scalars=None,
+                    graph=graph,
+                )
+                with db.engine.connect() as conn:
+                    conn.execute(
+                        text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
+                        {"run_id": run_id},
+                    )
+                    conn.commit()
 
-        # ── Reconciliation: EVERY counter field, non-vacuous on rows_buffered ─
-        assert run_b_resume.status == RunStatus.COMPLETED, (
-            f"Resume of the aggregation pipeline must reach COMPLETED; got {run_b_resume.status}"
-        )
-        assert run_b_resume.rows_buffered >= 1, (
-            f"Resumed aggregation run must record at least one BUFFERED record (non-vacuous); "
-            f"got rows_buffered={run_b_resume.rows_buffered}. If 0, derive's (None, BUFFERED) arm "
-            f"miscounts the persisted BUFFERED records."
-        )
-        assert run_b_resume.rows_buffered == run_a.rows_buffered, (
-            f"rows_buffered must equal the uninterrupted run: A={run_a.rows_buffered}, "
-            f"B={run_b_resume.rows_buffered}. derive reconstructs this purely from the "
-            f"(None, BUFFERED) arm in run_status.py (not grafted); a divergence means that "
-            f"arm regressed or the BUFFERED records were not preserved across resume."
-        )
+                check = recovery_mgr.can_resume(run_id, graph)
+                assert check.can_resume, f"cannot resume: {check.reason}"
+                resume_point = recovery_mgr.get_resume_point(run_id, graph)
+                assert resume_point is not None
 
-        for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
-            assert b_val == a_val, (
-                f"F2 reconciliation failure on '{field}': resumed run (run1 + resume) must equal "
-                f"the uninterrupted run field-for-field. uninterrupted={a_val}, resumed={b_val}. "
-                f"derive_resume_terminal_status_from_audit must reconstruct this field from the "
-                f"audit trail to match the live accumulator."
-            )
+                checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+                resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+                run_b_resume = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
 
-        assert dict(run_b_resume.routed_destinations) == dict(run_a.routed_destinations), (
-            f"F2 reconciliation failure on routed_destinations: "
-            f"uninterrupted={dict(run_a.routed_destinations)}, resumed={dict(run_b_resume.routed_destinations)}"
-        )
+                # ── Reconciliation: EVERY counter field, non-vacuous on rows_buffered ─
+                assert run_b_resume.status == RunStatus.COMPLETED, (
+                    f"Resume of the aggregation pipeline must reach COMPLETED; got {run_b_resume.status}"
+                )
+                assert run_b_resume.rows_buffered >= 1, (
+                    f"Resumed aggregation run must record at least one BUFFERED record (non-vacuous); "
+                    f"got rows_buffered={run_b_resume.rows_buffered}. If 0, derive's (None, BUFFERED) arm "
+                    f"miscounts the persisted BUFFERED records."
+                )
+                assert run_b_resume.rows_buffered == run_a.rows_buffered, (
+                    f"rows_buffered must equal the uninterrupted run: A={run_a.rows_buffered}, "
+                    f"B={run_b_resume.rows_buffered}. derive reconstructs this purely from the "
+                    f"(None, BUFFERED) arm in run_status.py (not grafted); a divergence means that "
+                    f"arm regressed or the BUFFERED records were not preserved across resume."
+                )
+
+                for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
+                    assert b_val == a_val, (
+                        f"F2 reconciliation failure on '{field}': resumed run (run1 + resume) must equal "
+                        f"the uninterrupted run field-for-field. uninterrupted={a_val}, resumed={b_val}. "
+                        f"derive_resume_terminal_status_from_audit must reconstruct this field from the "
+                        f"audit trail to match the live accumulator."
+                    )
+
+                assert dict(run_b_resume.routed_destinations) == dict(run_a.routed_destinations), (
+                    f"F2 reconciliation failure on routed_destinations: "
+                    f"uninterrupted={dict(run_a.routed_destinations)}, resumed={dict(run_b_resume.routed_destinations)}"
+                )
 
     def test_rows_buffered_live_equals_derive_after_unification(self) -> None:
         """rows_buffered parity on the count==N mid-stream trigger (elspeth-e1dd5e1303 FIXED).
@@ -1393,56 +1414,56 @@ class TestForkRecoveryInvariant:
         n = 3
 
         # ── Run A (uninterrupted oracle, count == N → mid-stream trigger) ──────
-        db_a, config_a, graph_a, settings_a = self._build_end_of_source_flush_aggregation(n, trigger_count=n)
-        run_a = Orchestrator(db_a).run(config_a, graph=graph_a, settings=settings_a, payload_store=MockPayloadStore())
-        assert run_a.status == RunStatus.COMPLETED, run_a.status
+        with self._build_end_of_source_flush_aggregation(n, trigger_count=n) as (db_a, config_a, graph_a, settings_a):
+            run_a = Orchestrator(db_a).run(config_a, graph=graph_a, settings=settings_a, payload_store=MockPayloadStore())
+            assert run_a.status == RunStatus.COMPLETED, run_a.status
 
-        # ── Run B (run-1 + interrupt + resume via the all-terminal branch) ────
-        db, config, graph, settings_obj = self._build_end_of_source_flush_aggregation(n, trigger_count=n)
-        payload_store = MockPayloadStore()
-        run_b1 = Orchestrator(db).run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
-        run_id = run_b1.run_id
-        checkpoint_mgr = CheckpointManager(db)
-        recovery_mgr = RecoveryManager(db, checkpoint_mgr)
-        reseat_crashed_leader(db, run_id)
-        create_checkpoint(checkpoint_mgr, run_id=run_id, sequence_number=1, barrier_scalars=None, graph=graph)
-        with db.engine.connect() as conn:
-            conn.execute(text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"), {"run_id": run_id})
-            conn.commit()
-        check = recovery_mgr.can_resume(run_id, graph)
-        assert check.can_resume, f"cannot resume: {check.reason}"
-        resume_point = recovery_mgr.get_resume_point(run_id, graph)
-        assert resume_point is not None
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
-        resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
-        run_b_resume = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
-        assert run_b_resume.status == RunStatus.COMPLETED, run_b_resume.status
+            # ── Run B (run-1 + interrupt + resume via the all-terminal branch) ────
+            with self._build_end_of_source_flush_aggregation(n, trigger_count=n) as (db, config, graph, settings_obj):
+                payload_store = MockPayloadStore()
+                run_b1 = Orchestrator(db).run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+                run_id = run_b1.run_id
+                checkpoint_mgr = CheckpointManager(db)
+                recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+                reseat_crashed_leader(db, run_id)
+                create_checkpoint(checkpoint_mgr, run_id=run_id, sequence_number=1, barrier_scalars=None, graph=graph)
+                with db.engine.connect() as conn:
+                    conn.execute(text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"), {"run_id": run_id})
+                    conn.commit()
+                check = recovery_mgr.can_resume(run_id, graph)
+                assert check.can_resume, f"cannot resume: {check.reason}"
+                resume_point = recovery_mgr.get_resume_point(run_id, graph)
+                assert resume_point is not None
+                checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+                resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+                run_b_resume = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
+                assert run_b_resume.status == RunStatus.COMPLETED, run_b_resume.status
 
-        # ── Unified value: live == derive == N exactly (elspeth-e1dd5e1303 fix) ──
-        assert run_a.rows_buffered == n, (
-            f"UNIFICATION: uninterrupted oracle (live accumulator) must report rows_buffered == N == {n} "
-            f"on a count==N mid-stream trigger — every buffer-accept (including the flush-triggering "
-            f"token) yields exactly one (None, BUFFERED) RowResult; got {run_a.rows_buffered}. "
-            f"An N-1 here means the count-trigger token's synthetic BUFFERED emission regressed "
-            f"(F1 Task 4.3 Step 2, elspeth-e1dd5e1303)."
-        )
-        assert run_b_resume.rows_buffered == n, (
-            f"UNIFICATION: resumed run (derive) must report rows_buffered == N == {n} (one BUFFERED audit "
-            f"record per input row); got {run_b_resume.rows_buffered}. If this changed, derive's "
-            f"(None, BUFFERED) arm moved — see elspeth-e1dd5e1303."
-        )
-        assert run_b_resume.rows_buffered == run_a.rows_buffered, (
-            f"UNIFICATION: live and derive must agree on rows_buffered for the count==N topology. "
-            f"oracle={run_a.rows_buffered}, resumed={run_b_resume.rows_buffered}. ANY delta is a "
-            f"re-divergence of the unified counter (elspeth-e1dd5e1303) and may not land silently."
-        )
+                # ── Unified value: live == derive == N exactly (elspeth-e1dd5e1303 fix) ──
+                assert run_a.rows_buffered == n, (
+                    f"UNIFICATION: uninterrupted oracle (live accumulator) must report rows_buffered == N == {n} "
+                    f"on a count==N mid-stream trigger — every buffer-accept (including the flush-triggering "
+                    f"token) yields exactly one (None, BUFFERED) RowResult; got {run_a.rows_buffered}. "
+                    f"An N-1 here means the count-trigger token's synthetic BUFFERED emission regressed "
+                    f"(F1 Task 4.3 Step 2, elspeth-e1dd5e1303)."
+                )
+                assert run_b_resume.rows_buffered == n, (
+                    f"UNIFICATION: resumed run (derive) must report rows_buffered == N == {n} (one BUFFERED audit "
+                    f"record per input row); got {run_b_resume.rows_buffered}. If this changed, derive's "
+                    f"(None, BUFFERED) arm moved — see elspeth-e1dd5e1303."
+                )
+                assert run_b_resume.rows_buffered == run_a.rows_buffered, (
+                    f"UNIFICATION: live and derive must agree on rows_buffered for the count==N topology. "
+                    f"oracle={run_a.rows_buffered}, resumed={run_b_resume.rows_buffered}. ANY delta is a "
+                    f"re-divergence of the unified counter (elspeth-e1dd5e1303) and may not land silently."
+                )
 
-        # ── EVERY counter field must reconcile (no divergent field remains) ────
-        for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
-            assert b_val == a_val, (
-                f"'{field}' must reconcile on the count==N topology (live/derive unification, "
-                f"elspeth-e1dd5e1303). uninterrupted={a_val}, resumed={b_val}."
-            )
+                # ── EVERY counter field must reconcile (no divergent field remains) ────
+                for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
+                    assert b_val == a_val, (
+                        f"'{field}' must reconcile on the count==N topology (live/derive unification, "
+                        f"elspeth-e1dd5e1303). uninterrupted={a_val}, resumed={b_val}."
+                    )
 
     def test_resume_expand_coalesce_full_type_domain_roundtrip(self) -> None:
         """Task 12 addition (ADDENDUM 6): the token_data_ref envelope round-trips the FULL

@@ -28,23 +28,30 @@ Non-terminal state:
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from sqlalchemy import text
+from sqlalchemy import Connection, event, text
 
+import elspeth.engine.orchestrator.run_lifecycle as run_lifecycle
 from elspeth.contracts import Determinism
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
+from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 from tests.fixtures.base_classes import (
     as_sink,
     as_source,
     as_transform,
 )
-from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.plugins import (
     CollectSink,
     ConditionalErrorTransform,
@@ -61,6 +68,49 @@ if TYPE_CHECKING:
 # =============================================================================
 # Audit Verification Helpers
 # =============================================================================
+
+
+@contextmanager
+def _pipeline_database() -> Iterator[LandscapeDB]:
+    """Give the live heartbeat its own connection, as in production SQLite."""
+    with TemporaryDirectory(prefix="terminal-pipeline-") as directory:
+        db = LandscapeDB(f"sqlite:///{Path(directory) / 'audit.db'}")
+        try:
+            yield db
+        finally:
+            db.close()
+
+
+def _assert_error_rows_terminal(db: LandscapeDB, rows: list[dict[str, Any]]) -> None:
+    payload_store = MockPayloadStore()
+    source = ListSource(rows)
+    transform = ConditionalErrorTransform()
+    sink = CollectSink()
+
+    config = PipelineConfig(
+        sources={"primary": as_source(source)},
+        transforms=[as_transform(transform)],
+        sinks={"default": as_sink(sink)},
+    )
+
+    orchestrator = Orchestrator(db)
+    run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
+
+    # Count expected outcomes
+    expected_errors = sum(1 for r in rows if r.get("fail"))
+    expected_success = len(rows) - expected_errors
+
+    # Verify we got the right number of results
+    assert len(sink.results) == expected_success, f"Expected {expected_success} successful rows, got {len(sink.results)}"
+
+    # THE INVARIANT: ALL tokens (success AND error) reach terminal state
+    missing = count_tokens_missing_terminal(db, run.run_id)
+    assert missing == 0, (
+        f"AUDIT INTEGRITY VIOLATION: {missing} tokens missing terminal outcome. "
+        f"Total rows: {len(rows)}, Expected errors: {expected_errors}, "
+        f"Expected success: {expected_success}. "
+        f"Error rows must reach QUARANTINED state, not vanish."
+    )
 
 
 def count_tokens_missing_terminal(db: LandscapeDB, run_id: str) -> int:
@@ -214,35 +264,35 @@ class TestTerminalStateProperty:
         This is THE foundational property of ELSPETH's audit trail.
         A token without a terminal outcome means we lost track of data.
         """
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
-        source = ListSource(rows)
-        transform = PassTransform()
-        sink = CollectSink()
+        with _pipeline_database() as db:
+            payload_store = MockPayloadStore()
+            source = ListSource(rows)
+            transform = PassTransform()
+            sink = CollectSink()
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(transform)],
-            sinks={"default": as_sink(sink)},
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[as_transform(transform)],
+                sinks={"default": as_sink(sink)},
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
 
-        # THE INVARIANT: No tokens should be missing terminal outcomes
-        missing = count_tokens_missing_terminal(db, run.run_id)
-        assert missing == 0, (
-            f"AUDIT INTEGRITY VIOLATION: {missing} tokens missing terminal outcome. "
-            f"Rows processed: {len(rows)}. "
-            f"This means data was lost without being recorded."
-        )
+            # THE INVARIANT: No tokens should be missing terminal outcomes
+            missing = count_tokens_missing_terminal(db, run.run_id)
+            assert missing == 0, (
+                f"AUDIT INTEGRITY VIOLATION: {missing} tokens missing terminal outcome. "
+                f"Rows processed: {len(rows)}. "
+                f"This means data was lost without being recorded."
+            )
 
-        # Also verify no duplicates
-        duplicates = count_duplicate_terminal_outcomes(db, run.run_id)
-        assert duplicates == 0, (
-            f"AUDIT INTEGRITY VIOLATION: {duplicates} tokens have multiple terminal outcomes. "
-            f"Each token should reach exactly ONE terminal state."
-        )
+            # Also verify no duplicates
+            duplicates = count_duplicate_terminal_outcomes(db, run.run_id)
+            assert duplicates == 0, (
+                f"AUDIT INTEGRITY VIOLATION: {duplicates} tokens have multiple terminal outcomes. "
+                f"Each token should reach exactly ONE terminal state."
+            )
 
     @given(rows=st.lists(row_with_possible_error, min_size=1, max_size=30))
     @settings(max_examples=100, deadline=None)
@@ -252,71 +302,106 @@ class TestTerminalStateProperty:
         Transform errors don't cause tokens to vanish - they're routed to
         quarantine and recorded with the QUARANTINED outcome.
         """
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
-        source = ListSource(rows)
-        transform = ConditionalErrorTransform()
-        sink = CollectSink()
+        # StaticPool shares one DBAPI connection with the live heartbeat. A
+        # delayed example can overlap its write with the final audit read.
+        with _pipeline_database() as db:
+            _assert_error_rows_terminal(db, rows)
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(transform)],
-            sinks={"default": as_sink(sink)},
-        )
+    def test_error_rows_reach_terminal_during_heartbeat_write(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A real heartbeat transaction must not collide with the final audit read."""
+        heartbeats: list[RunHeartbeatThread] = []
+        original_start = RunHeartbeatThread.start
+        original_check = run_lifecycle.assert_bound_groups_settled_from_audit
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
+        def capture_start(heartbeat: RunHeartbeatThread) -> None:
+            heartbeats.append(heartbeat)
+            original_start(heartbeat)
 
-        # Count expected outcomes
-        expected_errors = sum(1 for r in rows if r.get("fail"))
-        expected_success = len(rows) - expected_errors
+        def check_during_heartbeat(db: LandscapeDB, run_id: str, graph: ExecutionGraph) -> None:
+            reached = threading.Event()
+            release = threading.Event()
+            audit_read = threading.Event()
+            failures: list[BaseException] = []
+            held_connections: list[Connection] = []
 
-        # Verify we got the right number of results
-        assert len(sink.results) == expected_success, f"Expected {expected_success} successful rows, got {len(sink.results)}"
+            def hold_heartbeat(
+                conn: Connection, cursor: object, statement: str, parameters: object, context: object, executemany: bool
+            ) -> None:
+                if threading.current_thread().name == "controlled-real-heartbeat" and statement.startswith("UPDATE run_workers"):
+                    assert conn.in_transaction()
+                    held_connections.append(conn)
+                    reached.set()
+                    assert release.wait(10), "controller did not release heartbeat"
 
-        # THE INVARIANT: ALL tokens (success AND error) reach terminal state
-        missing = count_tokens_missing_terminal(db, run.run_id)
-        assert missing == 0, (
-            f"AUDIT INTEGRITY VIOLATION: {missing} tokens missing terminal outcome. "
-            f"Total rows: {len(rows)}, Expected errors: {expected_errors}, "
-            f"Expected success: {expected_success}. "
-            f"Error rows must reach QUARANTINED state, not vanish."
-        )
+            def observe_audit_read(
+                conn: Connection, cursor: object, statement: str, parameters: object, context: object, executemany: bool
+            ) -> None:
+                if statement.startswith("SELECT DISTINCT token_lineage_frames.group_id"):
+                    assert reached.is_set() and not release.is_set()
+                    assert conn.connection.dbapi_connection is not held_connections[0].connection.dbapi_connection
+                    audit_read.set()
+
+            def beat() -> None:
+                try:
+                    heartbeats[-1]._step_beat()
+                except BaseException as exc:
+                    failures.append(exc)
+
+            event.listen(db.engine, "after_cursor_execute", hold_heartbeat)
+            event.listen(db.engine, "before_cursor_execute", observe_audit_read)
+            thread = threading.Thread(target=beat, name="controlled-real-heartbeat")
+            thread.start()
+            try:
+                assert reached.wait(10), "heartbeat update did not reach held boundary"
+                original_check(db, run_id, graph)
+                assert audit_read.is_set(), "the real bound-group audit query did not execute"
+            finally:
+                release.set()
+                thread.join(10)
+                event.remove(db.engine, "after_cursor_execute", hold_heartbeat)
+                event.remove(db.engine, "before_cursor_execute", observe_audit_read)
+                assert not thread.is_alive(), "heartbeat controller thread did not finish"
+                assert not failures, failures
+
+        monkeypatch.setattr(RunHeartbeatThread, "start", capture_start)
+        monkeypatch.setattr(run_lifecycle, "assert_bound_groups_settled_from_audit", check_during_heartbeat)
+        with _pipeline_database() as db:
+            _assert_error_rows_terminal(db, [{"id": 185, "fail": False}, {"id": 186, "fail": True}])
 
     @given(rows=st.lists(single_row, min_size=0, max_size=20))
     @settings(max_examples=50, deadline=None)
     def test_terminal_outcomes_have_correct_type(self, rows: list[dict[str, Any]]) -> None:
         """Property: All terminal outcomes use valid ADR-019 enum values."""
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
-        source = ListSource(rows)
-        transform = PassTransform()
-        sink = CollectSink()
+        with _pipeline_database() as db:
+            payload_store = MockPayloadStore()
+            source = ListSource(rows)
+            transform = PassTransform()
+            sink = CollectSink()
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(transform)],
-            sinks={"default": as_sink(sink)},
-        )
-
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
-
-        # Get all outcomes and verify they're valid enum values
-        outcomes = get_all_token_outcomes(db, run.run_id)
-        valid_outcomes = {o.value for o in TerminalOutcome}
-        valid_paths = {p.value for p in TerminalPath}
-
-        for token_id, outcome, path, completed in outcomes:
-            if completed:
-                assert outcome in valid_outcomes, f"Invalid outcome '{outcome}' for token {token_id}. Valid outcomes: {valid_outcomes}"
-            else:
-                assert outcome is None, f"Non-terminal token {token_id} must have NULL outcome, got {outcome!r}"
-            assert path in valid_paths, f"Invalid path '{path}' for token {token_id}. Valid paths: {valid_paths}"
-
-            assert completed == (outcome is not None), (
-                f"completed mismatch for token {token_id}: outcome={outcome}, path={path}, completed={completed}"
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[as_transform(transform)],
+                sinks={"default": as_sink(sink)},
             )
+
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
+
+            # Get all outcomes and verify they're valid enum values
+            outcomes = get_all_token_outcomes(db, run.run_id)
+            valid_outcomes = {o.value for o in TerminalOutcome}
+            valid_paths = {p.value for p in TerminalPath}
+
+            for token_id, outcome, path, completed in outcomes:
+                if completed:
+                    assert outcome in valid_outcomes, f"Invalid outcome '{outcome}' for token {token_id}. Valid outcomes: {valid_outcomes}"
+                else:
+                    assert outcome is None, f"Non-terminal token {token_id} must have NULL outcome, got {outcome!r}"
+                assert path in valid_paths, f"Invalid path '{path}' for token {token_id}. Valid paths: {valid_paths}"
+
+                assert completed == (outcome is not None), (
+                    f"completed mismatch for token {token_id}: outcome={outcome}, path={path}, completed={completed}"
+                )
 
 
 class TestTerminalStateEdgeCases:
@@ -324,27 +409,27 @@ class TestTerminalStateEdgeCases:
 
     def test_empty_source_no_orphan_tokens(self) -> None:
         """Edge case: Empty source should not create any orphan tokens."""
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
-        source = ListSource([])  # Empty
-        transform = PassTransform()
-        sink = CollectSink()
+        with _pipeline_database() as db:
+            payload_store = MockPayloadStore()
+            source = ListSource([])  # Empty
+            transform = PassTransform()
+            sink = CollectSink()
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(transform)],
-            sinks={"default": as_sink(sink)},
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[as_transform(transform)],
+                sinks={"default": as_sink(sink)},
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
 
-        # No rows means no tokens
-        missing = count_tokens_missing_terminal(db, run.run_id)
-        assert missing == 0
+            # No rows means no tokens
+            missing = count_tokens_missing_terminal(db, run.run_id)
+            assert missing == 0
 
-        # Verify sink is empty
-        assert len(sink.results) == 0
+            # Verify sink is empty
+            assert len(sink.results) == 0
 
     @given(n=st.integers(min_value=1, max_value=100))
     @settings(max_examples=20, deadline=None)
@@ -352,47 +437,47 @@ class TestTerminalStateEdgeCases:
         """Property: Even minimal rows (single field) reach terminal state."""
         rows = [{"id": i} for i in range(n)]
 
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
-        source = ListSource(rows)
-        transform = PassTransform()
-        sink = CollectSink()
+        with _pipeline_database() as db:
+            payload_store = MockPayloadStore()
+            source = ListSource(rows)
+            transform = PassTransform()
+            sink = CollectSink()
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(transform)],
-            sinks={"default": as_sink(sink)},
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[as_transform(transform)],
+                sinks={"default": as_sink(sink)},
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
 
-        assert len(sink.results) == n
-        missing = count_tokens_missing_terminal(db, run.run_id)
-        assert missing == 0, f"{missing} tokens missing terminal outcome for {n} rows"
+            assert len(sink.results) == n
+            missing = count_tokens_missing_terminal(db, run.run_id)
+            assert missing == 0, f"{missing} tokens missing terminal outcome for {n} rows"
 
     @given(rows=st.lists(single_row, min_size=1, max_size=10))
     @settings(max_examples=30, deadline=None)
     def test_no_transform_pipeline(self, rows: list[dict[str, Any]]) -> None:
         """Property: Pipeline with no transforms still records terminal states."""
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
-        source = ListSource(rows)
-        sink = CollectSink()
+        with _pipeline_database() as db:
+            payload_store = MockPayloadStore()
+            source = ListSource(rows)
+            sink = CollectSink()
 
-        # No transforms - source direct to sink
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[],  # Empty!
-            sinks={"default": as_sink(sink)},
-        )
+            # No transforms - source direct to sink
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[],  # Empty!
+                sinks={"default": as_sink(sink)},
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
 
-        assert len(sink.results) == len(rows)
-        missing = count_tokens_missing_terminal(db, run.run_id)
-        assert missing == 0
+            assert len(sink.results) == len(rows)
+            missing = count_tokens_missing_terminal(db, run.run_id)
+            assert missing == 0
 
 
 class TestTerminalStateAggregation:
@@ -493,25 +578,27 @@ class TestTerminalStateAggregation:
             aggregation_settings={transform_node_id: agg_settings},
         )
 
-        db = make_landscape_db()
-        orchestrator = Orchestrator(db)
-        payload_store = MockPayloadStore()
-        run = orchestrator.run(config, graph=graph, payload_store=payload_store)
+        with _pipeline_database() as db:
+            orchestrator = Orchestrator(db)
+            payload_store = MockPayloadStore()
+            run = orchestrator.run(config, graph=graph, payload_store=payload_store)
 
-        # THE INVARIANT: No tokens missing terminal outcome
-        missing = count_tokens_missing_terminal(db, run.run_id)
-        assert missing == 0, (
-            f"AUDIT INTEGRITY VIOLATION: {missing} tokens missing terminal outcome "
-            f"in aggregation pipeline. Rows: {n}. "
-            f"BUFFERED tokens must reach terminal state at end-of-source flush."
-        )
+            # THE INVARIANT: No tokens missing terminal outcome
+            missing = count_tokens_missing_terminal(db, run.run_id)
+            assert missing == 0, (
+                f"AUDIT INTEGRITY VIOLATION: {missing} tokens missing terminal outcome "
+                f"in aggregation pipeline. Rows: {n}. "
+                f"BUFFERED tokens must reach terminal state at end-of-source flush."
+            )
 
-        # No duplicate terminals
-        duplicates = count_duplicate_terminal_outcomes(db, run.run_id)
-        assert duplicates == 0, f"AUDIT INTEGRITY VIOLATION: {duplicates} tokens have multiple terminal outcomes in aggregation pipeline."
+            # No duplicate terminals
+            duplicates = count_duplicate_terminal_outcomes(db, run.run_id)
+            assert duplicates == 0, (
+                f"AUDIT INTEGRITY VIOLATION: {duplicates} tokens have multiple terminal outcomes in aggregation pipeline."
+            )
 
-        # Counter sanity: all rows should have been buffered
-        assert run.rows_buffered == n, f"Expected {n} rows_buffered, got {run.rows_buffered}"
+            # Counter sanity: all rows should have been buffered
+            assert run.rows_buffered == n, f"Expected {n} rows_buffered, got {run.rows_buffered}"
 
 
 class TestTerminalPairEnumProperties:

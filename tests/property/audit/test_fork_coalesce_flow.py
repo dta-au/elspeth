@@ -14,6 +14,9 @@ This tests the FULL fork->coalesce->continue path, not just fork-to-sinks.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
 
 from hypothesis import HealthCheck, given, settings
@@ -38,7 +41,6 @@ from tests.fixtures.base_classes import (
     as_transform,
 )
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
 
 if TYPE_CHECKING:
@@ -48,6 +50,17 @@ if TYPE_CHECKING:
 # =============================================================================
 # Audit Verification Helpers
 # =============================================================================
+
+
+@contextmanager
+def _pipeline_database() -> Iterator[LandscapeDB]:
+    """Give each pipeline's live heartbeat a separate SQLite connection."""
+    with TemporaryDirectory(prefix="fork-coalesce-pipeline-") as directory:
+        db = LandscapeDB(f"sqlite:///{Path(directory) / 'audit.db'}")
+        try:
+            yield db
+        finally:
+            db.close()
 
 
 def get_outcome_counts(db: LandscapeDB, run_id: str) -> dict[tuple[str | None, str], int]:
@@ -254,7 +267,6 @@ class TestForkCoalesceFlow:
 
         Total terminal outcomes: N FORKED + 3*N COALESCED = 4*N
         """
-        db = make_landscape_db()
         payload_store = MockPayloadStore()
 
         rows = [{"value": i} for i in range(n_rows)]
@@ -306,42 +318,43 @@ class TestForkCoalesceFlow:
             coalesce=[coalesce],
         )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+        with _pipeline_database() as db:
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
 
-        # Get statistics
-        stats = get_fork_coalesce_stats(db, run.run_id)
+            # Get statistics
+            stats = get_fork_coalesce_stats(db, run.run_id)
 
-        # Verify token accounting
-        # For 2-branch terminal coalesce: each row produces 1 FORKED + 3 COALESCED.
-        expected_forked = n_rows
-        expected_coalesced = n_rows * 3  # 2 consumed branches + terminal merged token
-        expected_completed = 0
+            # Verify token accounting
+            # For 2-branch terminal coalesce: each row produces 1 FORKED + 3 COALESCED.
+            expected_forked = n_rows
+            expected_coalesced = n_rows * 3  # 2 consumed branches + terminal merged token
+            expected_completed = 0
 
-        assert stats["forked_count"] == expected_forked, (
-            f"Expected {expected_forked} FORKED outcomes, got {stats['forked_count']}. "
-            f"Each source row should produce exactly one FORKED parent token."
-        )
-        assert stats["fork_groups"] == n_rows, f"Expected {n_rows} fork groups (one per source row), got {stats['fork_groups']}."
+            assert stats["forked_count"] == expected_forked, (
+                f"Expected {expected_forked} FORKED outcomes, got {stats['forked_count']}. "
+                f"Each source row should produce exactly one FORKED parent token."
+            )
+            assert stats["fork_groups"] == n_rows, f"Expected {n_rows} fork groups (one per source row), got {stats['fork_groups']}."
 
-        assert stats["coalesced_count"] == expected_coalesced, (
-            f"Expected {expected_coalesced} COALESCED outcomes, got {stats['coalesced_count']}. "
-            f"Each fork branch plus the terminal merged token should produce COALESCED outcomes."
-        )
+            assert stats["coalesced_count"] == expected_coalesced, (
+                f"Expected {expected_coalesced} COALESCED outcomes, got {stats['coalesced_count']}. "
+                f"Each fork branch plus the terminal merged token should produce COALESCED outcomes."
+            )
 
-        assert stats["completed_count"] == expected_completed, (
-            f"Expected {expected_completed} DEFAULT_FLOW outcomes, got {stats['completed_count']}. "
-            f"Terminal coalesce records the merged sink write as COALESCED."
-        )
+            assert stats["completed_count"] == expected_completed, (
+                f"Expected {expected_completed} DEFAULT_FLOW outcomes, got {stats['completed_count']}. "
+                f"Terminal coalesce records the merged sink write as COALESCED."
+            )
 
-        # Verify no tokens lost
-        missing = count_tokens_missing_terminal(db, run.run_id)
-        assert missing == 0, f"TOKEN LEAK: {missing} tokens have no terminal outcome. Every token must reach a terminal state."
+            # Verify no tokens lost
+            missing = count_tokens_missing_terminal(db, run.run_id)
+            assert missing == 0, f"TOKEN LEAK: {missing} tokens have no terminal outcome. Every token must reach a terminal state."
 
-        # Verify sink received correct number of results
-        assert len(sink.results) == n_rows, (
-            f"Expected {n_rows} results in sink, got {len(sink.results)}. Each row should produce exactly one output after fork->coalesce."
-        )
+            # Verify sink received correct number of results
+            assert len(sink.results) == n_rows, (
+                f"Expected {n_rows} results in sink, got {len(sink.results)}. Each row should produce exactly one output after fork->coalesce."
+            )
 
     @given(n_rows=st.integers(min_value=1, max_value=10))
     @settings(max_examples=20, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
@@ -351,7 +364,6 @@ class TestForkCoalesceFlow:
         This is critical for lineage tracking - we need to know which
         parent token(s) contributed to each coalesced result.
         """
-        db = make_landscape_db()
         payload_store = MockPayloadStore()
 
         rows = [{"value": i} for i in range(n_rows)]
@@ -401,17 +413,18 @@ class TestForkCoalesceFlow:
             coalesce=[coalesce],
         )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+        with _pipeline_database() as db:
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
 
-        # Get statistics
-        stats = get_fork_coalesce_stats(db, run.run_id)
+            # Get statistics
+            stats = get_fork_coalesce_stats(db, run.run_id)
 
-        # Verify all coalesced tokens have parent links
-        assert stats["coalesced_without_parents"] == 0, (
-            f"LINEAGE VIOLATION: {stats['coalesced_without_parents']} COALESCED tokens "
-            f"have no parent links. Cannot trace lineage without parent relationships."
-        )
+            # Verify all coalesced tokens have parent links
+            assert stats["coalesced_without_parents"] == 0, (
+                f"LINEAGE VIOLATION: {stats['coalesced_without_parents']} COALESCED tokens "
+                f"have no parent links. Cannot trace lineage without parent relationships."
+            )
 
     @given(n_rows=st.integers(min_value=1, max_value=10))
     @settings(max_examples=20, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
@@ -421,7 +434,6 @@ class TestForkCoalesceFlow:
         Transforms that run before the fork should contribute their fields
         to the merged result after coalesce.
         """
-        db = make_landscape_db()
         payload_store = MockPayloadStore()
 
         rows = [{"value": i} for i in range(n_rows)]
@@ -471,17 +483,18 @@ class TestForkCoalesceFlow:
             coalesce=[coalesce],
         )
 
-        orchestrator = Orchestrator(db)
-        orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+        with _pipeline_database() as db:
+            orchestrator = Orchestrator(db)
+            orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
 
-        # Verify all results have the enriched field
-        assert len(sink.results) == n_rows
+            # Verify all results have the enriched field
+            assert len(sink.results) == n_rows
 
-        for i, result in enumerate(sink.results):
-            assert "enriched" in result, (
-                f"Result {i} missing 'enriched' field. Transform enrichment was lost during fork->coalesce. Got: {result}"
-            )
-            assert result["enriched"] is True, f"Result {i} has wrong 'enriched' value: {result['enriched']}"
+            for i, result in enumerate(sink.results):
+                assert "enriched" in result, (
+                    f"Result {i} missing 'enriched' field. Transform enrichment was lost during fork->coalesce. Got: {result}"
+                )
+                assert result["enriched"] is True, f"Result {i} has wrong 'enriched' value: {result['enriched']}"
 
 
 class TestForkCoalesceEdgeCases:
@@ -489,7 +502,6 @@ class TestForkCoalesceEdgeCases:
 
     def test_empty_source_with_coalesce_config(self) -> None:
         """Empty source with coalesce config should not cause issues."""
-        db = make_landscape_db()
         payload_store = MockPayloadStore()
 
         source = _ListSource([])  # Empty
@@ -538,19 +550,19 @@ class TestForkCoalesceEdgeCases:
             coalesce=[coalesce],
         )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+        with _pipeline_database() as db:
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
 
-        # No rows means no tokens
-        stats = get_fork_coalesce_stats(db, run.run_id)
-        assert stats["forked_count"] == 0
-        assert stats["coalesced_count"] == 0
-        assert stats["completed_count"] == 0
-        assert len(sink.results) == 0
+            # No rows means no tokens
+            stats = get_fork_coalesce_stats(db, run.run_id)
+            assert stats["forked_count"] == 0
+            assert stats["coalesced_count"] == 0
+            assert stats["completed_count"] == 0
+            assert len(sink.results) == 0
 
     def test_single_row_fork_coalesce(self) -> None:
         """Single row through fork->coalesce should work correctly."""
-        db = make_landscape_db()
         payload_store = MockPayloadStore()
 
         source = _ListSource([{"value": 42}])
@@ -599,15 +611,16 @@ class TestForkCoalesceEdgeCases:
             coalesce=[coalesce],
         )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+        with _pipeline_database() as db:
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
 
-        stats = get_fork_coalesce_stats(db, run.run_id)
+            stats = get_fork_coalesce_stats(db, run.run_id)
 
-        # Single row: 1 FORKED, 3 COALESCED (2 consumed branches + terminal merged token)
-        assert stats["forked_count"] == 1
-        assert stats["coalesced_count"] == 3
-        assert stats["completed_count"] == 0
-        assert len(sink.results) == 1
-        assert sink.results[0]["value"] == 42
-        assert sink.results[0]["enriched"] is True
+            # Single row: 1 FORKED, 3 COALESCED (2 consumed branches + terminal merged token)
+            assert stats["forked_count"] == 1
+            assert stats["coalesced_count"] == 3
+            assert stats["completed_count"] == 0
+            assert len(sink.results) == 1
+            assert sink.results[0]["value"] == 42
+            assert sink.results[0]["enriched"] is True
