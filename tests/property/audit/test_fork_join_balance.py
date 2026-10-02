@@ -20,8 +20,12 @@ Fork terminology:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import fields as dataclass_fields
 from datetime import UTC
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import pytest
@@ -56,6 +60,22 @@ from tests.fixtures.plugins import (
 )
 from tests.fixtures.stores import MockPayloadStore
 from tests.helpers.checkpoint import create_checkpoint
+
+
+@contextmanager
+def _runtime_landscape_db() -> Iterator[LandscapeDB]:
+    """Give each runtime example independent connections for its live heartbeat.
+
+    Keep the database open through final audit queries and recovery, then dispose
+    its connections before removing the example's temporary directory.
+    """
+    with TemporaryDirectory(prefix="elspeth-fork-join-") as directory:
+        db = LandscapeDB(f"sqlite:///{Path(directory) / 'landscape.db'}")
+        try:
+            yield db
+        finally:
+            db.close()
+
 
 # =============================================================================
 # Audit Verification Helpers
@@ -509,79 +529,79 @@ class TestForkJoinRuntimeBalance:
         """
         from elspeth.core.config import ElspethSettings
 
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        rows = [{"value": i} for i in range(n_rows)]
-        source = ListSource(rows, on_success="sink_a")
-        sink_a = CollectSink("sink_a")
-        sink_b = CollectSink("sink_b")
+            rows = [{"value": i} for i in range(n_rows)]
+            source = ListSource(rows, on_success="sink_a")
+            sink_a = CollectSink("sink_a")
+            sink_b = CollectSink("sink_b")
 
-        # Gate that forks all rows to both sinks
-        gate = GateSettings(
-            name="fork_gate",
-            input="gate_in",
-            condition="True",
-            routes={"true": "fork", "false": "sink_a"},
-            fork_to=["sink_a", "sink_b"],
-        )
+            # Gate that forks all rows to both sinks
+            gate = GateSettings(
+                name="fork_gate",
+                input="gate_in",
+                condition="True",
+                routes={"true": "fork", "false": "sink_a"},
+                fork_to=["sink_a", "sink_b"],
+            )
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+            )
 
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(source)},
-            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-            aggregations={},
-            coalesce_settings=[],
-        )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(source)},
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+                aggregations={},
+                coalesce_settings=[],
+            )
 
-        # Settings needed for fork execution
-        settings_obj = ElspethSettings(
-            sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
-            sinks={
-                "sink_a": {"plugin": "test", "on_write_failure": "discard"},
-                "sink_b": {"plugin": "test", "on_write_failure": "discard"},
-            },
-            gates=[gate],
-        )
+            # Settings needed for fork execution
+            settings_obj = ElspethSettings(
+                sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
+                sinks={
+                    "sink_a": {"plugin": "test", "on_write_failure": "discard"},
+                    "sink_b": {"plugin": "test", "on_write_failure": "discard"},
+                },
+                gates=[gate],
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
 
-        # Verify fork audit integrity
-        missing_parents = count_fork_children_missing_parents(db, run.run_id)
-        assert missing_parents == 0, (
-            f"FORK AUDIT VIOLATION: {missing_parents} fork children missing parent links. Rows: {n_rows}. Fork lineage would be incomplete."
-        )
+            # Verify fork audit integrity
+            missing_parents = count_fork_children_missing_parents(db, run.run_id)
+            assert missing_parents == 0, (
+                f"FORK AUDIT VIOLATION: {missing_parents} fork children missing parent links. Rows: {n_rows}. Fork lineage would be incomplete."
+            )
 
-        # Verify FORKED outcomes recorded for parent tokens
-        forked_count = count_forked_outcomes(db, run.run_id)
-        assert forked_count == n_rows, f"Expected {n_rows} FORKED outcomes (one per parent token), got {forked_count}"
+            # Verify FORKED outcomes recorded for parent tokens
+            forked_count = count_forked_outcomes(db, run.run_id)
+            assert forked_count == n_rows, f"Expected {n_rows} FORKED outcomes (one per parent token), got {forked_count}"
 
-        # Verify fork statistics
-        stats = get_fork_group_stats(db, run.run_id)
-        expected_children_per_group = len(gate.fork_to or [])
-        expected_children_total = n_rows * expected_children_per_group
-        assert stats["total_fork_children"] == stats["children_with_parents"], (
-            f"Not all fork children have parents: {stats['children_with_parents']}/{stats['total_fork_children']}"
-        )
-        assert stats["total_fork_children"] == expected_children_total, (
-            f"Expected {expected_children_total} fork children (rows={n_rows}, branches={expected_children_per_group}), "
-            f"got {stats['total_fork_children']}."
-        )
-        assert stats["total_fork_groups"] == n_rows, (
-            f"Expected {n_rows} fork groups (one per parent token), got {stats['total_fork_groups']}."
-        )
-        bad_groups = count_fork_groups_with_unexpected_children(db, run.run_id, expected_children=expected_children_per_group)
-        assert bad_groups == 0, f"{bad_groups} fork groups have unexpected child counts."
+            # Verify fork statistics
+            stats = get_fork_group_stats(db, run.run_id)
+            expected_children_per_group = len(gate.fork_to or [])
+            expected_children_total = n_rows * expected_children_per_group
+            assert stats["total_fork_children"] == stats["children_with_parents"], (
+                f"Not all fork children have parents: {stats['children_with_parents']}/{stats['total_fork_children']}"
+            )
+            assert stats["total_fork_children"] == expected_children_total, (
+                f"Expected {expected_children_total} fork children (rows={n_rows}, branches={expected_children_per_group}), "
+                f"got {stats['total_fork_children']}."
+            )
+            assert stats["total_fork_groups"] == n_rows, (
+                f"Expected {n_rows} fork groups (one per parent token), got {stats['total_fork_groups']}."
+            )
+            bad_groups = count_fork_groups_with_unexpected_children(db, run.run_id, expected_children=expected_children_per_group)
+            assert bad_groups == 0, f"{bad_groups} fork groups have unexpected child counts."
 
 
 class TestForkJoinEnumProperties:
@@ -611,79 +631,79 @@ class TestForkJoinEdgeCases:
 
     def test_no_fork_no_fork_groups(self) -> None:
         """Pipeline without forks should have no fork groups."""
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        source = ListSource([{"value": 1}, {"value": 2}])
-        transform = PassTransform()
-        sink = CollectSink()
+            source = ListSource([{"value": 1}, {"value": 2}])
+            transform = PassTransform()
+            sink = CollectSink()
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(transform)],
-            sinks={"default": as_sink(sink)},
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[as_transform(transform)],
+                sinks={"default": as_sink(sink)},
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=_build_production_graph(config), payload_store=payload_store)
 
-        stats = get_fork_group_stats(db, run.run_id)
-        assert stats["total_fork_groups"] == 0
-        assert stats["total_fork_children"] == 0
+            stats = get_fork_group_stats(db, run.run_id)
+            assert stats["total_fork_groups"] == 0
+            assert stats["total_fork_children"] == 0
 
     def test_empty_source_no_fork_issues(self) -> None:
         """Empty source with fork config should not cause issues."""
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        source = ListSource([], on_success="sink_a")  # Empty
-        sink_a = CollectSink("sink_a")
-        sink_b = CollectSink("sink_b")
+            source = ListSource([], on_success="sink_a")  # Empty
+            sink_a = CollectSink("sink_a")
+            sink_b = CollectSink("sink_b")
 
-        gate = GateSettings(
-            name="fork_gate",
-            input="gate_in",
-            condition="True",
-            routes={"true": "fork", "false": "sink_a"},
-            fork_to=["sink_a", "sink_b"],
-        )
+            gate = GateSettings(
+                name="fork_gate",
+                input="gate_in",
+                condition="True",
+                routes={"true": "fork", "false": "sink_a"},
+                fork_to=["sink_a", "sink_b"],
+            )
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+            )
 
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(source)},
-            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-            aggregations={},
-            coalesce_settings=[],
-        )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(source)},
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+                aggregations={},
+                coalesce_settings=[],
+            )
 
-        from elspeth.core.config import ElspethSettings
+            from elspeth.core.config import ElspethSettings
 
-        settings_obj = ElspethSettings(
-            sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
-            sinks={
-                "sink_a": {"plugin": "test", "on_write_failure": "discard"},
-                "sink_b": {"plugin": "test", "on_write_failure": "discard"},
-            },
-            gates=[gate],
-        )
+            settings_obj = ElspethSettings(
+                sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
+                sinks={
+                    "sink_a": {"plugin": "test", "on_write_failure": "discard"},
+                    "sink_b": {"plugin": "test", "on_write_failure": "discard"},
+                },
+                gates=[gate],
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
 
-        # No rows means no forks
-        stats = get_fork_group_stats(db, run.run_id)
-        assert stats["total_fork_groups"] == 0
-        missing = count_fork_children_missing_parents(db, run.run_id)
-        assert missing == 0
+            # No rows means no forks
+            stats = get_fork_group_stats(db, run.run_id)
+            assert stats["total_fork_groups"] == 0
+            missing = count_fork_children_missing_parents(db, run.run_id)
+            assert missing == 0
 
 
 class TestForkRecoveryInvariant:
@@ -709,59 +729,59 @@ class TestForkRecoveryInvariant:
         from elspeth.core.config import ElspethSettings
         from elspeth.core.landscape.schema import token_outcomes_table
 
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        rows = [{"value": i} for i in range(n_rows)]
-        source = ListSource(rows, on_success="sink_a")
-        sink_a = CollectSink("sink_a")
-        sink_b = CollectSink("sink_b")
+            rows = [{"value": i} for i in range(n_rows)]
+            source = ListSource(rows, on_success="sink_a")
+            sink_a = CollectSink("sink_a")
+            sink_b = CollectSink("sink_b")
 
-        # Gate that forks all rows to both sinks
-        gate = GateSettings(
-            name="fork_gate",
-            input="gate_in",
-            condition="True",
-            routes={"true": "fork", "false": "sink_a"},
-            fork_to=["sink_a", "sink_b"],
-        )
+            # Gate that forks all rows to both sinks
+            gate = GateSettings(
+                name="fork_gate",
+                input="gate_in",
+                condition="True",
+                routes={"true": "fork", "false": "sink_a"},
+                fork_to=["sink_a", "sink_b"],
+            )
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+            )
 
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(source)},
-            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-            aggregations={},
-            coalesce_settings=[],
-        )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(source)},
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+                aggregations={},
+                coalesce_settings=[],
+            )
 
-        settings_obj = ElspethSettings(
-            sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
-            sinks={
-                "sink_a": {"plugin": "test", "on_write_failure": "discard"},
-                "sink_b": {"plugin": "test", "on_write_failure": "discard"},
-            },
-            gates=[gate],
-        )
+            settings_obj = ElspethSettings(
+                sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
+                sinks={
+                    "sink_a": {"plugin": "test", "on_write_failure": "discard"},
+                    "sink_b": {"plugin": "test", "on_write_failure": "discard"},
+                },
+                gates=[gate],
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
 
-        # Pipeline completed successfully - all rows processed
-        # Now simulate partial failure by deleting ONE child outcome per row
+            # Pipeline completed successfully - all rows processed
+            # Now simulate partial failure by deleting ONE child outcome per row
 
-        # Get tokens that went to sink_a (one branch of the fork)
-        with db.engine.connect() as conn:
-            sink_a_outcomes = conn.execute(
-                text("""
+            # Get tokens that went to sink_a (one branch of the fork)
+            with db.engine.connect() as conn:
+                sink_a_outcomes = conn.execute(
+                    text("""
                     SELECT o.outcome_id, t.row_id
                     FROM token_outcomes o
                     JOIN tokens t ON t.token_id = o.token_id
@@ -769,46 +789,46 @@ class TestForkRecoveryInvariant:
                     WHERE r.run_id = :run_id
                       AND o.sink_name = 'sink_a'
                 """),
-                {"run_id": run.run_id},
-            ).fetchall()
+                    {"run_id": run.run_id},
+                ).fetchall()
 
-            # Delete one branch's outcomes to simulate partial fork completion
-            for outcome in sink_a_outcomes:
-                conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == outcome.outcome_id))
-            conn.commit()
+                # Delete one branch's outcomes to simulate partial fork completion
+                for outcome in sink_a_outcomes:
+                    conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == outcome.outcome_id))
+                conn.commit()
 
-        _scrub_scheduler_work_for_outcomeless_tokens(db, run.run_id)
-        # Create a checkpoint (required for recovery to work) as the crashed
-        # leader's last act: the completed run vacated its seat on teardown.
-        reseat_crashed_leader(db, run.run_id)
-        checkpoint_manager = CheckpointManager(db)
-        create_checkpoint(
-            checkpoint_manager,
-            run_id=run.run_id,
-            sequence_number=1,
-            barrier_scalars=None,
-            graph=graph,
-        )
-
-        # Mark run as failed (required for recovery)
-        with db.engine.connect() as conn:
-            conn.execute(
-                text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
-                {"run_id": run.run_id},
+            _scrub_scheduler_work_for_outcomeless_tokens(db, run.run_id)
+            # Create a checkpoint (required for recovery to work) as the crashed
+            # leader's last act: the completed run vacated its seat on teardown.
+            reseat_crashed_leader(db, run.run_id)
+            checkpoint_manager = CheckpointManager(db)
+            create_checkpoint(
+                checkpoint_manager,
+                run_id=run.run_id,
+                sequence_number=1,
+                barrier_scalars=None,
+                graph=graph,
             )
-            conn.commit()
 
-        # Now test recovery - it should find all rows as unprocessed
-        recovery_manager = RecoveryManager(db, checkpoint_manager)
-        unprocessed = recovery_manager.get_unprocessed_rows(run.run_id)
+            # Mark run as failed (required for recovery)
+            with db.engine.connect() as conn:
+                conn.execute(
+                    text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
+                    {"run_id": run.run_id},
+                )
+                conn.commit()
 
-        # PROPERTY: When fork is partial (one child outcome deleted),
-        # ALL rows should appear in unprocessed list
-        assert len(unprocessed) == n_rows, (
-            f"RECOVERY INVARIANT VIOLATED: Expected {n_rows} unprocessed rows "
-            f"(all have partial fork completion), got {len(unprocessed)}. "
-            f"Recovery is incorrectly marking partially-completed forks as done."
-        )
+            # Now test recovery - it should find all rows as unprocessed
+            recovery_manager = RecoveryManager(db, checkpoint_manager)
+            unprocessed = recovery_manager.get_unprocessed_rows(run.run_id)
+
+            # PROPERTY: When fork is partial (one child outcome deleted),
+            # ALL rows should appear in unprocessed list
+            assert len(unprocessed) == n_rows, (
+                f"RECOVERY INVARIANT VIOLATED: Expected {n_rows} unprocessed rows "
+                f"(all have partial fork completion), got {len(unprocessed)}. "
+                f"Recovery is incorrectly marking partially-completed forks as done."
+            )
 
     def test_expand_token_persists_per_child_payload(self) -> None:
         """expand_token stores a {data, contract} envelope and writes tokens.token_data_ref.
@@ -1083,56 +1103,56 @@ class TestForkRecoveryInvariant:
         from elspeth.core.config import ElspethSettings
         from elspeth.core.landscape.schema import token_outcomes_table
 
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        # Single row keeps the test deterministic.
-        source = ListSource([{"value": 1}], on_success="sink_a")
-        sink_a = CollectSink("sink_a")
-        sink_b = CollectSink("sink_b")
+            # Single row keeps the test deterministic.
+            source = ListSource([{"value": 1}], on_success="sink_a")
+            sink_a = CollectSink("sink_a")
+            sink_b = CollectSink("sink_b")
 
-        # Gate forks every row to both sinks.
-        gate = GateSettings(
-            name="fork_gate",
-            input="gate_in",
-            condition="True",
-            routes={"true": "fork", "false": "sink_a"},
-            fork_to=["sink_a", "sink_b"],
-        )
+            # Gate forks every row to both sinks.
+            gate = GateSettings(
+                name="fork_gate",
+                input="gate_in",
+                condition="True",
+                routes={"true": "fork", "false": "sink_a"},
+                fork_to=["sink_a", "sink_b"],
+            )
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-        )
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(source)},
-            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
-            transforms=[],
-            sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
-            gates=[gate],
-            aggregations={},
-            coalesce_settings=[],
-        )
-        settings_obj = ElspethSettings(
-            sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
-            sinks={
-                "sink_a": {"plugin": "test", "on_write_failure": "discard"},
-                "sink_b": {"plugin": "test", "on_write_failure": "discard"},
-            },
-            gates=[gate],
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+            )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(source)},
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
+                transforms=[],
+                sinks={"sink_a": as_sink(sink_a), "sink_b": as_sink(sink_b)},
+                gates=[gate],
+                aggregations={},
+                coalesce_settings=[],
+            )
+            settings_obj = ElspethSettings(
+                sources={"primary": {"plugin": "test", "on_success": "sink_a", "options": {}}},
+                sinks={
+                    "sink_a": {"plugin": "test", "on_write_failure": "discard"},
+                    "sink_b": {"plugin": "test", "on_write_failure": "discard"},
+                },
+                gates=[gate],
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
-        run_id = run.run_id
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+            run_id = run.run_id
 
-        # Determine the sink_a child token ID independently of the method under test.
-        # After a complete run we expect exactly one fork child per sink per row.
-        with db.engine.connect() as conn:
-            sink_a_tokens = conn.execute(
-                text("""
+            # Determine the sink_a child token ID independently of the method under test.
+            # After a complete run we expect exactly one fork child per sink per row.
+            with db.engine.connect() as conn:
+                sink_a_tokens = conn.execute(
+                    text("""
                     SELECT t.token_id AS token_id
                     FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
@@ -1141,53 +1161,53 @@ class TestForkRecoveryInvariant:
                       AND f.kind = 'fork'
                       AND f.member_key = 'sink_a'
                 """),
-                {"run_id": run_id},
-            ).fetchall()
-        assert len(sink_a_tokens) == 1, f"Expected exactly one sink_a fork-child token, got {len(sink_a_tokens)}"
-        incomplete_token_id = sink_a_tokens[0].token_id
+                    {"run_id": run_id},
+                ).fetchall()
+            assert len(sink_a_tokens) == 1, f"Expected exactly one sink_a fork-child token, got {len(sink_a_tokens)}"
+            incomplete_token_id = sink_a_tokens[0].token_id
 
-        # Interrupt: delete the sink_a child's terminal outcome to simulate a crash
-        # after sink_b wrote but before sink_a wrote (or after sink_a wrote but before
-        # the outcome was recorded).
-        with db.engine.connect() as conn:
-            sink_a_outcomes = conn.execute(
-                text("""
+            # Interrupt: delete the sink_a child's terminal outcome to simulate a crash
+            # after sink_b wrote but before sink_a wrote (or after sink_a wrote but before
+            # the outcome was recorded).
+            with db.engine.connect() as conn:
+                sink_a_outcomes = conn.execute(
+                    text("""
                     SELECT o.outcome_id AS outcome_id
                     FROM token_outcomes o
                     JOIN tokens t ON t.token_id = o.token_id
                     JOIN rows r ON r.row_id = t.row_id
                     WHERE r.run_id = :run_id AND o.sink_name = 'sink_a'
                 """),
-                {"run_id": run_id},
-            ).fetchall()
-            assert sink_a_outcomes, "expected a sink_a outcome to delete"
-            for outcome in sink_a_outcomes:
-                conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == outcome.outcome_id))
-            conn.commit()
+                    {"run_id": run_id},
+                ).fetchall()
+                assert sink_a_outcomes, "expected a sink_a outcome to delete"
+                for outcome in sink_a_outcomes:
+                    conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == outcome.outcome_id))
+                conn.commit()
 
-        _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
-        # Exercise the method under test — no checkpoint or run-status required.
-        checkpoint_mgr = CheckpointManager(db)
-        recovery = RecoveryManager(db, checkpoint_mgr)
-        by_row = recovery.get_incomplete_tokens_by_row(run_id)
+            _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
+            # Exercise the method under test — no checkpoint or run-status required.
+            checkpoint_mgr = CheckpointManager(db)
+            recovery = RecoveryManager(db, checkpoint_mgr)
+            by_row = recovery.get_incomplete_tokens_by_row(run_id)
 
-        # Exactly one row_id group, exactly one spec in it.
-        assert len(by_row) == 1, f"Expected 1 row group, got {len(by_row)}: {list(by_row.keys())}"
-        all_specs = [s for specs in by_row.values() for s in specs]
-        assert len(all_specs) == 1, f"Expected exactly 1 incomplete token spec, got {len(all_specs)}: {[s.token_id for s in all_specs]}"
+            # Exactly one row_id group, exactly one spec in it.
+            assert len(by_row) == 1, f"Expected 1 row group, got {len(by_row)}: {list(by_row.keys())}"
+            all_specs = [s for specs in by_row.values() for s in specs]
+            assert len(all_specs) == 1, f"Expected exactly 1 incomplete token spec, got {len(all_specs)}: {[s.token_id for s in all_specs]}"
 
-        spec = all_specs[0]
-        assert spec.token_id == incomplete_token_id, f"Spec token_id {spec.token_id!r} != expected {incomplete_token_id!r}"
-        assert path_branch_name(spec.lineage_path) == "sink_a", f"Spec branch_name {path_branch_name(spec.lineage_path)!r} != 'sink_a'"
-        assert path_fork_group_id(spec.lineage_path) is not None, "fork child must carry fork_group_id (set by the gate on fork)"
-        assert spec.token_data_ref is None, "fork child shares the source payload (retrieval by row_id); token_data_ref must be NULL"
-        # The fork child visited a sink node → node_states written → max_attempt should be 0.
-        # If this fires at -1 it means fork children don't write node_states, which is a
-        # real finding: the re-drive logic in a later task relies on max_attempt + 1.
-        assert spec.max_attempt >= 0, (
-            f"Fork child token {spec.token_id!r} has no node_state entry (max_attempt=-1); "
-            f"the re-drive attempt-number anchor is missing — audit invariant violation."
-        )
+            spec = all_specs[0]
+            assert spec.token_id == incomplete_token_id, f"Spec token_id {spec.token_id!r} != expected {incomplete_token_id!r}"
+            assert path_branch_name(spec.lineage_path) == "sink_a", f"Spec branch_name {path_branch_name(spec.lineage_path)!r} != 'sink_a'"
+            assert path_fork_group_id(spec.lineage_path) is not None, "fork child must carry fork_group_id (set by the gate on fork)"
+            assert spec.token_data_ref is None, "fork child shares the source payload (retrieval by row_id); token_data_ref must be NULL"
+            # The fork child visited a sink node → node_states written → max_attempt should be 0.
+            # If this fires at -1 it means fork children don't write node_states, which is a
+            # real finding: the re-drive logic in a later task relies on max_attempt + 1.
+            assert spec.max_attempt >= 0, (
+                f"Fork child token {spec.token_id!r} has no node_state entry (max_attempt=-1); "
+                f"the re-drive attempt-number anchor is missing — audit invariant violation."
+            )
 
     def test_token_data_ref_read_paths_are_distinct(self) -> None:
         """The two read paths for token_data_ref differ in HYDRATION, not in the ref.
@@ -1529,16 +1549,19 @@ class TestForkRecoveryInvariant:
     # F1 Regression Cells (Task 9) — fork→coalesce + post-coalesce (B1)
     # ─────────────────────────────────────────────────────────────────────
 
+    @contextmanager
     def _setup_coalesce_pipeline(
         self,
-    ) -> tuple[
-        LandscapeDB,
-        MockPayloadStore,
-        PipelineConfig,
-        ExecutionGraph,
-        ElspethSettings,
-        str,  # run_id
-        RunResult,  # the completed run-1 RunResult (live counters)
+    ) -> Iterator[
+        tuple[
+            LandscapeDB,
+            MockPayloadStore,
+            PipelineConfig,
+            ExecutionGraph,
+            ElspethSettings,
+            str,  # run_id
+            RunResult,  # the completed run-1 RunResult (live counters)
+        ]
     ]:
         """Shared setup: build and run a fork→PassTransform→coalesce→sink pipeline.
 
@@ -1568,65 +1591,65 @@ class TestForkRecoveryInvariant:
         """
         from elspeth.core.config import ElspethSettings
 
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        source = ListSource([{"value": 1}], on_success="gate_in")
-        sink = CollectSink("output")
+            source = ListSource([{"value": 1}], on_success="gate_in")
+            sink = CollectSink("output")
 
-        pass_a = PassTransform(name="pass_a")
-        pass_b = PassTransform(name="pass_b")
+            pass_a = PassTransform(name="pass_a")
+            pass_b = PassTransform(name="pass_b")
 
-        gate = GateSettings(
-            name="fork_gate",
-            input="gate_in",
-            condition="True",
-            routes={"true": "fork", "false": "output"},
-            fork_to=["path_a", "path_b"],
-        )
+            gate = GateSettings(
+                name="fork_gate",
+                input="gate_in",
+                condition="True",
+                routes={"true": "fork", "false": "output"},
+                fork_to=["path_a", "path_b"],
+            )
 
-        # branches dict maps branch-name → final-connection-into-coalesce.
-        # wire_transforms wires: path_a → pass_a → done_a (consumed by coalesce 'merge').
-        coalesce = CoalesceSettings(
-            name="merge",
-            branches={"path_a": "done_a", "path_b": "done_b"},
-            policy="require_all",
-            merge="union",
-            on_success="output",
-        )
+            # branches dict maps branch-name → final-connection-into-coalesce.
+            # wire_transforms wires: path_a → pass_a → done_a (consumed by coalesce 'merge').
+            coalesce = CoalesceSettings(
+                name="merge",
+                branches={"path_a": "done_a", "path_b": "done_b"},
+                policy="require_all",
+                merge="union",
+                on_success="output",
+            )
 
-        wired_a = wire_transforms([pass_a], source_connection="path_a", final_sink="done_a", names=["pass_a"])
-        wired_b = wire_transforms([pass_b], source_connection="path_b", final_sink="done_b", names=["pass_b"])
+            wired_a = wire_transforms([pass_a], source_connection="path_a", final_sink="done_a", names=["pass_a"])
+            wired_b = wire_transforms([pass_b], source_connection="path_b", final_sink="done_b", names=["pass_b"])
 
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(source)},
-            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
-            transforms=wired_a + wired_b,
-            sinks={"output": as_sink(sink)},
-            gates=[gate],
-            aggregations={},
-            coalesce_settings=[coalesce],
-        )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(source)},
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
+                transforms=wired_a + wired_b,
+                sinks={"output": as_sink(sink)},
+                gates=[gate],
+                aggregations={},
+                coalesce_settings=[coalesce],
+            )
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(pass_a), as_transform(pass_b)],
-            sinks={"output": as_sink(sink)},
-            gates=[gate],
-            coalesce_settings=[coalesce],
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[as_transform(pass_a), as_transform(pass_b)],
+                sinks={"output": as_sink(sink)},
+                gates=[gate],
+                coalesce_settings=[coalesce],
+            )
 
-        settings_obj = ElspethSettings(
-            sources={"primary": {"plugin": "test", "on_success": "gate_in", "options": {}}},
-            sinks={"output": {"plugin": "test", "on_write_failure": "discard"}},
-            gates=[gate],
-            coalesce=[coalesce],
-        )
+            settings_obj = ElspethSettings(
+                sources={"primary": {"plugin": "test", "on_success": "gate_in", "options": {}}},
+                sinks={"output": {"plugin": "test", "on_write_failure": "discard"}},
+                gates=[gate],
+                coalesce=[coalesce],
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
-        run_id = run.run_id
-        return db, payload_store, config, graph, settings_obj, run_id, run
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+            run_id = run.run_id
+            yield db, payload_store, config, graph, settings_obj, run_id, run
 
     def test_resume_fork_to_coalesce_before_barrier(self) -> None:
         """Re-driving branch tokens interrupted BEFORE the coalesce barrier must not
@@ -1675,13 +1698,12 @@ class TestForkRecoveryInvariant:
         from elspeth.core.config import CheckpointSettings
         from elspeth.core.landscape.schema import token_outcomes_table, token_parents_table, tokens_table
 
-        db, payload_store, config, graph, settings_obj, run_id, _run1 = self._setup_coalesce_pipeline()
-
-        # ── Baseline (run-1 completed) ──────────────────────────────────────────
-        def _outcome_counts() -> dict[tuple[str, str], int]:
-            with db.engine.connect() as conn:
-                result = conn.execute(
-                    text("""
+        with self._setup_coalesce_pipeline() as (db, payload_store, config, graph, settings_obj, run_id, _run1):
+            # ── Baseline (run-1 completed) ──────────────────────────────────────────
+            def _outcome_counts() -> dict[tuple[str, str], int]:
+                with db.engine.connect() as conn:
+                    result = conn.execute(
+                        text("""
                         SELECT t.row_id AS row_id, o.sink_name AS sink_name, COUNT(*) AS n
                         FROM token_outcomes o
                         JOIN tokens t ON t.token_id = o.token_id
@@ -1691,18 +1713,18 @@ class TestForkRecoveryInvariant:
                           AND o.sink_name IS NOT NULL
                         GROUP BY t.row_id, o.sink_name
                     """),
-                    {"run_id": run_id},
-                ).fetchall()
-            return {(row.row_id, row.sink_name): row.n for row in result}
+                        {"run_id": run_id},
+                    ).fetchall()
+                return {(row.row_id, row.sink_name): row.n for row in result}
 
-        baseline = _outcome_counts()
-        assert len(baseline) == 1, f"Expected exactly one (row_id, sink_name) completed outcome; got {baseline}"
-        assert all(n == 1 for n in baseline.values()), baseline
+            baseline = _outcome_counts()
+            assert len(baseline) == 1, f"Expected exactly one (row_id, sink_name) completed outcome; got {baseline}"
+            assert all(n == 1 for n in baseline.values()), baseline
 
-        # ── Find the merged token (join_group_id set, branch_name NULL) ───────────
-        with db.engine.connect() as conn:
-            merged_rows = conn.execute(
-                text("""
+            # ── Find the merged token (join_group_id set, branch_name NULL) ───────────
+            with db.engine.connect() as conn:
+                merged_rows = conn.execute(
+                    text("""
                     SELECT t.token_id AS token_id, t.join_group_id AS join_group_id
                     FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
@@ -1713,76 +1735,76 @@ class TestForkRecoveryInvariant:
                           WHERE f.run_id = t.run_id AND f.kind = 'fork'
                       )
                 """),
-                {"run_id": run_id},
-            ).fetchall()
-        assert len(merged_rows) == 1, f"Expected exactly one merged token (join_group_id set, branch/fork NULL); got {len(merged_rows)}"
-        merged_token_id = merged_rows[0].token_id
+                    {"run_id": run_id},
+                ).fetchall()
+            assert len(merged_rows) == 1, f"Expected exactly one merged token (join_group_id set, branch/fork NULL); got {len(merged_rows)}"
+            merged_token_id = merged_rows[0].token_id
 
-        # ── Interrupt: undo the barrier entirely ───────────────────────────────────
-        # A pre-barrier crash means: the barrier code never ran.  In production this
-        # means no merged token exists, no branch COALESCED outcomes were recorded,
-        # and the branch tokens' node_states at the coalesce node are NOT marked
-        # completed (the CoalesceExecutor calls begin_node_state on arrival but only
-        # calls complete_node_state once the barrier fires).
-        #
-        # We must therefore reverse everything the barrier wrote:
-        #   1. merged token's terminal outcome (COMPLETED at sink)
-        #   2. merged token's node_states
-        #   3. token_parents where token_id = merged (merged→branch parent links)
-        #   4. merged token row itself
-        #   5. branch tokens' COALESCED outcomes (path='coalesced', jgid=join_group_id)
-        #   6. branch tokens' COMPLETED node_states at the coalesce node —
-        #      CoalesceExecutor._check_landscape_for_completion queries
-        #      has_completed_group_for_node which joins node_states→lineage
-        #      frames and checks completed_at IS NOT NULL; if these remain, accept() sees
-        #      "already completed" and records a spurious UNROUTED outcome instead
-        #      of holding/merging the re-driven branch tokens.
-        #
-        # After this, the two branch child tokens have no terminal outcome and no
-        # completed coalesce node_state — faithful pre-barrier crash state.
+            # ── Interrupt: undo the barrier entirely ───────────────────────────────────
+            # A pre-barrier crash means: the barrier code never ran.  In production this
+            # means no merged token exists, no branch COALESCED outcomes were recorded,
+            # and the branch tokens' node_states at the coalesce node are NOT marked
+            # completed (the CoalesceExecutor calls begin_node_state on arrival but only
+            # calls complete_node_state once the barrier fires).
+            #
+            # We must therefore reverse everything the barrier wrote:
+            #   1. merged token's terminal outcome (COMPLETED at sink)
+            #   2. merged token's node_states
+            #   3. token_parents where token_id = merged (merged→branch parent links)
+            #   4. merged token row itself
+            #   5. branch tokens' COALESCED outcomes (path='coalesced', jgid=join_group_id)
+            #   6. branch tokens' COMPLETED node_states at the coalesce node —
+            #      CoalesceExecutor._check_landscape_for_completion queries
+            #      has_completed_group_for_node which joins node_states→lineage
+            #      frames and checks completed_at IS NOT NULL; if these remain, accept() sees
+            #      "already completed" and records a spurious UNROUTED outcome instead
+            #      of holding/merging the re-driven branch tokens.
+            #
+            # After this, the two branch child tokens have no terminal outcome and no
+            # completed coalesce node_state — faithful pre-barrier crash state.
 
-        # First, find the coalesce node_id so we can delete the branch tokens'
-        # coalesce-node node_states by (token_id, node_id) rather than all states.
-        coalesce_node_id_for_deletion = graph.get_coalesce_id_map()[CoalesceName("merge")]
+            # First, find the coalesce node_id so we can delete the branch tokens'
+            # coalesce-node node_states by (token_id, node_id) rather than all states.
+            coalesce_node_id_for_deletion = graph.get_coalesce_id_map()[CoalesceName("merge")]
 
-        with db.engine.connect() as conn:
-            # Temporarily disable FK enforcement to allow deletion of the merged token
-            # and its dependents in a single connection without a strict topological order.
-            # All rows being deleted are barrier artifacts from this specific run; the
-            # connection is committed before FKs are re-enabled to keep the DB consistent.
-            _fk_driver = conn.connection.driver_connection  # raw sqlite3 conn
-            assert _fk_driver is not None
-            # PRAGMA foreign_keys is a silent no-op inside a transaction; the
-            # write-intent begin discipline autobegins an explicit BEGIN on the
-            # first conn.execute(), so toggle FKs at the raw driver level
-            # (driver autocommit) before the transaction starts.
-            _fk_driver.execute("PRAGMA foreign_keys = OFF")
+            with db.engine.connect() as conn:
+                # Temporarily disable FK enforcement to allow deletion of the merged token
+                # and its dependents in a single connection without a strict topological order.
+                # All rows being deleted are barrier artifacts from this specific run; the
+                # connection is committed before FKs are re-enabled to keep the DB consistent.
+                _fk_driver = conn.connection.driver_connection  # raw sqlite3 conn
+                assert _fk_driver is not None
+                # PRAGMA foreign_keys is a silent no-op inside a transaction; the
+                # write-intent begin discipline autobegins an explicit BEGIN on the
+                # first conn.execute(), so toggle FKs at the raw driver level
+                # (driver autocommit) before the transaction starts.
+                _fk_driver.execute("PRAGMA foreign_keys = OFF")
 
-            # 1. merged token outcomes (COMPLETED at sink)
-            conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.token_id == merged_token_id))
-            # 2. merged token node_states (coalesce node may have routing_events referencing
-            #    them; disable FKs makes this safe without a full cascade walk)
-            conn.execute(
-                text("DELETE FROM node_states WHERE token_id = :tid"),
-                {"tid": merged_token_id},
-            )
-            # 3. durable coalesce receipt and normalized membership. A pre-barrier
-            #    crash cannot retain the receipt for the merged token being removed.
-            conn.execute(
-                text(
-                    "DELETE FROM coalesce_effect_members WHERE effect_id IN "
-                    "(SELECT effect_id FROM coalesce_effects WHERE result_token_id = :tid)"
-                ),
-                {"tid": merged_token_id},
-            )
-            conn.execute(text("DELETE FROM coalesce_effects WHERE result_token_id = :tid"), {"tid": merged_token_id})
-            # 4. token_parents for merged token (FK: token_id → token_parents.token_id)
-            conn.execute(token_parents_table.delete().where(token_parents_table.c.token_id == merged_token_id))
-            # 5. merged token row (FK deps removed above)
-            conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
-            # 6. branch COALESCED outcomes (recorded by the barrier, path='coalesced')
-            conn.execute(
-                text("""
+                # 1. merged token outcomes (COMPLETED at sink)
+                conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.token_id == merged_token_id))
+                # 2. merged token node_states (coalesce node may have routing_events referencing
+                #    them; disable FKs makes this safe without a full cascade walk)
+                conn.execute(
+                    text("DELETE FROM node_states WHERE token_id = :tid"),
+                    {"tid": merged_token_id},
+                )
+                # 3. durable coalesce receipt and normalized membership. A pre-barrier
+                #    crash cannot retain the receipt for the merged token being removed.
+                conn.execute(
+                    text(
+                        "DELETE FROM coalesce_effect_members WHERE effect_id IN "
+                        "(SELECT effect_id FROM coalesce_effects WHERE result_token_id = :tid)"
+                    ),
+                    {"tid": merged_token_id},
+                )
+                conn.execute(text("DELETE FROM coalesce_effects WHERE result_token_id = :tid"), {"tid": merged_token_id})
+                # 4. token_parents for merged token (FK: token_id → token_parents.token_id)
+                conn.execute(token_parents_table.delete().where(token_parents_table.c.token_id == merged_token_id))
+                # 5. merged token row (FK deps removed above)
+                conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
+                # 6. branch COALESCED outcomes (recorded by the barrier, path='coalesced')
+                conn.execute(
+                    text("""
                     DELETE FROM token_outcomes
                     WHERE path = 'coalesced'
                       AND token_id IN (
@@ -1790,79 +1812,79 @@ class TestForkRecoveryInvariant:
                           WHERE run_id = :run_id AND kind = 'fork'
                       )
                 """),
-                {"run_id": run_id},
+                    {"run_id": run_id},
+                )
+                # 7. branch tokens' COMPLETED node_states at the coalesce node.
+                #    CoalesceExecutor._check_landscape_for_completion (called by accept())
+                #    queries completed_at IS NOT NULL for the coalesce node.  If these
+                #    remain, the re-driven branch tokens are treated as late arrivals
+                #    and get UNROUTED/FAILURE instead of being held/merged.
+                #    We delete by (node_id=coalesce_node_id, run_id=run_id) — which covers
+                #    both branch token_ids without needing to enumerate them.
+                conn.execute(
+                    text("DELETE FROM node_states WHERE node_id = :nid AND run_id = :rid"),
+                    {"nid": str(coalesce_node_id_for_deletion), "rid": run_id},
+                )
+                conn.commit()
+                _fk_driver.execute("PRAGMA foreign_keys = ON")
+
+            _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
+            # ── Oracle: incomplete specs must be the TWO branch children (Case 2) ────
+            checkpoint_mgr = CheckpointManager(db)
+            recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+            by_row = recovery_mgr.get_incomplete_tokens_by_row(run_id)
+
+            all_specs = [s for specs in by_row.values() for s in specs]
+            assert len(all_specs) == 2, (
+                f"Oracle must return exactly 2 incomplete specs (both branch children, "
+                f"pre-barrier state); got {len(all_specs)}: {[s.token_id for s in all_specs]}"
             )
-            # 7. branch tokens' COMPLETED node_states at the coalesce node.
-            #    CoalesceExecutor._check_landscape_for_completion (called by accept())
-            #    queries completed_at IS NOT NULL for the coalesce node.  If these
-            #    remain, the re-driven branch tokens are treated as late arrivals
-            #    and get UNROUTED/FAILURE instead of being held/merged.
-            #    We delete by (node_id=coalesce_node_id, run_id=run_id) — which covers
-            #    both branch token_ids without needing to enumerate them.
-            conn.execute(
-                text("DELETE FROM node_states WHERE node_id = :nid AND run_id = :rid"),
-                {"nid": str(coalesce_node_id_for_deletion), "rid": run_id},
+            for spec in all_specs:
+                assert path_branch_name(spec.lineage_path) is not None, (
+                    f"Before-barrier spec must have branch_name set (Case 2); got None for token {spec.token_id!r}"
+                )
+                assert spec.join_group_id is None, (
+                    f"Before-barrier spec must NOT have join_group_id (no merged token); got {spec.join_group_id!r} for token {spec.token_id!r}"
+                )
+                assert spec.token_data_ref is None, (
+                    f"Before-barrier spec (fork child) must NOT have token_data_ref (shares source payload); got {spec.token_data_ref!r}"
+                )
+
+            # ── Resume ────────────────────────────────────────────────────────────────
+            reseat_crashed_leader(db, run_id)
+            create_checkpoint(
+                checkpoint_mgr,
+                run_id=run_id,
+                sequence_number=1,
+                barrier_scalars=None,
+                graph=graph,
             )
-            conn.commit()
-            _fk_driver.execute("PRAGMA foreign_keys = ON")
+            with db.engine.connect() as conn:
+                conn.execute(
+                    text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
+                    {"run_id": run_id},
+                )
+                conn.commit()
 
-        _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
-        # ── Oracle: incomplete specs must be the TWO branch children (Case 2) ────
-        checkpoint_mgr = CheckpointManager(db)
-        recovery_mgr = RecoveryManager(db, checkpoint_mgr)
-        by_row = recovery_mgr.get_incomplete_tokens_by_row(run_id)
+            check = recovery_mgr.can_resume(run_id, graph)
+            assert check.can_resume, f"cannot resume: {check.reason}"
+            resume_point = recovery_mgr.get_resume_point(run_id, graph)
+            assert resume_point is not None
 
-        all_specs = [s for specs in by_row.values() for s in specs]
-        assert len(all_specs) == 2, (
-            f"Oracle must return exactly 2 incomplete specs (both branch children, "
-            f"pre-barrier state); got {len(all_specs)}: {[s.token_id for s in all_specs]}"
-        )
-        for spec in all_specs:
-            assert path_branch_name(spec.lineage_path) is not None, (
-                f"Before-barrier spec must have branch_name set (Case 2); got None for token {spec.token_id!r}"
-            )
-            assert spec.join_group_id is None, (
-                f"Before-barrier spec must NOT have join_group_id (no merged token); got {spec.join_group_id!r} for token {spec.token_id!r}"
-            )
-            assert spec.token_data_ref is None, (
-                f"Before-barrier spec (fork child) must NOT have token_data_ref (shares source payload); got {spec.token_data_ref!r}"
-            )
+            checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+            resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+            resume_result = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
 
-        # ── Resume ────────────────────────────────────────────────────────────────
-        reseat_crashed_leader(db, run_id)
-        create_checkpoint(
-            checkpoint_mgr,
-            run_id=run_id,
-            sequence_number=1,
-            barrier_scalars=None,
-            graph=graph,
-        )
-        with db.engine.connect() as conn:
-            conn.execute(
-                text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
-                {"run_id": run_id},
-            )
-            conn.commit()
+            # ── Conservation law ──────────────────────────────────────────────────────
+            after = _outcome_counts()
+            assert after == baseline, f"Resume must conserve the terminal-outcome multiset. baseline={baseline} after={after}"
+            orphans = orphan_leaf_token_ids(db, run_id)
+            assert not orphans, f"Resume left {len(orphans)} non-delegation leaf token(s) with no terminal outcome (orphans): {orphans}"
+            assert all(n == 1 for n in after.values()), f"No (row_id, sink_name) may carry two outcomes after resume: {after}"
+            assert resume_result.status == RunStatus.COMPLETED, resume_result.status
 
-        check = recovery_mgr.can_resume(run_id, graph)
-        assert check.can_resume, f"cannot resume: {check.reason}"
-        resume_point = recovery_mgr.get_resume_point(run_id, graph)
-        assert resume_point is not None
-
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
-        resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
-        resume_result = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
-
-        # ── Conservation law ──────────────────────────────────────────────────────
-        after = _outcome_counts()
-        assert after == baseline, f"Resume must conserve the terminal-outcome multiset. baseline={baseline} after={after}"
-        orphans = orphan_leaf_token_ids(db, run_id)
-        assert not orphans, f"Resume left {len(orphans)} non-delegation leaf token(s) with no terminal outcome (orphans): {orphans}"
-        assert all(n == 1 for n in after.values()), f"No (row_id, sink_name) may carry two outcomes after resume: {after}"
-        assert resume_result.status == RunStatus.COMPLETED, resume_result.status
-
-        post_stats = get_fork_group_stats(db, run_id)
-        assert post_stats["total_fork_groups"] == 1, f"Fork-group count must remain 1 (one row, one fork); got {post_stats}"
+            post_stats = get_fork_group_stats(db, run_id)
+            assert post_stats["total_fork_groups"] == 1, f"Fork-group count must remain 1 (one row, one fork); got {post_stats}"
 
     def test_resume_coalesce_held_branch_not_redriven(self) -> None:
         """A branch HELD at a coalesce barrier (a journal BLOCKED row) must
@@ -1926,13 +1948,12 @@ class TestForkRecoveryInvariant:
         from elspeth.core.config import CheckpointSettings
         from elspeth.core.landscape.schema import token_outcomes_table, token_parents_table, tokens_table
 
-        db, payload_store, config, graph, settings_obj, run_id, _run1 = self._setup_coalesce_pipeline()
-
-        # ── Baseline (run-1 completed) ──────────────────────────────────────────
-        def _outcome_counts() -> dict[tuple[str, str], int]:
-            with db.engine.connect() as conn:
-                result = conn.execute(
-                    text("""
+        with self._setup_coalesce_pipeline() as (db, payload_store, config, graph, settings_obj, run_id, _run1):
+            # ── Baseline (run-1 completed) ──────────────────────────────────────────
+            def _outcome_counts() -> dict[tuple[str, str], int]:
+                with db.engine.connect() as conn:
+                    result = conn.execute(
+                        text("""
                         SELECT t.row_id AS row_id, o.sink_name AS sink_name, COUNT(*) AS n
                         FROM token_outcomes o
                         JOIN tokens t ON t.token_id = o.token_id
@@ -1942,19 +1963,19 @@ class TestForkRecoveryInvariant:
                           AND o.sink_name IS NOT NULL
                         GROUP BY t.row_id, o.sink_name
                     """),
-                    {"run_id": run_id},
-                ).fetchall()
-            return {(row.row_id, row.sink_name): row.n for row in result}
+                        {"run_id": run_id},
+                    ).fetchall()
+                return {(row.row_id, row.sink_name): row.n for row in result}
 
-        baseline = _outcome_counts()
-        assert len(baseline) == 1, f"Expected exactly one (row_id, sink_name) completed outcome; got {baseline}"
-        assert all(n == 1 for n in baseline.values()), baseline
+            baseline = _outcome_counts()
+            assert len(baseline) == 1, f"Expected exactly one (row_id, sink_name) completed outcome; got {baseline}"
+            assert all(n == 1 for n in baseline.values()), baseline
 
-        # ── Locate the merged token and the two branch tokens ─────────────────────
-        coalesce_node_id = str(graph.get_coalesce_id_map()[CoalesceName("merge")])
-        with db.engine.connect() as conn:
-            merged_rows = conn.execute(
-                text("""
+            # ── Locate the merged token and the two branch tokens ─────────────────────
+            coalesce_node_id = str(graph.get_coalesce_id_map()[CoalesceName("merge")])
+            with db.engine.connect() as conn:
+                merged_rows = conn.execute(
+                    text("""
                     SELECT t.token_id AS token_id, t.join_group_id AS join_group_id
                     FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
@@ -1965,10 +1986,10 @@ class TestForkRecoveryInvariant:
                           WHERE f.run_id = t.run_id AND f.kind = 'fork'
                       )
                 """),
-                {"run_id": run_id},
-            ).fetchall()
-            branch_rows = conn.execute(
-                text("""
+                    {"run_id": run_id},
+                ).fetchall()
+                branch_rows = conn.execute(
+                    text("""
                     SELECT t.token_id AS token_id, f.member_key AS branch_name, t.row_id AS row_id,
                            f.group_id AS fork_group_id
                     FROM tokens t
@@ -1976,73 +1997,73 @@ class TestForkRecoveryInvariant:
                     JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
                     WHERE r.run_id = :run_id AND f.member_key IN ('path_a', 'path_b')
                 """),
-                {"run_id": run_id},
-            ).fetchall()
-        assert len(merged_rows) == 1, f"Expected exactly one merged token; got {len(merged_rows)}"
-        merged_token_id = merged_rows[0].token_id
-        by_branch = {b.branch_name: b for b in branch_rows}
-        assert set(by_branch) == {"path_a", "path_b"}, f"expected path_a + path_b; got {set(by_branch)}"
-        # Hold the branch that dispatches FIRST so the held-branch re-drive is the FIRST
-        # coalesce arrival on resume — it re-arrives while it is the only _pending entry
-        # (sibling not yet re-driven, no merge yet, _check_landscape_for_completion False),
-        # deterministically hitting the duplicate-arrival guard rather than the
-        # late-arrival path. get_incomplete_tokens_by_row orders specs by
-        # (step_in_pipeline, token_id); both branches share the coalesce step, so dispatch
-        # order is ascending token_id → hold the lexicographically-smallest token_id.
-        held_branch = min(branch_rows, key=lambda b: b.token_id)  # held at barrier (restored into _pending)
-        incomplete_branch = next(b for b in branch_rows if b.token_id != held_branch.token_id)  # not-yet-arrived; re-drives
-        held_branch_name = held_branch.branch_name
-        row_id = held_branch.row_id
+                    {"run_id": run_id},
+                ).fetchall()
+            assert len(merged_rows) == 1, f"Expected exactly one merged token; got {len(merged_rows)}"
+            merged_token_id = merged_rows[0].token_id
+            by_branch = {b.branch_name: b for b in branch_rows}
+            assert set(by_branch) == {"path_a", "path_b"}, f"expected path_a + path_b; got {set(by_branch)}"
+            # Hold the branch that dispatches FIRST so the held-branch re-drive is the FIRST
+            # coalesce arrival on resume — it re-arrives while it is the only _pending entry
+            # (sibling not yet re-driven, no merge yet, _check_landscape_for_completion False),
+            # deterministically hitting the duplicate-arrival guard rather than the
+            # late-arrival path. get_incomplete_tokens_by_row orders specs by
+            # (step_in_pipeline, token_id); both branches share the coalesce step, so dispatch
+            # order is ascending token_id → hold the lexicographically-smallest token_id.
+            held_branch = min(branch_rows, key=lambda b: b.token_id)  # held at barrier (restored into _pending)
+            incomplete_branch = next(b for b in branch_rows if b.token_id != held_branch.token_id)  # not-yet-arrived; re-drives
+            held_branch_name = held_branch.branch_name
+            row_id = held_branch.row_id
 
-        # ── Capture the held branch's coalesce-node state_id (real node_state) ─────
-        # The journal restore derives the held branch's PENDING hold from the OPEN
-        # node_state at the coalesce node (get_open_node_state_ids) — reuse the
-        # genuine run-1 coalesce-node node_state for the held branch.
-        with db.engine.connect() as conn:
-            held_state_row = conn.execute(
-                text("""
+            # ── Capture the held branch's coalesce-node state_id (real node_state) ─────
+            # The journal restore derives the held branch's PENDING hold from the OPEN
+            # node_state at the coalesce node (get_open_node_state_ids) — reuse the
+            # genuine run-1 coalesce-node node_state for the held branch.
+            with db.engine.connect() as conn:
+                held_state_row = conn.execute(
+                    text("""
                     SELECT state_id FROM node_states
                     WHERE token_id = :tid AND node_id = :nid AND run_id = :rid
                     ORDER BY attempt DESC LIMIT 1
                 """),
-                {"tid": held_branch.token_id, "nid": coalesce_node_id, "rid": run_id},
-            ).fetchone()
-        assert held_state_row is not None, (
-            "Setup precondition violated: path_a must have a coalesce-node node_state from run-1 "
-            "(CoalesceExecutor.accept calls begin_node_state on arrival)."
-        )
-        held_state_id = held_state_row.state_id
-
-        # ── The contract the row was produced under (for the journal row payloads) ──
-        checkpoint_mgr = CheckpointManager(db)
-        recovery_for_contract = RecoveryManager(db, checkpoint_mgr)
-        source_contract = recovery_for_contract.verify_contract_integrity(run_id)
-
-        # ── Interrupt: undo the barrier; revert path_a to PENDING, drop path_b's arrival ──
-        with db.engine.connect() as conn:
-            _fk_driver = conn.connection.driver_connection  # raw sqlite3 conn
-            assert _fk_driver is not None
-            # PRAGMA foreign_keys is a silent no-op inside a transaction; the
-            # write-intent begin discipline autobegins an explicit BEGIN on the
-            # first conn.execute(), so toggle FKs at the raw driver level
-            # (driver autocommit) before the transaction starts.
-            _fk_driver.execute("PRAGMA foreign_keys = OFF")
-            # Merged token artifacts (the barrier's output)
-            conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.token_id == merged_token_id))
-            conn.execute(text("DELETE FROM node_states WHERE token_id = :tid"), {"tid": merged_token_id})
-            conn.execute(
-                text(
-                    "DELETE FROM coalesce_effect_members WHERE effect_id IN "
-                    "(SELECT effect_id FROM coalesce_effects WHERE result_token_id = :tid)"
-                ),
-                {"tid": merged_token_id},
+                    {"tid": held_branch.token_id, "nid": coalesce_node_id, "rid": run_id},
+                ).fetchone()
+            assert held_state_row is not None, (
+                "Setup precondition violated: path_a must have a coalesce-node node_state from run-1 "
+                "(CoalesceExecutor.accept calls begin_node_state on arrival)."
             )
-            conn.execute(text("DELETE FROM coalesce_effects WHERE result_token_id = :tid"), {"tid": merged_token_id})
-            conn.execute(token_parents_table.delete().where(token_parents_table.c.token_id == merged_token_id))
-            conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
-            # Branch COALESCED outcomes (recorded by the barrier on both branches)
-            conn.execute(
-                text("""
+            held_state_id = held_state_row.state_id
+
+            # ── The contract the row was produced under (for the journal row payloads) ──
+            checkpoint_mgr = CheckpointManager(db)
+            recovery_for_contract = RecoveryManager(db, checkpoint_mgr)
+            source_contract = recovery_for_contract.verify_contract_integrity(run_id)
+
+            # ── Interrupt: undo the barrier; revert path_a to PENDING, drop path_b's arrival ──
+            with db.engine.connect() as conn:
+                _fk_driver = conn.connection.driver_connection  # raw sqlite3 conn
+                assert _fk_driver is not None
+                # PRAGMA foreign_keys is a silent no-op inside a transaction; the
+                # write-intent begin discipline autobegins an explicit BEGIN on the
+                # first conn.execute(), so toggle FKs at the raw driver level
+                # (driver autocommit) before the transaction starts.
+                _fk_driver.execute("PRAGMA foreign_keys = OFF")
+                # Merged token artifacts (the barrier's output)
+                conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.token_id == merged_token_id))
+                conn.execute(text("DELETE FROM node_states WHERE token_id = :tid"), {"tid": merged_token_id})
+                conn.execute(
+                    text(
+                        "DELETE FROM coalesce_effect_members WHERE effect_id IN "
+                        "(SELECT effect_id FROM coalesce_effects WHERE result_token_id = :tid)"
+                    ),
+                    {"tid": merged_token_id},
+                )
+                conn.execute(text("DELETE FROM coalesce_effects WHERE result_token_id = :tid"), {"tid": merged_token_id})
+                conn.execute(token_parents_table.delete().where(token_parents_table.c.token_id == merged_token_id))
+                conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
+                # Branch COALESCED outcomes (recorded by the barrier on both branches)
+                conn.execute(
+                    text("""
                     DELETE FROM token_outcomes
                     WHERE path = 'coalesced'
                       AND token_id IN (
@@ -2050,135 +2071,135 @@ class TestForkRecoveryInvariant:
                           WHERE run_id = :run_id AND kind = 'fork'
                       )
                 """),
-                {"run_id": run_id},
+                    {"run_id": run_id},
+                )
+                # HELD branch (path_a): revert its coalesce-node node_state to the held/open
+                # state (status='open', completed_at NULL) — the genuine pre-barrier state that
+                # CoalesceExecutor.accept's begin_node_state writes on arrival (the barrier never
+                # completed it because the crash happened before path_b arrived). 'open' is
+                # non-terminal, so on GREEN _execute_merge can complete this state by state_id
+                # when the barrier finally fires; deleting it would crash the completion write,
+                # and leaving it 'completed' would hit the immutable-terminal guard.
+                conn.execute(
+                    text("UPDATE node_states SET status = 'open', completed_at = NULL, output_hash = NULL WHERE state_id = :sid"),
+                    {"sid": held_state_id},
+                )
+                # SIBLING branch (path_b): delete ALL its node_states — it is genuinely
+                # not-yet-started (crash after the fork enqueued its work item but before
+                # any worker claimed it), so no node visit may remain on the audit trail.
+                conn.execute(
+                    text("DELETE FROM node_states WHERE token_id = :tid AND run_id = :rid"),
+                    {"tid": incomplete_branch.token_id, "rid": run_id},
+                )
+                conn.commit()
+                _fk_driver.execute("PRAGMA foreign_keys = ON")
+
+            _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
+
+            # ── Restore the SIBLING's durable scheduler work item (crash-faithful) ────
+            # In a real RC6 crash at this point the fork had already enqueued BOTH branch
+            # continuations; the held branch's item went BLOCKED at the barrier (re-seeded
+            # below through the production journal verbs) while the sibling's item sat
+            # READY, never claimed. Re-enqueue the sibling at its branch-first node with
+            # its coalesce cursor so resume's scheduler drain re-drives it into the
+            # restored barrier.
+            branch_index_by_name = {"path_a": 0, "path_b": 1}
+            sibling_first_node = str(graph.get_transform_id_map()[branch_index_by_name[incomplete_branch.branch_name]])
+            with db.engine.connect() as conn:
+                sibling_ingest_sequence = conn.execute(
+                    text("SELECT ingest_sequence FROM rows WHERE row_id = :rid"),
+                    {"rid": row_id},
+                ).scalar_one()
+            scheduler_repo = RecorderFactory(db).scheduler
+            scheduler_repo.enqueue_ready(
+                run_id=run_id,
+                token_id=incomplete_branch.token_id,
+                row_id=row_id,
+                node_id=sibling_first_node,
+                step_index=1,
+                ingest_sequence=sibling_ingest_sequence,
+                row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 1}, contract=source_contract)),
+                lineage_path=(
+                    LineageFrame(kind=FrameKind.FORK, group_id=incomplete_branch.fork_group_id, member_key=incomplete_branch.branch_name),
+                ),
+                coalesce_node_id=coalesce_node_id,
+                coalesce_name="merge",
             )
-            # HELD branch (path_a): revert its coalesce-node node_state to the held/open
-            # state (status='open', completed_at NULL) — the genuine pre-barrier state that
-            # CoalesceExecutor.accept's begin_node_state writes on arrival (the barrier never
-            # completed it because the crash happened before path_b arrived). 'open' is
-            # non-terminal, so on GREEN _execute_merge can complete this state by state_id
-            # when the barrier finally fires; deleting it would crash the completion write,
-            # and leaving it 'completed' would hit the immutable-terminal guard.
-            conn.execute(
-                text("UPDATE node_states SET status = 'open', completed_at = NULL, output_hash = NULL WHERE state_id = :sid"),
-                {"sid": held_state_id},
+            # ── Re-seed the HELD branch's BLOCKED journal row (F1: journal is truth) ──
+            # Production journal verbs, exactly as a live barrier hold is recorded: the
+            # fork enqueued the branch continuation at its branch-first node, a worker
+            # claimed it, the branch arrived at the coalesce and accept() held it →
+            # mark_blocked(barrier_key='merge') stamped barrier_blocked_at. The BLOCKED
+            # row carries the branch's row payload — resume restores _pending from it
+            # (BarrierRecoveryCoordinator.restore_from_journal ← list_blocked_barrier_items).
+            held_first_node = str(graph.get_transform_id_map()[branch_index_by_name[held_branch_name]])
+            datetime.now(UTC)
+            held_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
+                run_id=run_id,
+                token_id=held_branch.token_id,
+                row_id=row_id,
+                node_id=held_first_node,
+                step_index=1,
+                ingest_sequence=sibling_ingest_sequence,
+                row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 1}, contract=source_contract)),
+                lease_owner="test-harness",
+                lease_seconds=60,
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=held_branch.fork_group_id, member_key=held_branch_name),),
+                coalesce_node_id=coalesce_node_id,
+                coalesce_name="merge",
             )
-            # SIBLING branch (path_b): delete ALL its node_states — it is genuinely
-            # not-yet-started (crash after the fork enqueued its work item but before
-            # any worker claimed it), so no node visit may remain on the audit trail.
-            conn.execute(
-                text("DELETE FROM node_states WHERE token_id = :tid AND run_id = :rid"),
-                {"tid": incomplete_branch.token_id, "rid": run_id},
+            scheduler_repo.mark_blocked(
+                work_item_id=held_item.work_item_id,
+                queue_key=None,
+                barrier_key="merge",  # coalesce barrier_key == coalesce NAME (restore partition D1)
+                expected_lease_owner="test-harness",
             )
-            conn.commit()
-            _fk_driver.execute("PRAGMA foreign_keys = ON")
 
-        _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
+            # ── Create the checkpoint (F1: scalars only — no barrier blob) ──
+            reseat_crashed_leader(db, run_id)
+            create_checkpoint(
+                checkpoint_mgr,
+                run_id=run_id,
+                sequence_number=1,
+                barrier_scalars=None,
+                graph=graph,
+            )
+            with db.engine.connect() as conn:
+                conn.execute(text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"), {"run_id": run_id})
+                conn.commit()
 
-        # ── Restore the SIBLING's durable scheduler work item (crash-faithful) ────
-        # In a real RC6 crash at this point the fork had already enqueued BOTH branch
-        # continuations; the held branch's item went BLOCKED at the barrier (re-seeded
-        # below through the production journal verbs) while the sibling's item sat
-        # READY, never claimed. Re-enqueue the sibling at its branch-first node with
-        # its coalesce cursor so resume's scheduler drain re-drives it into the
-        # restored barrier.
-        branch_index_by_name = {"path_a": 0, "path_b": 1}
-        sibling_first_node = str(graph.get_transform_id_map()[branch_index_by_name[incomplete_branch.branch_name]])
-        with db.engine.connect() as conn:
-            sibling_ingest_sequence = conn.execute(
-                text("SELECT ingest_sequence FROM rows WHERE row_id = :rid"),
-                {"rid": row_id},
-            ).scalar_one()
-        scheduler_repo = RecorderFactory(db).scheduler
-        scheduler_repo.enqueue_ready(
-            run_id=run_id,
-            token_id=incomplete_branch.token_id,
-            row_id=row_id,
-            node_id=sibling_first_node,
-            step_index=1,
-            ingest_sequence=sibling_ingest_sequence,
-            row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 1}, contract=source_contract)),
-            lineage_path=(
-                LineageFrame(kind=FrameKind.FORK, group_id=incomplete_branch.fork_group_id, member_key=incomplete_branch.branch_name),
-            ),
-            coalesce_node_id=coalesce_node_id,
-            coalesce_name="merge",
-        )
-        # ── Re-seed the HELD branch's BLOCKED journal row (F1: journal is truth) ──
-        # Production journal verbs, exactly as a live barrier hold is recorded: the
-        # fork enqueued the branch continuation at its branch-first node, a worker
-        # claimed it, the branch arrived at the coalesce and accept() held it →
-        # mark_blocked(barrier_key='merge') stamped barrier_blocked_at. The BLOCKED
-        # row carries the branch's row payload — resume restores _pending from it
-        # (BarrierRecoveryCoordinator.restore_from_journal ← list_blocked_barrier_items).
-        held_first_node = str(graph.get_transform_id_map()[branch_index_by_name[held_branch_name]])
-        datetime.now(UTC)
-        held_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
-            run_id=run_id,
-            token_id=held_branch.token_id,
-            row_id=row_id,
-            node_id=held_first_node,
-            step_index=1,
-            ingest_sequence=sibling_ingest_sequence,
-            row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 1}, contract=source_contract)),
-            lease_owner="test-harness",
-            lease_seconds=60,
-            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=held_branch.fork_group_id, member_key=held_branch_name),),
-            coalesce_node_id=coalesce_node_id,
-            coalesce_name="merge",
-        )
-        scheduler_repo.mark_blocked(
-            work_item_id=held_item.work_item_id,
-            queue_key=None,
-            barrier_key="merge",  # coalesce barrier_key == coalesce NAME (restore partition D1)
-            expected_lease_owner="test-harness",
-        )
+            recovery_mgr = RecoveryManager(db, checkpoint_mgr)
 
-        # ── Create the checkpoint (F1: scalars only — no barrier blob) ──
-        reseat_crashed_leader(db, run_id)
-        create_checkpoint(
-            checkpoint_mgr,
-            run_id=run_id,
-            sequence_number=1,
-            barrier_scalars=None,
-            graph=graph,
-        )
-        with db.engine.connect() as conn:
-            conn.execute(text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"), {"run_id": run_id})
-            conn.commit()
+            # ── PRECONDITION: the journal barrier-hold arm is genuinely live ──
+            buffered_ids = recovery_mgr._get_buffered_journal_token_ids(run_id)
+            assert held_branch.token_id in buffered_ids, (
+                f"PRECONDITION FAILED: the held path_a token must be in the journal BLOCKED barrier-hold "
+                f"set (else the held-branch exclusion path is skipped). buffered_ids={buffered_ids}"
+            )
+            assert incomplete_branch.token_id not in buffered_ids, (
+                f"path_b must NOT be buffered (it is the not-yet-arrived sibling); buffered_ids={buffered_ids}"
+            )
 
-        recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+            # ── Resume ────────────────────────────────────────────────────────────────
+            check = recovery_mgr.can_resume(run_id, graph)
+            assert check.can_resume, f"cannot resume: {check.reason}"
+            resume_point = recovery_mgr.get_resume_point(run_id, graph)
+            assert resume_point is not None
 
-        # ── PRECONDITION: the journal barrier-hold arm is genuinely live ──
-        buffered_ids = recovery_mgr._get_buffered_journal_token_ids(run_id)
-        assert held_branch.token_id in buffered_ids, (
-            f"PRECONDITION FAILED: the held path_a token must be in the journal BLOCKED barrier-hold "
-            f"set (else the held-branch exclusion path is skipped). buffered_ids={buffered_ids}"
-        )
-        assert incomplete_branch.token_id not in buffered_ids, (
-            f"path_b must NOT be buffered (it is the not-yet-arrived sibling); buffered_ids={buffered_ids}"
-        )
+            checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+            resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+            resume_result = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
 
-        # ── Resume ────────────────────────────────────────────────────────────────
-        check = recovery_mgr.can_resume(run_id, graph)
-        assert check.can_resume, f"cannot resume: {check.reason}"
-        resume_point = recovery_mgr.get_resume_point(run_id, graph)
-        assert resume_point is not None
+            # ── Conservation law ──────────────────────────────────────────────────────
+            after = _outcome_counts()
+            assert after == baseline, f"Resume must conserve the terminal-outcome multiset. baseline={baseline} after={after}"
+            orphans = orphan_leaf_token_ids(db, run_id)
+            assert not orphans, f"Resume left {len(orphans)} non-delegation leaf token(s) with no terminal outcome (orphans): {orphans}"
+            assert all(n == 1 for n in after.values()), f"No (row_id, sink_name) may carry two outcomes after resume: {after}"
+            assert resume_result.status == RunStatus.COMPLETED, resume_result.status
 
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
-        resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
-        resume_result = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
-
-        # ── Conservation law ──────────────────────────────────────────────────────
-        after = _outcome_counts()
-        assert after == baseline, f"Resume must conserve the terminal-outcome multiset. baseline={baseline} after={after}"
-        orphans = orphan_leaf_token_ids(db, run_id)
-        assert not orphans, f"Resume left {len(orphans)} non-delegation leaf token(s) with no terminal outcome (orphans): {orphans}"
-        assert all(n == 1 for n in after.values()), f"No (row_id, sink_name) may carry two outcomes after resume: {after}"
-        assert resume_result.status == RunStatus.COMPLETED, resume_result.status
-
-        post_stats = get_fork_group_stats(db, run_id)
-        assert post_stats["total_fork_groups"] == 1, f"Fork-group count must remain 1 (one row, one fork); got {post_stats}"
+            post_stats = get_fork_group_stats(db, run_id)
+            assert post_stats["total_fork_groups"] == 1, f"Fork-group count must remain 1 (one row, one fork); got {post_stats}"
 
     def test_resume_redriven_transform_external_call_is_attributable(self) -> None:
         """A fork→coalesce branch whose transform makes a recorded state call is
@@ -2249,68 +2270,68 @@ class TestForkRecoveryInvariant:
         )
         from tests.fixtures.plugins import CallRecordingTransform
 
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        source = ListSource([{"value": 1}], on_success="gate_in")
-        sink = CollectSink("output")
+            source = ListSource([{"value": 1}], on_success="gate_in")
+            sink = CollectSink("output")
 
-        record_a = CallRecordingTransform(name="record_a")
-        pass_b = PassTransform(name="pass_b")
+            record_a = CallRecordingTransform(name="record_a")
+            pass_b = PassTransform(name="pass_b")
 
-        gate = GateSettings(
-            name="fork_gate",
-            input="gate_in",
-            condition="True",
-            routes={"true": "fork", "false": "output"},
-            fork_to=["path_a", "path_b"],
-        )
-        coalesce = CoalesceSettings(
-            name="merge",
-            branches={"path_a": "done_a", "path_b": "done_b"},
-            policy="require_all",
-            merge="union",
-            on_success="output",
-        )
+            gate = GateSettings(
+                name="fork_gate",
+                input="gate_in",
+                condition="True",
+                routes={"true": "fork", "false": "output"},
+                fork_to=["path_a", "path_b"],
+            )
+            coalesce = CoalesceSettings(
+                name="merge",
+                branches={"path_a": "done_a", "path_b": "done_b"},
+                policy="require_all",
+                merge="union",
+                on_success="output",
+            )
 
-        wired_a = wire_transforms([record_a], source_connection="path_a", final_sink="done_a", names=["record_a"])
-        wired_b = wire_transforms([pass_b], source_connection="path_b", final_sink="done_b", names=["pass_b"])
+            wired_a = wire_transforms([record_a], source_connection="path_a", final_sink="done_a", names=["record_a"])
+            wired_b = wire_transforms([pass_b], source_connection="path_b", final_sink="done_b", names=["pass_b"])
 
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(source)},
-            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
-            transforms=wired_a + wired_b,
-            sinks={"output": as_sink(sink)},
-            gates=[gate],
-            aggregations={},
-            coalesce_settings=[coalesce],
-        )
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(record_a), as_transform(pass_b)],
-            sinks={"output": as_sink(sink)},
-            gates=[gate],
-            coalesce_settings=[coalesce],
-        )
-        settings_obj = ElspethSettings(
-            sources={"primary": {"plugin": "test", "on_success": "gate_in", "options": {}}},
-            sinks={"output": {"plugin": "test", "on_write_failure": "discard"}},
-            gates=[gate],
-            coalesce=[coalesce],
-        )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(source)},
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
+                transforms=wired_a + wired_b,
+                sinks={"output": as_sink(sink)},
+                gates=[gate],
+                aggregations={},
+                coalesce_settings=[coalesce],
+            )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[as_transform(record_a), as_transform(pass_b)],
+                sinks={"output": as_sink(sink)},
+                gates=[gate],
+                coalesce_settings=[coalesce],
+            )
+            settings_obj = ElspethSettings(
+                sources={"primary": {"plugin": "test", "on_success": "gate_in", "options": {}}},
+                sinks={"output": {"plugin": "test", "on_write_failure": "discard"}},
+                gates=[gate],
+                coalesce=[coalesce],
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
-        run_id = run.run_id
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+            run_id = run.run_id
 
-        # ── Find the record_a branch token and its run-1 node_state ──────────
-        # graph.get_transform_id_map() uses integer keys (sequential index), not names.
-        # Find the node_id for record_a by searching graph.get_nodes() by plugin_name.
-        record_a_node_id = next(n.node_id for n in graph.get_nodes() if n.plugin_name == "record_a")
+            # ── Find the record_a branch token and its run-1 node_state ──────────
+            # graph.get_transform_id_map() uses integer keys (sequential index), not names.
+            # Find the node_id for record_a by searching graph.get_nodes() by plugin_name.
+            record_a_node_id = next(n.node_id for n in graph.get_nodes() if n.plugin_name == "record_a")
 
-        with db.engine.connect() as conn:
-            record_a_run1_ns = conn.execute(
-                text("""
+            with db.engine.connect() as conn:
+                record_a_run1_ns = conn.execute(
+                    text("""
                     SELECT ns.state_id AS state_id,
                            ns.attempt AS attempt,
                            ns.resume_checkpoint_id AS resume_checkpoint_id
@@ -2321,28 +2342,28 @@ class TestForkRecoveryInvariant:
                       AND ns.node_id = :node_id
                     ORDER BY ns.attempt
                 """),
-                {"run_id": run_id, "node_id": str(record_a_node_id)},
-            ).fetchall()
+                    {"run_id": run_id, "node_id": str(record_a_node_id)},
+                ).fetchall()
 
-        assert len(record_a_run1_ns) == 1, f"Expected 1 run-1 node_state for record_a transform; got {len(record_a_run1_ns)}"
-        run1_state_id = record_a_run1_ns[0].state_id
-        assert record_a_run1_ns[0].resume_checkpoint_id is None, (
-            f"Run-1 node_state must have resume_checkpoint_id IS NULL (not a re-drive); got {record_a_run1_ns[0].resume_checkpoint_id!r}"
-        )
+            assert len(record_a_run1_ns) == 1, f"Expected 1 run-1 node_state for record_a transform; got {len(record_a_run1_ns)}"
+            run1_state_id = record_a_run1_ns[0].state_id
+            assert record_a_run1_ns[0].resume_checkpoint_id is None, (
+                f"Run-1 node_state must have resume_checkpoint_id IS NULL (not a re-drive); got {record_a_run1_ns[0].resume_checkpoint_id!r}"
+            )
 
-        # ── Verify run-1 recorded exactly one state call ──────────────────────
-        with db.engine.connect() as conn:
-            run1_calls = conn.execute(
-                text("SELECT call_id FROM calls WHERE state_id = :sid"),
-                {"sid": run1_state_id},
-            ).fetchall()
+            # ── Verify run-1 recorded exactly one state call ──────────────────────
+            with db.engine.connect() as conn:
+                run1_calls = conn.execute(
+                    text("SELECT call_id FROM calls WHERE state_id = :sid"),
+                    {"sid": run1_state_id},
+                ).fetchall()
 
-        assert len(run1_calls) == 1, f"Run-1 record_a transform must have recorded exactly 1 state call; got {len(run1_calls)}"
+            assert len(run1_calls) == 1, f"Run-1 record_a transform must have recorded exactly 1 state call; got {len(run1_calls)}"
 
-        # ── Find the merged token for barrier reversal ─────────────────────────
-        with db.engine.connect() as conn:
-            merged_rows = conn.execute(
-                text("""
+            # ── Find the merged token for barrier reversal ─────────────────────────
+            with db.engine.connect() as conn:
+                merged_rows = conn.execute(
+                    text("""
                     SELECT t.token_id AS token_id, t.join_group_id AS join_group_id
                     FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
@@ -2353,44 +2374,44 @@ class TestForkRecoveryInvariant:
                           WHERE f.run_id = t.run_id AND f.kind = 'fork'
                       )
                 """),
-                {"run_id": run_id},
-            ).fetchall()
-        assert len(merged_rows) == 1, f"Expected exactly one merged token; got {len(merged_rows)}"
-        merged_token_id = merged_rows[0].token_id
-        coalesce_node_id = graph.get_coalesce_id_map()[CoalesceName("merge")]
+                    {"run_id": run_id},
+                ).fetchall()
+            assert len(merged_rows) == 1, f"Expected exactly one merged token; got {len(merged_rows)}"
+            merged_token_id = merged_rows[0].token_id
+            coalesce_node_id = graph.get_coalesce_id_map()[CoalesceName("merge")]
 
-        # ── Interrupt: undo the barrier (same pattern as test_resume_fork_to_coalesce_before_barrier) ──
-        with db.engine.connect() as conn:
-            _fk_driver = conn.connection.driver_connection  # raw sqlite3 conn
-            assert _fk_driver is not None
-            # PRAGMA foreign_keys is a silent no-op inside a transaction; the
-            # write-intent begin discipline autobegins an explicit BEGIN on the
-            # first conn.execute(), so toggle FKs at the raw driver level
-            # (driver autocommit) before the transaction starts.
-            _fk_driver.execute("PRAGMA foreign_keys = OFF")
-            # 1. merged token outcomes
-            conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.token_id == merged_token_id))
-            # 2. merged token node_states
-            conn.execute(
-                text("DELETE FROM node_states WHERE token_id = :tid"),
-                {"tid": merged_token_id},
-            )
-            # 3. durable coalesce receipt and normalized membership
-            conn.execute(
-                text(
-                    "DELETE FROM coalesce_effect_members WHERE effect_id IN "
-                    "(SELECT effect_id FROM coalesce_effects WHERE result_token_id = :tid)"
-                ),
-                {"tid": merged_token_id},
-            )
-            conn.execute(text("DELETE FROM coalesce_effects WHERE result_token_id = :tid"), {"tid": merged_token_id})
-            # 4. token_parents for merged token
-            conn.execute(token_parents_table.delete().where(token_parents_table.c.token_id == merged_token_id))
-            # 5. merged token row
-            conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
-            # 6. branch COALESCED outcomes
-            conn.execute(
-                text("""
+            # ── Interrupt: undo the barrier (same pattern as test_resume_fork_to_coalesce_before_barrier) ──
+            with db.engine.connect() as conn:
+                _fk_driver = conn.connection.driver_connection  # raw sqlite3 conn
+                assert _fk_driver is not None
+                # PRAGMA foreign_keys is a silent no-op inside a transaction; the
+                # write-intent begin discipline autobegins an explicit BEGIN on the
+                # first conn.execute(), so toggle FKs at the raw driver level
+                # (driver autocommit) before the transaction starts.
+                _fk_driver.execute("PRAGMA foreign_keys = OFF")
+                # 1. merged token outcomes
+                conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.token_id == merged_token_id))
+                # 2. merged token node_states
+                conn.execute(
+                    text("DELETE FROM node_states WHERE token_id = :tid"),
+                    {"tid": merged_token_id},
+                )
+                # 3. durable coalesce receipt and normalized membership
+                conn.execute(
+                    text(
+                        "DELETE FROM coalesce_effect_members WHERE effect_id IN "
+                        "(SELECT effect_id FROM coalesce_effects WHERE result_token_id = :tid)"
+                    ),
+                    {"tid": merged_token_id},
+                )
+                conn.execute(text("DELETE FROM coalesce_effects WHERE result_token_id = :tid"), {"tid": merged_token_id})
+                # 4. token_parents for merged token
+                conn.execute(token_parents_table.delete().where(token_parents_table.c.token_id == merged_token_id))
+                # 5. merged token row
+                conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
+                # 6. branch COALESCED outcomes
+                conn.execute(
+                    text("""
                     DELETE FROM token_outcomes
                     WHERE path = 'coalesced'
                       AND token_id IN (
@@ -2398,52 +2419,52 @@ class TestForkRecoveryInvariant:
                           WHERE run_id = :run_id AND kind = 'fork'
                       )
                 """),
-                {"run_id": run_id},
+                    {"run_id": run_id},
+                )
+                # 7. branch tokens' completed coalesce node_states
+                conn.execute(
+                    text("DELETE FROM node_states WHERE node_id = :nid AND run_id = :rid"),
+                    {"nid": str(coalesce_node_id), "rid": run_id},
+                )
+                conn.commit()
+                _fk_driver.execute("PRAGMA foreign_keys = ON")
+
+            _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
+            # ── Checkpoint + mark failed ──────────────────────────────────────────
+            reseat_crashed_leader(db, run_id)
+            checkpoint_mgr = CheckpointManager(db)
+            create_checkpoint(
+                checkpoint_mgr,
+                run_id=run_id,
+                sequence_number=1,
+                barrier_scalars=None,
+                graph=graph,
             )
-            # 7. branch tokens' completed coalesce node_states
-            conn.execute(
-                text("DELETE FROM node_states WHERE node_id = :nid AND run_id = :rid"),
-                {"nid": str(coalesce_node_id), "rid": run_id},
-            )
-            conn.commit()
-            _fk_driver.execute("PRAGMA foreign_keys = ON")
+            with db.engine.connect() as conn:
+                conn.execute(
+                    text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
+                    {"run_id": run_id},
+                )
+                conn.commit()
 
-        _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
-        # ── Checkpoint + mark failed ──────────────────────────────────────────
-        reseat_crashed_leader(db, run_id)
-        checkpoint_mgr = CheckpointManager(db)
-        create_checkpoint(
-            checkpoint_mgr,
-            run_id=run_id,
-            sequence_number=1,
-            barrier_scalars=None,
-            graph=graph,
-        )
-        with db.engine.connect() as conn:
-            conn.execute(
-                text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
-                {"run_id": run_id},
-            )
-            conn.commit()
+            # ── Resume ───────────────────────────────────────────────────────────
+            recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+            check = recovery_mgr.can_resume(run_id, graph)
+            assert check.can_resume, f"cannot resume: {check.reason}"
+            resume_point = recovery_mgr.get_resume_point(run_id, graph)
+            assert resume_point is not None
 
-        # ── Resume ───────────────────────────────────────────────────────────
-        recovery_mgr = RecoveryManager(db, checkpoint_mgr)
-        check = recovery_mgr.can_resume(run_id, graph)
-        assert check.can_resume, f"cannot resume: {check.reason}"
-        resume_point = recovery_mgr.get_resume_point(run_id, graph)
-        assert resume_point is not None
+            checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+            resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+            resume_result = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
+            assert resume_result.status == RunStatus.COMPLETED, resume_result.status
 
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
-        resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
-        resume_result = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
-        assert resume_result.status == RunStatus.COMPLETED, resume_result.status
-
-        # ── Attributability proof: re-driven node_state has resume_checkpoint_id ──
-        # After resume, the record_a branch re-drove at attempt = max+1 (the resume
-        # attempt).  Its node_state must carry resume_checkpoint_id IS NOT NULL.
-        with db.engine.connect() as conn:
-            record_a_all_ns = conn.execute(
-                text("""
+            # ── Attributability proof: re-driven node_state has resume_checkpoint_id ──
+            # After resume, the record_a branch re-drove at attempt = max+1 (the resume
+            # attempt).  Its node_state must carry resume_checkpoint_id IS NOT NULL.
+            with db.engine.connect() as conn:
+                record_a_all_ns = conn.execute(
+                    text("""
                     SELECT ns.state_id AS state_id,
                            ns.attempt AS attempt,
                            ns.resume_checkpoint_id AS resume_checkpoint_id
@@ -2454,45 +2475,47 @@ class TestForkRecoveryInvariant:
                       AND ns.node_id = :node_id
                     ORDER BY ns.attempt
                 """),
-                {"run_id": run_id, "node_id": str(record_a_node_id)},
-            ).fetchall()
+                    {"run_id": run_id, "node_id": str(record_a_node_id)},
+                ).fetchall()
 
-        assert len(record_a_all_ns) == 2, (
-            f"After resume, record_a transform must have 2 node_states (run-1 + re-drive); "
-            f"got {len(record_a_all_ns)} with attempts={[r.attempt for r in record_a_all_ns]!r}"
-        )
-        run1_ns = record_a_all_ns[0]
-        redrive_ns = record_a_all_ns[1]
+            assert len(record_a_all_ns) == 2, (
+                f"After resume, record_a transform must have 2 node_states (run-1 + re-drive); "
+                f"got {len(record_a_all_ns)} with attempts={[r.attempt for r in record_a_all_ns]!r}"
+            )
+            run1_ns = record_a_all_ns[0]
+            redrive_ns = record_a_all_ns[1]
 
-        # Run-1 node_state must still have resume_checkpoint_id IS NULL (append-only).
-        assert run1_ns.state_id == run1_state_id, f"First node_state must be run-1 (state_id={run1_state_id!r}); got {run1_ns.state_id!r}"
-        assert run1_ns.resume_checkpoint_id is None, (
-            f"Run-1 node_state resume_checkpoint_id must remain NULL after resume; got {run1_ns.resume_checkpoint_id!r}"
-        )
+            # Run-1 node_state must still have resume_checkpoint_id IS NULL (append-only).
+            assert run1_ns.state_id == run1_state_id, (
+                f"First node_state must be run-1 (state_id={run1_state_id!r}); got {run1_ns.state_id!r}"
+            )
+            assert run1_ns.resume_checkpoint_id is None, (
+                f"Run-1 node_state resume_checkpoint_id must remain NULL after resume; got {run1_ns.resume_checkpoint_id!r}"
+            )
 
-        # Re-drive node_state must have resume_checkpoint_id IS NOT NULL.
-        assert redrive_ns.resume_checkpoint_id is not None, (
-            f"Re-drive node_state (attempt={redrive_ns.attempt}) must have "
-            f"resume_checkpoint_id set (attributability invariant, ADDENDUM 2.C); "
-            f"got None.  The re-fired call cannot be attributed to the resume without this."
-        )
+            # Re-drive node_state must have resume_checkpoint_id IS NOT NULL.
+            assert redrive_ns.resume_checkpoint_id is not None, (
+                f"Re-drive node_state (attempt={redrive_ns.attempt}) must have "
+                f"resume_checkpoint_id set (attributability invariant, ADDENDUM 2.C); "
+                f"got None.  The re-fired call cannot be attributed to the resume without this."
+            )
 
-        # ── Call count: the call RE-FIRED (at-least-once, bounded non-goal) ──
-        # The re-driven node_state must have recorded a NEW state call.
-        with db.engine.connect() as conn:
-            redrive_calls = conn.execute(
-                text("SELECT call_id FROM calls WHERE state_id = :sid"),
-                {"sid": redrive_ns.state_id},
-            ).fetchall()
+            # ── Call count: the call RE-FIRED (at-least-once, bounded non-goal) ──
+            # The re-driven node_state must have recorded a NEW state call.
+            with db.engine.connect() as conn:
+                redrive_calls = conn.execute(
+                    text("SELECT call_id FROM calls WHERE state_id = :sid"),
+                    {"sid": redrive_ns.state_id},
+                ).fetchall()
 
-        assert len(redrive_calls) == 1, (
-            f"Re-drive node_state (state_id={redrive_ns.state_id!r}) must have exactly 1 re-fired state call; got {len(redrive_calls)}"
-        )
+            assert len(redrive_calls) == 1, (
+                f"Re-drive node_state (state_id={redrive_ns.state_id!r}) must have exactly 1 re-fired state call; got {len(redrive_calls)}"
+            )
 
-        # Confirm total calls for record_a's transform: 1 (run-1) + 1 (re-drive) = 2.
-        with db.engine.connect() as conn:
-            all_record_a_calls = conn.execute(
-                text("""
+            # Confirm total calls for record_a's transform: 1 (run-1) + 1 (re-drive) = 2.
+            with db.engine.connect() as conn:
+                all_record_a_calls = conn.execute(
+                    text("""
                     SELECT c.call_id AS call_id, c.state_id AS state_id
                     FROM calls c
                     WHERE c.state_id IN (
@@ -2502,20 +2525,20 @@ class TestForkRecoveryInvariant:
                         WHERE r.run_id = :run_id AND ns.node_id = :node_id
                     )
                 """),
-                {"run_id": run_id, "node_id": str(record_a_node_id)},
-            ).fetchall()
+                    {"run_id": run_id, "node_id": str(record_a_node_id)},
+                ).fetchall()
 
-        assert len(all_record_a_calls) == 2, (
-            f"Total calls for record_a transform must be 2 (run-1 + re-drive = at-least-once); "
-            f"got {len(all_record_a_calls)}.  "
-            f"run1_state={run1_state_id!r}, redrive_state={redrive_ns.state_id!r}"
-        )
-        # Confirm one call per node_state (run-1 → run1_state_id, re-drive → redrive_ns.state_id).
-        calls_by_state = {}
-        for c in all_record_a_calls:
-            calls_by_state.setdefault(c.state_id, []).append(c.call_id)
-        assert run1_state_id in calls_by_state, "Run-1 state must have a call"
-        assert redrive_ns.state_id in calls_by_state, "Re-drive state must have a call"
+            assert len(all_record_a_calls) == 2, (
+                f"Total calls for record_a transform must be 2 (run-1 + re-drive = at-least-once); "
+                f"got {len(all_record_a_calls)}.  "
+                f"run1_state={run1_state_id!r}, redrive_state={redrive_ns.state_id!r}"
+            )
+            # Confirm one call per node_state (run-1 → run1_state_id, re-drive → redrive_ns.state_id).
+            calls_by_state = {}
+            for c in all_record_a_calls:
+                calls_by_state.setdefault(c.state_id, []).append(c.call_id)
+            assert run1_state_id in calls_by_state, "Run-1 state must have a call"
+            assert redrive_ns.state_id in calls_by_state, "Re-drive state must have a call"
 
     # ─────────────────────────────────────────────────────────────────────
     # Task 11: F1/F2 counter-field reconciliation guard
@@ -2611,22 +2634,21 @@ class TestForkRecoveryInvariant:
         from elspeth.core.landscape.schema import token_outcomes_table, token_parents_table, tokens_table
 
         # ── Run A (uninterrupted oracle) ──────────────────────────────────────
-        _db_a, _ps_a, _config_a, _graph_a, _settings_a, _run_id_a, run_a = self._setup_coalesce_pipeline()
-        assert run_a.status == RunStatus.COMPLETED, run_a.status
-        # Non-vacuity precondition: the coalesce SUCCEEDED → rows_coalesced >= 1.
-        assert run_a.rows_coalesced >= 1, (
-            f"Run A (uninterrupted coalesce-success) must record at least one "
-            f"COALESCED terminal outcome (non-vacuous precondition); got "
-            f"rows_coalesced={run_a.rows_coalesced}"
-        )
+        with self._setup_coalesce_pipeline() as (_db_a, _ps_a, _config_a, _graph_a, _settings_a, _run_id_a, run_a):
+            assert run_a.status == RunStatus.COMPLETED, run_a.status
+            # Non-vacuity precondition: the coalesce SUCCEEDED → rows_coalesced >= 1.
+            assert run_a.rows_coalesced >= 1, (
+                f"Run A (uninterrupted coalesce-success) must record at least one "
+                f"COALESCED terminal outcome (non-vacuous precondition); got "
+                f"rows_coalesced={run_a.rows_coalesced}"
+            )
 
-        # ── Run B (run-1 + interrupt-before-barrier + resume) ─────────────────
-        db, payload_store, config, graph, settings_obj, run_id, _run_b1 = self._setup_coalesce_pipeline()
-
-        # Find the merged token (join_group_id set, branch_name NULL).
-        with db.engine.connect() as conn:
-            merged_rows = conn.execute(
-                text("""
+            # ── Run B (run-1 + interrupt-before-barrier + resume) ─────────────────
+            with self._setup_coalesce_pipeline() as (db, payload_store, config, graph, settings_obj, run_id, _run_b1):
+                # Find the merged token (join_group_id set, branch_name NULL).
+                with db.engine.connect() as conn:
+                    merged_rows = conn.execute(
+                        text("""
                     SELECT t.token_id AS token_id, t.join_group_id AS join_group_id
                     FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
@@ -2637,49 +2659,51 @@ class TestForkRecoveryInvariant:
                           WHERE f.run_id = t.run_id AND f.kind = 'fork'
                       )
                 """),
-                {"run_id": run_id},
-            ).fetchall()
-        assert len(merged_rows) == 1, f"Expected exactly one merged token (join_group_id set, branch/fork NULL); got {len(merged_rows)}"
-        merged_token_id = merged_rows[0].token_id
+                        {"run_id": run_id},
+                    ).fetchall()
+                assert len(merged_rows) == 1, (
+                    f"Expected exactly one merged token (join_group_id set, branch/fork NULL); got {len(merged_rows)}"
+                )
+                merged_token_id = merged_rows[0].token_id
 
-        # ── Interrupt: undo the barrier entirely (pre-barrier crash state) ────
-        # Verbatim from test_resume_fork_to_coalesce_before_barrier: reverse
-        # everything the barrier wrote so both branch children become incomplete
-        # leaves with no completed coalesce node_state.  Resume then re-drives
-        # both branches (the with-unprocessed-rows fork-re-drive branch).
-        coalesce_node_id_for_deletion = graph.get_coalesce_id_map()[CoalesceName("merge")]
+                # ── Interrupt: undo the barrier entirely (pre-barrier crash state) ────
+                # Verbatim from test_resume_fork_to_coalesce_before_barrier: reverse
+                # everything the barrier wrote so both branch children become incomplete
+                # leaves with no completed coalesce node_state.  Resume then re-drives
+                # both branches (the with-unprocessed-rows fork-re-drive branch).
+                coalesce_node_id_for_deletion = graph.get_coalesce_id_map()[CoalesceName("merge")]
 
-        with db.engine.connect() as conn:
-            _fk_driver = conn.connection.driver_connection  # raw sqlite3 conn
-            assert _fk_driver is not None
-            # PRAGMA foreign_keys is a silent no-op inside a transaction; the
-            # write-intent begin discipline autobegins an explicit BEGIN on the
-            # first conn.execute(), so toggle FKs at the raw driver level
-            # (driver autocommit) before the transaction starts.
-            _fk_driver.execute("PRAGMA foreign_keys = OFF")
-            # 1. merged token outcomes (COMPLETED at sink)
-            conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.token_id == merged_token_id))
-            # 2. merged token node_states
-            conn.execute(
-                text("DELETE FROM node_states WHERE token_id = :tid"),
-                {"tid": merged_token_id},
-            )
-            # 3. durable coalesce receipt and normalized membership
-            conn.execute(
-                text(
-                    "DELETE FROM coalesce_effect_members WHERE effect_id IN "
-                    "(SELECT effect_id FROM coalesce_effects WHERE result_token_id = :tid)"
-                ),
-                {"tid": merged_token_id},
-            )
-            conn.execute(text("DELETE FROM coalesce_effects WHERE result_token_id = :tid"), {"tid": merged_token_id})
-            # 4. token_parents for merged token
-            conn.execute(token_parents_table.delete().where(token_parents_table.c.token_id == merged_token_id))
-            # 5. merged token row
-            conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
-            # 6. branch COALESCED outcomes (recorded by the barrier, path='coalesced')
-            conn.execute(
-                text("""
+                with db.engine.connect() as conn:
+                    _fk_driver = conn.connection.driver_connection  # raw sqlite3 conn
+                    assert _fk_driver is not None
+                    # PRAGMA foreign_keys is a silent no-op inside a transaction; the
+                    # write-intent begin discipline autobegins an explicit BEGIN on the
+                    # first conn.execute(), so toggle FKs at the raw driver level
+                    # (driver autocommit) before the transaction starts.
+                    _fk_driver.execute("PRAGMA foreign_keys = OFF")
+                    # 1. merged token outcomes (COMPLETED at sink)
+                    conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.token_id == merged_token_id))
+                    # 2. merged token node_states
+                    conn.execute(
+                        text("DELETE FROM node_states WHERE token_id = :tid"),
+                        {"tid": merged_token_id},
+                    )
+                    # 3. durable coalesce receipt and normalized membership
+                    conn.execute(
+                        text(
+                            "DELETE FROM coalesce_effect_members WHERE effect_id IN "
+                            "(SELECT effect_id FROM coalesce_effects WHERE result_token_id = :tid)"
+                        ),
+                        {"tid": merged_token_id},
+                    )
+                    conn.execute(text("DELETE FROM coalesce_effects WHERE result_token_id = :tid"), {"tid": merged_token_id})
+                    # 4. token_parents for merged token
+                    conn.execute(token_parents_table.delete().where(token_parents_table.c.token_id == merged_token_id))
+                    # 5. merged token row
+                    conn.execute(tokens_table.delete().where(tokens_table.c.token_id == merged_token_id))
+                    # 6. branch COALESCED outcomes (recorded by the barrier, path='coalesced')
+                    conn.execute(
+                        text("""
                     DELETE FROM token_outcomes
                     WHERE path = 'coalesced'
                       AND token_id IN (
@@ -2687,81 +2711,82 @@ class TestForkRecoveryInvariant:
                           WHERE run_id = :run_id AND kind = 'fork'
                       )
                 """),
-                {"run_id": run_id},
-            )
-            # 7. branch tokens' COMPLETED node_states at the coalesce node
-            conn.execute(
-                text("DELETE FROM node_states WHERE node_id = :nid AND run_id = :rid"),
-                {"nid": str(coalesce_node_id_for_deletion), "rid": run_id},
-            )
-            conn.commit()
-            _fk_driver.execute("PRAGMA foreign_keys = ON")
+                        {"run_id": run_id},
+                    )
+                    # 7. branch tokens' COMPLETED node_states at the coalesce node
+                    conn.execute(
+                        text("DELETE FROM node_states WHERE node_id = :nid AND run_id = :rid"),
+                        {"nid": str(coalesce_node_id_for_deletion), "rid": run_id},
+                    )
+                    conn.commit()
+                    _fk_driver.execute("PRAGMA foreign_keys = ON")
 
-        _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
-        # ── Resume ────────────────────────────────────────────────────────────
-        reseat_crashed_leader(db, run_id)
-        checkpoint_mgr = CheckpointManager(db)
-        recovery_mgr = RecoveryManager(db, checkpoint_mgr)
-        create_checkpoint(
-            checkpoint_mgr,
-            run_id=run_id,
-            sequence_number=1,
-            barrier_scalars=None,
-            graph=graph,
-        )
-        with db.engine.connect() as conn:
-            conn.execute(
-                text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
-                {"run_id": run_id},
-            )
-            conn.commit()
+                _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
+                # ── Resume ────────────────────────────────────────────────────────────
+                reseat_crashed_leader(db, run_id)
+                checkpoint_mgr = CheckpointManager(db)
+                recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+                create_checkpoint(
+                    checkpoint_mgr,
+                    run_id=run_id,
+                    sequence_number=1,
+                    barrier_scalars=None,
+                    graph=graph,
+                )
+                with db.engine.connect() as conn:
+                    conn.execute(
+                        text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
+                        {"run_id": run_id},
+                    )
+                    conn.commit()
 
-        check = recovery_mgr.can_resume(run_id, graph)
-        assert check.can_resume, f"cannot resume: {check.reason}"
-        resume_point = recovery_mgr.get_resume_point(run_id, graph)
-        assert resume_point is not None
+                check = recovery_mgr.can_resume(run_id, graph)
+                assert check.can_resume, f"cannot resume: {check.reason}"
+                resume_point = recovery_mgr.get_resume_point(run_id, graph)
+                assert resume_point is not None
 
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
-        resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
-        run_b_resume = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
+                checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+                resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+                run_b_resume = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
 
-        # ── Reconciliation: EVERY counter field, non-vacuous on rows_coalesced ─
-        assert run_b_resume.status == RunStatus.COMPLETED, (
-            f"Resume of the coalesce pipeline must reach COMPLETED; got {run_b_resume.status}"
-        )
+                # ── Reconciliation: EVERY counter field, non-vacuous on rows_coalesced ─
+                assert run_b_resume.status == RunStatus.COMPLETED, (
+                    f"Resume of the coalesce pipeline must reach COMPLETED; got {run_b_resume.status}"
+                )
 
-        # Non-vacuity: the RESUMED run must also record the COALESCED outcome.
-        assert run_b_resume.rows_coalesced >= 1, (
-            f"Resumed coalesce-success run must record at least one COALESCED "
-            f"terminal outcome (non-vacuous); got rows_coalesced={run_b_resume.rows_coalesced}. "
-            f"If 0, the barrier did not re-fire on resume or derive miscounts COALESCED."
-        )
-        assert run_b_resume.rows_coalesced == run_a.rows_coalesced, (
-            f"rows_coalesced must equal the uninterrupted run: A={run_a.rows_coalesced}, "
-            f"B={run_b_resume.rows_coalesced}. derive reconstructs this purely from the "
-            f"(SUCCESS, COALESCED) arm in run_status.py (not grafted); a divergence means "
-            f"that arm regressed or the barrier failed to re-fire on resume."
-        )
+                # Non-vacuity: the RESUMED run must also record the COALESCED outcome.
+                assert run_b_resume.rows_coalesced >= 1, (
+                    f"Resumed coalesce-success run must record at least one COALESCED "
+                    f"terminal outcome (non-vacuous); got rows_coalesced={run_b_resume.rows_coalesced}. "
+                    f"If 0, the barrier did not re-fire on resume or derive miscounts COALESCED."
+                )
+                assert run_b_resume.rows_coalesced == run_a.rows_coalesced, (
+                    f"rows_coalesced must equal the uninterrupted run: A={run_a.rows_coalesced}, "
+                    f"B={run_b_resume.rows_coalesced}. derive reconstructs this purely from the "
+                    f"(SUCCESS, COALESCED) arm in run_status.py (not grafted); a divergence means "
+                    f"that arm regressed or the barrier failed to re-fire on resume."
+                )
 
-        for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
-            assert b_val == a_val, (
-                f"F2 reconciliation failure on '{field}': resumed run (run1 + resume) must equal "
-                f"the uninterrupted run field-for-field. uninterrupted={a_val}, resumed={b_val}. "
-                f"Both resume branches finalize cumulative counters from the audit trail; a divergence "
-                f"means either the with-rows branch regressed to resume-only counters or "
-                f"derive_resume_terminal_status_from_audit miscounts this field."
-            )
+                for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
+                    assert b_val == a_val, (
+                        f"F2 reconciliation failure on '{field}': resumed run (run1 + resume) must equal "
+                        f"the uninterrupted run field-for-field. uninterrupted={a_val}, resumed={b_val}. "
+                        f"Both resume branches finalize cumulative counters from the audit trail; a divergence "
+                        f"means either the with-rows branch regressed to resume-only counters or "
+                        f"derive_resume_terminal_status_from_audit miscounts this field."
+                    )
 
-        assert dict(run_b_resume.routed_destinations) == dict(run_a.routed_destinations), (
-            f"F2 reconciliation failure on routed_destinations: "
-            f"uninterrupted={dict(run_a.routed_destinations)}, resumed={dict(run_b_resume.routed_destinations)}"
-        )
+                assert dict(run_b_resume.routed_destinations) == dict(run_a.routed_destinations), (
+                    f"F2 reconciliation failure on routed_destinations: "
+                    f"uninterrupted={dict(run_a.routed_destinations)}, resumed={dict(run_b_resume.routed_destinations)}"
+                )
 
     @staticmethod
+    @contextmanager
     def _build_end_of_source_flush_aggregation(
         n_source_rows: int,
         trigger_count: int | None = None,
-    ) -> tuple[LandscapeDB, PipelineConfig, ExecutionGraph, ElspethSettings]:
+    ) -> Iterator[tuple[LandscapeDB, PipelineConfig, ExecutionGraph, ElspethSettings]]:
         """Build a fresh source(N rows) → batch aggregation → sink pipeline.
 
         ``trigger_count`` is the aggregation's ``count`` trigger. Default
@@ -2819,43 +2844,43 @@ class TestForkRecoveryInvariant:
                 total = sum(r.to_dict().get("value", 0) for r in rows)
                 return TransformResult.success(PipelineRow({"sum": total}, rows[0].contract), success_reason={"action": "sum"})
 
-        db = make_landscape_db()
-        src = ListSource([{"value": i + 1} for i in range(n_source_rows)], name="list_source", on_success="agg_in")
-        out = CollectSink("output")
-        agg = _SumAggregator()
-        agg_settings = AggregationSettings(
-            name="sum_agg",
-            plugin=agg.name,
-            input="agg_in",
-            on_success="output",
-            on_error="discard",
-            # Default count > N → never fires mid-stream → all N rows buffer to
-            # end-of-source. trigger_count=N forces the mid-stream-trigger topology.
-            trigger=TriggerConfig(count=trigger_count if trigger_count is not None else n_source_rows + 1, timeout_seconds=3600),
-            output_mode=OutputMode.TRANSFORM,
-        )
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(src)},
-            source_settings_map={"primary": SourceSettings(plugin=src.name, on_success="agg_in", options={})},
-            transforms=[],
-            sinks={"output": as_sink(out)},
-            aggregations={"sum_agg": (as_transform(agg), agg_settings)},
-            gates=[],
-        )
-        agg_id_map = graph.get_aggregation_id_map()
-        agg_node_id = agg_id_map[next(iter(agg_id_map))]
-        agg.node_id = agg_node_id
-        config = PipelineConfig(
-            sources={"primary": as_source(src)},
-            transforms=[as_transform(agg)],
-            sinks={"output": as_sink(out)},
-            aggregation_settings={agg_node_id: agg_settings},
-        )
-        settings = ElspethSettings(
-            sources={"primary": {"plugin": src.name, "on_success": "agg_in", "options": {}}},
-            sinks={"output": {"plugin": "test", "on_write_failure": "discard"}},
-        )
-        return db, config, graph, settings
+        with _runtime_landscape_db() as db:
+            src = ListSource([{"value": i + 1} for i in range(n_source_rows)], name="list_source", on_success="agg_in")
+            out = CollectSink("output")
+            agg = _SumAggregator()
+            agg_settings = AggregationSettings(
+                name="sum_agg",
+                plugin=agg.name,
+                input="agg_in",
+                on_success="output",
+                on_error="discard",
+                # Default count > N → never fires mid-stream → all N rows buffer to
+                # end-of-source. trigger_count=N forces the mid-stream-trigger topology.
+                trigger=TriggerConfig(count=trigger_count if trigger_count is not None else n_source_rows + 1, timeout_seconds=3600),
+                output_mode=OutputMode.TRANSFORM,
+            )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(src)},
+                source_settings_map={"primary": SourceSettings(plugin=src.name, on_success="agg_in", options={})},
+                transforms=[],
+                sinks={"output": as_sink(out)},
+                aggregations={"sum_agg": (as_transform(agg), agg_settings)},
+                gates=[],
+            )
+            agg_id_map = graph.get_aggregation_id_map()
+            agg_node_id = agg_id_map[next(iter(agg_id_map))]
+            agg.node_id = agg_node_id
+            config = PipelineConfig(
+                sources={"primary": as_source(src)},
+                transforms=[as_transform(agg)],
+                sinks={"output": as_sink(out)},
+                aggregation_settings={agg_node_id: agg_settings},
+            )
+            settings = ElspethSettings(
+                sources={"primary": {"plugin": src.name, "on_success": "agg_in", "options": {}}},
+                sinks={"output": {"plugin": "test", "on_write_failure": "discard"}},
+            )
+            yield db, config, graph, settings
 
     def test_resume_buffered_counter_reconciles_with_uninterrupted_run(self) -> None:
         """A resumed aggregation run reconciles EVERY counter field — including
@@ -2928,81 +2953,81 @@ class TestForkRecoveryInvariant:
         n = 3
 
         # ── Run A (uninterrupted oracle) ──────────────────────────────────────
-        db_a, config_a, graph_a, settings_a = self._build_end_of_source_flush_aggregation(n)
-        run_a = Orchestrator(db_a).run(config_a, graph=graph_a, settings=settings_a, payload_store=MockPayloadStore())
-        assert run_a.status == RunStatus.COMPLETED, run_a.status
-        # Non-vacuity precondition: all N rows buffered → rows_buffered == N >= 1.
-        assert run_a.rows_buffered == n, (
-            f"Run A (uninterrupted end-of-source-flush aggregation of {n} rows) must record "
-            f"rows_buffered={n} (one BUFFERED record per input row); got {run_a.rows_buffered}"
-        )
-        assert run_a.rows_buffered >= 1, "non-vacuity precondition"
-
-        # ── Run B (run-1 + interrupt + resume via the all-terminal branch) ────
-        db, config, graph, settings_obj = self._build_end_of_source_flush_aggregation(n)
-        payload_store = MockPayloadStore()
-        run_b1 = Orchestrator(db).run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
-        run_id = run_b1.run_id
-        assert run_b1.rows_buffered == n, run_b1.rows_buffered
-
-        # Interrupt: checkpoint + mark failed, deleting NO outcomes.  Every token
-        # already has its terminal (or non-completed BUFFERED) record, so resume's
-        # get_unprocessed_rows is empty → the all-rows-already-processed branch
-        # reconstructs the cumulative counters from the intact audit trail.
-        reseat_crashed_leader(db, run_id)
-        checkpoint_mgr = CheckpointManager(db)
-        recovery_mgr = RecoveryManager(db, checkpoint_mgr)
-        create_checkpoint(
-            checkpoint_mgr,
-            run_id=run_id,
-            sequence_number=1,
-            barrier_scalars=None,
-            graph=graph,
-        )
-        with db.engine.connect() as conn:
-            conn.execute(
-                text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
-                {"run_id": run_id},
+        with self._build_end_of_source_flush_aggregation(n) as (db_a, config_a, graph_a, settings_a):
+            run_a = Orchestrator(db_a).run(config_a, graph=graph_a, settings=settings_a, payload_store=MockPayloadStore())
+            assert run_a.status == RunStatus.COMPLETED, run_a.status
+            # Non-vacuity precondition: all N rows buffered → rows_buffered == N >= 1.
+            assert run_a.rows_buffered == n, (
+                f"Run A (uninterrupted end-of-source-flush aggregation of {n} rows) must record "
+                f"rows_buffered={n} (one BUFFERED record per input row); got {run_a.rows_buffered}"
             )
-            conn.commit()
+            assert run_a.rows_buffered >= 1, "non-vacuity precondition"
 
-        check = recovery_mgr.can_resume(run_id, graph)
-        assert check.can_resume, f"cannot resume: {check.reason}"
-        resume_point = recovery_mgr.get_resume_point(run_id, graph)
-        assert resume_point is not None
+            # ── Run B (run-1 + interrupt + resume via the all-terminal branch) ────
+            with self._build_end_of_source_flush_aggregation(n) as (db, config, graph, settings_obj):
+                payload_store = MockPayloadStore()
+                run_b1 = Orchestrator(db).run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+                run_id = run_b1.run_id
+                assert run_b1.rows_buffered == n, run_b1.rows_buffered
 
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
-        resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
-        run_b_resume = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
+                # Interrupt: checkpoint + mark failed, deleting NO outcomes.  Every token
+                # already has its terminal (or non-completed BUFFERED) record, so resume's
+                # get_unprocessed_rows is empty → the all-rows-already-processed branch
+                # reconstructs the cumulative counters from the intact audit trail.
+                reseat_crashed_leader(db, run_id)
+                checkpoint_mgr = CheckpointManager(db)
+                recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+                create_checkpoint(
+                    checkpoint_mgr,
+                    run_id=run_id,
+                    sequence_number=1,
+                    barrier_scalars=None,
+                    graph=graph,
+                )
+                with db.engine.connect() as conn:
+                    conn.execute(
+                        text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"),
+                        {"run_id": run_id},
+                    )
+                    conn.commit()
 
-        # ── Reconciliation: EVERY counter field, non-vacuous on rows_buffered ─
-        assert run_b_resume.status == RunStatus.COMPLETED, (
-            f"Resume of the aggregation pipeline must reach COMPLETED; got {run_b_resume.status}"
-        )
-        assert run_b_resume.rows_buffered >= 1, (
-            f"Resumed aggregation run must record at least one BUFFERED record (non-vacuous); "
-            f"got rows_buffered={run_b_resume.rows_buffered}. If 0, derive's (None, BUFFERED) arm "
-            f"miscounts the persisted BUFFERED records."
-        )
-        assert run_b_resume.rows_buffered == run_a.rows_buffered, (
-            f"rows_buffered must equal the uninterrupted run: A={run_a.rows_buffered}, "
-            f"B={run_b_resume.rows_buffered}. derive reconstructs this purely from the "
-            f"(None, BUFFERED) arm in run_status.py (not grafted); a divergence means that "
-            f"arm regressed or the BUFFERED records were not preserved across resume."
-        )
+                check = recovery_mgr.can_resume(run_id, graph)
+                assert check.can_resume, f"cannot resume: {check.reason}"
+                resume_point = recovery_mgr.get_resume_point(run_id, graph)
+                assert resume_point is not None
 
-        for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
-            assert b_val == a_val, (
-                f"F2 reconciliation failure on '{field}': resumed run (run1 + resume) must equal "
-                f"the uninterrupted run field-for-field. uninterrupted={a_val}, resumed={b_val}. "
-                f"derive_resume_terminal_status_from_audit must reconstruct this field from the "
-                f"audit trail to match the live accumulator."
-            )
+                checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+                resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+                run_b_resume = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
 
-        assert dict(run_b_resume.routed_destinations) == dict(run_a.routed_destinations), (
-            f"F2 reconciliation failure on routed_destinations: "
-            f"uninterrupted={dict(run_a.routed_destinations)}, resumed={dict(run_b_resume.routed_destinations)}"
-        )
+                # ── Reconciliation: EVERY counter field, non-vacuous on rows_buffered ─
+                assert run_b_resume.status == RunStatus.COMPLETED, (
+                    f"Resume of the aggregation pipeline must reach COMPLETED; got {run_b_resume.status}"
+                )
+                assert run_b_resume.rows_buffered >= 1, (
+                    f"Resumed aggregation run must record at least one BUFFERED record (non-vacuous); "
+                    f"got rows_buffered={run_b_resume.rows_buffered}. If 0, derive's (None, BUFFERED) arm "
+                    f"miscounts the persisted BUFFERED records."
+                )
+                assert run_b_resume.rows_buffered == run_a.rows_buffered, (
+                    f"rows_buffered must equal the uninterrupted run: A={run_a.rows_buffered}, "
+                    f"B={run_b_resume.rows_buffered}. derive reconstructs this purely from the "
+                    f"(None, BUFFERED) arm in run_status.py (not grafted); a divergence means that "
+                    f"arm regressed or the BUFFERED records were not preserved across resume."
+                )
+
+                for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
+                    assert b_val == a_val, (
+                        f"F2 reconciliation failure on '{field}': resumed run (run1 + resume) must equal "
+                        f"the uninterrupted run field-for-field. uninterrupted={a_val}, resumed={b_val}. "
+                        f"derive_resume_terminal_status_from_audit must reconstruct this field from the "
+                        f"audit trail to match the live accumulator."
+                    )
+
+                assert dict(run_b_resume.routed_destinations) == dict(run_a.routed_destinations), (
+                    f"F2 reconciliation failure on routed_destinations: "
+                    f"uninterrupted={dict(run_a.routed_destinations)}, resumed={dict(run_b_resume.routed_destinations)}"
+                )
 
     def test_rows_buffered_live_equals_derive_after_unification(self) -> None:
         """rows_buffered parity on the count==N mid-stream trigger (elspeth-e1dd5e1303 FIXED).
@@ -3036,56 +3061,56 @@ class TestForkRecoveryInvariant:
         n = 3
 
         # ── Run A (uninterrupted oracle, count == N → mid-stream trigger) ──────
-        db_a, config_a, graph_a, settings_a = self._build_end_of_source_flush_aggregation(n, trigger_count=n)
-        run_a = Orchestrator(db_a).run(config_a, graph=graph_a, settings=settings_a, payload_store=MockPayloadStore())
-        assert run_a.status == RunStatus.COMPLETED, run_a.status
+        with self._build_end_of_source_flush_aggregation(n, trigger_count=n) as (db_a, config_a, graph_a, settings_a):
+            run_a = Orchestrator(db_a).run(config_a, graph=graph_a, settings=settings_a, payload_store=MockPayloadStore())
+            assert run_a.status == RunStatus.COMPLETED, run_a.status
 
-        # ── Run B (run-1 + interrupt + resume via the all-terminal branch) ────
-        db, config, graph, settings_obj = self._build_end_of_source_flush_aggregation(n, trigger_count=n)
-        payload_store = MockPayloadStore()
-        run_b1 = Orchestrator(db).run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
-        run_id = run_b1.run_id
-        checkpoint_mgr = CheckpointManager(db)
-        recovery_mgr = RecoveryManager(db, checkpoint_mgr)
-        reseat_crashed_leader(db, run_id)
-        create_checkpoint(checkpoint_mgr, run_id=run_id, sequence_number=1, barrier_scalars=None, graph=graph)
-        with db.engine.connect() as conn:
-            conn.execute(text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"), {"run_id": run_id})
-            conn.commit()
-        check = recovery_mgr.can_resume(run_id, graph)
-        assert check.can_resume, f"cannot resume: {check.reason}"
-        resume_point = recovery_mgr.get_resume_point(run_id, graph)
-        assert resume_point is not None
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
-        resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
-        run_b_resume = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
-        assert run_b_resume.status == RunStatus.COMPLETED, run_b_resume.status
+            # ── Run B (run-1 + interrupt + resume via the all-terminal branch) ────
+            with self._build_end_of_source_flush_aggregation(n, trigger_count=n) as (db, config, graph, settings_obj):
+                payload_store = MockPayloadStore()
+                run_b1 = Orchestrator(db).run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+                run_id = run_b1.run_id
+                checkpoint_mgr = CheckpointManager(db)
+                recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+                reseat_crashed_leader(db, run_id)
+                create_checkpoint(checkpoint_mgr, run_id=run_id, sequence_number=1, barrier_scalars=None, graph=graph)
+                with db.engine.connect() as conn:
+                    conn.execute(text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"), {"run_id": run_id})
+                    conn.commit()
+                check = recovery_mgr.can_resume(run_id, graph)
+                assert check.can_resume, f"cannot resume: {check.reason}"
+                resume_point = recovery_mgr.get_resume_point(run_id, graph)
+                assert resume_point is not None
+                checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+                resume_orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+                run_b_resume = resume_orchestrator.resume(resume_point, config, graph, payload_store=payload_store, settings=settings_obj)
+                assert run_b_resume.status == RunStatus.COMPLETED, run_b_resume.status
 
-        # ── Unified value: live == derive == N exactly (elspeth-e1dd5e1303 fix) ──
-        assert run_a.rows_buffered == n, (
-            f"UNIFICATION: uninterrupted oracle (live accumulator) must report rows_buffered == N == {n} "
-            f"on a count==N mid-stream trigger — every buffer-accept (including the flush-triggering "
-            f"token) yields exactly one (None, BUFFERED) RowResult; got {run_a.rows_buffered}. "
-            f"An N-1 here means the count-trigger token's synthetic BUFFERED emission regressed "
-            f"(F1 Task 4.3 Step 2, elspeth-e1dd5e1303)."
-        )
-        assert run_b_resume.rows_buffered == n, (
-            f"UNIFICATION: resumed run (derive) must report rows_buffered == N == {n} (one BUFFERED audit "
-            f"record per input row); got {run_b_resume.rows_buffered}. If this changed, derive's "
-            f"(None, BUFFERED) arm moved — see elspeth-e1dd5e1303."
-        )
-        assert run_b_resume.rows_buffered == run_a.rows_buffered, (
-            f"UNIFICATION: live and derive must agree on rows_buffered for the count==N topology. "
-            f"oracle={run_a.rows_buffered}, resumed={run_b_resume.rows_buffered}. ANY delta is a "
-            f"re-divergence of the unified counter (elspeth-e1dd5e1303) and may not land silently."
-        )
+                # ── Unified value: live == derive == N exactly (elspeth-e1dd5e1303 fix) ──
+                assert run_a.rows_buffered == n, (
+                    f"UNIFICATION: uninterrupted oracle (live accumulator) must report rows_buffered == N == {n} "
+                    f"on a count==N mid-stream trigger — every buffer-accept (including the flush-triggering "
+                    f"token) yields exactly one (None, BUFFERED) RowResult; got {run_a.rows_buffered}. "
+                    f"An N-1 here means the count-trigger token's synthetic BUFFERED emission regressed "
+                    f"(F1 Task 4.3 Step 2, elspeth-e1dd5e1303)."
+                )
+                assert run_b_resume.rows_buffered == n, (
+                    f"UNIFICATION: resumed run (derive) must report rows_buffered == N == {n} (one BUFFERED audit "
+                    f"record per input row); got {run_b_resume.rows_buffered}. If this changed, derive's "
+                    f"(None, BUFFERED) arm moved — see elspeth-e1dd5e1303."
+                )
+                assert run_b_resume.rows_buffered == run_a.rows_buffered, (
+                    f"UNIFICATION: live and derive must agree on rows_buffered for the count==N topology. "
+                    f"oracle={run_a.rows_buffered}, resumed={run_b_resume.rows_buffered}. ANY delta is a "
+                    f"re-divergence of the unified counter (elspeth-e1dd5e1303) and may not land silently."
+                )
 
-        # ── EVERY counter field must reconcile (no divergent field remains) ────
-        for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
-            assert b_val == a_val, (
-                f"'{field}' must reconcile on the count==N topology (live/derive unification, "
-                f"elspeth-e1dd5e1303). uninterrupted={a_val}, resumed={b_val}."
-            )
+                # ── EVERY counter field must reconcile (no divergent field remains) ────
+                for field, a_val, b_val in counter_reconciliation_pairs(run_a, run_b_resume):
+                    assert b_val == a_val, (
+                        f"'{field}' must reconcile on the count==N topology (live/derive unification, "
+                        f"elspeth-e1dd5e1303). uninterrupted={a_val}, resumed={b_val}."
+                    )
 
     # ─────────────────────────────────────────────────────────────────────
     # Task 12: Remaining risk-ordered resume-recovery matrix
@@ -3102,13 +3127,14 @@ class TestForkRecoveryInvariant:
     # src/, running the single cell, capturing the failure, then reverting.
     # ─────────────────────────────────────────────────────────────────────
 
+    @contextmanager
     def _run_nway_fork(
         self,
         *,
         n_source_rows: int,
         sink_names: list[str],
         sink_factories: dict[str, Any] | None = None,
-    ) -> tuple[LandscapeDB, MockPayloadStore, PipelineConfig, ExecutionGraph, ElspethSettings, str, dict[str, Any]]:
+    ) -> Iterator[tuple[LandscapeDB, MockPayloadStore, PipelineConfig, ExecutionGraph, ElspethSettings, str, dict[str, Any]]]:
         """Run a fork pipeline: each source row forks to every sink in ``sink_names``.
 
         Generalises _setup_fork_and_interrupt to N branches and N source rows
@@ -3123,51 +3149,51 @@ class TestForkRecoveryInvariant:
         """
         from elspeth.core.config import ElspethSettings
 
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        sinks_by_name = dict(sink_factories) if sink_factories else {}
-        for name in sink_names:
-            if name not in sinks_by_name:
-                sinks_by_name[name] = CollectSink(name)
+            sinks_by_name = dict(sink_factories) if sink_factories else {}
+            for name in sink_names:
+                if name not in sinks_by_name:
+                    sinks_by_name[name] = CollectSink(name)
 
-        first_sink = sink_names[0]
-        rows = [{"value": i} for i in range(n_source_rows)]
-        source = ListSource(rows, on_success=first_sink)
+            first_sink = sink_names[0]
+            rows = [{"value": i} for i in range(n_source_rows)]
+            source = ListSource(rows, on_success=first_sink)
 
-        gate = GateSettings(
-            name="fork_gate",
-            input="gate_in",
-            condition="True",
-            routes={"true": "fork", "false": first_sink},
-            fork_to=list(sink_names),
-        )
+            gate = GateSettings(
+                name="fork_gate",
+                input="gate_in",
+                condition="True",
+                routes={"true": "fork", "false": first_sink},
+                fork_to=list(sink_names),
+            )
 
-        sink_map = {name: as_sink(sink) for name, sink in sinks_by_name.items()}
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[],
-            sinks=sink_map,
-            gates=[gate],
-        )
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(source)},
-            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
-            transforms=[],
-            sinks=sink_map,
-            gates=[gate],
-            aggregations={},
-            coalesce_settings=[],
-        )
-        settings_obj = ElspethSettings(
-            sources={"primary": {"plugin": "test", "on_success": first_sink, "options": {}}},
-            sinks={name: {"plugin": "test", "on_write_failure": "discard"} for name in sink_names},
-            gates=[gate],
-        )
+            sink_map = {name: as_sink(sink) for name, sink in sinks_by_name.items()}
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[],
+                sinks=sink_map,
+                gates=[gate],
+            )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(source)},
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="gate_in", options={})},
+                transforms=[],
+                sinks=sink_map,
+                gates=[gate],
+                aggregations={},
+                coalesce_settings=[],
+            )
+            settings_obj = ElspethSettings(
+                sources={"primary": {"plugin": "test", "on_success": first_sink, "options": {}}},
+                sinks={name: {"plugin": "test", "on_write_failure": "discard"} for name in sink_names},
+                gates=[gate],
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
-        return db, payload_store, config, graph, settings_obj, run.run_id, sinks_by_name
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+            yield db, payload_store, config, graph, settings_obj, run.run_id, sinks_by_name
 
     def _checkpoint_and_resume(
         self,
@@ -3268,22 +3294,21 @@ class TestForkRecoveryInvariant:
         from tests.fixtures.plugins import DivertingSink
 
         sink_bad = DivertingSink(name="sink_bad")  # divert_count=None → diverts ALL rows
-        db, payload_store, config, graph, settings_obj, run_id, sinks = self._run_nway_fork(
+        with self._run_nway_fork(
             n_source_rows=1,
             sink_names=["sink_ok", "sink_bad"],
             sink_factories={"sink_bad": sink_bad},
-        )
+        ) as (db, payload_store, config, graph, settings_obj, run_id, sinks):
+            # ── Baseline: sink_ok has a completed sink write; sink_bad has a FAILURE terminal ──
+            baseline_ok = self._completed_sink_outcome_counts(db, run_id)
+            # sink_ok completed once; sink_bad diverted → its terminal is FAILURE/SINK_DISCARDED
+            # (the discard-sentinel sink_name, not 'sink_bad'); not a CollectSink write.
+            assert ("sink_ok" in {k[1] for k in baseline_ok}) or any(k[1] == "sink_ok" for k in baseline_ok), baseline_ok
 
-        # ── Baseline: sink_ok has a completed sink write; sink_bad has a FAILURE terminal ──
-        baseline_ok = self._completed_sink_outcome_counts(db, run_id)
-        # sink_ok completed once; sink_bad diverted → its terminal is FAILURE/SINK_DISCARDED
-        # (the discard-sentinel sink_name, not 'sink_bad'); not a CollectSink write.
-        assert ("sink_ok" in {k[1] for k in baseline_ok}) or any(k[1] == "sink_ok" for k in baseline_ok), baseline_ok
-
-        def _branch_failure_terminals() -> list[tuple[str, str | None]]:
-            with db.engine.connect() as conn:
-                rows = conn.execute(
-                    text("""
+            def _branch_failure_terminals() -> list[tuple[str, str | None]]:
+                with db.engine.connect() as conn:
+                    rows = conn.execute(
+                        text("""
                         SELECT o.outcome AS outcome, o.path AS path
                         FROM token_outcomes o
                         JOIN tokens t ON t.token_id = o.token_id
@@ -3291,88 +3316,88 @@ class TestForkRecoveryInvariant:
                         JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
                         WHERE r.run_id = :run_id AND f.member_key = 'sink_bad' AND o.completed = 1
                     """),
-                    {"run_id": run_id},
-                ).fetchall()
-            return [(row.outcome, row.path) for row in rows]
+                        {"run_id": run_id},
+                    ).fetchall()
+                return [(row.outcome, row.path) for row in rows]
 
-        baseline_bad = _branch_failure_terminals()
-        assert len(baseline_bad) == 1, f"sink_bad branch must have exactly one completed FAILURE terminal in run-1; got {baseline_bad}"
-        assert baseline_bad[0][0] == "failure", f"sink_bad terminal outcome must be FAILURE; got {baseline_bad}"
+            baseline_bad = _branch_failure_terminals()
+            assert len(baseline_bad) == 1, f"sink_bad branch must have exactly one completed FAILURE terminal in run-1; got {baseline_bad}"
+            assert baseline_bad[0][0] == "failure", f"sink_bad terminal outcome must be FAILURE; got {baseline_bad}"
 
-        # Locate the sink_bad branch token (the one we interrupt).
-        with db.engine.connect() as conn:
-            bad_tokens = conn.execute(
-                text("""
+            # Locate the sink_bad branch token (the one we interrupt).
+            with db.engine.connect() as conn:
+                bad_tokens = conn.execute(
+                    text("""
                     SELECT t.token_id AS token_id FROM tokens t
                     JOIN rows r ON r.row_id = t.row_id
                     JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
                     WHERE r.run_id = :run_id AND f.member_key = 'sink_bad'
                 """),
-                {"run_id": run_id},
-            ).fetchall()
-        assert len(bad_tokens) == 1, f"expected one sink_bad branch token; got {len(bad_tokens)}"
-        bad_token_id = bad_tokens[0].token_id
+                    {"run_id": run_id},
+                ).fetchall()
+            assert len(bad_tokens) == 1, f"expected one sink_bad branch token; got {len(bad_tokens)}"
+            bad_token_id = bad_tokens[0].token_id
 
-        # ── Interrupt: delete the sink_bad branch's FAILURE outcome (leave node_states) ──
-        from elspeth.core.landscape.schema import token_outcomes_table
+            # ── Interrupt: delete the sink_bad branch's FAILURE outcome (leave node_states) ──
+            from elspeth.core.landscape.schema import token_outcomes_table
 
-        with db.engine.connect() as conn:
-            bad_outcomes = conn.execute(
-                text("SELECT outcome_id FROM token_outcomes WHERE token_id = :tid AND completed = 1"),
-                {"tid": bad_token_id},
-            ).fetchall()
-            assert bad_outcomes, "sink_bad branch must have a completed outcome to delete (precondition)"
-            for o in bad_outcomes:
-                conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == o.outcome_id))
-            conn.commit()
+            with db.engine.connect() as conn:
+                bad_outcomes = conn.execute(
+                    text("SELECT outcome_id FROM token_outcomes WHERE token_id = :tid AND completed = 1"),
+                    {"tid": bad_token_id},
+                ).fetchall()
+                assert bad_outcomes, "sink_bad branch must have a completed outcome to delete (precondition)"
+                for o in bad_outcomes:
+                    conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == o.outcome_id))
+                conn.commit()
 
-        _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
-        from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
+            _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
+            from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 
-        recovery_mgr = RecoveryManager(db, CheckpointManager(db))
-        by_row = recovery_mgr.get_incomplete_tokens_by_row(run_id)
-        all_specs = [s for specs in by_row.values() for s in specs]
-        assert len(all_specs) == 1 and all_specs[0].token_id == bad_token_id, (
-            f"only the sink_bad branch must be incomplete; got {[(s.token_id, path_branch_name(s.lineage_path)) for s in all_specs]}"
-        )
+            recovery_mgr = RecoveryManager(db, CheckpointManager(db))
+            by_row = recovery_mgr.get_incomplete_tokens_by_row(run_id)
+            all_specs = [s for specs in by_row.values() for s in specs]
+            assert len(all_specs) == 1 and all_specs[0].token_id == bad_token_id, (
+                f"only the sink_bad branch must be incomplete; got {[(s.token_id, path_branch_name(s.lineage_path)) for s in all_specs]}"
+            )
 
-        resume_result = self._checkpoint_and_resume(db, payload_store, config, graph, settings_obj, run_id)
+            resume_result = self._checkpoint_and_resume(db, payload_store, config, graph, settings_obj, run_id)
 
-        # ── Resume produces a FAILURE-class terminal, zero orphan ──
-        # The DivertingSink diverts the re-driven row again → (FAILURE, SINK_DISCARDED).
-        # Status is COMPLETED_WITH_FAILURES (a leaf reached a FAILURE terminal), not COMPLETED.
-        assert resume_result.status == RunStatus.COMPLETED_WITH_FAILURES, (
-            f"a diverted/failed leaf must drive COMPLETED_WITH_FAILURES; got {resume_result.status}"
-        )
-        post_bad = _branch_failure_terminals()
-        assert len(post_bad) == 1, f"sink_bad branch must have exactly one FAILURE terminal after resume; got {post_bad}"
-        assert post_bad[0][0] == "failure", f"sink_bad terminal must be FAILURE; got {post_bad}"
-        orphans = orphan_leaf_token_ids(db, run_id)
-        assert not orphans, f"Resume left orphan leaf token(s): {orphans}"
-        # sink_ok was complete before the interruption and must not be re-written.
-        assert len(sinks["sink_ok"].results) == 1, f"sink_ok re-written: {len(sinks['sink_ok'].results)} (must stay 1)"
+            # ── Resume produces a FAILURE-class terminal, zero orphan ──
+            # The DivertingSink diverts the re-driven row again → (FAILURE, SINK_DISCARDED).
+            # Status is COMPLETED_WITH_FAILURES (a leaf reached a FAILURE terminal), not COMPLETED.
+            assert resume_result.status == RunStatus.COMPLETED_WITH_FAILURES, (
+                f"a diverted/failed leaf must drive COMPLETED_WITH_FAILURES; got {resume_result.status}"
+            )
+            post_bad = _branch_failure_terminals()
+            assert len(post_bad) == 1, f"sink_bad branch must have exactly one FAILURE terminal after resume; got {post_bad}"
+            assert post_bad[0][0] == "failure", f"sink_bad terminal must be FAILURE; got {post_bad}"
+            orphans = orphan_leaf_token_ids(db, run_id)
+            assert not orphans, f"Resume left orphan leaf token(s): {orphans}"
+            # sink_ok was complete before the interruption and must not be re-written.
+            assert len(sinks["sink_ok"].results) == 1, f"sink_ok re-written: {len(sinks['sink_ok'].results)} (must stay 1)"
 
-        # ── BOUNDEDNESS: a SECOND resume must NOT re-select the failed branch ──
-        # The FAILURE outcome carries completed=1, so it is excluded from the
-        # incomplete-token query.  Capture the outcome multiset, run a second
-        # resume, and assert nothing changed and the token is not re-surfaced.
-        outcomes_before_second = self._completed_sink_outcome_counts(db, run_id)
-        bad_terminals_before = _branch_failure_terminals()
+            # ── BOUNDEDNESS: a SECOND resume must NOT re-select the failed branch ──
+            # The FAILURE outcome carries completed=1, so it is excluded from the
+            # incomplete-token query.  Capture the outcome multiset, run a second
+            # resume, and assert nothing changed and the token is not re-surfaced.
+            outcomes_before_second = self._completed_sink_outcome_counts(db, run_id)
+            bad_terminals_before = _branch_failure_terminals()
 
-        by_row_2 = recovery_mgr.get_incomplete_tokens_by_row(run_id)
-        specs_2 = [s for specs in by_row_2.values() for s in specs]
-        assert bad_token_id not in {s.token_id for s in specs_2}, (
-            f"BOUNDEDNESS violated: the failed branch {bad_token_id!r} is re-selected on a second resume "
-            f"(its completed=1 FAILURE outcome must exclude it). specs={[s.token_id for s in specs_2]}"
-        )
+            by_row_2 = recovery_mgr.get_incomplete_tokens_by_row(run_id)
+            specs_2 = [s for specs in by_row_2.values() for s in specs]
+            assert bad_token_id not in {s.token_id for s in specs_2}, (
+                f"BOUNDEDNESS violated: the failed branch {bad_token_id!r} is re-selected on a second resume "
+                f"(its completed=1 FAILURE outcome must exclude it). specs={[s.token_id for s in specs_2]}"
+            )
 
-        # Mark failed again and resume a second time; nothing must change.
-        second_resume = self._checkpoint_and_resume(db, payload_store, config, graph, settings_obj, run_id)
-        assert second_resume.status in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_FAILURES), second_resume.status
-        assert self._completed_sink_outcome_counts(db, run_id) == outcomes_before_second, (
-            "second resume must not add/remove completed sink outcomes (bounded)"
-        )
-        assert _branch_failure_terminals() == bad_terminals_before, "second resume must not add a duplicate FAILURE terminal (bounded)"
+            # Mark failed again and resume a second time; nothing must change.
+            second_resume = self._checkpoint_and_resume(db, payload_store, config, graph, settings_obj, run_id)
+            assert second_resume.status in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_FAILURES), second_resume.status
+            assert self._completed_sink_outcome_counts(db, run_id) == outcomes_before_second, (
+                "second resume must not add/remove completed sink outcomes (bounded)"
+            )
+            assert _branch_failure_terminals() == bad_terminals_before, "second resume must not add a duplicate FAILURE terminal (bounded)"
 
     def test_resume_linear_pipeline_regression_audit(self) -> None:
         """matrix #6 (linear regression): a linear (no-fork) resume uses process_existing_row.
@@ -3398,113 +3423,113 @@ class TestForkRecoveryInvariant:
         from elspeth.core.config import ElspethSettings
         from elspeth.core.landscape.schema import token_outcomes_table
 
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        source = ListSource([{"value": 7}], on_success="source_out")
-        transform = PassTransform(name="pass_linear")
-        sink = CollectSink("output")
+            source = ListSource([{"value": 7}], on_success="source_out")
+            transform = PassTransform(name="pass_linear")
+            sink = CollectSink("output")
 
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(transform)],
-            sinks={"output": as_sink(sink)},
-        )
-        graph = _build_production_graph(config)
-        settings_obj = ElspethSettings(
-            sources={"primary": {"plugin": "test", "on_success": "source_out", "options": {}}},
-            sinks={"output": {"plugin": "test", "on_write_failure": "discard"}},
-        )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[as_transform(transform)],
+                sinks={"output": as_sink(sink)},
+            )
+            graph = _build_production_graph(config)
+            settings_obj = ElspethSettings(
+                sources={"primary": {"plugin": "test", "on_success": "source_out", "options": {}}},
+                sinks={"output": {"plugin": "test", "on_write_failure": "discard"}},
+            )
 
-        orchestrator = Orchestrator(db)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
-        run_id = run.run_id
+            orchestrator = Orchestrator(db)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+            run_id = run.run_id
 
-        # Baseline audit: exactly one completed (row, output) outcome, no fork groups.
-        baseline = self._completed_sink_outcome_counts(db, run_id)
-        assert len(baseline) == 1 and all(n == 1 for n in baseline.values()), baseline
-        assert get_fork_group_stats(db, run_id)["total_fork_groups"] == 0, "linear pipeline must have no fork groups"
+            # Baseline audit: exactly one completed (row, output) outcome, no fork groups.
+            baseline = self._completed_sink_outcome_counts(db, run_id)
+            assert len(baseline) == 1 and all(n == 1 for n in baseline.values()), baseline
+            assert get_fork_group_stats(db, run_id)["total_fork_groups"] == 0, "linear pipeline must have no fork groups"
 
-        # Interrupt: delete the linear token's terminal outcome.  The single token
-        # is a linear token (no lineage fields) → recovery must NOT classify it as a
-        # fork/expand/coalesce spec.
-        with db.engine.connect() as conn:
-            outcomes = conn.execute(
-                text("""
+            # Interrupt: delete the linear token's terminal outcome.  The single token
+            # is a linear token (no lineage fields) → recovery must NOT classify it as a
+            # fork/expand/coalesce spec.
+            with db.engine.connect() as conn:
+                outcomes = conn.execute(
+                    text("""
                     SELECT o.outcome_id AS outcome_id
                     FROM token_outcomes o
                     JOIN tokens t ON t.token_id = o.token_id
                     JOIN rows r ON r.row_id = t.row_id
                     WHERE r.run_id = :run_id AND o.completed = 1 AND o.sink_name IS NOT NULL
                 """),
-                {"run_id": run_id},
-            ).fetchall()
-            assert outcomes, "linear pipeline must have a completed outcome to delete"
-            for o in outcomes:
-                conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == o.outcome_id))
-            conn.commit()
-
-        _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
-        # The incomplete linear token, if classified as fork/expand/coalesce, would
-        # carry NO lineage fields — the resume loop's filter must NOT route it to
-        # resume_incomplete_token (it routes to process_existing_row instead).
-        from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
-
-        recovery_mgr = RecoveryManager(db, CheckpointManager(db))
-        by_row = recovery_mgr.get_incomplete_tokens_by_row(run_id)
-        all_specs = [s for specs in by_row.values() for s in specs]
-        assert len(all_specs) == 1, f"linear interrupt must surface one incomplete token; got {len(all_specs)}"
-        linear_spec = all_specs[0]
-        assert path_branch_name(linear_spec.lineage_path) is None and path_fork_group_id(linear_spec.lineage_path) is None, (
-            f"linear token must have NO branch/fork lineage; got branch={path_branch_name(linear_spec.lineage_path)!r} "
-            f"fork={path_fork_group_id(linear_spec.lineage_path)!r}"
-        )
-        assert path_expand_group_id(linear_spec.lineage_path) is None and linear_spec.join_group_id is None, (
-            f"linear token must have NO expand/join lineage; got expand={path_expand_group_id(linear_spec.lineage_path)!r} "
-            f"join={linear_spec.join_group_id!r}"
-        )
-
-        # Count tokens before resume so we can prove a FRESH token was minted (the
-        # signature of the process_existing_row whole-row restart, distinct from the
-        # in-place re-drive used by fork/expand/coalesce).
-        with db.engine.connect() as conn:
-            tokens_before = int(
-                conn.execute(
-                    text("SELECT COUNT(*) FROM tokens t JOIN rows r ON r.row_id = t.row_id WHERE r.run_id = :run_id"),
                     {"run_id": run_id},
-                ).scalar()
-                or 0
+                ).fetchall()
+                assert outcomes, "linear pipeline must have a completed outcome to delete"
+                for o in outcomes:
+                    conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == o.outcome_id))
+                conn.commit()
+
+            _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
+            # The incomplete linear token, if classified as fork/expand/coalesce, would
+            # carry NO lineage fields — the resume loop's filter must NOT route it to
+            # resume_incomplete_token (it routes to process_existing_row instead).
+            from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
+
+            recovery_mgr = RecoveryManager(db, CheckpointManager(db))
+            by_row = recovery_mgr.get_incomplete_tokens_by_row(run_id)
+            all_specs = [s for specs in by_row.values() for s in specs]
+            assert len(all_specs) == 1, f"linear interrupt must surface one incomplete token; got {len(all_specs)}"
+            linear_spec = all_specs[0]
+            assert path_branch_name(linear_spec.lineage_path) is None and path_fork_group_id(linear_spec.lineage_path) is None, (
+                f"linear token must have NO branch/fork lineage; got branch={path_branch_name(linear_spec.lineage_path)!r} "
+                f"fork={path_fork_group_id(linear_spec.lineage_path)!r}"
+            )
+            assert path_expand_group_id(linear_spec.lineage_path) is None and linear_spec.join_group_id is None, (
+                f"linear token must have NO expand/join lineage; got expand={path_expand_group_id(linear_spec.lineage_path)!r} "
+                f"join={linear_spec.join_group_id!r}"
             )
 
-        resume_result = self._checkpoint_and_resume(db, payload_store, config, graph, settings_obj, run_id)
+            # Count tokens before resume so we can prove a FRESH token was minted (the
+            # signature of the process_existing_row whole-row restart, distinct from the
+            # in-place re-drive used by fork/expand/coalesce).
+            with db.engine.connect() as conn:
+                tokens_before = int(
+                    conn.execute(
+                        text("SELECT COUNT(*) FROM tokens t JOIN rows r ON r.row_id = t.row_id WHERE r.run_id = :run_id"),
+                        {"run_id": run_id},
+                    ).scalar()
+                    or 0
+                )
 
-        # AUDIT-TRAIL assertion (not just in-memory sink): the row reaches a completed
-        # terminal outcome again via the process_existing_row whole-row restart.
-        after = self._completed_sink_outcome_counts(db, run_id)
-        assert len(after) == 1 and all(n == 1 for n in after.values()), (
-            f"linear resume must restore exactly one completed (row, output) outcome; got {after}"
-        )
-        # process_existing_row mints a FRESH token (create_token_for_existing_row) rather
-        # than re-driving the original in place — confirming the no-incomplete-children
-        # dispatch branch was taken.  A fork/expand/coalesce re-drive would reuse the
-        # original token_id and NOT add a token.  The ORIGINAL linear token is
-        # legitimately left outcome-less (superseded by the fresh token) — that is the
-        # designed linear-restart behaviour, so orphan_leaf_token_ids is NOT applicable
-        # here (it correctly flags abandoned tokens, which the linear restart creates by
-        # design — distinct from a fork re-drive, which must leave none).
-        with db.engine.connect() as conn:
-            tokens_after = int(
-                conn.execute(
-                    text("SELECT COUNT(*) FROM tokens t JOIN rows r ON r.row_id = t.row_id WHERE r.run_id = :run_id"),
-                    {"run_id": run_id},
-                ).scalar()
-                or 0
+            resume_result = self._checkpoint_and_resume(db, payload_store, config, graph, settings_obj, run_id)
+
+            # AUDIT-TRAIL assertion (not just in-memory sink): the row reaches a completed
+            # terminal outcome again via the process_existing_row whole-row restart.
+            after = self._completed_sink_outcome_counts(db, run_id)
+            assert len(after) == 1 and all(n == 1 for n in after.values()), (
+                f"linear resume must restore exactly one completed (row, output) outcome; got {after}"
             )
-        assert tokens_after == tokens_before + 1, (
-            f"linear resume must mint exactly ONE fresh token via process_existing_row "
-            f"(whole-row restart); tokens before={tokens_before} after={tokens_after}"
-        )
-        assert resume_result.status == RunStatus.COMPLETED, resume_result.status
+            # process_existing_row mints a FRESH token (create_token_for_existing_row) rather
+            # than re-driving the original in place — confirming the no-incomplete-children
+            # dispatch branch was taken.  A fork/expand/coalesce re-drive would reuse the
+            # original token_id and NOT add a token.  The ORIGINAL linear token is
+            # legitimately left outcome-less (superseded by the fresh token) — that is the
+            # designed linear-restart behaviour, so orphan_leaf_token_ids is NOT applicable
+            # here (it correctly flags abandoned tokens, which the linear restart creates by
+            # design — distinct from a fork re-drive, which must leave none).
+            with db.engine.connect() as conn:
+                tokens_after = int(
+                    conn.execute(
+                        text("SELECT COUNT(*) FROM tokens t JOIN rows r ON r.row_id = t.row_id WHERE r.run_id = :run_id"),
+                        {"run_id": run_id},
+                    ).scalar()
+                    or 0
+                )
+            assert tokens_after == tokens_before + 1, (
+                f"linear resume must mint exactly ONE fresh token via process_existing_row "
+                f"(whole-row restart); tokens before={tokens_before} after={tokens_after}"
+            )
+            assert resume_result.status == RunStatus.COMPLETED, resume_result.status
 
     def test_resume_aggregation_buffer_with_partial_fork(self) -> None:
         """matrix #5: a row with MIXED buffered + incomplete fork children is NOT excluded.
@@ -3551,14 +3576,19 @@ class TestForkRecoveryInvariant:
         from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
         from elspeth.core.landscape.schema import token_outcomes_table
 
-        db, _payload_store, _config, graph, _settings_obj, run_id, _sinks = self._run_nway_fork(
-            n_source_rows=1, sink_names=["sink_a", "sink_b"]
-        )
-
-        # ── Locate both fork-child tokens and the source row's contract ──
-        with db.engine.connect() as conn:
-            children = conn.execute(
-                text("""
+        with self._run_nway_fork(n_source_rows=1, sink_names=["sink_a", "sink_b"]) as (
+            db,
+            _payload_store,
+            _config,
+            graph,
+            _settings_obj,
+            run_id,
+            _sinks,
+        ):
+            # ── Locate both fork-child tokens and the source row's contract ──
+            with db.engine.connect() as conn:
+                children = conn.execute(
+                    text("""
                     SELECT t.token_id AS token_id, f.member_key AS branch_name, t.row_id AS row_id,
                            f.group_id AS fork_group_id
                     FROM tokens t
@@ -3566,135 +3596,135 @@ class TestForkRecoveryInvariant:
                     JOIN token_lineage_frames f ON f.token_id = t.token_id AND f.run_id = t.run_id AND f.kind = 'fork'
                     WHERE r.run_id = :run_id AND f.member_key IN ('sink_a', 'sink_b')
                 """),
-                {"run_id": run_id},
-            ).fetchall()
-        by_branch = {c.branch_name: c for c in children}
-        assert set(by_branch) == {"sink_a", "sink_b"}, f"expected sink_a + sink_b fork children; got {by_branch}"
-        buffered_child = by_branch["sink_a"]  # will be placed into agg checkpoint state
-        incomplete_child = by_branch["sink_b"]  # will be left incomplete + NON-buffered
-        row_id = buffered_child.row_id
+                    {"run_id": run_id},
+                ).fetchall()
+            by_branch = {c.branch_name: c for c in children}
+            assert set(by_branch) == {"sink_a", "sink_b"}, f"expected sink_a + sink_b fork children; got {by_branch}"
+            buffered_child = by_branch["sink_a"]  # will be placed into agg checkpoint state
+            incomplete_child = by_branch["sink_b"]  # will be left incomplete + NON-buffered
+            row_id = buffered_child.row_id
 
-        # The run's stored schema contract is what the row was produced under — reuse it
-        # for the buffered token's journal row payload (genuine, not fabricated).
-        checkpoint_mgr = CheckpointManager(db)
-        recovery_for_contract = RecoveryManager(db, checkpoint_mgr)
-        source_contract = recovery_for_contract.verify_contract_integrity(run_id)
+            # The run's stored schema contract is what the row was produced under — reuse it
+            # for the buffered token's journal row payload (genuine, not fabricated).
+            checkpoint_mgr = CheckpointManager(db)
+            recovery_for_contract = RecoveryManager(db, checkpoint_mgr)
+            source_contract = recovery_for_contract.verify_contract_integrity(run_id)
 
-        # The barrier_key is opaque to recovery's journal arm:
-        # _get_buffered_journal_token_ids reads only "BLOCKED + barrier_key IS NOT
-        # NULL" (blocked_barrier_hold_clause); the key is validated against the
-        # pipeline's barriers only at processor restore time, which this
-        # function-level test never reaches.  Use a real node id (the source node)
-        # as the key, mirroring the old opaque-node-id convention.
-        source_node_ids = graph.get_sources()
-        assert source_node_ids, "expected at least one source node in fork recovery test graph"
-        barrier_key_for_seed = str(source_node_ids[0])
+            # The barrier_key is opaque to recovery's journal arm:
+            # _get_buffered_journal_token_ids reads only "BLOCKED + barrier_key IS NOT
+            # NULL" (blocked_barrier_hold_clause); the key is validated against the
+            # pipeline's barriers only at processor restore time, which this
+            # function-level test never reaches.  Use a real node id (the source node)
+            # as the key, mirroring the old opaque-node-id convention.
+            source_node_ids = graph.get_sources()
+            assert source_node_ids, "expected at least one source node in fork recovery test graph"
+            barrier_key_for_seed = str(source_node_ids[0])
 
-        # ── Interrupt: delete BOTH branches' terminal outcomes ──
-        # sink_a → buffered-incomplete (restored from checkpoint state, not reprocessed);
-        # sink_b → non-buffered incomplete (must be reprocessed).  A "buffered" token must
-        # itself be incomplete (no terminal outcome) for the mixed-state arithmetic to
-        # engage — so sink_a's outcome is deleted too.
-        with db.engine.connect() as conn:
-            both_outcomes = conn.execute(
-                text("""
+            # ── Interrupt: delete BOTH branches' terminal outcomes ──
+            # sink_a → buffered-incomplete (restored from checkpoint state, not reprocessed);
+            # sink_b → non-buffered incomplete (must be reprocessed).  A "buffered" token must
+            # itself be incomplete (no terminal outcome) for the mixed-state arithmetic to
+            # engage — so sink_a's outcome is deleted too.
+            with db.engine.connect() as conn:
+                both_outcomes = conn.execute(
+                    text("""
                     SELECT o.outcome_id AS outcome_id
                     FROM token_outcomes o
                     WHERE o.token_id IN (:a, :b) AND o.completed = 1
                 """),
-                {"a": buffered_child.token_id, "b": incomplete_child.token_id},
-            ).fetchall()
-            assert len(both_outcomes) == 2, (
-                f"both fork children must have a completed outcome to delete (precondition); got {len(both_outcomes)}"
+                    {"a": buffered_child.token_id, "b": incomplete_child.token_id},
+                ).fetchall()
+                assert len(both_outcomes) == 2, (
+                    f"both fork children must have a completed outcome to delete (precondition); got {len(both_outcomes)}"
+                )
+                for o in both_outcomes:
+                    conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == o.outcome_id))
+                conn.commit()
+
+            _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
+            # ── Seed the sink_a token's BLOCKED journal row (F1: journal is truth) ──
+            # Production journal verbs, exactly as a live barrier hold is recorded:
+            # enqueue+claim, then mark_blocked stamps barrier_blocked_at.
+            with db.engine.connect() as conn:
+                row_ingest_sequence = conn.execute(
+                    text("SELECT ingest_sequence FROM rows WHERE row_id = :rid"),
+                    {"rid": row_id},
+                ).scalar_one()
+            scheduler_repo = RecorderFactory(db).scheduler
+            datetime.now(UTC)
+            seeded_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
+                run_id=run_id,
+                token_id=buffered_child.token_id,
+                row_id=row_id,
+                node_id=barrier_key_for_seed,
+                step_index=1,
+                ingest_sequence=row_ingest_sequence,
+                row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 0}, contract=source_contract)),
+                lease_owner="test-harness",
+                lease_seconds=60,
+                lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=buffered_child.fork_group_id, member_key="sink_a"),),
             )
-            for o in both_outcomes:
-                conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == o.outcome_id))
-            conn.commit()
+            scheduler_repo.mark_blocked(
+                work_item_id=seeded_item.work_item_id,
+                queue_key=None,
+                barrier_key=barrier_key_for_seed,
+                expected_lease_owner="test-harness",
+            )
 
-        _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
-        # ── Seed the sink_a token's BLOCKED journal row (F1: journal is truth) ──
-        # Production journal verbs, exactly as a live barrier hold is recorded:
-        # enqueue+claim, then mark_blocked stamps barrier_blocked_at.
-        with db.engine.connect() as conn:
-            row_ingest_sequence = conn.execute(
-                text("SELECT ingest_sequence FROM rows WHERE row_id = :rid"),
-                {"rid": row_id},
-            ).scalar_one()
-        scheduler_repo = RecorderFactory(db).scheduler
-        datetime.now(UTC)
-        seeded_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
-            run_id=run_id,
-            token_id=buffered_child.token_id,
-            row_id=row_id,
-            node_id=barrier_key_for_seed,
-            step_index=1,
-            ingest_sequence=row_ingest_sequence,
-            row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 0}, contract=source_contract)),
-            lease_owner="test-harness",
-            lease_seconds=60,
-            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=buffered_child.fork_group_id, member_key="sink_a"),),
-        )
-        scheduler_repo.mark_blocked(
-            work_item_id=seeded_item.work_item_id,
-            queue_key=None,
-            barrier_key=barrier_key_for_seed,
-            expected_lease_owner="test-harness",
-        )
+            # A checkpoint is the resume precondition (get_unprocessed_rows returns []
+            # for a run with no checkpoint). F1: it carries scalars only — no blob.
+            reseat_crashed_leader(db, run_id)
+            create_checkpoint(
+                checkpoint_mgr,
+                run_id=run_id,
+                sequence_number=1,
+                barrier_scalars=None,
+                graph=graph,
+            )
 
-        # A checkpoint is the resume precondition (get_unprocessed_rows returns []
-        # for a run with no checkpoint). F1: it carries scalars only — no blob.
-        reseat_crashed_leader(db, run_id)
-        create_checkpoint(
-            checkpoint_mgr,
-            run_id=run_id,
-            sequence_number=1,
-            barrier_scalars=None,
-            graph=graph,
-        )
+            recovery_mgr = RecoveryManager(db, checkpoint_mgr)
 
-        recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+            # ── PRECONDITION: the mixed-state path is genuinely live ──
+            # _get_buffered_journal_token_ids must return the sink_a token (proof the
+            # exclusion logic in get_unprocessed_rows actually executes — `if
+            # buffered_token_ids and unprocessed:`).  Without this, the test would pass
+            # vacuously.
+            buffered_ids = recovery_mgr._get_buffered_journal_token_ids(run_id)
+            assert buffered_child.token_id in buffered_ids, (
+                f"PRECONDITION FAILED: the sink_a token must be in the journal BLOCKED barrier-hold set "
+                f"(else the mixed-state exclusion path is skipped and the test is vacuous). "
+                f"buffered_ids={buffered_ids}"
+            )
+            assert incomplete_child.token_id not in buffered_ids, (
+                f"sink_b token must NOT be buffered (it is the non-buffered incomplete leaf); buffered_ids={buffered_ids}"
+            )
 
-        # ── PRECONDITION: the mixed-state path is genuinely live ──
-        # _get_buffered_journal_token_ids must return the sink_a token (proof the
-        # exclusion logic in get_unprocessed_rows actually executes — `if
-        # buffered_token_ids and unprocessed:`).  Without this, the test would pass
-        # vacuously.
-        buffered_ids = recovery_mgr._get_buffered_journal_token_ids(run_id)
-        assert buffered_child.token_id in buffered_ids, (
-            f"PRECONDITION FAILED: the sink_a token must be in the journal BLOCKED barrier-hold set "
-            f"(else the mixed-state exclusion path is skipped and the test is vacuous). "
-            f"buffered_ids={buffered_ids}"
-        )
-        assert incomplete_child.token_id not in buffered_ids, (
-            f"sink_b token must NOT be buffered (it is the non-buffered incomplete leaf); buffered_ids={buffered_ids}"
-        )
+            # ── MIXED-STATE INVARIANT: the row is NOT excluded ──
+            # The row has one buffered (sink_a) + one non-buffered incomplete (sink_b) leaf.
+            # get_unprocessed_rows must still return it (sink_b needs reprocessing).
+            unprocessed = recovery_mgr.get_unprocessed_rows(run_id)
+            assert row_id in unprocessed, (
+                f"mixed-state row must NOT be excluded (only ALL-buffered rows are excluded); unprocessed={unprocessed}. "
+                f"The row has a non-buffered incomplete sink_b leaf that still needs reprocessing — "
+                f"excluding it would silently orphan sink_b."
+            )
 
-        # ── MIXED-STATE INVARIANT: the row is NOT excluded ──
-        # The row has one buffered (sink_a) + one non-buffered incomplete (sink_b) leaf.
-        # get_unprocessed_rows must still return it (sink_b needs reprocessing).
-        unprocessed = recovery_mgr.get_unprocessed_rows(run_id)
-        assert row_id in unprocessed, (
-            f"mixed-state row must NOT be excluded (only ALL-buffered rows are excluded); unprocessed={unprocessed}. "
-            f"The row has a non-buffered incomplete sink_b leaf that still needs reprocessing — "
-            f"excluding it would silently orphan sink_b."
-        )
-
-        # The incomplete (non-buffered) sink_b child must surface as a resume spec; the
-        # buffered (sink_a) child must NOT (it is restored-and-flushed from the aggregation
-        # buffer, not re-driven — get_incomplete_tokens_by_row excludes buffered tokens at
-        # the token level via _get_buffered_journal_token_ids' BLOCKED barrier-hold set).
-        # This is the function-level guard for the aggregation arm; the full-resume
-        # double-emit guard is test_resume_aggregation_buffered_fork_branch_not_redriven.
-        by_row = recovery_mgr.get_incomplete_tokens_by_row(run_id)
-        incomplete_specs = [s for specs in by_row.values() for s in specs]
-        spec_token_ids = {s.token_id for s in incomplete_specs}
-        assert incomplete_child.token_id in spec_token_ids, (
-            f"sink_b (non-buffered incomplete) must surface as a resume spec; specs={spec_token_ids}"
-        )
-        assert buffered_child.token_id not in spec_token_ids, (
-            f"sink_a (aggregation-buffered) must NOT surface as a resume spec — re-driving a buffered "
-            f"token double-emits; it is restored-and-flushed from the buffer instead. specs={spec_token_ids}"
-        )
+            # The incomplete (non-buffered) sink_b child must surface as a resume spec; the
+            # buffered (sink_a) child must NOT (it is restored-and-flushed from the aggregation
+            # buffer, not re-driven — get_incomplete_tokens_by_row excludes buffered tokens at
+            # the token level via _get_buffered_journal_token_ids' BLOCKED barrier-hold set).
+            # This is the function-level guard for the aggregation arm; the full-resume
+            # double-emit guard is test_resume_aggregation_buffered_fork_branch_not_redriven.
+            by_row = recovery_mgr.get_incomplete_tokens_by_row(run_id)
+            incomplete_specs = [s for specs in by_row.values() for s in specs]
+            spec_token_ids = {s.token_id for s in incomplete_specs}
+            assert incomplete_child.token_id in spec_token_ids, (
+                f"sink_b (non-buffered incomplete) must surface as a resume spec; specs={spec_token_ids}"
+            )
+            assert buffered_child.token_id not in spec_token_ids, (
+                f"sink_a (aggregation-buffered) must NOT surface as a resume spec — re-driving a buffered "
+                f"token double-emits; it is restored-and-flushed from the buffer instead. specs={spec_token_ids}"
+            )
 
     def test_resume_expand_aggregation_all_buffered_row_excluded(self) -> None:
         """An aggregation-buffered expand row is excluded from resume re-drive at the ROW
@@ -3811,71 +3841,71 @@ class TestForkRecoveryInvariant:
                     return TransformResult.success(_PipelineRow(output, contract), success_reason={"action": "batch"})
                 return TransformResult.success(make_pipeline_row(dict(row)), success_reason={"action": "single"})
 
-        db = make_landscape_db()
-        payload_store = MockPayloadStore()
+        with _runtime_landscape_db() as db:
+            payload_store = MockPayloadStore()
 
-        dt0 = datetime.datetime(2021, 1, 1, tzinfo=datetime.UTC)
-        dt1 = datetime.datetime(2022, 2, 2, tzinfo=datetime.UTC)
+            dt0 = datetime.datetime(2021, 1, 1, tzinfo=datetime.UTC)
+            dt1 = datetime.datetime(2022, 2, 2, tzinfo=datetime.UTC)
 
-        source = ListSource(
-            [{"id": 1, "value": 10, "items": [{"ts": dt0}, {"ts": dt1}]}],
-            on_success="explode_in",
-        )
-        sink = CollectSink("output")
-        explode = JSONExplode({"array_field": "items", "output_field": "item", "include_index": True, "schema": {"mode": "observed"}})
-        agg = BatchCollectorTransform()
-        agg_transform = as_transform(agg)
-        wired = wire_transforms(
-            [as_transform(explode), agg_transform],
-            source_connection="explode_in",
-            final_sink="output",
-            names=["explode", "agg"],
-        )
-        graph = ExecutionGraph.from_plugin_instances(
-            sources={"primary": as_source(source)},
-            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="explode_in", options={})},
-            transforms=wired,
-            sinks={"output": as_sink(sink)},
-            gates=[],
-            aggregations={},
-            coalesce_settings=[],
-        )
-        agg_node_id = graph.get_transform_id_map()[1]  # explode=0, agg=1
-        agg_settings = AggregationSettings(
-            name="agg",
-            plugin="batch_collector",
-            input="agg_in",
-            on_success="output",
-            on_error="discard",
-            trigger=TriggerConfig(count=3, timeout_seconds=3600),
-            output_mode="transform",
-        )
-        config = PipelineConfig(
-            sources={"primary": as_source(source)},
-            transforms=[as_transform(explode), agg_transform],
-            sinks={"output": as_sink(sink)},
-            aggregation_settings={agg_node_id: agg_settings},
-            coalesce_settings=[],
-        )
-        checkpoint_settings = CheckpointSettings(enabled=True, frequency="every_row")
-        settings_obj = ElspethSettings(
-            sources={"primary": {"plugin": "test", "on_success": "explode_in", "options": {}}},
-            sinks={"output": SinkSettings(plugin="test", on_write_failure="discard", options={})},
-            aggregations=[agg_settings],
-            checkpoint=checkpoint_settings,
-        )
+            source = ListSource(
+                [{"id": 1, "value": 10, "items": [{"ts": dt0}, {"ts": dt1}]}],
+                on_success="explode_in",
+            )
+            sink = CollectSink("output")
+            explode = JSONExplode({"array_field": "items", "output_field": "item", "include_index": True, "schema": {"mode": "observed"}})
+            agg = BatchCollectorTransform()
+            agg_transform = as_transform(agg)
+            wired = wire_transforms(
+                [as_transform(explode), agg_transform],
+                source_connection="explode_in",
+                final_sink="output",
+                names=["explode", "agg"],
+            )
+            graph = ExecutionGraph.from_plugin_instances(
+                sources={"primary": as_source(source)},
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="explode_in", options={})},
+                transforms=wired,
+                sinks={"output": as_sink(sink)},
+                gates=[],
+                aggregations={},
+                coalesce_settings=[],
+            )
+            agg_node_id = graph.get_transform_id_map()[1]  # explode=0, agg=1
+            agg_settings = AggregationSettings(
+                name="agg",
+                plugin="batch_collector",
+                input="agg_in",
+                on_success="output",
+                on_error="discard",
+                trigger=TriggerConfig(count=3, timeout_seconds=3600),
+                output_mode="transform",
+            )
+            config = PipelineConfig(
+                sources={"primary": as_source(source)},
+                transforms=[as_transform(explode), agg_transform],
+                sinks={"output": as_sink(sink)},
+                aggregation_settings={agg_node_id: agg_settings},
+                coalesce_settings=[],
+            )
+            checkpoint_settings = CheckpointSettings(enabled=True, frequency="every_row")
+            settings_obj = ElspethSettings(
+                sources={"primary": {"plugin": "test", "on_success": "explode_in", "options": {}}},
+                sinks={"output": SinkSettings(plugin="test", on_write_failure="discard", options={})},
+                aggregations=[agg_settings],
+                checkpoint=checkpoint_settings,
+            )
 
-        checkpoint_mgr = CheckpointManager(db)
-        checkpoint_config = RuntimeCheckpointConfig.from_settings(checkpoint_settings)
-        orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
-        run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
-        run_id = run.run_id
-        assert run.status == RunStatus.COMPLETED, f"run-1 must complete: {run.status}"
+            checkpoint_mgr = CheckpointManager(db)
+            checkpoint_config = RuntimeCheckpointConfig.from_settings(checkpoint_settings)
+            orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+            run = orchestrator.run(config, graph=graph, settings=settings_obj, payload_store=payload_store)
+            run_id = run.run_id
+            assert run.status == RunStatus.COMPLETED, f"run-1 must complete: {run.status}"
 
-        # ── The two expand-child LEAVES (buffered into the aggregation batch) ──
-        with db.engine.connect() as conn:
-            children = conn.execute(
-                text("""
+            # ── The two expand-child LEAVES (buffered into the aggregation batch) ──
+            with db.engine.connect() as conn:
+                children = conn.execute(
+                    text("""
                     SELECT DISTINCT t.token_id AS token_id, t.row_id AS row_id, f.group_id AS expand_group_id,
                            t.token_data_ref AS token_data_ref
                     FROM tokens t
@@ -3886,99 +3916,99 @@ class TestForkRecoveryInvariant:
                       AND o.path = :consumed AND o.completed = 1
                     ORDER BY t.token_id
                 """),
-                {"run_id": run_id, "consumed": TerminalPath.BATCH_CONSUMED.value},
-            ).fetchall()
-        assert len(children) == 2, f"Expected exactly 2 expand-child leaves consumed into the aggregation batch; got {len(children)}"
-        row_id = children[0].row_id
+                    {"run_id": run_id, "consumed": TerminalPath.BATCH_CONSUMED.value},
+                ).fetchall()
+            assert len(children) == 2, f"Expected exactly 2 expand-child leaves consumed into the aggregation batch; got {len(children)}"
+            row_id = children[0].row_id
 
-        def _envelope(token_data_ref: str) -> dict:
-            raw = payload_store.retrieve(token_data_ref)
-            return checkpoint_loads(raw.decode("utf-8"))
+            def _envelope(token_data_ref: str) -> dict:
+                raw = payload_store.retrieve(token_data_ref)
+                return checkpoint_loads(raw.decode("utf-8"))
 
-        # ── Interrupt: delete BOTH leaves' terminal (batch_consumed) outcomes ──
-        with db.engine.connect() as conn:
-            both = conn.execute(
-                text("SELECT o.outcome_id AS outcome_id FROM token_outcomes o WHERE o.token_id IN (:a, :b) AND o.completed = 1"),
-                {"a": children[0].token_id, "b": children[1].token_id},
-            ).fetchall()
-            assert len(both) == 2, f"both expand leaves must have a completed outcome to delete (precondition); got {len(both)}"
-            for o in both:
-                conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == o.outcome_id))
-            conn.commit()
+            # ── Interrupt: delete BOTH leaves' terminal (batch_consumed) outcomes ──
+            with db.engine.connect() as conn:
+                both = conn.execute(
+                    text("SELECT o.outcome_id AS outcome_id FROM token_outcomes o WHERE o.token_id IN (:a, :b) AND o.completed = 1"),
+                    {"a": children[0].token_id, "b": children[1].token_id},
+                ).fetchall()
+                assert len(both) == 2, f"both expand leaves must have a completed outcome to delete (precondition); got {len(both)}"
+                for o in both:
+                    conn.execute(token_outcomes_table.delete().where(token_outcomes_table.c.outcome_id == o.outcome_id))
+                conn.commit()
 
-        _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
-        # The scrub keys on "no outcome rows at all", but these leaves keep their
-        # genuine incomplete (None, BUFFERED) outcomes — which a real crash-state
-        # WOULD carry — so their run-1 TERMINAL journal rows survive the scrub.
-        # Delete them explicitly: a crash before the flush would never have
-        # terminalized these rows, and the re-seed below replaces them with the
-        # crash-faithful BLOCKED state.
-        with db.engine.connect() as conn:
-            conn.execute(
-                text("DELETE FROM token_work_items WHERE run_id = :rid AND token_id IN (:a, :b)"),
-                {"rid": run_id, "a": children[0].token_id, "b": children[1].token_id},
+            _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
+            # The scrub keys on "no outcome rows at all", but these leaves keep their
+            # genuine incomplete (None, BUFFERED) outcomes — which a real crash-state
+            # WOULD carry — so their run-1 TERMINAL journal rows survive the scrub.
+            # Delete them explicitly: a crash before the flush would never have
+            # terminalized these rows, and the re-seed below replaces them with the
+            # crash-faithful BLOCKED state.
+            with db.engine.connect() as conn:
+                conn.execute(
+                    text("DELETE FROM token_work_items WHERE run_id = :rid AND token_id IN (:a, :b)"),
+                    {"rid": run_id, "a": children[0].token_id, "b": children[1].token_id},
+                )
+                conn.commit()
+            # ── Re-seed BOTH leaves as BLOCKED journal rows (F1: journal is truth) ──
+            # Production journal verbs, exactly as a live aggregation barrier hold is
+            # recorded: enqueue+claim at the aggregation node, then mark_blocked with
+            # barrier_key = str(aggregation node_id) stamps barrier_blocked_at. Each
+            # row carries the leaf's REAL payload (from its token_data_ref envelope).
+            with db.engine.connect() as conn:
+                row_ingest_sequence = conn.execute(
+                    text("SELECT ingest_sequence FROM rows WHERE row_id = :rid"),
+                    {"rid": row_id},
+                ).scalar_one()
+            scheduler_repo = RecorderFactory(db).scheduler
+            datetime.datetime.now(datetime.UTC)
+            for c in children:
+                env = _envelope(c.token_data_ref)
+                leaf_payload = _PipelineRow(dict(env["data"]), _SchemaContract.from_checkpoint(dict(env["contract"])))
+                seeded_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
+                    run_id=run_id,
+                    token_id=c.token_id,
+                    row_id=row_id,
+                    node_id=str(agg_node_id),
+                    step_index=2,
+                    ingest_sequence=row_ingest_sequence,
+                    row_payload_json=scheduler_repo.serialize_row_payload(leaf_payload),
+                    lease_owner="test-harness",
+                    lease_seconds=60,
+                    lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=c.expand_group_id, member_key=c.token_id),),
+                )
+                scheduler_repo.mark_blocked(
+                    work_item_id=seeded_item.work_item_id,
+                    queue_key=None,
+                    barrier_key=str(agg_node_id),
+                    expected_lease_owner="test-harness",
+                )
+
+            recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+
+            # ── PRECONDITION: the journal barrier-hold arm is live — both leaves buffered ──
+            buffered_ids = recovery_mgr._get_buffered_journal_token_ids(run_id)
+            assert {children[0].token_id, children[1].token_id}.issubset(buffered_ids), (
+                f"PRECONDITION FAILED: both expand leaves must be in the journal BLOCKED barrier-hold set; buffered_ids={buffered_ids}"
             )
-            conn.commit()
-        # ── Re-seed BOTH leaves as BLOCKED journal rows (F1: journal is truth) ──
-        # Production journal verbs, exactly as a live aggregation barrier hold is
-        # recorded: enqueue+claim at the aggregation node, then mark_blocked with
-        # barrier_key = str(aggregation node_id) stamps barrier_blocked_at. Each
-        # row carries the leaf's REAL payload (from its token_data_ref envelope).
-        with db.engine.connect() as conn:
-            row_ingest_sequence = conn.execute(
-                text("SELECT ingest_sequence FROM rows WHERE row_id = :rid"),
-                {"rid": row_id},
-            ).scalar_one()
-        scheduler_repo = RecorderFactory(db).scheduler
-        datetime.datetime.now(datetime.UTC)
-        for c in children:
-            env = _envelope(c.token_data_ref)
-            leaf_payload = _PipelineRow(dict(env["data"]), _SchemaContract.from_checkpoint(dict(env["contract"])))
-            seeded_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
-                run_id=run_id,
-                token_id=c.token_id,
-                row_id=row_id,
-                node_id=str(agg_node_id),
-                step_index=2,
-                ingest_sequence=row_ingest_sequence,
-                row_payload_json=scheduler_repo.serialize_row_payload(leaf_payload),
-                lease_owner="test-harness",
-                lease_seconds=60,
-                lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=c.expand_group_id, member_key=c.token_id),),
-            )
-            scheduler_repo.mark_blocked(
-                work_item_id=seeded_item.work_item_id,
-                queue_key=None,
-                barrier_key=str(agg_node_id),
-                expected_lease_owner="test-harness",
+
+            # ── ROW-level exclusion: the all-buffered row is NOT in unprocessed_rows ──
+            # This is the reachable mechanism: the resume loop iterates unprocessed_rows, so an
+            # excluded row is never visited and its buffered tokens are never dispatched.
+            unprocessed = recovery_mgr.get_unprocessed_rows(run_id)
+            assert row_id not in unprocessed, (
+                f"all-buffered aggregation row must be excluded from unprocessed_rows (its tokens are restored-and-flushed, "
+                f"not re-driven); unprocessed={unprocessed}"
             )
 
-        recovery_mgr = RecoveryManager(db, checkpoint_mgr)
-
-        # ── PRECONDITION: the journal barrier-hold arm is live — both leaves buffered ──
-        buffered_ids = recovery_mgr._get_buffered_journal_token_ids(run_id)
-        assert {children[0].token_id, children[1].token_id}.issubset(buffered_ids), (
-            f"PRECONDITION FAILED: both expand leaves must be in the journal BLOCKED barrier-hold set; buffered_ids={buffered_ids}"
-        )
-
-        # ── ROW-level exclusion: the all-buffered row is NOT in unprocessed_rows ──
-        # This is the reachable mechanism: the resume loop iterates unprocessed_rows, so an
-        # excluded row is never visited and its buffered tokens are never dispatched.
-        unprocessed = recovery_mgr.get_unprocessed_rows(run_id)
-        assert row_id not in unprocessed, (
-            f"all-buffered aggregation row must be excluded from unprocessed_rows (its tokens are restored-and-flushed, "
-            f"not re-driven); unprocessed={unprocessed}"
-        )
-
-        # ── TOKEN-level exclusion: get_incomplete_tokens_by_row returns nothing for the row ──
-        # Mirrors the row-level exclusion (incomplete_by_row ⊆ unprocessed_rows). Without the
-        # fix, both buffered leaves would surface here, drifting from get_unprocessed_rows.
-        by_row = recovery_mgr.get_incomplete_tokens_by_row(run_id)
-        row_specs = by_row.get(row_id, [])
-        assert not row_specs, (
-            f"all-buffered aggregation row must contribute NO incomplete specs (buffered tokens are excluded at the "
-            f"token level, mirroring get_unprocessed_rows); got {[s.token_id for s in row_specs]}"
-        )
+            # ── TOKEN-level exclusion: get_incomplete_tokens_by_row returns nothing for the row ──
+            # Mirrors the row-level exclusion (incomplete_by_row ⊆ unprocessed_rows). Without the
+            # fix, both buffered leaves would surface here, drifting from get_unprocessed_rows.
+            by_row = recovery_mgr.get_incomplete_tokens_by_row(run_id)
+            row_specs = by_row.get(row_id, [])
+            assert not row_specs, (
+                f"all-buffered aggregation row must contribute NO incomplete specs (buffered tokens are excluded at the "
+                f"token level, mirroring get_unprocessed_rows); got {[s.token_id for s in row_specs]}"
+            )
 
     def test_resume_expand_coalesce_full_type_domain_roundtrip(self) -> None:
         """Task 12 addition (ADDENDUM 6): the token_data_ref envelope round-trips the FULL
