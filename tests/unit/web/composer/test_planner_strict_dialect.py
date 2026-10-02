@@ -21,6 +21,7 @@ settings; these tests set the two ``PlannerModelConfig`` dialects directly.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -270,6 +271,12 @@ async def test_a_dispatched_discovery_name_outside_the_sent_palette_reaches_s_un
     is not decoded and S rejects it exactly as today, with no wire facts.
     Control: pass the full 19 as ``sent_tool_names`` and the call succeeds.
     """
+    # This pins dispatch/decoding semantics, independent of host scheduling.
+    # A controlled pause before candidate validation reproduces the unrelated
+    # five-second deadline failure; real deadline tests retain their own clock.
+    loop = asyncio.get_running_loop()
+    clock_origin = loop.time()
+    monkeypatch.setattr(loop, "time", lambda: clock_origin)
     monkeypatch.setattr(planner_module.PlannerDiscoveryPolicy, "initial", lambda *args, **kwargs: _palette_without("list_models"))
     completion = _ScriptedCompletion(
         _response(("list_models", {"provider": None})),

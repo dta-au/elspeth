@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.web.blobs.service import content_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.service import CatalogServiceImpl
+from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_csv_source_content
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import execute_tool
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
@@ -343,6 +345,140 @@ def test_csv_blob_with_normalization_collision_returns_blocking_diagnostic(tmp_p
     assert "Customer ID" not in diagnostic_blob
     assert matching[0]["evidence_locator"]["observed_headers_redacted"] is True
     assert "observed_headers" not in matching[0]["evidence_locator"]
+
+
+@pytest.mark.parametrize("schema_mode", ["observed", "fixed", "flexible"])
+@pytest.mark.parametrize("header", [b"Case Study,case_study", b",id", b"!!!,id"])
+def test_csv_unresolvable_headers_block_every_schema_mode(schema_mode: str, header: bytes, tmp_path: Path) -> None:
+    engine, session_id = _session_engine()
+    try:
+        blob_id = _insert_blob(
+            engine,
+            session_id,
+            tmp_path,
+            filename="invalid.csv",
+            mime_type="text/csv",
+            content=header + b"\nROW_VALUE_SENTINEL_ALPHA_82E7,ROW_VALUE_SENTINEL_BETA_82E7\n",
+        )
+        schema: dict[str, Any] = {"mode": schema_mode}
+        if schema_mode != "observed":
+            schema["fields"] = ["id: str"]
+        state = _state_with_blob_source(engine, session_id, blob_id, data_dir=tmp_path, plugin="csv", options={"schema": schema})
+
+        data = _preview_data(engine, session_id, state, data_dir=tmp_path)
+
+        diagnostics = data["proof_diagnostics"]
+        matching = [item for item in diagnostics if item["code"] == _HEADER_RESOLUTION_ERROR_CODE]
+        assert len(matching) == 1
+        assert matching[0]["severity"] == "blocking"
+        assert matching[0]["evidence_locator"]["observed_header_count"] == 2
+        assert matching[0]["evidence_locator"]["observed_headers_redacted"] is True
+        assert "observed_headers" not in matching[0]["evidence_locator"]
+        assert data["preview_is_valid"] is False
+        assert _HEADER_MISMATCH_CODE not in [item["code"] for item in diagnostics]
+        assert "csv_fixed_schema_omits_observed_columns" not in [item["code"] for item in diagnostics]
+        assert "ROW_VALUE_SENTINEL_ALPHA_82E7" not in repr(diagnostics)
+        assert "ROW_VALUE_SENTINEL_BETA_82E7" not in repr(diagnostics)
+    finally:
+        engine.dispose()
+
+
+def test_csv_normalization_warning_redacts_regressed_details(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The final preview boundary withholds even regressed detector text."""
+    import elspeth.web.composer.tools.generation as generation_module
+
+    raw_warning_sentinel = "RAW_NORMALIZATION_WARNING_82E7"
+
+    def inspect_with_regressed_warning(**kwargs: Any) -> SourceInspectionFacts:
+        facts = inspect_csv_source_content(**kwargs)
+        assert any(warning.startswith("csv_field_normalization_failed:") for warning in facts.warnings)
+        return replace(facts, warnings=(f"csv_field_normalization_failed: {raw_warning_sentinel}",))
+
+    monkeypatch.setattr(generation_module, "inspect_csv_source_content", inspect_with_regressed_warning)
+    engine, session_id = _session_engine()
+    try:
+        blob_id = _insert_blob(
+            engine,
+            session_id,
+            tmp_path,
+            filename="invalid.csv",
+            mime_type="text/csv",
+            content=b"RAW HEADER SENTINEL,raw_header_sentinel\n123,456\n",
+        )
+        state = _state_with_blob_source(
+            engine, session_id, blob_id, data_dir=tmp_path, plugin="csv", options={"schema": {"mode": "observed"}}
+        )
+
+        data = _preview_data(engine, session_id, state, data_dir=tmp_path)
+
+        diagnostics = data["proof_diagnostics"]
+        matching = [item for item in diagnostics if item["code"] == _HEADER_RESOLUTION_ERROR_CODE]
+        assert len(matching) == 1
+        assert matching[0]["severity"] == "blocking"
+        assert matching[0]["evidence_locator"]["observed_headers_redacted"] is True
+        assert raw_warning_sentinel not in repr(diagnostics)
+        assert "RAW HEADER SENTINEL" not in repr(diagnostics)
+        assert "raw_header_sentinel" not in repr(diagnostics)
+        assert data["preview_is_valid"] is False
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("content", "warning_code"),
+    [
+        (b"Field" + b"x" * 9000 + b"\nvalue\n", "csv_header_sample_truncated:"),
+        (b"\xff,id\nvalue,other\n", "csv_header_decode_failed:"),
+    ],
+    ids=("truncated_header", "undecodable_header"),
+)
+def test_csv_uncertified_header_sample_is_not_a_normalization_failure(content: bytes, warning_code: str, tmp_path: Path) -> None:
+    """Hold preflight green to prove the proof stage preserves its abstention."""
+    engine, session_id = _session_engine()
+    try:
+        blob_id = _insert_blob(engine, session_id, tmp_path, filename="sample.csv", mime_type="text/csv", content=content)
+        state = _state_with_blob_source(
+            engine, session_id, blob_id, data_dir=tmp_path, plugin="csv", options={"schema": {"mode": "observed"}}
+        )
+
+        data = _preview_data(engine, session_id, state, data_dir=tmp_path)
+
+        diagnostics = data["proof_diagnostics"]
+        advisory = [
+            item for item in diagnostics if item["code"] == "source_inspection_warning" and item["message"].startswith(warning_code)
+        ]
+        assert len(advisory) == 1
+        assert advisory[0]["severity"] == "info"
+        assert _HEADER_RESOLUTION_ERROR_CODE not in [item["code"] for item in diagnostics]
+        assert data["preview_is_valid"] is True
+    finally:
+        engine.dispose()
+
+
+def test_text_source_with_csv_named_blob_does_not_require_csv_header_normalization(tmp_path: Path) -> None:
+    engine, session_id = _session_engine()
+    try:
+        blob_id = _insert_blob(
+            engine, session_id, tmp_path, filename="customers.csv", mime_type="text/csv", content=b"Customer ID,customer_id\n123,456\n"
+        )
+        state = _state_with_blob_source(
+            engine, session_id, blob_id, data_dir=tmp_path, plugin="text", options={"column": "text", "schema": {"mode": "observed"}}
+        )
+
+        data = _preview_data(engine, session_id, state, data_dir=tmp_path)
+
+        diagnostics = data["proof_diagnostics"]
+        assert _HEADER_RESOLUTION_ERROR_CODE not in [item["code"] for item in diagnostics]
+        advisory = [
+            item
+            for item in diagnostics
+            if item["code"] == "source_inspection_warning" and item["message"].startswith("csv_field_normalization_failed:")
+        ]
+        assert len(advisory) == 1
+        assert advisory[0]["severity"] == "info"
+        assert data["preview_is_valid"] is True
+    finally:
+        engine.dispose()
 
 
 def test_csv_blob_with_invalid_field_mapping_returns_blocking_diagnostic(tmp_path: Path) -> None:

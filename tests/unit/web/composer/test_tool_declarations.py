@@ -971,13 +971,19 @@ class TestStep3BlobDiscoveryTierMigration:
             "name": "inspect_source",
             "description": (
                 "Return bounded structural facts about a blob-backed source: `source_kind`, "
-                "`observed_headers`, `sample_row_count`, `inferred_types` (lexical scalar-type observations per column, not runtime coercions), "
+                "`observed_headers`, `runtime_headers`, `field_name_mapping` (raw CSV labels to runtime row keys), "
+                "`sample_row_count`, `inferred_types` (lexical scalar-type observations per column, not runtime coercions), "
                 "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
                 "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
                 "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
                 "before declaring a fixed CSV/JSON schema — observed_headers are raw headers. "
-                "Declare the normalized name (First Name becomes first_name), or the source field_mapping target; "
-                "headerless columns are carried as written. Inferred types are lexical observations that tell you what numeric coercion is "
+                "For CSV, declare runtime_headers exactly (case_study_ becomes case_study), or the source field_mapping target; "
+                "field_name_mapping preserves the raw-label provenance and headerless columns are carried as written. "
+                "Null runtime_headers means the bounded header could not be resolved reliably because of naming, parsing, "
+                "truncation, or encoding; follow warnings to correct or inspect the input before declaring fields. "
+                "Uploaded/path-bound headers are samples, not guaranteed_fields: use a flexible/fixed schema with "
+                "non-optional fields for a runtime contract, or source_data_contract review and user acknowledgement "
+                "for observed-mode guarantees. Inferred types are lexical observations that tell you what numeric coercion is "
                 "needed before any gate or value_transform numeric op. Never returns raw row "
                 "content; only summary facts."
             ),

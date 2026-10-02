@@ -1105,7 +1105,11 @@ class TestComposerDiscoveryAuditPreservesResult:
             ),
         ):
             mock_llm.side_effect = [turn1, turn2]
-            result = await service.compose(f"Run {tool_name}", [], state, session_id=session_id)
+            result = await service.compose(f"Inspect {tool_name}", [], state, session_id=session_id)
+
+        # Discovery-only requests finish without the empty-state build
+        # reconciliation turn; the two provider replies cover the full walk.
+        assert mock_llm.await_count == 2
 
         invocations = result.tool_invocations
         assert len(invocations) == 1, f"{tool_name}: expected exactly one audit row"

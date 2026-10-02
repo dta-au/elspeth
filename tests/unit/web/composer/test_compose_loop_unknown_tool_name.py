@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import threading
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -241,8 +242,9 @@ class TestUnknownToolNameComposeLoopAuditShape:
         4. ``payload["data"]["error"]`` contains the literal substring
            ``"Unknown tool: this_tool_does_not_exist"`` — the error message
            produced by ``_failure_result`` at ``tools.py:5731``.
-        5. The compose loop continues after the unknown-tool-call turn:
-           ``result.message`` is the LLM's self-correction text from turn 2.
+        5. The compose loop continues after the unknown-tool-call turn,
+           then reconciles the still-empty build request through the provider
+           before returning its concrete clarification question.
 
         Spec refs: §4.2.6 disposition table (added row: unknown tool name →
         SUCCESS-with-semantic-failure); §5.7.5 (audit status clarified).
@@ -267,13 +269,32 @@ class TestUnknownToolNameComposeLoopAuditShape:
         # Turn 2: LLM self-corrects with a text response after receiving the
         # failure payload as a role=tool message.
         self_correction = _make_llm_response(content="I apologise — that tool does not exist. Let me try again.")
+        clarification = _make_llm_response(content="Which data source should the pipeline use?")
+        responses = iter((unknown_tool_call, self_correction, clarification))
+        provider_messages: list[list[dict[str, Any]]] = []
+
+        async def scripted_provider(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> _AdmittedLLMCompletion:
+            # The service extends one shared message list between calls.
+            # Snapshot each provider boundary before those later mutations.
+            provider_messages.append(deepcopy(messages))
+            return next(responses)
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.side_effect = [unknown_tool_call, self_correction]
+            mock_llm.side_effect = scripted_provider
             result = await service.compose("Build a pipeline", [], state, session_id=session_id)
 
-        # Assert 5: compose loop continued; turn 2 text is the result message.
-        assert "apologise" in result.message or "sorry" in result.message.lower() or result.message
+        # Assert 5: one neutral reconciliation turn follows the failed
+        # dispatch; the provider supplies the final clarification.
+        assert mock_llm.await_count == 3
+        assert "Which data source should the pipeline use?" in result.message
+        reconciliation_prefix = "[composer-system] No composition-state mutation completed successfully this turn"
+        assert not any(
+            message["content"].startswith(reconciliation_prefix) for message in provider_messages[1] if message["role"] == "user"
+        )
+        assert (
+            sum(message["content"].startswith(reconciliation_prefix) for message in provider_messages[2] if message["role"] == "user") == 1
+        )
+        assert any(message["role"] == "tool" and message["tool_call_id"] == "call_unknown" for message in provider_messages[1])
 
         # Find the invocation for the hallucinated tool name.
         unknown_invocations = [inv for inv in result.tool_invocations if inv.tool_name == "this_tool_does_not_exist"]

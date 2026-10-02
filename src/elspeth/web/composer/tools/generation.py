@@ -3436,9 +3436,9 @@ def _compute_proof_diagnostics_for_source(
         (``id: int``) that flows unchanged from an observed CSV source,
         whose values are strings by construction — every row would fail
         that consumer's input validation at runtime (elspeth-e6e552ce34).
-      * ``source_inspection_warning`` — every warning surfaced by
-        ``inspect_blob_content`` is mirrored here at ``info`` severity
-        so the model sees them in the same array as blocking issues.
+      * ``source_inspection_warning`` — advisory inspection warnings are
+        mirrored here at ``info`` severity. Definite CSV normalization
+        failures and duplicate headers instead produce blocking diagnostics.
 
     Bounded I/O: exactly one attempted blob resolution per call, bounded by
     ``inspect_blob_content``'s 8 KiB / 100 row caps.
@@ -3810,7 +3810,8 @@ def _compute_proof_diagnostics_for_source(
     #    sees them in the same array as blocking issues. These are *advisory*
     #    only — the model can ignore them if the operator's intent justifies.
     #
-    #    Exception: ``csv_duplicate_headers`` is promoted to blocking. Duplicate
+    #    Definite normalization failures and ``csv_duplicate_headers`` are
+    #    promoted to blocking. Duplicate
     #    headers cause silent column collapse in csv.DictReader (last-write-
     #    wins) and similar libraries, fabricating a single column from multiple
     #    source columns. That is a Tier-1 audit-integrity violation — the
@@ -3857,6 +3858,32 @@ def _compute_proof_diagnostics_for_source(
                         "duplicate_header_column_count": len(duplicate_positions),
                         "duplicate_header_positions": duplicate_positions,
                         "header_values_redacted": True,
+                    },
+                )
+            )
+            continue
+        if source.plugin == "csv" and warning.startswith("csv_field_normalization_failed:"):
+            diagnostics.append(
+                _blocking_diagnostic(
+                    code="csv_source_field_resolution_error",
+                    message=(
+                        "CSV source headers cannot produce unique, nonempty runtime field names. "
+                        "CSVSource would reject this header before processing data rows, so "
+                        "preview_pipeline is blocking it for repair. Observed header values "
+                        "and inspection warning details are withheld because malformed or "
+                        "headerless CSV can make row content look like headers."
+                    ),
+                    suggested_repair=(
+                        "Correct the source file so every physical header normalizes to a "
+                        "unique, nonempty field name, then re-upload and re-bind the replacement "
+                        "blob. For genuinely headerless input, declare explicit unique `columns`, "
+                        "then re-run preview_pipeline."
+                    ),
+                    evidence_locator={
+                        "source": "blob",
+                        "blob_id": str(blob_id),
+                        "observed_header_count": len(facts.observed_headers or ()),
+                        "observed_headers_redacted": True,
                     },
                 )
             )

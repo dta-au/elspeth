@@ -9,6 +9,7 @@ import json
 import threading
 import tracemalloc
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -116,6 +117,29 @@ def _make_llm_response(
 
 def _advisor_checkpoint_reply(*, verdict: Literal["CLEAN", "FLAGGED"], findings: str, note: str | None) -> str:
     return json.dumps({"verdict": verdict, "category": "other", "steps": [], "findings": findings, "note": note})
+
+
+class _ReconciliationLLMScript:
+    """Finite provider replies with prompts captured before the loop appends to them."""
+
+    def __init__(self, *responses: _AdmittedLLMCompletion) -> None:
+        self.responses = responses
+        self._responses = iter(responses)
+        self.prompts: list[list[dict[str, Any]]] = []
+
+    async def respond(self, messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> _AdmittedLLMCompletion:
+        self.prompts.append(deepcopy(messages))
+        return next(self._responses)
+
+
+def _assert_reconciliation_turn(mock_llm: AsyncMock, script: _ReconciliationLLMScript) -> None:
+    assert mock_llm.await_count == 3
+    assert len(script.prompts) == 3
+    prompt = script.prompts[2][-1]
+    assert prompt["role"] == "user"
+    assert "[composer-system]" in prompt["content"]
+    assert "No composition-state mutation completed successfully this turn" in prompt["content"]
+    assert "Re-check the user's request against that state" in prompt["content"]
 
 
 def _advisor_checkpoint_responses(*replies: str) -> Callable[..., Awaitable[tuple[str, dict[str, object]]]]:
@@ -658,8 +682,11 @@ class TestComposerTextOnlyResponse:
         text_response = _make_llm_response(content=final_prose)
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.side_effect = [failed_set_pipeline, text_response]
+            script = _ReconciliationLLMScript(failed_set_pipeline, text_response, text_response)
+            mock_llm.side_effect = script.respond
             result = await service.compose("Build the CSV workflow now.", [], state, session_id=session_id)
+
+        _assert_reconciliation_turn(mock_llm, script)
 
         assert result.state.version == state.version
         assert result.raw_assistant_content == final_prose
@@ -2444,8 +2471,11 @@ class TestComposerErrorHandling:
         text = _make_llm_response(content="Fixed.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.side_effect = [bad_call, text]
+            script = _ReconciliationLLMScript(bad_call, text, text)
+            mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
+
+        _assert_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -2497,8 +2527,11 @@ class TestComposerErrorHandling:
             ),
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
-            mock_llm.side_effect = [bad_call, text]
+            script = _ReconciliationLLMScript(bad_call, text, text)
+            mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
+
+        _assert_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -2562,15 +2595,18 @@ class TestComposerErrorHandling:
         text = _make_llm_response(content="Recovered.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.side_effect = [bad_call, text]
+            script = _ReconciliationLLMScript(bad_call, text, text)
+            mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
+
+        _assert_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
             tool_name="set_pipeline",
             expected_detail="source.plugin",
         )
-        tool_msg = mock_llm.call_args_list[1][0][0][-1]
+        tool_msg = script.prompts[1][-1]
         error_content = json.loads(tool_msg["content"])
         assert "source.plugin" in error_content["error"]
         assert "missing required" in error_content["error"].lower()
@@ -2645,8 +2681,11 @@ class TestComposerErrorHandling:
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
-            mock_llm.side_effect = [good_call, text]
+            script = _ReconciliationLLMScript(good_call, text, text)
+            mock_llm.side_effect = script.respond
             await service.compose("Setup", [], state, session_id=session_id)
+
+        _assert_reconciliation_turn(mock_llm, script)
 
         # The pre-dispatch validator must not have rejected the call.
         # Verify by inspecting the tool-result message content: the
@@ -2654,7 +2693,7 @@ class TestComposerErrorHandling:
         # ``error`` field starts with ``Tool 'set_pipeline' missing required
         # argument(s):``. A no-inline payload must not trigger that path,
         # regardless of what the tool handler returns afterwards.
-        tool_msg = mock_llm.call_args_list[1][0][0][-1]
+        tool_msg = script.prompts[1][-1]
         assert tool_msg["role"] == "tool"
         try:
             error_content = json.loads(tool_msg["content"])
@@ -2722,15 +2761,18 @@ class TestComposerErrorHandling:
         text = _make_llm_response(content="Adjusted.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.side_effect = [partial_call, text]
+            script = _ReconciliationLLMScript(partial_call, text, text)
+            mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
+
+        _assert_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
             tool_name="set_pipeline",
             expected_detail="source.inline_blob.mime_type, source.inline_blob.content",
         )
-        tool_msg = mock_llm.call_args_list[1][0][0][-1]
+        tool_msg = script.prompts[1][-1]
         error_content = json.loads(tool_msg["content"])
         assert "source.inline_blob.mime_type" in error_content["error"]
         assert "source.inline_blob.content" in error_content["error"]
@@ -2805,11 +2847,14 @@ class TestComposerErrorHandling:
         text = _make_llm_response(content="Ok.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.side_effect = [bad_call, text]
+            script = _ReconciliationLLMScript(bad_call, text, text)
+            mock_llm.side_effect = script.respond
             await service.compose("Setup", [], state, session_id=session_id)
 
+        _assert_reconciliation_turn(mock_llm, script)
+
         # Verify the error message sent back to the LLM mentions the missing keys
-        tool_msg = mock_llm.call_args_list[1][0][0][-1]  # last message in second call
+        tool_msg = script.prompts[1][-1]  # last message in second call
         error_content = json.loads(tool_msg["content"])
         assert "on_success" in error_content["error"]
         assert "missing required" in error_content["error"].lower()
@@ -2841,8 +2886,11 @@ class TestComposerErrorHandling:
             ) as mock_execute_tool,
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         ):
-            mock_llm.side_effect = [bad_call, text]
+            script = _ReconciliationLLMScript(bad_call, text, text)
+            mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
+
+        _assert_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -2850,7 +2898,7 @@ class TestComposerErrorHandling:
             expected_detail="arguments (",
         )
         mock_execute_tool.assert_not_called()
-        tool_msg = mock_llm.call_args_list[1][0][0][-1]
+        tool_msg = script.prompts[1][-1]
         error_content = json.loads(tool_msg["content"])
         assert "arguments must be a JSON object" in error_content["error"]
 
@@ -5145,11 +5193,14 @@ class TestPluginBugCrashesFromToolExecution:
                 ),
             ),
         ):
-            mock_llm.side_effect = [valid_call, text]
+            script = _ReconciliationLLMScript(valid_call, text, text)
+            mock_llm.side_effect = script.respond
             result = await service.compose("Setup", [], state, session_id=session_id)
 
+        _assert_reconciliation_turn(mock_llm, script)
+
         assert isinstance(result, ComposerResult)
-        second_call_messages = mock_llm.call_args_list[1].args[0]
+        second_call_messages = script.prompts[1]
         tool_messages = [m for m in second_call_messages if m.get("role") == "tool"]
         assert len(tool_messages) == 1
         error_payload = json.loads(tool_messages[0]["content"])
@@ -5230,14 +5281,20 @@ class TestPluginBugCrashesFromToolExecution:
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=leaky),
         ):
-            mock_llm.side_effect = [tool_call, text]
+            script = _ReconciliationLLMScript(tool_call, text, text)
+            mock_llm.side_effect = script.respond
             result = await service.compose("Setup", [], state, session_id=session_id)
 
-        second_call_messages = mock_llm.call_args_list[1].args[0]
+        _assert_reconciliation_turn(mock_llm, script)
+
+        second_call_messages = script.prompts[1]
         prompt_blob = json.dumps(second_call_messages, sort_keys=True)
         audit_blob = json.dumps([invocation.to_dict() for invocation in result.tool_invocations], sort_keys=True)
         assert canary not in prompt_blob
         assert loc_canary not in prompt_blob
+        all_prompts_blob = json.dumps(script.prompts, sort_keys=True)
+        assert canary not in all_prompts_blob
+        assert loc_canary not in all_prompts_blob
         assert canary not in audit_blob
         assert loc_canary not in audit_blob
 
@@ -6540,15 +6597,18 @@ class TestToolArgumentErrorAcrossThreadBoundary:
         text = _make_llm_response(content="Fixed.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.side_effect = [bad_call, text]
+            script = _ReconciliationLLMScript(bad_call, text, text)
+            mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=self.session_id)
+
+        _assert_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
             tool_name="create_blob",
             expected_detail="ToolArgumentError",
         )
-        second_call_messages = mock_llm.call_args_list[1].args[0]
+        second_call_messages = script.prompts[1]
         tool_messages = [m for m in second_call_messages if m.get("role") == "tool"]
         assert len(tool_messages) == 1
         error_content = json.loads(tool_messages[0]["content"])
@@ -6619,15 +6679,18 @@ class TestToolArgumentErrorAcrossThreadBoundary:
         text = _make_llm_response(content="Fixed.")
 
         with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.side_effect = [bad_call, text]
+            script = _ReconciliationLLMScript(bad_call, text, text)
+            mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=self.session_id)
+
+        _assert_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
             tool_name="set_source_from_blob",
             expected_detail="ToolArgumentError",
         )
-        second_call_messages = mock_llm.call_args_list[1].args[0]
+        second_call_messages = script.prompts[1]
         tool_messages = [m for m in second_call_messages if m.get("role") == "tool"]
         assert len(tool_messages) == 1
         error_content = json.loads(tool_messages[0]["content"])

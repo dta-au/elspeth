@@ -46,6 +46,7 @@ to production behaviour while staying deterministic and offline.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -187,6 +188,7 @@ class _EnvelopeRun:
 
     result: Any
     per_turn_byte_sizes: tuple[int, ...]
+    per_turn_messages: tuple[list[dict[str, Any]], ...]
 
 
 async def _run_envelope(script: Sequence[ScriptedTurn], *, user_message: str = "Build a CSV pipeline.") -> _EnvelopeRun:
@@ -202,18 +204,20 @@ async def _run_envelope(script: Sequence[ScriptedTurn], *, user_message: str = "
 
     responses = iter(_build_scripted_response(turn) for turn in script)
     sizes: list[int] = []
+    dispatched_messages: list[list[dict[str, Any]]] = []
 
     async def complete(**kwargs: Any) -> _ScriptedResponse:
         # Capture at dispatch: the append-only loop mutates the message list
         # after each call, so inspecting call_args_list later overcounts bytes.
         sizes.append(_serialize_call(kwargs["messages"], kwargs["tools"]))
+        dispatched_messages.append(deepcopy(kwargs["messages"]))
         return next(responses)
 
     with patch("litellm.acompletion", new_callable=AsyncMock) as mock_llm:
         mock_llm.side_effect = complete
         result = await service.compose(user_message, [], state, session_id=session_id)
 
-    return _EnvelopeRun(result=result, per_turn_byte_sizes=tuple(sizes))
+    return _EnvelopeRun(result=result, per_turn_byte_sizes=tuple(sizes), per_turn_messages=tuple(dispatched_messages))
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +259,9 @@ assert len(_ROOTLESS_TRIVIAL_SCRIPT) <= ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT, (
 # (simulating the elspeth-4e79436719 staging case where the full skill +
 # tools spec is re-sent on every turn). The harness must reject this:
 # 5 x 20K = 100K, well above ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT.
-# Final turn is text-only so the loop terminates cleanly (vs. hitting a
-# budget exhaustion path which would also be a positive harness signal).
+# The fourth turn's prose leaves an empty pipeline after discovery. The
+# fifth turn answers the neutral rootless recovery, so the loop terminates
+# cleanly instead of exhausting the finite provider script.
 _PATHOLOGICAL_PROMPT_GROWTH_SCRIPT: tuple[ScriptedTurn, ...] = (
     ScriptedTurn(
         content=None,
@@ -275,6 +280,10 @@ _PATHOLOGICAL_PROMPT_GROWTH_SCRIPT: tuple[ScriptedTurn, ...] = (
     ),
     ScriptedTurn(
         content="I have surveyed the catalog.",
+        prompt_tokens=20_000,
+    ),
+    ScriptedTurn(
+        content="I still need your input file before I can build the pipeline.",
         prompt_tokens=20_000,
     ),
 )
@@ -374,11 +383,23 @@ class TestEnvelopeHarness:
                 # from cache and 1K of fresh prompt.
                 cache_read_input_tokens=7_000,
             ),
+            ScriptedTurn(
+                content="I still need your input file before I can build the pipeline.",
+                prompt_tokens=8_000,
+                cache_read_input_tokens=7_000,
+            ),
         )
         run = await _run_envelope(warm_script)
-        assert len(run.result.llm_calls) == 2
+        assert len(run.result.llm_calls) == 3
+        assert run.result.repair_turns_used == 1
         assert run.result.llm_calls[0].cache_read_input_tokens is None
         assert run.result.llm_calls[1].cache_read_input_tokens == 7_000
+        assert run.result.llm_calls[2].cache_read_input_tokens == 7_000
+        recovery_prefix = "[composer-system] No composition-state mutation completed successfully this turn"
+        assert not any(recovery_prefix in str(message.get("content", "")) for message in run.per_turn_messages[1])
+        recovery = [message for message in run.per_turn_messages[2] if recovery_prefix in str(message.get("content", ""))]
+        assert len(recovery) == 1
+        assert recovery[0]["role"] == "user"
 
 
 class TestEnvelopeHarnessSelfTests:
@@ -411,7 +432,7 @@ class TestEnvelopeHarnessSelfTests:
         envelope_breached = total > ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT
         turn_ceiling_breached = len(run.result.llm_calls) > ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT
         assert envelope_breached or turn_ceiling_breached, (
-            f"Harness self-test failed: a 4-turn 20K-token-each script produced "
+            f"Harness self-test failed: a 5-turn 20K-token-each script produced "
             f"{len(run.result.llm_calls)} turns x {total} total prompt tokens, "
             "but neither the envelope assertion nor the turn ceiling fired. "
             "The harness would not catch the original elspeth-4e79436719 regression."
