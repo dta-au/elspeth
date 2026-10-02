@@ -7,7 +7,7 @@ import hashlib
 import json
 import threading
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import CheckConstraint
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 
@@ -123,6 +124,19 @@ _EMPTY_STATE = CompositionState(
     metadata=PipelineMetadata(),
     version=1,
 )
+
+
+_APP_SESSION_ENGINES: list[Engine] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_app_session_engines() -> Iterator[None]:
+    """Release every session engine created by this module's app helper."""
+    try:
+        yield
+    finally:
+        while _APP_SESSION_ENGINES:
+            _APP_SESSION_ENGINES.pop().dispose()
 
 
 class _RecordedSyncCall:
@@ -791,6 +805,7 @@ def _make_app(
         poolclass=StaticPool,
         connect_args={"check_same_thread": False},
     )
+    _APP_SESSION_ENGINES.append(engine)
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id=user_id)

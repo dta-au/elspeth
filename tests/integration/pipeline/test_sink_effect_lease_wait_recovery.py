@@ -249,7 +249,7 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
                 )
                 assert refreshed.rowcount == 1
 
-        refresh_for_resume = refresh_foreign_lease_before_wait
+        refresh_for_resume = None if lease_expired_during_reopen else refresh_foreign_lease_before_wait
         lease_clock = _LeaseWaitClock(
             clock,
             RecorderFactory(reopened).execution.sink_effects,
@@ -299,10 +299,13 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
         assert scheduler_after == ("terminal",)
         assert reopened_checkpoints.get_latest_checkpoint(run_id) is None
         poll_sleeps = lease_clock.poll_sleeps
-        assert poll_sleeps
-        assert all(0.0 < seconds <= 0.25 for seconds in poll_sleeps)
-        assert lease_clock.expiration_delay is not None
-        assert sum(poll_sleeps) <= lease_clock.expiration_delay + 0.25
+        if lease_expired_during_reopen:
+            assert not poll_sleeps
+        else:
+            assert poll_sleeps
+            assert all(0.0 < seconds <= 0.25 for seconds in poll_sleeps)
+            assert lease_clock.expiration_delay is not None
+            assert sum(poll_sleeps) <= lease_clock.expiration_delay + 0.25
         assert [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()] == [{"id": 1, "value": "once"}]
     finally:
         reopened.close()
