@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import timedelta
 from pathlib import Path
 from threading import Event
 from unittest.mock import patch
@@ -22,15 +21,15 @@ from elspeth.contracts.enums import CallStatus, CallType
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.execution.calls import CallAuditRepository
-from elspeth.core.landscape.schema import runs_table, sink_effect_members_table, token_outcomes_table
+from elspeth.core.landscape.schema import runs_table, sink_effect_members_table, sink_effects_table, token_outcomes_table
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionSeam
 from elspeth.plugins.sources.power_automate import PowerAutomateSource
 from tests.e2e.recovery.harness import spawn_database_process_with_pause
 from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
     _install_short_run_liveness,
-    _install_short_sink_lease,
     _wait_until_run_is_resumable,
 )
+from tests.fixtures.landscape import expire_sink_effect_lease
 from tests.fixtures.power_automate import (
     PROTOCOL,
     PUBLIC_IP,
@@ -48,14 +47,6 @@ def credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "power-automate-integration-key")
     monkeypatch.setenv("POWER_AUTOMATE_READ_TRIGGER_URL", READ_URL)
     monkeypatch.setenv("POWER_AUTOMATE_WRITE_TRIGGER_URL", WRITE_URL)
-    original_init = SinkEffectCoordinator.__init__
-
-    def short_lease(self: SinkEffectCoordinator, *args: object, **kwargs: object) -> None:
-        kwargs.setdefault("lease_ttl", timedelta(seconds=0.2))
-        kwargs.setdefault("poll_interval", 0.02)
-        original_init(self, *args, **kwargs)
-
-    monkeypatch.setattr(SinkEffectCoordinator, "__init__", short_lease)
 
 
 def _run_id(tmp_path: Path) -> str:
@@ -64,6 +55,21 @@ def _run_id(tmp_path: Path) -> str:
 
 
 def _resume(tmp_path: Path, run_id: str) -> Result:
+    # Every caller has stopped the original worker. Expire its abandoned leases
+    # explicitly instead of shortening the lease used during live execution.
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db:
+        with db.engine.connect() as connection:
+            effect_ids = (
+                connection.execute(
+                    select(sink_effects_table.c.effect_id)
+                    .where(sink_effects_table.c.run_id == run_id)
+                    .where(sink_effects_table.c.state == "in_flight")
+                )
+                .scalars()
+                .all()
+            )
+        for effect_id in effect_ids:
+            expire_sink_effect_lease(db.engine, effect_id)
     return CliRunner().invoke(
         app, ["--no-dotenv", "resume", run_id, "--settings", str(tmp_path / "settings.yaml"), "--execute", "--format", "json"]
     )
@@ -163,7 +169,7 @@ def test_partial_group_finalized_member_is_skipped_and_equal_rows_have_distinct_
         failed = invoke(tmp_path, pipeline_settings(tmp_path))
     assert failed.exit_code != 0, failed.output
     before = flow.actions()
-    assert len(before) == 2
+    assert len(before) == 2, failed.output
     assert before[0]["delivery_id"] != before[1]["delivery_id"]
     with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
         members = connection.execute(select(sink_effect_members_table).order_by(sink_effect_members_table.c.ordinal)).mappings().all()
@@ -278,7 +284,6 @@ def _worker_at_remote_commit(db: LandscapeDB, pause: object, root: str, seam_val
     assert callable(pause)
     del db
     _install_short_run_liveness()
-    _install_short_sink_lease()
     path = Path(root)
     flow = DurablePowerAutomateFlow(path / "target.db", pages=[[{"record_id": "A", "result": "ok"}]])
     original_fault = SinkEffectCoordinator._fault
