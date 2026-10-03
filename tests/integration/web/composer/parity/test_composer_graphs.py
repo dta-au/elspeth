@@ -265,9 +265,14 @@ def test_failure_policy_route_vs_discard_is_detected() -> None:
     left = _error_routing_state()
     right = copy.deepcopy(left)
     right["nodes"][0]["on_error"] = "discard"
-    right["outputs"] = [o for o in right["outputs"] if o["name"] != "errors"]
     with pytest.raises(IsomorphismError):
         assert_isomorphic(left, right)
+
+    # Restoring the only mutation must restore isomorphism. This negative
+    # control proves the failure above came from on_error, not an incidental
+    # difference elsewhere in the fixture.
+    right["nodes"][0]["on_error"] = "errors"
+    assert_isomorphic(left, right)
 
 
 @pytest.mark.parametrize(
@@ -297,6 +302,9 @@ def test_gate_and_coalesce_failure_policy_route_vs_discard_is_detected(node_inde
     with pytest.raises(IsomorphismError):
         assert_isomorphic(left, right)
 
+    right["nodes"][node_index]["on_error"] = "errors"
+    assert_isomorphic(left, right)
+
 
 def test_absent_and_none_on_error_are_equivalent() -> None:
     """An absent on_error is the identical terminal policy as an explicit None.
@@ -317,9 +325,23 @@ def test_source_validation_failure_route_vs_discard_is_detected() -> None:
     left = _error_routing_state()
     right = copy.deepcopy(left)
     right["sources"]["source"]["on_validation_failure"] = "discard"
-    right["outputs"] = [o for o in right["outputs"] if o["name"] != "rejected"]
     with pytest.raises(IsomorphismError):
         assert_isomorphic(left, right)
+
+    right["sources"]["source"]["on_validation_failure"] = "rejected"
+    assert_isomorphic(left, right)
+
+
+def test_sink_write_failure_route_vs_discard_is_detected() -> None:
+    left = _error_routing_state()
+    left["outputs"][0]["on_write_failure"] = "errors"
+    right = copy.deepcopy(left)
+    right["outputs"][0]["on_write_failure"] = "discard"
+    with pytest.raises(IsomorphismError):
+        assert_isomorphic(left, right)
+
+    right["outputs"][0]["on_write_failure"] = "errors"
+    assert_isomorphic(left, right)
 
 
 def test_identical_graph_is_isomorphic_to_itself() -> None:
