@@ -156,6 +156,7 @@ from elspeth.web.interpretation_state import (
     RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX,
     SOURCE_AUTHORING_KEY,
     VAGUE_TERM_UNWIRED_PREFIX,
+    InterpretationReviewCapacityError,
     composition_review_contract_error,
     current_source_data_contract_demand,
     interpretation_sites,
@@ -2413,6 +2414,12 @@ def _matching_interpretation_sites(
     normalized_user_term = user_term.strip()
     try:
         sites = interpretation_sites(state)
+    except InterpretationReviewCapacityError as exc:
+        raise ToolArgumentError(
+            argument="affected_node_id",
+            expected="source data-contract analysis within the bounded work limit",
+            actual_type="source/required-field combination exceeds the review-analysis limit",
+        ) from exc
     except (TypeError, ValueError) as exc:
         raise ToolArgumentError(
             argument="affected_node_id",

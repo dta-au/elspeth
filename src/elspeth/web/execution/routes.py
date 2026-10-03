@@ -100,7 +100,7 @@ from elspeth.web.execution.schemas import (
 from elspeth.web.execution.secret_guard import SECRET_GUARD_ERROR_TYPE, ExecutionSecretApprovalRequired
 from elspeth.web.execution.websocket_close import TRANSIENT_BACKEND_FAILURES, RunStreamCloseCode
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
-from elspeth.web.interpretation_state import InterpretationReviewIntegrityError
+from elspeth.web.interpretation_state import InterpretationReviewCapacityError, InterpretationReviewIntegrityError
 from elspeth.web.middleware.rate_limit import get_rate_limiter
 from elspeth.web.paths import allowed_sink_directories
 from elspeth.web.sessions.converters import state_from_record
@@ -1265,6 +1265,20 @@ def create_execution_router() -> APIRouter:
                     "detail": "Pipeline is not ready for execution.",
                     "kind": "execution_not_ready",
                     "blockers": [blocker.model_dump() for blocker in exc.blockers],
+                },
+            ) from exc
+        except InterpretationReviewCapacityError as exc:
+            public_detail = "Source data-contract review analysis exceeds the bounded work limit."
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error_type": "source_data_contract_analysis_limit_exceeded",
+                    "kind": "source_data_contract_analysis_limit_exceeded",
+                    "detail": public_detail,
+                    "message": public_detail,
+                    "component_id": exc.component_id,
+                    "component_type": exc.component_type,
+                    "review_kind": exc.kind.value,
                 },
             ) from exc
         except InterpretationReviewIntegrityError as exc:

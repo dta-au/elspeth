@@ -18,6 +18,7 @@ import pytest
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.composer import source_demand
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
     build_source_data_contract_draft,
@@ -27,6 +28,7 @@ from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, P
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     SOURCE_AUTHORING_KEY,
+    InterpretationReviewCapacityError,
     InterpretationReviewPending,
     current_source_data_contract_demand,
     interpretation_sites,
@@ -355,6 +357,21 @@ class TestFanInSiteLifecycle:
         )
         sites = _contract_sites(state)
         assert sorted(site.component_id for site in sites) == ["source:src_a", "source:src_b"]
+
+    def test_hypothesis_limit_is_a_typed_fail_closed_integrity_blocker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        state = _fan_in_state(
+            {
+                "src_a": _fan_in_source({"path": "/tmp/a.csv", "schema": {"mode": "observed", "guaranteed_fields": ["id"]}}),
+                "src_b": _fan_in_source({"path": "/tmp/b.csv", "schema": {"mode": "observed", "guaranteed_fields": ["id"]}}),
+            }
+        )
+        monkeypatch.setattr(source_demand, "MAX_SOURCE_DEMAND_HYPOTHESIS_FIELD_REFERENCES", 1)
+
+        with pytest.raises(InterpretationReviewCapacityError) as exc_info:
+            current_source_data_contract_demand(state, "src_a")
+
+        assert isinstance(exc_info.value.__cause__, source_demand.SourceDemandAnalysisLimitError)
+        assert exc_info.value.component_id == "source:src_a"
 
     def test_resolved_source_stays_closed_while_a_sibling_is_pending(self) -> None:
         draft = build_source_data_contract_draft(["colour"], None)
