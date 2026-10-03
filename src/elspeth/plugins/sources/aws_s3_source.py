@@ -20,7 +20,7 @@ from types import TracebackType
 from typing import Any, BinaryIO, ClassVar, Literal, Never, Protocol, Self, cast, runtime_checkable
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, JsonValue, ValidationError, field_validator, model_validator
 
 from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, RunMode, SourceRow
 from elspeth.contracts.aws_s3 import (
@@ -885,7 +885,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c4ec0031a5163f4d"
+    source_file_hash: str | None = "sha256:95b46ac953b9c321"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -1343,7 +1343,7 @@ class AWSS3Source(BaseSource):
                 source_row_index=source_row_index,
             )
 
-    def _normalize_row_keys(self, row: Any) -> Mapping[str, Any]:
+    def _prepare_normalized_row_keys(self, row: Any) -> tuple[Mapping[str, JsonValue], FieldResolution]:
         try:
             row_items = list(row.items())
         except AttributeError:
@@ -1351,16 +1351,18 @@ class AWSS3Source(BaseSource):
 
         raw_keys = [key for key, _ in row_items]
         if self._field_resolution is None:
-            self._field_resolution = self._resolve_json_field_names(raw_keys)
+            prospective_resolution = self._resolve_json_field_names(raw_keys)
             if self._contract_builder is None and self.get_schema_contract() is None:
                 initial_contract = create_contract_from_config(
                     self._schema_config,
-                    field_resolution=self._field_resolution.resolution_mapping,
+                    field_resolution=prospective_resolution.resolution_mapping,
                 )
                 self._contract_builder = ContractBuilder(initial_contract)
+        else:
+            prospective_resolution = self._field_resolution
 
-        mapping = self._field_resolution.resolution_mapping
-        normalized: dict[str, Any] = {}
+        mapping = prospective_resolution.resolution_mapping
+        normalized: dict[str, JsonValue] = {}
         new_raw_keys: list[str] = []
         for key, value in row_items:
             if not isinstance(key, str):
@@ -1379,13 +1381,19 @@ class AWSS3Source(BaseSource):
 
         if new_raw_keys:
             try:
-                self._field_resolution = extend_field_resolution(
-                    self._field_resolution,
+                prospective_resolution = extend_field_resolution(
+                    prospective_resolution,
                     raw_headers=new_raw_keys,
                     field_mapping=self._field_mapping,
                 )
             except FieldMappingCollisionError as exc:
                 raise ExternalHeaderError(str(exc)) from exc
+        return normalized, prospective_resolution
+
+    def _normalize_row_keys(self, row: Any) -> Mapping[str, Any]:
+        """Normalize and commit field resolution for direct trusted callers."""
+        normalized, prospective_resolution = self._prepare_normalized_row_keys(row)
+        self._field_resolution = prospective_resolution
         return normalized
 
     def _resolve_json_field_names(self, raw_keys: list[str]) -> FieldResolution:
@@ -1400,8 +1408,13 @@ class AWSS3Source(BaseSource):
             raise ExternalHeaderError(str(exc)) from exc
 
     def _validate_and_yield(self, row: Any, ctx: SourceContext, *, source_row_index: int) -> ABCIterator[SourceRow]:
+        prospective_resolution: FieldResolution | None
         try:
-            row_to_validate = self._normalize_row_keys(row) if self._format in ("json", "jsonl") else row
+            if self._format in ("json", "jsonl"):
+                row_to_validate, prospective_resolution = self._prepare_normalized_row_keys(row)
+            else:
+                row_to_validate = row
+                prospective_resolution = self._field_resolution
         except ExternalHeaderError as exc:
             message = f"Field normalization failed: {exc}"
             ctx.record_validation_error(
@@ -1423,26 +1436,25 @@ class AWSS3Source(BaseSource):
             validated = self._schema_class.model_validate(row_to_validate)
             validated_row = validated.to_row()
             if self._contract_builder is not None and not self._first_valid_row_processed:
-                if self._field_resolution is None:
-                    if self._format in ("json", "jsonl"):
-                        raise ValueError("field_resolution must exist before first-row inference")
+                if prospective_resolution is None:
                     field_resolution_map: Mapping[str, str] = {key: key for key in validated_row}
                 else:
-                    field_resolution_map = self._field_resolution.resolution_mapping
+                    field_resolution_map = prospective_resolution.resolution_mapping
                 self._contract_builder.process_first_row(validated_row, field_resolution_map)
                 self.set_schema_contract(self._contract_builder.contract)
                 self._first_valid_row_processed = True
 
             contract = self.require_schema_contract()
             if self._format in ("json", "jsonl") and self._contract_builder is not None and contract.mode in ("OBSERVED", "FLEXIBLE"):
-                if self._field_resolution is None:
+                if prospective_resolution is None:
                     raise ValueError("field_resolution must exist before sparse-field inference")
                 contract = self._contract_builder.process_sparse_fields(
                     validated_row,
-                    self._field_resolution.resolution_mapping,
+                    prospective_resolution.resolution_mapping,
                 )
                 self.set_schema_contract(contract)
 
+            self._field_resolution = prospective_resolution
             if contract.locked:
                 violations = contract.validate(validated_row)
                 if violations:

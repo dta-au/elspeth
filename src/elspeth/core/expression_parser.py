@@ -155,6 +155,17 @@ _UNSPELLED_INDEX = "<an index the expression does not spell out>"
 # that can never produce a route label.
 _ALWAYS_NUMERIC_BUILTINS: frozenset[str] = frozenset({"len", "abs"})
 
+_SAFE_BUILTIN_ARITIES: MappingProxyType[str, tuple[int, int]] = MappingProxyType(
+    {
+        "len": (1, 1),
+        "abs": (1, 1),
+        "lower": (1, 1),
+        "upper": (1, 1),
+        "strip": (1, 2),
+        "casefold": (1, 1),
+    }
+)
+
 
 # Expression node types the grammar handles, split by disposition.  Adding a
 # new visit_* method to a visitor is NOT sufficient to admit a type — it must
@@ -374,6 +385,10 @@ class _ExpressionValidator(ast.NodeVisitor):
         if isinstance(node.func, ast.Name) and node.func.id in _SAFE_BUILTINS:
             if node.keywords:
                 self.errors.append(f"{node.func.id}() does not accept keyword arguments")
+            minimum, maximum = _SAFE_BUILTIN_ARITIES[node.func.id]
+            if not minimum <= len(node.args) <= maximum:
+                expected = str(minimum) if minimum == maximum else f"{minimum} or {maximum}"
+                self.errors.append(f"{node.func.id}() requires {expected} arguments, got {len(node.args)}")
             # Visit func name (validated by visit_Name)
             self._allow_safe_builtin_reference += 1
             try:
@@ -688,6 +703,10 @@ class _ExpressionEvaluator(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> Any:
         """Evaluate function calls (row.get and safe builtins)."""
+        if isinstance(node.func, ast.Name) and node.func.id in _SAFE_BUILTIN_ARITIES:
+            minimum, maximum = _SAFE_BUILTIN_ARITIES[node.func.id]
+            if not minimum <= len(node.args) <= maximum:
+                raise ExpressionSecurityError(f"Invalid argument count reached evaluator for {node.func.id}()")
         func = self.visit(node.func)
         args = [self.visit(arg) for arg in node.args]
 
@@ -1089,6 +1108,56 @@ class ExpressionParser:
         ``_SAFE_BUILTINS``.
         """
         return self._node_has_string_amplification(self._ast.body)
+
+    def has_string_concatenation_risk(self) -> bool:
+        """Check for addition whose operands are not provably numeric.
+
+        A caller that materializes expression results cannot safely evaluate
+        a long chain of string-capable additions: a compact expression can
+        repeatedly copy a large input value before any post-evaluation size
+        check runs. Numeric-only addition remains available.
+        """
+        return any(
+            isinstance(child, ast.BinOp)
+            and isinstance(child.op, ast.Add)
+            and (not self._is_non_routable_node(child.left) or not self._is_non_routable_node(child.right))
+            for child in ast.walk(self._ast.body)
+        )
+
+    def has_eager_container_string_allocation_risk(self) -> bool:
+        """Check for string-copying calls retained inside a container literal.
+
+        Container literals evaluate every child before a caller can inspect
+        the result size. Repeated case-conversion calls can therefore retain
+        many copies of one large input, even when the final expression wraps
+        that container in ``len()`` and returns only a small integer.
+        """
+        string_copying_calls = _SAFE_BUILTINS.keys() - _ALWAYS_NUMERIC_BUILTINS
+        for child in ast.walk(self._ast.body):
+            if not isinstance(child, (ast.List, ast.Tuple, ast.Dict)):
+                continue
+            if any(
+                isinstance(descendant, ast.Call) and isinstance(descendant.func, ast.Name) and descendant.func.id in string_copying_calls
+                for descendant in ast.walk(child)
+            ):
+                return True
+        return False
+
+    def has_repeated_string_copying_calls(self) -> bool:
+        """Check for multiple case/whitespace calls in one expression.
+
+        Nested calls retain already evaluated arguments while descending into
+        siblings, so even without a container literal, N calls can hold N
+        copies of one large input before the outer expression returns.
+        """
+        string_copying_calls = _SAFE_BUILTINS.keys() - _ALWAYS_NUMERIC_BUILTINS
+        count = 0
+        for child in ast.walk(self._ast.body):
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id in string_copying_calls:
+                count += 1
+                if count > 1:
+                    return True
+        return False
 
     def _node_has_string_amplification(self, node: ast.expr) -> bool:
         """True if any Mult/Mod BinOp under ``node`` has a can-be-string operand."""

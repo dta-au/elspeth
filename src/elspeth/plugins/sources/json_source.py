@@ -14,7 +14,7 @@ import json
 from collections.abc import Iterator, Mapping
 from typing import Any, Literal
 
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import Field, JsonValue, ValidationError, field_validator, model_validator
 
 from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import SourceContext
@@ -184,7 +184,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b7e16113907d55c3"
+    source_file_hash: str | None = "sha256:997ca99f1069c7e6"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -472,7 +472,7 @@ class JSONSource(BaseSource):
         for source_row_index, row in enumerate(data):
             yield from self._validate_and_yield(row, ctx, source_row_index=source_row_index)
 
-    def _normalize_row_keys(self, row: Any) -> dict[str, Any]:
+    def _prepare_normalized_row_keys(self, row: Any) -> tuple[dict[str, JsonValue], FieldResolution]:
         """Normalize JSON keys to valid Python identifiers.
 
         On the first row, builds field resolution via resolve_field_names()
@@ -498,7 +498,7 @@ class JSONSource(BaseSource):
 
         if self._field_resolution is None:
             # First row — build field resolution from its keys
-            self._field_resolution = resolve_field_names(
+            prospective_resolution = resolve_field_names(
                 raw_headers=raw_keys,
                 field_mapping=self._field_mapping,
                 columns=None,
@@ -510,17 +510,19 @@ class JSONSource(BaseSource):
             if self._contract_builder is None and self.get_schema_contract() is None:
                 initial_contract = create_contract_from_config(
                     self._schema_config,
-                    field_resolution=self._field_resolution.resolution_mapping,
+                    field_resolution=prospective_resolution.resolution_mapping,
                 )
                 self._contract_builder = ContractBuilder(initial_contract)
+        else:
+            prospective_resolution = self._field_resolution
 
         # Apply resolution mapping.
         # Tier 3: JSON objects may have fields not in the first row
         # (sparse records, optional attributes). Normalize new fields using the
         # same algorithm rather than passing them through raw — inconsistent
         # normalization would break downstream template references.
-        mapping = self._field_resolution.resolution_mapping
-        normalized: dict[str, Any] = {}
+        mapping = prospective_resolution.resolution_mapping
+        normalized: dict[str, JsonValue] = {}
         new_raw_keys: list[str] = []
         for key, value in row_items:
             if key in mapping:
@@ -540,13 +542,18 @@ class JSONSource(BaseSource):
         # resolution with just those new raw keys. This preserves B4.3 union
         # semantics without re-normalizing every previously seen sparse key.
         if new_raw_keys:
-            assert self._field_resolution is not None  # set on first row above
-            self._field_resolution = extend_field_resolution(
-                self._field_resolution,
+            prospective_resolution = extend_field_resolution(
+                prospective_resolution,
                 raw_headers=new_raw_keys,
                 field_mapping=self._field_mapping,
             )
 
+        return normalized, prospective_resolution
+
+    def _normalize_row_keys(self, row: Any) -> dict[str, Any]:
+        """Normalize and commit field resolution for direct trusted callers."""
+        normalized, prospective_resolution = self._prepare_normalized_row_keys(row)
+        self._field_resolution = prospective_resolution
         return normalized
 
     def _validate_and_yield(self, row: Any, ctx: SourceContext, *, source_row_index: int) -> Iterator[SourceRow]:
@@ -572,7 +579,7 @@ class JSONSource(BaseSource):
         # signal OUR config error, not bad source data.  Mirrors azure_blob_source.py
         # _validate_and_yield (elspeth-bdcdce6f58) and the CSV _load_csv path.
         try:
-            normalized_row = self._normalize_row_keys(row)
+            normalized_row, prospective_resolution = self._prepare_normalized_row_keys(row)
         except ExternalHeaderError as exc:
             quarantined = self._record_validation_failure(
                 ctx=ctx,
@@ -591,11 +598,9 @@ class JSONSource(BaseSource):
 
             # For FLEXIBLE/OBSERVED schemas, process first valid row to lock contract
             if self._contract_builder is not None and not self._first_valid_row_processed:
-                # _field_resolution is guaranteed set by _normalize_row_keys above
-                assert self._field_resolution is not None
                 self._contract_builder.process_first_row(
                     validated_row,
-                    self._field_resolution.resolution_mapping,
+                    prospective_resolution.resolution_mapping,
                 )
                 self.set_schema_contract(self._contract_builder.contract)
                 self._first_valid_row_processed = True
@@ -609,14 +614,16 @@ class JSONSource(BaseSource):
                 # first valid row. If we emit those fields, the row contract must
                 # own their original-name/type metadata before validation and
                 # audit recording.
-                if self._field_resolution is None:
-                    raise ValueError("field_resolution must be established before sparse-field contract inference")
                 contract = self._contract_builder.process_sparse_fields(
                     validated_row,
-                    self._field_resolution.resolution_mapping,
+                    prospective_resolution.resolution_mapping,
                 )
                 self.set_schema_contract(contract)
 
+            # ContractBuilder commits inferred metadata in process_* above.
+            # Keep the matching raw-name resolution in the same transaction;
+            # a ContractFieldLimitExceeded exit reaches neither assignment.
+            self._field_resolution = prospective_resolution
             if contract.locked:
                 violations = contract.validate(validated_row)
                 if violations:

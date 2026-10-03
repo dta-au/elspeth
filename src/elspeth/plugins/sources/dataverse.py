@@ -16,7 +16,7 @@ from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar, Literal, Self, TypedDict
 
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import Field, JsonValue, ValidationError, field_validator, model_validator
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import Call, CallStatus, CallType, Determinism, PluginSchema, SourceRow
@@ -290,7 +290,7 @@ class DataverseSource(BaseSource):
     _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:fe84ee1118943bf9"
+    source_file_hash: str | None = "sha256:a993a9a403c9b3b8"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -655,11 +655,11 @@ class DataverseSource(BaseSource):
 
         return cleaned
 
-    def _normalize_row_fields(
+    def _prepare_normalized_row_fields(
         self,
-        row: dict[str, Any],
+        row: dict[str, JsonValue],
         is_first_row: bool,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, JsonValue], FieldResolution]:
         """Normalize field names and apply field mapping.
 
         On first row, creates the field resolution mapping.
@@ -673,12 +673,14 @@ class DataverseSource(BaseSource):
         """
         if is_first_row or self._field_resolution is None:
             raw_headers = list(row.keys())
-            self._field_resolution = resolve_field_names(
+            prospective_resolution = resolve_field_names(
                 raw_headers=raw_headers,
                 field_mapping=self._field_mapping,
                 columns=None,
                 require_all_mapping_keys=False,  # sparse Dataverse entities may omit optional mapped attributes
             )
+        else:
+            prospective_resolution = self._field_resolution
 
         # Apply resolution mapping.
         # Tier 3: Dataverse responses may include fields not in the first row
@@ -686,8 +688,8 @@ class DataverseSource(BaseSource):
         # same algorithm rather than passing them through raw — inconsistent
         # normalization would break downstream template references.
         # Schema validation (lines below) quarantines rows with unexpected fields.
-        mapping = self._field_resolution.resolution_mapping
-        result: dict[str, Any] = {}
+        mapping = prospective_resolution.resolution_mapping
+        result: dict[str, JsonValue] = {}
         new_raw_keys: list[str] = []
         for k, v in row.items():
             if k in mapping:
@@ -707,14 +709,19 @@ class DataverseSource(BaseSource):
         # resolution with just those new raw keys. This preserves B4.3 union
         # semantics without re-normalizing every previously seen sparse key.
         if new_raw_keys:
-            assert self._field_resolution is not None  # set on first row above
-            self._field_resolution = extend_field_resolution(
-                self._field_resolution,
+            prospective_resolution = extend_field_resolution(
+                prospective_resolution,
                 raw_headers=new_raw_keys,
                 field_mapping=self._field_mapping,
             )
 
-        return result
+        return result, prospective_resolution
+
+    def _normalize_row_fields(self, row: dict[str, Any], is_first_row: bool) -> dict[str, Any]:
+        """Normalize and commit field resolution for direct trusted callers."""
+        normalized, prospective_resolution = self._prepare_normalized_row_fields(row, is_first_row)
+        self._field_resolution = prospective_resolution
+        return normalized
 
     def _verify_recorded_page_call(
         self,
@@ -961,7 +968,7 @@ class DataverseSource(BaseSource):
                     # source data. Mirrors azure_blob_source.py _validate_and_yield
                     # and the CSV _load_csv path (elspeth-594221617d).
                     try:
-                        normalized_row = self._normalize_row_fields(cleaned_row, is_first_row)
+                        normalized_row, prospective_resolution = self._prepare_normalized_row_fields(cleaned_row, is_first_row)
                     except ExternalHeaderError as e:
                         ctx.record_validation_error(
                             row=cleaned_row,
@@ -1007,10 +1014,7 @@ class DataverseSource(BaseSource):
                     # Lock contract on first valid row (FLEXIBLE/OBSERVED)
                     if not self._first_valid_row_processed and self._contract_builder is not None:
                         resolution_map: Mapping[str, str]
-                        if self._field_resolution is not None:
-                            resolution_map = self._field_resolution.resolution_mapping
-                        else:
-                            resolution_map = {k: k for k in validated_row}
+                        resolution_map = prospective_resolution.resolution_mapping
 
                         try:
                             self._contract_builder.process_first_row(validated_row, resolution_map)
@@ -1042,12 +1046,10 @@ class DataverseSource(BaseSource):
                         # result sets. If a later row emits a new attribute,
                         # its SourceRow contract must carry the audit/header
                         # metadata before validation and yield.
-                        if self._field_resolution is None:
-                            raise ValueError("field_resolution must be established before sparse-field contract inference")
                         try:
                             contract = self._contract_builder.process_sparse_fields(
                                 validated_row,
-                                self._field_resolution.resolution_mapping,
+                                prospective_resolution.resolution_mapping,
                             )
                         except ContractFieldLimitExceeded as e:
                             ctx.record_validation_error(
@@ -1067,6 +1069,7 @@ class DataverseSource(BaseSource):
                             continue
                         self.set_schema_contract(contract)
 
+                    self._field_resolution = prospective_resolution
                     if contract.locked:
                         violations = contract.validate(validated_row)
                         if violations:
