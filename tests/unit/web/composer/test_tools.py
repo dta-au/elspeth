@@ -18410,6 +18410,12 @@ class TestPreviewProofStep:
         assert budget_failures[0]["evidence_locator"]["max_declared_input_type_diagnostics"] == 16
         assert result.data["preview_is_valid"] is False
 
+        from elspeth.web.composer.discovery_response import admit_discovery_result
+
+        admitted = admit_discovery_result("preview_pipeline", result).to_dict()
+        admitted_budget_failures = [item for item in admitted["data"]["proof_diagnostics"] if item["code"] == "source_inspection_failed"]
+        assert admitted_budget_failures[0]["evidence_locator"] == budget_failures[0]["evidence_locator"]
+
     def test_observed_csv_str_input_declaration_does_not_block(self) -> None:
         """str/any declarations match what an observed CSV actually delivers."""
         with _blob_operation(self.engine, self.session_id) as (authority, context):
