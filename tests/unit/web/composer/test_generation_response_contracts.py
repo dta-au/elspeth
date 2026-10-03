@@ -183,6 +183,23 @@ def test_proof_evidence_rejects_unknown_nested_field_and_wrong_count(producer_re
             responses.PREVIEW_PIPELINE_RESPONSE_CONTRACT.admit(raw)
 
 
+def test_preview_contract_admits_declared_input_type_budget_evidence(producer_results):
+    raw = deep_thaw(producer_results["preview_proof"].data)
+    evidence = {
+        "source": "pipeline",
+        "max_declared_input_type_checks": 256,
+        "max_declared_input_type_diagnostics": 16,
+    }
+    raw["proof_diagnostics"][0]["evidence_locator"] = evidence
+
+    wire = responses.PREVIEW_PIPELINE_RESPONSE_CONTRACT.admit(raw).to_wire()
+
+    assert wire["proof_diagnostics"][0]["evidence_locator"] == evidence
+    evidence["blob_source_count"] = 1
+    with pytest.raises(FrameworkBugError, match="Invalid pipeline proof evidence"):
+        responses.PREVIEW_PIPELINE_RESPONSE_CONTRACT.admit(raw)
+
+
 def test_failed_diff_stays_validation_only():
     from elspeth.web.composer.discovery_response import admit_discovery_result
 
