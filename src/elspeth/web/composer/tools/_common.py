@@ -3233,18 +3233,20 @@ def _prevalidate_source_for_context(
     on_validation_failure: str = _DEFAULT_SOURCE_VALIDATION_FAILURE,
     *,
     source_name: str = "source",
-) -> str | None:
+) -> tuple[str, str] | None:
     """Validate one candidate source through the shared profile adapter.
 
     Profile lowering is an in-memory validation projection only.  The caller
     persists its original authored ``options``; this helper validates the
     corresponding executable provider binding without returning or exposing
-    that private projection.
+    that private projection. Rejections carry ``(message, error_code)`` so
+    policy failures keep their diagnosis through feedback and audit redaction.
     """
     if "on_validation_failure" in options and options["on_validation_failure"] != on_validation_failure:
         return (
             f"Invalid options for source '{plugin_name}': options.on_validation_failure conflicts with "
-            "the source routing field on_validation_failure"
+            "the source routing field on_validation_failure",
+            "plugin_options_invalid",
         )
     profile_options = {
         **deep_thaw(options),
@@ -3268,21 +3270,23 @@ def _prevalidate_source_for_context(
     try:
         profile_validation = context.catalog.validate_composition_state(candidate)
     except ValueError as exc:
-        return f"Invalid options for source '{plugin_name}': {exc}"
+        return f"Invalid options for source '{plugin_name}': {exc}", "plugin_options_invalid"
     blocking = tuple(
         finding for finding in profile_validation.policy_findings if finding.stage in {"plugin_enablement", "operator_profile_options"}
     )
     if blocking:
-        return f"Invalid options for source '{plugin_name}': {blocking[0].error_code} — {blocking[0].message}"
+        finding = blocking[0]
+        return f"Invalid options for source '{plugin_name}': {finding.error_code} — {finding.message}", finding.error_code
     executable_source = profile_validation.executable_state.sources[source_name]
     if type(executable_source.on_validation_failure) is not str or executable_source.on_validation_failure != on_validation_failure:
-        return f"Invalid options for source '{plugin_name}': profile lowering changed on_validation_failure"
+        return f"Invalid options for source '{plugin_name}': profile lowering changed on_validation_failure", "plugin_options_invalid"
     executable_options = deep_thaw(executable_source.options)
     if "on_validation_failure" in executable_options:
         executable_on_validation_failure = executable_options.pop("on_validation_failure")
         if type(executable_on_validation_failure) is not str or executable_on_validation_failure != on_validation_failure:
-            return f"Invalid options for source '{plugin_name}': profile lowering changed on_validation_failure"
-    return _prevalidate_source(plugin_name, executable_options, on_validation_failure)
+            return f"Invalid options for source '{plugin_name}': profile lowering changed on_validation_failure", "plugin_options_invalid"
+    error = _prevalidate_source(plugin_name, executable_options, on_validation_failure)
+    return (error, "plugin_options_invalid") if error is not None else None
 
 
 def _prevalidate_transform(plugin_name: str, options: Mapping[str, Any]) -> str | None:
@@ -3294,15 +3298,16 @@ def _prevalidate_transform_for_context(
     context: ToolContext,
     plugin_name: str,
     options: Mapping[str, Any],
-) -> str | None:
-    """Validate one candidate transform through the shared profile adapter."""
+) -> tuple[str, str] | None:
+    """Validate one transform, returning ``(message, error_code)`` on rejection.
+
+    The projection contains only the subject being checked. Synthetic source
+    or sink plugins would add unrelated enablement failures and prevent profile
+    lowering even when this transform is available. Whole-graph validation is
+    the caller's responsibility, not this option prevalidation helper's.
+    """
     candidate = CompositionState(
-        source=SourceSpec(
-            plugin="csv",
-            on_success="profile_prevalidation_in",
-            options={"schema": {"mode": "observed"}},
-            on_validation_failure="discard",
-        ),
+        source=None,
         nodes=(
             NodeSpec(
                 id="profile_prevalidation",
@@ -3321,14 +3326,7 @@ def _prevalidate_transform_for_context(
             ),
         ),
         edges=(),
-        outputs=(
-            OutputSpec(
-                name="profile_prevalidation_out",
-                plugin="json",
-                options={"schema": {"mode": "observed"}},
-                on_write_failure="discard",
-            ),
-        ),
+        outputs=(),
         metadata=PipelineMetadata(),
         version=1,
     )
@@ -3342,7 +3340,7 @@ def _prevalidate_transform_for_context(
         # planner path degraded it to the unrepairable
         # CANDIDATE_CONSTRUCTION_ERROR, non-planner tool paths 500'd).
         # Mirror the core's own idiom: surface it as an options message.
-        return f"Invalid options for transform '{plugin_name}': {exc}"
+        return f"Invalid options for transform '{plugin_name}': {exc}", "plugin_options_invalid"
     blocking = tuple(
         finding for finding in profile_validation.policy_findings if finding.stage in {"plugin_enablement", "operator_profile_options"}
     )
@@ -3350,11 +3348,13 @@ def _prevalidate_transform_for_context(
         # Carry the finding's own explanation — the bare error_code alone
         # (e.g. "profile_unavailable") tells neither the model nor the user
         # what is actually switched off.
-        return f"Invalid options for transform '{plugin_name}': {blocking[0].error_code} — {blocking[0].message}"
+        finding = blocking[0]
+        return f"Invalid options for transform '{plugin_name}': {finding.error_code} — {finding.message}", finding.error_code
     alias = options["profile"] if "profile" in options else plugin_name
     if type(alias) is not str:
-        return f"Invalid options for transform '{plugin_name}': profile_unavailable"
-    return _prevalidate_transform(plugin_name, profile_validation.executable_state.nodes[0].options)
+        return f"Invalid options for transform '{plugin_name}': profile must be a string", "plugin_options_invalid"
+    error = _prevalidate_transform(plugin_name, profile_validation.executable_state.nodes[0].options)
+    return (error, "plugin_options_invalid") if error is not None else None
 
 
 def _prevalidate_sink(plugin_name: str, options: dict[str, Any]) -> str | None:

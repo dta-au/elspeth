@@ -9491,7 +9491,7 @@ class TestTransformProviderConfigPathRestriction:
                 # The mocked state never yields loadable settings, so a bare
                 # ``raises`` is satisfied by ANY node. Pin the refusal to the
                 # operator-profile gate and to this node.
-                assert [(error.error_code, error.component_id) for error in raised.value.errors] == [("profile_unavailable", "rag")]
+                assert [(error.error_code, error.component_id) for error in raised.value.errors] == [("plugin_options_invalid", "rag")]
                 rendered = " ".join(error.message for error in raised.value.errors)
             else:
                 with pytest.raises(RuntimeError, match="Plugin policy validation diverged") as diverged:

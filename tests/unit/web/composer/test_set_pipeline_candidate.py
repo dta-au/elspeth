@@ -1784,7 +1784,7 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             _profile_rejecting_context(data_dir=tmp_path),
             "Node 'copy': Invalid options for transform 'passthrough': profile_unavailable — "
             "The requested operator profile is unavailable.",
-            "plugin_options_invalid",
+            "profile_unavailable",
         ),
         (
             "invalid_options",

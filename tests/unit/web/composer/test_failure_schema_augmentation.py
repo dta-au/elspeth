@@ -1327,14 +1327,49 @@ class TestFailureSchemaAugmentationBlobBinders:
         assert build_plugin_schemas_for_failure(result, view) == {"source/blob_rows": view.get_schema("source", "blob_rows").model_dump()}
 
 
+def _prevalidation_message_local(message: ast.expr) -> str | None:
+    local = message.value if isinstance(message, ast.Subscript) else message
+    return local.id if isinstance(local, ast.Name) and "prevalidation" in local.id else None
+
+
+def _prevalidation_code_matches(message: ast.expr, code: ast.expr | None) -> bool:
+    local = _prevalidation_message_local(message)
+    if local is None or code is None:
+        return False
+    if isinstance(message, ast.Name):
+        return isinstance(code, ast.Constant) and code.value == "plugin_options_invalid"
+    return ast.unparse(message) == f"{local}[0]" and ast.unparse(code) == f"{local}[1]"
+
+
+@pytest.mark.parametrize(
+    ("message", "code", "local", "matches"),
+    [
+        ("prevalidation_error", "'plugin_options_invalid'", "prevalidation_error", True),
+        ("prevalidation_error[0]", "prevalidation_error[1]", "prevalidation_error", True),
+        ("prevalidation_error[0]", "'plugin_options_invalid'", "prevalidation_error", False),
+        ("prevalidation_error[0]", "other_prevalidation[1]", "prevalidation_error", False),
+        ("prevalidation_error[1]", "prevalidation_error[1]", "prevalidation_error", False),
+        ("prevalidation_error[0]", "None", "prevalidation_error", False),
+        ("unrelated_message", "'plugin_options_invalid'", None, False),
+    ],
+)
+def test_prevalidation_tripwire_controls(message: str, code: str, local: str | None, matches: bool) -> None:
+    message_node = ast.parse(message, mode="eval").body
+    code_node = ast.parse(code, mode="eval").body
+    assert _prevalidation_message_local(message_node) == local
+    assert _prevalidation_code_matches(message_node, code_node) is matches
+    assert _prevalidation_code_matches(message_node, None) is False
+
+
 def _prevalidation_rejection_calls() -> list[tuple[str, ast.Call]]:
-    """Every ``_failure_result`` call whose message is a ``*prevalidation*`` local.
+    """Every rejection whose message is a prevalidation local or its tuple item.
 
     Walks the four tool modules that call a ``_prevalidate_*`` helper and
     returns ``(module, call)`` for each rejection built from its result. The
     local's name is the join point: every producer binds the helper's return
     to a name containing ``prevalidation`` before rejecting on it, so a
-    rejection whose message is such a Name IS a plugin-option rejection.
+    rejection whose message is such a Name or its ``[0]`` item carries the
+    corresponding schema error or structured policy rejection.
     """
     calls: list[tuple[str, ast.Call]] = []
     for module in (sources_tools, outputs_tools, transforms_tools, sessions_tools):
@@ -1342,7 +1377,7 @@ def _prevalidation_rejection_calls() -> list[tuple[str, ast.Call]]:
         for node in ast.walk(tree):
             if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_failure_result"):
                 continue
-            if len(node.args) < 2 or not isinstance(node.args[1], ast.Name) or "prevalidation" not in node.args[1].id:
+            if len(node.args) < 2 or _prevalidation_message_local(node.args[1]) is None:
                 continue
             calls.append((module.__name__, node))
     return calls
@@ -1356,8 +1391,8 @@ def test_every_prevalidation_rejection_stamps_its_plugin_identity_and_code() -> 
     without the contract. The per-tool tests above catch a lost stamp on the
     paths they drive; this pins the rule at the source so a NEW producer of
     a plugin-option rejection cannot land unstamped or codeless. The
-    keyword must be a non-``None`` expression and the code the closed
-    ``plugin_options_invalid`` literal.
+    identity must be non-``None``. A scalar schema error keeps the generic
+    literal; a structured rejection must forward its OWN paired code.
     """
     calls = _prevalidation_rejection_calls()
     assert len(calls) >= 12, f"expected every prevalidation rejection site, found {len(calls)}"
@@ -1368,8 +1403,8 @@ def test_every_prevalidation_rejection_stamps_its_plugin_identity_and_code() -> 
         if identity is None or (isinstance(identity, ast.Constant) and identity.value is None):
             wrong.append(f"{module}:{call.lineno} rejects on a prevalidation result without plugin_identity=")
         code = keywords.get("error_code")
-        if not (isinstance(code, ast.Constant) and code.value == "plugin_options_invalid"):
-            wrong.append(f"{module}:{call.lineno} rejects on a prevalidation result without error_code='plugin_options_invalid'")
+        if not _prevalidation_code_matches(call.args[1], code):
+            wrong.append(f"{module}:{call.lineno} rejects without the schema fallback or its paired policy code")
     assert not wrong, "\n".join(wrong)
 
 

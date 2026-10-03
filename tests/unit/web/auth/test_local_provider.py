@@ -291,7 +291,12 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         def racing_open(path: Any, flags: int, mode: int = 0o777, *args: Any, **kwargs: Any) -> int:
             if flags & os.O_CREAT:
                 winner = real_open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o640)
-                os.close(winner)
+                try:
+                    # The declared group-readable winner must not depend on umask.
+                    os.fchmod(winner, 0o640)
+                    assert stat.S_IMODE(os.fstat(winner).st_mode) == 0o640
+                finally:
+                    os.close(winner)
             return real_open(path, flags, mode, *args, **kwargs)
 
         monkeypatch.setattr(os, "open", racing_open)

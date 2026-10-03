@@ -1165,8 +1165,8 @@ def build_set_pipeline_candidate(
             # 'validation_error' in the planner view).
             return _failure_result(
                 state,
-                src_prevalidation,
-                error_code="plugin_options_invalid",
+                src_prevalidation[0],
+                error_code=src_prevalidation[1],
                 plugin_identity=("source", src_plugin),
                 rejected_component="source",
             )
@@ -1351,8 +1351,8 @@ def build_set_pipeline_candidate(
                 _record_component_rejection(
                     _failure_result(
                         state,
-                        src_prevalidation,
-                        error_code="plugin_options_invalid",
+                        src_prevalidation[0],
+                        error_code=src_prevalidation[1],
                         plugin_identity=("source", src_plugin),
                         rejected_component=source_ref,
                     )
@@ -1501,8 +1501,8 @@ def build_set_pipeline_candidate(
                 _record_component_rejection(
                     _failure_result(
                         state,
-                        node_prevalidation,
-                        error_code="plugin_options_invalid",
+                        node_prevalidation[0],
+                        error_code=node_prevalidation[1],
                         plugin_identity=("transform", node_plugin),
                         rejected_component=node_ref,
                     )
