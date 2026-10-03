@@ -2783,6 +2783,7 @@ def test_allowlisted_candidate_feedback_scopes_withholding_per_entry() -> None:
     assert feedback["repeat_notice"] == _REPEAT_NOTICE_WITHHELD
     serialized = canonical_json(feedback)
     assert "REVIEWED-PRIVATE-PATH-CANARY" not in serialized
+
     assert "PRIVATE-ROUTING-CANARY" not in serialized
 
     # The same rejection with no finalizer ownership discloses everything.
@@ -2796,6 +2797,17 @@ def test_allowlisted_candidate_feedback_scopes_withholding_per_entry() -> None:
         "source",
     ]
     assert open_feedback["repeat_notice"] == _REPEAT_NOTICE
+
+
+@pytest.mark.parametrize("reason", list(PluginUnavailableReason))
+def test_withheld_availability_guidance_keeps_the_closed_diagnosis(reason: PluginUnavailableReason) -> None:
+    ordinary = explain_validation_code(reason.value)
+    withheld = explain_withheld_validation_code(reason.value)
+    assert ordinary is not None
+    assert withheld is not None
+    assert ordinary[0] in withheld[0]
+    assert ordinary[1] in withheld[1]
+    assert "withheld configuration" in withheld[1]
 
 
 def test_allowlisted_candidate_feedback_projects_coalesce_union_type_facts() -> None:
@@ -3010,6 +3022,72 @@ async def test_finalizer_mutation_keeps_model_authored_component_detail(
     assert "repeat_notice" not in feedback
     # The private server-bound value never crosses into the transcript.
     assert private_value not in canonical_json(completion.requests[1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withheld", [False, True])
+async def test_profile_rejection_keeps_diagnosis_through_feedback_and_attempt_audit(
+    tmp_path: Path, tool_context: ToolContext, withheld: bool
+) -> None:
+    """A finalizer-restored profile node keeps the policy code, not private prose."""
+    view, snapshot = _web_authored_policy_pair()
+    candidate = _pipeline(tmp_path)
+    candidate["nodes"] = [
+        {
+            "id": "assess",
+            "node_type": "transform",
+            "plugin": "llm",
+            "input": "rows",
+            "on_success": "assessed",
+            "on_error": "discard",
+            "options": {
+                "profile": "missing-role",
+                "prompt_template": "Assess {{ row.name }}.",
+                "required_input_fields": ["name"],
+                "response_field": "assessment",
+                "schema": {"mode": "observed"},
+            },
+        }
+    ]
+    candidate["outputs"][0]["sink_name"] = "assessed"
+    private_alias = "PRIVATE-PROFILE-FINALIZER-CANARY"
+
+    def finalize(authored: Mapping[str, Any]) -> Mapping[str, Any]:
+        if not withheld:
+            return authored
+        finalized = deepcopy(dict(authored))
+        finalized["nodes"][0]["options"]["profile"] = private_alias
+        return finalized
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": candidate})),
+        _response(("emit_pipeline_proposal", {"pipeline": candidate})),
+    )
+    recorder = BufferingRecorder()
+    with pytest.raises(PipelinePlannerError) as excinfo:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            policy_override=(view, snapshot),
+            candidate_finalizer=finalize,
+            repair_budget=1,
+            model_overrides={"escape_hatch_model": None},
+        )
+    assert excinfo.value.code == "REPAIR_EXHAUSTED"
+    assert excinfo.value.detail_codes == ("profile_unavailable",)
+    assert len(completion.requests) == 2
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    entry = feedback["validation"]["errors"][0]
+    assert entry["error_code"] == "profile_unavailable"
+    assert "operator must configure an operator profile" in entry["suggested_fix"]
+    assert entry["component"] == ("pipeline" if withheld else "node:assess")
+    assert "detail" not in entry
+    assert private_alias not in canonical_json(completion.requests)
+    rejected = [attempt for attempt in recorder.planner_attempts if attempt.outcome is ComposerPlannerAttemptOutcome.CANDIDATE_REJECTED]
+    assert len(rejected) == 2
+    assert all(attempt.rejection_codes == ("profile_unavailable",) for attempt in rejected)
 
 
 @pytest.mark.asyncio

@@ -159,7 +159,13 @@ def test_detached_policy_validation_matches_live_validation_concurrently() -> No
                 id="search",
                 node_type="transform",
                 plugin="azure_ai_search",
-                options={"profile": "search", "index": "denied"},
+                options={
+                    "profile": "search",
+                    "index": "denied",
+                    "query_field": "question",
+                    "output_prefix": "search",
+                    "schema": {"mode": "observed"},
+                },
                 input="rows",
                 on_success="results",
                 on_error="discard",
@@ -176,11 +182,18 @@ def test_detached_policy_validation_matches_live_validation_concurrently() -> No
         version=1,
     )
     expected = validate_authored_composition_state(state, snapshot=snapshot, profile_registry=registry, catalog=catalog)
-    assert any(finding.error_code == "profile_unavailable" for finding in expected.policy_findings)
+    assert [finding.error_code for finding in expected.policy_findings] == ["plugin_options_invalid"]
+    assert expected.policy_findings[0].message.endswith("['index'].")
+    admitted = replace(state, nodes=(replace(state.nodes[0], options={**state.nodes[0].options, "index": "admitted"}),))
+    admitted_expected = validate_authored_composition_state(admitted, snapshot=snapshot, profile_registry=registry, catalog=catalog)
+    assert admitted_expected.policy_findings == ()
     registry._resolvers.clear()
     with ThreadPoolExecutor(max_workers=4) as executor:
-        results = list(executor.map(lambda _index: validate_composition_state_with_interpretation_inputs(state, inputs), range(8)))
-    assert all(result == expected for result in results)
+        results = list(
+            executor.map(lambda candidate: validate_composition_state_with_interpretation_inputs(candidate, inputs), (state, admitted) * 4)
+        )
+    assert results[::2] == [expected] * 4
+    assert results[1::2] == [admitted_expected] * 4
 
 
 def test_detached_source_policy_validation_matches_dynamic_key_and_route_lowering() -> None:

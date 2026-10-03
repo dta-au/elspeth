@@ -10,7 +10,7 @@ source options.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pytest
@@ -245,6 +245,24 @@ def test_set_source_rejects_conflicting_duplicate_validation_failure_route(
     assert result.validation.errors[1:] == profiled_source_harness.empty_state.validate().errors
 
 
+def test_authoritative_source_policy_codes_a_conflicting_route_as_invalid_options(
+    profiled_source_harness: _ProfiledSourceHarness,
+) -> None:
+    created = _execute_set_source(
+        _source_args(on_validation_failure="quarantine"),
+        profiled_source_harness.empty_state,
+        profiled_source_harness.context,
+    )
+    assert created.success is True
+    authored = created.updated_state
+    source = authored.sources["briefing"]
+    conflicting = authored.with_named_source("briefing", replace(source, options={**source.options, "on_validation_failure": "discard"}))
+    checked = profiled_source_harness.context.catalog.validate_composition_state(conflicting)
+    assert checked.policy_findings[0].error_code == "plugin_options_invalid"
+    assert checked.validation.errors[0].error_code == "plugin_options_invalid"
+    assert checked.executable_state is conflicting
+
+
 def test_patch_source_options_revalidates_profile_without_persisting_private_binding(
     profiled_source_harness: _ProfiledSourceHarness,
 ) -> None:
@@ -284,6 +302,7 @@ def test_patch_source_options_rejects_operator_temperature_override_atomically(
     assert patched.success is False
     assert patched.updated_state is created.updated_state
     assert patched.affected_nodes == ()
+    assert patched.validation.errors[0].error_code == "plugin_options_invalid"
     assert "temperature" in patched.validation.errors[0].message
     _assert_audit_safe_source_options(patched.updated_state.sources["briefing"].options)
 
@@ -358,8 +377,75 @@ def test_set_source_rejects_unknown_profile_alias_atomically(
     assert rejection.error_code == "plugin_options_invalid"
     assert rejection.severity == "high"
     assert rejection.plugin_identity == ("source", "llm")
-    assert "profile_unavailable" in rejection.message
+    assert "operator-approved aliases" in rejection.message
     assert result.validation.errors[1:] == profiled_source_harness.empty_state.validate().errors
+
+
+def test_patch_source_codes_a_wrong_alias_as_invalid_options(profiled_source_harness: _ProfiledSourceHarness) -> None:
+    created = _execute_set_source(_source_args(), profiled_source_harness.empty_state, profiled_source_harness.context)
+    assert created.success is True
+    result = _execute_patch_source_options(
+        {"source_name": "briefing", "patch": {"profile": "missing-role"}},
+        created.updated_state,
+        profiled_source_harness.context,
+    )
+    assert result.success is False
+    assert result.updated_state is created.updated_state
+    assert result.validation.errors[0].error_code == "plugin_options_invalid"
+
+
+@pytest.mark.parametrize("container", ["source", "sources"])
+def test_set_pipeline_source_codes_a_wrong_alias_as_invalid_options(
+    profiled_source_harness: _ProfiledSourceHarness, container: str
+) -> None:
+    source = _source_args(options=_authored_options(profile="missing-role"))
+    del source["source_name"]
+    block = {"source": source} if container == "source" else {"sources": {"briefing": source}}
+    candidate = build_set_pipeline_candidate(
+        {**block, "nodes": [], "edges": [], "outputs": [_output()]},
+        profiled_source_harness.empty_state,
+        profiled_source_harness.context,
+    )
+    assert candidate.acceptable is False
+    assert candidate.result.updated_state is profiled_source_harness.empty_state
+    assert candidate.result.validation.errors[0].error_code == "plugin_options_invalid"
+
+
+@pytest.mark.parametrize("tool", ["set_source", "patch_source_options", "set_pipeline-source", "set_pipeline-sources"])
+def test_source_prevalidation_preserves_unavailable_binding_code(
+    profiled_source_harness: _ProfiledSourceHarness, monkeypatch: pytest.MonkeyPatch, tool: str
+) -> None:
+    from elspeth.web.plugin_policy import validation
+
+    state = profiled_source_harness.empty_state
+    if tool == "patch_source_options":
+        created = _execute_set_source(_source_args(), state, profiled_source_harness.context)
+        assert created.success is True
+        state = created.updated_state
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("profile_unavailable")
+
+    monkeypatch.setattr(validation, "_lower_profile_options", refuse)
+    if tool == "set_source":
+        result = _execute_set_source(_source_args(), state, profiled_source_harness.context)
+    elif tool == "patch_source_options":
+        result = _execute_patch_source_options(
+            {"source_name": "briefing", "patch": {"prompt_template": "Write a longer briefing."}},
+            state,
+            profiled_source_harness.context,
+        )
+    else:
+        source = _source_args()
+        del source["source_name"]
+        block = {"source": source} if tool == "set_pipeline-source" else {"sources": {"briefing": source}}
+        result = build_set_pipeline_candidate(
+            {**block, "nodes": [], "edges": [], "outputs": [_output()]}, state, profiled_source_harness.context
+        ).result
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.affected_nodes == ()
+    assert result.validation.errors[0].error_code == "profile_unavailable"
 
 
 @pytest.mark.parametrize(
