@@ -34,6 +34,7 @@ from httpx import ASGITransport, AsyncClient
 from tests.unit.web.sessions.test_e2e_state_seed_route import _make_app, _ready_readiness, _valid_state
 
 from elspeth.web.execution.schemas import ValidationResult
+from elspeth.web.secrets.service import ScopedSecretResolver
 
 _CHECK_TARGET = "elspeth.web.composer.interpretation_surfacing.unsurfaceable_pending_interpretation_review_sites"
 _PREFLIGHT_TARGET = "elspeth.web.sessions.routes._helpers._runtime_preflight_for_state"
@@ -132,7 +133,7 @@ async def test_seed_review_debt_check_refuses_at_the_configured_bound(tmp_path: 
 @pytest.mark.asyncio
 async def test_yaml_import_refuses_source_demand_hypothesis_over_work_limit(tmp_path: Path) -> None:
     app, service = _make_app(tmp_path)
-    secret_service = MagicMock()
+    secret_service = MagicMock(spec=ScopedSecretResolver)
     secret_service.list_refs.return_value = []
     app.state.scoped_secret_resolver = secret_service
     session = await service.create_session("alice", "Import", "local")

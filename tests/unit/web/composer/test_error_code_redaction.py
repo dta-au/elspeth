@@ -113,6 +113,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("execution/_validation_authoring.py", "lower_plugin_policy", "item.error_code"),
         ("execution/_validation_authoring.py", "validate_web_network_policy", "error_code"),
         ("execution/_validation_authoring.py", "review_interpretations", "INTERPRETATION_REVIEW_PENDING_CODE"),
+        ("execution/validation.py", "_interpretation_review_capacity_failure", "SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE"),
         ("execution/validation.py", "_interpretation_review_drift_failure", "INTERPRETATION_REVIEW_DRIFT_CODE"),
         ("execution/_validation_diagnostics.py", "_reframe_settings_missing_parts", "_SETTINGS_MISSING_PART_REFRAMES[part][0]"),
         ("execution/_validation_materialization.py", "_blob_inline_validation_error", "f'{violation.category}_inline_blob_content'"),
@@ -319,9 +320,17 @@ class TestRegistryCensus:
 
         from elspeth.contracts.blobs_inline import BlobInlineValidationCategory
         from elspeth.web.execution._validation_diagnostics import _SETTINGS_MISSING_PART_REFRAMES
-        from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_DRIFT_CODE, INTERPRETATION_REVIEW_PENDING_CODE
+        from elspeth.web.interpretation_state import (
+            INTERPRETATION_REVIEW_DRIFT_CODE,
+            INTERPRETATION_REVIEW_PENDING_CODE,
+            SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE,
+        )
 
-        assert {INTERPRETATION_REVIEW_PENDING_CODE, INTERPRETATION_REVIEW_DRIFT_CODE} <= REGISTERED_ERROR_CODES
+        assert {
+            INTERPRETATION_REVIEW_PENDING_CODE,
+            INTERPRETATION_REVIEW_DRIFT_CODE,
+            SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE,
+        } <= REGISTERED_ERROR_CODES
         assert {reframe[0] for reframe in _SETTINGS_MISSING_PART_REFRAMES.values()} <= REGISTERED_ERROR_CODES
         assert {f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory)} <= REGISTERED_ERROR_CODES
         assert {"web_scrape_private_network_not_allowed", "web_fetch_private_network_not_allowed"} <= REGISTERED_ERROR_CODES
@@ -381,6 +390,7 @@ def _persisted_first_error(tool_name: str, error_code: str) -> dict[str, object]
         ("upsert_node", "profile_alias_used_as_bucket"),
         ("upsert_node", "required_control_unavailable"),
         ("set_pipeline", "required_control_coverage"),
+        ("set_pipeline", "source_data_contract_analysis_limit_exceeded"),
         ("patch_node_options", "llm_base_url_not_allowed"),
         ("set_source", "fabricated_secret"),
         ("set_source", "power_automate_origin_not_allowed"),

@@ -220,6 +220,7 @@ _EMITTED_POLICY_AND_EXECUTION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "missing_secret_ref",
         "missing_sink",
         "missing_source",
+        "source_data_contract_analysis_limit_exceeded",
         "state_shape_materialization",
         "unauthorized_secret_ref",
         "web_fetch_private_network_not_allowed",
