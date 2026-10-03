@@ -28,6 +28,7 @@ from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
+    SourceDemandAnalysisLimitError,
     backtraced_source_demand,
     parse_source_data_contract_accepted_fields,
     source_data_contract_artifact_hash,
@@ -65,6 +66,7 @@ PROMPT_TEMPLATE_PARTS_KEY = "prompt_template_parts"
 SOURCE_COMPONENT_ID = "source"
 INTERPRETATION_REVIEW_PENDING_CODE = "interpretation_review_pending"
 INTERPRETATION_REVIEW_DRIFT_CODE = "interpretation_review_drift"
+SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE = "source_data_contract_analysis_limit_exceeded"
 PENDING_INTERPRETATION_AUTHORING_TEXT = "pending interpretation"
 RAW_HTML_CLEANUP_USER_TERM: Final[str] = "drop_raw_html_fields"
 # The CLOSED set of reviewable pipeline-decision terms. Every member must have
@@ -368,6 +370,23 @@ class InterpretationReviewIntegrityError(ValueError):
         super().__init__(message)
         self.component_id = component_id
         self.component_type: Literal["source", "transform"] = component_type
+        self.kind = kind
+
+
+class InterpretationReviewCapacityError(ValueError):
+    """Review derivation exceeded a fixed resource-safety boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        component_id: str,
+        component_type: Literal["source", "transform"],
+        kind: InterpretationKind,
+    ) -> None:
+        super().__init__(message)
+        self.component_id = component_id
+        self.component_type = component_type
         self.kind = kind
 
 
@@ -1456,7 +1475,15 @@ def current_source_data_contract_demand(state: CompositionState, source_name: st
             requirement["accepted_artifact_hash"],
         )
         disregard = frozenset(acknowledged)
-    return backtraced_source_demand(state, source_name, disregard_fields=disregard)
+    try:
+        return backtraced_source_demand(state, source_name, disregard_fields=disregard)
+    except SourceDemandAnalysisLimitError as exc:
+        raise InterpretationReviewCapacityError(
+            "source data-contract demand exceeds the bounded analysis limit",
+            component_id=source_component_id(source_name),
+            component_type="source",
+            kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+        ) from exc
 
 
 def _pending_source_data_contract_sites(state: CompositionState) -> tuple[InterpretationReviewSite, ...]:

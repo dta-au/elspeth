@@ -16,9 +16,11 @@ from typing import Any
 import pytest
 
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.composer import source_demand
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_DRAFT_VERSION,
     SOURCE_DATA_CONTRACT_USER_TERM,
+    SourceDemandAnalysisLimitError,
     backtraced_source_demand,
     build_source_data_contract_draft,
     parse_source_data_contract_accepted_fields,
@@ -340,6 +342,71 @@ class TestFanInDemandAttribution:
         assert any("Contract check skipped" in warning.message for warning in result.warnings)
         assert backtraced_source_demand(state, "src_a") == ()
         assert backtraced_source_demand(state, "src_b") == ()
+
+    def test_oversized_hypothesis_fails_closed_before_cross_product_materialization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A source-by-field product above the bound is a refusal, not no demand."""
+        state = _fan_in_state(
+            {
+                "src_a": _csv_source(_observed("id")),
+                "src_b": _csv_source(_observed("id")),
+                "src_c": _csv_source(_observed("id")),
+            },
+            required=["colour", "size"],
+        )
+        monkeypatch.setattr(source_demand, "MAX_SOURCE_DEMAND_HYPOTHESIS_FIELD_REFERENCES", 5)
+        original_stamp = source_demand.stamp_source_options_with_guarantees
+        original_eligibility = source_demand._eligible_source_stamp_size
+        stamped_field_counts: list[int] = []
+        eligibility_checks = 0
+
+        def _counting_stamp(options: dict[str, Any], guaranteed_fields: tuple[str, ...]) -> dict[str, Any] | None:
+            materialized_fields = tuple(guaranteed_fields)
+            stamped_field_counts.append(len(materialized_fields))
+            stamped = original_stamp(options, materialized_fields)
+            return dict(stamped) if stamped is not None else None
+
+        def _counting_eligibility(source: SourceSpec) -> int | None:
+            nonlocal eligibility_checks
+            eligibility_checks += 1
+            return original_eligibility(source)
+
+        monkeypatch.setattr(source_demand, "stamp_source_options_with_guarantees", _counting_stamp)
+        monkeypatch.setattr(source_demand, "_eligible_source_stamp_size", _counting_eligibility)
+
+        with pytest.raises(SourceDemandAnalysisLimitError, match="bounded hypothesis-work limit"):
+            backtraced_source_demand(state, "src_a")
+
+        # The eligibility probes are the positive control that the instrument
+        # observed the real path.  No cross-product stamp was built at all.
+        assert eligibility_checks > 0
+        assert stamped_field_counts == []
+
+    def test_maximal_runtime_fan_in_cannot_exceed_production_hypothesis_budget(self) -> None:
+        source_count = 50
+        field_count = source_demand.MAX_SOURCE_DEMAND_HYPOTHESIS_FIELD_REFERENCES // source_count + 1
+        state = _fan_in_state(
+            {f"src_{index}": _csv_source(_observed("id")) for index in range(source_count)},
+            required=[f"field_{index}" for index in range(field_count)],
+        )
+
+        with pytest.raises(SourceDemandAnalysisLimitError, match="bounded hypothesis-work limit"):
+            backtraced_source_demand(state, "src_0")
+
+    def test_existing_guarantees_are_charged_to_hypothesis_budget(self) -> None:
+        existing = tuple(f"existing_{index}" for index in range(500))
+        state = _fan_in_state(
+            {
+                "src_a": _csv_source(_observed(*existing)),
+                "src_b": _csv_source(_observed(*existing)),
+            },
+            required=["missing"],
+        )
+
+        with pytest.raises(SourceDemandAnalysisLimitError, match="bounded hypothesis-work limit"):
+            backtraced_source_demand(state, "src_a")
 
 
 class TestStampSourceOptions:

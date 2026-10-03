@@ -2493,6 +2493,7 @@ def _runtime_connection_lineage(
         nodes=nodes,
         sink_names=frozenset(),
     )
+    connection_memo: dict[str, tuple[bool, frozenset[str]]] = {}
 
     def _producer_is_compatible(
         producer: ProducerEntry,
@@ -2534,23 +2535,35 @@ def _runtime_connection_lineage(
             return True, frozenset()
         if connection_name in visiting:
             return False, frozenset()
+        if connection_name in connection_memo:
+            return connection_memo[connection_name]
         next_visiting = visiting | {connection_name}
         producer = resolver.find_producer_for(connection_name)
         if producer is None:
-            return False, frozenset()
+            result: tuple[bool, frozenset[str]] = (False, frozenset())
+            connection_memo[connection_name] = result
+            return result
         producer_node = resolver.get_node(producer.producer_id)
         if producer_node is not None and producer_node.node_type == "queue":
             predecessors = resolver.queue_predecessors(producer_node.id)
             if not predecessors:
-                return False, frozenset()
+                result = (False, frozenset())
+                connection_memo[connection_name] = result
+                return result
             lineage = frozenset((producer_node.id,))
             for predecessor in predecessors:
                 is_compatible, predecessor_lineage = _producer_is_compatible(predecessor, visiting=next_visiting)
                 if not is_compatible:
-                    return False, frozenset()
+                    result = (False, frozenset())
+                    connection_memo[connection_name] = result
+                    return result
                 lineage |= predecessor_lineage
-            return True, lineage
-        return _producer_is_compatible(producer, visiting=next_visiting)
+            result = (True, lineage)
+            connection_memo[connection_name] = result
+            return result
+        result = _producer_is_compatible(producer, visiting=next_visiting)
+        connection_memo[connection_name] = result
+        return result
 
     is_compatible, lineage_ids = _connection_is_compatible(target, visiting=frozenset())
     if not is_compatible:
@@ -5800,7 +5813,26 @@ def _check_schema_contracts(
             return False, frozenset()
         return _producer_entry_propagation_vote(producer, visited_fan_in_ids=visited_fan_in_ids)
 
+    _structural_vote_memo: dict[str, tuple[bool, frozenset[str]]] = {}
+
     def _producer_entry_propagation_vote(
+        producer: ProducerEntry,
+        *,
+        visited_fan_in_ids: frozenset[str],
+    ) -> tuple[bool, frozenset[str]]:
+        """Return one producer's structural vote, memoized for this validation walk."""
+        if producer.producer_id in visited_fan_in_ids:
+            return False, frozenset()
+        if producer.producer_id in _structural_vote_memo:
+            return _structural_vote_memo[producer.producer_id]
+        vote = _producer_entry_propagation_vote_uncached(
+            producer,
+            visited_fan_in_ids=visited_fan_in_ids | {producer.producer_id},
+        )
+        _structural_vote_memo[producer.producer_id] = vote
+        return vote
+
+    def _producer_entry_propagation_vote_uncached(
         producer: ProducerEntry,
         *,
         visited_fan_in_ids: frozenset[str],
@@ -5811,7 +5843,8 @@ def _check_schema_contracts(
         arms are several producers publishing the SAME connection (the queue
         id), so an arm's vote must be resolved per-entry, not per-connection.
 
-        ``visited_fan_in_ids`` terminates routing loops back into a fan-in node
+        ``visited_fan_in_ids`` is the historical name for the active producer
+        path. It terminates routing loops through every producer kind
         — drafts are not DAG-checked at Stage 1, so a composition can route a
         barrier's own output back into one of its branches, and a revisited
         barrier votes conservative abstention instead of recursing unboundedly
@@ -5839,8 +5872,6 @@ def _check_schema_contracts(
             # promoting a single arm's guarantee to the interleaved stream
             # would over-claim — the elspeth-a5b86149d4 hazard this branch
             # previously abstained over entirely.
-            if producer_node.id in visited_fan_in_ids:
-                return False, frozenset()
             arm_entries = resolver.queue_predecessors(producer_node.id)
             if not arm_entries:
                 return False, frozenset()
@@ -5860,8 +5891,6 @@ def _check_schema_contracts(
             # still must not invent guarantees from a SINGLE branch:
             # released rows arrive from exactly one branch, so
             # ``compose_propagation``'s abstainer-skip would over-claim.
-            if producer_node.id in visited_fan_in_ids:
-                return False, frozenset()
             branch_connections = _coalesce_branch_connections(producer_node.branches)
             if not branch_connections:
                 return False, frozenset()
@@ -5874,7 +5903,7 @@ def _check_schema_contracts(
             return False, frozenset()
 
         if producer_node.node_type == "coalesce":
-            if not producer_node.branches or producer_node.id in visited_fan_in_ids:
+            if not producer_node.branches:
                 return False, frozenset()
 
             branch_names = _coalesce_branch_names(producer_node.branches)

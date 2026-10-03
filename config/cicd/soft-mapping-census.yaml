@@ -441,20 +441,20 @@ files:
   src/elspeth/plugins/sources/aws_s3_source.py:
     Mapping[str, Any]: 1
     Mapping[str, object]: 3
-    dict[str, Any]: 6
+    dict[str, Any]: 5
   src/elspeth/plugins/sources/azure_blob_source.py:
     Mapping[str, Any]: 1
-    dict[str, Any]: 2
+    dict[str, Any]: 1
   src/elspeth/plugins/sources/blob_rows.py:
     dict[str, Any]: 2
   src/elspeth/plugins/sources/csv_source.py:
     Mapping[str, object]: 1
     dict[str, Any]: 1
   src/elspeth/plugins/sources/dataverse.py:
-    dict[str, Any]: 8
+    dict[str, Any]: 7
   src/elspeth/plugins/sources/json_source.py:
     Mapping[str, object]: 2
-    dict[str, Any]: 3
+    dict[str, Any]: 2
   src/elspeth/plugins/sources/llm/config.py:
     dict[str, Any]: 5
   src/elspeth/plugins/sources/llm/source.py:
@@ -1057,6 +1057,6 @@ totals:
   Mapping[str, object]: 311
   MutableMapping[str, Any]: 8
   boundary: 59
-  dict[str, Any]: 1069
+  dict[str, Any]: 1065
   dict[str, object]: 389
-  soft: 2517
+  soft: 2513
