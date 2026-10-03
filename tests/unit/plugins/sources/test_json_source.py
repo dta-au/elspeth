@@ -1657,6 +1657,9 @@ class TestJSONSourceKeyNormalization:
         sparse_error = rows[2].quarantine_error
         assert sparse_error is not None
         assert "exceeds maximum inferred schema fields" in sparse_error
+        resolution = source.get_field_resolution()
+        assert resolution is not None
+        assert resolution[0] == {"a": "a", "b": "b"}
 
     def test_observed_first_row_over_contract_field_cap_is_quarantined(
         self,
@@ -1688,6 +1691,7 @@ class TestJSONSourceKeyNormalization:
         first_row_error = rows[0].quarantine_error
         assert first_row_error is not None
         assert "exceeds maximum inferred schema fields" in first_row_error
+        assert source.get_field_resolution() is None
 
     def test_first_row_quarantined_key_rebuild(self, tmp_path: Path, ctx: PluginContext) -> None:
         """When first row is quarantined and second row has different keys, resolution rebuilds.

@@ -2011,6 +2011,7 @@ class TestSchemaContractLocking:
         error_call = ctx.record_validation_error.call_args.kwargs
         assert error_call["destination"] == on_validation_failure
         assert "exceeds maximum inferred schema fields" in error_call["error"]
+        assert source.get_field_resolution() is None
 
     @pytest.mark.parametrize("on_validation_failure", ["quarantine", "discard"])
     def test_sparse_contract_field_cap_is_a_counted_validation_failure(
@@ -2043,6 +2044,9 @@ class TestSchemaContractLocking:
             assert len(rows) == 1
         assert source._first_valid_row_processed is True
         assert source._quarantine_count == 1
+        resolution = source.get_field_resolution()
+        assert resolution is not None
+        assert resolution[0] == {"contactid": "contactid"}
         ctx.record_validation_error.assert_called_once()
         error_call = ctx.record_validation_error.call_args.kwargs
         assert error_call["destination"] == on_validation_failure

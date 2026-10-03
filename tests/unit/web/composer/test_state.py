@@ -10257,6 +10257,97 @@ class TestCompositionStateQueueGuaranteePropagation:
         result = state.validate()
         assert len(self._queue_skip_warnings(result)) == 1
 
+    def test_shared_queue_guarantee_subgraphs_are_evaluated_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A layered queue diamond stays linear in authored graph size."""
+        from elspeth.web.composer._producer_resolver import ProducerResolver
+
+        depth = 8
+        nodes: list[NodeSpec] = [self._queue("queue_0_a"), self._queue("queue_0_b")]
+        for layer in range(1, depth + 1):
+            previous = layer - 1
+            destinations = (f"queue_{layer}_a", f"queue_{layer}_b")
+            for branch in ("a", "b"):
+                nodes.append(
+                    NodeSpec(
+                        id=f"gate_{layer}_{branch}",
+                        node_type="gate",
+                        plugin=None,
+                        input=f"queue_{previous}_{branch}",
+                        on_success=None,
+                        on_error=None,
+                        options={},
+                        condition="True",
+                        routes={"true": destinations[0], "false": destinations[1]},
+                        fork_to=None,
+                        branches=None,
+                        policy=None,
+                        merge=None,
+                    )
+                )
+            nodes.extend((self._queue(destinations[0]), self._queue(destinations[1])))
+        nodes.extend(
+            (
+                self._consumer(input=f"queue_{depth}_a", required=["shared"]),
+                self._consumer("drain", input=f"queue_{depth}_b", on_success="drained"),
+            )
+        )
+
+        calls = 0
+        original = ProducerResolver.queue_predecessors
+
+        def counting_queue_predecessors(resolver: ProducerResolver, queue_id: str):
+            nonlocal calls
+            calls += 1
+            return original(resolver, queue_id)
+
+        monkeypatch.setattr(ProducerResolver, "queue_predecessors", counting_queue_predecessors)
+        state = self._state(
+            sources={
+                "left": self._source(guarantees=["shared"], on_success="queue_0_a"),
+                "right": self._source(guarantees=["shared"], on_success="queue_0_b"),
+            },
+            nodes=tuple(nodes),
+            outputs=(self._sink(), self._sink("drained")),
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, [error.message for error in result.errors]
+        assert calls <= (2 * depth) + 2
+
+    def test_gate_only_cycle_abstains_instead_of_recursing(self) -> None:
+        def gate(node_id: str, input_connection: str, output_connection: str) -> NodeSpec:
+            return NodeSpec(
+                id=node_id,
+                node_type="gate",
+                plugin=None,
+                input=input_connection,
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": output_connection, "false": output_connection},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+
+        state = self._state(
+            sources={"source": self._source(guarantees=["shared"], on_success="unused")},
+            nodes=(
+                gate("gate_a", "loop_b", "loop_a"),
+                gate("gate_b", "loop_a", "loop_b"),
+                self._consumer(input="loop_b", required=["shared"]),
+            ),
+            outputs=(self._sink(),),
+        )
+
+        result = state.validate()
+
+        assert result.is_valid is False
+        assert result.errors
+
     def test_queue_consumer_requiring_unguaranteed_field_is_rejected(self) -> None:
         # Red-parity direction: the engine rejects this at graph build
         # ("guarantees: (none - dynamic schema)" pre-fix / missing-field
@@ -10934,6 +11025,79 @@ class TestCompositionStateRowUnion:
             ("control_branch", "control_done"),
             ("treatment_branch", "treatment_done"),
         ]
+
+    def test_single_lineage_query_memoizes_shared_queue_subgraphs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.web.composer import state as state_module
+        from elspeth.web.composer._producer_resolver import ProducerResolver
+
+        def node(**overrides: Any) -> NodeSpec:
+            values: dict[str, Any] = {
+                "id": "node",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "root",
+                "on_success": "out",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+                "condition": None,
+                "routes": None,
+                "fork_to": None,
+                "branches": None,
+                "policy": None,
+                "merge": None,
+            }
+            values.update(overrides)
+            return NodeSpec(**values)
+
+        depth = 8
+        nodes = [
+            node(id="seed_a", on_success="queue_0_a"),
+            node(id="seed_b", on_success="queue_0_b"),
+            node(id="queue_0_a", node_type="queue", plugin=None, input="queue_0_a", on_success=None, on_error=None, options={}),
+            node(id="queue_0_b", node_type="queue", plugin=None, input="queue_0_b", on_success=None, on_error=None, options={}),
+        ]
+        for layer in range(1, depth + 1):
+            previous = layer - 1
+            destinations = (f"queue_{layer}_a", f"queue_{layer}_b")
+            for branch in ("a", "b"):
+                nodes.append(
+                    node(
+                        id=f"gate_{layer}_{branch}",
+                        node_type="gate",
+                        plugin=None,
+                        input=f"queue_{previous}_{branch}",
+                        on_success=None,
+                        on_error=None,
+                        options={},
+                        condition="True",
+                        routes={"true": destinations[0], "false": destinations[1]},
+                    )
+                )
+            for destination in destinations:
+                nodes.append(
+                    node(id=destination, node_type="queue", plugin=None, input=destination, on_success=None, on_error=None, options={})
+                )
+
+        calls = 0
+        original = ProducerResolver.queue_predecessors
+
+        def counting_queue_predecessors(resolver: ProducerResolver, queue_id: str):
+            nonlocal calls
+            calls += 1
+            return original(resolver, queue_id)
+
+        monkeypatch.setattr(ProducerResolver, "queue_predecessors", counting_queue_predecessors)
+
+        compatible, lineage = state_module._runtime_connection_lineage(
+            "root",
+            f"queue_{depth}_a",
+            {"source": self._source(on_success="root")},
+            tuple(nodes),
+        )
+
+        assert compatible is True
+        assert lineage
+        assert calls <= (2 * depth) + 2
 
     @pytest.mark.parametrize("output_mode", [None, "transform"])
     def test_row_union_rejects_transform_mode_aggregation_inside_branch(self, output_mode: str | None) -> None:

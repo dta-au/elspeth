@@ -1835,6 +1835,49 @@ class TestStringAmplificationRisk:
     def test_quiet_when_no_string_polarity(self, expression: str) -> None:
         assert ExpressionParser(expression).has_string_amplification_risk() is False
 
+    @pytest.mark.parametrize("expression", ["row['x'] + row['y']", "row['x'] + 'suffix'"])
+    def test_string_concatenation_risk_fires_for_ambiguous_addition(self, expression: str) -> None:
+        assert ExpressionParser(expression).has_string_concatenation_risk() is True
+
+    @pytest.mark.parametrize("expression", ["len(row['x']) + 1", "2 + 3"])
+    def test_string_concatenation_risk_allows_provably_numeric_addition(self, expression: str) -> None:
+        assert ExpressionParser(expression).has_string_concatenation_risk() is False
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "[upper(row['x']), upper(row['x'])]",
+            "len([casefold(row['x']), casefold(row['x'])])",
+            "{'a': strip(row['x']), 'b': lower(row['x'])}",
+        ],
+    )
+    def test_eager_container_string_allocation_risk_fires(self, expression: str) -> None:
+        assert ExpressionParser(expression).has_eager_container_string_allocation_risk() is True
+
+    def test_eager_container_string_allocation_allows_direct_references(self) -> None:
+        assert ExpressionParser("[row['x'], row['x']]").has_eager_container_string_allocation_risk() is False
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "len(upper(row['x']), upper(row['x']))",
+            "lower(row['x'], row['x'])",
+            "strip()",
+            "strip(row['x'], 'x', 'y')",
+        ],
+    )
+    def test_invalid_safe_builtin_arity_is_rejected_before_evaluation(self, expression: str) -> None:
+        with pytest.raises(ExpressionSecurityError, match="requires"):
+            ExpressionParser(expression)
+
+    def test_repeated_string_copying_calls_include_nested_arguments(self) -> None:
+        parser = ExpressionParser("strip(upper(row['x']), strip(lower(row['x'])))")
+
+        assert parser.has_repeated_string_copying_calls() is True
+
+    def test_single_string_copying_call_is_allowed(self) -> None:
+        assert ExpressionParser("upper(row['x'])").has_repeated_string_copying_calls() is False
+
     def test_polarity_not_shape_for_call_operands(self) -> None:
         """A str-capable Call operand fires; a numeric one does not.
 

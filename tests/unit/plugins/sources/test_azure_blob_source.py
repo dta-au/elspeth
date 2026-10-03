@@ -992,6 +992,24 @@ class TestAzureBlobSourceSchemaValidation:
         assert {field.normalized_name for field in second_contract.fields} == {"a", "b"}
         assert second_contract.get_field("b").original_name == "b"
 
+    def test_rejected_sparse_json_key_does_not_grow_field_resolution(
+        self,
+        ctx: PluginContext,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import elspeth.contracts.contract_builder as contract_builder
+
+        monkeypatch.setattr(contract_builder, "_MAX_INFERRED_CONTRACT_FIELDS", 2)
+        source = _make_source(_base_config(format="jsonl", schema=DYNAMIC_SCHEMA))
+
+        with patch(PATCH_AUTH, return_value=_fake_blob_service(b'{"a":1}\n{"b":2}\n{"c":3}\n')):
+            rows = list(source.load(ctx))
+
+        assert [row.is_quarantined for row in rows] == [False, False, True]
+        resolution = source.get_field_resolution()
+        assert resolution is not None
+        assert resolution[0] == {"a": "a", "b": "b"}
+
 
 class TestAzureBlobSourceFieldResolutionUnion:
     """B4.3: field resolution after heterogeneous sparse rows must be the UNION."""
