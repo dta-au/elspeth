@@ -3354,6 +3354,37 @@ def _make_basic_transform() -> WebScrapeTransform:
 
 
 @respx.mock
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("status_code", [101, 199, 600, 999])
+def test_nonstandard_non_success_status_never_emits_scraped_content(mock_ctx, method, status_code):
+    respx.route(method=method, url=f"https://{_TEST_IP}:443/nonstandard").mock(
+        return_value=httpx.Response(
+            status_code, text="<html><body>not successful content</body></html>", headers={"content-type": "text/html"}
+        )
+    )
+    transform = WebScrapeTransform(
+        {
+            "schema": {"mode": "observed"},
+            "url_field": "url",
+            "content_field": "page_content",
+            "fingerprint_field": "page_fingerprint",
+            "method": method,
+            "request_json_field": "request_payload" if method == "POST" else None,
+            "http": {"abuse_contact": "test@example.com", "scraping_reason": "status admission regression"},
+        }
+    )
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/nonstandard", "request_payload": {}}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.row is None
+    assert result.reason is not None
+    assert str(status_code) in result.reason["error"]
+
+
+@respx.mock
 def test_b3_9_http_400_returns_error_not_fingerprint(mock_ctx):
     """HTTP 400 must return an error result - not fingerprint the error-page body (B3.9)."""
     error_body = "<html><body><p>Bad Request</p></body></html>"
