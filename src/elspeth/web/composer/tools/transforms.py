@@ -744,8 +744,8 @@ def _execute_upsert_node(
         if prevalidation_error is not None:
             return _failure_result(
                 state,
-                prevalidation_error,
-                error_code="plugin_options_invalid",
+                prevalidation_error[0],
+                error_code=prevalidation_error[1],
                 plugin_identity=("transform", plugin),
             )
 
@@ -1767,8 +1767,8 @@ def _execute_patch_node_options(
         if prevalidation_error is not None:
             return _failure_result(
                 state,
-                prevalidation_error,
-                error_code="plugin_options_invalid",
+                prevalidation_error[0],
+                error_code=prevalidation_error[1],
                 plugin_identity=("transform", current.plugin),
             )
 
@@ -1962,8 +1962,8 @@ def _prepare_transform_candidate(
     if prevalidation_error is not None:
         return _failure_result(
             state,
-            prevalidation_error,
-            error_code="plugin_options_invalid",
+            prevalidation_error[0],
+            error_code=prevalidation_error[1],
             plugin_identity=("transform", plugin),
         )
     # Operator-profiled nodes carry their private provider config (retry budget /

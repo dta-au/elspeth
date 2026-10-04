@@ -9,13 +9,14 @@ escaped ``validate_pipeline`` uncaught (a bare 500 on /validate) while
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.protocol import YamlGenerator
 from elspeth.web.execution.schemas import CHECK_INTERPRETATION_REVIEW
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, InterpretationReviewCapacityError
 from tests.unit.web.execution.test_validation import (
     _make_node,
     _make_settings,
@@ -75,4 +76,28 @@ def test_resolved_prompt_review_drift_is_a_readiness_blocker_not_an_exception() 
     ]
     # Fixed copy only: the raw integrity message never reaches the result.
     assert "hash drifted" not in result.model_dump_json()
+    mock_yaml_gen.generate_yaml.assert_not_called()
+
+
+def test_source_demand_capacity_is_not_misreported_as_approved_review_drift() -> None:
+    mock_yaml_gen = MagicMock(spec=YamlGenerator)
+    capacity_error = InterpretationReviewCapacityError(
+        "bounded source-demand analysis refused",
+        component_id="source:src_a",
+        component_type="source",
+        kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+    )
+
+    with patch("elspeth.web.execution.validation.review_interpretations", side_effect=capacity_error):
+        result = validate_pipeline_for_trained_operator(_make_state(), _make_settings(), mock_yaml_gen)
+
+    assert result.is_valid is False
+    error = result.errors[0]
+    assert error.error_code == "source_data_contract_analysis_limit_exceeded"
+    assert error.component_id == "source:src_a"
+    assert error.component_type == "source"
+    assert "approved" not in error.message.lower()
+    assert result.readiness.authoring_valid is False
+    assert result.readiness.execution_ready is False
+    assert result.readiness.blockers[0].code == "source_data_contract_analysis_limit_exceeded"
     mock_yaml_gen.generate_yaml.assert_not_called()

@@ -49,6 +49,10 @@ export const IMPORT_YAML_NOT_RUNNABLE_INTRO_NO_DETAIL =
 export const IMPORT_YAML_422_MESSAGE =
   "This paste could not be imported: it is empty, or larger than the 256 KB limit.";
 
+const MAX_IMPORT_YAML_CHARS = 262_144;
+export const IMPORT_YAML_UNSAFE_MESSAGE =
+  "Pipeline YAML could not be read safely. Remove aliases or reduce nesting.";
+
 const IMPORT_YAML_GENERIC_ERROR_DETAIL = "Failed to import YAML. Please try again.";
 
 export const IMPORT_YAML_SECTION_KEYS = [
@@ -282,18 +286,35 @@ interface ParsedImportYamlDraft {
   hasText: boolean;
   document: ImportYamlParsedDocument | null;
   root: unknown;
+  validationMessage: string | null;
 }
 
 function parseImportYamlDraft(yamlText: string): ParsedImportYamlDraft {
-  if (yamlText.trim().length === 0) {
-    return { hasText: false, document: null, root: null };
+  // Python's backend limit counts Unicode code points, not UTF-16 units.
+  // Only count code points in the bounded ambiguous interval; do not allocate
+  // an Array for arbitrarily large pasted input.
+  if (yamlText.length > MAX_IMPORT_YAML_CHARS && (
+    yamlText.length > 2 * MAX_IMPORT_YAML_CHARS ||
+    Array.from(yamlText).length > MAX_IMPORT_YAML_CHARS
+  )) {
+    return { hasText: true, document: null, root: null, validationMessage: IMPORT_YAML_422_MESSAGE };
   }
-  const document = parseDocument(yamlText, { prettyErrors: false });
-  return {
-    hasText: true,
-    document,
-    root: document.errors.length > 0 ? null : document.toJS({}),
-  };
+  if (yamlText.trim().length === 0) {
+    return { hasText: false, document: null, root: null, validationMessage: null };
+  }
+  try {
+    const document = parseDocument(yamlText, { prettyErrors: false });
+    return {
+      hasText: true,
+      document,
+      // The backend refuses aliases before construction. Keep that rule here,
+      // before materialization, and contain parser/conversion exceptions.
+      root: document.errors.length > 0 ? null : document.toJS({ maxAliasCount: 0 }),
+      validationMessage: null,
+    };
+  } catch {
+    return { hasText: true, document: null, root: null, validationMessage: IMPORT_YAML_UNSAFE_MESSAGE };
+  }
 }
 
 function findImportYamlSourceBindingCandidatesFromParsed(
@@ -350,6 +371,17 @@ function analyseImportYamlDraftFromParsed(
   }
 
   const parsed = parsedDraft.document;
+  if (parsedDraft.validationMessage !== null) {
+    return {
+      hasText: true,
+      canImport: false,
+      sectionsParsed: false,
+      sourceCount: 0,
+      stepCount: 0,
+      outputCount: 0,
+      validationMessage: parsedDraft.validationMessage,
+    };
+  }
   if (parsed === null) {
     return {
       hasText: false,
@@ -796,6 +828,12 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
     // Reset the input so re-selecting the same file still fires onChange.
     event.target.value = "";
     if (!file) return;
+    // UTF-8 needs at most four bytes per admitted backend character. Refuse
+    // files that cannot fit before FileReader loads their contents.
+    if (file.size > 4 * MAX_IMPORT_YAML_CHARS) {
+      setError({ title: "Could not import the selected file.", detail: IMPORT_YAML_422_MESSAGE });
+      return;
+    }
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === "string") {

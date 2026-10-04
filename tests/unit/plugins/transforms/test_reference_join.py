@@ -141,6 +141,56 @@ class TestJoinSemantics:
         with pytest.raises(PluginConfigError, match=r"2 entries and 2 output fields.*4 values; the limit is 3"):
             build(output={"description": "ref['description']", "price": "ref['price']"})
 
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "ref['description'] * 1000000",
+            "ref['description'] % ref['price']",
+            "ref['description'] + ref['price']",
+        ],
+    )
+    def test_rejects_text_amplifying_output_expressions_before_evaluation(self, expression: str) -> None:
+        with pytest.raises(PluginConfigError, match="can amplify text"):
+            build(output={"description": expression})
+
+    def test_rejects_aggregate_materialized_output_above_byte_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(reference_join, "MAX_REFERENCE_INDEX_BYTES", 20)
+
+        with pytest.raises(PluginConfigError, match="20-byte materialized index limit"):
+            build(output={"first": "upper(ref['description'])", "second": "upper(ref['description'])"})
+
+    def test_rejects_repeated_large_values_inside_container_before_serialization(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(reference_join, "MAX_REFERENCE_INDEX_BYTES", 20)
+
+        with pytest.raises(PluginConfigError, match="20-byte materialized index limit"):
+            build(output={"copies": "[ref['description'], ref['description']]"})
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "[upper(ref['description']), upper(ref['description'])]",
+            "len([upper(ref['description']), upper(ref['description'])])",
+        ],
+    )
+    def test_rejects_eager_string_copies_inside_container(self, expression: str) -> None:
+        with pytest.raises(PluginConfigError, match="eager container construction"):
+            build(output={"copies": expression})
+
+    def test_rejects_invalid_builtin_arity_before_argument_evaluation(self) -> None:
+        with pytest.raises(PluginConfigError, match="requires 1 arguments"):
+            build(output={"copies": "len(upper(ref['description']), upper(ref['description']))"})
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "len(strip(upper(ref['description']), strip(lower(ref['description']))))",
+            "len({strip(ref['description'], 'a'), strip(ref['description'], 'ab')})",
+        ],
+    )
+    def test_rejects_repeated_string_copying_calls_without_a_list_literal(self, expression: str) -> None:
+        with pytest.raises(PluginConfigError, match="repeated string-copying calls"):
+            build(output={"copies": expression})
+
     def test_csv_flat_hit_adds_named_field(self, ctx: "PluginContext") -> None:
         transform = build()
         result = transform.process(make_pipeline_row({"order_id": "a", "product": "hats"}), ctx)
@@ -566,31 +616,16 @@ class TestTheTableIsWholeOrItIsRefused:
         assert result.row is not None
         assert result.row.to_dict()["d"] is None
 
-    def test_a_format_key_the_entry_lacks_is_a_miss_not_a_crash(self) -> None:
-        """``str % mapping`` raises KeyError when the mapping lacks the named key (C3 review r2).
-
-        The evaluator classifies it as ``missing_key`` — the same fact as a
-        subscript miss: this entry's mapping does not hold what the expression
-        asks for — so a sparse entry stays governed by on_miss. It used to crash
-        through the load as a bare KeyError.
-        """
+    def test_percent_format_expression_is_refused_before_sparse_evaluation(self) -> None:
+        """Formatting can allocate before the retained-byte gate, so load refuses it."""
         table = json.dumps([{"sku": "hats", "attrs": {"description": "A fine hat"}}, {"sku": "coats", "attrs": {}}])
-        transform = build(
-            reference_content=table,
-            reference_format="json",
-            output={"d": "'%(description)s' % ref['attrs']"},
-            on_miss="null",
-        )
-        ctx_local = make_source_context()
-
-        hit = transform.process(make_pipeline_row({"product": "hats"}), ctx_local)
-        miss = transform.process(make_pipeline_row({"product": "coats"}), ctx_local)
-
-        assert hit.row is not None
-        assert hit.row.to_dict()["d"] == "A fine hat"
-        assert miss.status == "success"
-        assert miss.row is not None
-        assert miss.row.to_dict()["d"] is None
+        with pytest.raises(PluginConfigError, match="can amplify text"):
+            build(
+                reference_content=table,
+                reference_format="json",
+                output={"d": "'%(description)s' % ref['attrs']"},
+                on_miss="null",
+            )
 
 
 class TestANullIsAValueAndAMissIsNot:

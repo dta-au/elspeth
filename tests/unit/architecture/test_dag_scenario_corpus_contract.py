@@ -964,7 +964,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # Strict snapshot opt-in: csv/json source hashes moved; the exact projection
 # pins retain their behavior and the checkpoint full-history hash was measured
 # by the production harness. This digest comes from the canonical loader.
-EXPECTED_CASE_REGISTRY_SHA256 = "5b90e5b4eef5e7fb7b7f3f509a7f9eb6b3d3e997d71c20570d80173427afc215"
+# Resource exhaustion fixes: JSONSource's manifest provenance token moved to
+# 997ca99f1069c7e6. Reverting only that token reproduces the prior registry
+# digest; no resume projection or frozen oracle changes are required.
+EXPECTED_CASE_REGISTRY_SHA256 = "b5dec215ed98c17e3b91f7dfe01e1ecd093d36799948beb165f50a1b6a2188ac"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

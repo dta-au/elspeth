@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 
 import structlog
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, JsonValue, ValidationError, field_validator, model_validator
 
 from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import SourceContext
@@ -424,7 +424,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:187311dbfdf3a7d6"
+    source_file_hash: str | None = "sha256:9b3702740122b8f8"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -1110,7 +1110,7 @@ class AzureBlobSource(BaseSource):
                 )
             return
 
-    def _normalize_row_keys(self, row: Any) -> Mapping[str, Any]:
+    def _prepare_normalized_row_keys(self, row: Any) -> tuple[Mapping[str, JsonValue], FieldResolution]:
         """Normalize JSON/JSONL object keys at the source boundary."""
         try:
             row_items = list(row.items())
@@ -1128,17 +1128,19 @@ class AzureBlobSource(BaseSource):
         raw_keys = [key for key, _ in row_items]
 
         if self._field_resolution is None:
-            self._field_resolution = self._resolve_json_field_names(raw_keys)
+            prospective_resolution = self._resolve_json_field_names(raw_keys)
 
             if self._contract_builder is None and self.get_schema_contract() is None:
                 initial_contract = create_contract_from_config(
                     self._schema_config,
-                    field_resolution=self._field_resolution.resolution_mapping,
+                    field_resolution=prospective_resolution.resolution_mapping,
                 )
                 self._contract_builder = ContractBuilder(initial_contract)
+        else:
+            prospective_resolution = self._field_resolution
 
-        mapping = self._field_resolution.resolution_mapping
-        normalized: dict[str, Any] = {}
+        mapping = prospective_resolution.resolution_mapping
+        normalized: dict[str, JsonValue] = {}
         new_raw_keys: list[str] = []
         for key, value in row_items:
             if key in mapping:
@@ -1157,16 +1159,21 @@ class AzureBlobSource(BaseSource):
             # Extend with just the new raw keys while preserving B4.3 union
             # semantics. Rebuilding the full historical key set on every sparse
             # row is quadratic in attacker-controlled fields.
-            assert self._field_resolution is not None  # set on first row above
             try:
-                self._field_resolution = extend_field_resolution(
-                    self._field_resolution,
+                prospective_resolution = extend_field_resolution(
+                    prospective_resolution,
                     raw_headers=new_raw_keys,
                     field_mapping=self._field_mapping,
                 )
             except FieldMappingCollisionError as exc:
                 raise ExternalHeaderError(str(exc)) from exc
 
+        return normalized, prospective_resolution
+
+    def _normalize_row_keys(self, row: Any) -> Mapping[str, Any]:
+        """Normalize and commit field resolution for direct trusted callers."""
+        normalized, prospective_resolution = self._prepare_normalized_row_keys(row)
+        self._field_resolution = prospective_resolution
         return normalized
 
     def _resolve_json_field_names(self, raw_keys: list[str]) -> FieldResolution:
@@ -1195,8 +1202,13 @@ class AzureBlobSource(BaseSource):
         Yields:
             SourceRow.valid() if valid, SourceRow.quarantined() if invalid.
         """
+        prospective_resolution: FieldResolution | None
         try:
-            row_to_validate = self._normalize_row_keys(row) if self._format in ("json", "jsonl") else row
+            if self._format in ("json", "jsonl"):
+                row_to_validate, prospective_resolution = self._prepare_normalized_row_keys(row)
+            else:
+                row_to_validate = row
+                prospective_resolution = self._field_resolution
         except ExternalHeaderError as e:
             # Tier-3 data faults only: a non-object row, external-key
             # normalization failure, or a row-created mapping collision reclassified
@@ -1227,12 +1239,10 @@ class AzureBlobSource(BaseSource):
 
             # For FLEXIBLE/OBSERVED schemas, process first valid row to lock contract
             if self._contract_builder is not None and not self._first_valid_row_processed:
-                if self._field_resolution is None:
-                    if self._format in ("json", "jsonl"):
-                        raise ValueError("field_resolution must be established before first-row contract inference")
+                if prospective_resolution is None:
                     field_resolution_map: Mapping[str, str] = {k: k for k in validated_row}
                 else:
-                    field_resolution_map = self._field_resolution.resolution_mapping
+                    field_resolution_map = prospective_resolution.resolution_mapping
 
                 self._contract_builder.process_first_row(validated_row, field_resolution_map)
                 self.set_schema_contract(self._contract_builder.contract)
@@ -1246,14 +1256,15 @@ class AzureBlobSource(BaseSource):
                 # JSON/JSONL blobs can be sparse. If a later row emits a new
                 # normalized key, the row contract must own its original-name
                 # and type metadata before validation and yield.
-                if self._field_resolution is None:
+                if prospective_resolution is None:
                     raise ValueError("field_resolution must be established before sparse-field contract inference")
                 contract = self._contract_builder.process_sparse_fields(
                     validated_row,
-                    self._field_resolution.resolution_mapping,
+                    prospective_resolution.resolution_mapping,
                 )
                 self.set_schema_contract(contract)
 
+            self._field_resolution = prospective_resolution
             if contract.locked:
                 violations = contract.validate(validated_row)
                 if violations:

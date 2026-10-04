@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -298,6 +299,10 @@ def test_owner_only_directory_check_refuses_unsafe_ancestor(tmp_path: Path, kind
         directory.symlink_to(tmp_path, target_is_directory=True)
     else:
         directory.mkdir(mode=0o755 if kind == "public-directory" else 0o700)
+        if kind == "public-directory":
+            # mkdir's mode is filtered by umask; construct the actual unsafe input.
+            directory.chmod(0o755)
+            assert stat.S_IMODE(directory.stat().st_mode) == 0o755
     if kind == "foreign-owner":
         # The OS stat result remains real; a process with a different uid
         # must refuse this directory instead of accepting another owner's data.

@@ -70,6 +70,19 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/tools/_common.py", "_validate_plugin_name", "PluginUnavailableReason.NOT_INSTALLED"),
         ("composer/tools/_common.py", "_validate_plugin_name", "PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING"),
         ("composer/tools/_common.py", "_validate_plugin_name", "reason"),
+        # Context prevalidation carries a censused policy code or the ordinary
+        # plugin_options_invalid fallback alongside its message, including the
+        # nested legacy-source rejection and the plural-source builder path.
+        ("composer/tools/sources.py", "_resolve_source_blob", "prevalidation_error[1]"),
+        ("composer/tools/sources.py", "_execute_set_source", "prevalidation_error[1]"),
+        ("composer/tools/sources.py", "_resolve_source_blobs", "prevalidation_error[1]"),
+        ("composer/tools/sources.py", "_execute_patch_source_options", "prevalidation_error[1]"),
+        ("composer/tools/transforms.py", "_execute_upsert_node", "prevalidation_error[1]"),
+        ("composer/tools/transforms.py", "_execute_patch_node_options", "prevalidation_error[1]"),
+        ("composer/tools/transforms.py", "_prepare_transform_candidate", "prevalidation_error[1]"),
+        ("composer/tools/sessions.py", "build_set_pipeline_candidate", "src_prevalidation[1]"),
+        ("composer/tools/sessions.py", "_legacy_source_rejection", "src_prevalidation[1]"),
+        ("composer/tools/sessions.py", "build_set_pipeline_candidate", "node_prevalidation[1]"),
         # A code read back from a state-validation entry, directly or through
         # ``_post_mutation_invariant_error`` / ``_row_union_node_contract_error``
         # (both return an entry's own ``error_code``), or a local chosen from
@@ -113,6 +126,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("execution/_validation_authoring.py", "lower_plugin_policy", "item.error_code"),
         ("execution/_validation_authoring.py", "validate_web_network_policy", "error_code"),
         ("execution/_validation_authoring.py", "review_interpretations", "INTERPRETATION_REVIEW_PENDING_CODE"),
+        ("execution/validation.py", "_interpretation_review_capacity_failure", "SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE"),
         ("execution/validation.py", "_interpretation_review_drift_failure", "INTERPRETATION_REVIEW_DRIFT_CODE"),
         ("execution/_validation_diagnostics.py", "_reframe_settings_missing_parts", "_SETTINGS_MISSING_PART_REFRAMES[part][0]"),
         ("execution/_validation_materialization.py", "_blob_inline_validation_error", "f'{violation.category}_inline_blob_content'"),
@@ -171,18 +185,21 @@ def _is_literal(expression: ast.expr, constants: dict[str, str]) -> bool:
 
 
 def _walk_outside_fstrings(expression: ast.expr) -> list[ast.AST]:
-    """``ast.walk`` that does not descend into f-strings.
+    """Walk potential code values, excluding predicates and f-string fragments.
 
     An f-string's constant fragments are not codes (``f"{category}_suffix"``
     would otherwise report ``"_suffix"``); the whole f-string is a non-literal
-    site and must be a reviewed forwarder.
+    site and must be a reviewed forwarder. A conditional's predicate chooses
+    between code values; its own comparison strings are not emitted codes.
     """
     nodes: list[ast.AST] = []
     pending: list[ast.AST] = [expression]
     while pending:
         node = pending.pop()
         nodes.append(node)
-        if not isinstance(node, ast.JoinedStr):
+        if isinstance(node, ast.IfExp):
+            pending.extend((node.body, node.orelse))
+        elif not isinstance(node, ast.JoinedStr):
             pending.extend(ast.iter_child_nodes(node))
     return nodes
 
@@ -280,6 +297,20 @@ class TestRegistryCensus:
         planted = "_err = ValidationEntry\ndef f():\n    return _err('c', 'm', 'high', 'zz_positional_unregistered')\n"
         assert _unregistered_literals(_code_sites("planted.py", planted)) == {("planted.py", "f", "zz_positional_unregistered")}
 
+    @pytest.mark.parametrize("other_code", ["plugin_unavailable", "zz_branch_unregistered"])
+    def test_instrument_ignores_condition_strings_but_checks_both_code_values(self, other_code: str) -> None:
+        planted = (
+            "def f(state, reason):\n"
+            "    return _failure_result(state, 'm', error_code='plugin_options_invalid' "
+            f"if reason == 'zz_condition_literal' else {other_code!r})\n"
+        )
+        sites = _code_sites("planted.py", planted)
+        assert sites[0].literals == (other_code, "plugin_options_invalid")
+        assert _unregistered_literals(sites) == (
+            set() if other_code == "plugin_unavailable" else {("planted.py", "f", "zz_branch_unregistered")}
+        )
+        assert _unreviewed_forwarders(sites) == set()
+
     def test_instrument_flags_a_planted_unreviewed_forwarder(self) -> None:
         planted = "def f(state, code):\n    return _failure_result(state, 'm', error_code=code)\n"
         assert _unreviewed_forwarders(_code_sites("planted.py", planted)) == {("planted.py", "f", "code")}
@@ -319,9 +350,17 @@ class TestRegistryCensus:
 
         from elspeth.contracts.blobs_inline import BlobInlineValidationCategory
         from elspeth.web.execution._validation_diagnostics import _SETTINGS_MISSING_PART_REFRAMES
-        from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_DRIFT_CODE, INTERPRETATION_REVIEW_PENDING_CODE
+        from elspeth.web.interpretation_state import (
+            INTERPRETATION_REVIEW_DRIFT_CODE,
+            INTERPRETATION_REVIEW_PENDING_CODE,
+            SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE,
+        )
 
-        assert {INTERPRETATION_REVIEW_PENDING_CODE, INTERPRETATION_REVIEW_DRIFT_CODE} <= REGISTERED_ERROR_CODES
+        assert {
+            INTERPRETATION_REVIEW_PENDING_CODE,
+            INTERPRETATION_REVIEW_DRIFT_CODE,
+            SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE,
+        } <= REGISTERED_ERROR_CODES
         assert {reframe[0] for reframe in _SETTINGS_MISSING_PART_REFRAMES.values()} <= REGISTERED_ERROR_CODES
         assert {f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory)} <= REGISTERED_ERROR_CODES
         assert {"web_scrape_private_network_not_allowed", "web_fetch_private_network_not_allowed"} <= REGISTERED_ERROR_CODES
@@ -381,6 +420,7 @@ def _persisted_first_error(tool_name: str, error_code: str) -> dict[str, object]
         ("upsert_node", "profile_alias_used_as_bucket"),
         ("upsert_node", "required_control_unavailable"),
         ("set_pipeline", "required_control_coverage"),
+        ("set_pipeline", "source_data_contract_analysis_limit_exceeded"),
         ("patch_node_options", "llm_base_url_not_allowed"),
         ("set_source", "fabricated_secret"),
         ("set_source", "power_automate_origin_not_allowed"),

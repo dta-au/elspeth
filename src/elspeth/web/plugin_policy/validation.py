@@ -510,7 +510,7 @@ def _lower_profiled_components(
                         stage="operator_profile_options",
                         component_id=component.component_id,
                         component_type=component.component_type,
-                        error_code="profile_unavailable",
+                        error_code="plugin_options_invalid",
                         message=(
                             f"Plugin '{plugin_id}' source routing disagrees with its profile-bound "
                             "on_validation_failure option. Keep one exact source routing value."
@@ -560,7 +560,7 @@ def _lower_profiled_components(
                     stage="operator_profile_options",
                     component_id=component.component_id,
                     component_type=component.component_type,
-                    error_code="profile_unavailable",
+                    error_code="plugin_options_invalid",
                     message=f"Plugin '{plugin_id}' options do not match its public operator-profile schema; {detail}",
                 )
             )
@@ -609,7 +609,11 @@ def _lower_profiled_components(
                     stage="operator_profile_options",
                     component_id=component.component_id,
                     component_type=component.component_type,
-                    error_code="plugin_unavailable",
+                    error_code=(
+                        "plugin_options_invalid"
+                        if str(exc) in {"private_profile_option", "unsafe_s3_object_key", "profile_index_not_admitted"}
+                        else "plugin_unavailable"
+                    ),
                     message=message,
                 )
             )
@@ -679,7 +683,7 @@ def _profile_unavailable_finding(
     plugin_id: PluginId,
     available_aliases: tuple[str, ...] = (),
 ) -> PluginPolicyFinding:
-    # Two distinct realities share this error code: profiles exist but the
+    # Two distinct realities need distinct codes: profiles exist but the
     # options failed to select one (author-fixable — name the aliases), and
     # no profile is configured or available at all (operator-fixable).
     # Conflating them told authors "an operator must enable a profile" while
@@ -700,7 +704,7 @@ def _profile_unavailable_finding(
         stage="operator_profile_options",
         component_id=component.component_id,
         component_type=component.component_type,
-        error_code="profile_unavailable",
+        error_code="plugin_options_invalid" if available_aliases else "profile_unavailable",
         message=message,
     )
 
@@ -800,6 +804,17 @@ def _profile_lowering_context(
     if not requires_profile and "profile" not in component.options:
         return None
     aliases = aliases_by_plugin[plugin_id] if plugin_id in aliases_by_plugin else ()
+    if not requires_profile and not aliases:
+        findings.append(
+            PluginPolicyFinding(
+                stage="operator_profile_options",
+                component_id=component.component_id,
+                component_type=component.component_type,
+                error_code="plugin_options_invalid",
+                message=f"Plugin '{plugin_id}' does not offer operator profiles for this request; remove the profile option and use its authored options.",
+            )
+        )
+        return None
     if profile_registry is None or not aliases:
         findings.append(_profile_unavailable_finding(component, plugin_id))
         return None
@@ -812,7 +827,7 @@ def _profile_lowering_context(
 
 
 def _normalized_profile_findings(findings: list[PluginPolicyFinding]) -> tuple[PluginPolicyFinding, ...]:
-    """Expose the single public profile failure code at the web boundary."""
+    """Normalize unavailable bindings without relabelling author option errors."""
     return tuple(
         replace(finding, error_code="profile_unavailable")
         if finding.stage == "operator_profile_options" and finding.error_code == "plugin_unavailable"

@@ -1072,6 +1072,19 @@ class TestAWSS3SourceRegistrationAndParsing:
         )
         assert [row.row for row in source.load(ctx)] == [{"id": 1}, {"id": 2, "display_name": "Grace"}]
 
+    def test_rejected_sparse_json_key_does_not_grow_field_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import elspeth.contracts.contract_builder as contract_builder
+
+        monkeypatch.setattr(contract_builder, "_MAX_INFERRED_CONTRACT_FIELDS", 2)
+        source, _, ctx = _source_for(b'{"a":1}\n{"b":2}\n{"c":3}\n', format="jsonl")
+
+        rows = list(source.load(ctx))
+
+        assert [row.is_quarantined for row in rows] == [False, False, True]
+        resolution = source.get_field_resolution()
+        assert resolution is not None
+        assert resolution[0] == {"a": "a", "b": "b"}
+
     def test_fixed_schema_quarantines_invalid_row_without_echoing_value(self) -> None:
         sentinel = "credential-body-SENTINEL"
         source, _, ctx = _source_for(

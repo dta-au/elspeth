@@ -128,6 +128,8 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REVIEW_DRIFT_CODE,
+    SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE,
+    InterpretationReviewCapacityError,
     InterpretationReviewIntegrityError,
     InterpretationReviewPending,
     materialize_state_for_authoring,
@@ -228,6 +230,42 @@ def _interpretation_review_drift_failure(
     )
 
 
+def _interpretation_review_capacity_failure(
+    exc: InterpretationReviewCapacityError,
+    *,
+    semantic_contracts: tuple[SemanticEdgeContractResponse, ...],
+) -> PhaseFailure:
+    """Fail closed when safe review derivation exceeds its fixed work bound."""
+    detail = "Source data-contract review analysis exceeds the bounded work limit."
+    return PhaseFailure(
+        passed_checks=(),
+        failed_check=ValidationCheck(
+            name=CHECK_INTERPRETATION_REVIEW,
+            passed=False,
+            detail=detail,
+            affected_nodes=(),
+            outcome_code=None,
+        ),
+        errors=(
+            ValidationError(
+                component_id=exc.component_id,
+                component_type=exc.component_type,
+                message=detail,
+                suggestion="Reduce the source/required-field combination or declare explicit source schemas.",
+                error_code=SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE,
+            ),
+        ),
+        readiness=_blocked_readiness(
+            code=SOURCE_DATA_CONTRACT_ANALYSIS_LIMIT_CODE,
+            detail=detail,
+            component_id=exc.component_id,
+            component_type=exc.component_type,
+            authoring_valid=False,
+        ),
+        semantic_contracts=semantic_contracts,
+    )
+
+
 def _review_interpretations_or_drift_failure(
     authored: AuthoredValidatedState,
     *,
@@ -236,6 +274,8 @@ def _review_interpretations_or_drift_failure(
     """The interpretation-review phase outcome, with resolved-review drift as its failure."""
     try:
         return review_interpretations(authored, allow_pending_placeholders=allow_pending_placeholders)
+    except InterpretationReviewCapacityError as exc:
+        return _interpretation_review_capacity_failure(exc, semantic_contracts=authored.semantic_contracts)
     except InterpretationReviewIntegrityError as exc:
         return _interpretation_review_drift_failure(exc, semantic_contracts=authored.semantic_contracts)
 

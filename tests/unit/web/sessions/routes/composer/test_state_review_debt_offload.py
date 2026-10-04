@@ -27,13 +27,14 @@ import time
 from pathlib import Path
 from time import perf_counter
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from tests.unit.web.sessions.test_e2e_state_seed_route import _make_app, _ready_readiness, _valid_state
 
 from elspeth.web.execution.schemas import ValidationResult
+from elspeth.web.secrets.service import ScopedSecretResolver
 
 _CHECK_TARGET = "elspeth.web.composer.interpretation_surfacing.unsurfaceable_pending_interpretation_review_sites"
 _PREFLIGHT_TARGET = "elspeth.web.sessions.routes._helpers._runtime_preflight_for_state"
@@ -126,4 +127,52 @@ async def test_seed_review_debt_check_refuses_at_the_configured_bound(tmp_path: 
     assert entered.is_set()
     assert response.status_code == 504, response.text
     assert response.json()["detail"] == "Review-debt check did not complete within the configured bound; seed aborted."
+    assert await service.get_current_state(session.id) is None
+
+
+@pytest.mark.asyncio
+async def test_yaml_import_refuses_source_demand_hypothesis_over_work_limit(tmp_path: Path) -> None:
+    app, service = _make_app(tmp_path)
+    secret_service = MagicMock(spec=ScopedSecretResolver)
+    secret_service.list_refs.return_value = []
+    app.state.scoped_secret_resolver = secret_service
+    session = await service.create_session("alice", "Import", "local")
+    sources = "\n".join(
+        f"""  src_{index}:
+    plugin: csv
+    on_success: q
+    on_validation_failure: discard
+    options:
+      schema:
+        mode: observed
+        guaranteed_fields: [id]"""
+        for index in range(50)
+    )
+    required_fields = ", ".join(f"field_{index}" for index in range(21))
+    pipeline_yaml = f"""sources:
+{sources}
+queues:
+  q: {{}}
+transforms:
+  - name: rate
+    plugin: llm
+    input: q
+    on_success: rated
+    on_error: discard
+    options:
+      profile: test
+      prompt_template: "Rate the row."
+      required_input_fields: [{required_fields}]
+      schema:
+        mode: observed
+"""
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": pipeline_yaml})
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == (
+        "Imported YAML requires source data-contract analysis beyond the bounded work limit. "
+        "Reduce the source/required-field combination or declare explicit source schemas."
+    )
     assert await service.get_current_state(session.id) is None

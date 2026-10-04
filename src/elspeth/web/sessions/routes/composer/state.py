@@ -38,7 +38,12 @@ from elspeth.web.coordination.composer_progress_authority import (
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import require_no_credential_material_in_state
-from elspeth.web.interpretation_state import InterpretationReviewSite, parse_interpretation_requirements
+from elspeth.web.interpretation_state import (
+    InterpretationReviewCapacityError,
+    InterpretationReviewIntegrityError,
+    InterpretationReviewSite,
+    parse_interpretation_requirements,
+)
 from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, managed_blob_directory, resolve_data_path
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
@@ -933,6 +938,19 @@ async def seed_state_from_runtime_yaml(
                     request=request,
                     timeout_detail=_IMPORT_REVIEW_DEBT_TIMEOUT_DETAIL,
                 )
+            except InterpretationReviewCapacityError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Imported YAML requires source data-contract analysis beyond the bounded work limit. "
+                        "Reduce the source/required-field combination or declare explicit source schemas."
+                    ),
+                ) from exc
+            except InterpretationReviewIntegrityError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Imported YAML contains malformed interpretation review metadata.",
+                ) from exc
             except (InvariantError, KeyError, TypeError, ValueError) as exc:
                 # These remain invariant failures for internally persisted state.
                 # At this route the state is untrusted YAML, so reject statically

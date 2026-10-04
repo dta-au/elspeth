@@ -74,6 +74,20 @@ _SAMPLE_HEADER_READ_BYTES: Final[int] = 65536
 _SAMPLE_HEADER_MAX_COLUMNS: Final[int] = 512
 _SAMPLE_HEADER_MAX_CELL_CHARS: Final[int] = 512
 
+# Every source-demand hypothesis copies the complete missing-field set into
+# every card-eligible source.  Keep that Cartesian product bounded before any
+# such copy is materialized.  The runtime admits at most 50 sources, so this
+# permits (for example) 20 missing fields across a maximal fan-in while
+# bounding one hypothesis to 1,000 retained field references.  States above
+# the bound remain invalid under the ordinary edge-contract validation; they
+# must be repaired with explicit schemas instead of asking the review system
+# to construct an unbounded proof.
+MAX_SOURCE_DEMAND_HYPOTHESIS_FIELD_REFERENCES: Final[int] = 1_000
+
+
+class SourceDemandAnalysisLimitError(ValueError):
+    """The source-demand proof would exceed its fixed materialization bound."""
+
 
 def source_data_contract_artifact_hash(fields: Iterable[str]) -> str:
     """Canonical artifact hash binding current semantics and demand fields.
@@ -198,6 +212,55 @@ def _unsatisfied_edge_misses(state: CompositionState) -> dict[tuple[str, str], f
     }
 
 
+def _eligible_source_stamp_size(source: SourceSpec) -> int | None:
+    """Return the existing stamp size without copying its field collection."""
+    options = source.options
+    schema_key = "schema" if "schema" in options else ("schema_config" if "schema_config" in options else None)
+    if schema_key is None:
+        return 0
+    raw_schema = options[schema_key]
+    if not isinstance(raw_schema, Mapping):
+        return None
+    if "fields" in raw_schema and raw_schema["fields"]:
+        return None
+    mode = raw_schema["mode"] if "mode" in raw_schema else "observed"
+    if mode != "observed":
+        return None
+    existing = raw_schema["guaranteed_fields"] if "guaranteed_fields" in raw_schema else ()
+    if existing is None:
+        return 0
+    if not isinstance(existing, (list, tuple)):
+        return None
+    if len(existing) > MAX_SOURCE_DEMAND_HYPOTHESIS_FIELD_REFERENCES:
+        raise SourceDemandAnalysisLimitError("source data-contract demand analysis exceeds the bounded hypothesis-work limit")
+    if not all(isinstance(field, str) for field in existing):
+        return None
+    return len(existing)
+
+
+def _eligible_sources(state: CompositionState) -> dict[str, tuple[SourceSpec, int]]:
+    """Return sources that can carry a review-backed guarantee stamp.
+
+    The predicate mirrors the stamp authority's supported schema spellings
+    and abstention rules without materializing the attacker-amplified
+    source-by-field product.
+    """
+    eligible: dict[str, tuple[SourceSpec, int]] = {}
+    for name, candidate in state.sources.items():
+        if SOURCE_AUTHORING_KEY in candidate.options:
+            continue
+        existing_count = _eligible_source_stamp_size(candidate)
+        if existing_count is not None:
+            eligible[name] = candidate, existing_count
+    return eligible
+
+
+def _check_hypothesis_work_bound(*, existing_field_counts: Iterable[int], missing_field_count: int) -> None:
+    projected_field_references = sum(existing_count + missing_field_count for existing_count in existing_field_counts)
+    if projected_field_references > MAX_SOURCE_DEMAND_HYPOTHESIS_FIELD_REFERENCES:
+        raise SourceDemandAnalysisLimitError("source data-contract demand analysis exceeds the bounded hypothesis-work limit")
+
+
 def backtraced_source_demand(
     state: CompositionState,
     source_name: str,
@@ -243,7 +306,8 @@ def backtraced_source_demand(
     if source is None or SOURCE_AUTHORING_KEY in source.options:
         return ()
     baseline_options = _source_options_without_guaranteed_fields(source.options, disregard_fields)
-    if stamp_source_options_with_guarantees(baseline_options, ()) is None:
+    baseline_source = replace(source, options=baseline_options)
+    if _eligible_source_stamp_size(baseline_source) is None:
         return ()
     baseline_state = _state_with_source_options(state, source_name, source, baseline_options)
     baseline_misses = _unsatisfied_edge_misses(baseline_state)
@@ -252,17 +316,24 @@ def backtraced_source_demand(
     all_missing = frozenset().union(*baseline_misses.values())
 
     # Card-eligible sources, judged on the BASELINE state (so this source's
-    # eligibility reflects its stripped options).
-    stamped_by_name: dict[str, Mapping[str, Any]] = {}
-    for name, candidate in baseline_state.sources.items():
-        if SOURCE_AUTHORING_KEY in candidate.options:
-            continue
-        stamped = stamp_source_options_with_guarantees(candidate.options, sorted(all_missing))
-        if stamped is None:
-            continue
-        stamped_by_name[name] = stamped
-    if source_name not in stamped_by_name:
+    # eligibility reflects its stripped options).  Establish eligibility
+    # with empty stamps first, then reject an oversized Cartesian hypothesis
+    # before copying all_missing into any source.
+    eligible_by_name = _eligible_sources(baseline_state)
+    if source_name not in eligible_by_name:
         return ()
+    _check_hypothesis_work_bound(
+        existing_field_counts=(existing_count for _source, existing_count in eligible_by_name.values()),
+        missing_field_count=len(all_missing),
+    )
+
+    sorted_missing = sorted(all_missing)
+    stamped_by_name: dict[str, Mapping[str, Any]] = {}
+    for name, (candidate, _existing_count) in eligible_by_name.items():
+        stamped = stamp_source_options_with_guarantees(candidate.options, sorted_missing)
+        if stamped is None:  # pragma: no cover - eligibility and stamping share one pure authority
+            raise AuditIntegrityError("source guarantee-stamp eligibility changed within one demand analysis")
+        stamped_by_name[name] = stamped
 
     h_all_misses = _unsatisfied_edge_misses(_state_with_stamped_sources(baseline_state, stamped_by_name))
     if len(stamped_by_name) == 1:

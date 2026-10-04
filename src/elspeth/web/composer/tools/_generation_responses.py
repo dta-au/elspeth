@@ -220,11 +220,17 @@ class ProofEvidence(_ResponseRecord):
     header_values_redacted: bool | None = None
     blob_source_count: int | None = None
     max_blob_sources: int | None = None
+    max_declared_input_type_checks: int | None = None
+    max_declared_input_type_diagnostics: int | None = None
 
     @model_validator(mode="after")
     def _evidence_presence(self) -> Self:
         if self.source == "pipeline":
-            if self.model_fields_set != {"source", "blob_source_count", "max_blob_sources"}:
+            pipeline_evidence_shapes = (
+                {"source", "blob_source_count", "max_blob_sources"},
+                {"source", "max_declared_input_type_checks", "max_declared_input_type_diagnostics"},
+            )
+            if self.model_fields_set not in pipeline_evidence_shapes:
                 raise FrameworkBugError("Invalid pipeline proof evidence")
         elif self.blob_id is None or self.source_name is None:
             raise FrameworkBugError("Missing blob proof attribution")

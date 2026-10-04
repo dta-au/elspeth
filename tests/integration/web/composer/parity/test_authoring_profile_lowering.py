@@ -36,7 +36,9 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.composer.tools._common import ToolContext, _prevalidate_transform_for_context
 from elspeth.web.composer.tools._dispatch import execute_tool
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 
 
 def _empty_state() -> CompositionState:
@@ -197,6 +199,80 @@ def test_splice_transform_clears_retry_budget_gate_for_profiled_multi_query(pari
     assert _RETRY_BUDGET_MARKER not in error, result.data
 
 
+@pytest.mark.parametrize("tool", ["upsert_node", "patch_node_options", "splice_transform", "set_pipeline"])
+@pytest.mark.parametrize("binding_unavailable", [False, True], ids=["wrong-alias", "binding-unavailable"])
+def test_transform_profile_rejections_keep_their_distinct_codes(
+    parity_env: Any, tool: str, binding_unavailable: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options = {**_profiled_multi_query_options(), "profile": "task-role" if binding_unavailable else "missing-role"}
+    state = _empty_state()
+    if tool == "patch_node_options":
+        created = _run(parity_env, "upsert_node", _profiled_node(_profiled_multi_query_options()), state)
+        assert created.success is True, created.validation
+        state = created.updated_state
+        args = {"node_id": "assess_blue", "patch": {"profile": options["profile"], "prompt_template": "Review {{ row.color_name }}."}}
+    elif tool == "splice_transform":
+        state = _splice_base_state()
+        args = {
+            "predecessor_id": "before",
+            "successor_id": "after",
+            "node": {"id": "assess_blue", "plugin": "llm", "options": options, "on_error": "discard"},
+        }
+    elif tool == "set_pipeline":
+        args = {
+            "source": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+                "options": {"path": str(parity_env.data_dir / "blobs" / "rows.csv"), "schema": {"mode": "observed"}},
+            },
+            "nodes": [_profiled_node(options)],
+            "edges": [],
+            "outputs": [],
+        }
+    else:
+        args = _profiled_node(options)
+    if binding_unavailable:
+        # The frozen snapshot still grants the alias, but its resolver is now
+        # unavailable. This must remain an operator-repairable policy failure,
+        # unlike the author-correctable wrong-alias control.
+        from elspeth.web.plugin_policy import validation
+
+        def refuse(*_args: object, **_kwargs: object) -> None:
+            raise ValueError("profile_unavailable")
+
+        monkeypatch.setattr(validation, "_lower_profile_options", refuse)
+    if tool == "set_pipeline":
+        kwargs = _tool_kwargs(parity_env)
+        result = execute_tool(tool, args, state, kwargs["policy"], plugin_snapshot=kwargs["plugin_snapshot"])
+    else:
+        result = _run(parity_env, tool, args, state)
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.affected_nodes == ()
+    assert result.validation.errors[0].error_code == ("profile_unavailable" if binding_unavailable else "plugin_options_invalid")
+
+
+def test_transform_prevalidation_does_not_require_unrelated_source_or_sink(parity_env: Any) -> None:
+    kwargs = _tool_kwargs(parity_env)
+    original = kwargs["plugin_snapshot"]
+    transform_id = PluginId("transform", "llm")
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash=original.policy_hash,
+        principal_scope=original.principal_scope,
+        available=frozenset({transform_id}),
+        unavailable=(),
+        selected=(),
+        usable_profile_aliases=((transform_id, ("task-role",)),),
+        selected_profile_aliases=((transform_id, "task-role"),),
+        binding_generation_fingerprint="transform-only-prevalidation",
+    )
+    policy = PolicyCatalogView(parity_env.app.state.catalog_service, snapshot, parity_env.app.state.operator_profile_registry)
+    context = ToolContext(catalog=policy, plugin_snapshot=snapshot)
+    assert _prevalidate_transform_for_context(context, "llm", _profiled_multi_query_options()) is None
+    assert _prevalidate_transform_for_context(context, "llm", {**_profiled_multi_query_options(), "profile": "missing-role"}) is not None
+
+
 # --------------------------------------------------------------------------- #
 # Negative: credential-egress fields cannot be smuggled onto a profiled node   #
 # --------------------------------------------------------------------------- #
@@ -214,7 +290,7 @@ def test_splice_transform_clears_retry_budget_gate_for_profiled_multi_query(pari
 # node that ALSO carries one of those credential-egress / SSRF fields is
 # ``_prevalidate_transform_for_context`` — it lowers the profile first, and the
 # public profile schema rejects the smuggled key (surfaced as
-# ``profile_unavailable``).
+# ``plugin_options_invalid`` for these malformed authored options).
 #
 # These negatives regression-lock that rejection at each of the three seams. The
 # load-bearing invariant is ``success is False``: paired with the positive
@@ -242,7 +318,7 @@ def _egress_rejection_error(result: Any) -> str:
     Mirrors the profile-lowering rejection the incremental seams produce for a
     profiled node carrying a credential-egress field. ``success is False`` is the
     security invariant; the returned message lets the caller pin the current
-    ``profile_unavailable`` mechanism.
+    ``plugin_options_invalid`` mechanism.
     """
     assert result.success is False, result.data
     return str(result.validation.errors[0].message).lower()
@@ -251,7 +327,8 @@ def _egress_rejection_error(result: Any) -> str:
 @pytest.mark.parametrize("field,value", _SMUGGLED_EGRESS_FIELDS)
 def test_upsert_node_rejects_smuggled_egress_on_profiled_llm(parity_env: Any, field: str, value: str) -> None:
     result = _run(parity_env, "upsert_node", _profiled_node(_profiled_options_with(field, value)), _empty_state())
-    assert "profile_unavailable" in _egress_rejection_error(result), result.data
+    assert field in _egress_rejection_error(result), result.data
+    assert result.validation.errors[0].error_code == "plugin_options_invalid"
     # Rejection is atomic: the egress-carrying node is never committed.
     assert all(n.id != "assess_blue" for n in result.updated_state.nodes), result.updated_state
 
@@ -267,7 +344,8 @@ def test_patch_node_options_rejects_smuggled_egress_onto_profiled_llm(parity_env
         {"node_id": "assess_blue", "patch": {field: value}},
         created.updated_state,
     )
-    assert "profile_unavailable" in _egress_rejection_error(patched), patched.data
+    assert field in _egress_rejection_error(patched), patched.data
+    assert patched.validation.errors[0].error_code == "plugin_options_invalid"
     # Rejection is atomic: the smuggled field is never merged into the node.
     node = next(n for n in patched.updated_state.nodes if n.id == "assess_blue")
     assert field not in node.options, node.options
@@ -277,7 +355,7 @@ def test_patch_node_options_rejects_smuggled_egress_onto_profiled_llm(parity_env
 def test_splice_transform_rejects_smuggled_egress_on_profiled_llm(parity_env: Any, field: str, value: str) -> None:
     # The splice candidate prevalidation (``_prepare_transform_candidate``) lowers
     # the profile before the whole-pipeline splice validation, so the smuggled
-    # egress field is rejected here as ``profile_unavailable`` rather than reaching
+    # egress field is rejected here as ``plugin_options_invalid`` rather than reaching
     # the orthogonal graph validation.
     args = {
         "predecessor_id": "before",
@@ -290,6 +368,7 @@ def test_splice_transform_rejects_smuggled_egress_on_profiled_llm(parity_env: An
         },
     }
     result = _run(parity_env, "splice_transform", args, _splice_base_state())
-    assert "profile_unavailable" in _egress_rejection_error(result), result.data
+    assert field in _egress_rejection_error(result), result.data
+    assert result.validation.errors[0].error_code == "plugin_options_invalid"
     # Rejection is atomic: the egress-carrying node is never spliced in.
     assert all(n.id != "assess_blue" for n in result.updated_state.nodes), result.updated_state

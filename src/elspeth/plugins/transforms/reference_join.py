@@ -55,10 +55,76 @@ REFERENCE_ENTRY_NAME = "ref"
 #: would still permit an unsafe Cartesian product.
 MAX_REFERENCE_INDEX_CELLS = 1_000_000
 
+#: Upper bound on canonical bytes retained by the materialized index. Cell
+#: count alone does not bound values copied from a wide reference field.
+MAX_REFERENCE_INDEX_BYTES = 64 * 1024 * 1024
+
 #: Sentinel for an output path that did not resolve against a matched entry.
 #: Distinct from ``None``, which is a legitimate value a reference table may
 #: hold (a JSON ``null``), and which ``on_miss: null`` also produces.
 _UNRESOLVED = object()
+
+
+def _bounded_canonical_size(value: object, *, limit: int) -> int:
+    """Return canonical-JSON byte size while stopping at ``limit``."""
+
+    def add(total: int, increment: int) -> int:
+        total += increment
+        if total > limit:
+            raise ReferenceTableError(
+                f"reference table outputs exceed the {MAX_REFERENCE_INDEX_BYTES}-byte materialized index limit. "
+                "Reduce the table, output map, or retained value sizes."
+            )
+        return total
+
+    def string_size(text: str) -> int:
+        size = add(0, 2)
+        for character in text:
+            codepoint = ord(character)
+            if character in ('"', "\\"):
+                width = 2
+            elif codepoint <= 0x1F:
+                width = 6
+            elif codepoint <= 0x7F:
+                width = 1
+            elif codepoint <= 0x7FF:
+                width = 2
+            elif codepoint <= 0xFFFF:
+                width = 3
+            else:
+                width = 4
+            size = add(size, width)
+        return size
+
+    if value is None:
+        return add(0, 4)
+    if type(value) is bool:
+        return add(0, 4 if value else 5)
+    if type(value) is str:
+        return string_size(value)
+    if type(value) is int:
+        return add(0, len(str(value)))
+    if type(value) is float:
+        return add(0, 32)
+    if isinstance(value, Mapping):
+        total = add(0, 2)
+        for index, (key, item) in enumerate(value.items()):
+            if type(key) is not str:
+                raise TypeError("reference output objects must use string keys")
+            if index:
+                total = add(total, 1)
+            total = add(total, string_size(key))
+            total = add(total, 1)
+            total = add(total, _bounded_canonical_size(item, limit=limit - total))
+        return total
+    if isinstance(value, (list, tuple)):
+        total = add(0, 2)
+        for index, item in enumerate(value):
+            if index:
+                total = add(total, 1)
+            total = add(total, _bounded_canonical_size(item, limit=limit - total))
+        return total
+    raise TypeError(f"reference output value of type {type(value).__name__} is not canonical JSON")
 
 
 class ReferenceJoinConfig(TransformDataConfig):
@@ -284,6 +350,17 @@ def _compile_output_expressions(cfg: ReferenceJoinConfig) -> dict[str, Expressio
                 f"output field {field_name!r} has an invalid expression {expression!r}: {exc}. "
                 f"Address the matched entry as {REFERENCE_ENTRY_NAME!r}, e.g. \"{REFERENCE_ENTRY_NAME}['description']\"."
             ) from exc
+        if (
+            compiled[field_name].has_string_amplification_risk()
+            or compiled[field_name].has_string_concatenation_risk()
+            or compiled[field_name].has_eager_container_string_allocation_risk()
+            or compiled[field_name].has_repeated_string_copying_calls()
+        ):
+            raise ReferenceTableError(
+                f"output field {field_name!r} has an expression {expression!r} that can amplify text through "
+                "multiplication, formatting, concatenation, eager container construction, or repeated string-copying calls. "
+                "Reference outputs must use bounded field access and conversion only."
+            )
         if compiled[field_name].result_can_be_set():
             raise ReferenceTableError(
                 f"output field {field_name!r} has an expression {expression!r} that can produce a set, which has no "
@@ -319,6 +396,7 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
     resolved: dict[str, dict[str, Any]] = {}
     first_position: dict[str, int] = {}
     resolved_count = dict.fromkeys(cfg.output, 0)
+    retained_bytes = 0
 
     for position, entry in enumerate(entries):
         if cfg.reference_key_name not in entry:
@@ -346,7 +424,7 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
             # KeyError/TypeError are deliberately NOT caught: expression_parser
             # re-raises those as evaluator bugs that must crash through.
             try:
-                values[field_name] = parser.evaluate({REFERENCE_ENTRY_NAME: entry})
+                value = parser.evaluate({REFERENCE_ENTRY_NAME: entry})
             except ExpressionEvaluationError as exc:
                 if exc.kind not in ("missing_key", "index_out_of_range"):
                     raise ReferenceTableError(
@@ -356,6 +434,8 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
                     ) from exc
                 values[field_name] = _UNRESOLVED
             else:
+                retained_bytes += _bounded_canonical_size(value, limit=MAX_REFERENCE_INDEX_BYTES - retained_bytes)
+                values[field_name] = value
                 resolved_count[field_name] += 1
         resolved[key] = values
 
@@ -562,7 +642,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f6caccc517971b90"
+    source_file_hash: str | None = "sha256:5c739014e71f9bbc"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (

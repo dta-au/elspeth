@@ -925,8 +925,8 @@ def _resolve_source_blob(
     if prevalidation_error is not None:
         return _failure_result(
             state,
-            prevalidation_error,
-            error_code="plugin_options_invalid",
+            prevalidation_error[0],
+            error_code=prevalidation_error[1],
             plugin_identity=("source", plugin),
         )
 
@@ -1109,8 +1109,8 @@ def _execute_set_source(
     if prevalidation_error is not None:
         return _failure_result(
             state,
-            prevalidation_error,
-            error_code="plugin_options_invalid",
+            prevalidation_error[0],
+            error_code=prevalidation_error[1],
             plugin_identity=("source", plugin),
         )
 
@@ -1388,8 +1388,8 @@ def _resolve_source_blobs(
     if prevalidation_error is not None:
         return _failure_result(
             state,
-            prevalidation_error,
-            error_code="plugin_options_invalid",
+            prevalidation_error[0],
+            error_code=prevalidation_error[1],
             plugin_identity=("source", "blob_rows"),
         )
     return merged_options, tuple(payloads)
@@ -2016,8 +2016,8 @@ def _execute_patch_source_options(
     if prevalidation_error is not None:
         return _failure_result(
             state,
-            prevalidation_error,
-            error_code="plugin_options_invalid",
+            prevalidation_error[0],
+            error_code=prevalidation_error[1],
             plugin_identity=("source", current_source.plugin),
         )
 

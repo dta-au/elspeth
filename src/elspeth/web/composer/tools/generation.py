@@ -1900,6 +1900,15 @@ def explain_withheld_validation_code(code: str) -> tuple[str, str] | None:
     """
     if type(code) is not str or not code:
         return None
+    if code in {reason.value for reason in PluginUnavailableReason}:
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        # Availability remedies use only the closed code, not private validator
+        # detail. Keep that diagnosis while explicitly withholding the binding.
+        return (
+            f"{_WITHHELD_VALIDATION_GUIDANCE[0]} {guidance[0]}",
+            f"Do not guess at or edit the withheld configuration. {guidance[1]}",
+        )
     return _WITHHELD_VALIDATION_GUIDANCE
 
 

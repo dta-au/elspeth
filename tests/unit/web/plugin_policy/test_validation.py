@@ -16,10 +16,12 @@ def test_profile_unavailable_finding_enumerates_available_aliases() -> None:
     from elspeth.web.plugin_policy.models import PluginId
 
     finding = _profile_unavailable_finding(_Component(), PluginId("transform", "llm"), available_aliases=("sonnet",))
+    assert finding.error_code == "plugin_options_invalid"
     assert "sonnet" in finding.message
     assert "operator must enable" not in finding.message
 
     unconfigured = _profile_unavailable_finding(_Component(), PluginId("transform", "llm"))
+    assert unconfigured.error_code == "profile_unavailable"
     assert "sonnet" not in unconfigured.message
 
 
@@ -787,7 +789,7 @@ def test_validate_plugin_policy_refuses_a_raw_azure_ai_search_node() -> None:
 
     result = _validate_search(state)
 
-    assert [finding.error_code for finding in result.findings] == ["profile_unavailable"]
+    assert [finding.error_code for finding in result.findings] == ["plugin_options_invalid"]
     assert result.executable_state is state
     # The finding names the aliases the author may choose, never the binding.
     assert "policies" in result.findings[0].message
@@ -812,6 +814,7 @@ def test_validate_plugin_policy_refuses_a_private_option_beside_a_profile(privat
     result = _validate_search(state)
 
     assert len(result.findings) == 1
+    assert result.findings[0].error_code == "plugin_options_invalid"
     assert "not authorable on a profile-bound node" in result.findings[0].message
     assert next(iter(private)) in result.findings[0].message
     assert result.executable_state is state
@@ -825,9 +828,38 @@ def test_validate_plugin_policy_refuses_an_index_the_profile_does_not_admit() ->
     result = _validate_search(state)
 
     assert len(result.findings) == 1
+    assert result.findings[0].error_code == "plugin_options_invalid"
     assert "Index is not admitted by the selected Azure AI Search profile" in result.findings[0].message
     assert "hr-records" not in result.findings[0].message
     assert "approved-documents" not in result.findings[0].message
+    assert result.executable_state is state
+
+
+@pytest.mark.parametrize(
+    ("reason", "code"),
+    [
+        ("private_profile_option", "plugin_options_invalid"),
+        ("unsafe_s3_object_key", "plugin_options_invalid"),
+        ("profile_index_not_admitted", "plugin_options_invalid"),
+        ("profile_unavailable", "profile_unavailable"),
+        ("unknown_lowering_failure", "profile_unavailable"),
+    ],
+)
+def test_profile_lowering_discriminates_author_repair_from_unavailable_binding(
+    monkeypatch: pytest.MonkeyPatch, reason: str, code: str
+) -> None:
+    from elspeth.web.plugin_policy import validation
+
+    registry, snapshot, catalog = _search_policy_context()
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise ValueError(reason)
+
+    monkeypatch.setattr(validation, "_lower_profile_options", refuse)
+    state = _search_node_state(profile="policies", index="approved-documents")
+    result = _validate_search(state, (registry, snapshot, catalog))
+    assert len(result.findings) == 1
+    assert result.findings[0].error_code == code
     assert result.executable_state is state
 
 
@@ -884,6 +916,61 @@ def test_raw_azure_ai_search_is_refused_on_every_plugin_bearing_node_kind(node_t
 
     result = _validate_search(state)
 
-    assert [finding.error_code for finding in result.findings] == ["profile_unavailable"]
+    assert [finding.error_code for finding in result.findings] == ["plugin_options_invalid"]
     assert result.findings[0].component_id == "rag_1"
     assert result.executable_state is state
+
+
+@pytest.mark.parametrize("profiled_kind", [None, "source", "transform", "sink"], ids=["authored-control", "source", "transform", "sink"])
+def test_unoffered_profile_on_an_authored_plugin_is_an_option_error(profiled_kind: str | None) -> None:
+    from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+    from elspeth.web.plugin_policy.validation import validate_plugin_policy
+
+    registry, snapshot, catalog = _textract_policy_context()
+
+    def options(kind: str, **values: object) -> dict[str, object]:
+        return {**values, **({"profile": "unoffered-profile"} if kind == profiled_kind else {})}
+
+    state = CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            options=options("source", path="rows.csv", schema={"mode": "observed"}),
+            on_success="rows",
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="copy",
+                node_type="transform",
+                plugin="passthrough",
+                input="rows",
+                on_success="results",
+                on_error="discard",
+                options=options("transform", schema={"mode": "observed"}),
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        outputs=(
+            OutputSpec(
+                name="results",
+                plugin="json",
+                options=options("sink", path="results.json", schema={"mode": "observed"}),
+                on_write_failure="discard",
+            ),
+        ),
+        edges=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    result = validate_plugin_policy(state, snapshot=snapshot, profile_registry=registry, catalog=catalog)
+    if profiled_kind is None:
+        assert result.findings == ()
+    else:
+        assert [finding.error_code for finding in result.findings] == ["plugin_options_invalid"]
+        assert "remove the profile option" in result.findings[0].message
+        assert result.executable_state is state
