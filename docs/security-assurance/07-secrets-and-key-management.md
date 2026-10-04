@@ -482,6 +482,13 @@ Secret names referenced by `.github/workflows/*` at
 | `state-engine-live-provider.yml` | Manual only | `OPENROUTER_API_KEY`, `AZURE_API_KEY`, `AZURE_CLIENT_SECRET`, `AZURE_CONTENT_SAFETY_KEY`, `AZURE_DOCUMENT_INTELLIGENCE_KEY`, `AZURE_SEARCH_API_KEY`, `ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL`, `GATEWAY_BEARER` | Live-provider tests; each job runs in a named GitHub environment |
 | `codeql.yaml`, `composer-redaction-gate.yml`, `enforce-telemetry-backfill-trailer.yaml`, `mutation-testing.yaml`, `pages.yaml` | — | None | — |
 
+The table above records the historical snapshot. Automatic judge-quality
+validation has since been removed: the current `enforce-allowlist-judge-gates.yaml`
+runs deterministic C3 without provider credentials. The corpus and CLI remain
+available only by [explicit operator opt-in](../../config/cicd/judge-quality-corpus/README.md).
+This change does not remove stored secrets or alter the separate live-provider
+integration workflow.
+
 No checked-in workflow references or injects the judge metadata HMAC key
 (§ 5.1), a production web secret key, a share-link key, a fingerprint key or
 a deployment database credential. The workflow files prove only which secret
