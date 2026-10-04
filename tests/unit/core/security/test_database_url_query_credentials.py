@@ -8,6 +8,30 @@ from elspeth.contracts.security import secret_fingerprint
 from elspeth.contracts.url import SanitizedDatabaseUrl
 
 
+@pytest.mark.parametrize("location", ["query", "fragment"])
+@pytest.mark.parametrize(
+    ("connect", "public_prefix", "secret_tail"),
+    [
+        ("DRIVER=x;PWD={alpha;private_tail;UID=sa", "DRIVER=x", "{alpha;private_tail;UID=sa"),
+        ("DRIVER=x; Password = {alpha;private_tail", "DRIVER=x", "{alpha;private_tail"),
+        ("DRIVER={x;PWD={alpha;private_tail;UID=sa", "DRIVER={x", "{alpha;private_tail;UID=sa"),
+        ("DRIVER=x;PWD={alpha}};private_tail;UID=sa", "DRIVER=x", "{alpha}};private_tail;UID=sa"),
+    ],
+)
+def test_unterminated_odbc_password_removes_and_fingerprints_entire_ambiguous_tail(
+    monkeypatch: pytest.MonkeyPatch, location: str, connect: str, public_prefix: str, secret_tail: str
+) -> None:
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
+    separator = "?" if location == "query" else "#"
+    result = SanitizedDatabaseUrl.from_raw_url(f"mssql+pyodbc:///{separator}odbc_connect={quote_plus(connect)}")
+
+    parsed = urlparse(result.sanitized_url)
+    params = parse_qs(parsed.query if location == "query" else parsed.fragment)
+    assert params["odbc_connect"] == [public_prefix]
+    assert "private_tail" not in result.sanitized_url
+    assert result.fingerprint == secret_fingerprint(secret_tail)
+
+
 def test_database_url_query_password_removed_from_audit_url(monkeypatch: pytest.MonkeyPatch) -> None:
     """Query-string database passwords are removed before audit storage."""
     monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")

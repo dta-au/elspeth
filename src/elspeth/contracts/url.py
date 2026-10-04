@@ -181,10 +181,18 @@ def _iter_odbc_connect_parts(decoded_value: str) -> list[str]:
             value_has_non_space = True
         i += 1
     if in_braces:
-        # The final value opened a brace that never closed. Treat that
-        # unmatched brace as literal so later attributes cannot be swallowed
-        # into a non-sensitive value and bypass password detection.
-        parts.extend(decoded_value[start:].split(";"))
+        # Recover later password keys hidden by a malformed public attribute,
+        # but never split a braced password's ambiguous suffix into public
+        # attributes. This also covers a second unmatched brace in recovery.
+        tail = decoded_value[start:]
+        offset = 0
+        for part in tail.split(";"):
+            key, sep, value = part.partition("=")
+            if sep and key.strip().lower() in _ODBC_PASSWORD_KEYS and value.lstrip().startswith("{"):
+                parts.append(tail[offset:])
+                break
+            parts.append(part)
+            offset += len(part) + 1
     else:
         parts.append(decoded_value[start:])
     return parts

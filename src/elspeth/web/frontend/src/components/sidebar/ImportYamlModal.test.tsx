@@ -12,6 +12,7 @@ import {
   findImportYamlSourceBindingCandidates,
   IMPORT_YAML_NOT_RUNNABLE_INTRO,
   IMPORT_YAML_422_MESSAGE,
+  IMPORT_YAML_UNSAFE_MESSAGE,
   IMPORT_YAML_SECTION_KEYS,
   IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE,
   IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE,
@@ -667,6 +668,63 @@ describe("ImportYamlModal", () => {
         "source:\n  plugin: csv\n  options:\n    path: rejected.csv\nsinks:\n  out: {}\n",
       ),
     ).toEqual([]);
+  });
+
+  it.each([
+    "sources: *missing\n",
+    "sources: &sources [*sources]\n",
+    "a: &a [one, two]\nb: &b [*a, *a]\nsources: [*b, *b]\n",
+    "defaults: &defaults {plugin: csv}\nsources:\n  source: *defaults\n",
+  ])("fails closed for aliases in both preflight consumers: %s", (yaml) => {
+    expect(analyseImportYamlDraft(yaml)).toMatchObject({
+      hasText: true,
+      canImport: false,
+      sectionsParsed: false,
+      validationMessage: IMPORT_YAML_UNSAFE_MESSAGE,
+    });
+    expect(findImportYamlSourceBindingCandidates(yaml)).toEqual([]);
+    render(<ImportYamlModal onClose={onClose} />);
+    typeYaml(yaml);
+    expect(screen.getByRole("button", { name: /^import$/i })).toBeDisabled();
+    typeYaml(PIPELINE_YAML);
+    expect(screen.getByText("Parsed preview")).toBeInTheDocument();
+  });
+
+  it("rejects over-limit input before calling the YAML parser", () => {
+    const analysis = analyseImportYamlDraft("sources: {}\n#" + "x".repeat(262_144));
+    expect(analysis.canImport).toBe(false);
+    expect(analysis.validationMessage).toBe(IMPORT_YAML_422_MESSAGE);
+    expect(parseDocument).not.toHaveBeenCalled();
+  });
+
+  it("counts Unicode characters like the backend rather than UTF-16 units", () => {
+    const prefix = PIPELINE_YAML + "#";
+    const yaml = prefix + "𐐀".repeat(262_144 - prefix.length);
+    expect(analyseImportYamlDraft(yaml).canImport).toBe(true);
+    vi.mocked(parseDocument).mockClear();
+    expect(analyseImportYamlDraft(yaml + "𐐀").canImport).toBe(false);
+    expect(parseDocument).not.toHaveBeenCalled();
+  });
+
+  it("refuses an impossibly large file before reading its contents", () => {
+    render(<ImportYamlModal onClose={onClose} />);
+    const read = vi.spyOn(FileReader.prototype, "readAsText");
+    const file = new File(["x".repeat(4 * 262_144 + 1)], "large.yaml", { type: "text/yaml" });
+    fireEvent.change(screen.getByLabelText(/choose a \.yaml file/i), { target: { files: [file] } });
+    expect(read).not.toHaveBeenCalled();
+    expect(screen.getByText(IMPORT_YAML_422_MESSAGE)).toBeInTheDocument();
+    read.mockRestore();
+  });
+
+  it("contains parser exceptions and leaves source-binding discovery closed", () => {
+    vi.mocked(parseDocument).mockImplementationOnce(() => {
+      throw new RangeError("parser nesting limit");
+    });
+    expect(analyseImportYamlDraft("sources: {}\n").canImport).toBe(false);
+    vi.mocked(parseDocument).mockImplementationOnce(() => {
+      throw new RangeError("parser nesting limit");
+    });
+    expect(findImportYamlSourceBindingCandidates("sources: {}\n")).toEqual([]);
   });
 
   it("defers draft YAML analysis through one shared parse", () => {

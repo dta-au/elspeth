@@ -21,7 +21,11 @@ turns).
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -45,6 +49,37 @@ from elspeth.web.composer.state_claim_grounding import (
     verify_action_claims,
     verify_state_claims,
 )
+
+
+@pytest.mark.parametrize("extractor", ["extract_action_claims", "extract_state_claims"])
+def test_grounding_extractors_bound_whitespace_work_and_preserve_late_claims(extractor: str) -> None:
+    """A subprocess deadline catches backtracking without hanging the test worker."""
+    root = Path(__file__).resolve().parents[4]
+    code = f"""
+from elspeth.web.composer.state_claim_grounding import {extractor} as extract
+for whitespace in (' ', '\\t', '\\n', '\\u00a0'):
+    padding = whitespace * 100_000
+    if {extractor!r} == 'extract_action_claims':
+        assert extract('Yes, I' + padding + '!') == ()
+        prose = 'Yes, I' + padding + 'will fix'
+        claims = extract(prose)
+        assert len(claims) == 1 and claims[0].verb == 'fixed'
+    else:
+        for field in ('on_validation_failure', 'on_write_failure'):
+            assert extract(field + padding + '!') == ()
+            prose = field + padding + 'is set to discard'
+            claims = extract(prose)
+            assert len(claims) == 1 and claims[0].claimed_value == 'discard'
+    assert claims[0].span == (0, len(prose))
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        timeout=10,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root / "elspeth-lints/src")))},
+        capture_output=True,
+        text=True,
+    )
 
 
 def _state_with_source(on_validation_failure: str = "discard") -> CompositionState:

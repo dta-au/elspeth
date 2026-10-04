@@ -137,16 +137,17 @@ def _build_field_value_pattern(field_name: str, allowed_values: tuple[str, ...])
     # fail when the value token turns out to be ``set``.
     pattern = (
         rf"\b{field_re}\b"
-        r"\s*"
-        r"(?:[`'\"]?\s*(?::|=|->|→)\s*[`'\"]?"
-        r"|\s+(?:"
-        r"is\s+set\s+to"
-        r"|is\s+configured\s+(?:to|as|with)"
-        r"|set\s+to"
-        r"|configured\s+(?:to|as|with)"
+        # Each separator arm owns its leading whitespace. Possessive runs
+        # cannot repartition whitespace on a nonmatching untrusted suffix.
+        r"(?:\s*+[`'\"]?\s*+(?::|=|->|→)\s*+[`'\"]?"
+        r"|\s++(?:"
+        r"is\s++set\s++to"
+        r"|is\s++configured\s++(?:to|as|with)"
+        r"|set\s++to"
+        r"|configured\s++(?:to|as|with)"
         r"|uses"
         r"|is"
-        r")\s+[`'\"]?)"
+        r")\s++[`'\"]?)"
         rf"({values_alt})"
         r"\b[`'\"]?"
     )
@@ -297,7 +298,7 @@ _AGREEMENT_OPENER_ALTERNATION: Final[str] = (
 _AGREEMENT_PROMISE_PATTERN: Final[re.Pattern[str]] = re.compile(
     rf"\b(?:{_AGREEMENT_OPENER_ALTERNATION})"
     r"[\s,.\-—:;]+"
-    r"I(?:[\s']*(?:'ll|\s+will|\s+can|\s+should))?\s+"
+    r"I(?:\s*+'ll|\s++(?:will|can|should))?\s++"
     rf"(?P<verb>{_verb_alternation(_ACTION_VERBS_BASE)})"
     r"\b",
     re.IGNORECASE,
