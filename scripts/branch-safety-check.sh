@@ -54,7 +54,7 @@
 #   --intent commit|rebase|merge|push   what you are about to do (default: commit)
 #   --base REF        the integration ref for the range checks (default: @{u} if set,
 #                     else origin/HEAD if set; otherwise the base checks are skipped)
-#   --fetch           `git fetch origin` first (the only write this script performs)
+#   --fetch           refresh origin's configured refs and the actual named base
 #   --allow-protected downgrade the protected-branch FAIL to WARN for rebase/push
 #   -h, --help
 #
@@ -175,13 +175,102 @@ fi
 
 # --- upstream / published ----------------------------------------------------
 if [ "$FETCH" = 1 ]; then
-    if git fetch --quiet origin 2>/dev/null; then report INFO fetch "origin refreshed" "git fetch origin"
+    if git fetch --quiet origin 2>/dev/null; then report INFO fetch "origin's configured refs refreshed" "git fetch origin"
     else report WARN fetch "git fetch origin failed; remote-tracking refs may be stale" "git fetch origin"; fi
 else
     report INFO fetch "not fetched (--fetch to refresh); origin/* is as of the last fetch" ""
 fi
 
 UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+if [ -z "$BASE" ]; then
+    if [ -n "$UPSTREAM" ]; then BASE="$UPSTREAM"
+    elif git rev-parse --verify --quiet origin/HEAD >/dev/null; then BASE="origin/HEAD"; fi
+fi
+
+source_is_excluded() {
+    local remote="$1" source_ref="$2" refspec exclusion prefix suffix
+    while IFS= read -r refspec; do
+        [[ "$refspec" != ^* ]] && continue
+        exclusion="${refspec#^}"
+        if [[ "$exclusion" == *\** ]]; then
+            prefix="${exclusion%%\**}"; suffix="${exclusion#*\*}"
+            [[ "$source_ref" == "$prefix"*"$suffix" ]] && return 0
+        elif [ "$source_ref" = "$exclusion" ]; then
+            return 0
+        fi
+    done < <(git config --get-all "remote.$remote.fetch" || true)
+    return 1
+}
+
+refresh_base() {
+    local base_ref base_remote="" base_source="" remote refspec source destination prefix suffix middle matched_source mapped_destination=0
+    base_ref="$(git rev-parse --verify --symbolic-full-name "$BASE" 2>/dev/null || true)"
+    # A main-only clone may not have the requested tracking ref yet.
+    if [ -z "$base_ref" ] && ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
+        if [[ "$BASE" == refs/remotes/* ]]; then base_ref="$BASE"
+        else base_ref="refs/remotes/$BASE"; fi
+    fi
+    base_ref="$(git symbolic-ref --quiet "$base_ref" 2>/dev/null || printf '%s' "$base_ref")"
+    if [[ "$base_ref" != refs/remotes/* ]]; then
+        report INFO fetch-base "$BASE is a local or immutable base; no remote base to refresh"
+        return
+    fi
+    # Ref mappings own their destinations, which need not use the remote's
+    # name. Resolve explicit aliases and wildcard mappings before falling back
+    # to conventional tracking names in a single-branch clone.
+    while IFS= read -r remote; do
+        while IFS= read -r refspec; do
+            [[ "$refspec" == ^* || "$refspec" != *:* ]] && continue
+            refspec="${refspec#+}"; source="${refspec%%:*}"; destination="${refspec#*:}"
+            matched_source=""
+            if [[ "$destination" == *\** ]]; then
+                prefix="${destination%%\**}"; suffix="${destination#*\*}"
+                if [[ "$base_ref" == "$prefix"*"$suffix" ]]; then
+                    middle="${base_ref#"$prefix"}"; middle="${middle%"$suffix"}"
+                    matched_source="${source/\*/"$middle"}"
+                fi
+            elif [ "$destination" = "$base_ref" ]; then
+                matched_source="$source"
+            fi
+            [ -z "$matched_source" ] && continue
+            mapped_destination=1
+            if source_is_excluded "$remote" "$matched_source"; then continue; fi
+            if [ -n "$base_remote" ] && { [ "$base_remote" != "$remote" ] || [ "$base_source" != "$matched_source" ]; }; then
+                report FAIL fetch-base "$BASE has ambiguous fetch mappings; base was not refreshed explicitly"
+                return
+            fi
+            base_remote="$remote"; base_source="$matched_source"
+        done < <(git config --get-all "remote.$remote.fetch" || true)
+    done < <(git remote)
+    if [ -z "$base_remote" ]; then
+        if [ "$mapped_destination" = 1 ]; then
+            report FAIL fetch-base "$BASE is excluded by all its configured mappings; base was not refreshed explicitly"
+            return
+        fi
+        # Remote names can contain slashes; use the longest conventional prefix.
+        while IFS= read -r remote; do
+            if [[ "$base_ref" == "refs/remotes/$remote/"* ]] && [ "${#remote}" -gt "${#base_remote}" ]; then
+                base_remote="$remote"
+            fi
+        done < <(git remote)
+    fi
+    if [ -z "$base_remote" ]; then
+        report FAIL fetch-base "no configured remote owns $BASE; base was not refreshed"
+        return
+    fi
+    base_source="${base_source:-refs/heads/${base_ref#"refs/remotes/$base_remote/"}}"
+    if source_is_excluded "$base_remote" "$base_source"; then
+        report FAIL fetch-base "$BASE is excluded by $base_remote's configured fetch refspecs; base was not refreshed explicitly"
+        return
+    fi
+    if git fetch --quiet -- "$base_remote" "+$base_source:$base_ref" 2>/dev/null; then
+        report INFO fetch-base "$BASE refreshed from $base_remote:$base_source" "git fetch $base_remote +$base_source:$base_ref"
+    else
+        report FAIL fetch-base "$BASE could not be refreshed from $base_remote; comparisons may use stale refs" "git fetch $base_remote +$base_source:$base_ref"
+    fi
+}
+if [ "$FETCH" = 1 ] && [ -n "$BASE" ]; then refresh_base; fi
+
 if [ -n "$UPSTREAM" ]; then
     U_SHA="$(git rev-parse '@{u}')"
     # rev-list's three-dot is the symmetric difference — the right tool for
@@ -205,10 +294,6 @@ else
 fi
 
 # --- base relation (named two-dot range) -------------------------------------
-if [ -z "$BASE" ]; then
-    if [ -n "$UPSTREAM" ]; then BASE="$UPSTREAM"
-    elif git rev-parse --verify --quiet origin/HEAD >/dev/null; then BASE="origin/HEAD"; fi
-fi
 if [ -n "$BASE" ] && git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
     BASE_SHA="$(git rev-parse "${BASE}^{commit}")"
     ahead_b="$(git rev-list --count "$BASE_SHA..HEAD")"
