@@ -17,7 +17,8 @@
     "lint": "eslint src vite.config.ts playwright.oidc.config.ts tests/e2e/aws-ecs-oidc.staging.spec.ts tests/e2e/harness/oidc-*.ts tests/e2e/composer-workspace-*.spec.ts tests/e2e/composer-workspace.visual.spec.ts tests/e2e/composer-reflow.spec.ts tests/e2e/helpers/api.ts tests/e2e/helpers/workspace-*.ts tests/e2e/page-objects/composer-page.ts",
     "lint:css": "stylelint 'src/**/*.css'",
     "preview": "vite preview",
-    "test": "vitest run",
+    "test": "npm run test:dependencies && vitest run",
+    "test:dependencies": "node --test scripts/braces-depth-guard.test.mjs",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "test:e2e:oidc": "playwright test --config=playwright.oidc.config.ts",
@@ -71,6 +72,7 @@
     "vitest": "^4.1.2"
   },
   "overrides": {
+    "braces": "npm:@dieub/braces-depth-guard@3.0.3-pn.2",
     "openapi-typescript": {
       "undici": "6.29.0"
     }
