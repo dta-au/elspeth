@@ -429,13 +429,70 @@ def test_no_workflow_references_the_operator_hmac_key() -> None:
             assert "ELSPETH_JUDGE_METADATA_HMAC_KEY" not in json.dumps(_workflow(workflow_path)), workflow_path.name
 
 
-def test_judge_quality_never_receives_openrouter_credentials_on_prs() -> None:
-    """The live-judge secret remains push-only; PRs skip the trusted job."""
+def test_automatic_judge_workflow_has_no_paid_quality_job_or_credentials() -> None:
+    """Both push and PR paths remain deterministic and credential-free."""
     workflow = _workflow(JUDGE_GATES_WORKFLOW)
-    job = workflow["jobs"]["check-judge-quality"]
 
-    assert job["if"] == "github.event_name != 'pull_request'"
-    assert job["env"]["OPENROUTER_API_KEY"] == "${{ secrets.OPENROUTER_API_KEY }}"
+    assert set(workflow["jobs"]) == {"check-override-rate", "judge-gates-success"}
+    assert "OPENROUTER_API_KEY" not in json.dumps(workflow)
+    assert "check-judge-quality" not in json.dumps(workflow)
+    assert workflow["jobs"]["judge-gates-success"]["needs"] == ["check-override-rate"]
+
+
+def _assert_no_automatic_judge_quality(workflow: dict[str, Any]) -> None:
+    # PyYAML's YAML 1.1 loader reads the unquoted GitHub "on" key as True.
+    events = workflow.get("on", workflow.get(True))
+    assert isinstance(events, (str, list, dict)), "workflow must declare its triggers"
+    event_names = {events} if isinstance(events, str) else set(events)
+    assert event_names, "an empty trigger set cannot prove manual-only execution"
+    if event_names != {"workflow_dispatch"}:
+        assert "check-judge-quality" not in json.dumps(workflow), "automatic workflow can invoke paid judge-quality validation"
+
+
+def test_all_automatic_workflows_exclude_paid_judge_quality() -> None:
+    """Direct paid-quality commands cannot move to another automatic workflow.
+
+    This configuration guard does not follow wrapper scripts or reusable actions;
+    caller inspection remains part of workflow review.
+    """
+    paths = sorted((REPO_ROOT / ".github" / "workflows").glob("*.y*ml"))
+    assert CI_WORKFLOW in paths
+    assert JUDGE_GATES_WORKFLOW in paths
+    for path in paths:
+        _assert_no_automatic_judge_quality(_workflow(path))
+
+
+@pytest.mark.parametrize("event", ["push", "pull_request", "schedule", "workflow_run", "workflow_call"])
+def test_automatic_paid_judge_guard_rejects_live_calls(event: str) -> None:
+    """A paid invocation must be detected for every automatic entry point."""
+    workflow = {"on": {event: {}}, "jobs": {"quality": {"steps": [{"run": "elspeth-lints check-judge-quality --corpus cases.jsonl"}]}}}
+
+    with pytest.raises(AssertionError, match="automatic workflow"):
+        _assert_no_automatic_judge_quality(workflow)
+
+
+def test_paid_judge_guard_allows_only_exclusively_manual_validation() -> None:
+    """An explicit manual path is allowed; adding any automatic trigger is caught."""
+    workflow = yaml.safe_load(
+        "on:\n  workflow_dispatch:\njobs:\n  quality:\n    steps:\n"
+        "      - run: python -m elspeth_lints.core.cli check-judge-quality --corpus cases.jsonl\n"
+    )
+    _assert_no_automatic_judge_quality(workflow)
+    workflow[True]["push"] = {}
+    with pytest.raises(AssertionError, match="automatic workflow"):
+        _assert_no_automatic_judge_quality(workflow)
+
+
+@pytest.mark.parametrize("result", ["success", "failure", "cancelled", "skipped", "timed_out"])
+def test_judge_aggregate_still_requires_successful_override_rate(result: str) -> None:
+    """Removing live judging cannot turn a failed deterministic check green."""
+    job = _workflow(JUDGE_GATES_WORKFLOW)["jobs"]["judge-gates-success"]
+    run = _step_run(job, "Check all judge gates passed")
+    run = run.replace("${{ needs.check-override-rate.result }}", result)
+
+    completed = subprocess.run(["bash", "-e", "-c", run], capture_output=True, text=True, check=False, timeout=5)
+
+    assert completed.returncode == (0 if result == "success" else 1), completed.stdout + completed.stderr
 
 
 @pytest.mark.parametrize("job_name", ["test", "integration"])

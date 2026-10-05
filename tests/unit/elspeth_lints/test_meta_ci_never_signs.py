@@ -32,8 +32,8 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW = REPO_ROOT / ".github/workflows/enforce-allowlist-judge-gates.yaml"
 
-# The two verify-only elspeth-lints gates the workflow is permitted to invoke.
-ALLOWED_GATE_SUBCOMMANDS = frozenset({"check-override-rate", "check-judge-quality"})
+# Automatic CI runs the deterministic override-rate check only.
+ALLOWED_GATE_SUBCOMMANDS = frozenset({"check-override-rate"})
 
 # Any elspeth-lints subcommand that mints or rotates a judge-metadata HMAC
 # signature. None of these may appear in a CI ``run`` body.
@@ -80,7 +80,7 @@ def test_enforce_workflow_exists() -> None:
 
 
 def test_enforce_workflow_invokes_only_verify_gates() -> None:
-    """The workflow runs exactly the two verify-only gates and nothing else."""
+    """The workflow runs the deterministic verify gate without paid judging."""
     bodies = _run_step_bodies(WORKFLOW.read_text(encoding="utf-8"))
     invoked = _invoked_cli_subcommands(bodies)
 

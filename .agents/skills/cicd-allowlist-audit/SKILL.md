@@ -73,7 +73,7 @@ orientation to the current seam.
 | `stage_rekey` (MCP) / `rekey` (CLI) | Key-free rekey worklist followed by an operator-only signature-key rotation. | MCP: no; CLI: signatures only |
 | `check-judge-coverage` (C1) | CI gate: every new entry must carry signed judge metadata (pre-judge entries grandfathered, rotation-stable). | No |
 | `check-override-rate` (C3) | CI gate: rolling-30d operator-override rate must stay under `--max-rate` (workflow-pinned 0.10). | No |
-| `check-judge-quality` (VAL) | CI gate, trusted contexts only: judge accuracy on a labelled corpus ≥ 0.90 (regression tripwire, not a guarantee). | No |
+| `check-judge-quality` (VAL) | Operator opt-in CLI validation: judge accuracy on a labelled corpus ≥ 0.90 (regression tripwire, not a guarantee). Makes paid calls; never an automatic CI gate. | No |
 | `check-rotation-audit` | CI gate: fingerprint rotations match the `.elspeth/rotations.log` manifest. | No |
 
 ### HMAC key custody — the load-bearing rule
@@ -165,16 +165,16 @@ operator attaches a post-review verdict with `--key <exact allow_hits key>`,
 and `--rationale`. This records the human reversal in the audit trail without
 silently deleting the entry.
 
-### The three CI gates (branch protection)
+### Automatic CI and operator opt-in validation
 
-The gates live in `.github/workflows/enforce-allowlist-judge-gates.yaml`; the
-single required status check is the aggregate `judge-gates-success` job (C1 + C3
-must pass; VAL may be `skipped` on fork PRs, which cannot read the OpenRouter
-secret). On fork PRs the HMAC key is also withheld, so signature verification
-falls back to `shape-only-when-key-missing` mode
-(`ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE`). A C3 failure is an audit
-trigger (see "When to run"); a C1 failure means an entry bypassed the staged
-signing workflow.
+`.github/workflows/enforce-allowlist-judge-gates.yaml` runs deterministic C3
+and its `judge-gates-success` summary. The workflow is advisory, outside branch
+protection, and receives no provider credential. C1 remains intentionally
+unwired until all covered allowlist shapes can acquire judge metadata. Fork
+pull requests cannot execute on the trusted runners or receive a green summary.
+A C3 failure is an audit trigger (see "When to run"). Live VAL validation is
+operator opt-in through the CLI; consult `config/cicd/judge-quality-corpus/README.md`
+and obtain authorization from the provider credential owner before making calls.
 
 ## Method (5 stages)
 
