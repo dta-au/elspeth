@@ -44,9 +44,10 @@ are unchanged from 0.8.1; this release adds no schema-epoch cutover. Installatio
 still on 0.8.0 must follow the paired database recreation described in the
 [0.8.1 notes](#081---2026-09-10-replica-recovery-and-deployment-hardening) and
 [cutover runbook](docs/runbooks/staging-session-db-recreation.md). These notes
-describe source changes, not a published image. GHCR publication remains
-blocked by the reported `write_package` denial; confirm a published tag or
-digest before using container installation instructions.
+describe source changes, not a published image. An earlier GHCR publishing
+attempt was denied with `write_package`; this candidate does not establish
+registry access or publication. Confirm a published tag or digest for the
+intended commit before using container installation instructions.
 
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
