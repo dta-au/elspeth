@@ -29,8 +29,9 @@ The signature is a **symmetric HMAC** — any holder of
   bundle, optionally run a non-authoritative preview judge. The authoritative
   verdict is minted only inside the operator-keyed step. The `elspeth-judge` MCP
   tools **fail closed** if the key is in their environment.
-- **Signing never runs in CI.** CI only verifies (`check-override-rate`,
-  `check-judge-quality`); a standing test (`test_meta_ci_never_signs.py`) fails if
+- **Signing never runs in CI.** Automatic CI only runs `check-override-rate`;
+  live `check-judge-quality` validation is explicit operator opt-in through the
+  CLI, never an automatic gate. A standing test (`test_meta_ci_never_signs.py`) fails if
   any signing verb appears in the gate workflow.
 - **Staging asserts; firing verifies.** A staged bundle carries *zero* authority.
   Every claim in it (which entries drifted, which findings are new, which keys

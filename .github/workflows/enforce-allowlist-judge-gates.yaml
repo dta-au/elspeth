@@ -25,14 +25,9 @@
 #     --min-samples (default 10). Above-threshold data fails this advisory
 #     workflow without making it a repository merge gate.
 #
-#   check-judge-quality: on trusted pushes only, run the labelled
-#     judge-quality corpus through the live OpenRouter-backed judge and
-#     require exact verdict/decorator accuracy >= 0.90. This is a prompt/model
-#     REGRESSION TRIPWIRE, not a quality guarantee: the corpus is small (10-30
-#     cases) and tolerates ~1 miss, so it catches a gross prompt edit or model
-#     swap that parser/schema tests cannot see — it does NOT prove the judge is
-#     well-calibrated or injection-resistant. Grow the corpus (esp. adversarial
-#     cases) to widen what the tripwire detects.
+# Live judge-quality validation is operator opt-in, outside automatic CI.
+# The corpus and CLI remain available; see config/cicd/judge-quality-corpus/.
+# This workflow does not receive provider credentials or make model calls.
 #
 # All gates are implemented as elspeth-lints subcommands; the workflow
 # orchestrates checkout and invocation.
@@ -53,9 +48,7 @@
 #
 # The aggregate ``judge-gates-success`` job at the bottom provides one summary
 # status for this additional workflow. Neither it nor the individual
-# diagnostics is a required Git check. The aggregate fails unless C3 succeeds;
-# check-judge-quality may be ``skipped`` because it is intentionally skipped on
-# every PR so PR-controlled code can never read the OpenRouter secret.
+# diagnostics is a required Git check. The aggregate fails unless C3 succeeds.
 #
 # Spec: notes/cicd-judge-cli-prototype-plan.md + the convergent-findings
 # remediation diff that introduced this workflow.
@@ -93,64 +86,6 @@ defaults:
 # Code-executing jobs admit same-repository PRs and trusted pushes. Fork PRs
 # fail the aggregate without checking out or executing their repository code.
 jobs:
-  check-judge-quality:
-    name: Judge-quality validation corpus
-    if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
-    # This job makes real OpenRouter calls; keep the corpus bounded and fail
-    # quickly on transport/config drift.
-    timeout-minutes: 20
-    container:
-      image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
-    env:
-      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-judge-quality
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          path: ${{ env.CI_CHECKOUT_PATH }}
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
-        with:
-          version: "0.10.2"
-          enable-cache: false
-          prune-cache: true
-
-      - name: Use checkout-local uv cache
-        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
-
-      - name: Install judge dependencies
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        run: uv sync --frozen --extra llm --no-install-project
-
-      - name: Verify OpenRouter key is present
-        run: |
-          if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
-            echo "OPENROUTER_API_KEY secret is required for the trusted judge-quality gate." >&2
-            exit 2
-          fi
-
-      - name: Run check-judge-quality
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        run: |
-          set -o pipefail
-          report_file="${RUNNER_TEMP:-/tmp}/judge-quality-report.txt"
-          PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli \
-            check-judge-quality \
-            --corpus config/cicd/judge-quality-corpus/v1.jsonl \
-            --min-accuracy 0.90 2>&1 | tee "$report_file"
-          status="${PIPESTATUS[0]}"
-          {
-            echo "## Judge-quality validation corpus"
-            echo
-            echo '```text'
-            cat "$report_file"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
-
   check-override-rate:
     name: Override-rate drift gate (C3)
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -212,13 +147,12 @@ jobs:
   # Aggregate result for the advisory workflow
   # ===========================================================================
   # This job supplies one mechanical summary status: it fails unless C3
-  # succeeded and check-judge-quality succeeded or was skipped. It remains an
+  # succeeded. It remains an
   # additional diagnostic and is intentionally outside branch protection.
   judge-gates-success:
     name: Judge gates success
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs:
-      - check-judge-quality
       - check-override-rate
     if: always()
     steps:
@@ -242,13 +176,4 @@ jobs:
             echo "C3 override-rate drift gate did not pass (result: ${{ needs.check-override-rate.result }})"
             exit 1
           fi
-          # check-judge-quality is intentionally skipped on every PR: it needs the
-          # OpenRouter secret, which must not be reachable from PR-controlled code.
-          # 'skipped' is therefore acceptable here; any other non-success result
-          # (failure / cancelled / timed_out) fails this advisory workflow.
-          judge_quality_result="${{ needs.check-judge-quality.result }}"
-          if [[ "$judge_quality_result" != "success" && "$judge_quality_result" != "skipped" ]]; then
-            echo "judge-quality gate did not pass (result: $judge_quality_result)"
-            exit 1
-          fi
-          echo "All judge gates passed (judge-quality result: $judge_quality_result)."
+          echo "C3 override-rate drift gate passed."

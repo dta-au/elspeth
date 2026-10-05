@@ -30,8 +30,10 @@ signatures.
   stage a bundle, run a non-authoritative preview judge — but the authoritative
   verdict for a finding is only ever minted inside the operator-keyed step.
 - **Signing never runs in CI.** The key must never be reachable from
-  workflow-controlled code. CI keeps policy checks (`check-override-rate`,
-  `check-judge-quality`); it never signs. This is enforced as a standing
+  workflow-controlled code. Automatic CI keeps `check-override-rate`; live
+  `check-judge-quality` validation is an explicit operator opt-in through the
+  CLI (see [the corpus guide](../config/cicd/judge-quality-corpus/README.md)).
+  CI never signs. This is enforced as a standing
   regression guard by `tests/unit/elspeth_lints/test_meta_ci_never_signs.py`,
   which fails if any signing verb is added to a `run:` step of
   `.github/workflows/enforce-allowlist-judge-gates.yaml`.
