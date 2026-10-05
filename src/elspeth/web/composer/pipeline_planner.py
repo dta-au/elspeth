@@ -3155,6 +3155,11 @@ async def plan_pipeline(
             primary_error.add_note(f"planner lifecycle settlement also failed ({type(settlement_error).__name__})")
 
 
+def _planner_deadline_time() -> float:
+    """Read the planner budget clock without changing asyncio's timer clock."""
+    return asyncio.get_running_loop().time()
+
+
 async def _plan_pipeline_inner(
     *,
     trail: _PlannerAttemptTrail,
@@ -3178,10 +3183,10 @@ async def _plan_pipeline_inner(
     candidate_finalizer: PipelineCandidateFinalizer,
 ) -> PipelinePlanResult:
     skill_hash = hashlib.sha256(rendered_skill.encode("utf-8")).hexdigest()
-    deadline = asyncio.get_running_loop().time() + model_config.timeout_seconds
+    deadline = _planner_deadline_time() + model_config.timeout_seconds
 
     async def run_planner_sync(func: Callable[..., Any], *args: Any) -> Any:
-        remaining = deadline - asyncio.get_running_loop().time()
+        remaining = deadline - _planner_deadline_time()
         if remaining <= 0:
             raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT")
         try:
@@ -3446,7 +3451,7 @@ async def _plan_pipeline_inner(
         for attempt in range(1, model_config.max_api_attempts + 1):
             if total_calls >= budget_policy.max_total_provider_calls:
                 raise PipelinePlannerError("planner provider call budget exhausted", code="PROVIDER_CALLS_EXHAUSTED")
-            remaining = deadline - asyncio.get_running_loop().time()
+            remaining = deadline - _planner_deadline_time()
             if remaining <= 0:
                 raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT")
             total_calls += 1
@@ -3534,7 +3539,7 @@ async def _plan_pipeline_inner(
                 if provider_failure.retryable and attempt < model_config.max_api_attempts:
                     retry_delay = model_config.api_retry_base_seconds * (2 ** (attempt - 1))
                     if retry_delay > 0:
-                        await asyncio.sleep(min(retry_delay, max(0.0, deadline - asyncio.get_running_loop().time())))
+                        await asyncio.sleep(min(retry_delay, max(0.0, deadline - _planner_deadline_time())))
                     continue
                 raise PipelinePlannerError(
                     f"planner provider call failed ({type(exc).__name__})",
