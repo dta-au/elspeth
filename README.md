@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.1](https://img.shields.io/badge/status-0.8.1-green.svg)
+![Status: 0.8.2](https://img.shields.io/badge/status-0.8.2-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -89,13 +89,19 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.1
+## What changed in 0.8.2
 
-This release changes recovery and audit storage. For SQLite installations,
-the cutover is from session epoch 53 to 71 and Landscape epoch 38 to 49;
+This release tightens resource limits for imported YAML, source-contract
+analysis and reference joins, improves Composer policy feedback, and hardens
+credential redaction. Release checks can verify eligible PR-only evidence
+through the merged source lineage. See the [release notes](CHANGELOG.md).
+
+The session and Landscape schema epochs remain unchanged from 0.8.1. For
+SQLite installations upgrading from 0.8.0, the cutover is from
+session epoch 53 to 71 and Landscape epoch 38 to 49;
 ELSPETH does not migrate either store in place. Archive or export evidence you
 need, stop the old service, recreate both stale databases in the same service-stop
-window, and install 0.8.1. See the
+window, and install 0.8.2. See the
 [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
 before upgrading.
 
