@@ -11,14 +11,16 @@ import asyncio
 import json
 import pathlib
 import threading
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import ExitStack, asynccontextmanager, contextmanager
+from contextvars import ContextVar
 
 import jwt as pyjwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
+from sqlalchemy import Engine
 
 from elspeth.web.async_workers import ADMISSION_CAPACITY, outstanding_admissions, run_sync_in_worker
 from elspeth.web.auth.local import LocalAuthProvider
@@ -138,6 +140,46 @@ def make_rs256_token(private_key, claims: dict[str, object]) -> str:
     return make_rsa_token(private_key, claims, algorithm="RS256")
 
 
+_local_auth_engine_owner: ContextVar[ExitStack | None] = ContextVar("local_auth_engine_owner", default=None)
+
+
+@contextmanager
+def local_auth_engine_scope() -> Iterator[None]:
+    """Own helper-created engines until test workers and provider fixtures finish."""
+    with ExitStack() as owner:
+        token = _local_auth_engine_owner.set(owner)
+        try:
+            yield
+        finally:
+            _local_auth_engine_owner.reset(token)
+
+
+@pytest.fixture(autouse=True)
+def local_auth_engine_owner() -> Iterator[None]:
+    with local_auth_engine_scope():
+        yield
+
+
+@contextmanager
+def _provider_session_engine(db_path: pathlib.Path, session_engine: Engine | None) -> Iterator[Engine]:
+    if session_engine is not None:
+        # A supplied engine belongs to the caller, including on failure.
+        yield session_engine
+        return
+    owner = _local_auth_engine_owner.get()
+    if owner is None:
+        raise RuntimeError("build_local_auth_provider requires local_auth_engine_scope or local_auth_engine_owner")
+    sessions_db = pathlib.Path(db_path).parent / "identity-substrate.db"
+    engine = create_session_engine(f"sqlite:///{sessions_db}")
+    with ExitStack() as construction:
+        construction.callback(engine.dispose)
+        initialize_session_schema(engine)
+        yield engine
+        owner.callback(engine.dispose)
+        # Successful construction transfers disposal to the test scope.
+        construction.pop_all()
+
+
 def build_local_auth_provider(
     db_path,
     *,
@@ -151,7 +193,7 @@ def build_local_auth_provider(
     quota_storage_bytes: int | None = None,
     identity_dormancy_days: int = 90,
 ) -> LocalAuthProvider:
-    """Build a LocalAuthProvider wired to a real in-memory identity substrate.
+    """Build a LocalAuthProvider wired to a real file-backed identity substrate.
 
     A local provider now needs THREE things: a credential store (``auth.db``),
     an identity substrate to resolve ``sub``, and a token issuer. Tests build
@@ -167,69 +209,66 @@ def build_local_auth_provider(
     a repeat login finding its own identity, an activation writing a quota
     row -- are arbitrated by constraints, and a stub arbitrates nothing.
 
-    FILE-BACKED, not ``:memory:``. The session engine pools per THREAD
-    (SingletonThreadPool), and admission runs inside ``run_sync_in_worker``,
+    FILE-BACKED, not ``:memory:``. Admission runs inside ``run_sync_in_worker``,
     so an in-memory database would hand the worker thread its own empty copy
     and every login would fail with "no such table: identities".
+
+    Helper-created engines are disposed by ``local_auth_engine_owner`` after
+    the test's workers and fixtures finish. Standalone probes must use
+    ``local_auth_engine_scope``. Supplied engines remain caller-owned.
     """
-    if session_engine is not None:
-        engine = session_engine
-    else:
-        sessions_db = pathlib.Path(db_path).parent / "identity-substrate.db"
-        engine = create_session_engine(f"sqlite:///{sessions_db}")
-        initialize_session_schema(engine)
+    with _provider_session_engine(db_path, session_engine) as engine:
+        # The substrate is reached only through its authority, as in app.py.
+        authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
 
-    # The substrate is reached only through its authority, as in app.py.
-    authority = RepositoryIdentityAuthority(engine, lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply)
+        def _principal_is_active(identity_id: str) -> bool:
+            record = authority.read_identity(identity_id=identity_id)
+            return record is not None and record.is_active
 
-    def _principal_is_active(identity_id: str) -> bool:
-        record = authority.read_identity(identity_id=identity_id)
-        return record is not None and record.is_active
+        def _record_nothing(_identity_id: str, _username: str, _quota_written: bool) -> None:
+            # These tests exercise the provider, not the Landscape admission
+            # pair; app.py binds the real recorder. Explicit, because the
+            # authority refuses to guess that a caller audits nothing.
+            return None
 
-    def _record_nothing(_identity_id: str, _username: str, _quota_written: bool) -> None:
-        # These tests exercise the provider, not the Landscape admission
-        # pair; app.py binds the real recorder. Explicit, because the
-        # authority refuses to guess that a caller audits nothing.
-        return None
+        def _record_no_retirement(_outcome: IdentityRetired) -> None:
+            # Same decision as ``_record_nothing``: the provider tests do not
+            # exercise the Landscape retirement row that app.py records.
+            return None
 
-    def _record_no_retirement(_outcome: IdentityRetired) -> None:
-        # Same decision as ``_record_nothing``: the provider tests do not
-        # exercise the Landscape retirement row that app.py records.
-        return None
+        def _record_no_rebound(_outcome: IdentityRebound) -> None:
+            # Same decision again, and unreachable besides: this fixture is the
+            # LOCAL provider, which R3 excludes.
+            return None
 
-    def _record_no_rebound(_outcome: IdentityRebound) -> None:
-        # Same decision again, and unreachable besides: this fixture is the
-        # LOCAL provider, which R3 excludes.
-        return None
+        def _record_no_dormancy(_outcome: IdentityDormant) -> None:
+            # Same decision as ``_record_nothing``. Unlike the rebound callback
+            # this one IS reachable -- R9 does not exclude local auth -- but no
+            # login in this fixture's tests is 90 days old.
+            return None
 
-    def _record_no_dormancy(_outcome: IdentityDormant) -> None:
-        # Same decision as ``_record_nothing``. Unlike the rebound callback
-        # this one IS reachable -- R9 does not exclude local auth -- but no
-        # login in this fixture's tests is 90 days old.
-        return None
+        def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
+            return authority.ensure_identity(
+                claims=claims,
+                activate=registration_open,
+                quota_tokens_per_day=quota_tokens_per_day,
+                quota_storage_bytes=quota_storage_bytes,
+                identity_dormancy_days=identity_dormancy_days,
+                record_admission=_record_nothing,
+                record_rebound=_record_no_rebound,
+                record_dormant=_record_no_dormancy,
+            )
 
-    def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
-        return authority.ensure_identity(
-            claims=claims,
-            activate=registration_open,
-            quota_tokens_per_day=quota_tokens_per_day,
-            quota_storage_bytes=quota_storage_bytes,
-            identity_dormancy_days=identity_dormancy_days,
-            record_admission=_record_nothing,
-            record_rebound=_record_no_rebound,
-            record_dormant=_record_no_dormancy,
+        return LocalAuthProvider(
+            db_path=db_path,
+            token_issuer=SessionTokenIssuer(
+                signing_key=signing_key,
+                provider="local",
+                audience=audience,
+                token_expiry_hours=token_expiry_hours,
+                max_refresh_chain_hours=max_refresh_chain_hours,
+                principal_is_active=_principal_is_active,
+            ),
+            admit_identity=_admit_identity,
+            retire_identity=local_identity_retirer(authority, _record_no_retirement),
         )
-
-    return LocalAuthProvider(
-        db_path=db_path,
-        token_issuer=SessionTokenIssuer(
-            signing_key=signing_key,
-            provider="local",
-            audience=audience,
-            token_expiry_hours=token_expiry_hours,
-            max_refresh_chain_hours=max_refresh_chain_hours,
-            principal_is_active=_principal_is_active,
-        ),
-        admit_identity=_admit_identity,
-        retire_identity=local_identity_retirer(authority, _record_no_retirement),
-    )

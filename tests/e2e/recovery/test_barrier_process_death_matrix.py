@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, select
 
 from elspeth.contracts import Determinism, NodeType, RunStatus, TokenInfo
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
@@ -54,7 +54,6 @@ from elspeth.core.landscape.schema import (
     group_losses_table,
     group_records_table,
     node_states_table,
-    run_coordination_table,
     run_workers_table,
     token_lineage_frames_table,
     token_outcomes_table,
@@ -76,12 +75,11 @@ from elspeth.testing import make_row, make_token_info
 from tests.e2e.recovery.harness import _PassthroughTransform, spawn_database_process_at_seam, spawn_database_process_with_pause
 from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
     _PROCESS_TIMEOUT_SECONDS,
-    _install_short_run_liveness,
     _wait_until_run_is_resumable,
 )
 from tests.fixtures.dag_scenario_corpus.plugins import CorpusBranchLossTransform
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import leader_coordination_token, leader_token_for
+from tests.fixtures.landscape import expire_leader_seat, leader_coordination_token, leader_token_for
 from tests.fixtures.plugins import CollectSink
 from tests.integration.pipeline.test_aggregation_recovery import (
     _build_eof_aggregation_pipeline,
@@ -161,7 +159,6 @@ def _run_aggregation_to_receipt_seam(
     """Commit the aggregation receipt, then pause before output routing."""
     from elspeth.engine.executors.aggregation import AggregationExecutor
 
-    _install_short_run_liveness()
     source = _LoadCountingSource([{"value": 10}, {"value": 20}, {"value": 30}], on_success="batch_in")
     transform = _SumBatchTransform()
     config, graph = _build_eof_aggregation_pipeline(source, transform, CollectSink("output"))
@@ -391,12 +388,7 @@ def _exercise_aggregation(tmp_path: Path) -> LandscapeDB:
         RecorderFactory(killed_db).run_lifecycle.update_run_status(
             RunStatus.FAILED, coordination_token=leader_coordination_token(RecorderFactory(killed_db), run_id)
         )
-        with killed_db.write_connection() as conn:
-            conn.execute(
-                update(run_coordination_table)
-                .where(run_coordination_table.c.run_id == run_id)
-                .values(leader_heartbeat_expires_at=datetime.now(UTC) - timedelta(seconds=1))
-            )
+        expire_leader_seat(killed_db, run_id)
     _wait_until_run_is_resumable(database_url, run_id)
     _run_fresh_recovery(database_url, _resume_aggregation_after_death, (run_id, str(payload_path)))
     recovered = LandscapeDB.from_url(database_url, create_tables=False)

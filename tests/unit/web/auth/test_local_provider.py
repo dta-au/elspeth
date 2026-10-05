@@ -11,9 +11,9 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing, contextmanager
 from typing import Any
 
 import jwt as pyjwt
@@ -37,6 +37,24 @@ from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 from .conftest import build_local_auth_provider
+
+
+@contextmanager
+def _release_audit_on_exit(release: threading.Event) -> Iterator[None]:
+    """Release before executor shutdown even when the interleaving assertion fails."""
+    try:
+        yield
+    finally:
+        release.set()
+
+
+def _wait_for_audit_entry(entered: threading.Event, future: Future[str]) -> None:
+    # The test's overall watchdog bounds entry, interleaving and joining.
+    # Report an early worker failure directly instead of waiting for entry.
+    while not entered.wait(timeout=0.01):
+        if future.done():
+            future.result()
+            pytest.fail("registration worker finished without entering its required audit")
 
 
 class _CommitFailingConnection:
@@ -543,6 +561,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         with pytest.raises(RuntimeError, match="without calling the credential deletion"):
             provider.delete_user("alice", reason="left the team")
 
+    @pytest.mark.timeout(30, method="thread")
     def test_open_registration_audit_failure_removes_the_committed_user(self, provider) -> None:
         """Audit runs after the durable commit; a failed audit compensates.
 
@@ -555,10 +574,10 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
         def fail_required_audit(_token: str) -> None:
             audit_entered.set()
-            assert release_audit.wait(timeout=2)
+            release_audit.wait()
             raise OSError("Landscape unavailable")
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor, _release_audit_on_exit(release_audit):
             future = executor.submit(
                 provider.register_open_user_with_audit,
                 "alice",
@@ -567,53 +586,75 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
                 None,
                 record_token_issued=fail_required_audit,
             )
-            assert audit_entered.wait(timeout=2)
+            _wait_for_audit_entry(audit_entered, future)
             # The account is durable before the audit callback observes it.
             token = provider._login_sync("alice", "password123")
             assert len(token.split(".")) == 3
             release_audit.set()
             with pytest.raises(OSError, match="Landscape unavailable"):
-                future.result(timeout=2)
+                future.result()
 
         # The audit failure compensated: the unaudited account is gone.
         with pytest.raises(AuthenticationError, match="Invalid credentials"):
             provider._login_sync("alice", "password123")
 
     @pytest.mark.asyncio
+    @pytest.mark.timeout(30, method="thread")
     async def test_cancelled_open_registration_finishes_audit_and_state_together(self, provider) -> None:
         audit_entered = threading.Event()
         release_audit = threading.Event()
         audit_finished = threading.Event()
+        worker_started = threading.Event()
+        worker_finished = threading.Event()
+        worker_errors: list[BaseException] = []
 
         async def wait_for_event(event: threading.Event) -> bool:
             # Keep a loop timer active: thread completion alone may not wake
             # the selector promptly in sandboxed test environments.
-            deadline = asyncio.get_running_loop().time() + 2
-            while not event.is_set() and asyncio.get_running_loop().time() < deadline:
+            while not event.is_set():
+                if task.done():
+                    await task
+                    pytest.fail("registration worker finished without entering its required audit")
                 await asyncio.sleep(0.01)
             return event.is_set()
 
         def record_required_audit(_token: str) -> None:
             audit_entered.set()
-            assert release_audit.wait(timeout=2)
+            release_audit.wait()
             audit_finished.set()
 
-        task = asyncio.create_task(
-            run_sync_in_worker(
-                provider.register_open_user_with_audit,
-                "alice",
-                "password123",
-                "Alice",
-                None,
-                record_token_issued=record_required_audit,
-            )
-        )
-        assert await wait_for_event(audit_entered)
-        task.cancel()
-        release_audit.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert await wait_for_event(audit_finished)
+        def register() -> str:
+            worker_started.set()
+            try:
+                return provider.register_open_user_with_audit(
+                    "alice",
+                    "password123",
+                    "Alice",
+                    None,
+                    record_token_issued=record_required_audit,
+                )
+            except BaseException as error:
+                worker_errors.append(error)
+                raise
+            finally:
+                worker_finished.set()
+
+        task = asyncio.create_task(run_sync_in_worker(register))
+        try:
+            assert await wait_for_event(audit_entered)
+            task.cancel()
+        finally:
+            release_audit.set()
+            # Cancelling the awaiter does not stop a running worker. Observe
+            # full registration completion, after its post-audit transaction,
+            # before fixture teardown can dispose its session engine.
+            await asyncio.gather(task, return_exceptions=True)
+            while worker_started.is_set() and not worker_finished.is_set():
+                await asyncio.sleep(0.01)
+            if worker_errors:
+                raise worker_errors[0]
+        assert task.cancelled()
+        assert audit_finished.is_set()
 
         token = await provider.login("alice", "password123")
         assert len(token.split(".")) == 3
@@ -722,6 +763,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         with pytest.raises(AuthenticationError, match="Invalid credentials"):
             provider._login_sync("alice", "password123")
 
+    @pytest.mark.timeout(30, method="thread")
     def test_registration_audit_intent_is_durable_until_delivered(self, provider) -> None:
         """The commit durably records an undelivered intent, cleared on delivery."""
         audit_entered = threading.Event()
@@ -729,9 +771,9 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
         def record_required_audit(_token: str) -> None:
             audit_entered.set()
-            assert release_audit.wait(timeout=2)
+            release_audit.wait()
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor, _release_audit_on_exit(release_audit):
             future = executor.submit(
                 provider.register_open_user_with_audit,
                 "alice",
@@ -740,15 +782,16 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
                 None,
                 record_token_issued=record_required_audit,
             )
-            assert audit_entered.wait(timeout=2)
+            _wait_for_audit_entry(audit_entered, future)
             # The durable pre-delivery window is marked, never silent.
             assert _audit_intents(provider) == [("alice", "register")]
             release_audit.set()
-            token = future.result(timeout=2)
+            token = future.result()
 
         assert len(token.split(".")) == 3
         assert _audit_intents(provider) == []
 
+    @pytest.mark.timeout(30, method="thread")
     def test_reclaimed_active_registration_cannot_return_token(
         self,
         provider,
@@ -762,9 +805,9 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
         def record_required_audit(_token: str) -> None:
             audit_entered.set()
-            assert release_audit.wait(timeout=2)
+            release_audit.wait()
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor, _release_audit_on_exit(release_audit):
             future = executor.submit(
                 provider.register_open_user_with_audit,
                 "alice",
@@ -773,7 +816,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
                 None,
                 record_token_issued=record_required_audit,
             )
-            assert audit_entered.wait(timeout=2)
+            _wait_for_audit_entry(audit_entered, future)
             now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
             restarted = build_local_auth_provider(provider._db_path)
             replacement_token = restarted.register_open_user_with_audit(
@@ -786,13 +829,14 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             release_audit.set()
 
             with pytest.raises(AuditIntegrityError):
-                future.result(timeout=2)
+                future.result()
 
         with pytest.raises(AuthenticationError, match="Invalid credentials"):
             provider._login_sync("alice", "password123")
         assert len(replacement_token.split(".")) == 3
         assert len(restarted._login_sync("alice", "replacement456").split(".")) == 3
 
+    @pytest.mark.timeout(30, method="thread")
     def test_reclaimed_registration_audit_failure_spares_replacement_account(
         self,
         provider,
@@ -812,10 +856,10 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
         def fail_required_audit(_token: str) -> None:
             audit_entered.set()
-            assert release_audit.wait(timeout=2)
+            release_audit.wait()
             raise OSError("Landscape unavailable")
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor, _release_audit_on_exit(release_audit):
             future = executor.submit(
                 provider.register_open_user_with_audit,
                 "alice",
@@ -824,7 +868,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
                 None,
                 record_token_issued=fail_required_audit,
             )
-            assert audit_entered.wait(timeout=2)
+            _wait_for_audit_entry(audit_entered, future)
             now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
             restarted = build_local_auth_provider(provider._db_path)
             replacement_token = restarted.register_open_user_with_audit(
@@ -837,7 +881,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             release_audit.set()
 
             with pytest.raises(OSError, match="Landscape unavailable"):
-                future.result(timeout=2)
+                future.result()
 
         # The replacement account survived the fenced compensation.
         assert len(replacement_token.split(".")) == 3
@@ -853,6 +897,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         assert owned is False
         assert len(provider._login_sync("alice", "replacement456").split(".")) == 3
 
+    @pytest.mark.timeout(30, method="thread")
     def test_reclaimed_active_verification_cannot_return_token(
         self,
         provider,
@@ -874,15 +919,15 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
         def record_required_audit(_identity: UserIdentity, _access_token: str) -> None:
             audit_entered.set()
-            assert release_audit.wait(timeout=2)
+            release_audit.wait()
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor, _release_audit_on_exit(release_audit):
             future = executor.submit(
                 provider.verify_email_and_issue_token,
                 verification_token,
                 record_token_issued=record_required_audit,
             )
-            assert audit_entered.wait(timeout=2)
+            _wait_for_audit_entry(audit_entered, future)
             now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
             restarted = build_local_auth_provider(provider._db_path)
             retry_token = restarted.verify_email_and_issue_token(
@@ -892,7 +937,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             release_audit.set()
 
             with pytest.raises(AuditIntegrityError):
-                future.result(timeout=2)
+                future.result()
 
         assert len(retry_token.split(".")) == 3
         assert len(restarted._login_sync("alice", "password123").split(".")) == 3

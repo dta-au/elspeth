@@ -29,6 +29,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.unit.web.auth.conftest import build_local_auth_provider
+from tests.unit.web.auth.conftest import local_auth_engine_owner as local_auth_engine_owner
 
 runner = CliRunner()
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -19,17 +20,16 @@ from elspeth.cli import app
 from elspeth.contracts.call_data import CallPayload, HTTPCallRequest
 from elspeth.contracts.enums import CallStatus, CallType
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape import LandscapeDB, run_coordination_repository
 from elspeth.core.landscape.execution.calls import CallAuditRepository
 from elspeth.core.landscape.schema import runs_table, sink_effect_members_table, sink_effects_table, token_outcomes_table
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionSeam
 from elspeth.plugins.sources.power_automate import PowerAutomateSource
 from tests.e2e.recovery.harness import spawn_database_process_with_pause
 from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
-    _install_short_run_liveness,
     _wait_until_run_is_resumable,
 )
-from tests.fixtures.landscape import expire_sink_effect_lease
+from tests.fixtures.landscape import expire_leader_seat, expire_sink_effect_lease
 from tests.fixtures.power_automate import (
     PROTOCOL,
     PUBLIC_IP,
@@ -283,7 +283,6 @@ def test_same_id_concurrent_write_controls_remote_dedup(tmp_path: Path, deduplic
 def _worker_at_remote_commit(db: LandscapeDB, pause: object, root: str, seam_value: str) -> None:
     assert callable(pause)
     del db
-    _install_short_run_liveness()
     path = Path(root)
     flow = DurablePowerAutomateFlow(path / "target.db", pages=[[{"record_id": "A", "result": "ok"}]])
     original_fault = SinkEffectCoordinator._fault
@@ -298,6 +297,44 @@ def _worker_at_remote_commit(db: LandscapeDB, pause: object, root: str, seam_val
     with flow.transport(), patch.object(SinkEffectCoordinator, "_fault", pause_at_target):
         result = invoke(path, pipeline_settings(path))
     assert result.exit_code == 0, result.output
+
+
+def _worker_with_slow_live_renewal(db: LandscapeDB, pause: object, root: str) -> None:
+    """Delay one real fenced transaction beyond the former test-only budget."""
+    original_renew = run_coordination_repository._renew_leader_deadline_on
+    delayed = False
+    assert callable(pause)
+
+    def slow_renew(conn, *, token, window_seconds, verb):
+        nonlocal delayed
+        original_renew(conn, token=token, window_seconds=window_seconds, verb=verb)
+        if not delayed:
+            delayed = True
+            time.sleep(0.4)
+
+    def pause_after_delay() -> None:
+        assert delayed, "controlled renewal delay was not exercised"
+        pause()
+
+    with patch.object(run_coordination_repository, "_renew_leader_deadline_on", slow_renew):
+        _worker_at_remote_commit(db, pause_after_delay, root, "remote_commit")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGKILL oracle is POSIX-specific")
+def test_live_worker_reaches_remote_commit_after_slow_fenced_transaction(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'landscape.db'}"
+    with LandscapeDB(database_url):
+        pass
+    with spawn_database_process_with_pause(
+        database_url=database_url,
+        seam="remote-commit-after-slow-renewal",
+        action=_worker_with_slow_live_renewal,
+        action_args=(str(tmp_path),),
+    ) as child:
+        child.wait_until_ready(timeout=20)
+        child.kill()
+        assert child.wait_for_exit(timeout=20).was_killed
+    assert len(DurablePowerAutomateFlow(tmp_path / "target.db").actions()) == 1
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL oracle is POSIX-specific")
@@ -340,6 +377,10 @@ def exercise_power_automate_process_death(tmp_path: Path, seam_value: str) -> No
         assert len(killed_actions) == 1
         assert killed_actions[0]["delivery_id"] == original_delivery
     run_id = _run_id(tmp_path)
+    # The original process is confirmed dead. Age its abandoned seat on the
+    # database clock without imposing a 0.2-second budget on live transactions.
+    with LandscapeDB.from_url(database_url, create_tables=False) as db:
+        expire_leader_seat(db, run_id)
     _wait_until_run_is_resumable(database_url, run_id)
     with (
         patch.dict(
