@@ -291,6 +291,7 @@ def test_build_push_verifies_ruleset_required_checks_for_image_sha() -> None:
     assert "scripts/cicd/check_release_required_checks.py" in run
     assert '--sha "$IMAGE_SHA"' in run
     assert '--repo "$GITHUB_REPOSITORY"' in run
+    assert "--target-branch main" in run
     assert "check_name=CI%20Success" not in run
     assert "Workflow run trigger already supplied successful CI conclusion" not in run
 
@@ -302,12 +303,33 @@ def test_build_push_grants_read_permissions_for_required_check_verifier() -> Non
     assert job["permissions"]["actions"] == "read"
     assert job["permissions"]["checks"] == "read"
     assert job["permissions"]["statuses"] == "read"
+    assert job["permissions"]["pull-requests"] == "read"
 
 
 def test_image_metadata_binds_oci_revision_to_the_checked_out_image_sha() -> None:
     metadata = _step(_build_push_job(), "Generate image metadata")
 
     assert "org.opencontainers.image.revision=${{ env.IMAGE_SHA }}" in metadata["with"]["labels"]
+    assert "type=raw,value=sha-${{ env.IMAGE_SHA }}" in metadata["with"]["tags"]
+    assert "type=sha" not in metadata["with"]["tags"]
+
+
+@pytest.mark.parametrize("job_name", ["build-push", "smoke-test", "release"])
+def test_every_publisher_checkout_uses_immutable_image_sha(job_name: str) -> None:
+    """Build, smoke and promotion consume the same event-selected source."""
+    checkouts = [step for step in _job(job_name)["steps"] if str(step.get("uses", "")).startswith("actions/checkout@")]
+    assert len(checkouts) == 1
+    assert checkouts[0]["with"]["ref"] == "${{ env.IMAGE_SHA }}"
+
+
+def test_workflow_run_selects_completed_ci_sha_instead_of_current_default_tip() -> None:
+    workflow = _workflow()
+    assert workflow["env"]["IMAGE_SHA"] == (
+        "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}"
+    )
+    admission = _build_push_job()["if"]
+    assert "github.event.workflow_run.event == 'push'" in admission
+    assert "github.event.workflow_run.head_repository.full_name == github.repository" in admission
 
 
 # ---------------------------------------------------------------------------

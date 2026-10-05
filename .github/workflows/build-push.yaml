@@ -87,6 +87,7 @@ jobs:
       checks: read
       contents: read
       packages: write
+      pull-requests: read
       statuses: read
       id-token: write
 
@@ -132,7 +133,8 @@ jobs:
           python3 scripts/cicd/check_release_required_checks.py \
             --repo "$GITHUB_REPOSITORY" \
             --sha "$IMAGE_SHA" \
-            --ruleset-name main
+            --ruleset-name main \
+            --target-branch main
 
       - name: Set up QEMU (for multi-platform builds)
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8
@@ -239,7 +241,7 @@ jobs:
             ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             # SHA tag (immutable)
-            type=sha,prefix=sha-,format=short
+            type=raw,value=sha-${{ env.IMAGE_SHA }}
             # Semantic version from tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -904,6 +906,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ env.IMAGE_SHA }}
           path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Set up Docker Buildx
