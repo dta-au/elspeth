@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -36,10 +36,10 @@ from sqlalchemy import func, select, update
 from elspeth.contracts import RunStatus
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
-    run_coordination_table,
     run_workers_table,
     runs_table,
     token_outcomes_table,
@@ -50,10 +50,9 @@ from elspeth.engine.executors.aggregation import AggregationExecutor
 from tests.e2e.recovery.harness import spawn_database_process_at_seam, spawn_database_process_with_pause
 from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
     _PROCESS_TIMEOUT_SECONDS,
-    _install_short_run_liveness,
     _wait_until_run_is_resumable,
 )
-from tests.fixtures.landscape import leader_coordination_token
+from tests.fixtures.landscape import expire_leader_seat, leader_coordination_token
 from tests.integration.pipeline.test_aggregation_release_continuations import _DOCUMENTS, _GROUP_OUTPUT, _scope_pipeline
 from tests.integration.pipeline.test_barrier_hold_payload import build_pipeline, resume_pipeline, run_pipeline, terminal_counts
 
@@ -66,7 +65,6 @@ _OPENER_NODE_PREFIX = "transform_explode_"
 
 def _run_to_seam(db: LandscapeDB, pause: Callable[[], None], seam: str, output_mode: str, work_dir: str) -> None:
     """Child: run the pipeline and pause (to be SIGKILLed) at ``seam``."""
-    _install_short_run_liveness()
     env = build_pipeline(Path(work_dir), _scope_pipeline(output_mode), _DOCUMENTS["two"], db=db)
     # This process is SIGKILLed at the seam, so the patch is never undone.
     patch = pytest.MonkeyPatch()
@@ -115,17 +113,12 @@ def _mark_killed_run_failed(database_url: str, run_id: str) -> None:
     seat, its worker heartbeat and the scheduler lease it held are expired, so
     the resume takeover can seize the run and reap the killed claim.
     """
-    expired_at = datetime.now(UTC) - timedelta(seconds=1)
     with LandscapeDB.from_url(database_url, create_tables=False) as killed_db:
         RecorderFactory(killed_db).run_lifecycle.update_run_status(
             RunStatus.FAILED, coordination_token=leader_coordination_token(RecorderFactory(killed_db), run_id)
         )
         with killed_db.write_connection() as conn:
-            conn.execute(
-                update(run_coordination_table)
-                .where(run_coordination_table.c.run_id == run_id)
-                .values(leader_heartbeat_expires_at=expired_at)
-            )
+            expired_at = read_landscape_transaction_time(conn) - timedelta(seconds=1)
             conn.execute(update(run_workers_table).where(run_workers_table.c.run_id == run_id).values(heartbeat_expires_at=expired_at))
             conn.execute(
                 update(token_work_items_table)
@@ -133,6 +126,7 @@ def _mark_killed_run_failed(database_url: str, run_id: str) -> None:
                 .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
                 .values(lease_expires_at=expired_at)
             )
+        expire_leader_seat(killed_db, run_id)
 
 
 def _journal_statuses(db: LandscapeDB) -> dict[str, int]:

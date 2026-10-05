@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.fixtures.landscape import leader_coordination_token, register_test_node
+from tests.helpers.process_diagnostics import ProcessDiagnostics, trace_child_process
 from tests.testcontainer.web.test_cross_process_run_control_postgres import _envelope
 from tests.testcontainer.web.test_global_run_recovery_postgres import _expire_fence, _expire_instance, _register_live_instance
 from tests.unit.web.blobs.test_service_fencing import _reserve_output_blob
@@ -200,23 +201,42 @@ def _run_reconciler(session_url, landscape_url, data_dir, crash_before_outputs, 
     asyncio.run(recover())
 
 
+def _traced_process_target(target, args, sender, diagnostic_path):
+    with trace_child_process(diagnostic_path) as phase:
+        phase(f"running {target.__module__}.{target.__qualname__}")
+        target(*args, sender)
+        phase("target returned")
+
+
 def _process(target, *args, expected_exit):
     context = multiprocessing.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
-    process = context.Process(target=target, args=(*args, sender))
+    diagnostics = ProcessDiagnostics()
+    process = context.Process(target=_traced_process_target, args=(target, args, sender, diagnostics.path))
     try:
         process.start()
         sender.close()
-        assert receiver.poll(90), "recovery subprocess did not report its durable seam"
-        result = receiver.recv()
+        if not receiver.poll(90):
+            raise AssertionError(f"recovery subprocess did not report its durable seam\n{diagnostics.snapshot(process)}")
+        try:
+            result = receiver.recv()
+        except EOFError as exc:
+            raise AssertionError(f"recovery subprocess exited before its durable seam\n{diagnostics.snapshot(process)}") from exc
         process.join(timeout=30)
-        assert process.exitcode == expected_exit
+        assert process.exitcode == expected_exit, diagnostics.snapshot(process)
         return result
     finally:
         if process.is_alive():
             process.terminate()
             process.join(timeout=10)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=10)
+        assert not process.is_alive(), "could not stop owned recovery subprocess"
         receiver.close()
+        sender.close()
+        process.close()
+        diagnostics.close()
 
 
 def _expire_dead_owner(session_url, session_id, owner):
