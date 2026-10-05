@@ -260,7 +260,7 @@ on `main` (§ 1.3). Pre-commit hooks run on the contributor's machine once
 | File hygiene hooks | Trailing whitespace, final newline, YAML and TOML syntax, files over 1,000 KB, merge-conflict markers, debug statements | Pre-commit | Local only | [.pre-commit-config.yaml](../../.pre-commit-config.yaml) [EV-606] |
 | Mutation testing | Whether tests kill injected faults in `core/canonical.py` and `core/landscape/` | Weekly schedule and manual | No — advisory by design; scores are not thresholds ([GOVERNANCE.md](../../GOVERNANCE.md#maintainer-continuity)) | [mutation-testing.yaml](../../.github/workflows/mutation-testing.yaml) [EV-615] |
 | Dependabot version updates | Seven weekly update entries: both `uv` trees, both `npm` trees, GitHub Actions and both Docker contexts | Monday schedule | Not a gate; its pull requests pass the gates above | [dependabot.yml](../../.github/dependabot.yml) [EV-616] |
-| Release required-checks verification | The image commit has successful checks for every context the `main` ruleset requires | `build-push.yaml`, before any build | Blocks image publication (§ 6.2) | `scripts/cicd/check_release_required_checks.py` [EV-625] |
+| Release required-checks verification | Every `main` ruleset context succeeds on the image commit or, only for missing PR-only contexts, its verified identical-tree merged PR head | `build-push.yaml`, before any build | Blocks image publication (§ 6.2) | `scripts/cicd/check_release_required_checks.py` [EV-625] |
 
 ### 2.3 `elspeth-lints` rule families
 
@@ -530,8 +530,13 @@ workflow [EV-625] [EV-626].
 In every case the first step,
 `scripts/cicd/check_release_required_checks.py`, reads the live `main`
 ruleset, takes its required status checks, and refuses to publish unless the
-image commit has a successful check for every one. A missing, pending or
-failed check stops the job [EV-625].
+image commit has successful evidence for every one. Only missing PR-only
+cohort-attribution and redaction contexts may use the verified merged PR's
+exact source head, with an identical tree and trusted workflow provenance.
+CI/CodeQL and unknown contexts remain exact-image requirements; direct pending
+or failed checks cannot be replaced. Unproven evidence stops the job [EV-625].
+The [publication proof guide](../maintainer/release-check-evidence.md) describes
+the accepted lineage, event binding and conservative refusal cases.
 
 The workflow then performs the following sequence [EV-626]:
 
