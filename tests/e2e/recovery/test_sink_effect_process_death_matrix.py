@@ -18,20 +18,10 @@ import pytest
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.scheduler import SchedulerEventType
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager, check_run_status_resumable
-from elspeth.core.checkpoint import manager as checkpoint_manager_module
 from elspeth.core.config import CheckpointSettings, QueueSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
-from elspeth.core.landscape import LandscapeDB, run_lifecycle_repository
-from elspeth.core.landscape.data_flow import tokens as token_repository_module
-from elspeth.core.landscape.execution import node_states as node_states_module
-from elspeth.core.landscape.execution import operations as operations_module
-from elspeth.core.landscape.execution import sink_effect_finalization as sink_effect_finalization_module
-from elspeth.core.landscape.execution import sink_effect_lifecycle as sink_effect_lifecycle_module
-from elspeth.core.landscape.execution import sink_effect_reservation as sink_effect_reservation_module
-from elspeth.core.landscape.scheduler import dispositions as scheduler_dispositions_module
-from elspeth.core.landscape.scheduler import fencing as scheduler_fencing_module
-from elspeth.core.landscape.scheduler import queue as scheduler_queue_module
+from elspeth.core.landscape import LandscapeDB
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionSeam
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
@@ -45,6 +35,7 @@ from tests.e2e.recovery.harness import (
     spawn_database_process_with_pause,
 )
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
+from tests.fixtures.landscape import expire_leader_seat
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 
 if TYPE_CHECKING:
@@ -273,26 +264,6 @@ def _install_short_sink_lease() -> None:
     SinkEffectCoordinator.__init__ = short_init  # type: ignore[method-assign]
 
 
-def _install_short_run_liveness() -> None:
-    run_lifecycle_repository.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
-    checkpoint_manager_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
-    token_repository_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
-    # The operation begins before BEFORE_RESERVATION and extends the same seat.
-    operations_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
-    # Bulk sink state opening also fences before the first reservation seam.
-    node_states_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
-    scheduler_dispositions_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
-    scheduler_fencing_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
-    scheduler_queue_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
-    # ADR-048 D8.5: the sink-effect verbs fence too, and every fence EXTENDS
-    # the seat it verifies. Leaving these three at the product window keeps the
-    # killed leader's seat alive past the test's patience, so the run never
-    # becomes resumable.
-    sink_effect_lifecycle_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
-    sink_effect_finalization_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
-    sink_effect_reservation_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
-
-
 def _run_to_sink_seam(
     db: LandscapeDB,
     pause: object,
@@ -303,7 +274,6 @@ def _run_to_sink_seam(
 ) -> None:
     assert callable(pause)
     _install_short_sink_lease()
-    _install_short_run_liveness()
     if seam_value == _VISIBLE_PUBLICATION_SEAM:
         _local_file_effects._after_replace = lambda _target: pause()
     elif seam_value == _SCHEDULER_CALLBACK_SEAM:
@@ -536,6 +506,11 @@ def _exercise_process_death_seam(
         assert killed_image.tables["artifacts"] == ()
         assert killed_image.tables["token_outcomes"] == ()
 
+    # Every path above has observed the original child's SIGKILL exit. Move
+    # its abandoned seat into database time's past, leaving live run budgets
+    # at their production values throughout the crash-seam execution.
+    with LandscapeDB.from_url(database_url, create_tables=False) as killed_db:
+        expire_leader_seat(killed_db, run_id)
     _wait_until_run_is_resumable(database_url, run_id)
     with spawn_database_process_at_seam(
         database_url=database_url,

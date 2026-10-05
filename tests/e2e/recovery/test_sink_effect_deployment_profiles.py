@@ -56,7 +56,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, WebPlug
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.sessions.protocol import CompositionStateRecord
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.e2e.recovery.harness import spawn_database_process_at_seam, spawn_database_process_with_pause
+from tests.e2e.recovery.harness import SpawnedProcessAtSeam, spawn_database_process_at_seam, spawn_database_process_with_pause
 from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
     _EXPECTED_BYTES,
     _FINAL_ATTEMPTS,
@@ -534,10 +534,14 @@ def _resume_profile_via_cli(
         raise AssertionError(f"CLI resume failed with exit {result.exit_code}: {result.output}") from result.exception
 
 
-def _wait_for_fork_ready(database_url: str, run_id: str, child_alive: Any) -> None:
+def _wait_for_fork_ready(database_url: str, run_id: str, child: SpawnedProcessAtSeam) -> None:
     deadline = time.monotonic() + _PROCESS_TIMEOUT_SECONDS
+    last_error: OperationalError | None = None
+    last_ready: bool | None = None
+    last_leader: bool | None = None
+    observations = 0
     while time.monotonic() < deadline:
-        assert child_alive(), "leader exited before producing follower-claimable work"
+        assert child.is_alive, f"leader exited before producing follower-claimable work\n{child.diagnostic_snapshot()}"
         try:
             with LandscapeDB.from_url(database_url, create_tables=False) as db, db.engine.connect() as conn:
                 ready = conn.execute(
@@ -553,12 +557,19 @@ def _wait_for_fork_ready(database_url: str, run_id: str, child_alive: Any) -> No
                         run_workers_table.c.status == "active",
                     )
                 ).first()
-            if ready is not None and leader is not None:
+            observations += 1
+            last_ready = ready is not None
+            last_leader = leader is not None
+            if last_ready and last_leader:
                 return
-        except OperationalError:
-            pass
+        except OperationalError as exc:
+            last_error = exc
         time.sleep(0.01)
-    raise AssertionError("leader did not produce follower-claimable work")
+    raise AssertionError(
+        f"leader did not produce follower-claimable work: run_id={run_id!r}, "
+        f"successful_observations={observations}, last_ready={last_ready}, last_active_leader={last_leader}, "
+        f"last_database_error={last_error!r}\n{child.diagnostic_snapshot()}"
+    ) from last_error
 
 
 def _run_cli_follower_until_seat_dead(
@@ -660,7 +671,7 @@ def _exercise_worker_profile(
             action=leader_action,
             action_args=(run_id, str(settings_path), seam_value),
         ) as child:
-            _wait_for_fork_ready(database_url, run_id, lambda: child.is_alive)
+            _wait_for_fork_ready(database_url, run_id, child)
             effective_settings_path = tmp_path / "admitted-settings.yaml" if web_attributed else settings_path
             assert effective_settings_path.is_file()
             follower_child = spawn_database_process_at_seam(
@@ -824,7 +835,7 @@ def test_profile_leader_parked_at_the_follower_handoff_hook_stays_live_past_its_
         action=_run_same_host_leader_to_sink_seam,
         action_args=(run_id, str(settings_path), seam_value),
     ) as child:
-        _wait_for_fork_ready(database_url, run_id, lambda: child.is_alive)
+        _wait_for_fork_ready(database_url, run_id, child)
         live, minted_deadline, database_now = _seat_liveness(database_url, run_id)
         assert live and minted_deadline is not None, f"seat not live at fork-ready: deadline={minted_deadline} now={database_now}"
         # The deadline minted before the leader parked is at most one window
