@@ -63,14 +63,15 @@ class ProcessDiagnostics:
                 pass  # The child exited between the observation and signal.
             else:
                 # Diagnostic grace does not turn a missed readiness deadline
-                # into a pass. Keep it bounded even when the child is stuck.
+                # into a pass. Native faulthandler writes a dump in multiple
+                # chunks; first growth does not mean the stack is complete.
+                # Consume the existing grace, then reread even when the last
+                # write lands at the deadline. Capture remains best effort if
+                # the child cannot finish its dump within this bound.
                 deadline = time.monotonic() + 0.2
-                while time.monotonic() < deadline:
-                    latest = Path(self.path).read_text(encoding="utf-8", errors="replace")
-                    if len(latest) > len(trace):
-                        trace = latest
-                        break
-                    time.sleep(0.01)
+                while (remaining := deadline - time.monotonic()) > 0:
+                    time.sleep(min(0.01, remaining))
+                trace = Path(self.path).read_text(encoding="utf-8", errors="replace")
         return f"pid={process.pid} alive={alive} exitcode={process.exitcode} elapsed={time.monotonic() - self._started_at:.3f}s\n{trace}"
 
     def close(self) -> None:
