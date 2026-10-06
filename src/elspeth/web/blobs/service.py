@@ -70,11 +70,10 @@ from elspeth.web.coordination.quota_authority import (
     refuse_unrecorded_quota_exceeded,
 )
 from elspeth.web.sessions.converters import pipeline_dict_from_record
+from elspeth.web.sessions.locking import _blob_custody_session_lock as _blob_custody_session_lock
 from elspeth.web.sessions.locking import (
     _run_lock_cleanup,
     acquire_session_advisory_xact_lock,
-    postgres_blob_custody_advisory_lock,
-    sqlite_process_session_lock,
 )
 from elspeth.web.sessions.models import (
     blob_deletion_cleanups_table,
@@ -1261,20 +1260,6 @@ def _blob_phase_transaction(engine: Engine, held_connection: Connection | None) 
         if primary_exc is not transaction_exc:
             raise primary_exc from transaction_exc
         raise
-
-
-@contextmanager
-def _blob_custody_session_lock(engine: Engine, session_id: str) -> Iterator[Connection | None]:
-    dialect = engine.dialect.name
-    if dialect == "sqlite":
-        with sqlite_process_session_lock(engine, session_id):
-            yield None
-        return
-    if dialect == "postgresql":
-        with engine.connect() as conn, postgres_blob_custody_advisory_lock(conn, session_id):
-            yield conn
-        return
-    raise NotImplementedError(f"Blob custody locking is not implemented for dialect {dialect}")
 
 
 def _acquire_blob_phase_lock(conn: Connection, session_id: str) -> None:

@@ -401,6 +401,9 @@ class _RecordingSessionService:
         self._cancel_side_effect = cancel_side_effect
         self.cancel_all_orphaned_runs_calls: list[dict[str, object]] = []
 
+    async def reconcile_consumed_archives(self) -> int:
+        return 0
+
     async def cancel_all_orphaned_runs(self, **kwargs: object) -> int:
         self.cancel_all_orphaned_runs_calls.append(dict(kwargs))
         if self._cancel_side_effect is not None:
@@ -2737,6 +2740,53 @@ class TestPeriodicOrphanCleanup:
     """Tests for _periodic_orphan_cleanup background task."""
 
     @pytest.mark.asyncio
+    async def test_archive_mount_failure_retries_are_bounded_and_redacted(self, monkeypatch) -> None:
+        sessions = _RecordingSessionService()
+        calls = 0
+
+        async def fail_archive_cleanup() -> int:
+            nonlocal calls
+            calls += 1
+            raise OSError(5, "private archive path must not reach logs", "/private/archive")
+
+        monkeypatch.setattr(sessions, "reconcile_consumed_archives", fail_archive_cleanup)
+        with capture_logs() as logs, pytest.raises(OSError):
+            await asyncio.wait_for(
+                _periodic_orphan_cleanup(
+                    sessions, _RecordingExecutionService(), build_sessions_telemetry(), interval_seconds=0, max_age_seconds=900
+                ),
+                timeout=5,
+            )
+        assert calls == app_module._ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES
+        assert len(sessions.cancel_all_orphaned_runs_calls) == calls - 1
+        assert [entry["consecutive_failures"] for entry in logs] == list(range(1, calls))
+        assert all(entry["event"] == "periodic_archive_cleanup_pending" and entry["errno"] == 5 for entry in logs)
+        assert "private" not in str(logs)
+
+    @pytest.mark.asyncio
+    async def test_archive_startup_failure_precedes_inline_custody_and_membership(self, monkeypatch, tmp_path) -> None:
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
+        reached: list[str] = []
+
+        async def fail_archive_cleanup() -> int:
+            reached.append("archive")
+            raise OSError("archive mount unavailable")
+
+        async def inline_cleanup() -> None:
+            reached.append("inline")
+
+        async def membership_start(_self) -> None:
+            reached.append("membership")
+
+        monkeypatch.setattr(app.state.session_service, "reconcile_consumed_archives", fail_archive_cleanup)
+        monkeypatch.setattr(app.state.blob_service, "reconcile_inline_custody_publications", inline_cleanup)
+        monkeypatch.setattr(SingleProcessWebInstanceMembership, "start", membership_start)
+        with pytest.raises(OSError, match="archive mount unavailable"):
+            async with lifespan(app):
+                pytest.fail("startup must not serve with unresolved consumed custody")
+        assert reached == ["archive"]
+
+    @pytest.mark.asyncio
     async def test_calls_cancel_all_with_max_age(self) -> None:
         """Periodic cleanup passes max_age_seconds (not None) to cancel_all_orphaned_runs.
 
@@ -2883,6 +2933,9 @@ class TestPeriodicOrphanCleanup:
         finalize_calls: list[bool] = []
 
         class _RecordSessionService:
+            async def reconcile_consumed_archives(self) -> int:
+                return 0
+
             async def cancel_all_orphaned_run_records(self, **_kwargs: object) -> list[RunRecord]:
                 return []
 
