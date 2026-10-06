@@ -8,15 +8,18 @@ real archive helper failure and HTTP 500 while preserving the session and bytes.
 Ordinary `os.rename` overwrites an empty competing directory; controlled existing
 collision tests fail under that substitution, so it cannot be a safe fallback.
 
-The repair is isolated on `fix/efs-archive-20261006`, based on
-`edc844699a350a90a624089e12a5a1e75b7b2dde`. The untracked report remains unchanged
+The repair is isolated on `fix/efs-archive-20261006`. Its initial base was
+`edc844699a350a90a624089e12a5a1e75b7b2dde`; normal integration of landed PR #275
+produced candidate `b8c34c05b7494e64db1705e9cb481bd34ef2dcf5`, based on main
+`23822a7477624d6264c60fade0905c19e8c552d7`. The untracked report remains unchanged
 in the main checkout (SHA-256
 `5df889ed9e3e32277b71a0a667e236d5bdc66a2d3c1fbd06b502c125fb14009f`).
 The operator explicitly approved the bounded archive/recovery implementation.
-No release metadata, Composer authoring/retry path, gateway provenance,
-infrastructure, security configuration, credentials, or deployment is changed.
-PR #275 was OPEN at `f8cc1be1928a0f5f6a72b308984c7a8259333e32` when compared
-through GitHub's file-list API; its version-only changes did not overlap this fix.
+This repair authors no release metadata, Composer authoring/retry path, gateway
+provenance, infrastructure, security configuration, credentials, or deployment
+change. It consumes landed PR #275's release and dependency/gateway fixes from
+main. Independent Git-object comparison of that integration measured 15 archive
+and 59 main changed paths with no overlap and exact parent-object preservation.
 
 ## Recovery representation
 
@@ -96,11 +99,12 @@ interrupted publication/restore/purge/retirement, invalid control entries, sourc
 substitution, extra hardlinks, changed current-mount device numbers, peer
 retirement, startup ordering, bounded retries, and PostgreSQL custody contention.
 Independent review found recovery and locking defects during development; these
-were fixed and given regression controls. The final independent review approved
+were fixed and given regression controls. The completed development review approved
 the corrected patch and rechecked its filesystem/lock controls on unchanged
 source hashes. The whole-tree scanner initially timed out under an explicit
-60-second test limit; its completed 300-second rerun above passed. Full-suite
-validation, Daybreak review, and protected PR checks remain merge requirements.
+60-second test limit; its completed 300-second rerun above passed. These are
+development-stage measurements; the integrated candidate's validation and review
+are recorded below. Required protected checks remain a merge requirement.
 
 PR #276's first CI run exposed stale PostgreSQL test-double signatures and
 exact mutation-authority inventory drift. The doubles now accept and forward
@@ -113,7 +117,7 @@ mutation authority. Scanner and table-policy implementations were not widened.
 
 All prior caller mutation/escape controls remain, with new live-source controls
 for advisory-helper DELETE/leak/yield and the consumed predicate's DML/connection
-escape. Independent final review approved the corrected repair and passed all
+escape. Independent CI-repair review approved the corrected repair and passed all
 seven new controls. Completed local results on unchanged test inputs:
 
 ```text
@@ -126,8 +130,34 @@ ruff-ci-repair.log: exit=0; All checks passed!
 
 The expected xfail remains the repository's existing writer-authority burn-down;
 the relocated raw custody escape is explicitly visible in that inventory.
-These checks validate the focused test/inventory repair, not full CI or Daybreak
-clearance. Dependency-audit fixes belong to separately maintained PR #275.
+These checks validate the focused test/inventory repair. On archive head
+`bba870e35d90d301f1485c6130389cd30b40767f`, CI run `37409235806` passed all eight
+Python shards, PostgreSQL contention proofs, frontend checks, and coverage. Its
+dependency audit failed on fsspec 2026.1.0 and multidict 6.7.0; the normal main
+integration consumes PR #275's fsspec 2026.6.0 and multidict 6.9.1 fixes.
+
+The integrated candidate used a task-private Python 3.13.15 environment from the
+frozen all-extras lock, with both owned source roots explicitly selected. Its
+canonical static gate recorded ruff, mypy, and contracts exit 0 and a frozen tree.
+Keyless lints remained nonzero; the controlled normalized comparison to the
+reviewed archive candidate had 1468 distinct emitted findings on each side, with
+no additions or removals. This does not establish operator signature clearance.
+The complete affected serial selection exited 0: 1526 passed, one expected
+writer-inventory xfail, one quorum-policy warning, in 661.97 seconds. HEAD and
+tracked state were unchanged. This is not a local full Python/PostgreSQL suite.
+An earlier restricted-sandbox attempt stalled and was terminated with exit 143;
+the unchanged isolated metrics test, full app file, and original combined order
+then passed outside the sandbox. The original stall's cause remains unproven.
+
+John approved transmission of this archive candidate and relevant source,
+excluding secrets/credentials, through the existing ChatGPT-authenticated CLI.
+The read-only CLI review selected `gpt-daybreak-blue-latest`, exited 0, and gave
+correctness GO conditional on protected CI. It identified one P3 documentation
+provenance issue, corrected in this assessment. Its prose self-label contradicted
+the CLI model metadata; the unedited report and invocation record are retained
+separately. Subsequent changes require review appropriate to their scope, and the
+final head must pass fresh protected CI before merge. No Astra substitution was
+made for that completed invocation.
 
 This is a local EFS-like errno simulation, not a live EFS measurement. Stable
 source inode identity across clients of the same filesystem is required.
