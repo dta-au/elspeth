@@ -18,7 +18,7 @@
     "lint:css": "stylelint 'src/**/*.css'",
     "preview": "vite preview",
     "test": "npm run test:dependencies && vitest run",
-    "test:dependencies": "node --test scripts/braces-depth-guard.test.mjs",
+    "test:dependencies": "node --test scripts/braces-depth-guard.test.mjs scripts/release-dependencies.test.mjs",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "test:e2e:oidc": "playwright test --config=playwright.oidc.config.ts",
@@ -73,6 +73,9 @@
   },
   "overrides": {
     "braces": "npm:@dieub/braces-depth-guard@3.0.3-pn.2",
+    "mermaid": {
+      "katex": "0.18.2"
+    },
     "openapi-typescript": {
       "undici": "6.29.0"
     }
