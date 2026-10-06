@@ -6,6 +6,14 @@ All notable changes to ELSPETH are documented here.
 
 ## 0.8.2 - Unreleased (Bounded validation and release-check hardening)
 
+- **Azurite test tooling uses an owned, bounded diagnostic formatter.** Replace
+  the affected `sprintf-js` dependency only for the locked Tedious tooling
+  consumer. The replacement preserves all driver diagnostic formats and
+  removes floating-point precision operations (CVE-2026-97058). The strict
+  dependency audit remains required; CI also verifies installed consumer
+  resolution, format compatibility and blob source/sink tests without allowing
+  an unavailable emulator to silently skip that coverage.
+
 - **Composer validation keeps resource use bounded.** Source data-contract
   demand analysis limits the source-by-field hypothesis work before copying
   guarantees. Schema propagation reuses structural votes and stops cyclic

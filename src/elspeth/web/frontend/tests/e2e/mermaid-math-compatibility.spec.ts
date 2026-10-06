@@ -6,7 +6,7 @@ for (const forceLegacyMathML of [false, true]) {
   test(`Mermaid math renders with legacy output ${forceLegacyMathML}`, async ({ page }) => {
     await page.goto("/");
     const result = await page.evaluate(async (legacy) => {
-      const modulePath = "/node_modules/mermaid/dist/mermaid.core.mjs";
+      const modulePath = "/tests/e2e/harness/mermaid-browser.ts";
       const { default: mermaid } = await import(modulePath);
       mermaid.initialize({ startOnLoad: false, securityLevel: "strict", forceLegacyMathML: legacy });
       const { svg } = await mermaid.render("release-math-control", 'flowchart TD\n A["$$x^2+\\frac{1}{2}$$"] --> B["ordinary"]');
