@@ -204,7 +204,7 @@ def test_release_publishes_signed_attested_gateway_digest_and_smokes_it() -> Non
 
     inspect = _step(build, "Inspect gateway SBOM and provenance attestations")["run"]
     assert ".SBOM" in inspect and ".Provenance" in inspect
-    assert "python3 scripts/cicd/check_gateway_attestations.py" in inspect
+    assert "PYTHONPATH=elspeth-lints/src python3 scripts/cicd/check_release_required_checks.py gateway-attestations" in inspect
     assert '--source-sha "$IMAGE_SHA"' in inspect
     assert '--platforms "$PLATFORMS"' in inspect
     assert '--run-id "$GITHUB_RUN_ID"' in inspect

@@ -1,4 +1,4 @@
-"""Fail closed on gateway SBOM/build identity before scans, signatures and smoke.
+"""Runtime gateway artifact validation used by the existing release verifier.
 
 Buildx renders SLSA v1 predicates under each platform's ``SLSA`` key. The
 builder is the GitHub run URL; BuildKit identifies its format in buildType.
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -160,7 +161,8 @@ def validate_gateway_attestations(
             _expect(vcs, key, value, platform)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def qualify_gateway_attestations(argv: Sequence[str] | None = None) -> int:
+    """Qualify captured artifacts; called by the release verifier's CLI mode."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sbom", type=Path, required=True)
     parser.add_argument("--provenance", type=Path, required=True)
@@ -191,9 +193,5 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except (OSError, ValueError) as exc:
         parser.exit(1, f"gateway attestation qualification failed: {exc}\n")
-    print("Gateway SBOM and SLSA v1 identities verified for linux/amd64 and linux/arm64")
+    sys.stdout.write("Gateway SBOM and SLSA v1 identities verified for linux/amd64 and linux/arm64\n")
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

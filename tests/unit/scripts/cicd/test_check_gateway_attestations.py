@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
-from scripts.cicd.check_gateway_attestations import GatewayBuildIdentity, main, validate_gateway_attestations
+from scripts.cicd.check_release_required_checks import main as release_main
+
+from elspeth_lints.release.gateway_attestations import GatewayBuildIdentity, validate_gateway_attestations
 
 FIXTURES = Path(__file__).parent / "fixtures"
+REPO_ROOT = Path(__file__).resolve().parents[4]
 SOURCE_SHA = "edc844699a350a90a624089e12a5a1e75b7b2dde"
 IDENTITY = GatewayBuildIdentity(
     repository="dta-au/elspeth",
@@ -165,15 +170,34 @@ def _cli_args(sbom: Path, provenance: Path) -> list[str]:
 def test_workflow_cli_admits_capture_and_exits_nonzero_for_wrong_sha(tmp_path: Path) -> None:
     sbom = FIXTURES / "gateway-sbom-document-ids.json"
     provenance = FIXTURES / "gateway-buildkit-slsa-v1.json"
-    assert main(_cli_args(sbom, provenance)) == 0
+    assert release_main(["gateway-attestations", *_cli_args(sbom, provenance)]) == 0
     args = _cli_args(sbom, provenance)
     args[args.index("--source-sha") + 1] = "a" * 40
     with pytest.raises(SystemExit) as exc:
-        main(args)
+        release_main(["gateway-attestations", *args])
     assert exc.value.code == 1
 
     invalid = tmp_path / "invalid.json"
     invalid.write_text("{invalid", encoding="utf-8")
     with pytest.raises(SystemExit) as exc:
-        main(_cli_args(sbom, invalid))
+        release_main(["gateway-attestations", *_cli_args(sbom, invalid)])
     assert exc.value.code == 1
+
+
+def test_production_release_entrypoint_requires_no_installed_tooling_or_github_token() -> None:
+    command = [
+        sys.executable,
+        "-S",  # The publisher invokes host Python: prove only stdlib and the checkout are needed.
+        str(REPO_ROOT / "scripts/cicd/check_release_required_checks.py"),
+        "gateway-attestations",
+        *_cli_args(FIXTURES / "gateway-sbom-document-ids.json", FIXTURES / "gateway-buildkit-slsa-v1.json"),
+    ]
+    env = {"PYTHONPATH": str(REPO_ROOT / "elspeth-lints/src")}
+    accepted = subprocess.run(command, cwd=REPO_ROOT, env=env, text=True, capture_output=True, check=False)
+    assert accepted.returncode == 0, accepted.stderr
+    assert "identities verified for linux/amd64 and linux/arm64" in accepted.stdout
+
+    command[command.index("--source-sha") + 1] = "a" * 40
+    refused = subprocess.run(command, cwd=REPO_ROOT, env=env, text=True, capture_output=True, check=False)
+    assert refused.returncode == 1
+    assert "does not match the expected build identity" in refused.stderr

@@ -322,7 +322,7 @@ jobs:
           docker buildx imagetools inspect "$gateway_image" \
             --format '{{ json .Provenance }}' \
             >.build-evidence/gateway-provenance.json
-          python3 scripts/cicd/check_gateway_attestations.py \
+          PYTHONPATH=elspeth-lints/src python3 scripts/cicd/check_release_required_checks.py gateway-attestations \
             --sbom .build-evidence/gateway-sbom.spdx.json \
             --provenance .build-evidence/gateway-provenance.json \
             --repository "$GITHUB_REPOSITORY" \

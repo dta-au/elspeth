@@ -13,6 +13,10 @@ by the Checks API. In the current repository, the ruleset context ``CodeQL`` is
 reported by the CodeQL workflow's ``Analyze Python`` job. Keep that mapping
 explicit so a future ruleset or workflow rename fails closed instead of silently
 weakening release proof.
+
+The ``gateway-attestations`` mode qualifies captured gateway SBOM/provenance
+through the tooling package's runtime artifact validator. The default mode
+continues to require trusted GitHub evidence before any image build.
 """
 
 from __future__ import annotations
@@ -462,12 +466,17 @@ def fetch_commit_statuses(*, repo: str, sha: str, token: str) -> tuple[CommitSta
 
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["gateway-attestations"]:
+        from elspeth_lints.release.gateway_attestations import qualify_gateway_attestations
+
+        return qualify_gateway_attestations(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, help="Repository in owner/name form.")
     parser.add_argument("--sha", required=True, help="Commit SHA represented by the release image.")
     parser.add_argument("--ruleset-name", default="main", help="Active branch ruleset name to mirror.")
     parser.add_argument("--target-branch", default="main", help="Trusted merge target for PR-only publication evidence.")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     if re.fullmatch(r"[0-9a-f]{40}", args.sha) is None:
         print("A full immutable commit SHA is required for publication proof.", file=sys.stderr)
         return 2
