@@ -16,7 +16,7 @@
     "test:formatter": "node --test tooling/tedious-formatter/index.test.cjs"
   },
   "dependencies": {
-    "playwright": "^1.61.1"
+    "playwright": "^1.63.0"
   },
   "overrides": {
     "uuid": "^11.1.1",
