@@ -607,7 +607,7 @@ docker run --rm \
 - [AWS ECS Full Acceptance Runbook](../runbooks/aws-ecs-deployment.md) - Disposable two-scenario provisioning and acceptance
 - [Azure Container Apps Cold Install](../runbooks/azure-container-apps-cold-install.md) - Bicep environment with external PostgreSQL and NFS Azure Files
 - [Azure Container Apps Existing-Service Redeploy](../runbooks/azure-container-apps-existing-service-redeploy.md) - Digest-pinned revision rollout
-- [Azure Container Apps Full Acceptance Runbook](../runbooks/azure-container-apps-deployment.md) - Disposable 0.8.1 test and fix-on-fail procedure
+- [Azure Container Apps Full Acceptance Runbook](../runbooks/azure-container-apps-deployment.md) - Disposable 0.8.2 test and fix-on-fail procedure
 - [Your First Pipeline](your-first-pipeline.md) - Getting started guide
 - [Configuration Reference](../reference/configuration.md) - Complete config options
 - [Runbooks](../runbooks/) - Operational procedures

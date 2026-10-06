@@ -3,7 +3,7 @@
 ## Project Status
 
 ELSPETH is an open-source, MIT-licensed pipeline platform on the
-0.8.1 release line. The repository is maintained as a public
+0.8.2 release line. The repository is maintained as a public
 project for evaluation and pilot-adoption planning. It does not
 claim a completed whole-platform independent assurance assessment.
 

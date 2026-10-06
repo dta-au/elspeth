@@ -16,6 +16,9 @@ from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _res
 
 @pytest.fixture
 def deferred_model_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Scope/completeness is the subject here. Each real worker/provider timer
+    # remains bounded; dedicated planner tests exercise budget progression.
+    monkeypatch.setattr(pipeline_planner, "_planner_deadline_time", lambda: 100.0)
     original = pipeline_planner.build_planner_authoring_aids
 
     def without_model_catalog(view):

@@ -2388,15 +2388,16 @@ async def test_end_gate_compose_deadline_keeps_the_completed_reply_recoverable(m
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_deadline_preserves_malformed_attempt_before_retry_expiry(make_service, simple_state):
+async def test_checkpoint_deadline_preserves_malformed_attempt_before_retry_expiry(make_service, simple_state, monkeypatch):
     service = make_service()
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + 0.005
+    now = [100.0]
+    monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint._compose_deadline_time", lambda: now[0])
+    deadline = now[0] + 0.005
 
     async def malformed_after_deadline(*_args: object, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: object) -> object:
         if on_provider_dispatch is not None:
             on_provider_dispatch()
-        await asyncio.sleep(0.01)
+        now[0] = deadline + 0.005
         raise _malformed_provider_error("malformed provider response")
 
     service._advisor_checkpoint._call_advisor_with_audit = AsyncMock(
@@ -2413,22 +2414,24 @@ async def test_checkpoint_deadline_preserves_malformed_attempt_before_retry_expi
     )
 
     assert service._advisor_checkpoint._call_advisor_with_audit.await_count == 1
+    assert service._advisor_checkpoint._call_advisor_with_audit.call_args.kwargs["timeout"] == pytest.approx(0.005)
     assert verdict.ok is False
     assert verdict.failure_class == "malformed"
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_deadline_preserves_unparseable_attempt_before_retry_expiry(make_service, simple_state):
+async def test_checkpoint_deadline_preserves_unparseable_attempt_before_retry_expiry(make_service, simple_state, monkeypatch):
     service = make_service()
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + 0.005
+    now = [100.0]
+    monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint._compose_deadline_time", lambda: now[0])
+    deadline = now[0] + 0.005
 
     async def unparseable_after_deadline(
         *_args: object, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: object
     ) -> tuple[str, dict[str, object]]:
         if on_provider_dispatch is not None:
             on_provider_dispatch()
-        await asyncio.sleep(0.01)
+        now[0] = deadline + 0.005
         return "This reply states no verdict.", {}
 
     service._advisor_checkpoint._call_advisor_with_audit = AsyncMock(
@@ -2445,6 +2448,7 @@ async def test_checkpoint_deadline_preserves_unparseable_attempt_before_retry_ex
     )
 
     assert service._advisor_checkpoint._call_advisor_with_audit.await_count == 1
+    assert service._advisor_checkpoint._call_advisor_with_audit.call_args.kwargs["timeout"] == pytest.approx(0.005)
     assert verdict.ok is False
     assert verdict.failure_class == "malformed"
 
@@ -2488,6 +2492,7 @@ async def test_checkpoint_deadline_preserves_provider_error_classification(make_
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_checkpoint_deadline_cancels_provider_and_retains_timeout_audit(
     make_service,
     simple_state,
@@ -2497,11 +2502,14 @@ async def test_checkpoint_deadline_cancels_provider_and_retains_timeout_audit(
 
     service = make_service()
     recorder = make_recorder()
+    session = _fenced_session(service)
+    provider_entered = asyncio.Event()
     provider_cleanup_seen = asyncio.Event()
 
     async def wait_until_cancelled(*, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: object) -> object:
         if on_provider_dispatch is not None:
             on_provider_dispatch()
+        provider_entered.set()
         try:
             await asyncio.Event().wait()
         finally:
@@ -2512,11 +2520,12 @@ async def test_checkpoint_deadline_cancels_provider_and_retains_timeout_audit(
     verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
         phase="end",
         state=simple_state,
-        **_fenced_session(service),
+        **session,
         recorder=recorder,
         deadline=asyncio.get_running_loop().time() + 0.01,
     )
 
+    assert provider_entered.is_set()
     assert provider_cleanup_seen.is_set()
     assert verdict.ok is False
     assert verdict.failure_class == "unavailable"

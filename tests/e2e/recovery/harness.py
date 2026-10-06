@@ -104,6 +104,7 @@ from elspeth.plugins.infrastructure.results import TransformResult
 from tests.fixtures.base_classes import _TestSourceBase, as_sink, as_source, as_transform
 from tests.fixtures.landscape import expire_lease, leader_token_for
 from tests.fixtures.plugins import CollectSink
+from tests.helpers.process_diagnostics import ProcessDiagnostics, trace_child_process
 
 # Deterministic epoch for the injected MockClock (UTC datetimes derive from it).
 _T0 = 1_750_000_000.0
@@ -153,12 +154,29 @@ def _database_process_target(
     action_args: tuple[object, ...],
     ready_writer: Connection,
     release_reader: Connection,
+    diagnostic_path: str,
+) -> None:
+    with trace_child_process(diagnostic_path) as phase:
+        _run_database_process_target(database_url, seam, action, action_args, ready_writer, release_reader, phase)
+
+
+def _run_database_process_target(
+    database_url: str,
+    seam: ProcessSeam,
+    action: Callable[..., None],
+    action_args: tuple[object, ...],
+    ready_writer: Connection,
+    release_reader: Connection,
+    phase: Callable[[str], None],
 ) -> None:
     """Spawn target: open a fresh DB, cross one action, then block at a seam."""
     database: LandscapeDB | None = None
     try:
+        phase("opening landscape")
         database = LandscapeDB.from_url(database_url, create_tables=False)
+        phase("running action")
         action(database, *action_args)
+        phase("seam reached; waiting for release")
         ready_writer.send(
             ProcessSeamReady(
                 pid=os.getpid(),
@@ -181,6 +199,7 @@ def _database_process_target(
         raise
     finally:
         if database is not None:
+            phase("closing landscape")
             database.close()
         ready_writer.close()
         release_reader.close()
@@ -193,6 +212,20 @@ def _pausable_database_process_target(
     action_args: tuple[object, ...],
     ready_writer: Connection,
     release_reader: Connection,
+    diagnostic_path: str,
+) -> None:
+    with trace_child_process(diagnostic_path) as phase:
+        _run_pausable_database_process_target(database_url, seam, action, action_args, ready_writer, release_reader, phase)
+
+
+def _run_pausable_database_process_target(
+    database_url: str,
+    seam: ProcessSeam,
+    action: Callable[..., None],
+    action_args: tuple[object, ...],
+    ready_writer: Connection,
+    release_reader: Connection,
+    phase: Callable[[str], None],
 ) -> None:
     """Spawn target whose action pauses at its own exact in-operation seam."""
     database: LandscapeDB | None = None
@@ -203,6 +236,7 @@ def _pausable_database_process_target(
         if paused:
             raise RuntimeError(f"child reached process seam {seam!s} more than once")
         paused = True
+        phase("seam reached; waiting for release")
         ready_writer.send(
             ProcessSeamReady(
                 pid=os.getpid(),
@@ -215,8 +249,11 @@ def _pausable_database_process_target(
         release_reader.recv_bytes()
 
     try:
+        phase("opening landscape")
         database = LandscapeDB.from_url(database_url, create_tables=False)
+        phase("running action")
         action(database, pause, *action_args)
+        phase("action completed")
         if not paused:
             raise RuntimeError(f"child action returned without reaching process seam {seam!s}")
     except BaseException as exc:
@@ -232,6 +269,7 @@ def _pausable_database_process_target(
         raise
     finally:
         if database is not None:
+            phase("closing landscape")
             database.close()
         ready_writer.close()
         release_reader.close()
@@ -247,11 +285,13 @@ class SpawnedProcessAtSeam:
         ready_reader: Connection,
         release_writer: Connection,
         seam: ProcessSeam,
+        diagnostics: ProcessDiagnostics,
     ) -> None:
         self._process = process
         self._ready_reader = ready_reader
         self._release_writer = release_writer
         self._seam = seam
+        self._diagnostics = diagnostics
         self._ready: ProcessSeamReady | None = None
         self._released = False
         self._closed = False
@@ -270,6 +310,12 @@ class SpawnedProcessAtSeam:
     @property
     def is_alive(self) -> bool:
         return False if self._closed else self._process.is_alive()
+
+    def diagnostic_snapshot(self) -> str:
+        """Capture the child's current phase and stack before caller cleanup."""
+        if self._closed:
+            raise RuntimeError("state-engine child handle is closed")
+        return self._diagnostics.snapshot(self._process)
 
     def wait_until_ready(self, *, timeout: float) -> ProcessSeamReady:
         """Wait for the exact named seam or fail on timeout/early child exit."""
@@ -306,8 +352,9 @@ class SpawnedProcessAtSeam:
             self.close()
             raise AssertionError(f"child exited with code {exitcode} before reaching process seam {self._seam!s}")
 
+        evidence = self._diagnostics.snapshot(self._process)
         self.close()
-        raise AssertionError(f"child did not reach process seam {self._seam!s} within {timeout:.3f}s")
+        raise AssertionError(f"child did not reach process seam {self._seam!s} within {timeout:.3f}s\n{evidence}")
 
     def kill(self) -> None:
         """Abruptly terminate the child (SIGKILL on POSIX)."""
@@ -333,8 +380,9 @@ class SpawnedProcessAtSeam:
             raise ValueError("exit timeout must be positive")
         self._process.join(timeout=timeout)
         if self._process.is_alive():
+            evidence = self._diagnostics.snapshot(self._process)
             self.close()
-            raise AssertionError(f"child did not exit from process seam {self._seam!s} within {timeout:.3f}s")
+            raise AssertionError(f"child did not exit from process seam {self._seam!s} within {timeout:.3f}s\n{evidence}")
         exitcode = self._process.exitcode
         if exitcode is None:
             raise AssertionError("child exit code remained unavailable after bounded join")
@@ -360,6 +408,7 @@ class SpawnedProcessAtSeam:
         self._ready_reader.close()
         self._release_writer.close()
         self._process.close()
+        self._diagnostics.close()
         self._closed = True
 
     def __enter__(self) -> Self:
@@ -395,9 +444,10 @@ def spawn_database_process_at_seam(
     context = multiprocessing.get_context("spawn")
     ready_reader, ready_writer = context.Pipe(duplex=False)
     release_reader, release_writer = context.Pipe(duplex=False)
+    diagnostics = ProcessDiagnostics()
     process = context.Process(
         target=_database_process_target,
-        args=(database_url, ProcessSeam(seam), action, action_args, ready_writer, release_reader),
+        args=(database_url, ProcessSeam(seam), action, action_args, ready_writer, release_reader, diagnostics.path),
         name=f"state-engine:{seam}",
     )
     try:
@@ -408,6 +458,7 @@ def spawn_database_process_at_seam(
         release_reader.close()
         release_writer.close()
         process.close()
+        diagnostics.close()
         raise
     ready_writer.close()
     release_reader.close()
@@ -416,6 +467,7 @@ def spawn_database_process_at_seam(
         ready_reader=ready_reader,
         release_writer=release_writer,
         seam=ProcessSeam(seam),
+        diagnostics=diagnostics,
     )
 
 
@@ -435,9 +487,10 @@ def spawn_database_process_with_pause(
     context = multiprocessing.get_context("spawn")
     ready_reader, ready_writer = context.Pipe(duplex=False)
     release_reader, release_writer = context.Pipe(duplex=False)
+    diagnostics = ProcessDiagnostics()
     process = context.Process(
         target=_pausable_database_process_target,
-        args=(database_url, ProcessSeam(seam), action, action_args, ready_writer, release_reader),
+        args=(database_url, ProcessSeam(seam), action, action_args, ready_writer, release_reader, diagnostics.path),
         name=f"state-engine:{seam}",
     )
     try:
@@ -448,6 +501,7 @@ def spawn_database_process_with_pause(
         release_reader.close()
         release_writer.close()
         process.close()
+        diagnostics.close()
         raise
     ready_writer.close()
     release_reader.close()
@@ -456,6 +510,7 @@ def spawn_database_process_with_pause(
         ready_reader=ready_reader,
         release_writer=release_writer,
         seam=ProcessSeam(seam),
+        diagnostics=diagnostics,
     )
 
 

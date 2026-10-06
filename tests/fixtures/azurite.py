@@ -9,10 +9,25 @@ import shutil
 import socket
 import subprocess
 import time
+from importlib import import_module
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--require-azurite",
+        action="store_true",
+        help="Fail rather than skip if the Azurite blob emulator is unavailable.",
+    )
+
+
+def _azurite_unavailable(reason: str, *, required: bool) -> None:
+    if required:
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 def _find_azurite_bin() -> str | None:
@@ -56,13 +71,17 @@ def _build_azurite_connection_string(host: str, port: int) -> str:
 
 
 @pytest.fixture(scope="session")
-def azurite_blob_service(tmp_path_factory):
+def azurite_blob_service(tmp_path_factory, request: pytest.FixtureRequest):
     """Start Azurite (blob-only) and provide connection details."""
-    pytest.importorskip("azure.storage.blob")
+    required = request.config.getoption("--require-azurite")
+    if required:
+        import_module("azure.storage.blob")
+    else:
+        pytest.importorskip("azure.storage.blob")
 
     azurite_bin = _find_azurite_bin()
     if azurite_bin is None:
-        pytest.skip("Azurite CLI not found.")
+        _azurite_unavailable("Azurite CLI not found.", required=required)
 
     host = "127.0.0.1"
     port = _get_free_port()
@@ -94,7 +113,7 @@ def azurite_blob_service(tmp_path_factory):
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             process.kill()
-        pytest.skip("Azurite failed to start.")
+        _azurite_unavailable("Azurite failed to start.", required=required)
 
     connection_string = _build_azurite_connection_string(host, port)
     previous = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
@@ -121,7 +140,7 @@ def azurite_blob_service(tmp_path_factory):
 
 
 @pytest.fixture
-def azurite_blob_container(azurite_blob_service):
+def azurite_blob_container(azurite_blob_service, request: pytest.FixtureRequest):
     """Create a temporary container in Azurite for blob tests."""
     from azure.storage.blob import BlobServiceClient
 
@@ -132,7 +151,7 @@ def azurite_blob_container(azurite_blob_service):
         service_client = BlobServiceClient.from_connection_string(connection_string)
         service_client.create_container(container_name)
     except Exception as exc:
-        pytest.skip(f"Azurite connection failed: {exc}")
+        _azurite_unavailable(f"Azurite connection failed: {exc}", required=request.config.getoption("--require-azurite"))
 
     try:
         yield {

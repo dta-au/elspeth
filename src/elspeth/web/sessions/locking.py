@@ -177,7 +177,18 @@ def _sqlite_session_lock_path(engine: Engine, session_id: str) -> Path | None:
 
 
 @contextlib.contextmanager
-def sqlite_process_session_lock(engine: Engine, session_id: str) -> Iterator[None]:
+def _sqlite_session_mutex_scope(engine: Engine, session_id: str, *, blocking: bool) -> Iterator[bool]:
+    mutex = sqlite_session_mutex(engine, session_id)
+    acquired = mutex.acquire(blocking=blocking)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            mutex.release()
+
+
+@contextlib.contextmanager
+def sqlite_process_session_lock(engine: Engine, session_id: str, *, blocking: bool = True) -> Iterator[bool]:
     """Exclude same-session SQLite writers across threads and OS processes.
 
     File-backed databases use a stable, never-unlinked sidecar inode. The
@@ -185,11 +196,14 @@ def sqlite_process_session_lock(engine: Engine, session_id: str) -> Iterator[Non
     kernel. In-memory databases remain process-local because they cannot be
     shared across processes.
     """
-    with sqlite_session_mutex(engine, session_id):
+    with _sqlite_session_mutex_scope(engine, session_id, blocking=blocking) as acquired:
+        if not acquired:
+            yield False
+            return
         lease_key = (database_lock_identity(engine), session_id)
         lock_path = _sqlite_session_lock_path(engine, session_id)
         if lock_path is None:
-            yield
+            yield True
             return
         if _fcntl is None:
             raise AuditIntegrityError("File-backed SQLite requires POSIX flock support for cross-process session safety")
@@ -198,7 +212,7 @@ def sqlite_process_session_lock(engine: Engine, session_id: str) -> Iterator[Non
             descriptor, depth = leases[lease_key]
             leases[lease_key] = (descriptor, depth + 1)
             try:
-                yield
+                yield True
             finally:
                 leases[lease_key] = (descriptor, depth)
             return
@@ -209,13 +223,18 @@ def sqlite_process_session_lock(engine: Engine, session_id: str) -> Iterator[Non
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                 raise AuditIntegrityError("SQLite session lock sidecar is not a regular file")
             try:
-                _fcntl.flock(descriptor, _fcntl.LOCK_EX)
+                _fcntl.flock(descriptor, _fcntl.LOCK_EX | (0 if blocking else _fcntl.LOCK_NB))
+            except BlockingIOError:
+                if blocking:
+                    raise
+                yield False
+                return
             except OSError as exc:
                 raise AuditIntegrityError("Unable to acquire SQLite process-shared session lock") from exc
             leases[lease_key] = (descriptor, 1)
             lease_primary_exc: BaseException | None = None
             try:
-                yield
+                yield True
             except BaseException as exc:
                 lease_primary_exc = exc
                 raise
@@ -334,28 +353,46 @@ def sqlite_transaction_session_lock(conn: Connection, engine: Engine, session_id
 
 
 @contextlib.contextmanager
-def _postgres_advisory_session_lock(conn: Connection, classid: int, key: str, *, label: str) -> Iterator[None]:
+def _postgres_advisory_session_lock(conn: Connection, classid: int, key: str, *, label: str, blocking: bool = True) -> Iterator[bool]:
     """Hold one PostgreSQL session-level advisory lock across multiple transactions."""
-    conn.exec_driver_sql(
-        "SELECT pg_catalog.pg_advisory_lock(%s, pg_catalog.hashtext(%s))",
-        (classid, key),
-    )
-    conn.commit()
+    try:
+        if blocking:
+            conn.exec_driver_sql("SELECT pg_catalog.pg_advisory_lock(%s, pg_catalog.hashtext(%s))", (classid, key))
+            acquired = True
+        else:
+            acquired = conn.exec_driver_sql(
+                "SELECT pg_catalog.pg_try_advisory_lock(%s, pg_catalog.hashtext(%s))", (classid, key)
+            ).scalar_one()
+            if type(acquired) is not bool:
+                raise AuditIntegrityError("PostgreSQL advisory try-lock returned a non-boolean result")
+        conn.commit()
+    except BaseException as acquisition_exc:
+        # PostgreSQL session locks survive rollback. An acknowledgement or
+        # commit failure cannot return a possibly locked backend to the pool.
+        _run_lock_cleanup(conn.invalidate, label=f"{label} acquisition invalidation", primary_exc=acquisition_exc)
+        raise
+    if not acquired:
+        yield False
+        return
 
     def _release() -> None:
-        if conn.in_transaction():
-            conn.rollback()
-        unlocked = conn.exec_driver_sql(
-            "SELECT pg_catalog.pg_advisory_unlock(%s, pg_catalog.hashtext(%s))",
-            (classid, key),
-        ).scalar_one()
-        conn.commit()
-        if unlocked is not True:
-            raise AuditIntegrityError(f"{label} was not held during release")
+        try:
+            if conn.in_transaction():
+                conn.rollback()
+            unlocked = conn.exec_driver_sql(
+                "SELECT pg_catalog.pg_advisory_unlock(%s, pg_catalog.hashtext(%s))",
+                (classid, key),
+            ).scalar_one()
+            conn.commit()
+            if unlocked is not True:
+                raise AuditIntegrityError(f"{label} was not held during release")
+        except BaseException as release_exc:
+            _run_lock_cleanup(conn.invalidate, label=f"{label} release invalidation", primary_exc=release_exc)
+            raise
 
     primary_exc: BaseException | None = None
     try:
-        yield
+        yield True
     except BaseException as exc:
         primary_exc = exc
         raise
@@ -385,3 +422,38 @@ def postgres_blob_custody_advisory_lock(conn: Connection, session_id: str) -> It
         label="PostgreSQL blob custody advisory lock",
     ):
         yield
+
+
+@contextlib.contextmanager
+def _blob_custody_session_lock(engine: Engine, session_id: str) -> Iterator[Connection | None]:
+    """Serialize blob filesystem phases and archive cleanup across replicas."""
+    dialect = engine.dialect.name
+    if dialect == "sqlite":
+        with sqlite_process_session_lock(engine, session_id):
+            yield None
+        return
+    if dialect == "postgresql":
+        with engine.connect() as conn, postgres_blob_custody_advisory_lock(conn, session_id):
+            yield conn
+        return
+    raise NotImplementedError(f"Blob custody locking is not implemented for dialect {dialect}")
+
+
+@contextlib.contextmanager
+def try_blob_custody_session_lock(engine: Engine, session_id: str) -> Iterator[bool]:
+    """Skip a busy recovery candidate; use the ordinary custody namespace."""
+    dialect = engine.dialect.name
+    if dialect == "sqlite":
+        with sqlite_process_session_lock(engine, session_id, blocking=False) as acquired:
+            yield acquired
+        return
+    if dialect == "postgresql":
+        with (
+            engine.connect() as conn,
+            _postgres_advisory_session_lock(
+                conn, ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, session_id, label="PostgreSQL blob custody advisory try-lock", blocking=False
+            ) as acquired,
+        ):
+            yield acquired
+        return
+    raise NotImplementedError(f"Blob custody locking is not implemented for dialect {dialect}")

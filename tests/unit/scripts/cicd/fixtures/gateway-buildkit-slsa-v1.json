@@ -1,0 +1,2626 @@
+{
+  "linux/amd64": {
+    "SLSA": {
+      "buildDefinition": {
+        "buildType": "https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md",
+        "externalParameters": {
+          "configSource": {
+            "path": "Dockerfile"
+          },
+          "request": {
+            "args": {
+              "build-arg:GATEWAY_REVISION": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+              "cmdline": "docker/dockerfile:1",
+              "label:org.opencontainers.image.revision": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+              "label:org.opencontainers.image.source": "https://github.com/dta-au/elspeth/tree/edc844699a350a90a624089e12a5a1e75b7b2dde/gateway",
+              "source": "docker/dockerfile:1"
+            },
+            "compatibilityVersion": 30,
+            "frontend": "gateway.v0",
+            "locals": [
+              {
+                "name": "context"
+              },
+              {
+                "name": "dockerfile"
+              }
+            ],
+            "root": {
+              "configSource": {
+                "path": "Dockerfile"
+              },
+              "request": {
+                "args": {
+                  "build-arg:GATEWAY_REVISION": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+                  "label:org.opencontainers.image.revision": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+                  "label:org.opencontainers.image.source": "https://github.com/dta-au/elspeth/tree/edc844699a350a90a624089e12a5a1e75b7b2dde/gateway",
+                  "vcs:localdir:context": "gateway",
+                  "vcs:localdir:dockerfile": "gateway",
+                  "vcs:revision": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+                  "vcs:source": "https://github.com/dta-au/elspeth"
+                }
+              }
+            }
+          }
+        },
+        "internalParameters": {
+          "buildConfig": {
+            "digestMapping": {
+              "sha256:17d0e3a32db86371853562219bb86d0c1da531bbe452d96cf5fc87b1d747bd44": "step0",
+              "sha256:33c9cd9a41ce6475785f680954be34ea29591bdc5538efce2ca8182dcea449d9": "step5",
+              "sha256:444cd0c88fce69fd71de0886f8070bd129f00007679aa66db6ffe229ed11a668": "step2",
+              "sha256:6081b14048305964f2d44d783070d09681a4f6b431aae618f07775c539673878": "step1",
+              "sha256:743e22fe2bc5b5b4f5a62776fe48b17fe02c45a86a08a3b9e0f05bb6eca81e22": "step9",
+              "sha256:78fa7689d9051bc01678a4ec96a8cfa3ec4c868d5d7295bcf47ab374c789fbf2": "step6",
+              "sha256:7cb3d035cfeebd439864820f2677cf6baed5a682c6f7ef4a623c917983415510": "step4",
+              "sha256:7dc91ee0f4189ff67b064f79d692f1ac875e78a564d2311dd0d47b44ca813fae": "step11",
+              "sha256:81389b1e7aa6ff52c22259061033dfda7df84b6d5d8f60e174aa0ae037e84a65": "step8",
+              "sha256:bb4ce7d27011f4eaf027b21fe0e7419aba87c8cbcf45b2f73ca343f5f3c111bb": "step3",
+              "sha256:c4a55345771243f3e3643c10739e9bb78267d8e4bcedf4fb3c99ea585b7b4d2b": "step10",
+              "sha256:d5b0b5981e0a80ed3b822c249ae6fdd968e7633ec9b5faeec930e3d4ebb2dc47": "step7"
+            },
+            "llbDefinition": [
+              {
+                "id": "step0",
+                "op": {
+                  "Op": {
+                    "source": {
+                      "identifier": "docker-image://docker.io/library/python:3.12-alpine@sha256:4c47124a8391cb7a9f571164147d154777cf012a4ece5f86097130d7a4478111"
+                    }
+                  },
+                  "constraints": {},
+                  "platform": {
+                    "Architecture": "amd64",
+                    "OS": "linux"
+                  }
+                }
+              },
+              {
+                "id": "step1",
+                "inputs": [
+                  "step0:0"
+                ],
+                "op": {
+                  "Op": {
+                    "exec": {
+                      "meta": {
+                        "args": [
+                          "/bin/sh",
+                          "-c",
+                          "test -n \"$GATEWAY_REVISION\""
+                        ],
+                        "cwd": "/",
+                        "env": [
+                          "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                          "LANG=C.UTF-8",
+                          "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+                          "PYTHON_VERSION=3.12.14",
+                          "PYTHON_SHA256=5c8462af5790baf43a321a1559dbe0db06d1be4300fb85fb53c40060668e548a",
+                          "GATEWAY_REVISION=edc844699a350a90a624089e12a5a1e75b7b2dde"
+                        ],
+                        "removeMountStubsRecursive": true
+                      },
+                      "mounts": [
+                        {
+                          "dest": "/"
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {},
+                  "platform": {
+                    "Architecture": "amd64",
+                    "OS": "linux"
+                  }
+                }
+              },
+              {
+                "id": "step2",
+                "op": {
+                  "Op": {
+                    "source": {
+                      "identifier": "docker-image://ghcr.io/astral-sh/uv@sha256:e590846f4776907b254ac0f44b5b380347af5d90d668138ca7938d1b0c2f98d3"
+                    }
+                  },
+                  "constraints": {},
+                  "platform": {
+                    "Architecture": "amd64",
+                    "OS": "linux"
+                  }
+                }
+              },
+              {
+                "id": "step3",
+                "inputs": [
+                  "step1:0",
+                  "step2:0"
+                ],
+                "op": {
+                  "Op": {
+                    "file": {
+                      "actions": [
+                        {
+                          "Action": {
+                            "copy": {
+                              "allowEmptyWildcard": true,
+                              "allowWildcard": true,
+                              "createDestPath": true,
+                              "dest": "/usr/local/bin/uv",
+                              "dirCopyContents": true,
+                              "followSymlink": true,
+                              "mode": -1,
+                              "src": "/uv",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 0,
+                          "output": 0,
+                          "secondaryInput": 1
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step4",
+                "inputs": [
+                  "step3:0"
+                ],
+                "op": {
+                  "Op": {
+                    "file": {
+                      "actions": [
+                        {
+                          "Action": {
+                            "mkdir": {
+                              "makeParents": true,
+                              "mode": 493,
+                              "path": "/build",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 0,
+                          "output": 0,
+                          "secondaryInput": -1
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step5",
+                "op": {
+                  "Op": {
+                    "source": {
+                      "attrs": {
+                        "local.excludepatterns": "[\".venv\",\".pytest_cache\",\".benchmarks\",\"__pycache__\",\"*.pyc\",\"tests\",\"conformance\",\"scaffold\",\"mock\",\"README.md\"]",
+                        "local.followpaths": "[\"pyproject.toml\",\"src\",\"uv.lock\"]",
+                        "local.sharedkeyhint": "context"
+                      },
+                      "identifier": "local://context"
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step6",
+                "inputs": [
+                  "step4:0",
+                  "step5:0"
+                ],
+                "op": {
+                  "Op": {
+                    "file": {
+                      "actions": [
+                        {
+                          "Action": {
+                            "copy": {
+                              "allowEmptyWildcard": true,
+                              "allowWildcard": true,
+                              "createDestPath": true,
+                              "dest": "/build/",
+                              "dirCopyContents": true,
+                              "followSymlink": true,
+                              "mode": -1,
+                              "src": "/pyproject.toml",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 0,
+                          "output": -1,
+                          "secondaryInput": 1
+                        },
+                        {
+                          "Action": {
+                            "copy": {
+                              "allowEmptyWildcard": true,
+                              "allowWildcard": true,
+                              "createDestPath": true,
+                              "dest": "/build/",
+                              "dirCopyContents": true,
+                              "followSymlink": true,
+                              "mode": -1,
+                              "src": "/uv.lock",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 2,
+                          "output": 0,
+                          "secondaryInput": 1
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step7",
+                "inputs": [
+                  "step6:0"
+                ],
+                "op": {
+                  "Op": {
+                    "exec": {
+                      "meta": {
+                        "args": [
+                          "/bin/sh",
+                          "-c",
+                          "uv venv /build-venv \u0026\u0026     VIRTUAL_ENV=/build-venv UV_PROJECT_ENVIRONMENT=/build-venv PATH=\"/build-venv/bin:$PATH\" uv sync       --directory /build       --frozen       --no-default-groups       --group container-build       --no-install-project       --active"
+                        ],
+                        "cwd": "/build",
+                        "env": [
+                          "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                          "LANG=C.UTF-8",
+                          "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+                          "PYTHON_VERSION=3.12.14",
+                          "PYTHON_SHA256=5c8462af5790baf43a321a1559dbe0db06d1be4300fb85fb53c40060668e548a",
+                          "GATEWAY_REVISION=edc844699a350a90a624089e12a5a1e75b7b2dde",
+                          "UV_PYTHON_DOWNLOADS=never"
+                        ],
+                        "removeMountStubsRecursive": true
+                      },
+                      "mounts": [
+                        {
+                          "dest": "/"
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {},
+                  "platform": {
+                    "Architecture": "amd64",
+                    "OS": "linux"
+                  }
+                }
+              },
+              {
+                "id": "step8",
+                "inputs": [
+                  "step7:0",
+                  "step5:0"
+                ],
+                "op": {
+                  "Op": {
+                    "file": {
+                      "actions": [
+                        {
+                          "Action": {
+                            "copy": {
+                              "allowEmptyWildcard": true,
+                              "allowWildcard": true,
+                              "createDestPath": true,
+                              "dest": "/build/src",
+                              "dirCopyContents": true,
+                              "followSymlink": true,
+                              "mode": -1,
+                              "src": "/src",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 0,
+                          "output": 0,
+                          "secondaryInput": 1
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step9",
+                "inputs": [
+                  "step8:0"
+                ],
+                "op": {
+                  "Op": {
+                    "exec": {
+                      "meta": {
+                        "args": [
+                          "/bin/sh",
+                          "-c",
+                          "VIRTUAL_ENV=/build-venv PATH=\"/build-venv/bin:$PATH\" uv build       --directory /build       --no-build-isolation       --wheel       --out-dir /dist \u0026\u0026     uv venv /venv \u0026\u0026     VIRTUAL_ENV=/venv UV_PROJECT_ENVIRONMENT=/venv PATH=\"/venv/bin:$PATH\" uv sync       --directory /build       --frozen       --no-default-groups       --no-install-project       --active \u0026\u0026     uv pip install --python /venv/bin/python --no-deps /dist/elspeth_llm_gateway-*.whl"
+                        ],
+                        "cwd": "/build",
+                        "env": [
+                          "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                          "LANG=C.UTF-8",
+                          "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+                          "PYTHON_VERSION=3.12.14",
+                          "PYTHON_SHA256=5c8462af5790baf43a321a1559dbe0db06d1be4300fb85fb53c40060668e548a",
+                          "GATEWAY_REVISION=edc844699a350a90a624089e12a5a1e75b7b2dde",
+                          "UV_PYTHON_DOWNLOADS=never"
+                        ],
+                        "removeMountStubsRecursive": true
+                      },
+                      "mounts": [
+                        {
+                          "dest": "/"
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {},
+                  "platform": {
+                    "Architecture": "amd64",
+                    "OS": "linux"
+                  }
+                }
+              },
+              {
+                "id": "step10",
+                "inputs": [
+                  "step0:0",
+                  "step9:0"
+                ],
+                "op": {
+                  "Op": {
+                    "file": {
+                      "actions": [
+                        {
+                          "Action": {
+                            "copy": {
+                              "allowEmptyWildcard": true,
+                              "allowWildcard": true,
+                              "createDestPath": true,
+                              "dest": "/venv",
+                              "dirCopyContents": true,
+                              "followSymlink": true,
+                              "mode": -1,
+                              "src": "/venv",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 0,
+                          "output": 0,
+                          "secondaryInput": 1
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step11",
+                "inputs": [
+                  "step10:0"
+                ],
+                "op": {
+                  "Op": {}
+                }
+              }
+            ]
+          },
+          "builderPlatform": "linux/amd64",
+          "github_actor": "johnm-dta",
+          "github_actor_id": "181720297",
+          "github_event_name": "workflow_run",
+          "github_event_payload": {
+            "action": "completed",
+            "organization": {
+              "avatar_url": "https://avatars.githubusercontent.com/u/182742397?v=4",
+              "description": null,
+              "events_url": "https://api.github.com/orgs/dta-au/events",
+              "hooks_url": "https://api.github.com/orgs/dta-au/hooks",
+              "id": 182742397,
+              "issues_url": "https://api.github.com/orgs/dta-au/issues",
+              "login": "dta-au",
+              "members_url": "https://api.github.com/orgs/dta-au/members{/member}",
+              "node_id": "O_kgDOCuRtfQ",
+              "public_members_url": "https://api.github.com/orgs/dta-au/public_members{/member}",
+              "repos_url": "https://api.github.com/orgs/dta-au/repos",
+              "url": "https://api.github.com/orgs/dta-au"
+            },
+            "repository": {
+              "allow_forking": true,
+              "archive_url": "https://api.github.com/repos/dta-au/elspeth/{archive_format}{/ref}",
+              "archived": false,
+              "assignees_url": "https://api.github.com/repos/dta-au/elspeth/assignees{/user}",
+              "blobs_url": "https://api.github.com/repos/dta-au/elspeth/git/blobs{/sha}",
+              "branches_url": "https://api.github.com/repos/dta-au/elspeth/branches{/branch}",
+              "clone_url": "https://github.com/dta-au/elspeth.git",
+              "collaborators_url": "https://api.github.com/repos/dta-au/elspeth/collaborators{/collaborator}",
+              "comments_url": "https://api.github.com/repos/dta-au/elspeth/comments{/number}",
+              "commits_url": "https://api.github.com/repos/dta-au/elspeth/commits{/sha}",
+              "compare_url": "https://api.github.com/repos/dta-au/elspeth/compare/{base}...{head}",
+              "contents_url": "https://api.github.com/repos/dta-au/elspeth/contents/{+path}",
+              "contributors_url": "https://api.github.com/repos/dta-au/elspeth/contributors",
+              "created_at": "2026-01-22T01:24:02Z",
+              "custom_properties": {},
+              "default_branch": "main",
+              "deployments_url": "https://api.github.com/repos/dta-au/elspeth/deployments",
+              "description": "Auditable Sense/Decide/Act pipelines for high-stakes data processing.",
+              "disabled": false,
+              "downloads_url": "https://api.github.com/repos/dta-au/elspeth/downloads",
+              "events_url": "https://api.github.com/repos/dta-au/elspeth/events",
+              "fork": false,
+              "forks": 0,
+              "forks_count": 0,
+              "forks_url": "https://api.github.com/repos/dta-au/elspeth/forks",
+              "full_name": "dta-au/elspeth",
+              "git_commits_url": "https://api.github.com/repos/dta-au/elspeth/git/commits{/sha}",
+              "git_refs_url": "https://api.github.com/repos/dta-au/elspeth/git/refs{/sha}",
+              "git_tags_url": "https://api.github.com/repos/dta-au/elspeth/git/tags{/sha}",
+              "git_url": "git://github.com/dta-au/elspeth.git",
+              "has_discussions": false,
+              "has_downloads": false,
+              "has_issues": true,
+              "has_pages": true,
+              "has_projects": true,
+              "has_pull_requests": true,
+              "has_wiki": true,
+              "homepage": "",
+              "hooks_url": "https://api.github.com/repos/dta-au/elspeth/hooks",
+              "html_url": "https://github.com/dta-au/elspeth",
+              "id": 1139453241,
+              "is_template": false,
+              "issue_comment_url": "https://api.github.com/repos/dta-au/elspeth/issues/comments{/number}",
+              "issue_events_url": "https://api.github.com/repos/dta-au/elspeth/issues/events{/number}",
+              "issues_url": "https://api.github.com/repos/dta-au/elspeth/issues{/number}",
+              "keys_url": "https://api.github.com/repos/dta-au/elspeth/keys{/key_id}",
+              "labels_url": "https://api.github.com/repos/dta-au/elspeth/labels{/name}",
+              "language": "Python",
+              "languages_url": "https://api.github.com/repos/dta-au/elspeth/languages",
+              "license": {
+                "key": "mit",
+                "name": "MIT License",
+                "node_id": "MDc6TGljZW5zZTEz",
+                "spdx_id": "MIT",
+                "url": "https://api.github.com/licenses/mit"
+              },
+              "merges_url": "https://api.github.com/repos/dta-au/elspeth/merges",
+              "milestones_url": "https://api.github.com/repos/dta-au/elspeth/milestones{/number}",
+              "mirror_url": null,
+              "name": "elspeth",
+              "node_id": "R_kgDOQ-qtOQ",
+              "notifications_url": "https://api.github.com/repos/dta-au/elspeth/notifications{?since,all,participating}",
+              "open_issues": 62,
+              "open_issues_count": 62,
+              "owner": {
+                "avatar_url": "https://avatars.githubusercontent.com/u/182742397?v=4",
+                "events_url": "https://api.github.com/users/dta-au/events{/privacy}",
+                "followers_url": "https://api.github.com/users/dta-au/followers",
+                "following_url": "https://api.github.com/users/dta-au/following{/other_user}",
+                "gists_url": "https://api.github.com/users/dta-au/gists{/gist_id}",
+                "gravatar_id": "",
+                "html_url": "https://github.com/dta-au",
+                "id": 182742397,
+                "login": "dta-au",
+                "node_id": "O_kgDOCuRtfQ",
+                "organizations_url": "https://api.github.com/users/dta-au/orgs",
+                "received_events_url": "https://api.github.com/users/dta-au/received_events",
+                "repos_url": "https://api.github.com/users/dta-au/repos",
+                "site_admin": false,
+                "starred_url": "https://api.github.com/users/dta-au/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/dta-au/subscriptions",
+                "type": "Organization",
+                "url": "https://api.github.com/users/dta-au",
+                "user_view_type": "public"
+              },
+              "private": false,
+              "pull_request_creation_policy": "all",
+              "pulls_url": "https://api.github.com/repos/dta-au/elspeth/pulls{/number}",
+              "pushed_at": "2026-10-05T15:52:10Z",
+              "releases_url": "https://api.github.com/repos/dta-au/elspeth/releases{/id}",
+              "size": 153025,
+              "ssh_url": "git@github.com:dta-au/elspeth.git",
+              "stargazers_count": 0,
+              "stargazers_url": "https://api.github.com/repos/dta-au/elspeth/stargazers",
+              "statuses_url": "https://api.github.com/repos/dta-au/elspeth/statuses/{sha}",
+              "subscribers_url": "https://api.github.com/repos/dta-au/elspeth/subscribers",
+              "subscription_url": "https://api.github.com/repos/dta-au/elspeth/subscription",
+              "svn_url": "https://github.com/dta-au/elspeth",
+              "tags_url": "https://api.github.com/repos/dta-au/elspeth/tags",
+              "teams_url": "https://api.github.com/repos/dta-au/elspeth/teams",
+              "topics": [],
+              "trees_url": "https://api.github.com/repos/dta-au/elspeth/git/trees{/sha}",
+              "updated_at": "2026-10-05T15:52:17Z",
+              "url": "https://api.github.com/repos/dta-au/elspeth",
+              "visibility": "public",
+              "watchers": 0,
+              "watchers_count": 0,
+              "web_commit_signoff_required": false
+            },
+            "sender": {
+              "avatar_url": "https://avatars.githubusercontent.com/u/181720297?v=4",
+              "events_url": "https://api.github.com/users/johnm-dta/events{/privacy}",
+              "followers_url": "https://api.github.com/users/johnm-dta/followers",
+              "following_url": "https://api.github.com/users/johnm-dta/following{/other_user}",
+              "gists_url": "https://api.github.com/users/johnm-dta/gists{/gist_id}",
+              "gravatar_id": "",
+              "html_url": "https://github.com/johnm-dta",
+              "id": 181720297,
+              "login": "johnm-dta",
+              "node_id": "U_kgDOCtTU6Q",
+              "organizations_url": "https://api.github.com/users/johnm-dta/orgs",
+              "received_events_url": "https://api.github.com/users/johnm-dta/received_events",
+              "repos_url": "https://api.github.com/users/johnm-dta/repos",
+              "site_admin": false,
+              "starred_url": "https://api.github.com/users/johnm-dta/starred{/owner}{/repo}",
+              "subscriptions_url": "https://api.github.com/users/johnm-dta/subscriptions",
+              "type": "User",
+              "url": "https://api.github.com/users/johnm-dta",
+              "user_view_type": "public"
+            },
+            "workflow": {
+              "badge_url": "https://github.com/dta-au/elspeth/workflows/CI/badge.svg",
+              "created_at": "2026-01-22T01:26:05.000Z",
+              "html_url": "https://github.com/dta-au/elspeth/blob/main/.github/workflows/ci.yaml",
+              "id": 225844184,
+              "name": "CI",
+              "node_id": "W_kwDOQ-qtOc4NdhvY",
+              "path": ".github/workflows/ci.yaml",
+              "state": "active",
+              "updated_at": "2026-02-01T08:10:55.000Z",
+              "url": "https://api.github.com/repos/dta-au/elspeth/actions/workflows/225844184"
+            },
+            "workflow_run": {
+              "actor": {
+                "avatar_url": "https://avatars.githubusercontent.com/u/181720297?v=4",
+                "events_url": "https://api.github.com/users/johnm-dta/events{/privacy}",
+                "followers_url": "https://api.github.com/users/johnm-dta/followers",
+                "following_url": "https://api.github.com/users/johnm-dta/following{/other_user}",
+                "gists_url": "https://api.github.com/users/johnm-dta/gists{/gist_id}",
+                "gravatar_id": "",
+                "html_url": "https://github.com/johnm-dta",
+                "id": 181720297,
+                "login": "johnm-dta",
+                "node_id": "U_kgDOCtTU6Q",
+                "organizations_url": "https://api.github.com/users/johnm-dta/orgs",
+                "received_events_url": "https://api.github.com/users/johnm-dta/received_events",
+                "repos_url": "https://api.github.com/users/johnm-dta/repos",
+                "site_admin": false,
+                "starred_url": "https://api.github.com/users/johnm-dta/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/johnm-dta/subscriptions",
+                "type": "User",
+                "url": "https://api.github.com/users/johnm-dta",
+                "user_view_type": "public"
+              },
+              "artifacts_url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981/artifacts",
+              "cancel_url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981/cancel",
+              "check_suite_id": 101128143941,
+              "check_suite_node_id": "CS_kwDOQ-qtOc8AAAAXi7UERQ",
+              "check_suite_url": "https://api.github.com/repos/dta-au/elspeth/check-suites/101128143941",
+              "conclusion": "success",
+              "created_at": "2026-10-05T15:52:13Z",
+              "display_title": "Merge pull request #274 from dta-au/fix/test-reliability-20261005",
+              "event": "push",
+              "head_branch": "main",
+              "head_commit": {
+                "author": {
+                  "email": "john.morrissey@dta.gov.au",
+                  "name": "John Morrissey"
+                },
+                "committer": {
+                  "email": "noreply@github.com",
+                  "name": "GitHub"
+                },
+                "id": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+                "message": "Merge pull request #274 from dta-au/fix/test-reliability-20261005\n\nStabilize test synchronization, deadlines, and recovery leases",
+                "timestamp": "2026-10-05T15:52:09Z",
+                "tree_id": "bc488ce1645ad802d09bab52d3da30797b08ddb6"
+              },
+              "head_repository": {
+                "archive_url": "https://api.github.com/repos/dta-au/elspeth/{archive_format}{/ref}",
+                "assignees_url": "https://api.github.com/repos/dta-au/elspeth/assignees{/user}",
+                "blobs_url": "https://api.github.com/repos/dta-au/elspeth/git/blobs{/sha}",
+                "branches_url": "https://api.github.com/repos/dta-au/elspeth/branches{/branch}",
+                "collaborators_url": "https://api.github.com/repos/dta-au/elspeth/collaborators{/collaborator}",
+                "comments_url": "https://api.github.com/repos/dta-au/elspeth/comments{/number}",
+                "commits_url": "https://api.github.com/repos/dta-au/elspeth/commits{/sha}",
+                "compare_url": "https://api.github.com/repos/dta-au/elspeth/compare/{base}...{head}",
+                "contents_url": "https://api.github.com/repos/dta-au/elspeth/contents/{+path}",
+                "contributors_url": "https://api.github.com/repos/dta-au/elspeth/contributors",
+                "deployments_url": "https://api.github.com/repos/dta-au/elspeth/deployments",
+                "description": "Auditable Sense/Decide/Act pipelines for high-stakes data processing.",
+                "downloads_url": "https://api.github.com/repos/dta-au/elspeth/downloads",
+                "events_url": "https://api.github.com/repos/dta-au/elspeth/events",
+                "fork": false,
+                "forks_url": "https://api.github.com/repos/dta-au/elspeth/forks",
+                "full_name": "dta-au/elspeth",
+                "git_commits_url": "https://api.github.com/repos/dta-au/elspeth/git/commits{/sha}",
+                "git_refs_url": "https://api.github.com/repos/dta-au/elspeth/git/refs{/sha}",
+                "git_tags_url": "https://api.github.com/repos/dta-au/elspeth/git/tags{/sha}",
+                "hooks_url": "https://api.github.com/repos/dta-au/elspeth/hooks",
+                "html_url": "https://github.com/dta-au/elspeth",
+                "id": 1139453241,
+                "issue_comment_url": "https://api.github.com/repos/dta-au/elspeth/issues/comments{/number}",
+                "issue_events_url": "https://api.github.com/repos/dta-au/elspeth/issues/events{/number}",
+                "issues_url": "https://api.github.com/repos/dta-au/elspeth/issues{/number}",
+                "keys_url": "https://api.github.com/repos/dta-au/elspeth/keys{/key_id}",
+                "labels_url": "https://api.github.com/repos/dta-au/elspeth/labels{/name}",
+                "languages_url": "https://api.github.com/repos/dta-au/elspeth/languages",
+                "merges_url": "https://api.github.com/repos/dta-au/elspeth/merges",
+                "milestones_url": "https://api.github.com/repos/dta-au/elspeth/milestones{/number}",
+                "name": "elspeth",
+                "node_id": "R_kgDOQ-qtOQ",
+                "notifications_url": "https://api.github.com/repos/dta-au/elspeth/notifications{?since,all,participating}",
+                "owner": {
+                  "avatar_url": "https://avatars.githubusercontent.com/u/182742397?v=4",
+                  "events_url": "https://api.github.com/users/dta-au/events{/privacy}",
+                  "followers_url": "https://api.github.com/users/dta-au/followers",
+                  "following_url": "https://api.github.com/users/dta-au/following{/other_user}",
+                  "gists_url": "https://api.github.com/users/dta-au/gists{/gist_id}",
+                  "gravatar_id": "",
+                  "html_url": "https://github.com/dta-au",
+                  "id": 182742397,
+                  "login": "dta-au",
+                  "node_id": "O_kgDOCuRtfQ",
+                  "organizations_url": "https://api.github.com/users/dta-au/orgs",
+                  "received_events_url": "https://api.github.com/users/dta-au/received_events",
+                  "repos_url": "https://api.github.com/users/dta-au/repos",
+                  "site_admin": false,
+                  "starred_url": "https://api.github.com/users/dta-au/starred{/owner}{/repo}",
+                  "subscriptions_url": "https://api.github.com/users/dta-au/subscriptions",
+                  "type": "Organization",
+                  "url": "https://api.github.com/users/dta-au",
+                  "user_view_type": "public"
+                },
+                "private": false,
+                "pulls_url": "https://api.github.com/repos/dta-au/elspeth/pulls{/number}",
+                "releases_url": "https://api.github.com/repos/dta-au/elspeth/releases{/id}",
+                "stargazers_url": "https://api.github.com/repos/dta-au/elspeth/stargazers",
+                "statuses_url": "https://api.github.com/repos/dta-au/elspeth/statuses/{sha}",
+                "subscribers_url": "https://api.github.com/repos/dta-au/elspeth/subscribers",
+                "subscription_url": "https://api.github.com/repos/dta-au/elspeth/subscription",
+                "tags_url": "https://api.github.com/repos/dta-au/elspeth/tags",
+                "teams_url": "https://api.github.com/repos/dta-au/elspeth/teams",
+                "trees_url": "https://api.github.com/repos/dta-au/elspeth/git/trees{/sha}",
+                "url": "https://api.github.com/repos/dta-au/elspeth"
+              },
+              "head_sha": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+              "html_url": "https://github.com/dta-au/elspeth/actions/runs/37336294981",
+              "id": 37336294981,
+              "jobs_url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981/jobs",
+              "logs_url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981/logs",
+              "name": "CI",
+              "node_id": "WFR_kwLOQ-qtOc8AAAAIsWqmRQ",
+              "path": ".github/workflows/ci.yaml",
+              "previous_attempt_url": null,
+              "pull_requests": [],
+              "referenced_workflows": [],
+              "repository": {
+                "archive_url": "https://api.github.com/repos/dta-au/elspeth/{archive_format}{/ref}",
+                "assignees_url": "https://api.github.com/repos/dta-au/elspeth/assignees{/user}",
+                "blobs_url": "https://api.github.com/repos/dta-au/elspeth/git/blobs{/sha}",
+                "branches_url": "https://api.github.com/repos/dta-au/elspeth/branches{/branch}",
+                "collaborators_url": "https://api.github.com/repos/dta-au/elspeth/collaborators{/collaborator}",
+                "comments_url": "https://api.github.com/repos/dta-au/elspeth/comments{/number}",
+                "commits_url": "https://api.github.com/repos/dta-au/elspeth/commits{/sha}",
+                "compare_url": "https://api.github.com/repos/dta-au/elspeth/compare/{base}...{head}",
+                "contents_url": "https://api.github.com/repos/dta-au/elspeth/contents/{+path}",
+                "contributors_url": "https://api.github.com/repos/dta-au/elspeth/contributors",
+                "deployments_url": "https://api.github.com/repos/dta-au/elspeth/deployments",
+                "description": "Auditable Sense/Decide/Act pipelines for high-stakes data processing.",
+                "downloads_url": "https://api.github.com/repos/dta-au/elspeth/downloads",
+                "events_url": "https://api.github.com/repos/dta-au/elspeth/events",
+                "fork": false,
+                "forks_url": "https://api.github.com/repos/dta-au/elspeth/forks",
+                "full_name": "dta-au/elspeth",
+                "git_commits_url": "https://api.github.com/repos/dta-au/elspeth/git/commits{/sha}",
+                "git_refs_url": "https://api.github.com/repos/dta-au/elspeth/git/refs{/sha}",
+                "git_tags_url": "https://api.github.com/repos/dta-au/elspeth/git/tags{/sha}",
+                "hooks_url": "https://api.github.com/repos/dta-au/elspeth/hooks",
+                "html_url": "https://github.com/dta-au/elspeth",
+                "id": 1139453241,
+                "issue_comment_url": "https://api.github.com/repos/dta-au/elspeth/issues/comments{/number}",
+                "issue_events_url": "https://api.github.com/repos/dta-au/elspeth/issues/events{/number}",
+                "issues_url": "https://api.github.com/repos/dta-au/elspeth/issues{/number}",
+                "keys_url": "https://api.github.com/repos/dta-au/elspeth/keys{/key_id}",
+                "labels_url": "https://api.github.com/repos/dta-au/elspeth/labels{/name}",
+                "languages_url": "https://api.github.com/repos/dta-au/elspeth/languages",
+                "merges_url": "https://api.github.com/repos/dta-au/elspeth/merges",
+                "milestones_url": "https://api.github.com/repos/dta-au/elspeth/milestones{/number}",
+                "name": "elspeth",
+                "node_id": "R_kgDOQ-qtOQ",
+                "notifications_url": "https://api.github.com/repos/dta-au/elspeth/notifications{?since,all,participating}",
+                "owner": {
+                  "avatar_url": "https://avatars.githubusercontent.com/u/182742397?v=4",
+                  "events_url": "https://api.github.com/users/dta-au/events{/privacy}",
+                  "followers_url": "https://api.github.com/users/dta-au/followers",
+                  "following_url": "https://api.github.com/users/dta-au/following{/other_user}",
+                  "gists_url": "https://api.github.com/users/dta-au/gists{/gist_id}",
+                  "gravatar_id": "",
+                  "html_url": "https://github.com/dta-au",
+                  "id": 182742397,
+                  "login": "dta-au",
+                  "node_id": "O_kgDOCuRtfQ",
+                  "organizations_url": "https://api.github.com/users/dta-au/orgs",
+                  "received_events_url": "https://api.github.com/users/dta-au/received_events",
+                  "repos_url": "https://api.github.com/users/dta-au/repos",
+                  "site_admin": false,
+                  "starred_url": "https://api.github.com/users/dta-au/starred{/owner}{/repo}",
+                  "subscriptions_url": "https://api.github.com/users/dta-au/subscriptions",
+                  "type": "Organization",
+                  "url": "https://api.github.com/users/dta-au",
+                  "user_view_type": "public"
+                },
+                "private": false,
+                "pulls_url": "https://api.github.com/repos/dta-au/elspeth/pulls{/number}",
+                "releases_url": "https://api.github.com/repos/dta-au/elspeth/releases{/id}",
+                "stargazers_url": "https://api.github.com/repos/dta-au/elspeth/stargazers",
+                "statuses_url": "https://api.github.com/repos/dta-au/elspeth/statuses/{sha}",
+                "subscribers_url": "https://api.github.com/repos/dta-au/elspeth/subscribers",
+                "subscription_url": "https://api.github.com/repos/dta-au/elspeth/subscription",
+                "tags_url": "https://api.github.com/repos/dta-au/elspeth/tags",
+                "teams_url": "https://api.github.com/repos/dta-au/elspeth/teams",
+                "trees_url": "https://api.github.com/repos/dta-au/elspeth/git/trees{/sha}",
+                "url": "https://api.github.com/repos/dta-au/elspeth"
+              },
+              "rerun_url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981/rerun",
+              "run_attempt": 1,
+              "run_number": 1411,
+              "run_started_at": "2026-10-05T15:52:13Z",
+              "status": "completed",
+              "triggering_actor": {
+                "avatar_url": "https://avatars.githubusercontent.com/u/181720297?v=4",
+                "events_url": "https://api.github.com/users/johnm-dta/events{/privacy}",
+                "followers_url": "https://api.github.com/users/johnm-dta/followers",
+                "following_url": "https://api.github.com/users/johnm-dta/following{/other_user}",
+                "gists_url": "https://api.github.com/users/johnm-dta/gists{/gist_id}",
+                "gravatar_id": "",
+                "html_url": "https://github.com/johnm-dta",
+                "id": 181720297,
+                "login": "johnm-dta",
+                "node_id": "U_kgDOCtTU6Q",
+                "organizations_url": "https://api.github.com/users/johnm-dta/orgs",
+                "received_events_url": "https://api.github.com/users/johnm-dta/received_events",
+                "repos_url": "https://api.github.com/users/johnm-dta/repos",
+                "site_admin": false,
+                "starred_url": "https://api.github.com/users/johnm-dta/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/johnm-dta/subscriptions",
+                "type": "User",
+                "url": "https://api.github.com/users/johnm-dta",
+                "user_view_type": "public"
+              },
+              "updated_at": "2026-10-05T17:26:50Z",
+              "url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981",
+              "workflow_id": 225844184,
+              "workflow_url": "https://api.github.com/repos/dta-au/elspeth/actions/workflows/225844184"
+            }
+          },
+          "github_job": "build-push",
+          "github_ref": "refs/heads/main",
+          "github_ref_name": "main",
+          "github_ref_protected": "true",
+          "github_ref_type": "branch",
+          "github_repository": "dta-au/elspeth",
+          "github_repository_id": "1139453241",
+          "github_repository_owner": "dta-au",
+          "github_repository_owner_id": "182742397",
+          "github_run_attempt": "2",
+          "github_run_id": "37348491709",
+          "github_run_number": "51",
+          "github_server_url": "https://github.com",
+          "github_triggering_actor": "johnm-dta",
+          "github_workflow": "Build and Push",
+          "github_workflow_ref": "dta-au/elspeth/.github/workflows/build-push.yaml@refs/heads/main",
+          "github_workflow_sha": "edc844699a350a90a624089e12a5a1e75b7b2dde"
+        },
+        "resolvedDependencies": [
+          {
+            "digest": {
+              "sha256": "ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9"
+            },
+            "uri": "pkg:docker/docker/buildkit-syft-scanner@stable-1?platform=linux%2Famd64"
+          },
+          {
+            "digest": {
+              "sha256": "4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e"
+            },
+            "uri": "pkg:docker/docker/dockerfile@1"
+          },
+          {
+            "digest": {
+              "sha256": "4c47124a8391cb7a9f571164147d154777cf012a4ece5f86097130d7a4478111"
+            },
+            "uri": "pkg:docker/python@3.12-alpine?digest=sha256:4c47124a8391cb7a9f571164147d154777cf012a4ece5f86097130d7a4478111\u0026platform=linux%2Famd64"
+          },
+          {
+            "digest": {
+              "sha256": "e590846f4776907b254ac0f44b5b380347af5d90d668138ca7938d1b0c2f98d3"
+            },
+            "uri": "pkg:docker/ghcr.io/astral-sh/uv?digest=sha256:e590846f4776907b254ac0f44b5b380347af5d90d668138ca7938d1b0c2f98d3\u0026platform=linux%2Famd64"
+          }
+        ]
+      },
+      "runDetails": {
+        "builder": {
+          "id": "https://github.com/dta-au/elspeth/actions/runs/37348491709/attempts/2"
+        },
+        "metadata": {
+          "buildkit_completeness": {
+            "request": true,
+            "resolvedDependencies": false
+          },
+          "buildkit_metadata": {
+            "layers": {
+              "step0:0": [
+                [
+                  {
+                    "digest": "sha256:e2de96513ba9eb53b431787ec8a65cdde380ac4772a3e4c4b714dcfde2a102b5",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 3849738
+                  },
+                  {
+                    "digest": "sha256:dfd5c69ca31cfb36ae0002c3049cf2d7bf398b9bb1099035e8634e3510ee84da",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 416265
+                  },
+                  {
+                    "digest": "sha256:7abff04c4f315a5424ff8d34ad0c10700efc2fc32961841df78d2bfc17e1a353",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 13771491
+                  },
+                  {
+                    "digest": "sha256:6eec1681053c5141288662af49733b23283c6aa149e2f077733bd515acdfa190",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 249
+                  }
+                ]
+              ],
+              "step10:0": [
+                [
+                  {
+                    "digest": "sha256:e2de96513ba9eb53b431787ec8a65cdde380ac4772a3e4c4b714dcfde2a102b5",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 3849738
+                  },
+                  {
+                    "digest": "sha256:dfd5c69ca31cfb36ae0002c3049cf2d7bf398b9bb1099035e8634e3510ee84da",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 416265
+                  },
+                  {
+                    "digest": "sha256:7abff04c4f315a5424ff8d34ad0c10700efc2fc32961841df78d2bfc17e1a353",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 13771491
+                  },
+                  {
+                    "digest": "sha256:6eec1681053c5141288662af49733b23283c6aa149e2f077733bd515acdfa190",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 249
+                  },
+                  {
+                    "digest": "sha256:1b050120e1340a38fa38c965f1ad501623ab128b796bdb3637587c23eb1e5ad4",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 3769457
+                  }
+                ]
+              ],
+              "step2:0": [
+                [
+                  {
+                    "digest": "sha256:51e5b22c7c9f50cb9b87616ce109058a097bf732e479d7cd03f1968e4e75b9ee",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 24898909
+                  },
+                  {
+                    "digest": "sha256:edf16e7a8ef4fafc6ea9c9cff19db5558f8dad3b64f9ad7540a11699fc7e6a60",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 98
+                  }
+                ]
+              ]
+            },
+            "source": {
+              "infos": [
+                {
+                  "data": "IyBzeW50YXg9ZG9ja2VyL2RvY2tlcmZpbGU6MQojCiMgTXVsdGktc3RhZ2UgYnVpbGQ6IHRoZSBidWlsZGVyIHRha2VzIHV2IGZyb20gYW4gaW1tdXRhYmxlIGltYWdlIGRpZ2VzdCwgdXNlcwojIHRoZSBsb2NrIGZvciBib3RoIHRoZSBidWlsZCB0b29scyBhbmQgcnVudGltZSBncmFwaCwgdGhlbiBpbnN0YWxscyB0aGUgZXhhY3QKIyBsb2NhbCB3aGVlbCB3aXRob3V0IGRlcGVuZGVuY3kgcmVzb2x1dGlvbi4gVGhlIGZpbmFsIHN0YWdlIGNvcGllcyBvbmx5IHRoZQojIHJ1bnRpbWUgdmVudiBvbnRvIGEgZnJlc2gsIHBpbm5lZCBiYXNlIGFuZCBydW5zIGFzIGEgbm9uLXJvb3QgVUlEIHdpdGggbm8KIyBmdXJ0aGVyIGluc3RhbGxhdGlvbi4gVGhlcmUgaXMgbm8gc2hlbGwgZW50cnlwb2ludCBvciBidWlsZCB0b29sIGF0IHJ1bnRpbWUuCiMKIyBCYXNlIGltYWdlIGlzIHBpbm5lZCBieSBkaWdlc3QgKG5vdCBqdXN0IHRoZSBgYDMuMTItYWxwaW5lYGAgdGFnKSBzbyBhCiMgcmVwb3NpdG9yeSBwdXNoIGJlaGluZCB0aGF0IHRhZyBjYW4gbmV2ZXIgc2lsZW50bHkgY2hhbmdlIHdoYXQgdGhpcwojIGltYWdlIGlzIGJ1aWx0IEZST00uCkZST00gcHl0aG9uOjMuMTItYWxwaW5lQHNoYTI1Njo0YzQ3MTI0YTgzOTFjYjdhOWY1NzExNjQxNDdkMTU0Nzc3Y2YwMTJhNGVjZTVmODYwOTcxMzBkN2E0NDc4MTExIEFTIGJ1aWxkZXIKCkFSRyBHQVRFV0FZX1JFVklTSU9OClJVTiB0ZXN0IC1uICIkR0FURVdBWV9SRVZJU0lPTiIKCiMgVGhlIGJpbmFyeSBjb21lcyBmcm9tIHRoZSBzYW1lIGRpZ2VzdC1waW5uZWQgc291cmNlIGFzIHRoZSByb290IHJlbGVhc2UKIyBpbWFnZS4gQSBtdXRhYmxlIHV2IHRhZyBtdXN0IG5ldmVyIHBhcnRpY2lwYXRlIGluIHRoaXMgYnVpbGQuCkNPUFkgLS1mcm9tPWdoY3IuaW8vYXN0cmFsLXNoL3V2QHNoYTI1NjplNTkwODQ2ZjQ3NzY5MDdiMjU0YWMwZjQ0YjViMzgwMzQ3YWY1ZDkwZDY2ODEzOGNhNzkzOGQxYjBjMmY5OGQzIC91diAvdXNyL2xvY2FsL2Jpbi91dgoKRU5WIFVWX1BZVEhPTl9ET1dOTE9BRFM9bmV2ZXIKCldPUktESVIgL2J1aWxkCkNPUFkgcHlwcm9qZWN0LnRvbWwgdXYubG9jayAuLwoKIyBJbnN0YWxsIHRoZSBsb2NrZWQgcnVudGltZSBhbmQgYnVpbGQgZ3JhcGhzIGJlZm9yZSBjb3B5aW5nIHNvdXJjZSBzbwojIHNvdXJjZS1vbmx5IGNoYW5nZXMgY2FuIHJldXNlIHRoaXMgbGF5ZXIuIFRoZSBzZXBhcmF0ZSBidWlsZCB2ZW52IGtlZXBzIHRoZQojIHBpbm5lZCBiYWNrZW5kIG91dCBvZiB0aGUgc2hpcHBlZCBydW50aW1lIGVudmlyb25tZW50LgpSVU4gdXYgdmVudiAvYnVpbGQtdmVudiAmJiBcCiAgICBWSVJUVUFMX0VOVj0vYnVpbGQtdmVudiBVVl9QUk9KRUNUX0VOVklST05NRU5UPS9idWlsZC12ZW52IFBBVEg9Ii9idWlsZC12ZW52L2JpbjokUEFUSCIgdXYgc3luYyBcCiAgICAgIC0tZGlyZWN0b3J5IC9idWlsZCBcCiAgICAgIC0tZnJvemVuIFwKICAgICAgLS1uby1kZWZhdWx0LWdyb3VwcyBcCiAgICAgIC0tZ3JvdXAgY29udGFpbmVyLWJ1aWxkIFwKICAgICAgLS1uby1pbnN0YWxsLXByb2plY3QgXAogICAgICAtLWFjdGl2ZQoKQ09QWSBzcmMgL2J1aWxkL3NyYwoKIyBCdWlsZCB3aXRoIHRoZSBiYWNrZW5kIGFscmVhZHkgaW5zdGFsbGVkIGZyb20gdGhlIGxvY2suIFRoZW4gY3JlYXRlIGEgY2xlYW4KIyBydW50aW1lIHZlbnYsIHN5bmMgb25seSBpdHMgbG9ja2VkIHRoaXJkLXBhcnR5IGdyYXBoLCBhbmQgYWRkIHRoZSBleGFjdCBsb2NhbAojIHdoZWVsIHdpdGhvdXQgZGVwZW5kZW5jeSByZXNvbHV0aW9uLgpSVU4gVklSVFVBTF9FTlY9L2J1aWxkLXZlbnYgUEFUSD0iL2J1aWxkLXZlbnYvYmluOiRQQVRIIiB1diBidWlsZCBcCiAgICAgIC0tZGlyZWN0b3J5IC9idWlsZCBcCiAgICAgIC0tbm8tYnVpbGQtaXNvbGF0aW9uIFwKICAgICAgLS13aGVlbCBcCiAgICAgIC0tb3V0LWRpciAvZGlzdCAmJiBcCiAgICB1diB2ZW52IC92ZW52ICYmIFwKICAgIFZJUlRVQUxfRU5WPS92ZW52IFVWX1BST0pFQ1RfRU5WSVJPTk1FTlQ9L3ZlbnYgUEFUSD0iL3ZlbnYvYmluOiRQQVRIIiB1diBzeW5jIFwKICAgICAgLS1kaXJlY3RvcnkgL2J1aWxkIFwKICAgICAgLS1mcm96ZW4gXAogICAgICAtLW5vLWRlZmF1bHQtZ3JvdXBzIFwKICAgICAgLS1uby1pbnN0YWxsLXByb2plY3QgXAogICAgICAtLWFjdGl2ZSAmJiBcCiAgICB1diBwaXAgaW5zdGFsbCAtLXB5dGhvbiAvdmVudi9iaW4vcHl0aG9uIC0tbm8tZGVwcyAvZGlzdC9lbHNwZXRoX2xsbV9nYXRld2F5LSoud2hsCgpGUk9NIHB5dGhvbjozLjEyLWFscGluZUBzaGEyNTY6NGM0NzEyNGE4MzkxY2I3YTlmNTcxMTY0MTQ3ZDE1NDc3N2NmMDEyYTRlY2U1Zjg2MDk3MTMwZDdhNDQ3ODExMQoKQVJHIEdBVEVXQVlfUkVWSVNJT04KTEFCRUwgb3JnLm9wZW5jb250YWluZXJzLmltYWdlLnJldmlzaW9uPSIke0dBVEVXQVlfUkVWSVNJT059IiBcCiAgICBpby5lbHNwZXRoLmxsbS1nYXRld2F5LnJ1bnRpbWUtaWRlbnRpdHk9ImVsc3BldGgtbGxtLWdhdGV3YXkiIFwKICAgIGlvLmVsc3BldGgubGxtLWdhdGV3YXkucnVudGltZS12ZXJzaW9uPSIwLjEuMCIgXAogICAgaW8uZWxzcGV0aC5sbG0tZ2F0ZXdheS5jb250cmFjdC1tYWpvcj0iMSIgXAogICAgaW8uZWxzcGV0aC5sbG0tZ2F0ZXdheS5hZGFwdGVyLW5hbWU9InJlZmVyZW5jZV92MV9pbnZva2UiIFwKICAgIGlvLmVsc3BldGgubGxtLWdhdGV3YXkuYWRhcHRlci12ZXJzaW9uPSIwLjEuMCIgXAogICAgaW8uZWxzcGV0aC5sbG0tZ2F0ZXdheS5hZGFwdGVyLWFwaS1tYWpvcj0iMSIgXAogICAgaW8uZWxzcGV0aC5sbG0tZ2F0ZXdheS5hZGFwdGVyLWZpbmdlcnByaW50PSIyYjE5NTE0OWNkMjA1NmVmNTFiYWI2Y2JkMTlmM2RhN2M2MjlhOTVlZGE2MTQ2MTRmMzg1ZTA0OTMzODQ2YzgzIgoKIyBQWVRIT05ET05UV1JJVEVCWVRFQ09ERTogdGhpcyBpbWFnZSBydW5zIHJlYWQtb25seSAobm8gd3JpdGVzIG91dHNpZGUKIyAvdG1wKTsgdGhlIGludGVycHJldGVyIG11c3QgbmV2ZXIgYXR0ZW1wdCB0byB3cml0ZSAucHljIGZpbGVzIG5leHQgdG8gdGhlCiMgdmVudidzIHNpdGUtcGFja2FnZXMuIFBBVEggcHV0cyB0aGUgdmVudidzIGFic29sdXRlIHB5dGhvbi91dmljb3JuIGFoZWFkCiMgb2YgdGhlIGJhc2UgaW1hZ2UncyBzeXN0ZW0gaW50ZXJwcmV0ZXIuCkVOViBQWVRIT05ET05UV1JJVEVCWVRFQ09ERT0xIFwKICAgIFBBVEg9Ii92ZW52L2JpbjokUEFUSCIKCkNPUFkgLS1mcm9tPWJ1aWxkZXIgL3ZlbnYgL3ZlbnYKCiMgRml4ZWQsIG5vbi1yb290LCBub24tYWxsb2NhdGFibGUgVUlEL0dJRCAoZGlzdHJvbGVzcyBjb252ZW50aW9uKSAtLSBuZXZlcgojIHJvb3QsIGFuZCBuZXZlciBhIFVJRCB0aGF0IGNvdWxkIGNvbGxpZGUgd2l0aCBhIGNvbnRhaW5lci1ob3N0IGFjY291bnQuClVTRVIgNjU1MzI6NjU1MzIKCkVYUE9TRSA4Nzg3CgojIEFic29sdXRlIC92ZW52L2Jpbi9weXRob24gaXMgbWFuZGF0b3J5OiBhIGJhcmUgInB5dGhvbiIgb24gUEFUSCB3b3VsZAojIHN0aWxsIHJlc29sdmUgdG8gdGhlIHZlbnYgZmlyc3QgaGVyZSwgYnV0IGFuIGFic29sdXRlIHBhdGggcmVtb3ZlcyBhbnkKIyBkb3VidCBhbmQgc3Vydml2ZXMgYSBQQVRIIG92ZXJyaWRlIGZyb20gYGRvY2tlciBydW4gLS1lbnYgUEFUSD0uLi5gLgojIE5vIHNoZWxsIGVudHJ5cG9pbnQgKGV4ZWMgZm9ybSBvbmx5KSAtLSBQSUQgMSBpcyB1dmljb3JuIGl0c2VsZiwgc28KIyBTSUdURVJNIHJlYWNoZXMgaXQgZGlyZWN0bHkgZm9yIC0tdGltZW91dC1ncmFjZWZ1bC1zaHV0ZG93biB0byBtYXR0ZXIuCkVOVFJZUE9JTlQgWyIvdmVudi9iaW4vcHl0aG9uIiwgIi1tIiwgInV2aWNvcm4iLCAiZWxzcGV0aF9sbG1fZ2F0ZXdheS5jb3JlLmFwcDpidWlsZCIsICItLWhvc3QiLCAiMC4wLjAuMCIsICItLXBvcnQiLCAiODc4NyIsICItLWZhY3RvcnkiLCAiLS10aW1lb3V0LWdyYWNlZnVsLXNodXRkb3duIiwgIjMwIl0K",
+                  "digestMapping": {
+                    "sha256:5edbdffdb0e067f4b6665c9ac89e985be40bd55f8e516524faa51c006dae4b34": "step0",
+                    "sha256:b8fac24b98a59d6233cf50bdb2db0967531b88a9a1e70c7b53f115cd7421dd2c": "step1"
+                  },
+                  "filename": "Dockerfile",
+                  "language": "Dockerfile",
+                  "llbDefinition": [
+                    {
+                      "id": "step0",
+                      "op": {
+                        "Op": {
+                          "source": {
+                            "attrs": {
+                              "local.differ": "none",
+                              "local.followpaths": "[\"Dockerfile\",\"Dockerfile.dockerignore\",\"dockerfile\"]",
+                              "local.sharedkeyhint": "dockerfile"
+                            },
+                            "identifier": "local://dockerfile"
+                          }
+                        },
+                        "constraints": {}
+                      }
+                    },
+                    {
+                      "id": "step1",
+                      "inputs": [
+                        "step0:0"
+                      ],
+                      "op": {
+                        "Op": {}
+                      }
+                    }
+                  ]
+                }
+              ],
+              "locations": {
+                "step0": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 57
+                          },
+                          "start": {
+                            "line": 57
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 12
+                          },
+                          "start": {
+                            "line": 12
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step1": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 15
+                          },
+                          "start": {
+                            "line": 15
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step10": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 76
+                          },
+                          "start": {
+                            "line": 76
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step2": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 19
+                          },
+                          "start": {
+                            "line": 19
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step3": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 19
+                          },
+                          "start": {
+                            "line": 19
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step4": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 23
+                          },
+                          "start": {
+                            "line": 23
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step5": {},
+                "step6": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 24
+                          },
+                          "start": {
+                            "line": 24
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step7": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 29
+                          },
+                          "start": {
+                            "line": 29
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 30
+                          },
+                          "start": {
+                            "line": 30
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 31
+                          },
+                          "start": {
+                            "line": 31
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 32
+                          },
+                          "start": {
+                            "line": 32
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 33
+                          },
+                          "start": {
+                            "line": 33
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 34
+                          },
+                          "start": {
+                            "line": 34
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 35
+                          },
+                          "start": {
+                            "line": 35
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 36
+                          },
+                          "start": {
+                            "line": 36
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step8": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 38
+                          },
+                          "start": {
+                            "line": 38
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step9": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 43
+                          },
+                          "start": {
+                            "line": 43
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 44
+                          },
+                          "start": {
+                            "line": 44
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 45
+                          },
+                          "start": {
+                            "line": 45
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 46
+                          },
+                          "start": {
+                            "line": 46
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 47
+                          },
+                          "start": {
+                            "line": 47
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 48
+                          },
+                          "start": {
+                            "line": 48
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 49
+                          },
+                          "start": {
+                            "line": 49
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 50
+                          },
+                          "start": {
+                            "line": 50
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 51
+                          },
+                          "start": {
+                            "line": 51
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 52
+                          },
+                          "start": {
+                            "line": 52
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 53
+                          },
+                          "start": {
+                            "line": 53
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 54
+                          },
+                          "start": {
+                            "line": 54
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 55
+                          },
+                          "start": {
+                            "line": 55
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            "vcs": {
+              "localdir:context": "gateway",
+              "localdir:dockerfile": "gateway",
+              "revision": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+              "source": "https://github.com/dta-au/elspeth"
+            }
+          },
+          "finishedOn": "2026-10-06T00:27:30.282201702Z",
+          "invocationId": "pfdsf5s5y90g27nirvyid9oix",
+          "startedOn": "2026-10-06T00:27:06.379036058Z"
+        }
+      }
+    }
+  },
+  "linux/arm64": {
+    "SLSA": {
+      "buildDefinition": {
+        "buildType": "https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md",
+        "externalParameters": {
+          "configSource": {
+            "path": "Dockerfile"
+          },
+          "request": {
+            "args": {
+              "build-arg:GATEWAY_REVISION": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+              "cmdline": "docker/dockerfile:1",
+              "label:org.opencontainers.image.revision": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+              "label:org.opencontainers.image.source": "https://github.com/dta-au/elspeth/tree/edc844699a350a90a624089e12a5a1e75b7b2dde/gateway",
+              "source": "docker/dockerfile:1"
+            },
+            "compatibilityVersion": 30,
+            "frontend": "gateway.v0",
+            "locals": [
+              {
+                "name": "context"
+              },
+              {
+                "name": "dockerfile"
+              }
+            ],
+            "root": {
+              "configSource": {
+                "path": "Dockerfile"
+              },
+              "request": {
+                "args": {
+                  "build-arg:GATEWAY_REVISION": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+                  "label:org.opencontainers.image.revision": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+                  "label:org.opencontainers.image.source": "https://github.com/dta-au/elspeth/tree/edc844699a350a90a624089e12a5a1e75b7b2dde/gateway",
+                  "vcs:localdir:context": "gateway",
+                  "vcs:localdir:dockerfile": "gateway",
+                  "vcs:revision": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+                  "vcs:source": "https://github.com/dta-au/elspeth"
+                }
+              }
+            }
+          }
+        },
+        "internalParameters": {
+          "buildConfig": {
+            "digestMapping": {
+              "sha256:072c43f7dc004559da3d415bd5d7f68f57cd660d6fbf6b8590675f804e94c275": "step9",
+              "sha256:0ea88055f2fa8a166e566c70a5d859f1e2e477b58aa724a3c5f14d4a709a4d89": "step6",
+              "sha256:0f86a8df148f0d1485137f7c7bb2834f1b0bf024238ea4d848a9dccc12643eb9": "step0",
+              "sha256:2529b822f633c2322dad79624836b8e26b4b8487ef53b6e72afc2977321ed3a7": "step7",
+              "sha256:33c9cd9a41ce6475785f680954be34ea29591bdc5538efce2ca8182dcea449d9": "step5",
+              "sha256:3e4216a7cb10746fa9d41ce1e4e77998897aebffecefe38347d0387f293b4f7b": "step1",
+              "sha256:8203dd2bedeed796b212347f2e8ba2872cee9596fab3896fa6fd9f5b13bbe765": "step11",
+              "sha256:997899d6308d2d305cc479f5319b1703d429a7997997347326d60665103d08b1": "step4",
+              "sha256:a2722e3494cc70c35f870d844296bd68c1869863bc0ce83dd2bf007aefd80b29": "step8",
+              "sha256:c361d5bfb03500b2d13b696b86497fd729067af76fdc2883279d1cbe4347ef96": "step3",
+              "sha256:c6fccdb165c80a10d5c4c4c6db2f285b72a6154ecd84a546e90bf4b37b771c31": "step2",
+              "sha256:e5781454ef34bfb7bceb40349431ae325bd060c209f86c3c322fb3e75cacbeb0": "step10"
+            },
+            "llbDefinition": [
+              {
+                "id": "step0",
+                "op": {
+                  "Op": {
+                    "source": {
+                      "identifier": "docker-image://docker.io/library/python:3.12-alpine@sha256:4c47124a8391cb7a9f571164147d154777cf012a4ece5f86097130d7a4478111"
+                    }
+                  },
+                  "constraints": {},
+                  "platform": {
+                    "Architecture": "arm64",
+                    "OS": "linux"
+                  }
+                }
+              },
+              {
+                "id": "step1",
+                "inputs": [
+                  "step0:0"
+                ],
+                "op": {
+                  "Op": {
+                    "exec": {
+                      "meta": {
+                        "args": [
+                          "/bin/sh",
+                          "-c",
+                          "test -n \"$GATEWAY_REVISION\""
+                        ],
+                        "cwd": "/",
+                        "env": [
+                          "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                          "LANG=C.UTF-8",
+                          "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+                          "PYTHON_VERSION=3.12.14",
+                          "PYTHON_SHA256=5c8462af5790baf43a321a1559dbe0db06d1be4300fb85fb53c40060668e548a",
+                          "GATEWAY_REVISION=edc844699a350a90a624089e12a5a1e75b7b2dde"
+                        ],
+                        "removeMountStubsRecursive": true
+                      },
+                      "mounts": [
+                        {
+                          "dest": "/"
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {},
+                  "platform": {
+                    "Architecture": "arm64",
+                    "OS": "linux"
+                  }
+                }
+              },
+              {
+                "id": "step2",
+                "op": {
+                  "Op": {
+                    "source": {
+                      "identifier": "docker-image://ghcr.io/astral-sh/uv@sha256:e590846f4776907b254ac0f44b5b380347af5d90d668138ca7938d1b0c2f98d3"
+                    }
+                  },
+                  "constraints": {},
+                  "platform": {
+                    "Architecture": "arm64",
+                    "OS": "linux"
+                  }
+                }
+              },
+              {
+                "id": "step3",
+                "inputs": [
+                  "step1:0",
+                  "step2:0"
+                ],
+                "op": {
+                  "Op": {
+                    "file": {
+                      "actions": [
+                        {
+                          "Action": {
+                            "copy": {
+                              "allowEmptyWildcard": true,
+                              "allowWildcard": true,
+                              "createDestPath": true,
+                              "dest": "/usr/local/bin/uv",
+                              "dirCopyContents": true,
+                              "followSymlink": true,
+                              "mode": -1,
+                              "src": "/uv",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 0,
+                          "output": 0,
+                          "secondaryInput": 1
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step4",
+                "inputs": [
+                  "step3:0"
+                ],
+                "op": {
+                  "Op": {
+                    "file": {
+                      "actions": [
+                        {
+                          "Action": {
+                            "mkdir": {
+                              "makeParents": true,
+                              "mode": 493,
+                              "path": "/build",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 0,
+                          "output": 0,
+                          "secondaryInput": -1
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step5",
+                "op": {
+                  "Op": {
+                    "source": {
+                      "attrs": {
+                        "local.excludepatterns": "[\".venv\",\".pytest_cache\",\".benchmarks\",\"__pycache__\",\"*.pyc\",\"tests\",\"conformance\",\"scaffold\",\"mock\",\"README.md\"]",
+                        "local.followpaths": "[\"pyproject.toml\",\"src\",\"uv.lock\"]",
+                        "local.sharedkeyhint": "context"
+                      },
+                      "identifier": "local://context"
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step6",
+                "inputs": [
+                  "step4:0",
+                  "step5:0"
+                ],
+                "op": {
+                  "Op": {
+                    "file": {
+                      "actions": [
+                        {
+                          "Action": {
+                            "copy": {
+                              "allowEmptyWildcard": true,
+                              "allowWildcard": true,
+                              "createDestPath": true,
+                              "dest": "/build/",
+                              "dirCopyContents": true,
+                              "followSymlink": true,
+                              "mode": -1,
+                              "src": "/pyproject.toml",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 0,
+                          "output": -1,
+                          "secondaryInput": 1
+                        },
+                        {
+                          "Action": {
+                            "copy": {
+                              "allowEmptyWildcard": true,
+                              "allowWildcard": true,
+                              "createDestPath": true,
+                              "dest": "/build/",
+                              "dirCopyContents": true,
+                              "followSymlink": true,
+                              "mode": -1,
+                              "src": "/uv.lock",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 2,
+                          "output": 0,
+                          "secondaryInput": 1
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step7",
+                "inputs": [
+                  "step6:0"
+                ],
+                "op": {
+                  "Op": {
+                    "exec": {
+                      "meta": {
+                        "args": [
+                          "/bin/sh",
+                          "-c",
+                          "uv venv /build-venv \u0026\u0026     VIRTUAL_ENV=/build-venv UV_PROJECT_ENVIRONMENT=/build-venv PATH=\"/build-venv/bin:$PATH\" uv sync       --directory /build       --frozen       --no-default-groups       --group container-build       --no-install-project       --active"
+                        ],
+                        "cwd": "/build",
+                        "env": [
+                          "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                          "LANG=C.UTF-8",
+                          "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+                          "PYTHON_VERSION=3.12.14",
+                          "PYTHON_SHA256=5c8462af5790baf43a321a1559dbe0db06d1be4300fb85fb53c40060668e548a",
+                          "GATEWAY_REVISION=edc844699a350a90a624089e12a5a1e75b7b2dde",
+                          "UV_PYTHON_DOWNLOADS=never"
+                        ],
+                        "removeMountStubsRecursive": true
+                      },
+                      "mounts": [
+                        {
+                          "dest": "/"
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {},
+                  "platform": {
+                    "Architecture": "arm64",
+                    "OS": "linux"
+                  }
+                }
+              },
+              {
+                "id": "step8",
+                "inputs": [
+                  "step7:0",
+                  "step5:0"
+                ],
+                "op": {
+                  "Op": {
+                    "file": {
+                      "actions": [
+                        {
+                          "Action": {
+                            "copy": {
+                              "allowEmptyWildcard": true,
+                              "allowWildcard": true,
+                              "createDestPath": true,
+                              "dest": "/build/src",
+                              "dirCopyContents": true,
+                              "followSymlink": true,
+                              "mode": -1,
+                              "src": "/src",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 0,
+                          "output": 0,
+                          "secondaryInput": 1
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step9",
+                "inputs": [
+                  "step8:0"
+                ],
+                "op": {
+                  "Op": {
+                    "exec": {
+                      "meta": {
+                        "args": [
+                          "/bin/sh",
+                          "-c",
+                          "VIRTUAL_ENV=/build-venv PATH=\"/build-venv/bin:$PATH\" uv build       --directory /build       --no-build-isolation       --wheel       --out-dir /dist \u0026\u0026     uv venv /venv \u0026\u0026     VIRTUAL_ENV=/venv UV_PROJECT_ENVIRONMENT=/venv PATH=\"/venv/bin:$PATH\" uv sync       --directory /build       --frozen       --no-default-groups       --no-install-project       --active \u0026\u0026     uv pip install --python /venv/bin/python --no-deps /dist/elspeth_llm_gateway-*.whl"
+                        ],
+                        "cwd": "/build",
+                        "env": [
+                          "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                          "LANG=C.UTF-8",
+                          "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+                          "PYTHON_VERSION=3.12.14",
+                          "PYTHON_SHA256=5c8462af5790baf43a321a1559dbe0db06d1be4300fb85fb53c40060668e548a",
+                          "GATEWAY_REVISION=edc844699a350a90a624089e12a5a1e75b7b2dde",
+                          "UV_PYTHON_DOWNLOADS=never"
+                        ],
+                        "removeMountStubsRecursive": true
+                      },
+                      "mounts": [
+                        {
+                          "dest": "/"
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {},
+                  "platform": {
+                    "Architecture": "arm64",
+                    "OS": "linux"
+                  }
+                }
+              },
+              {
+                "id": "step10",
+                "inputs": [
+                  "step0:0",
+                  "step9:0"
+                ],
+                "op": {
+                  "Op": {
+                    "file": {
+                      "actions": [
+                        {
+                          "Action": {
+                            "copy": {
+                              "allowEmptyWildcard": true,
+                              "allowWildcard": true,
+                              "createDestPath": true,
+                              "dest": "/venv",
+                              "dirCopyContents": true,
+                              "followSymlink": true,
+                              "mode": -1,
+                              "src": "/venv",
+                              "timestamp": -1
+                            }
+                          },
+                          "input": 0,
+                          "output": 0,
+                          "secondaryInput": 1
+                        }
+                      ]
+                    }
+                  },
+                  "constraints": {}
+                }
+              },
+              {
+                "id": "step11",
+                "inputs": [
+                  "step10:0"
+                ],
+                "op": {
+                  "Op": {}
+                }
+              }
+            ]
+          },
+          "builderPlatform": "linux/amd64",
+          "github_actor": "johnm-dta",
+          "github_actor_id": "181720297",
+          "github_event_name": "workflow_run",
+          "github_event_payload": {
+            "action": "completed",
+            "organization": {
+              "avatar_url": "https://avatars.githubusercontent.com/u/182742397?v=4",
+              "description": null,
+              "events_url": "https://api.github.com/orgs/dta-au/events",
+              "hooks_url": "https://api.github.com/orgs/dta-au/hooks",
+              "id": 182742397,
+              "issues_url": "https://api.github.com/orgs/dta-au/issues",
+              "login": "dta-au",
+              "members_url": "https://api.github.com/orgs/dta-au/members{/member}",
+              "node_id": "O_kgDOCuRtfQ",
+              "public_members_url": "https://api.github.com/orgs/dta-au/public_members{/member}",
+              "repos_url": "https://api.github.com/orgs/dta-au/repos",
+              "url": "https://api.github.com/orgs/dta-au"
+            },
+            "repository": {
+              "allow_forking": true,
+              "archive_url": "https://api.github.com/repos/dta-au/elspeth/{archive_format}{/ref}",
+              "archived": false,
+              "assignees_url": "https://api.github.com/repos/dta-au/elspeth/assignees{/user}",
+              "blobs_url": "https://api.github.com/repos/dta-au/elspeth/git/blobs{/sha}",
+              "branches_url": "https://api.github.com/repos/dta-au/elspeth/branches{/branch}",
+              "clone_url": "https://github.com/dta-au/elspeth.git",
+              "collaborators_url": "https://api.github.com/repos/dta-au/elspeth/collaborators{/collaborator}",
+              "comments_url": "https://api.github.com/repos/dta-au/elspeth/comments{/number}",
+              "commits_url": "https://api.github.com/repos/dta-au/elspeth/commits{/sha}",
+              "compare_url": "https://api.github.com/repos/dta-au/elspeth/compare/{base}...{head}",
+              "contents_url": "https://api.github.com/repos/dta-au/elspeth/contents/{+path}",
+              "contributors_url": "https://api.github.com/repos/dta-au/elspeth/contributors",
+              "created_at": "2026-01-22T01:24:02Z",
+              "custom_properties": {},
+              "default_branch": "main",
+              "deployments_url": "https://api.github.com/repos/dta-au/elspeth/deployments",
+              "description": "Auditable Sense/Decide/Act pipelines for high-stakes data processing.",
+              "disabled": false,
+              "downloads_url": "https://api.github.com/repos/dta-au/elspeth/downloads",
+              "events_url": "https://api.github.com/repos/dta-au/elspeth/events",
+              "fork": false,
+              "forks": 0,
+              "forks_count": 0,
+              "forks_url": "https://api.github.com/repos/dta-au/elspeth/forks",
+              "full_name": "dta-au/elspeth",
+              "git_commits_url": "https://api.github.com/repos/dta-au/elspeth/git/commits{/sha}",
+              "git_refs_url": "https://api.github.com/repos/dta-au/elspeth/git/refs{/sha}",
+              "git_tags_url": "https://api.github.com/repos/dta-au/elspeth/git/tags{/sha}",
+              "git_url": "git://github.com/dta-au/elspeth.git",
+              "has_discussions": false,
+              "has_downloads": false,
+              "has_issues": true,
+              "has_pages": true,
+              "has_projects": true,
+              "has_pull_requests": true,
+              "has_wiki": true,
+              "homepage": "",
+              "hooks_url": "https://api.github.com/repos/dta-au/elspeth/hooks",
+              "html_url": "https://github.com/dta-au/elspeth",
+              "id": 1139453241,
+              "is_template": false,
+              "issue_comment_url": "https://api.github.com/repos/dta-au/elspeth/issues/comments{/number}",
+              "issue_events_url": "https://api.github.com/repos/dta-au/elspeth/issues/events{/number}",
+              "issues_url": "https://api.github.com/repos/dta-au/elspeth/issues{/number}",
+              "keys_url": "https://api.github.com/repos/dta-au/elspeth/keys{/key_id}",
+              "labels_url": "https://api.github.com/repos/dta-au/elspeth/labels{/name}",
+              "language": "Python",
+              "languages_url": "https://api.github.com/repos/dta-au/elspeth/languages",
+              "license": {
+                "key": "mit",
+                "name": "MIT License",
+                "node_id": "MDc6TGljZW5zZTEz",
+                "spdx_id": "MIT",
+                "url": "https://api.github.com/licenses/mit"
+              },
+              "merges_url": "https://api.github.com/repos/dta-au/elspeth/merges",
+              "milestones_url": "https://api.github.com/repos/dta-au/elspeth/milestones{/number}",
+              "mirror_url": null,
+              "name": "elspeth",
+              "node_id": "R_kgDOQ-qtOQ",
+              "notifications_url": "https://api.github.com/repos/dta-au/elspeth/notifications{?since,all,participating}",
+              "open_issues": 62,
+              "open_issues_count": 62,
+              "owner": {
+                "avatar_url": "https://avatars.githubusercontent.com/u/182742397?v=4",
+                "events_url": "https://api.github.com/users/dta-au/events{/privacy}",
+                "followers_url": "https://api.github.com/users/dta-au/followers",
+                "following_url": "https://api.github.com/users/dta-au/following{/other_user}",
+                "gists_url": "https://api.github.com/users/dta-au/gists{/gist_id}",
+                "gravatar_id": "",
+                "html_url": "https://github.com/dta-au",
+                "id": 182742397,
+                "login": "dta-au",
+                "node_id": "O_kgDOCuRtfQ",
+                "organizations_url": "https://api.github.com/users/dta-au/orgs",
+                "received_events_url": "https://api.github.com/users/dta-au/received_events",
+                "repos_url": "https://api.github.com/users/dta-au/repos",
+                "site_admin": false,
+                "starred_url": "https://api.github.com/users/dta-au/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/dta-au/subscriptions",
+                "type": "Organization",
+                "url": "https://api.github.com/users/dta-au",
+                "user_view_type": "public"
+              },
+              "private": false,
+              "pull_request_creation_policy": "all",
+              "pulls_url": "https://api.github.com/repos/dta-au/elspeth/pulls{/number}",
+              "pushed_at": "2026-10-05T15:52:10Z",
+              "releases_url": "https://api.github.com/repos/dta-au/elspeth/releases{/id}",
+              "size": 153025,
+              "ssh_url": "git@github.com:dta-au/elspeth.git",
+              "stargazers_count": 0,
+              "stargazers_url": "https://api.github.com/repos/dta-au/elspeth/stargazers",
+              "statuses_url": "https://api.github.com/repos/dta-au/elspeth/statuses/{sha}",
+              "subscribers_url": "https://api.github.com/repos/dta-au/elspeth/subscribers",
+              "subscription_url": "https://api.github.com/repos/dta-au/elspeth/subscription",
+              "svn_url": "https://github.com/dta-au/elspeth",
+              "tags_url": "https://api.github.com/repos/dta-au/elspeth/tags",
+              "teams_url": "https://api.github.com/repos/dta-au/elspeth/teams",
+              "topics": [],
+              "trees_url": "https://api.github.com/repos/dta-au/elspeth/git/trees{/sha}",
+              "updated_at": "2026-10-05T15:52:17Z",
+              "url": "https://api.github.com/repos/dta-au/elspeth",
+              "visibility": "public",
+              "watchers": 0,
+              "watchers_count": 0,
+              "web_commit_signoff_required": false
+            },
+            "sender": {
+              "avatar_url": "https://avatars.githubusercontent.com/u/181720297?v=4",
+              "events_url": "https://api.github.com/users/johnm-dta/events{/privacy}",
+              "followers_url": "https://api.github.com/users/johnm-dta/followers",
+              "following_url": "https://api.github.com/users/johnm-dta/following{/other_user}",
+              "gists_url": "https://api.github.com/users/johnm-dta/gists{/gist_id}",
+              "gravatar_id": "",
+              "html_url": "https://github.com/johnm-dta",
+              "id": 181720297,
+              "login": "johnm-dta",
+              "node_id": "U_kgDOCtTU6Q",
+              "organizations_url": "https://api.github.com/users/johnm-dta/orgs",
+              "received_events_url": "https://api.github.com/users/johnm-dta/received_events",
+              "repos_url": "https://api.github.com/users/johnm-dta/repos",
+              "site_admin": false,
+              "starred_url": "https://api.github.com/users/johnm-dta/starred{/owner}{/repo}",
+              "subscriptions_url": "https://api.github.com/users/johnm-dta/subscriptions",
+              "type": "User",
+              "url": "https://api.github.com/users/johnm-dta",
+              "user_view_type": "public"
+            },
+            "workflow": {
+              "badge_url": "https://github.com/dta-au/elspeth/workflows/CI/badge.svg",
+              "created_at": "2026-01-22T01:26:05.000Z",
+              "html_url": "https://github.com/dta-au/elspeth/blob/main/.github/workflows/ci.yaml",
+              "id": 225844184,
+              "name": "CI",
+              "node_id": "W_kwDOQ-qtOc4NdhvY",
+              "path": ".github/workflows/ci.yaml",
+              "state": "active",
+              "updated_at": "2026-02-01T08:10:55.000Z",
+              "url": "https://api.github.com/repos/dta-au/elspeth/actions/workflows/225844184"
+            },
+            "workflow_run": {
+              "actor": {
+                "avatar_url": "https://avatars.githubusercontent.com/u/181720297?v=4",
+                "events_url": "https://api.github.com/users/johnm-dta/events{/privacy}",
+                "followers_url": "https://api.github.com/users/johnm-dta/followers",
+                "following_url": "https://api.github.com/users/johnm-dta/following{/other_user}",
+                "gists_url": "https://api.github.com/users/johnm-dta/gists{/gist_id}",
+                "gravatar_id": "",
+                "html_url": "https://github.com/johnm-dta",
+                "id": 181720297,
+                "login": "johnm-dta",
+                "node_id": "U_kgDOCtTU6Q",
+                "organizations_url": "https://api.github.com/users/johnm-dta/orgs",
+                "received_events_url": "https://api.github.com/users/johnm-dta/received_events",
+                "repos_url": "https://api.github.com/users/johnm-dta/repos",
+                "site_admin": false,
+                "starred_url": "https://api.github.com/users/johnm-dta/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/johnm-dta/subscriptions",
+                "type": "User",
+                "url": "https://api.github.com/users/johnm-dta",
+                "user_view_type": "public"
+              },
+              "artifacts_url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981/artifacts",
+              "cancel_url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981/cancel",
+              "check_suite_id": 101128143941,
+              "check_suite_node_id": "CS_kwDOQ-qtOc8AAAAXi7UERQ",
+              "check_suite_url": "https://api.github.com/repos/dta-au/elspeth/check-suites/101128143941",
+              "conclusion": "success",
+              "created_at": "2026-10-05T15:52:13Z",
+              "display_title": "Merge pull request #274 from dta-au/fix/test-reliability-20261005",
+              "event": "push",
+              "head_branch": "main",
+              "head_commit": {
+                "author": {
+                  "email": "john.morrissey@dta.gov.au",
+                  "name": "John Morrissey"
+                },
+                "committer": {
+                  "email": "noreply@github.com",
+                  "name": "GitHub"
+                },
+                "id": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+                "message": "Merge pull request #274 from dta-au/fix/test-reliability-20261005\n\nStabilize test synchronization, deadlines, and recovery leases",
+                "timestamp": "2026-10-05T15:52:09Z",
+                "tree_id": "bc488ce1645ad802d09bab52d3da30797b08ddb6"
+              },
+              "head_repository": {
+                "archive_url": "https://api.github.com/repos/dta-au/elspeth/{archive_format}{/ref}",
+                "assignees_url": "https://api.github.com/repos/dta-au/elspeth/assignees{/user}",
+                "blobs_url": "https://api.github.com/repos/dta-au/elspeth/git/blobs{/sha}",
+                "branches_url": "https://api.github.com/repos/dta-au/elspeth/branches{/branch}",
+                "collaborators_url": "https://api.github.com/repos/dta-au/elspeth/collaborators{/collaborator}",
+                "comments_url": "https://api.github.com/repos/dta-au/elspeth/comments{/number}",
+                "commits_url": "https://api.github.com/repos/dta-au/elspeth/commits{/sha}",
+                "compare_url": "https://api.github.com/repos/dta-au/elspeth/compare/{base}...{head}",
+                "contents_url": "https://api.github.com/repos/dta-au/elspeth/contents/{+path}",
+                "contributors_url": "https://api.github.com/repos/dta-au/elspeth/contributors",
+                "deployments_url": "https://api.github.com/repos/dta-au/elspeth/deployments",
+                "description": "Auditable Sense/Decide/Act pipelines for high-stakes data processing.",
+                "downloads_url": "https://api.github.com/repos/dta-au/elspeth/downloads",
+                "events_url": "https://api.github.com/repos/dta-au/elspeth/events",
+                "fork": false,
+                "forks_url": "https://api.github.com/repos/dta-au/elspeth/forks",
+                "full_name": "dta-au/elspeth",
+                "git_commits_url": "https://api.github.com/repos/dta-au/elspeth/git/commits{/sha}",
+                "git_refs_url": "https://api.github.com/repos/dta-au/elspeth/git/refs{/sha}",
+                "git_tags_url": "https://api.github.com/repos/dta-au/elspeth/git/tags{/sha}",
+                "hooks_url": "https://api.github.com/repos/dta-au/elspeth/hooks",
+                "html_url": "https://github.com/dta-au/elspeth",
+                "id": 1139453241,
+                "issue_comment_url": "https://api.github.com/repos/dta-au/elspeth/issues/comments{/number}",
+                "issue_events_url": "https://api.github.com/repos/dta-au/elspeth/issues/events{/number}",
+                "issues_url": "https://api.github.com/repos/dta-au/elspeth/issues{/number}",
+                "keys_url": "https://api.github.com/repos/dta-au/elspeth/keys{/key_id}",
+                "labels_url": "https://api.github.com/repos/dta-au/elspeth/labels{/name}",
+                "languages_url": "https://api.github.com/repos/dta-au/elspeth/languages",
+                "merges_url": "https://api.github.com/repos/dta-au/elspeth/merges",
+                "milestones_url": "https://api.github.com/repos/dta-au/elspeth/milestones{/number}",
+                "name": "elspeth",
+                "node_id": "R_kgDOQ-qtOQ",
+                "notifications_url": "https://api.github.com/repos/dta-au/elspeth/notifications{?since,all,participating}",
+                "owner": {
+                  "avatar_url": "https://avatars.githubusercontent.com/u/182742397?v=4",
+                  "events_url": "https://api.github.com/users/dta-au/events{/privacy}",
+                  "followers_url": "https://api.github.com/users/dta-au/followers",
+                  "following_url": "https://api.github.com/users/dta-au/following{/other_user}",
+                  "gists_url": "https://api.github.com/users/dta-au/gists{/gist_id}",
+                  "gravatar_id": "",
+                  "html_url": "https://github.com/dta-au",
+                  "id": 182742397,
+                  "login": "dta-au",
+                  "node_id": "O_kgDOCuRtfQ",
+                  "organizations_url": "https://api.github.com/users/dta-au/orgs",
+                  "received_events_url": "https://api.github.com/users/dta-au/received_events",
+                  "repos_url": "https://api.github.com/users/dta-au/repos",
+                  "site_admin": false,
+                  "starred_url": "https://api.github.com/users/dta-au/starred{/owner}{/repo}",
+                  "subscriptions_url": "https://api.github.com/users/dta-au/subscriptions",
+                  "type": "Organization",
+                  "url": "https://api.github.com/users/dta-au",
+                  "user_view_type": "public"
+                },
+                "private": false,
+                "pulls_url": "https://api.github.com/repos/dta-au/elspeth/pulls{/number}",
+                "releases_url": "https://api.github.com/repos/dta-au/elspeth/releases{/id}",
+                "stargazers_url": "https://api.github.com/repos/dta-au/elspeth/stargazers",
+                "statuses_url": "https://api.github.com/repos/dta-au/elspeth/statuses/{sha}",
+                "subscribers_url": "https://api.github.com/repos/dta-au/elspeth/subscribers",
+                "subscription_url": "https://api.github.com/repos/dta-au/elspeth/subscription",
+                "tags_url": "https://api.github.com/repos/dta-au/elspeth/tags",
+                "teams_url": "https://api.github.com/repos/dta-au/elspeth/teams",
+                "trees_url": "https://api.github.com/repos/dta-au/elspeth/git/trees{/sha}",
+                "url": "https://api.github.com/repos/dta-au/elspeth"
+              },
+              "head_sha": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+              "html_url": "https://github.com/dta-au/elspeth/actions/runs/37336294981",
+              "id": 37336294981,
+              "jobs_url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981/jobs",
+              "logs_url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981/logs",
+              "name": "CI",
+              "node_id": "WFR_kwLOQ-qtOc8AAAAIsWqmRQ",
+              "path": ".github/workflows/ci.yaml",
+              "previous_attempt_url": null,
+              "pull_requests": [],
+              "referenced_workflows": [],
+              "repository": {
+                "archive_url": "https://api.github.com/repos/dta-au/elspeth/{archive_format}{/ref}",
+                "assignees_url": "https://api.github.com/repos/dta-au/elspeth/assignees{/user}",
+                "blobs_url": "https://api.github.com/repos/dta-au/elspeth/git/blobs{/sha}",
+                "branches_url": "https://api.github.com/repos/dta-au/elspeth/branches{/branch}",
+                "collaborators_url": "https://api.github.com/repos/dta-au/elspeth/collaborators{/collaborator}",
+                "comments_url": "https://api.github.com/repos/dta-au/elspeth/comments{/number}",
+                "commits_url": "https://api.github.com/repos/dta-au/elspeth/commits{/sha}",
+                "compare_url": "https://api.github.com/repos/dta-au/elspeth/compare/{base}...{head}",
+                "contents_url": "https://api.github.com/repos/dta-au/elspeth/contents/{+path}",
+                "contributors_url": "https://api.github.com/repos/dta-au/elspeth/contributors",
+                "deployments_url": "https://api.github.com/repos/dta-au/elspeth/deployments",
+                "description": "Auditable Sense/Decide/Act pipelines for high-stakes data processing.",
+                "downloads_url": "https://api.github.com/repos/dta-au/elspeth/downloads",
+                "events_url": "https://api.github.com/repos/dta-au/elspeth/events",
+                "fork": false,
+                "forks_url": "https://api.github.com/repos/dta-au/elspeth/forks",
+                "full_name": "dta-au/elspeth",
+                "git_commits_url": "https://api.github.com/repos/dta-au/elspeth/git/commits{/sha}",
+                "git_refs_url": "https://api.github.com/repos/dta-au/elspeth/git/refs{/sha}",
+                "git_tags_url": "https://api.github.com/repos/dta-au/elspeth/git/tags{/sha}",
+                "hooks_url": "https://api.github.com/repos/dta-au/elspeth/hooks",
+                "html_url": "https://github.com/dta-au/elspeth",
+                "id": 1139453241,
+                "issue_comment_url": "https://api.github.com/repos/dta-au/elspeth/issues/comments{/number}",
+                "issue_events_url": "https://api.github.com/repos/dta-au/elspeth/issues/events{/number}",
+                "issues_url": "https://api.github.com/repos/dta-au/elspeth/issues{/number}",
+                "keys_url": "https://api.github.com/repos/dta-au/elspeth/keys{/key_id}",
+                "labels_url": "https://api.github.com/repos/dta-au/elspeth/labels{/name}",
+                "languages_url": "https://api.github.com/repos/dta-au/elspeth/languages",
+                "merges_url": "https://api.github.com/repos/dta-au/elspeth/merges",
+                "milestones_url": "https://api.github.com/repos/dta-au/elspeth/milestones{/number}",
+                "name": "elspeth",
+                "node_id": "R_kgDOQ-qtOQ",
+                "notifications_url": "https://api.github.com/repos/dta-au/elspeth/notifications{?since,all,participating}",
+                "owner": {
+                  "avatar_url": "https://avatars.githubusercontent.com/u/182742397?v=4",
+                  "events_url": "https://api.github.com/users/dta-au/events{/privacy}",
+                  "followers_url": "https://api.github.com/users/dta-au/followers",
+                  "following_url": "https://api.github.com/users/dta-au/following{/other_user}",
+                  "gists_url": "https://api.github.com/users/dta-au/gists{/gist_id}",
+                  "gravatar_id": "",
+                  "html_url": "https://github.com/dta-au",
+                  "id": 182742397,
+                  "login": "dta-au",
+                  "node_id": "O_kgDOCuRtfQ",
+                  "organizations_url": "https://api.github.com/users/dta-au/orgs",
+                  "received_events_url": "https://api.github.com/users/dta-au/received_events",
+                  "repos_url": "https://api.github.com/users/dta-au/repos",
+                  "site_admin": false,
+                  "starred_url": "https://api.github.com/users/dta-au/starred{/owner}{/repo}",
+                  "subscriptions_url": "https://api.github.com/users/dta-au/subscriptions",
+                  "type": "Organization",
+                  "url": "https://api.github.com/users/dta-au",
+                  "user_view_type": "public"
+                },
+                "private": false,
+                "pulls_url": "https://api.github.com/repos/dta-au/elspeth/pulls{/number}",
+                "releases_url": "https://api.github.com/repos/dta-au/elspeth/releases{/id}",
+                "stargazers_url": "https://api.github.com/repos/dta-au/elspeth/stargazers",
+                "statuses_url": "https://api.github.com/repos/dta-au/elspeth/statuses/{sha}",
+                "subscribers_url": "https://api.github.com/repos/dta-au/elspeth/subscribers",
+                "subscription_url": "https://api.github.com/repos/dta-au/elspeth/subscription",
+                "tags_url": "https://api.github.com/repos/dta-au/elspeth/tags",
+                "teams_url": "https://api.github.com/repos/dta-au/elspeth/teams",
+                "trees_url": "https://api.github.com/repos/dta-au/elspeth/git/trees{/sha}",
+                "url": "https://api.github.com/repos/dta-au/elspeth"
+              },
+              "rerun_url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981/rerun",
+              "run_attempt": 1,
+              "run_number": 1411,
+              "run_started_at": "2026-10-05T15:52:13Z",
+              "status": "completed",
+              "triggering_actor": {
+                "avatar_url": "https://avatars.githubusercontent.com/u/181720297?v=4",
+                "events_url": "https://api.github.com/users/johnm-dta/events{/privacy}",
+                "followers_url": "https://api.github.com/users/johnm-dta/followers",
+                "following_url": "https://api.github.com/users/johnm-dta/following{/other_user}",
+                "gists_url": "https://api.github.com/users/johnm-dta/gists{/gist_id}",
+                "gravatar_id": "",
+                "html_url": "https://github.com/johnm-dta",
+                "id": 181720297,
+                "login": "johnm-dta",
+                "node_id": "U_kgDOCtTU6Q",
+                "organizations_url": "https://api.github.com/users/johnm-dta/orgs",
+                "received_events_url": "https://api.github.com/users/johnm-dta/received_events",
+                "repos_url": "https://api.github.com/users/johnm-dta/repos",
+                "site_admin": false,
+                "starred_url": "https://api.github.com/users/johnm-dta/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/johnm-dta/subscriptions",
+                "type": "User",
+                "url": "https://api.github.com/users/johnm-dta",
+                "user_view_type": "public"
+              },
+              "updated_at": "2026-10-05T17:26:50Z",
+              "url": "https://api.github.com/repos/dta-au/elspeth/actions/runs/37336294981",
+              "workflow_id": 225844184,
+              "workflow_url": "https://api.github.com/repos/dta-au/elspeth/actions/workflows/225844184"
+            }
+          },
+          "github_job": "build-push",
+          "github_ref": "refs/heads/main",
+          "github_ref_name": "main",
+          "github_ref_protected": "true",
+          "github_ref_type": "branch",
+          "github_repository": "dta-au/elspeth",
+          "github_repository_id": "1139453241",
+          "github_repository_owner": "dta-au",
+          "github_repository_owner_id": "182742397",
+          "github_run_attempt": "2",
+          "github_run_id": "37348491709",
+          "github_run_number": "51",
+          "github_server_url": "https://github.com",
+          "github_triggering_actor": "johnm-dta",
+          "github_workflow": "Build and Push",
+          "github_workflow_ref": "dta-au/elspeth/.github/workflows/build-push.yaml@refs/heads/main",
+          "github_workflow_sha": "edc844699a350a90a624089e12a5a1e75b7b2dde"
+        },
+        "resolvedDependencies": [
+          {
+            "digest": {
+              "sha256": "ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9"
+            },
+            "uri": "pkg:docker/docker/buildkit-syft-scanner@stable-1?platform=linux%2Famd64"
+          },
+          {
+            "digest": {
+              "sha256": "4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e"
+            },
+            "uri": "pkg:docker/docker/dockerfile@1"
+          },
+          {
+            "digest": {
+              "sha256": "4c47124a8391cb7a9f571164147d154777cf012a4ece5f86097130d7a4478111"
+            },
+            "uri": "pkg:docker/python@3.12-alpine?digest=sha256:4c47124a8391cb7a9f571164147d154777cf012a4ece5f86097130d7a4478111\u0026platform=linux%2Farm64"
+          },
+          {
+            "digest": {
+              "sha256": "e590846f4776907b254ac0f44b5b380347af5d90d668138ca7938d1b0c2f98d3"
+            },
+            "uri": "pkg:docker/ghcr.io/astral-sh/uv?digest=sha256:e590846f4776907b254ac0f44b5b380347af5d90d668138ca7938d1b0c2f98d3\u0026platform=linux%2Farm64"
+          }
+        ]
+      },
+      "runDetails": {
+        "builder": {
+          "id": "https://github.com/dta-au/elspeth/actions/runs/37348491709/attempts/2"
+        },
+        "metadata": {
+          "buildkit_completeness": {
+            "request": true,
+            "resolvedDependencies": false
+          },
+          "buildkit_metadata": {
+            "layers": {
+              "step0:0": [
+                [
+                  {
+                    "digest": "sha256:a9986cd6f37dbddae7862a6d4be71683472e7c2ea708e87db14f8a6393c00f00",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 4187659
+                  },
+                  {
+                    "digest": "sha256:8000482fc84a1406d5a86573d75f8795aa5e11ec684112f12d29b04e13503267",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 419099
+                  },
+                  {
+                    "digest": "sha256:8c6b3b5e68361d68fb90442b7afc1da2bb0422ff706f9b2022ada24ff7fa58d3",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 13912673
+                  },
+                  {
+                    "digest": "sha256:12fd4f54b89777aae21c6b0549a84a1c85a6f835fc160778601321011c89541b",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 247
+                  }
+                ]
+              ],
+              "step10:0": [
+                [
+                  {
+                    "digest": "sha256:a9986cd6f37dbddae7862a6d4be71683472e7c2ea708e87db14f8a6393c00f00",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 4187659
+                  },
+                  {
+                    "digest": "sha256:8000482fc84a1406d5a86573d75f8795aa5e11ec684112f12d29b04e13503267",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 419099
+                  },
+                  {
+                    "digest": "sha256:8c6b3b5e68361d68fb90442b7afc1da2bb0422ff706f9b2022ada24ff7fa58d3",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 13912673
+                  },
+                  {
+                    "digest": "sha256:12fd4f54b89777aae21c6b0549a84a1c85a6f835fc160778601321011c89541b",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 247
+                  },
+                  {
+                    "digest": "sha256:40ffde1ac6543868daf5f2feeeeeb9e203b6a7a0bf98e8d10e281ff277913975",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 3600481
+                  }
+                ]
+              ],
+              "step2:0": [
+                [
+                  {
+                    "digest": "sha256:6e0767f5632240575a5f06becd22c3792df5d21eec8fdae32d76003f35a204ef",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 23299805
+                  },
+                  {
+                    "digest": "sha256:a1046ffba888b7eb76473d46e48d9ae6cf24a0e8fe356dd9a828c27ec262b207",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 96
+                  }
+                ]
+              ]
+            },
+            "source": {
+              "infos": [
+                {
+                  "data": "IyBzeW50YXg9ZG9ja2VyL2RvY2tlcmZpbGU6MQojCiMgTXVsdGktc3RhZ2UgYnVpbGQ6IHRoZSBidWlsZGVyIHRha2VzIHV2IGZyb20gYW4gaW1tdXRhYmxlIGltYWdlIGRpZ2VzdCwgdXNlcwojIHRoZSBsb2NrIGZvciBib3RoIHRoZSBidWlsZCB0b29scyBhbmQgcnVudGltZSBncmFwaCwgdGhlbiBpbnN0YWxscyB0aGUgZXhhY3QKIyBsb2NhbCB3aGVlbCB3aXRob3V0IGRlcGVuZGVuY3kgcmVzb2x1dGlvbi4gVGhlIGZpbmFsIHN0YWdlIGNvcGllcyBvbmx5IHRoZQojIHJ1bnRpbWUgdmVudiBvbnRvIGEgZnJlc2gsIHBpbm5lZCBiYXNlIGFuZCBydW5zIGFzIGEgbm9uLXJvb3QgVUlEIHdpdGggbm8KIyBmdXJ0aGVyIGluc3RhbGxhdGlvbi4gVGhlcmUgaXMgbm8gc2hlbGwgZW50cnlwb2ludCBvciBidWlsZCB0b29sIGF0IHJ1bnRpbWUuCiMKIyBCYXNlIGltYWdlIGlzIHBpbm5lZCBieSBkaWdlc3QgKG5vdCBqdXN0IHRoZSBgYDMuMTItYWxwaW5lYGAgdGFnKSBzbyBhCiMgcmVwb3NpdG9yeSBwdXNoIGJlaGluZCB0aGF0IHRhZyBjYW4gbmV2ZXIgc2lsZW50bHkgY2hhbmdlIHdoYXQgdGhpcwojIGltYWdlIGlzIGJ1aWx0IEZST00uCkZST00gcHl0aG9uOjMuMTItYWxwaW5lQHNoYTI1Njo0YzQ3MTI0YTgzOTFjYjdhOWY1NzExNjQxNDdkMTU0Nzc3Y2YwMTJhNGVjZTVmODYwOTcxMzBkN2E0NDc4MTExIEFTIGJ1aWxkZXIKCkFSRyBHQVRFV0FZX1JFVklTSU9OClJVTiB0ZXN0IC1uICIkR0FURVdBWV9SRVZJU0lPTiIKCiMgVGhlIGJpbmFyeSBjb21lcyBmcm9tIHRoZSBzYW1lIGRpZ2VzdC1waW5uZWQgc291cmNlIGFzIHRoZSByb290IHJlbGVhc2UKIyBpbWFnZS4gQSBtdXRhYmxlIHV2IHRhZyBtdXN0IG5ldmVyIHBhcnRpY2lwYXRlIGluIHRoaXMgYnVpbGQuCkNPUFkgLS1mcm9tPWdoY3IuaW8vYXN0cmFsLXNoL3V2QHNoYTI1NjplNTkwODQ2ZjQ3NzY5MDdiMjU0YWMwZjQ0YjViMzgwMzQ3YWY1ZDkwZDY2ODEzOGNhNzkzOGQxYjBjMmY5OGQzIC91diAvdXNyL2xvY2FsL2Jpbi91dgoKRU5WIFVWX1BZVEhPTl9ET1dOTE9BRFM9bmV2ZXIKCldPUktESVIgL2J1aWxkCkNPUFkgcHlwcm9qZWN0LnRvbWwgdXYubG9jayAuLwoKIyBJbnN0YWxsIHRoZSBsb2NrZWQgcnVudGltZSBhbmQgYnVpbGQgZ3JhcGhzIGJlZm9yZSBjb3B5aW5nIHNvdXJjZSBzbwojIHNvdXJjZS1vbmx5IGNoYW5nZXMgY2FuIHJldXNlIHRoaXMgbGF5ZXIuIFRoZSBzZXBhcmF0ZSBidWlsZCB2ZW52IGtlZXBzIHRoZQojIHBpbm5lZCBiYWNrZW5kIG91dCBvZiB0aGUgc2hpcHBlZCBydW50aW1lIGVudmlyb25tZW50LgpSVU4gdXYgdmVudiAvYnVpbGQtdmVudiAmJiBcCiAgICBWSVJUVUFMX0VOVj0vYnVpbGQtdmVudiBVVl9QUk9KRUNUX0VOVklST05NRU5UPS9idWlsZC12ZW52IFBBVEg9Ii9idWlsZC12ZW52L2JpbjokUEFUSCIgdXYgc3luYyBcCiAgICAgIC0tZGlyZWN0b3J5IC9idWlsZCBcCiAgICAgIC0tZnJvemVuIFwKICAgICAgLS1uby1kZWZhdWx0LWdyb3VwcyBcCiAgICAgIC0tZ3JvdXAgY29udGFpbmVyLWJ1aWxkIFwKICAgICAgLS1uby1pbnN0YWxsLXByb2plY3QgXAogICAgICAtLWFjdGl2ZQoKQ09QWSBzcmMgL2J1aWxkL3NyYwoKIyBCdWlsZCB3aXRoIHRoZSBiYWNrZW5kIGFscmVhZHkgaW5zdGFsbGVkIGZyb20gdGhlIGxvY2suIFRoZW4gY3JlYXRlIGEgY2xlYW4KIyBydW50aW1lIHZlbnYsIHN5bmMgb25seSBpdHMgbG9ja2VkIHRoaXJkLXBhcnR5IGdyYXBoLCBhbmQgYWRkIHRoZSBleGFjdCBsb2NhbAojIHdoZWVsIHdpdGhvdXQgZGVwZW5kZW5jeSByZXNvbHV0aW9uLgpSVU4gVklSVFVBTF9FTlY9L2J1aWxkLXZlbnYgUEFUSD0iL2J1aWxkLXZlbnYvYmluOiRQQVRIIiB1diBidWlsZCBcCiAgICAgIC0tZGlyZWN0b3J5IC9idWlsZCBcCiAgICAgIC0tbm8tYnVpbGQtaXNvbGF0aW9uIFwKICAgICAgLS13aGVlbCBcCiAgICAgIC0tb3V0LWRpciAvZGlzdCAmJiBcCiAgICB1diB2ZW52IC92ZW52ICYmIFwKICAgIFZJUlRVQUxfRU5WPS92ZW52IFVWX1BST0pFQ1RfRU5WSVJPTk1FTlQ9L3ZlbnYgUEFUSD0iL3ZlbnYvYmluOiRQQVRIIiB1diBzeW5jIFwKICAgICAgLS1kaXJlY3RvcnkgL2J1aWxkIFwKICAgICAgLS1mcm96ZW4gXAogICAgICAtLW5vLWRlZmF1bHQtZ3JvdXBzIFwKICAgICAgLS1uby1pbnN0YWxsLXByb2plY3QgXAogICAgICAtLWFjdGl2ZSAmJiBcCiAgICB1diBwaXAgaW5zdGFsbCAtLXB5dGhvbiAvdmVudi9iaW4vcHl0aG9uIC0tbm8tZGVwcyAvZGlzdC9lbHNwZXRoX2xsbV9nYXRld2F5LSoud2hsCgpGUk9NIHB5dGhvbjozLjEyLWFscGluZUBzaGEyNTY6NGM0NzEyNGE4MzkxY2I3YTlmNTcxMTY0MTQ3ZDE1NDc3N2NmMDEyYTRlY2U1Zjg2MDk3MTMwZDdhNDQ3ODExMQoKQVJHIEdBVEVXQVlfUkVWSVNJT04KTEFCRUwgb3JnLm9wZW5jb250YWluZXJzLmltYWdlLnJldmlzaW9uPSIke0dBVEVXQVlfUkVWSVNJT059IiBcCiAgICBpby5lbHNwZXRoLmxsbS1nYXRld2F5LnJ1bnRpbWUtaWRlbnRpdHk9ImVsc3BldGgtbGxtLWdhdGV3YXkiIFwKICAgIGlvLmVsc3BldGgubGxtLWdhdGV3YXkucnVudGltZS12ZXJzaW9uPSIwLjEuMCIgXAogICAgaW8uZWxzcGV0aC5sbG0tZ2F0ZXdheS5jb250cmFjdC1tYWpvcj0iMSIgXAogICAgaW8uZWxzcGV0aC5sbG0tZ2F0ZXdheS5hZGFwdGVyLW5hbWU9InJlZmVyZW5jZV92MV9pbnZva2UiIFwKICAgIGlvLmVsc3BldGgubGxtLWdhdGV3YXkuYWRhcHRlci12ZXJzaW9uPSIwLjEuMCIgXAogICAgaW8uZWxzcGV0aC5sbG0tZ2F0ZXdheS5hZGFwdGVyLWFwaS1tYWpvcj0iMSIgXAogICAgaW8uZWxzcGV0aC5sbG0tZ2F0ZXdheS5hZGFwdGVyLWZpbmdlcnByaW50PSIyYjE5NTE0OWNkMjA1NmVmNTFiYWI2Y2JkMTlmM2RhN2M2MjlhOTVlZGE2MTQ2MTRmMzg1ZTA0OTMzODQ2YzgzIgoKIyBQWVRIT05ET05UV1JJVEVCWVRFQ09ERTogdGhpcyBpbWFnZSBydW5zIHJlYWQtb25seSAobm8gd3JpdGVzIG91dHNpZGUKIyAvdG1wKTsgdGhlIGludGVycHJldGVyIG11c3QgbmV2ZXIgYXR0ZW1wdCB0byB3cml0ZSAucHljIGZpbGVzIG5leHQgdG8gdGhlCiMgdmVudidzIHNpdGUtcGFja2FnZXMuIFBBVEggcHV0cyB0aGUgdmVudidzIGFic29sdXRlIHB5dGhvbi91dmljb3JuIGFoZWFkCiMgb2YgdGhlIGJhc2UgaW1hZ2UncyBzeXN0ZW0gaW50ZXJwcmV0ZXIuCkVOViBQWVRIT05ET05UV1JJVEVCWVRFQ09ERT0xIFwKICAgIFBBVEg9Ii92ZW52L2JpbjokUEFUSCIKCkNPUFkgLS1mcm9tPWJ1aWxkZXIgL3ZlbnYgL3ZlbnYKCiMgRml4ZWQsIG5vbi1yb290LCBub24tYWxsb2NhdGFibGUgVUlEL0dJRCAoZGlzdHJvbGVzcyBjb252ZW50aW9uKSAtLSBuZXZlcgojIHJvb3QsIGFuZCBuZXZlciBhIFVJRCB0aGF0IGNvdWxkIGNvbGxpZGUgd2l0aCBhIGNvbnRhaW5lci1ob3N0IGFjY291bnQuClVTRVIgNjU1MzI6NjU1MzIKCkVYUE9TRSA4Nzg3CgojIEFic29sdXRlIC92ZW52L2Jpbi9weXRob24gaXMgbWFuZGF0b3J5OiBhIGJhcmUgInB5dGhvbiIgb24gUEFUSCB3b3VsZAojIHN0aWxsIHJlc29sdmUgdG8gdGhlIHZlbnYgZmlyc3QgaGVyZSwgYnV0IGFuIGFic29sdXRlIHBhdGggcmVtb3ZlcyBhbnkKIyBkb3VidCBhbmQgc3Vydml2ZXMgYSBQQVRIIG92ZXJyaWRlIGZyb20gYGRvY2tlciBydW4gLS1lbnYgUEFUSD0uLi5gLgojIE5vIHNoZWxsIGVudHJ5cG9pbnQgKGV4ZWMgZm9ybSBvbmx5KSAtLSBQSUQgMSBpcyB1dmljb3JuIGl0c2VsZiwgc28KIyBTSUdURVJNIHJlYWNoZXMgaXQgZGlyZWN0bHkgZm9yIC0tdGltZW91dC1ncmFjZWZ1bC1zaHV0ZG93biB0byBtYXR0ZXIuCkVOVFJZUE9JTlQgWyIvdmVudi9iaW4vcHl0aG9uIiwgIi1tIiwgInV2aWNvcm4iLCAiZWxzcGV0aF9sbG1fZ2F0ZXdheS5jb3JlLmFwcDpidWlsZCIsICItLWhvc3QiLCAiMC4wLjAuMCIsICItLXBvcnQiLCAiODc4NyIsICItLWZhY3RvcnkiLCAiLS10aW1lb3V0LWdyYWNlZnVsLXNodXRkb3duIiwgIjMwIl0K",
+                  "digestMapping": {
+                    "sha256:5edbdffdb0e067f4b6665c9ac89e985be40bd55f8e516524faa51c006dae4b34": "step0",
+                    "sha256:b8fac24b98a59d6233cf50bdb2db0967531b88a9a1e70c7b53f115cd7421dd2c": "step1"
+                  },
+                  "filename": "Dockerfile",
+                  "language": "Dockerfile",
+                  "llbDefinition": [
+                    {
+                      "id": "step0",
+                      "op": {
+                        "Op": {
+                          "source": {
+                            "attrs": {
+                              "local.differ": "none",
+                              "local.followpaths": "[\"Dockerfile\",\"Dockerfile.dockerignore\",\"dockerfile\"]",
+                              "local.sharedkeyhint": "dockerfile"
+                            },
+                            "identifier": "local://dockerfile"
+                          }
+                        },
+                        "constraints": {}
+                      }
+                    },
+                    {
+                      "id": "step1",
+                      "inputs": [
+                        "step0:0"
+                      ],
+                      "op": {
+                        "Op": {}
+                      }
+                    }
+                  ]
+                }
+              ],
+              "locations": {
+                "step0": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 57
+                          },
+                          "start": {
+                            "line": 57
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 12
+                          },
+                          "start": {
+                            "line": 12
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step1": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 15
+                          },
+                          "start": {
+                            "line": 15
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step10": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 76
+                          },
+                          "start": {
+                            "line": 76
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step2": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 19
+                          },
+                          "start": {
+                            "line": 19
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step3": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 19
+                          },
+                          "start": {
+                            "line": 19
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step4": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 23
+                          },
+                          "start": {
+                            "line": 23
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step5": {},
+                "step6": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 24
+                          },
+                          "start": {
+                            "line": 24
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step7": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 29
+                          },
+                          "start": {
+                            "line": 29
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 30
+                          },
+                          "start": {
+                            "line": 30
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 31
+                          },
+                          "start": {
+                            "line": 31
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 32
+                          },
+                          "start": {
+                            "line": 32
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 33
+                          },
+                          "start": {
+                            "line": 33
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 34
+                          },
+                          "start": {
+                            "line": 34
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 35
+                          },
+                          "start": {
+                            "line": 35
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 36
+                          },
+                          "start": {
+                            "line": 36
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step8": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 38
+                          },
+                          "start": {
+                            "line": 38
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "step9": {
+                  "locations": [
+                    {
+                      "ranges": [
+                        {
+                          "end": {
+                            "line": 43
+                          },
+                          "start": {
+                            "line": 43
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 44
+                          },
+                          "start": {
+                            "line": 44
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 45
+                          },
+                          "start": {
+                            "line": 45
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 46
+                          },
+                          "start": {
+                            "line": 46
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 47
+                          },
+                          "start": {
+                            "line": 47
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 48
+                          },
+                          "start": {
+                            "line": 48
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 49
+                          },
+                          "start": {
+                            "line": 49
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 50
+                          },
+                          "start": {
+                            "line": 50
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 51
+                          },
+                          "start": {
+                            "line": 51
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 52
+                          },
+                          "start": {
+                            "line": 52
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 53
+                          },
+                          "start": {
+                            "line": 53
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 54
+                          },
+                          "start": {
+                            "line": 54
+                          }
+                        },
+                        {
+                          "end": {
+                            "line": 55
+                          },
+                          "start": {
+                            "line": 55
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            "vcs": {
+              "localdir:context": "gateway",
+              "localdir:dockerfile": "gateway",
+              "revision": "edc844699a350a90a624089e12a5a1e75b7b2dde",
+              "source": "https://github.com/dta-au/elspeth"
+            }
+          },
+          "finishedOn": "2026-10-06T00:27:30.282201702Z",
+          "invocationId": "pfdsf5s5y90g27nirvyid9oix",
+          "startedOn": "2026-10-06T00:27:06.379036058Z"
+        }
+      }
+    }
+  }
+}

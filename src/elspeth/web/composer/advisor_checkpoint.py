@@ -94,6 +94,11 @@ _ADVISOR_LIST_ITEM_MAX_CHARS: Final[int] = 2_000
 _ADVISOR_USER_MESSAGE_MAX_CHARS: Final[int] = 2_000
 
 
+def _compose_deadline_time() -> float:
+    """Read the compose budget clock without changing asyncio's timer clock."""
+    return asyncio.get_running_loop().time()
+
+
 class _AdvisorCheckpointComposeDeadlineExpired(Exception):
     """Internal signal: the compose budget expired before an advisor call.
 
@@ -1017,7 +1022,7 @@ class AdvisorCheckpointOwner:
         for _ in range(attempts):
             remaining: float | None = None
             if deadline is not None:
-                remaining = deadline - asyncio.get_running_loop().time()
+                remaining = deadline - _compose_deadline_time()
                 if remaining <= 0:
                     # The shared compose budget expired before this attempt.
                     # If no advisor call ran, this is a compose timeout rather

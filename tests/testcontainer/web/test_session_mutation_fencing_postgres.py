@@ -8,7 +8,7 @@ import os
 import shutil
 import threading
 import traceback
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import timedelta
@@ -1484,9 +1484,15 @@ async def test_postgres_consumed_archive_purges_exactly_once(
     reconciliation_outcomes: list[ArchiveDeleteReconciliation] = []
     original_purge = purge_archive_quarantine
 
-    def recording_purge(data_dir: Path, identity: ArchiveQuarantineIdentity, canonical: Path) -> None:
+    def recording_purge(
+        data_dir: Path,
+        identity: ArchiveQuarantineIdentity,
+        canonical: Path,
+        *,
+        cleanup_guard: Callable[[Callable[[], None]], None] | None = None,
+    ) -> None:
         purge_identities.append(identity)
-        original_purge(data_dir, identity, canonical)
+        original_purge(data_dir, identity, canonical, cleanup_guard=cleanup_guard)
 
     monkeypatch.setattr(session_service_module, "purge_archive_quarantine", recording_purge)
     if archive_action_visibility == "lost_acknowledgement":
@@ -1544,21 +1550,39 @@ async def test_postgres_winner_reconciles_stale_manifest_and_stale_archiver_cann
     original_restore = restore_archive_quarantine
     original_purge = purge_archive_quarantine
 
-    def block_first_stage(data_dir: Path, identity: ArchiveQuarantineIdentity, canonical: Path) -> None:
+    def block_first_stage(
+        data_dir: Path,
+        identity: ArchiveQuarantineIdentity,
+        canonical: Path,
+        *,
+        in_place_guard: Callable[[Callable[[], None]], None] | None = None,
+    ) -> None:
         nonlocal first_identity
-        original_stage(data_dir, identity, canonical)
+        original_stage(data_dir, identity, canonical, in_place_guard=in_place_guard)
         if first_identity is None:
             first_identity = identity
             first_stage_entered.set()
             assert first_stage_release.wait(timeout=10)
 
-    def recording_restore(data_dir: Path, identity: ArchiveQuarantineIdentity, canonical: Path) -> None:
+    def recording_restore(
+        data_dir: Path,
+        identity: ArchiveQuarantineIdentity,
+        canonical: Path,
+        *,
+        in_place_guard: Callable[[Callable[[], None]], None] | None = None,
+    ) -> None:
         restore_identities.append(identity)
-        original_restore(data_dir, identity, canonical)
+        original_restore(data_dir, identity, canonical, in_place_guard=in_place_guard)
 
-    def recording_purge(data_dir: Path, identity: ArchiveQuarantineIdentity, canonical: Path) -> None:
+    def recording_purge(
+        data_dir: Path,
+        identity: ArchiveQuarantineIdentity,
+        canonical: Path,
+        *,
+        cleanup_guard: Callable[[Callable[[], None]], None] | None = None,
+    ) -> None:
         purge_identities.append(identity)
-        original_purge(data_dir, identity, canonical)
+        original_purge(data_dir, identity, canonical, cleanup_guard=cleanup_guard)
 
     monkeypatch.setattr(session_service_module, "stage_archive_quarantine", block_first_stage)
     monkeypatch.setattr(session_service_module, "restore_archive_quarantine", recording_restore)

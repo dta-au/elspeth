@@ -4,12 +4,19 @@ The build-push workflow uses this gate before publishing images for a commit.
 It reads the active repository ruleset, extracts the required status-check
 contexts and optional GitHub App integration bindings, and then verifies that
 the image SHA has successful trusted evidence for every required context.
+Only missing known PR-only contexts may use the verified merged PR's exact
+head, provided its tree equals the image tree. Direct failures stay failures;
+CI/CodeQL and unknown future contexts still require exact-image evidence.
 
 GitHub ruleset contexts are not always identical to the check-run names exposed
 by the Checks API. In the current repository, the ruleset context ``CodeQL`` is
 reported by the CodeQL workflow's ``Analyze Python`` job. Keep that mapping
 explicit so a future ruleset or workflow rename fails closed instead of silently
 weakening release proof.
+
+The ``gateway-attestations`` mode qualifies captured gateway SBOM/provenance
+through the tooling package's runtime artifact validator. The default mode
+continues to require trusted GitHub evidence before any image build.
 """
 
 from __future__ import annotations
@@ -17,11 +24,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from types import MappingProxyType
 from typing import Any
 
@@ -31,6 +40,13 @@ DEFAULT_CONTEXT_ALIASES: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "CodeQL": ("Analyze Python",),
     }
 )
+PR_ONLY_WORKFLOWS: Mapping[str, str] = MappingProxyType(
+    {
+        "Check cohort-attribution trailers on PR commits": ".github/workflows/enforce-telemetry-backfill-trailer.yaml",
+        "redaction-gate": ".github/workflows/composer-redaction-gate.yml",
+    }
+)
+GITHUB_ACTIONS_APP_ID = 15368
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +68,8 @@ class CheckRun:
     app_id: int | None = None
     completed_at: str | None = None
     started_at: str | None = None
+    check_suite_id: int | None = None
+    head_sha: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +90,45 @@ class RequiredCheckResult:
     matched_name: str | None
     state: str
     url: str | None
+    evidence_sha: str | None = None
+    pull_request_number: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CommitIdentity:
+    """Immutable commit identity admitted from GitHub."""
+
+    sha: str
+    tree_sha: str
+    parents: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MergedPullRequest:
+    """Trusted merged PR whose result is exactly the publication candidate."""
+
+    number: int
+    head_sha: str
+    head_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowRun:
+    """GitHub Actions provenance for SHA-scoped PR checks."""
+
+    workflow_id: int
+    run_number: int
+    run_attempt: int
+    check_suite_id: int
+    head_sha: str
+    head_branch: str
+    path: str
+    event: str
+    repository: str
+    head_repository: str
+    status: str
+    conclusion: str | None
+    pull_request_numbers: tuple[int, ...]
 
 
 def extract_required_contexts(ruleset: Mapping[str, Any]) -> tuple[str, ...]:
@@ -158,6 +215,181 @@ def all_required_checks_succeeded(results: Iterable[RequiredCheckResult]) -> boo
     return all(result.state == "success" for result in results)
 
 
+def resolve_pr_only_checks(
+    *,
+    repo: str,
+    image_sha: str,
+    target_branch: str,
+    token: str,
+    required_checks: Sequence[RequiredCheckSpec],
+    results: Sequence[RequiredCheckResult],
+) -> tuple[RequiredCheckResult, ...]:
+    """Recover only absent PR-only checks through verified result/head/tree identity.
+
+    GitHub checks are SHA-scoped. Merged runs can have empty PR associations;
+    the proof is a trusted expected PR workflow on the merged PR's exact head,
+    not a claim that GitHub retained a unique per-PR execution attestation.
+    """
+    missing = {result.context for result in results if result.state == "missing" and result.context in PR_ONLY_WORKFLOWS}
+    if not missing:
+        return tuple(results)
+
+    image = fetch_commit_identity(repo=repo, sha=image_sha, token=token)
+    pull_request = fetch_merged_pull_request(repo=repo, image_sha=image_sha, target_branch=target_branch, token=token)
+    if len(image.parents) not in {1, 2}:
+        raise ValueError("publication result must have one or two parents")
+    if len(image.parents) == 2 and image.parents[1] != pull_request.head_sha:
+        raise ValueError("merged PR head does not match the result's second parent")
+    head = fetch_commit_identity(repo=repo, sha=pull_request.head_sha, token=token)
+    if head.tree_sha != image.tree_sha:
+        raise ValueError("merged PR head and image commit have different trees; fresh exact-image proof is required")
+
+    checks = fetch_check_runs(repo=repo, sha=head.sha, token=token)
+    workflows = fetch_pr_workflow_runs(repo=repo, sha=head.sha, token=token)
+    specs = {spec.context: spec for spec in required_checks}
+    resolved: list[RequiredCheckResult] = []
+    for result in results:
+        if result.context not in missing:
+            resolved.append(result)
+            continue
+        spec = specs[result.context]
+        candidates = [
+            run
+            for run in workflows
+            if run.path == PR_ONLY_WORKFLOWS[result.context]
+            and run.event == "pull_request"
+            and run.repository == repo
+            and run.head_repository == repo
+            and run.head_sha == head.sha
+            and run.head_branch == pull_request.head_ref
+            and (not run.pull_request_numbers or pull_request.number in run.pull_request_numbers)
+        ]
+        if not candidates:
+            resolved.append(result)
+            continue
+        if len({run.workflow_id for run in candidates}) != 1:
+            raise ValueError(f"ambiguous workflow identity for PR-only context {result.context!r}")
+        # run_number increases for each new run of one workflow; run_attempt
+        # advances on reruns. Completion time cannot make an older success win.
+        latest_key = max((run.run_number, run.run_attempt) for run in candidates)
+        latest_runs = {run for run in candidates if (run.run_number, run.run_attempt) == latest_key}
+        if len(latest_runs) != 1:
+            raise ValueError(f"ambiguous latest workflow attempt for {result.context!r}")
+        latest = latest_runs.pop()
+        if latest.status != "completed" or latest.conclusion != "success":
+            resolved.append(
+                RequiredCheckResult(
+                    context=result.context,
+                    matched_name=result.context,
+                    state=_check_state(latest.status, latest.conclusion),
+                    url=None,
+                    evidence_sha=head.sha,
+                    pull_request_number=pull_request.number,
+                )
+            )
+            continue
+        trusted_checks = [
+            check
+            for check in checks
+            if check.check_suite_id == latest.check_suite_id and check.head_sha == head.sha and check.app_id == GITHUB_ACTIONS_APP_ID
+        ]
+        inherited = evaluate_required_checks(required_contexts=(spec,), check_runs=trusted_checks, statuses=())[0]
+        resolved.append(
+            RequiredCheckResult(
+                context=inherited.context,
+                matched_name=inherited.matched_name,
+                state=inherited.state,
+                url=inherited.url,
+                evidence_sha=head.sha,
+                pull_request_number=pull_request.number,
+            )
+        )
+    return tuple(resolved)
+
+
+def fetch_commit_identity(*, repo: str, sha: str, token: str) -> CommitIdentity:
+    """Admit an exact immutable commit and tree, never a moving branch/tag ref."""
+    if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+        raise ValueError("publication proof requires a full immutable commit SHA")
+    payload = _object(_github_api_json(f"/repos/{repo}/git/commits/{sha}", token=token), "commit")
+    actual_sha = _required_str(payload, "sha")
+    if actual_sha != sha:
+        raise ValueError("GitHub returned a different commit identity")
+    tree = _object(payload.get("tree"), "commit tree")
+    raw_parents = payload.get("parents")
+    if not isinstance(raw_parents, list):
+        raise ValueError("commit parents are not a list")
+    return CommitIdentity(
+        sha=actual_sha,
+        tree_sha=_required_sha(tree, "sha"),
+        parents=tuple(_required_sha(_object(parent, "commit parent"), "sha") for parent in raw_parents),
+    )
+
+
+def fetch_merged_pull_request(*, repo: str, image_sha: str, target_branch: str, token: str) -> MergedPullRequest:
+    """Select exactly one trusted merged PR with this exact resulting commit."""
+    pages = _github_api_json_pages(f"/repos/{repo}/commits/{image_sha}/pulls", token=token, params={"per_page": "100"})
+    numbers: set[int] = set()
+    for page in pages:
+        if not isinstance(page, list):
+            raise ValueError("associated pull-requests page was not a list")
+        for raw in page:
+            numbers.add(_required_int(_object(raw, "associated pull request"), "number"))
+    candidates: list[MergedPullRequest] = []
+    for number in sorted(numbers):
+        payload = _object(_github_api_json(f"/repos/{repo}/pulls/{number}", token=token), "pull request")
+        if _required_int(payload, "number") != number:
+            raise ValueError("GitHub returned a different pull-request identity")
+        if payload.get("merged") is not True or payload.get("state") != "closed":
+            continue
+        if payload.get("merge_commit_sha") != image_sha:
+            continue
+        if datetime.fromisoformat(_required_str(payload, "merged_at")).tzinfo is None:
+            raise ValueError("merged PR timestamp lacks timezone")
+        base = _object(payload.get("base"), "pull-request base")
+        head = _object(payload.get("head"), "pull-request head")
+        if (
+            _required_str(base, "ref") != target_branch
+            or _required_str(_object(base.get("repo"), "base repository"), "full_name") != repo
+            or _required_str(_object(head.get("repo"), "head repository"), "full_name") != repo
+        ):
+            continue
+        candidates.append(MergedPullRequest(number=number, head_sha=_required_str(head, "sha"), head_ref=_required_str(head, "ref")))
+    if len(candidates) != 1:
+        raise ValueError(f"expected one trusted merged PR producing {image_sha} on {target_branch!r}; found {len(candidates)}")
+    return candidates[0]
+
+
+def fetch_pr_workflow_runs(*, repo: str, sha: str, token: str) -> tuple[WorkflowRun, ...]:
+    """Admit paginated workflow provenance; do not trust a check's details URL."""
+    pages = _github_api_json_pages(
+        f"/repos/{repo}/actions/runs", token=token, params={"head_sha": sha, "event": "pull_request", "per_page": "100"}
+    )
+    runs: list[WorkflowRun] = []
+    for run in _records_from_pages(pages, "workflow_runs"):
+        pull_requests = run.get("pull_requests")
+        if not isinstance(pull_requests, list):
+            raise ValueError("workflow run is missing pull_requests")
+        runs.append(
+            WorkflowRun(
+                workflow_id=_required_int(run, "workflow_id"),
+                run_number=_required_int(run, "run_number"),
+                run_attempt=_required_int(run, "run_attempt"),
+                check_suite_id=_required_int(run, "check_suite_id"),
+                head_sha=_required_str(run, "head_sha"),
+                head_branch=_required_str(run, "head_branch"),
+                path=_required_str(run, "path"),
+                event=_required_str(run, "event"),
+                repository=_required_str(_object(run.get("repository"), "workflow repository"), "full_name"),
+                head_repository=_required_str(_object(run.get("head_repository"), "workflow head repository"), "full_name"),
+                status=_required_str(run, "status"),
+                conclusion=_optional_str(run.get("conclusion")),
+                pull_request_numbers=tuple(_required_int(_object(pr, "workflow pull request"), "number") for pr in pull_requests),
+            )
+        )
+    return tuple(runs)
+
+
 def fetch_ruleset_by_name(*, repo: str, ruleset_name: str, token: str) -> Mapping[str, Any]:
     """Fetch one active repository ruleset by name."""
     rulesets_payload = _github_api_json(f"/repos/{repo}/rulesets", token=token)
@@ -189,26 +421,22 @@ def fetch_check_runs(*, repo: str, sha: str, token: str) -> tuple[CheckRun, ...]
     """Fetch all check runs for a commit SHA."""
     payloads = _github_api_json_pages(f"/repos/{repo}/commits/{sha}/check-runs", token=token, params={"per_page": "100"})
     runs: list[CheckRun] = []
-    for payload in payloads:
-        if not isinstance(payload, Mapping):
-            raise ValueError("GitHub check-runs page was not an object")
-        raw_runs = payload.get("check_runs")
-        if not isinstance(raw_runs, list):
-            raise ValueError("GitHub check-runs response is missing check_runs list")
-        for item in raw_runs:
-            if not isinstance(item, Mapping):
-                raise ValueError("GitHub check run entry was not an object")
-            runs.append(
-                CheckRun(
-                    name=_required_str(item, "name"),
-                    status=_required_str(item, "status"),
-                    conclusion=_optional_str(item.get("conclusion")),
-                    html_url=_optional_str(item.get("html_url")),
-                    app_id=_optional_app_id(item.get("app")),
-                    completed_at=_optional_str(item.get("completed_at")),
-                    started_at=_optional_str(item.get("started_at")),
-                )
+    for item in _records_from_pages(payloads, "check_runs"):
+        if _required_str(item, "head_sha") != sha:
+            raise ValueError("check run head differs from requested commit SHA")
+        runs.append(
+            CheckRun(
+                name=_required_str(item, "name"),
+                status=_required_str(item, "status"),
+                conclusion=_optional_str(item.get("conclusion")),
+                html_url=_optional_str(item.get("html_url")),
+                app_id=_optional_app_id(item.get("app")),
+                completed_at=_optional_str(item.get("completed_at")),
+                started_at=_optional_str(item.get("started_at")),
+                check_suite_id=_optional_suite_id(item.get("check_suite")),
+                head_sha=_required_str(item, "head_sha"),
             )
+        )
     return tuple(runs)
 
 
@@ -238,11 +466,20 @@ def fetch_commit_statuses(*, repo: str, sha: str, token: str) -> tuple[CommitSta
 
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["gateway-attestations"]:
+        from elspeth_lints.release.gateway_attestations import qualify_gateway_attestations
+
+        return qualify_gateway_attestations(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, help="Repository in owner/name form.")
     parser.add_argument("--sha", required=True, help="Commit SHA represented by the release image.")
     parser.add_argument("--ruleset-name", default="main", help="Active branch ruleset name to mirror.")
-    args = parser.parse_args(argv)
+    parser.add_argument("--target-branch", default="main", help="Trusted merge target for PR-only publication evidence.")
+    args = parser.parse_args(arguments)
+    if re.fullmatch(r"[0-9a-f]{40}", args.sha) is None:
+        print("A full immutable commit SHA is required for publication proof.", file=sys.stderr)
+        return 2
 
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not token:
@@ -254,12 +491,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     check_runs = fetch_check_runs(repo=args.repo, sha=args.sha, token=token)
     statuses = fetch_commit_statuses(repo=args.repo, sha=args.sha, token=token)
     results = evaluate_required_checks(required_contexts=required_checks, check_runs=check_runs, statuses=statuses)
+    try:
+        results = resolve_pr_only_checks(
+            repo=args.repo,
+            image_sha=args.sha,
+            target_branch=args.target_branch,
+            token=token,
+            required_checks=required_checks,
+            results=results,
+        )
+    except ValueError as exc:
+        print(f"Cannot verify PR-only publication evidence: {exc}; refusing to publish image.", file=sys.stderr)
+        return 1
 
     print(f"Required contexts from active ruleset {args.ruleset_name!r}:")
     for result in results:
         matched = result.matched_name or "<none>"
         url = result.url or "no URL"
-        print(f"- {result.context}: {result.state} via {matched} ({url})")
+        source = f" on {result.evidence_sha} through merged PR #{result.pull_request_number}" if result.evidence_sha else ""
+        print(f"- {result.context}: {result.state} via {matched}{source} ({url})")
 
     if all_required_checks_succeeded(results):
         print(f"All ruleset-required checks succeeded for {args.sha}.")
@@ -271,9 +521,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _check_run_state(check_run: CheckRun) -> str:
-    if check_run.status == "completed" and check_run.conclusion == "success":
-        return "success"
-    return check_run.conclusion or check_run.status
+    return _check_state(check_run.status, check_run.conclusion)
+
+
+def _check_state(status: str, conclusion: str | None) -> str:
+    if status == "completed":
+        return conclusion or "invalid"
+    if status in {"queued", "in_progress", "requested", "waiting", "pending"}:
+        return status
+    return "invalid"
 
 
 def _coerce_required_check(required: str | RequiredCheckSpec) -> RequiredCheckSpec:
@@ -291,7 +547,12 @@ def _latest_check_run(
     matches = [run for run in check_runs if run.name in accepted_names and (integration_id is None or run.app_id == integration_id)]
     if not matches:
         return None
-    return max(matches, key=lambda run: run.completed_at or run.started_at or "")
+    # Queued runs can have neither timestamp. Their order cannot be proven;
+    # a successful older run must not conceal unresolved evidence.
+    unordered_refusals = [run for run in matches if not (run.started_at or run.completed_at) and _check_run_state(run) != "success"]
+    if unordered_refusals:
+        return unordered_refusals[0]
+    return max(matches, key=lambda run: run.started_at or run.completed_at or "")
 
 
 def _latest_status(statuses: Sequence[CommitStatus], context: str) -> CommitStatus | None:
@@ -359,6 +620,55 @@ def _required_str(data: Mapping[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"GitHub payload field {key!r} is missing or not a string")
     return value
+
+
+def _object(value: Any, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"GitHub {name} is not an object")
+    return value
+
+
+def _records_from_pages(pages: Sequence[Any], collection: str) -> tuple[Mapping[str, Any], ...]:
+    """Reject incomplete or moving paginated proof rather than trust a subset."""
+    if not pages:
+        raise ValueError(f"GitHub {collection} proof has no response pages")
+    expected: int | None = None
+    records: list[Mapping[str, Any]] = []
+    for raw_page in pages:
+        page = _object(raw_page, f"{collection} page")
+        total = page.get("total_count")
+        if type(total) is not int or total < 0:
+            raise ValueError(f"GitHub {collection} page has invalid total_count")
+        if expected is not None and total != expected:
+            raise ValueError(f"GitHub {collection} count changed during pagination")
+        expected = total
+        items = page.get(collection)
+        if not isinstance(items, list):
+            raise ValueError(f"GitHub page is missing {collection}")
+        records.extend(_object(item, collection) for item in items)
+    if len(records) != expected:
+        raise ValueError(f"GitHub {collection} pagination is incomplete: expected {expected}, received {len(records)}")
+    return tuple(records)
+
+
+def _required_int(data: Mapping[str, Any], key: str) -> int:
+    value = data.get(key)
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"GitHub payload field {key!r} is missing or not a positive integer")
+    return value
+
+
+def _required_sha(data: Mapping[str, Any], key: str) -> str:
+    value = _required_str(data, key)
+    if re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise ValueError(f"GitHub field {key!r} is not a full immutable SHA")
+    return value
+
+
+def _optional_suite_id(value: Any) -> int | None:
+    if value is None:
+        return None
+    return _required_int(_object(value, "check suite"), "id")
 
 
 def _optional_str(value: Any) -> str | None:

@@ -254,13 +254,13 @@ on `main` (§ 1.3). Pre-commit hooks run on the contributor's machine once
 | CodeQL | Python, `security-extended` query suite; tests and lint fixtures excluded; also weekly on schedule | CI `Analyze Python`, protected-branch push, same-repository pull request and Monday schedule; fork pull requests skip the job | Yes (`CodeQL`) | [codeql.yaml](../../.github/workflows/codeql.yaml), [codeql-config.yml](../../.github/codeql/codeql-config.yml) [EV-612] |
 | Composer redaction gate | A change to the redaction snapshot is classified as weakening or strengthening; the matching label, and a rationale for a weakening, are required | Pull request (also re-runs on label and description edits) | Yes (`redaction-gate`) | [composer-redaction-gate.yml](../../.github/workflows/composer-redaction-gate.yml), [policy guide](../guides/redaction-policy-changes.md) [EV-613] |
 | Telemetry backfill trailer | Every commit touching a telemetry cohort directory carries its attribution trailer | Pre-commit (`commit-msg` stage); pull request | Yes (`Check cohort-attribution trailers on PR commits`) | [enforce-telemetry-backfill-trailer.yaml](../../.github/workflows/enforce-telemetry-backfill-trailer.yaml) [EV-614] |
-| Additional judge lint and quality diagnostics | Rolling 30-day operator-override signal for judged suppressions; judge-quality corpus signal against a live model (trusted pushes only) | Push and pull request | No — advisory by design and outside the standard enforcement package | [enforce-allowlist-judge-gates.yaml](../../.github/workflows/enforce-allowlist-judge-gates.yaml) [EV-611] |
+| Additional judge lint diagnostics | Deterministic rolling 30-day operator-override signal for judged suppressions; live judge-quality validation is operator opt-in through the CLI | Push and pull request for C3 only | No — advisory by design and outside the standard enforcement package | [enforce-allowlist-judge-gates.yaml](../../.github/workflows/enforce-allowlist-judge-gates.yaml), [manual corpus guide](../../config/cicd/judge-quality-corpus/README.md) [EV-611] |
 | Trust-tier model | Defensive patterns and upward imports that hide bugs; signed suppressions (§ 2.4) | Pre-commit ratchet; operator verification | Not a CI gate by design ([AGENTS.md](../../AGENTS.md#operator-signature-verification-tier-model-allowlist-signing)); track resulting risk in [15](15-risk-register.md) | `scripts/trust_tier_ratchet.py` [EV-610] |
 | Secret scanner | Credential-shaped strings in staged content ([07 § 4.4](07-secrets-and-key-management.md#44-source-control)) | Pre-commit, every commit | Blocks the local commit; track residual source-control risk in [15](15-risk-register.md) | `scripts/git-hooks/pre-commit-secret-scan.sh` [EV-606] |
 | File hygiene hooks | Trailing whitespace, final newline, YAML and TOML syntax, files over 1,000 KB, merge-conflict markers, debug statements | Pre-commit | Local only | [.pre-commit-config.yaml](../../.pre-commit-config.yaml) [EV-606] |
 | Mutation testing | Whether tests kill injected faults in `core/canonical.py` and `core/landscape/` | Weekly schedule and manual | No — advisory by design; scores are not thresholds ([GOVERNANCE.md](../../GOVERNANCE.md#maintainer-continuity)) | [mutation-testing.yaml](../../.github/workflows/mutation-testing.yaml) [EV-615] |
 | Dependabot version updates | Seven weekly update entries: both `uv` trees, both `npm` trees, GitHub Actions and both Docker contexts | Monday schedule | Not a gate; its pull requests pass the gates above | [dependabot.yml](../../.github/dependabot.yml) [EV-616] |
-| Release required-checks verification | The image commit has successful checks for every context the `main` ruleset requires | `build-push.yaml`, before any build | Blocks image publication (§ 6.2) | `scripts/cicd/check_release_required_checks.py` [EV-625] |
+| Release required-checks verification | Every `main` ruleset context succeeds on the image commit or, only for missing PR-only contexts, its verified identical-tree merged PR head | `build-push.yaml`, before any build | Blocks image publication (§ 6.2) | `scripts/cicd/check_release_required_checks.py` [EV-625] |
 
 ### 2.3 `elspeth-lints` rule families
 
@@ -530,8 +530,13 @@ workflow [EV-625] [EV-626].
 In every case the first step,
 `scripts/cicd/check_release_required_checks.py`, reads the live `main`
 ruleset, takes its required status checks, and refuses to publish unless the
-image commit has a successful check for every one. A missing, pending or
-failed check stops the job [EV-625].
+image commit has successful evidence for every one. Only missing PR-only
+cohort-attribution and redaction contexts may use the verified merged PR's
+exact source head, with an identical tree and trusted workflow provenance.
+CI/CodeQL and unknown contexts remain exact-image requirements; direct pending
+or failed checks cannot be replaced. Unproven evidence stops the job [EV-625].
+The [publication proof guide](../maintainer/release-check-evidence.md) describes
+the accepted lineage, event binding and conservative refusal cases.
 
 The workflow then performs the following sequence [EV-626]:
 
