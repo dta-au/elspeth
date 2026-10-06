@@ -91,7 +91,7 @@ jobs:
           "$tmp_dir/actionlint" -config-file .github/actionlint.yaml .github/workflows/*.yml .github/workflows/*.yaml
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -414,7 +414,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -560,7 +560,7 @@ jobs:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -580,7 +580,7 @@ jobs:
         run: uv sync --frozen --all-extras
 
       - name: Download Python 3.13 coverage shards
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: coverage-shard-3.13-*
           path: ${{ env.CI_CHECKOUT_PATH }}/coverage-shards
@@ -632,7 +632,7 @@ jobs:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -722,7 +722,7 @@ jobs:
           docker compose version
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -798,7 +798,7 @@ jobs:
           docker compose version
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -847,7 +847,7 @@ jobs:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -930,7 +930,7 @@ jobs:
           bicep build-params deploy/azure-container-apps/workload.acceptance.bicepparam --stdout >/dev/null
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -965,7 +965,7 @@ jobs:
           path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -1129,7 +1129,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
@@ -1149,10 +1149,10 @@ jobs:
             pytest gateway/tests gateway/conformance -q
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
 
       - name: Build frozen gateway image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
         with:
           context: ${{ env.CI_CHECKOUT_PATH }}/gateway
           build-args: GATEWAY_REVISION=${{ github.sha }}
@@ -1298,7 +1298,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
