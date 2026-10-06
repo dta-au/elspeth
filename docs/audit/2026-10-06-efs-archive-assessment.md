@@ -102,6 +102,33 @@ source hashes. The whole-tree scanner initially timed out under an explicit
 60-second test limit; its completed 300-second rerun above passed. Full-suite
 validation, Daybreak review, and protected PR checks remain merge requirements.
 
+PR #276's first CI run exposed stale PostgreSQL test-double signatures and
+exact mutation-authority inventory drift. The doubles now accept and forward
+the explicit custody callbacks. Independent live baseline/candidate scans
+reviewed the relocated acquisitions and updated exact identities, including
+five ordinal changes assessed by their actual statement anchors. The scalar
+try-lock receives one read admission bound to the reviewed advisory helper;
+the blocking custody wrapper remains an explicit connection escape, without
+mutation authority. Scanner and table-policy implementations were not widened.
+
+All prior caller mutation/escape controls remain, with new live-source controls
+for advisory-helper DELETE/leak/yield and the consumed predicate's DML/connection
+escape. Independent final review approved the corrected repair and passed all
+seven new controls. Completed local results on unchanged test inputs:
+
+```text
+postgres-repair-focused.log: exit=0; 3 passed, 17 deselected in 5.14s
+postgres-repair-file.log: exit=0; 20 passed in 9.45s
+mutation-gate-final.log: exit=0; 271 passed, 1 xfailed in 179.42s
+  before/after architecture and PostgreSQL test hashes: OK
+ruff-ci-repair.log: exit=0; All checks passed!
+```
+
+The expected xfail remains the repository's existing writer-authority burn-down;
+the relocated raw custody escape is explicitly visible in that inventory.
+These checks validate the focused test/inventory repair, not full CI or Daybreak
+clearance. Dependency-audit fixes belong to separately maintained PR #275.
+
 This is a local EFS-like errno simulation, not a live EFS measurement. Stable
 source inode identity across clients of the same filesystem is required.
 The final empty-directory rmdir relies on cooperating writers honoring custody;
