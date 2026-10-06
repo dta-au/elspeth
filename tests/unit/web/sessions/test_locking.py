@@ -31,6 +31,12 @@ class _FailingUnlockFcntl:
 class _PostgresUnlockFailureConnection:
     """Minimal connection double that fails only advisory-lock release."""
 
+    def __init__(self) -> None:
+        self.invalidated = False
+
+    def invalidate(self) -> None:
+        self.invalidated = True
+
     def exec_driver_sql(self, statement: str, _params: object) -> object:
         if "pg_advisory_unlock" in statement:
             raise OSError("advisory unlock failed")
@@ -231,6 +237,7 @@ def test_postgres_unlock_failure_preserves_primary_exception() -> None:
         raise LookupError("primary failure")
 
     assert exc_info.value.__notes__ == ["PostgreSQL blob custody advisory lock release also failed (OSError)"]
+    assert conn.invalidated
 
 
 def test_postgres_unlock_failure_surfaces_without_primary() -> None:
@@ -241,6 +248,7 @@ def test_postgres_unlock_failure_surfaces_without_primary() -> None:
         locking.postgres_blob_custody_advisory_lock(conn, "shared-session"),  # type: ignore[arg-type]
     ):
         pass
+    assert conn.invalidated
 
 
 def test_postgres_unlock_failure_surfaces_after_unrelated_caught_exception() -> None:

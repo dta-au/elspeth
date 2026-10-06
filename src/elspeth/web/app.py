@@ -408,11 +408,26 @@ async def _periodic_orphan_cleanup(
 
     slog = structlog.get_logger()
     consecutive_failures = 0
+    archive_cleanup_failures = 0
     while True:
         await asyncio.sleep(interval_seconds)
         cancelled = 0
         live_run_ids: frozenset[str] = frozenset()
         try:
+            try:
+                await session_service.reconcile_consumed_archives()
+            except OSError as cleanup_exc:
+                archive_cleanup_failures += 1
+                if archive_cleanup_failures >= _ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES:
+                    raise
+                slog.error(
+                    "periodic_archive_cleanup_pending",
+                    exc_class=type(cleanup_exc).__name__,
+                    errno=cleanup_exc.errno,
+                    consecutive_failures=archive_cleanup_failures,
+                )
+            else:
+                archive_cleanup_failures = 0
             live_run_ids = execution_service.get_live_run_ids()
             if recovery_coordinator is not None:
                 await recovery_coordinator.recover()
@@ -621,6 +636,9 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         landscape_url = settings.get_landscape_url()
     session_service = app.state.session_service
+    # Consumed in-place roots must settle before inline custody can inspect
+    # their contents. Live owners are skipped under the same custody lock.
+    await session_service.reconcile_consumed_archives()
     # Inline custody stages are part of the blob integrity protocol, not
     # best-effort orphan bookkeeping. Do not serve until every stage has a
     # row-authoritative outcome.
