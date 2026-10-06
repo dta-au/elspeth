@@ -5580,6 +5580,23 @@ class _SessionOperationAuthorityRepository:
                 self._raise_fence_lost(conn, context, database_now=database_now)
             return ArchiveDeleteReconciliation.CURRENT
 
+    def archive_cleanup_is_consumed(self, session_id: UUID) -> bool:
+        """Read terminal truth while the caller retains blob custody.
+
+        A filesystem obligation cannot grant a lease. Only absence of both
+        the parent and its fence permits consumed-resource cleanup; an extant
+        session is left to its current owner and ordinary lease recovery.
+        """
+        if type(session_id) is not UUID:
+            raise TypeError("session_id must be UUID")
+        sid = str(session_id)
+        with self._locked_transaction(sid) as conn:
+            session_row = conn.execute(select(sessions_table.c.id).where(sessions_table.c.id == sid)).one_or_none()
+            fence_row = self._select_fence(conn, session_id=sid)
+            if (session_row is None) != (fence_row is None):
+                raise AuditIntegrityError("archive cleanup found a half-present session/fence pair")
+            return session_row is None
+
     def classify_archive_manifest(
         self,
         current_context: SessionOperationContext,

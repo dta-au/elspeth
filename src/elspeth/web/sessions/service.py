@@ -123,6 +123,8 @@ from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions._persist_payload import AuditMessageDraft, AuditOutcome, RedactedToolRow, RejectionRecord, StatePayload
 from elspeth.web.sessions.archive_quarantine import (
     ArchiveQuarantineIdentity,
+    archive_quarantine_operation_ids,
+    archive_quarantine_session_ids,
     canonical_archive_present,
     list_archive_quarantine_manifests,
     prepare_archive_quarantine,
@@ -148,10 +150,12 @@ from elspeth.web.sessions.interpretation_validation import (
     validate_composition_state_with_interpretation_inputs,
 )
 from elspeth.web.sessions.locking import (
+    _blob_custody_session_lock,
     acquire_session_advisory_xact_lock,
     process_session_lock,
     sqlite_session_mutex,
     sqlite_transaction_session_lock,
+    try_blob_custody_session_lock,
 )
 from elspeth.web.sessions.models import (
     audit_access_log_table,
@@ -2206,6 +2210,38 @@ class SessionServiceImpl:
             for row in rows
         ]
 
+    async def reconcile_consumed_archives(self) -> int:
+        """Discharge exact obligations only after terminal DB absence is proven.
+
+        Startup and periodic callers use the same path. Custody drains late
+        blob writers and serializes replica cleanup; the DB proof releases its
+        transaction before any blocking filesystem work begins.
+        """
+        if self._data_dir is None:
+            return 0
+        data_dir = self._data_dir
+
+        def _sync() -> int:
+            retired = 0
+            for session_id in archive_quarantine_session_ids(data_dir):
+                with try_blob_custody_session_lock(self._engine, str(session_id)) as acquired:
+                    if not acquired:
+                        continue
+                    if not self._session_operation_authority.archive_cleanup_is_consumed(session_id):
+                        continue
+                    # Validate all obligations before deleting any one of them.
+                    list_archive_quarantine_manifests(data_dir, session_id)
+                    # A discovery snapshot may precede a peer's retirement.
+                    # Re-list under custody, never act on that stale snapshot.
+                    for identity in archive_quarantine_operation_ids(data_dir, session_id):
+                        canonical = data_dir / "blobs" / str(session_id)
+                        purge_archive_quarantine(data_dir, identity, canonical)
+                        retire_archive_quarantine(data_dir, identity)
+                        retired += 1
+            return retired
+
+        return cast(int, await self._run_sync(_sync))
+
     async def archive_session(self, session_id: UUID) -> None:
         """Archive through one exact DB fence and durable filesystem obligation."""
         sid = str(session_id)
@@ -2294,6 +2330,18 @@ class SessionServiceImpl:
                 authority_uncertain = True
                 raise
 
+        def current_in_place_guard(action: Callable[[], None]) -> None:
+            with _blob_custody_session_lock(self._engine, sid):
+                self._session_operation_authority.compare_and_swap(lease.context)
+                action()
+                self._session_operation_authority.compare_and_swap(lease.context)
+
+        def consumed_cleanup_guard(action: Callable[[], None]) -> None:
+            with _blob_custody_session_lock(self._engine, sid):
+                if not self._session_operation_authority.archive_cleanup_is_consumed(session_id):
+                    raise AuditIntegrityError("archive cleanup refused without confirmed session consumption")
+                action()
+
         async def reconcile_prior_manifests() -> None:
             assert data_dir is not None
             assert canonical is not None
@@ -2317,6 +2365,7 @@ class SessionServiceImpl:
                     data_dir,
                     manifest.identity,
                     canonical,
+                    in_place_guard=current_in_place_guard,
                 )
                 await checkpoint()
                 await run_sync_in_worker(
@@ -2356,6 +2405,7 @@ class SessionServiceImpl:
                 data_dir,
                 identity,
                 canonical,
+                in_place_guard=current_in_place_guard,
             )
             await checkpoint()
 
@@ -2368,6 +2418,7 @@ class SessionServiceImpl:
                 data_dir,
                 identity,
                 canonical,
+                in_place_guard=current_in_place_guard,
             )
             await checkpoint()
             await run_sync_in_worker(
@@ -2405,11 +2456,13 @@ class SessionServiceImpl:
                     data_dir,
                     identity,
                     canonical,
+                    cleanup_guard=consumed_cleanup_guard,
                 )
                 await run_sync_in_worker(
                     retire_archive_quarantine,
                     data_dir,
                     identity,
+                    cleanup_guard=consumed_cleanup_guard,
                 )
             except contract_errors.TIER_1_ERRORS:
                 raise
@@ -2433,6 +2486,7 @@ class SessionServiceImpl:
                         data_dir,
                         identity,
                         canonical,
+                        in_place_guard=current_in_place_guard,
                     )
                     await checkpoint()
                 await run_sync_in_worker(

@@ -2418,6 +2418,10 @@ class SessionOperationAuthority(Protocol):
 
     def reconcile_archive_delete(self, context: SessionOperationContext) -> ArchiveDeleteReconciliation: ...
 
+    def archive_cleanup_is_consumed(self, session_id: UUID) -> bool:
+        """Prove terminal absence without manufacturing authority from disk."""
+        ...
+
     def classify_archive_manifest(
         self,
         current_context: SessionOperationContext,

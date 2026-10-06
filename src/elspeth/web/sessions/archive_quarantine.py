@@ -9,12 +9,14 @@ import os
 import shutil
 import stat
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import Annotated, Any, Final, Literal
 from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
 
 _MANIFEST_SCHEMA: Final = "elspeth.session_archive_quarantine"
 _MANIFEST_VERSION: Final = 1
@@ -45,6 +47,10 @@ class ArchiveQuarantineIntegrityError(ArchiveQuarantineError):
 
 class ArchiveQuarantineCollisionError(ArchiveQuarantineIntegrityError):
     """A filesystem object collided with a required quarantine path."""
+
+
+class ArchiveQuarantineRenameUnsupported(ArchiveQuarantineIntegrityError):
+    """The filesystem cannot perform the required no-replace rename."""
 
 
 try:
@@ -149,6 +155,53 @@ class ArchiveQuarantinePaths:
     manifest: Path
     manifest_temp: Path
     payload: Path
+    in_place: Path
+    in_place_temp: Path
+    in_place_cleaned: Path
+    in_place_restored: Path
+
+
+class InPlaceArchiveRecord(BaseModel):
+    """Immutable, portable binding for a directory retained until DB consume.
+
+    The inode is scoped to the configured data filesystem. The source also
+    holds a hard link to this record: compare those links on the current
+    mount, rather than persisting Linux's mount-local ``st_dev`` number.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+    format: Literal["elspeth.archive_in_place.v1"] = "elspeth.archive_in_place.v1"
+    session_id: UUID
+    operation_id: UUID
+    operation_epoch: Annotated[StrictInt, Field(gt=0)]
+    source_inode: Annotated[StrictInt, Field(gt=0)]
+
+    @property
+    def identity(self) -> ArchiveQuarantineIdentity:
+        return ArchiveQuarantineIdentity(
+            session_id=self.session_id,
+            operation_id=self.operation_id,
+            operation_epoch=self.operation_epoch,
+        )
+
+    @property
+    def marker_name(self) -> str:
+        return f".archive-in-place-{self.operation_id}.json"
+
+    def to_bytes(self) -> bytes:
+        return self.model_dump_json().encode() + b"\n"
+
+    @classmethod
+    def from_bytes(cls, encoded: bytes) -> InPlaceArchiveRecord:
+        try:
+            record = cls.model_validate_json(encoded)
+        except ValidationError:
+            raise ArchiveQuarantineIntegrityError("in-place archive record is invalid") from None
+        # Only our canonical machine encoding is admitted. This also rejects
+        # duplicate JSON keys and noncanonical UUID spellings.
+        if record.to_bytes() != encoded:
+            raise ArchiveQuarantineIntegrityError("in-place archive record is not canonical")
+        return record
 
 
 def archive_quarantine_paths(
@@ -172,6 +225,10 @@ def archive_quarantine_paths(
         manifest=operation_dir / "manifest.json",
         manifest_temp=operation_dir / "manifest.json.tmp",
         payload=operation_dir / "payload",
+        in_place=operation_dir / "in_place.json",
+        in_place_temp=operation_dir / "in_place.json.tmp",
+        in_place_cleaned=operation_dir / "in_place.cleaned",
+        in_place_restored=operation_dir / "in_place.restored",
     )
 
 
@@ -212,7 +269,9 @@ def list_archive_quarantine_manifests(
     for candidate in version_dir.iterdir():
         candidate_stat = _path_lstat(candidate)
         if candidate_stat is None:
-            raise ArchiveQuarantineIntegrityError("archive quarantine session entry disappeared during discovery")
+            # Custody covers this session, not every peer session discovered
+            # in the shared version directory. A retired peer is stale input.
+            continue
         if stat.S_ISLNK(candidate_stat.st_mode) or not stat.S_ISDIR(candidate_stat.st_mode):
             raise ArchiveQuarantineCollisionError("archive quarantine session entry is not a real directory")
         try:
@@ -262,8 +321,12 @@ def list_archive_quarantine_manifests(
         paths = archive_quarantine_paths(data_dir, identity)
         if paths.operation_dir != operation_dir:
             raise ArchiveQuarantineIntegrityError("archive quarantine operation directory does not match its identity")
-        allowed_entries = {"manifest.json", "payload"}
+        allowed_entries = {"manifest.json", "payload", "in_place.json", "in_place.json.tmp", "in_place.cleaned", "in_place.restored"}
         operation_entries = {entry.name for entry in operation_dir.iterdir()}
+        if not operation_entries:
+            # Interrupted retirement leaves an empty, identity-derived entry.
+            # It carries no payload; consumed cleanup retires it later.
+            continue
         if "manifest.json" not in operation_entries or not operation_entries <= allowed_entries:
             raise ArchiveQuarantineIntegrityError("archive quarantine operation directory contains an invalid entry set")
         manifest = load_archive_quarantine(data_dir, identity)
@@ -342,8 +405,10 @@ def stage_archive_quarantine(
     data_dir: Path,
     identity: ArchiveQuarantineIdentity,
     canonical: Path,
+    *,
+    in_place_guard: Callable[[Callable[[], None]], None] | None = None,
 ) -> None:
-    """Rename the whole canonical archive directory into quarantine."""
+    """Stage native relocation, or bind unchanged source for consumed cleanup."""
     paths = _validated_paths(data_dir, identity)
     manifest = load_archive_quarantine(data_dir, identity)
     canonical = _validated_canonical_path(data_dir, identity, canonical)
@@ -362,7 +427,20 @@ def stage_archive_quarantine(
         return
     if not manifest.source_present:
         raise ArchiveQuarantineCollisionError("canonical archive exists although the manifest records no source")
-    _rename_directory(canonical, paths.payload)
+    source_stat = canonical.lstat()
+    if _in_place_present(paths):
+        _run_in_place_action(lambda: _stage_in_place(data_dir, paths, identity, canonical, source_stat), in_place_guard)
+        return
+    try:
+        _rename_directory(canonical, paths.payload)
+    except ArchiveQuarantineRenameUnsupported:
+        # Unsupported semantics never authorize a replacing rename. A
+        # published mode record keeps the source until fenced DB consume.
+        if _directory_present(paths.payload, role="payload"):
+            raise ArchiveQuarantineCollisionError("unsupported rename left a payload") from None
+        _require_same_inode(source_stat, canonical.lstat(), role="in-place archive source")
+        _run_in_place_action(lambda: _stage_in_place(data_dir, paths, identity, canonical, source_stat), in_place_guard)
+        return
     _fsync_rename_parents(canonical.parent, paths.operation_dir)
 
 
@@ -370,11 +448,20 @@ def restore_archive_quarantine(
     data_dir: Path,
     identity: ArchiveQuarantineIdentity,
     canonical: Path,
+    *,
+    in_place_guard: Callable[[Callable[[], None]], None] | None = None,
 ) -> None:
     """Restore a staged payload, preserving both sides on any collision."""
     paths = _validated_paths(data_dir, identity)
     manifest = load_archive_quarantine(data_dir, identity)
     canonical = _validated_canonical_path(data_dir, identity, canonical)
+    if _in_place_present(paths):
+        if _directory_present(paths.payload, role="payload"):
+            raise ArchiveQuarantineCollisionError("in-place archive also has a native payload")
+        if not manifest.source_present:
+            raise ArchiveQuarantineIntegrityError("in-place archive records an absent source")
+        _run_in_place_action(lambda: _restore_in_place(data_dir, paths, identity, canonical), in_place_guard)
+        return
     canonical_present = _directory_present(canonical, role="canonical archive")
     payload_present = _directory_present(paths.payload, role="payload")
     if canonical_present and payload_present:
@@ -399,11 +486,33 @@ def purge_archive_quarantine(
     data_dir: Path,
     identity: ArchiveQuarantineIdentity,
     canonical: Path,
+    *,
+    cleanup_guard: Callable[[Callable[[], None]], None] | None = None,
 ) -> None:
     """Delete only the payload bound to a validated manifest identity."""
+    if cleanup_guard is not None:
+        cleanup_guard(lambda: purge_archive_quarantine(data_dir, identity, canonical))
+        return
     paths = _validated_paths(data_dir, identity)
+    if _path_lstat(paths.operation_dir) is None:
+        return
+    _validate_existing_quarantine_directories(data_dir, paths)
+    _validate_cleanup_entries(paths)
+    if _path_lstat(paths.manifest) is None:
+        if tuple(paths.operation_dir.iterdir()):
+            raise ArchiveQuarantineIntegrityError("archive cleanup residue has no manifest")
+        # Retirement may have unlinked and synced the manifest before death.
+        _fsync_directory(paths.operation_dir)
+        return
     manifest = load_archive_quarantine(data_dir, identity)
     canonical = _validated_canonical_path(data_dir, identity, canonical)
+    if _in_place_present(paths):
+        if _directory_present(paths.payload, role="payload"):
+            raise ArchiveQuarantineCollisionError("in-place archive also has a native payload")
+        if not manifest.source_present:
+            raise ArchiveQuarantineIntegrityError("in-place archive records an absent source")
+        _purge_in_place(data_dir, paths, identity, canonical)
+        return
     canonical_present = _directory_present(canonical, role="canonical archive")
     payload_present = _directory_present(paths.payload, role="payload")
     if canonical_present and payload_present:
@@ -418,14 +527,20 @@ def purge_archive_quarantine(
 def retire_archive_quarantine(
     data_dir: Path,
     identity: ArchiveQuarantineIdentity,
+    *,
+    cleanup_guard: Callable[[Callable[[], None]], None] | None = None,
 ) -> None:
     """Retire an obligation only after its payload no longer exists."""
+    if cleanup_guard is not None:
+        cleanup_guard(lambda: retire_archive_quarantine(data_dir, identity))
+        return
     paths = _validated_paths(data_dir, identity)
     operation_stat = _path_lstat(paths.operation_dir)
     if operation_stat is None:
         _retire_empty_session_directory(data_dir, paths)
         return
     _validate_existing_quarantine_directories(data_dir, paths)
+    _validate_cleanup_entries(paths)
     manifest_stat = _path_lstat(paths.manifest)
     if manifest_stat is not None:
         manifest = load_archive_quarantine(data_dir, identity)
@@ -433,6 +548,8 @@ def retire_archive_quarantine(
             raise ArchiveQuarantineIntegrityError("manifest identity does not match retirement identity")
     if _directory_present(paths.payload, role="payload"):
         raise ArchiveQuarantineIntegrityError("cannot retire archive quarantine while payload exists")
+    if _in_place_present(paths):
+        raise ArchiveQuarantineIntegrityError("cannot retire archive quarantine while in-place work exists")
     _discard_manifest_temp(paths)
     if manifest_stat is not None:
         _unlink_manifest(paths.manifest)
@@ -468,6 +585,10 @@ def _validated_paths(
         paths.manifest,
         paths.manifest_temp,
         paths.payload,
+        paths.in_place,
+        paths.in_place_temp,
+        paths.in_place_cleaned,
+        paths.in_place_restored,
     ):
         _require_beneath(candidate, data_absolute)
     return paths
@@ -1004,12 +1125,12 @@ def _rename_noreplace_at(
     target_name: str,
 ) -> None:
     if not sys.platform.startswith("linux"):
-        raise ArchiveQuarantineIntegrityError("atomic no-replace directory rename is unavailable on this platform")
+        raise ArchiveQuarantineRenameUnsupported("atomic no-replace directory rename is unavailable on this platform")
     libc = ctypes.CDLL(None, use_errno=True)
     try:
         renameat2 = libc.renameat2
     except AttributeError as exc:
-        raise ArchiveQuarantineIntegrityError("atomic no-replace directory rename is unavailable") from exc
+        raise ArchiveQuarantineRenameUnsupported("atomic no-replace directory rename is unavailable") from exc
     renameat2.argtypes = (
         ctypes.c_int,
         ctypes.c_char_p,
@@ -1032,7 +1153,382 @@ def _rename_noreplace_at(
     error_number = ctypes.get_errno()
     if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
         raise ArchiveQuarantineCollisionError("rename target appeared before atomic publication")
+    if error_number in {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP}:
+        raise ArchiveQuarantineRenameUnsupported("atomic no-replace directory rename is unsupported") from OSError(
+            error_number, os.strerror(error_number)
+        )
     raise ArchiveQuarantineIntegrityError("atomic no-replace directory rename failed") from OSError(error_number, os.strerror(error_number))
+
+
+def archive_quarantine_session_ids(data_dir: Path) -> tuple[UUID, ...]:
+    """Discover session identities without inspecting a live owner's files."""
+    _require_existing_directory(data_dir, role="data directory")
+    root = data_dir / ".archive_quarantine"
+    if _path_lstat(root) is None:
+        return ()
+    _require_existing_directory(root, role="quarantine root")
+    entries = tuple(root.iterdir())
+    if any(entry.name != f"v{_MANIFEST_VERSION}" for entry in entries):
+        raise ArchiveQuarantineIntegrityError("archive quarantine contains an unsupported version")
+    version = root / f"v{_MANIFEST_VERSION}"
+    if _path_lstat(version) is None:
+        return ()
+    _require_existing_directory(version, role="quarantine version directory")
+    sessions: list[UUID] = []
+    for entry in sorted(version.iterdir(), key=lambda candidate: candidate.name):
+        # A peer can retire its empty session entry after the discovery
+        # snapshot. Substituted symlinks/non-directories remain collisions.
+        if not _directory_present(entry, role="quarantine session directory"):
+            continue
+        try:
+            session_id = UUID(entry.name)
+        except ValueError:
+            raise ArchiveQuarantineIntegrityError("quarantine session identity is invalid") from None
+        if str(session_id) != entry.name:
+            raise ArchiveQuarantineIntegrityError("quarantine session identity is not canonical")
+        sessions.append(session_id)
+    return tuple(sessions)
+
+
+def archive_quarantine_operation_ids(data_dir: Path, session_id: UUID) -> tuple[ArchiveQuarantineIdentity, ...]:
+    """Re-list obligations under custody, including empty retirement residue."""
+    session_dir = data_dir / ".archive_quarantine" / f"v{_MANIFEST_VERSION}" / str(session_id)
+    _require_symlink_free_existing_chain(_lexical_absolute(data_dir), _lexical_absolute(session_dir))
+    if _path_lstat(session_dir) is None:
+        return ()
+    _require_existing_directory(session_dir, role="quarantine session directory")
+    identities: list[ArchiveQuarantineIdentity] = []
+    for entry in sorted(session_dir.iterdir(), key=lambda candidate: candidate.name):
+        _require_existing_directory(entry, role="quarantine operation directory")
+        epoch_text = entry.name[:_EPOCH_WIDTH]
+        if len(epoch_text) != _EPOCH_WIDTH or not epoch_text.isascii() or not epoch_text.isdigit():
+            raise ArchiveQuarantineIntegrityError("quarantine operation epoch is invalid")
+        if entry.name[_EPOCH_WIDTH : _EPOCH_WIDTH + 1] != "-":
+            raise ArchiveQuarantineIntegrityError("quarantine operation name is invalid")
+        try:
+            operation_id = UUID(entry.name[_EPOCH_WIDTH + 1 :])
+        except ValueError:
+            raise ArchiveQuarantineIntegrityError("quarantine operation id is invalid") from None
+        if str(operation_id) != entry.name[_EPOCH_WIDTH + 1 :] or int(epoch_text) < 1:
+            raise ArchiveQuarantineIntegrityError("quarantine operation identity is not canonical")
+        identities.append(ArchiveQuarantineIdentity(session_id, operation_id, int(epoch_text)))
+    return tuple(identities)
+
+
+def _validate_cleanup_entries(paths: ArchiveQuarantinePaths) -> None:
+    """Reject untrusted control state before deleting bytes or evidence."""
+    allowed = {paths.manifest.name, paths.manifest_temp.name, paths.payload.name}
+    allowed.update(path.name for path in _mode_paths(paths))
+    if not {entry.name for entry in paths.operation_dir.iterdir()} <= allowed:
+        raise ArchiveQuarantineIntegrityError("archive quarantine operation directory contains an invalid entry set")
+    temp_stat = _path_lstat(paths.manifest_temp)
+    if temp_stat is None:
+        return
+    manifest_stat = _path_lstat(paths.manifest)
+    if manifest_stat is None:
+        _require_private_single_link_file_stat(temp_stat, role="archive quarantine manifest temp")
+    else:
+        _require_private_file_stat_allowing_links(temp_stat, role="archive quarantine manifest temp")
+        _require_private_file_stat_allowing_links(manifest_stat, role="archive quarantine manifest")
+        _require_same_inode(temp_stat, manifest_stat, role="archive quarantine manifest publication residue")
+        if temp_stat.st_nlink != 2 or manifest_stat.st_nlink != 2:
+            raise ArchiveQuarantineCollisionError("archive quarantine manifest publication residue has an unexpected link count")
+
+
+def _in_place_present(paths: ArchiveQuarantinePaths) -> bool:
+    return any(_path_lstat(path) is not None for path in _mode_paths(paths))
+
+
+def _run_in_place_action(action: Callable[[], None], guard: Callable[[Callable[[], None]], None] | None) -> None:
+    if guard is None:
+        action()
+    else:
+        guard(action)
+
+
+def _mode_paths(paths: ArchiveQuarantinePaths) -> tuple[Path, ...]:
+    return (paths.in_place, paths.in_place_temp, paths.in_place_cleaned, paths.in_place_restored)
+
+
+def _mode_file_stats(descriptor: int, paths: ArchiveQuarantinePaths) -> tuple[tuple[str, os.stat_result], ...]:
+    files: list[tuple[str, os.stat_result]] = []
+    for path in _mode_paths(paths):
+        try:
+            observed = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        _require_private_file_stat_allowing_links(observed, role="in-place archive record")
+        files.append((path.name, observed))
+    return tuple(files)
+
+
+def _load_mode_record(
+    descriptor: int,
+    paths: ArchiveQuarantinePaths,
+    identity: ArchiveQuarantineIdentity,
+    *,
+    discard_unpublished: bool,
+) -> tuple[InPlaceArchiveRecord, os.stat_result, frozenset[str]] | None:
+    files = _mode_file_stats(descriptor, paths)
+    if not files:
+        return None
+    if discard_unpublished and len(files) == 1 and files[0][0] == paths.in_place_temp.name and files[0][1].st_nlink == 1:
+        # A crash during the exclusive temp write cannot have linked a source
+        # witness. As with manifest temps, discard only a private single link.
+        os.unlink(paths.in_place_temp.name, dir_fd=descriptor)
+        _fsync_directory_descriptor(descriptor)
+        return None
+    name, observed = files[0]
+    file_descriptor = os.open(name, _FILE_READ_FLAGS, dir_fd=descriptor)
+    try:
+        opened = os.fstat(file_descriptor)
+        _require_private_file_stat_allowing_links(opened, role="in-place archive record")
+        _require_same_inode(observed, opened, role="in-place archive record")
+        encoded = os.read(file_descriptor, _MAX_MANIFEST_BYTES + 1)
+        if len(encoded) > _MAX_MANIFEST_BYTES:
+            raise ArchiveQuarantineIntegrityError("in-place archive record exceeds its size limit")
+    finally:
+        os.close(file_descriptor)
+    record = InPlaceArchiveRecord.from_bytes(encoded)
+    if record.identity != identity:
+        raise ArchiveQuarantineIntegrityError("in-place archive record has a foreign identity")
+    names = frozenset(filename for filename, _file_stat in files)
+    if paths.in_place_cleaned.name in names and paths.in_place_restored.name in names:
+        raise ArchiveQuarantineIntegrityError("in-place archive has conflicting terminal witnesses")
+    for _filename, file_stat in files:
+        _require_same_inode(opened, file_stat, role="in-place archive publication")
+    return record, opened, names
+
+
+def _open_mode_source(
+    parent_descriptor: int,
+    canonical: Path,
+    record: InPlaceArchiveRecord,
+    record_stat: os.stat_result,
+    names: frozenset[str],
+    paths: ArchiveQuarantinePaths,
+    *,
+    allow_absent: bool,
+) -> int | None:
+    try:
+        observed = os.stat(canonical.name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        if not allow_absent:
+            raise ArchiveQuarantineIntegrityError("in-place archive source is missing") from None
+        if record_stat.st_nlink != len(names):
+            raise ArchiveQuarantineCollisionError("absent in-place source has unexpected record links") from None
+        return None
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode) or observed.st_ino != record.source_inode:
+        raise ArchiveQuarantineCollisionError("in-place archive source identity changed")
+    descriptor = os.open(canonical.name, _DIRECTORY_READ_FLAGS, dir_fd=parent_descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        _require_same_inode(observed, opened, role="in-place archive source")
+        if opened.st_dev != record_stat.st_dev:
+            raise ArchiveQuarantineCollisionError("in-place source and witness are on different filesystems")
+        try:
+            marker_stat = os.stat(record.marker_name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            if not {paths.in_place_cleaned.name, paths.in_place_restored.name} & names:
+                raise ArchiveQuarantineCollisionError("in-place archive source witness is missing") from None
+            marker_links = 0
+        else:
+            _require_private_file_stat_allowing_links(marker_stat, role="in-place archive source witness")
+            _require_same_inode(record_stat, marker_stat, role="in-place archive source witness")
+            marker_links = 1
+        if record_stat.st_nlink != len(names) + marker_links:
+            raise ArchiveQuarantineCollisionError("in-place archive record has unexpected links")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _publish_mode_phase(descriptor: int, source_name: str, target_name: str) -> None:
+    try:
+        os.link(source_name, target_name, src_dir_fd=descriptor, dst_dir_fd=descriptor, follow_symlinks=False)
+    except FileExistsError:
+        source_stat = os.stat(source_name, dir_fd=descriptor, follow_symlinks=False)
+        target_stat = os.stat(target_name, dir_fd=descriptor, follow_symlinks=False)
+        _require_private_file_stat_allowing_links(target_stat, role="in-place archive phase")
+        _require_same_inode(source_stat, target_stat, role="in-place archive phase")
+    _fsync_directory_descriptor(descriptor)
+
+
+def _remove_mode_records(descriptor: int, paths: ArchiveQuarantinePaths, record_stat: os.stat_result) -> None:
+    # Terminal witnesses are last, so an interrupted retirement still has an
+    # authoritative record after the primary record was unlinked.
+    for path in _mode_paths(paths):
+        try:
+            observed = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        _require_private_file_stat_allowing_links(observed, role="in-place archive retirement")
+        _require_same_inode(record_stat, observed, role="in-place archive retirement")
+        os.unlink(path.name, dir_fd=descriptor)
+        _fsync_directory_descriptor(descriptor)
+
+
+def _unlink_source_marker(descriptor: int, record: InPlaceArchiveRecord, record_stat: os.stat_result) -> None:
+    try:
+        observed = os.stat(record.marker_name, dir_fd=descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        # A predecessor may have died after unlink but before the directory
+        # fsync. Make that observed absence durable before retiring witnesses.
+        _fsync_directory_descriptor(descriptor)
+        return
+    _require_private_file_stat_allowing_links(observed, role="in-place archive source witness")
+    _require_same_inode(record_stat, observed, role="in-place archive source witness")
+    os.unlink(record.marker_name, dir_fd=descriptor)
+    _fsync_directory_descriptor(descriptor)
+
+
+def _stage_in_place(
+    data_dir: Path,
+    paths: ArchiveQuarantinePaths,
+    identity: ArchiveQuarantineIdentity,
+    canonical: Path,
+    expected_source: os.stat_result,
+) -> None:
+    operation_descriptor = _open_directory_beneath(data_dir, paths.operation_dir)
+    try:
+        parent_descriptor = _open_directory_beneath(data_dir, canonical.parent)
+        try:
+            loaded = _load_mode_record(operation_descriptor, paths, identity, discard_unpublished=True)
+            if loaded is None:
+                source_descriptor = os.open(canonical.name, _DIRECTORY_READ_FLAGS, dir_fd=parent_descriptor)
+                try:
+                    source_stat = os.fstat(source_descriptor)
+                    _require_same_inode(expected_source, source_stat, role="in-place archive source")
+                    record = InPlaceArchiveRecord(
+                        session_id=identity.session_id,
+                        operation_id=identity.operation_id,
+                        operation_epoch=identity.operation_epoch,
+                        source_inode=source_stat.st_ino,
+                    )
+                    descriptor = os.open(paths.in_place_temp.name, _FILE_CREATE_FLAGS, 0o600, dir_fd=operation_descriptor)
+                    try:
+                        _write_all(descriptor, record.to_bytes())
+                        _fsync_file(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    _fsync_directory_descriptor(operation_descriptor)
+                    try:
+                        os.link(
+                            paths.in_place_temp.name,
+                            record.marker_name,
+                            src_dir_fd=operation_descriptor,
+                            dst_dir_fd=source_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError:
+                        raise ArchiveQuarantineCollisionError("in-place source witness already exists") from None
+                    _fsync_directory_descriptor(source_descriptor)
+                finally:
+                    os.close(source_descriptor)
+                loaded = _load_mode_record(operation_descriptor, paths, identity, discard_unpublished=False)
+                assert loaded is not None
+            record, record_stat, names = loaded
+            if {paths.in_place_cleaned.name, paths.in_place_restored.name} & names:
+                raise ArchiveQuarantineIntegrityError("cannot stage a terminal in-place archive")
+            opened_source = _open_mode_source(parent_descriptor, canonical, record, record_stat, names, paths, allow_absent=False)
+            assert opened_source is not None
+            source_descriptor = opened_source
+            try:
+                source_name = paths.in_place.name if paths.in_place.name in names else paths.in_place_temp.name
+                _publish_mode_phase(operation_descriptor, source_name, paths.in_place.name)
+                if paths.in_place_temp.name in names:
+                    os.unlink(paths.in_place_temp.name, dir_fd=operation_descriptor)
+                    _fsync_directory_descriptor(operation_descriptor)
+                _fsync_directory_descriptor(source_descriptor)
+                _fsync_directory_descriptor(parent_descriptor)
+            finally:
+                os.close(source_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        os.close(operation_descriptor)
+
+
+def _restore_in_place(data_dir: Path, paths: ArchiveQuarantinePaths, identity: ArchiveQuarantineIdentity, canonical: Path) -> None:
+    operation_descriptor = _open_directory_beneath(data_dir, paths.operation_dir)
+    try:
+        loaded = _load_mode_record(operation_descriptor, paths, identity, discard_unpublished=True)
+        if loaded is None:
+            return
+        record, record_stat, names = loaded
+        if paths.in_place_cleaned.name in names:
+            raise ArchiveQuarantineIntegrityError("cannot restore a consumed in-place archive")
+        parent_descriptor = _open_directory_beneath(data_dir, canonical.parent)
+        try:
+            source_descriptor = _open_mode_source(parent_descriptor, canonical, record, record_stat, names, paths, allow_absent=False)
+            assert source_descriptor is not None
+            try:
+                source_name = next(path.name for path in _mode_paths(paths) if path.name in names)
+                _publish_mode_phase(operation_descriptor, source_name, paths.in_place_restored.name)
+                _unlink_source_marker(source_descriptor, record, record_stat)
+                _remove_mode_records(operation_descriptor, paths, record_stat)
+            finally:
+                os.close(source_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        os.close(operation_descriptor)
+
+
+def _purge_in_place(data_dir: Path, paths: ArchiveQuarantinePaths, identity: ArchiveQuarantineIdentity, canonical: Path) -> None:
+    operation_descriptor = _open_directory_beneath(data_dir, paths.operation_dir)
+    try:
+        loaded = _load_mode_record(operation_descriptor, paths, identity, discard_unpublished=False)
+        assert loaded is not None
+        record, record_stat, names = loaded
+        parent_descriptor = _open_directory_beneath(data_dir, canonical.parent)
+        try:
+            source_descriptor = _open_mode_source(parent_descriptor, canonical, record, record_stat, names, paths, allow_absent=True)
+            if source_descriptor is None:
+                _fsync_directory_descriptor(parent_descriptor)
+                _remove_mode_records(operation_descriptor, paths, record_stat)
+                return
+            try:
+                if paths.in_place_restored.name in names:
+                    # A rollback witness never authorizes deletion of source
+                    # bytes, even if a later operation consumed the session.
+                    _unlink_source_marker(source_descriptor, record, record_stat)
+                    _remove_mode_records(operation_descriptor, paths, record_stat)
+                    return
+                if paths.in_place_cleaned.name in names:
+                    if any(name != record.marker_name for name in os.listdir(source_descriptor)):
+                        raise ArchiveQuarantineCollisionError("completed in-place source is not empty")
+                else:
+                    if paths.in_place.name not in names:
+                        raise ArchiveQuarantineIntegrityError("unpublished in-place work cannot authorize cleanup")
+                    for name in os.listdir(source_descriptor):
+                        if name == record.marker_name:
+                            continue
+                        child_stat = os.stat(name, dir_fd=source_descriptor, follow_symlinks=False)
+                        if stat.S_ISDIR(child_stat.st_mode):
+                            shutil.rmtree(name, dir_fd=source_descriptor)
+                        else:
+                            os.unlink(name, dir_fd=source_descriptor)
+                    _fsync_directory_descriptor(source_descriptor)
+                    _publish_mode_phase(operation_descriptor, paths.in_place.name, paths.in_place_cleaned.name)
+                _unlink_source_marker(source_descriptor, record, record_stat)
+                current_stat = os.stat(canonical.name, dir_fd=parent_descriptor, follow_symlinks=False)
+                _require_same_inode(current_stat, os.fstat(source_descriptor), role="in-place source retirement")
+                if os.listdir(source_descriptor):
+                    raise ArchiveQuarantineCollisionError("in-place source changed during retirement")
+                # Like quarantine session-directory rmdir, this is serialized
+                # for cooperating writers, not inode-conditional against an
+                # arbitrary actor that ignores custody and swaps an empty dir.
+                os.rmdir(canonical.name, dir_fd=parent_descriptor)
+                _fsync_directory_descriptor(parent_descriptor)
+                _remove_mode_records(operation_descriptor, paths, record_stat)
+            finally:
+                os.close(source_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        os.close(operation_descriptor)
 
 
 def _remove_payload_directory(path: Path) -> None:
