@@ -28,6 +28,7 @@ processor binds the post-usurpation token.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -44,6 +45,7 @@ from elspeth.core.config import CoalesceSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import run_coordination_table, token_work_items_table
 from elspeth.engine.clock import MockClock
 from elspeth.engine.coalesce_executor import CoalesceExecutor
@@ -53,7 +55,7 @@ from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_row
 from tests.fixtures.factories import make_context
 from tests.fixtures.group_lineage import ensure_fork_group_record
-from tests.fixtures.landscape import age_barrier_hold, leader_token_for, on_fresh_database_second
+from tests.fixtures.landscape import DatabaseSecondRollover, age_barrier_hold, leader_token_for, on_fresh_database_second
 from tests.unit.engine.test_adr030_slice3_intake import (
     AGG_NODE,
     _agg_processor,
@@ -76,6 +78,26 @@ RUN_ID = "test-run"
 USURPER = "worker-usurper"
 TIMEOUT_SECONDS = 10.0
 COALESCE_NODE = NodeID("coalesce::merge")
+
+
+def _assert_with_stable_database_second(scenario: Callable[[LandscapeDB, RecorderFactory, MockClock], None]) -> None:
+    """Retry only a clock-premise failure, with entirely fresh scenario state.
+
+    A takeover mutates the journal, so it cannot be replayed in the same DB.
+    Host scheduling can consume SQLite's whole-second window. Discard that
+    attempt and reconstruct both frames; property assertions still propagate
+    immediately, and persistent rollover fails after five attempts.
+    """
+    for attempt in range(5):
+        db, factory = _make_factory()
+        with db:
+            try:
+                scenario(db, factory, MockClock(start=_T0))
+            except DatabaseSecondRollover:
+                if attempt == 4:
+                    raise
+            else:
+                return
 
 
 def _usurp_seat(db: LandscapeDB, run_id: str, clock: MockClock) -> None:
@@ -151,8 +173,9 @@ class TestAggregationTimeoutInvariance:
     """Aggregation arm: ``TriggerEvaluator._first_accept_time`` anchors to T_b."""
 
     def test_fire_instant_and_composition_invariant_across_takeover(self) -> None:
-        clock = MockClock(start=_T0)
-        db, factory = _make_factory()
+        _assert_with_stable_database_second(self._assert_takeover_invariance)
+
+    def _assert_takeover_invariance(self, db: LandscapeDB, factory: RecorderFactory, clock: MockClock) -> None:
         transform = _passthrough_flush_transform()
         processor_a = _agg_processor(factory, trigger={"timeout_seconds": TIMEOUT_SECONDS}, transform=transform, clock=clock)
         ctx = make_context(
@@ -195,7 +218,8 @@ class TestAggregationTimeoutInvariance:
         # database clock (ADR-047); the MockClock's advance never reaches the
         # database, so the SAME T_b+timeout-ε age is written into the
         # database's past and the restore reads it inside one whole SQLite
-        # second (a rollover would be reported, not silently scored).
+        # second. A rollover discards this entire scenario; it is never scored
+        # or retried against the already-mutated journal.
         def take_over(_database_now: datetime) -> Any:
             for work_item_id in _blocked_work_item_ids(db):
                 age_barrier_hold(db.engine, work_item_id, seconds_ago=TIMEOUT_SECONDS - 0.5)
@@ -243,8 +267,9 @@ class TestCoalesceTimeoutInvariance:
     """Coalesce mirror: ``first_arrival`` anchors to T_b in both frames."""
 
     def test_first_arrival_anchor_and_fire_instant_invariant_across_takeover(self) -> None:
-        clock = MockClock(start=_T0)
-        db, factory = _make_factory()
+        _assert_with_stable_database_second(self._assert_takeover_invariance)
+
+    def _assert_takeover_invariance(self, db: LandscapeDB, factory: RecorderFactory, clock: MockClock) -> None:
         executor_a = _real_coalesce_executor(factory, clock)
         processor_a = _make_processor(
             factory,
