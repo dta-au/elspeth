@@ -48,18 +48,23 @@ def test_changelog_describes_release_boundaries_precisely() -> None:
     assert "sink-effect-v1" not in release
 
 
-def test_changelog_preserves_historical_epochs_and_assigns_live_epochs_to_current_release() -> None:
+def test_changelog_preserves_historical_epochs_and_documents_current_compatibility() -> None:
     changelog = _text(ROOT / "CHANGELOG.md")
     current_heading = f"\n## {CURRENT_VERSION} - "
     assert changelog.count(current_heading) == 1
     current_release = changelog.split(current_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    release_081 = changelog.split("\n## 0.8.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_080 = changelog.split("\n## 0.8.0 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_071 = changelog.split("\n## 0.7.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
 
-    assert f"SESSION_SCHEMA_EPOCH` advances from 53\nto {SESSION_SCHEMA_EPOCH}" in current_release
-    assert f"SQLITE_SCHEMA_EPOCH` advances from 38 to {SQLITE_SCHEMA_EPOCH}" in current_release
-    assert f"Session epoch {SESSION_SCHEMA_EPOCH} removes mode-specific operation state" in current_release
-    assert f"install {CURRENT_VERSION}" in " ".join(current_release.split())
+    assert f"Session epoch {SESSION_SCHEMA_EPOCH}" in current_release
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_release
+    assert "unchanged from 0.8.1; this release adds no schema-epoch cutover" in " ".join(current_release.split())
+
+    assert "SESSION_SCHEMA_EPOCH` advances from 53\nto 71" in release_081
+    assert "SQLITE_SCHEMA_EPOCH` advances from 38 to 49" in release_081
+    assert "Session epoch 71 removes mode-specific operation state" in release_081
+    assert "install 0.8.1" in " ".join(release_081.split())
 
     assert "SESSION_SCHEMA_EPOCH` advances from 35\nto 53" in release_080
     assert "SQLITE_SCHEMA_EPOCH` advances from 29 to 38" in release_080
@@ -165,13 +170,20 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert f"From 0.8.0 to {CURRENT_VERSION}" in current_text
     assert f"Sessions epoch {SESSION_SCHEMA_EPOCH}" in current_text
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_text
+    assert "Upgrades from 0.8.1 keep both database epochs unchanged" in current_text
     assert "ordinary freeform composition" in current_text
+    predecessor = soup.select('[data-release="0.8.1"]')
+    assert len(predecessor) == 1
+    predecessor_text = predecessor[0].get_text(" ", strip=True)
+    assert "From 0.8.0 to 0.8.1" in predecessor_text
+    assert "Sessions epoch 71" in predecessor_text and "Landscape epoch 49" in predecessor_text
     historical = soup.select('[data-release="0.8.0"]')
     assert len(historical) == 1
     historical_text = historical[0].get_text(" ", strip=True)
     assert "from 0.7.1 to 0.8.0" in historical_text
     assert "both database schemas" in historical_text and "coordinated recreation" in historical_text
     assert f"before installing {CURRENT_VERSION}" in html
+    assert "If upgrading from 0.8.0 or earlier" in html
     assert "aws-ecs-deployment.md" in html
 
 

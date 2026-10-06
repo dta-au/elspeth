@@ -1,0 +1,133 @@
+[
+  {
+    "file": "login7-payload.js",
+    "format": "TDS:0x%08X, PacketSize:0x%08X, ClientProgVer:0x%08X, ClientPID:0x%08X, ConnectionID:0x%08X",
+    "args": [
+      255,
+      256,
+      257,
+      258,
+      259
+    ],
+    "expected": "TDS:0x000000FF, PacketSize:0x00000100, ClientProgVer:0x00000101, ClientPID:0x00000102, ConnectionID:0x00000103"
+  },
+  {
+    "file": "login7-payload.js",
+    "format": "Flags1:0x%02X, Flags2:0x%02X, TypeFlags:0x%02X, Flags3:0x%02X, ClientTimezone:%d, ClientLCID:0x%08X",
+    "args": [
+      255,
+      256,
+      257,
+      258,
+      1,
+      260
+    ],
+    "expected": "Flags1:0xFF, Flags2:0x100, TypeFlags:0x101, Flags3:0x102, ClientTimezone:1, ClientLCID:0x00000104"
+  },
+  {
+    "file": "login7-payload.js",
+    "format": "Hostname:'%s', Username:'%s', Password:'%s', AppName:'%s', ServerName:'%s', LibraryName:'%s'",
+    "args": [
+      "field-0: %.101f",
+      "field-1: %.101f",
+      "field-2: %.101f",
+      "field-3: %.101f",
+      "field-4: %.101f",
+      "field-5: %.101f"
+    ],
+    "expected": "Hostname:'field-0: %.101f', Username:'field-1: %.101f', Password:'field-2: %.101f', AppName:'field-3: %.101f', ServerName:'field-4: %.101f', LibraryName:'field-5: %.101f'"
+  },
+  {
+    "file": "login7-payload.js",
+    "format": "Language:'%s', Database:'%s', SSPI:'%s', AttachDbFile:'%s', ChangePassword:'%s'",
+    "args": [
+      "field-0: %.101f",
+      "field-1: %.101f",
+      "field-2: %.101f",
+      "field-3: %.101f",
+      "field-4: %.101f"
+    ],
+    "expected": "Language:'field-0: %.101f', Database:'field-1: %.101f', SSPI:'field-2: %.101f', AttachDbFile:'field-3: %.101f', ChangePassword:'field-4: %.101f'"
+  },
+  {
+    "file": "metadata-parser.js",
+    "format": "Unrecognised data type 0x%02X",
+    "args": [
+      255
+    ],
+    "expected": "Unrecognised data type 0xFF"
+  },
+  {
+    "file": "metadata-parser.js",
+    "format": "Unrecognised type %s",
+    "args": [
+      "field-0: %.101f"
+    ],
+    "expected": "Unrecognised type field-0: %.101f"
+  },
+  {
+    "file": "packet.js",
+    "format": "type:0x%02X(%s), status:0x%02X(%s), length:0x%04X, spid:0x%04X, packetId:0x%02X, window:0x%02X",
+    "args": [
+      255,
+      "field-1: %.101f",
+      257,
+      "field-3: %.101f",
+      259,
+      260,
+      261,
+      262
+    ],
+    "expected": "type:0xFF(field-1: %.101f), status:0x101(field-3: %.101f), length:0x0103, spid:0x0104, packetId:0x105, window:0x106"
+  },
+  {
+    "file": "packet.js",
+    "format": "%04X  ",
+    "args": [
+      255
+    ],
+    "expected": "00FF  "
+  },
+  {
+    "file": "packet.js",
+    "format": "%02X",
+    "args": [
+      255
+    ],
+    "expected": "FF"
+  },
+  {
+    "file": "prelogin-payload.js",
+    "format": "version:%d.%d.%d.%d, encryption:0x%02X(%s), instopt:0x%02X, threadId:0x%08X, mars:0x%02X(%s), traceId:%s",
+    "args": [
+      -3,
+      -2,
+      -1,
+      0,
+      259,
+      "field-5: %.101f",
+      261,
+      262,
+      263,
+      "field-9: %.101f",
+      "field-10: %.101f"
+    ],
+    "expected": "version:-3.-2.-1.0, encryption:0x103(field-5: %.101f), instopt:0x105, threadId:0x00000106, mars:0x107(field-9: %.101f), traceId:field-10: %.101f"
+  },
+  {
+    "file": "value-parser.js",
+    "format": "Unsupported guid size %d",
+    "args": [
+      -3
+    ],
+    "expected": "Unsupported guid size -3"
+  },
+  {
+    "file": "value-parser.js",
+    "format": "Unsupported numeric dataLength %d",
+    "args": [
+      -3
+    ],
+    "expected": "Unsupported numeric dataLength -3"
+  }
+]

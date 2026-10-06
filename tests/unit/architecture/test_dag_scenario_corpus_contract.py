@@ -967,7 +967,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # Resource exhaustion fixes: JSONSource's manifest provenance token moved to
 # 997ca99f1069c7e6. Reverting only that token reproduces the prior registry
 # digest; no resume projection or frozen oracle changes are required.
-EXPECTED_CASE_REGISTRY_SHA256 = "b5dec215ed98c17e3b91f7dfe01e1ecd093d36799948beb165f50a1b6a2188ac"
+# Release 0.8.2: only eight engine-owned plugin_version audit values moved.
+# Reverting those values reproduces the previous manifest byte-for-byte;
+# frozen semantic oracles, behavior, and the resume history pin are unchanged.
+EXPECTED_CASE_REGISTRY_SHA256 = "a797d7cabcaaba8ad94a5396a1e438642d42b5fdcaec191f3471d6ce7facf949"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

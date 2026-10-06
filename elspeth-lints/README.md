@@ -60,6 +60,20 @@ For rule authorship and protocol details, see
 [the rule author guide](../docs/elspeth-lints/rule-author-guide.md) and
 [the protocol reference](../docs/elspeth-lints/protocols.md).
 
+## Runtime Release Artifacts
+
+The release verifier uses `elspeth_lints.release.gateway_attestations` for
+gateway SBOM and SLSA v1 qualification. This validates captured registry values
+at publication time; it is not a source-tree lint rule. Its standard-library
+implementation is called through the existing release verifier:
+
+```bash
+PYTHONPATH=elspeth-lints/src python3 scripts/cicd/check_release_required_checks.py gateway-attestations --help
+```
+
+Both the required-checks mode and this post-build qualification must pass,
+followed by image scans, signing and smoke checks.
+
 During migration, `scripts/cicd/parity_harness.py` compares each `shadow`
 manifest entry's legacy-script findings against the corresponding
 `elspeth-lints` rule findings before the old gate can be cut over.

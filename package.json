@@ -7,15 +7,21 @@
   },
   "packageManager": "npm@11.6.2",
   "devDependencies": {
-    "azurite": "^3.36.0"
+    "acorn": "^8.18.0",
+    "azurite": "^3.36.0",
+    "sprintf-js": "file:tooling/tedious-formatter"
   },
   "scripts": {
-    "azurite": "azurite --silent"
+    "azurite": "azurite --silent",
+    "test:formatter": "node --test tooling/tedious-formatter/index.test.cjs"
   },
   "dependencies": {
     "playwright": "^1.61.1"
   },
   "overrides": {
-    "uuid": "^11.1.1"
+    "uuid": "^11.1.1",
+    "tedious": {
+      "sprintf-js": "$sprintf-js"
+    }
   }
 }

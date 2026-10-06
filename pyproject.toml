@@ -1,6 +1,6 @@
 [project]
 name = "elspeth"
-version = "0.8.1"
+version = "0.8.2"
 description = "Auditable Sense/Decide/Act pipelines for high-reliability systems"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -87,6 +87,7 @@ dependencies = [
     # PR-discoverability gesture. The rule: if a non-optional unit
     # test references a plugin, that plugin's deps live here.
     "chromadb>=1.5,<2",  # backs chroma_sink + rag_retrieval plugins
+    "fsspec>=2026.6.0",  # Chroma tokenizer dependency: fixes CVE-2026-104851 template execution
     "html2text>=2024.2.26",  # backs web_scrape + web_scrape_extraction transforms
     "beautifulsoup4>=4.14,<5",  # paired with html2text in web_scrape
     "pypdfium2>=5.13,<6",  # backs the pdf_rasterize transform (imported only inside its worker subprocess)
@@ -136,6 +137,7 @@ llm = [
     "httpx>=0.28,<1",  # HTTP client (inherited from main deps)
     "openai>=2.36,<3",  # OpenAI SDK
     "litellm>=1.102.0,<2",  # Bundled pricing includes the production GPT-5.6 Terra model
+    "multidict>=6.9.1,<7",  # LiteLLM's aiohttp dependency: fixes CVE-2026-104874 reference leaks
 ]
 
 azure = [
@@ -176,6 +178,7 @@ webui = [
     "httpx>=0.28,<1",
     "bcrypt>=4.3,<5",
     "litellm>=1.102.0,<2",
+    "multidict>=6.9.1,<7",  # Same security floor as the independently installable llm extra
     # Prometheus metrics exposition endpoint (B1-r3 MeterProvider precondition)
     "opentelemetry-exporter-prometheus>=0.61b0,<0.62",
     "prometheus_client>=0.21,<1",
@@ -225,6 +228,7 @@ all = [
     "jinja2>=3.1,<4",
     "openai>=2.36,<3",
     "litellm>=1.102.0,<2",
+    "multidict>=6.9.1,<7",  # Same security floor as llm/webui for the independently authored all extra
     # azure dependencies
     "azure-storage-blob>=12.28,<13",
     "azure-identity>=1.25,<2",

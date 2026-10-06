@@ -4,6 +4,69 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.2 - Unreleased (Bounded validation and release-check hardening)
+
+- **Azurite test tooling uses an owned, bounded diagnostic formatter.** Replace
+  the affected `sprintf-js` dependency only for the locked Tedious tooling
+  consumer. The replacement preserves all driver diagnostic formats and
+  removes floating-point precision operations (CVE-2026-97058). The strict
+  dependency audit remains required; CI also verifies installed consumer
+  resolution, format compatibility and blob source/sink tests without allowing
+  an unavailable emulator to silently skip that coverage.
+
+- **Composer validation keeps resource use bounded.** Source data-contract
+  demand analysis limits the source-by-field hypothesis work before copying
+  guarantees. Schema propagation reuses structural votes and stops cyclic
+  traversal. Imported capacity diagnostics remain available to the planner
+  and review surfaces. The import preview checks text size before parsing,
+  bounds file reads, rejects aliases and contains parser/conversion failures.
+- **Reference joins reject expressions and values that can exhaust memory.**
+  Materialized reference outputs have a 64 MiB canonical-byte limit in addition
+  to the existing cell limit. Output expressions that can amplify text through
+  concatenation, formatting, multiplication, eager containers or repeated
+  string-copying calls are refused. Safe expression builtins validate argument
+  counts before evaluation. Pipelines using these patterns must reduce retained
+  values or simplify their output expressions before running.
+- **Source inference and redaction handle rejected input more carefully.**
+  JSON, S3, Azure Blob and Dataverse sources commit field-resolution updates
+  after schema validation and contract inference, so failures in those steps
+  do not expand normalization state.
+  Malformed braced ODBC password values remain redacted, and Composer claim
+  matching avoids excessive regex backtracking. The frontend dependency override
+  adds a bounded braces-nesting guard for its audit graph.
+- **Composer policy feedback preserves the relevant rejection.** Source and
+  transform prevalidation carries policy error codes through planner feedback
+  and audit redaction. Transform prevalidation checks the subject without
+  synthetic source/sink plugins adding unrelated enablement failures. Invalid
+  profile aliases produce field-specific diagnostics.
+- **Release checks verify eligible PR-only evidence through merged lineage.**
+  The image gate accepts the trusted PR head's checks only when its tree matches
+  the resulting image commit and the merged PR/workflow provenance is verified.
+  Incomplete, ambiguous or pending evidence still refuses publication. Automatic
+  paid judge-quality validation was removed from CI; test timing and recovery
+  diagnostics were made more deterministic. Branch preflight can refresh its
+  named remote base without moving a local branch.
+- **Runtime dependencies exclude two newly disclosed vulnerable versions.**
+  The base install requires fsspec 2026.6.0 or newer for its reference-template
+  sandbox fix (CVE-2026-104851). The LLM, Web UI and all-feature extras require
+  multidict 6.9.1 or newer, below version 7, for its C-extension reference-leak
+  fix (CVE-2026-104874).
+- **Gateway image qualification checks current BuildKit SLSA v1 records.**
+  Each target platform must carry an SBOM and provenance matching the expected
+  source, workflow and build run. Missing or conflicting identities refuse
+  qualification and release promotion; image scans, signing, signature
+  verification and smoke checks remain required.
+
+**Upgrade and publication notes.** Session epoch 71 and Landscape epoch 49
+are unchanged from 0.8.1; this release adds no schema-epoch cutover. Installations
+still on 0.8.0 must follow the paired database recreation described in the
+[0.8.1 notes](#081---2026-09-10-replica-recovery-and-deployment-hardening) and
+[cutover runbook](docs/runbooks/staging-session-db-recreation.md). These notes
+describe source changes, not a published image. An earlier GHCR publishing
+attempt was denied with `write_package`; this candidate does not establish
+registry access or publication. Confirm a published tag or digest for the
+intended commit before using container installation instructions.
+
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
 - **Composer CSV repair guidance follows the runtime field contract.** Source

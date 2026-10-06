@@ -1,0 +1,12 @@
+{
+  "linux/amd64": {
+    "SPDX": {
+      "SPDXID": "SPDXRef-DOCUMENT"
+    }
+  },
+  "linux/arm64": {
+    "SPDX": {
+      "SPDXID": "SPDXRef-DOCUMENT"
+    }
+  }
+}

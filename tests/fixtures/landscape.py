@@ -315,6 +315,10 @@ def reschedule_work_item(engine: Any, work_item_id: str, *, seconds_from_now: fl
     return available_at
 
 
+class DatabaseSecondRollover(AssertionError):
+    """A boundary action crossed a database clock tick; its timing premise is invalid."""
+
+
 def on_fresh_database_second(engine: Any, action: Any) -> Any:
     """Run ``action(database_now)`` just after a database-second boundary and return its result.
 
@@ -338,7 +342,7 @@ def on_fresh_database_second(engine: Any, action: Any) -> Any:
     result = action(before)
     after = landscape_database_now(engine)
     if after != before:
-        raise AssertionError(
+        raise DatabaseSecondRollover(
             f"the Landscape database second rolled over during the boundary action ({before.isoformat()} -> {after.isoformat()})"
         )
     return result

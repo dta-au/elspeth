@@ -31,7 +31,7 @@ procedures are `docs/runbooks/azure-container-apps-cold-install.md`,
 > Single/sticky routing, with PostgreSQL progress and shared budgets verified
 > through local mechanism/integration evidence. No live cloud
 > acceptance is claimed. A future receipt at
-> `docs/operator/evidence/azure-container-apps/0.8.1.json` must come from actual
+> `docs/operator/evidence/azure-container-apps/0.8.2.json` must come from actual
 > operator execution; it is no longer a closure or documentation-promotion gate.
 
 ## Scope first

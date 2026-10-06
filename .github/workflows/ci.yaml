@@ -1066,6 +1066,20 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: npm audit --package-lock-only --audit-level=low
 
+      - name: Check installed Azurite formatter compatibility
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          npm ci
+          npm run test:formatter
+
+      - name: Prove required Azurite blob integration
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: >-
+          uv run --frozen --all-extras python -m pytest
+          tests/e2e/external/test_blob_source.py
+          tests/e2e/external/test_blob_sink.py
+          --require-azurite -n 0 -q -rA
+
       - name: Check Python dependency licenses
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
