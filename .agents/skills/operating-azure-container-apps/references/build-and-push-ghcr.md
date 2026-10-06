@@ -16,7 +16,7 @@ cd "$(git rev-parse --show-toplevel)"
 set -euo pipefail
 SOURCE_SHA=$(git rev-parse HEAD)
 git status --short --branch
-git rev-list --left-right --count "origin/release/0.8.1...$SOURCE_SHA"
+git rev-list --left-right --count "origin/main...$SOURCE_SHA"
 IMAGE="ghcr.io/dta-au/elspeth:sha-${SOURCE_SHA}"
 BUILD_DIR=$(mktemp -d /tmp/elspeth-ghcr-source-XXXXXX)
 git archive --format=tar "$SOURCE_SHA" | tar -xf - -C "$BUILD_DIR"
