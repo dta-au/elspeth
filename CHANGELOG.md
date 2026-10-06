@@ -38,6 +38,16 @@ All notable changes to ELSPETH are documented here.
   paid judge-quality validation was removed from CI; test timing and recovery
   diagnostics were made more deterministic. Branch preflight can refresh its
   named remote base without moving a local branch.
+- **Runtime dependencies exclude two newly disclosed vulnerable versions.**
+  The base install requires fsspec 2026.6.0 or newer for its reference-template
+  sandbox fix (CVE-2026-104851). The LLM, Web UI and all-feature extras require
+  multidict 6.9.1 or newer, below version 7, for its C-extension reference-leak
+  fix (CVE-2026-104874).
+- **Gateway image qualification checks current BuildKit SLSA v1 records.**
+  Each target platform must carry an SBOM and provenance matching the expected
+  source, workflow and build run. Missing or conflicting identities refuse
+  qualification and release promotion; image scans, signing, signature
+  verification and smoke checks remain required.
 
 **Upgrade and publication notes.** Session epoch 71 and Landscape epoch 49
 are unchanged from 0.8.1; this release adds no schema-epoch cutover. Installations

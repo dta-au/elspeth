@@ -322,19 +322,17 @@ jobs:
           docker buildx imagetools inspect "$gateway_image" \
             --format '{{ json .Provenance }}' \
             >.build-evidence/gateway-provenance.json
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          sbom = json.loads(Path(".build-evidence/gateway-sbom.spdx.json").read_text())
-          provenance = json.loads(Path(".build-evidence/gateway-provenance.json").read_text())
-          sbom_text = json.dumps(sbom, sort_keys=True)
-          provenance_text = json.dumps(provenance, sort_keys=True)
-          assert '"SPDXID": "SPDXRef-DOCUMENT"' in sbom_text
-          assert "https://mobyproject.org/buildkit" in provenance_text
-          assert os.environ["IMAGE_SHA"] in provenance_text
-          PY
+          python3 scripts/cicd/check_gateway_attestations.py \
+            --sbom .build-evidence/gateway-sbom.spdx.json \
+            --provenance .build-evidence/gateway-provenance.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$IMAGE_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --workflow-ref "$GITHUB_WORKFLOW_REF" \
+            --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+            --server-url "$GITHUB_SERVER_URL" \
+            --platforms "$PLATFORMS"
 
       - name: Scan published gateway amd64 digest
         if: steps.gateway-ghcr-push.outputs.digest != ''

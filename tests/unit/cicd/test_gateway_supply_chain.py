@@ -204,7 +204,13 @@ def test_release_publishes_signed_attested_gateway_digest_and_smokes_it() -> Non
 
     inspect = _step(build, "Inspect gateway SBOM and provenance attestations")["run"]
     assert ".SBOM" in inspect and ".Provenance" in inspect
-    assert 'os.environ["IMAGE_SHA"]' in inspect
+    assert "python3 scripts/cicd/check_gateway_attestations.py" in inspect
+    assert '--source-sha "$IMAGE_SHA"' in inspect
+    assert '--platforms "$PLATFORMS"' in inspect
+    assert '--run-id "$GITHUB_RUN_ID"' in inspect
+    assert '--run-attempt "$GITHUB_RUN_ATTEMPT"' in inspect
+    assert '--workflow-ref "$GITHUB_WORKFLOW_REF"' in inspect
+    assert '--workflow-sha "$GITHUB_WORKFLOW_SHA"' in inspect
     for platform in ("amd64", "arm64"):
         scan = _step(build, f"Scan published gateway {platform} digest")
         assert re.fullmatch(r"aquasecurity/trivy-action@[0-9a-f]{40}", scan["uses"])
