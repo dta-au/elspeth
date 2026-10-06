@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-ELSPETH is currently on the `0.8.1` release line. Security
+ELSPETH is currently on the `0.8.2` release line. Security
 fixes are prioritised against the current release branch and `main`.
 Older release snapshots are retained for provenance, but are not
 maintained as separately supported long-term release lines.

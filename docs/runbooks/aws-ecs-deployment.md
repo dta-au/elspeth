@@ -1611,7 +1611,7 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_task_definition": "exact-candidate-task-definition-arn",
   "candidate_doctor_task_definition": "exact-candidate-doctor-task-definition-arn",
-  "candidate_package_version": "0.8.1",
+  "candidate_package_version": "0.8.2",
   "previous_source_sha": "40-lowercase-hex",
   "previous_image_digest": "sha256:64-lowercase-hex",
   "previous_task_definition": "exact-previous-task-definition-arn",
