@@ -28,7 +28,7 @@ SELECTOR_MANIFEST = "docs/architecture/state_engine/proof-catalog/v3/evidence_se
 PLUGIN_MATRIX = "tests/golden/state_engine/plugin_lifecycle_matrix.json"
 ACTION_PINS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
-    "astral-sh/setup-uv": "c771a70e6277c0a99b617c7a806ffedaca235ff9",
+    "astral-sh/setup-uv": "c18668ad3cf93ea998bef934396af7bb5c839dc7",
 }
 
 
