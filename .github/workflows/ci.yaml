@@ -995,28 +995,16 @@ jobs:
             --no-emit-package elspeth-lints \
             --format requirements-txt \
             --output-file requirements-audit.txt
-          # CVE-2026-45829 has no fixed chromadb release as of 2026-06-03 (the
-          # pip-audit "Fix Versions" column is empty). chromadb backs the
-          # chroma_sink + rag_retrieval plugins; remove this ignore and bump the
-          # pin once an upstream fix ships. PyJWT advisories PYSEC-2026-175/177/
-          # 178/179 and CVE-2026-102274 are NOT ignored — the authored floor
-          # and uv.lock select PyJWT 2.15.0 or newer.
-          #
-          # CVE-2026-45830 / CVE-2026-45831 / CVE-2026-45833 (added 2026-09-10)
-          # likewise have no fixed chromadb release. All three are defects in the
-          # ChromaDB *server*: cross-tenant read/write through missing
-          # authorization validation on /api/v2/tenants/... (45830), a
-          # SimpleRBACAuthorizationProvider that checks the permission but never
-          # the tenant/database/collection it applies to (45831), and
-          # trust_remote_code arbitrary code execution reachable by a caller
-          # holding UPDATE_COLLECTION (45833). ELSPETH never runs that server: it
-          # is a client only — chromadb.Client / PersistentClient / HttpClient in
-          # plugins/infrastructure/clients/retrieval/chroma.py, sinks/chroma_sink.py
-          # and infrastructure/probe_factory.py — and registers no authorization
-          # provider and no /api/v2 route. An operator who points HttpClient at a
-          # Chroma server they host owns that server's exposure; this ignore does
-          # not extend to it. Remove all four chromadb ignores and bump the pin
-          # once upstream ships a fix.
+          # Temporary Chroma exceptions: the current lock selects chromadb 1.5.5.
+          # These four advisories remain accepted findings, not fixed code.
+          # Client embedding configuration is also implicated; client-only or
+          # Rust-server use is not a complete mitigation. README warns against
+          # rag_retrieval/provider:chroma, chroma_sink and all Chroma examples.
+          # Review by 2026-10-30, sooner on advisory/package changes or an
+          # upstream fix. See docs/security-assurance/10-vulnerability-and-supply-chain.md
+          # section 3.4 and https://github.com/dta-au/elspeth/issues/280.
+          # Remove all four ignores after a verified fix or replacement.
+          # PyJWT advisories are NOT ignored; the lock selects 2.15.0 or newer.
           uv run --frozen --all-extras --group audit pip-audit \
             --strict \
             --timeout 60 \

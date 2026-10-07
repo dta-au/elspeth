@@ -76,11 +76,27 @@ def _assert_main_release_scan_contract(job: dict[str, Any]) -> None:
             assert step["with"]["scanners"] == "vuln"
             assert step["with"]["severity"] == "CRITICAL,HIGH"
             assert step["with"]["ignore-unfixed"] is False
-            assert step["with"]["exit-code"] == "1"
-            report = f"main-vulnerabilities-{file_label}-linux-{architecture}.txt"
+            assert step["with"]["exit-code"] == "0"
+            assert step["with"]["format"] == "json"
+            assert step["env"]["TRIVY_SHOW_SUPPRESSED"] == "true"
+            for variable in ("TRIVY_IGNORE_POLICY", "TRIVY_IGNOREFILE", "TRIVY_CONFIG"):
+                assert step["env"][variable] == ""
+            report = f"main-vulnerabilities-{file_label}-linux-{architecture}.json"
+            summary = f"main-qualification-{file_label}-linux-{architecture}.json"
             assert report in step["with"]["output"]
-            assert _step_index(job, build_name) < _step_index(job, name) < _step_index(job, sign_name)
-            evidence_files.append(report)
+            gate_name = f"Qualify published main {registry_label} {architecture} digest"
+            gate = _one_step(job, gate_name)
+            assert gate["env"]["SCANNED_IMAGE"] == image_ref
+            assert gate["if"] == step["if"]
+            assert "check_main_image_vulnerabilities.py" in gate["run"]
+            assert '--image "$SCANNED_IMAGE"' in gate["run"]
+            assert f"--platform linux/{architecture}" in gate["run"]
+            assert f"--report .build-evidence/{report}" in gate["run"]
+            assert f"--summary .build-evidence/{summary}" in gate["run"]
+            assert gate.get("continue-on-error", False) is False
+            assert "||" not in gate["run"]
+            assert _step_index(job, build_name) < _step_index(job, name) < _step_index(job, gate_name) < _step_index(job, sign_name)
+            evidence_files.extend((report, summary))
 
     evidence = _one_step(job, "Upload main image qualification evidence")["with"]
     assert evidence["retention-days"] == 90
@@ -93,27 +109,49 @@ def _compliant_main_release_job() -> dict[str, Any]:
     for registry_label, image_ref, build_name, sign_name, file_label in _MAIN_SCAN_CASES:
         steps.append({"name": build_name})
         for architecture in _PLATFORMS:
-            report = f"main-vulnerabilities-{file_label}-linux-{architecture}.txt"
+            report = f"main-vulnerabilities-{file_label}-linux-{architecture}.json"
+            summary = f"main-qualification-{file_label}-linux-{architecture}.json"
+            condition = "steps.test.outputs.digest != ''"
             steps.append(
                 {
                     "name": f"Scan published main {registry_label} {architecture} digest",
                     "uses": "aquasecurity/trivy-action@" + "a" * 40,
-                    "env": {"TRIVY_PLATFORM": f"linux/{architecture}"},
+                    "if": condition,
+                    "env": {
+                        "TRIVY_PLATFORM": f"linux/{architecture}",
+                        "TRIVY_IGNORE_POLICY": "",
+                        "TRIVY_IGNOREFILE": "",
+                        "TRIVY_CONFIG": "",
+                        "TRIVY_SHOW_SUPPRESSED": "true",
+                    },
                     "with": {
                         "image-ref": image_ref,
+                        "format": "json",
                         "output": f".build-evidence/{report}",
                         "scanners": "vuln",
                         "severity": "CRITICAL,HIGH",
                         "ignore-unfixed": False,
-                        "exit-code": "1",
+                        "exit-code": "0",
                     },
+                }
+            )
+            steps.append(
+                {
+                    "name": f"Qualify published main {registry_label} {architecture} digest",
+                    "if": condition,
+                    "env": {"SCANNED_IMAGE": image_ref},
+                    "run": (
+                        'python3 scripts/cicd/check_main_image_vulnerabilities.py --image "$SCANNED_IMAGE" '
+                        f"--platform linux/{architecture} --report .build-evidence/{report} --summary .build-evidence/{summary}"
+                    ),
                 }
             )
         steps.append({"name": sign_name})
     evidence_paths = "\n".join(
-        f".build-evidence/main-vulnerabilities-{registry}-linux-{architecture}.txt"
+        f".build-evidence/main-{kind}-{registry}-linux-{architecture}.json"
         for registry in ("ghcr", "acr")
         for architecture in _PLATFORMS
+        for kind in ("vulnerabilities", "qualification")
     )
     steps.append(
         {
@@ -153,9 +191,19 @@ def test_main_release_scan_validator_rejects_missing_rebound_late_or_unretained_
 
     unretained = copy.deepcopy(job)
     evidence = _one_step(unretained, "Upload main image qualification evidence")
-    evidence["with"]["path"] = evidence["with"]["path"].replace("main-vulnerabilities-acr-linux-amd64.txt", "")
+    evidence["with"]["path"] = evidence["with"]["path"].replace("main-vulnerabilities-acr-linux-amd64.json", "")
     with pytest.raises(AssertionError, match="must retain"):
         _assert_main_release_scan_contract(unretained)
+
+    bypassed = copy.deepcopy(job)
+    _one_step(bypassed, "Qualify published main GHCR amd64 digest")["continue-on-error"] = True
+    with pytest.raises(AssertionError):
+        _assert_main_release_scan_contract(bypassed)
+
+    rebound_gate = copy.deepcopy(job)
+    _one_step(rebound_gate, "Qualify published main ACR-only arm64 digest")["env"]["SCANNED_IMAGE"] = "registry.example/elspeth:mutable"
+    with pytest.raises(AssertionError):
+        _assert_main_release_scan_contract(rebound_gate)
 
 
 def _assert_container_is_digest_pinned(job_name: str, job: dict[str, Any]) -> None:

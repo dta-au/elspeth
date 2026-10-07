@@ -367,28 +367,57 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         env:
           TRIVY_PLATFORM: linux/amd64
+          TRIVY_IGNORE_POLICY: ''
+          TRIVY_IGNOREFILE: ''
+          TRIVY_CONFIG: ''
+          TRIVY_SHOW_SUPPRESSED: 'true'
         with:
           image-ref: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}@${{ steps.ghcr-push.outputs.digest }}
-          format: table
-          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-amd64.txt
+          format: json
+          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-amd64.json
           scanners: vuln
           severity: CRITICAL,HIGH
           ignore-unfixed: false
-          exit-code: "1"
+          # Capture all findings; the immediately following gate decides qualification.
+          exit-code: "0"
+
+      - name: Qualify published main GHCR amd64 digest
+        if: steps.ghcr-push.outputs.digest != ''
+        env:
+          SCANNED_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}@${{ steps.ghcr-push.outputs.digest }}
+        run: |
+          python3 scripts/cicd/check_main_image_vulnerabilities.py \
+            --image "$SCANNED_IMAGE" --platform linux/amd64 \
+            --report .build-evidence/main-vulnerabilities-ghcr-linux-amd64.json \
+            --summary .build-evidence/main-qualification-ghcr-linux-amd64.json
 
       - name: Scan published main GHCR arm64 digest
         if: steps.ghcr-push.outputs.digest != ''
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         env:
           TRIVY_PLATFORM: linux/arm64
+          TRIVY_IGNORE_POLICY: ''
+          TRIVY_IGNOREFILE: ''
+          TRIVY_CONFIG: ''
+          TRIVY_SHOW_SUPPRESSED: 'true'
         with:
           image-ref: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}@${{ steps.ghcr-push.outputs.digest }}
-          format: table
-          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-arm64.txt
+          format: json
+          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-arm64.json
           scanners: vuln
           severity: CRITICAL,HIGH
           ignore-unfixed: false
-          exit-code: "1"
+          exit-code: "0"
+
+      - name: Qualify published main GHCR arm64 digest
+        if: steps.ghcr-push.outputs.digest != ''
+        env:
+          SCANNED_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}@${{ steps.ghcr-push.outputs.digest }}
+        run: |
+          python3 scripts/cicd/check_main_image_vulnerabilities.py \
+            --image "$SCANNED_IMAGE" --platform linux/arm64 \
+            --report .build-evidence/main-vulnerabilities-ghcr-linux-arm64.json \
+            --summary .build-evidence/main-qualification-ghcr-linux-arm64.json
 
       # -----------------------------------------------------------------------
       # ACR publication.
@@ -442,28 +471,56 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         env:
           TRIVY_PLATFORM: linux/amd64
+          TRIVY_IGNORE_POLICY: ''
+          TRIVY_IGNOREFILE: ''
+          TRIVY_CONFIG: ''
+          TRIVY_SHOW_SUPPRESSED: 'true'
         with:
           image-ref: ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.acr-push.outputs.digest }}
-          format: table
-          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-amd64.txt
+          format: json
+          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-amd64.json
           scanners: vuln
           severity: CRITICAL,HIGH
           ignore-unfixed: false
-          exit-code: "1"
+          exit-code: "0"
+
+      - name: Qualify published main ACR-only amd64 digest
+        if: steps.acr-push.outputs.digest != ''
+        env:
+          SCANNED_IMAGE: ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.acr-push.outputs.digest }}
+        run: |
+          python3 scripts/cicd/check_main_image_vulnerabilities.py \
+            --image "$SCANNED_IMAGE" --platform linux/amd64 \
+            --report .build-evidence/main-vulnerabilities-acr-linux-amd64.json \
+            --summary .build-evidence/main-qualification-acr-linux-amd64.json
 
       - name: Scan published main ACR-only arm64 digest
         if: steps.acr-push.outputs.digest != ''
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         env:
           TRIVY_PLATFORM: linux/arm64
+          TRIVY_IGNORE_POLICY: ''
+          TRIVY_IGNOREFILE: ''
+          TRIVY_CONFIG: ''
+          TRIVY_SHOW_SUPPRESSED: 'true'
         with:
           image-ref: ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.acr-push.outputs.digest }}
-          format: table
-          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-arm64.txt
+          format: json
+          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-arm64.json
           scanners: vuln
           severity: CRITICAL,HIGH
           ignore-unfixed: false
-          exit-code: "1"
+          exit-code: "0"
+
+      - name: Qualify published main ACR-only arm64 digest
+        if: steps.acr-push.outputs.digest != ''
+        env:
+          SCANNED_IMAGE: ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.acr-push.outputs.digest }}
+        run: |
+          python3 scripts/cicd/check_main_image_vulnerabilities.py \
+            --image "$SCANNED_IMAGE" --platform linux/arm64 \
+            --report .build-evidence/main-vulnerabilities-acr-linux-arm64.json \
+            --summary .build-evidence/main-qualification-acr-linux-arm64.json
 
       # -----------------------------------------------------------------------
       # Sign pushed image digests with GitHub OIDC/Sigstore.
@@ -521,10 +578,14 @@ jobs:
         with:
           name: main-image-qualification-${{ env.IMAGE_SHA }}
           path: |
-            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-amd64.txt
-            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-arm64.txt
-            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-amd64.txt
-            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-arm64.txt
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-amd64.json
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-arm64.json
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-amd64.json
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-arm64.json
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-qualification-ghcr-linux-amd64.json
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-qualification-ghcr-linux-arm64.json
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-qualification-acr-linux-amd64.json
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-qualification-acr-linux-arm64.json
           if-no-files-found: error
           retention-days: 90
 
