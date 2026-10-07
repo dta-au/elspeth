@@ -1,0 +1,1269 @@
+{
+  "source_base_commit": "d2b73990d137e9725200c897544eebc5b958fdf4",
+  "source_and_modes": {
+    "config/cicd/soft-mapping-census.yaml": {
+      "sha256": "773cd2e115c098395132f256b3e9a14f07f40e40df62d0915081332d2bc0fd0e",
+      "mode": "0o664"
+    },
+    "deploy/aws-ecs/terraform/README.md": {
+      "sha256": "fa89fdc1996efb01fc24ea756f4b75d019e23853e7ff1331413ab724bd79729a",
+      "mode": "0o664"
+    },
+    "deploy/aws-ecs/terraform/modules/scenario/locals.tf": {
+      "sha256": "f00fc43f1f7a500ddf71476e2cea1a4ea8a007280b9b478705d3b0a468049048",
+      "mode": "0o664"
+    },
+    "deploy/aws-ecs/terraform/modules/scenario/variables.tf": {
+      "sha256": "9c6cbb2d7c9e26b4b4e38190bd8d9762318ecf6346ab0566225256c8f0dc41a3",
+      "mode": "0o664"
+    },
+    "deploy/azure-container-apps/scripts/acceptance.sh": {
+      "sha256": "50cabfa84c79d8400a5667950f289106790090243e2a826d4e1ad82d7413ed8f",
+      "mode": "0o775"
+    },
+    "deploy/azure-container-apps/scripts/validate-workload-parameters.jq": {
+      "sha256": "b9b294641d2cc7b0a49638a85beff05ba47dc2c3ea64d2fc4717de5f883f978e",
+      "mode": "0o664"
+    },
+    "deploy/azure-container-apps/workload.bicep": {
+      "sha256": "c8baf17fddcbf97e850c52566ea41f5ba2a1c7cd992b9f314aff13af3494658e",
+      "mode": "0o664"
+    },
+    "evals/composer-battery/README.md": {
+      "sha256": "15f154c533ffbe6895e727d8cc42ecdae289f7b6a9f2c923dcdeb3a4379acfd8",
+      "mode": "0o664"
+    },
+    "evals/composer-battery/drive_battery.py": {
+      "sha256": "84ad688d2b776cd3563e6e4b6f40f6f6285dd3bb0c57cf12b6afe170143c7a2d",
+      "mode": "0o664"
+    },
+    "evals/lib/battery_planner.py": {
+      "sha256": "3b213c1f25634999efc6d170fc0eb85253ad6b5bd2e55d95844902cd4fd333e2",
+      "mode": "0o664"
+    },
+    "evals/lib/battery_score.py": {
+      "sha256": "970d9a28685e775970d5d6b8a87b0701702c9d7f92aba5a85fc9c65fdb5f5b7a",
+      "mode": "0o664"
+    },
+    "evals/lib/common.sh": {
+      "sha256": "07c46c7aa0b541442ae9fd1d9c3ff6835b128202509d2a43cbba72105529375e",
+      "mode": "0o775"
+    },
+    "scripts/acceptance_battery.py": {
+      "sha256": "e5e9fa053d4ca9dd9ae051cb58648287ad4c887b31f9eca1af10a6808dbb429e",
+      "mode": "0o664"
+    },
+    "scripts/composer_acceptance/runner.py": {
+      "sha256": "41c4062ac8a94b49338a5dea24ae5c95727db48021e952d93ed866b833f32aee",
+      "mode": "0o664"
+    },
+    "src/elspeth/contracts/errors.py": {
+      "sha256": "c785f78dc16d3a0c5a1ff2d88cf03ed3d10f07c2923a910e7d06e0fe0ff201aa",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/_acceptance_common/replica_probes.py": {
+      "sha256": "f9ee8858c97a8403abac862710499ea059f16a061c6f4602e1d0792617a4f869",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/_aws_ecs_acceptance/operator_telemetry.py": {
+      "sha256": "3de3e3319b1b206fdccbaede1c52782adaf6760cd7229529faeea6cb81b5f0eb",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/_azure_container_apps_acceptance/controller.py": {
+      "sha256": "4358c2dd8d331e0d2c470d63a53a670a2ee22a5cb563ed2e8dbe2bbde081ecf1",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/app.py": {
+      "sha256": "145a21bf0ccdbda295f7f0da6be4b6af3b37e688da7e1542c63cc5d2bfbead29",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/async_workers.py": {
+      "sha256": "4ba4114d208517255750712a0036b5a082315de8951e8997c9d1aefa7bf8f517",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/azure_container_apps_acceptance.py": {
+      "sha256": "43bbd2337d558237d30e3db28ac0e548b24f693b6e306927e2424b4fbc7f88f0",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/azure_container_apps_observations.py": {
+      "sha256": "97fd4cb93adc8e2ad549aaa6b25c61bfac5fa54eb2a72e422f824c52efd5b1e6",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/azure_container_apps_single_revision.py": {
+      "sha256": "7a4d7c30acc8657450444e99efa76681b13ce83d7f9dd557811bbcb3df7c380d",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/advisor_checkpoint.py": {
+      "sha256": "5997d8d7273b79dce57472bf524e1fd07ee27411dc23056893cfc49a68df9429",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/audit.py": {
+      "sha256": "8afab816a2b9122ffc31bccf76fe92b6d6d1716fdf2f30a197fda00f1178925f",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/bounded_json.py": {
+      "sha256": "0eba05ae6012dea37773751d0b838895b6fb155944ae442b3e666f040c1af41b",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/composition_completion.py": {
+      "sha256": "64a7011a24513b9a685fe95fd5c02b8627d2432d78a6d35fbfa52350815b7f22",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/interpretation_surfacing.py": {
+      "sha256": "66943c94163f8ff2d48ea3adfc25fdd8a0cd8e0d99784ce93110ed8a14e79bd7",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/llm_response_parsing.py": {
+      "sha256": "56210fe5ef192acc4a3c5bc44266ce03956a7e8f792f3eab5684a78e5c6b1a02",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/pipeline_planner.py": {
+      "sha256": "c09a0a6dc877cb7039c40e3f4d66d518ca5b63dfc145e3e2302f49905494fb4a",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/planning_application.py": {
+      "sha256": "83595117a064284017cd53ca7c763693bf687ea1758fb50711f51b8c66f0b762",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/progress.py": {
+      "sha256": "49a795e6ddf4fec5ea77db962d75e5eed5637523f0948f9bc7fc443c090d810f",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/protocol.py": {
+      "sha256": "063e2c16eab2757f8c7e6fcb62cd6901d839fe90245572972db6f67a67669ab5",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/provider_gateway.py": {
+      "sha256": "92e08c63c9d8c37990505152d1a05df96a2c6b4f6d441c4c277851c479fc758d",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/provider_quota.py": {
+      "sha256": "bef5ca0ba886c999910ac201fd448d96f50a334443605df4f5153b4f7a1cd5b2",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/service.py": {
+      "sha256": "3ff50fd5d9ee44032ac431d957aba3106a02f29f932c994b5f5f12ca72df18f6",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/tool_batch.py": {
+      "sha256": "3e4209a3c8bca40601c707dcfefcd0e51af85ccca8d9f62fd42ad45b03463793",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer/turn_audit.py": {
+      "sha256": "3f9b8aaacb50cca855b3c056f08fea1127f819eeb709e501f5adbd4909b8a309",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/config.py": {
+      "sha256": "33cc459141824dc61ec8e6a4410d9af589501552197ddc568e4a5fdf88262831",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/coordination/composer_progress_authority.py": {
+      "sha256": "04acc6ba2b0063cf24d3b903e8dd217dfe7cbdd61a419474d2fce8ea19c16a7c",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/coordination/lifecycle.py": {
+      "sha256": "b20314c1ab30c2bf9bb858a7680753d2d65b490d9018484dfd5cbc2495f4d1a3",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/coordination/membership_lifecycle.py": {
+      "sha256": "13eb66d794ccec2cd1c89c086c0abdc483e7b8497bfb37745f8b5755d6bcf3a8",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/coordination/repository.py": {
+      "sha256": "945a8f226e0a73929b7489fedeb0256896a5a0c07f5b284a3ad03702730d6e32",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/execution/recovery.py": {
+      "sha256": "33a837822149e283d4da30b02b85c128c3391638e374be7fc8deba57e0186415",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/execution/routes.py": {
+      "sha256": "2f91459ea1c65782810c894a3628b798aab22afb2b49fba79b60833683f7463d",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/execution/service.py": {
+      "sha256": "566a107c62e7cfe61fef4310bf76cf84c4cb9711d03f7e4b6d87fd3edcf44ca5",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/App.test.tsx": {
+      "sha256": "d0a78524280bc4fd29844e9f7eda6c4a2c171b2b76f5cf2c2604e06d947d339a",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/App.tsx": {
+      "sha256": "009f6fcbb10571a46ddffc585e4d6f9027441e440a81ed243f46f28b5cdee384",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/api/client.auth-races.test.ts": {
+      "sha256": "1be525d436bac0651709bfff01ccb430c15480c3ea4c6313f30736b5445f6a37",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/api/client.recovery.test.ts": {
+      "sha256": "f3c9c1f22892aafa07e986b5c4e0b5aad4b19972e0a7175a0918b0791562e180",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/api/client.ts": {
+      "sha256": "5cbe78946fb48f53d2742c849e3a2fa575f4ce7c6c4b9260afcead496aa68d5c",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/chat/ChatInput.test.tsx": {
+      "sha256": "367d27b95ba1f0715b77cadd15e8de00b929a6bc4c63f297eaa73cb025372041",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/chat/ChatInput.tsx": {
+      "sha256": "ae5480696d3b778ee8b637cc47a4401e543ffe8cc6300077471d3602f25dda21",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/chat/ChatPanel.test.tsx": {
+      "sha256": "57b3aff082e71e34ffadb676150867d89dc610ca8e6e319cc041d34fcc7e9609",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/chat/ChatPanel.tsx": {
+      "sha256": "54ee486134e56ea6e4fbe32f7853e1ab67e838663e0502bb1fc78090b9a5a5e5",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/chat/DecisionPanel.tsx": {
+      "sha256": "53770290e4c06892695e78fd6e8eb5fef80fa5ca7bb704fc640ebeb874a6149d",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/chat/MessageBubble.test.tsx": {
+      "sha256": "e0ffcd6a8840b74a6ab21dfea3dccfaf75542a8526ad8c7099406fffad9b892e",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/chat/MessageBubble.tsx": {
+      "sha256": "7dbb6a030094830bbbad34be399b2fe8b7f3dfaca96248e7abd13f0b05b487bc",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/header/HeaderVersionSelector.tsx": {
+      "sha256": "2032f143ee946323e72e378df24f13bc838775dee7c365ad4315b1bc810eb6a4",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/sidebar/ImportYamlModal.tsx": {
+      "sha256": "8c979e3900c3f68a5480a731abe5b88d98d33d079c0bb67981daf7b71e61adc2",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/sidebar/SideRailValidationBanner.test.tsx": {
+      "sha256": "40ad43fe2087c1a8ef97573898e429b4b993eb29f84a12ba5baa19c771443c5d",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/sidebar/SideRailValidationBanner.tsx": {
+      "sha256": "e319fa9a2f42d1dcb357a03fb34cc7e646cb8436deecc8652a919fa3824979d2",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/tutorial/TutorialFreeformShell.integration.test.tsx": {
+      "sha256": "6f86592da51a38ec044f66e1c60710573b204e8245d539a8f312f172b39eb15a",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/tutorial/TutorialFreeformShell.test.tsx": {
+      "sha256": "a0e53f4b2aae12557e1fc96fce6887afaedeece26e881a6589f6638dbc1e6e34",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/tutorial/TutorialFreeformShell.tsx": {
+      "sha256": "204368f2046ce980c15e5bcd26c222840f05cce6469d4f7f657b4b914c289667",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/config/composer.test.ts": {
+      "sha256": "0ca9c45244b5e5b3d6dd77f6df6f32960a63ad91d85c5cff583664e897542d56",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/config/composer.ts": {
+      "sha256": "f6692fbaea30635c7f1e044e796d9a22a945b8e321c4b96f74a16800505fbaa9",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/hooks/useComposer.test.ts": {
+      "sha256": "b1172dd8d79b3faca8aaff26fe0f110fe5e3a3ea87bb48bc6069a7846ac8a6ca",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/hooks/useInterpretationResolver.ts": {
+      "sha256": "77fc9aae1269b9751942fdedfc592e8a6308e0c11901618ebeeb77cb29a908c6",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/stores/authStore.test.ts": {
+      "sha256": "a4ad1c99a932c22d846981e5da0430afad96e542743d8335fa7f3a13d9fbb1f4",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/stores/authStore.ts": {
+      "sha256": "a38dec31038116c998c1535ee3e022d7841b447f49d27f072bb61ff93579b7b4",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/stores/sessionStore.test.ts": {
+      "sha256": "a07a0864ac6ecb48b5eadf1609bdc4bc115907e6870bb8067b2e1e235e8f7544",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/stores/sessionStore.ts": {
+      "sha256": "373b286141a58b5bfb24cad67447ea4459e38b2d74f070a92b4bc20cfc34c887",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/test/composerOwnership.integration.test.tsx": {
+      "sha256": "85da69e25ca9efbc8d44fd93fbded3704f9a53d42e658ded5c90c07de9792227",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/test/inlineSourceIntegration.test.tsx": {
+      "sha256": "8655aa59e32f69dcea5c487001a3f02b6861436198b993e3544e36be72cb18fc",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/types/index.ts": {
+      "sha256": "6f7f78eb5aa17b73698e46a77d1178650ba7d483a82d34da60738a134982c79b",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/tests/e2e/composer-proposals.spec.ts": {
+      "sha256": "cc50c574346360604c1c35d652604fe61d6b62a6469a8580206e26b9a5b3d48f",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/tests/e2e/harness/transition-ledger.test.ts": {
+      "sha256": "d16e4b2622b0deb4a945899f417f77c427e96f7d1083a02a5ec655e30584a03a",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/tests/e2e/harness/transition-ledger.ts": {
+      "sha256": "92bcb35e6b117b0315917e732c2eff092173b38293350fc734fa5f301f231e31",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/tests/e2e/helpers/transition-ledger-recorder.ts": {
+      "sha256": "520d1ebfe7f9eea252ad46c276aa9450ff640e71ca56dad038d432c5067dc0fc",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/tests/e2e/tutorial.spec.ts": {
+      "sha256": "edcfcf5c86cfc02a159ef605bd0c346b093a3a6feb02205ab0f58a01f36d8d35",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/operator_telemetry.py": {
+      "sha256": "bd94719a6dc80883974675d79e87dbf119a8b19d47245095573029e224a0bb45",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/process_recovery.py": {
+      "sha256": "25aa5bf8da155584cfde1b7232700dc18e9d754f43385c9737c76c93b37f794c",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/_auto_title.py": {
+      "sha256": "55202b7f0f1cb9b205eec2cb7fc7f33b16825ff05e58275f3d69fee119f7599d",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/models.py": {
+      "sha256": "c39984d80a9691e3baa830e249780eb65ad05076eff1d6e8ff52811f93681f23",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/mutation_capabilities.py": {
+      "sha256": "38a5a5b32e6247a125a32c7da3d25d6d10ef59b0e70e20aa7f083472ac4cfc15",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/operation_receipts.py": {
+      "sha256": "5dca64ff613bc45f1edd8deaab0227e40e5a0bd19ecafc400428ccfecc9ac8fd",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/pending_interpretation.py": {
+      "sha256": "666450d17e0d6b701fe702a07c6b1e8658b41e5a8a4e34a7d483c03cdcc2959d",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/proposal_authority.py": {
+      "sha256": "df443ca3632dff2ce584254351f5246be22692a98861b60626cbf2f9018ba270",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/protocol.py": {
+      "sha256": "897c4201badf2113cb0985937d48cbc7f9b0ee6f5d505dc4917fefe60050098e",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/routes/_helpers.py": {
+      "sha256": "d085d9791bde25511796a00ece58482107801980a200d6c3c6728040d544508d",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/routes/composer/__init__.py": {
+      "sha256": "bc56634146f855da442d2803b695ad87315217e7020458e46108fb7252d918db",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/routes/composer/compose.py": {
+      "sha256": "559a095808b2ad632cc897d2e46fabd2d86b3302648b09ca6bd07458fbb671eb",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py": {
+      "sha256": "461e8415f55321cffc7024773b8523490b848ef6378b06a6aa17bfcd97f80ce4",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/routes/composer/proposals.py": {
+      "sha256": "4ca2af8af07e685f58b402b3c7ff681e368992bd028f43ae5be099dfe491f027",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/routes/messages.py": {
+      "sha256": "c9dcc0eb5f89e346d882b42398d4b048459ff4524226ee5c20cd70a0acf1ce3e",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/schema.py": {
+      "sha256": "4d52c9b5c1b25c2ef714c024ae014c2e6e04e6d6da9e5084a445dee4b095f7d9",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/schemas.py": {
+      "sha256": "b4f3a899e12d170da0ad59695c60aec7ca8f576c64f36e12407814b6d1e3159f",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/service.py": {
+      "sha256": "3eb30b312800558408a54ad02894839cad18a8774b1ea080ab775b7f0afdd257",
+      "mode": "0o664"
+    },
+    "tests/conftest.py": {
+      "sha256": "0be33cd6dac1725c16658534d34479306ce246351112b07ae0cf79927b41c5a3",
+      "mode": "0o664"
+    },
+    "tests/e2e/recovery/test_sink_effect_deployment_profiles.py": {
+      "sha256": "49046298467e1c348941b92e5f8560804652d168b80277373bf04410b76ab52b",
+      "mode": "0o664"
+    },
+    "tests/helpers/composer_lease.py": {
+      "sha256": "9b89ad3f6dd8f916c9c266667167f81da8978d4f5ab83e5ee32762deadff08d1",
+      "mode": "0o664"
+    },
+    "tests/integration/cli/test_state_engine_lifecycle_profiles.py": {
+      "sha256": "565be9d541536b592501838b8150e6f038027bffcfb2e65aac054996dcc3d641",
+      "mode": "0o664"
+    },
+    "tests/integration/pipeline/test_composer_runtime_agreement.py": {
+      "sha256": "20254ed17adf6baeaf5f927cb8c486f54e9096289de280b21e82617b00f57b7e",
+      "mode": "0o664"
+    },
+    "tests/integration/web/composer/parity/conftest.py": {
+      "sha256": "92e38e2a0f104c88ef4b118bef4c2fa708c42fa674af92d75c08a9543a7dbb20",
+      "mode": "0o664"
+    },
+    "tests/integration/web/composer/parity/test_readiness_preflight_profile_lowering.py": {
+      "sha256": "6b8966bf228b296046a327253005f512185e886ca697b38a5fd9ec78febf8802",
+      "mode": "0o664"
+    },
+    "tests/integration/web/composer/parity/test_repair_and_deferral.py": {
+      "sha256": "eae00fe223b45982dcf1163bc504b09052697d316b4f072d6a8df1a81e8c9765",
+      "mode": "0o664"
+    },
+    "tests/integration/web/composer/test_freeform_planner_failure_translation.py": {
+      "sha256": "948b9dd319d9340827e5bc139ddef6d328159786cf7a03051e2dabbedcf3b460",
+      "mode": "0o664"
+    },
+    "tests/integration/web/composer/test_freeform_required_controls.py": {
+      "sha256": "e2490b933f993742fa567279c648c1a13c99e493ee8572a69e83dd949638a31f",
+      "mode": "0o664"
+    },
+    "tests/integration/web/composer/test_interpretation_run_backstop.py": {
+      "sha256": "8a5840714f0d34731d3c3ab1c4d75b11af3b282d5593512b128e0fa8f5e5d8e1",
+      "mode": "0o664"
+    },
+    "tests/integration/web/composer/test_pipeline_proposal_lifecycle.py": {
+      "sha256": "11d23fb710bf609118734e80aca6a9751c5950d71520de477b8ccbee37d3bc9b",
+      "mode": "0o664"
+    },
+    "tests/integration/web/test_plugin_policy_end_to_end.py": {
+      "sha256": "f25027dc2ed364a5f9b326ffac4af14bacbd3634c0688f8e9ad9baac73a78192",
+      "mode": "0o664"
+    },
+    "tests/integration/web/test_preflight_per_class.py": {
+      "sha256": "9f88b3ea1801b57388d1a0fdf4c3267edb000d5c41f3a8d6ae42998713007a27",
+      "mode": "0o664"
+    },
+    "tests/testcontainer/web/test_add_message_transcript_postgres.py": {
+      "sha256": "aed79c66b2629aded930a2a169d4c7c94f0df74d46ffeccce33539d6bb7315ab",
+      "mode": "0o664"
+    },
+    "tests/testcontainer/web/test_composer_splice_concurrency.py": {
+      "sha256": "6f31a014466ed1bfd3062d9356a58cad9468d4f145bc0c2661e3aaeb22758844",
+      "mode": "0o664"
+    },
+    "tests/testcontainer/web/test_cross_process_composer_postgres.py": {
+      "sha256": "e7f07027904404decaaeaf6f8c883ff097a3e73f02affbdba8e4744f81b1ad00",
+      "mode": "0o664"
+    },
+    "tests/testcontainer/web/test_cross_process_execution_handoff_postgres.py": {
+      "sha256": "915ecc7734c9074ce3b759e6e84e38325443d7fff3f842c009ae60aed9b4b3e6",
+      "mode": "0o664"
+    },
+    "tests/testcontainer/web/test_cross_process_progress_postgres.py": {
+      "sha256": "5dc647fdab75df0a46f54680bf71aa45fecbe4da6f9bda3b8fa1100b42d341bb",
+      "mode": "0o664"
+    },
+    "tests/testcontainer/web/test_cross_process_rate_limit_postgres.py": {
+      "sha256": "607f8dcb6eec3c73b9583ccf4d7e1d32e65e659a8c67051192ca5a7225ea4de0",
+      "mode": "0o664"
+    },
+    "tests/testcontainer/web/test_cross_process_run_reconciliation_postgres.py": {
+      "sha256": "bf0745ca69b101cfb2a6d13a222a59577a0710c887f20bd96ac3849472d5109c",
+      "mode": "0o664"
+    },
+    "tests/testcontainer/web/test_membership_authority_postgres.py": {
+      "sha256": "abd311f04f3a8ff157d070c6d42ae3202cc1371d767d6a7004b36284dce8830d",
+      "mode": "0o664"
+    },
+    "tests/testcontainer/web/test_schema_probe_postgres.py": {
+      "sha256": "6c22ae2ed3003b317ada438f224677a37d8fb43f557fbc37e0ed2a4b86d7f1a7",
+      "mode": "0o664"
+    },
+    "tests/unit/architecture/test_digest_column_shape_checks.py": {
+      "sha256": "f1a1dde35d309564e64b8fb8764d8f60c85318793bdb3560bf6db8af66cce822",
+      "mode": "0o664"
+    },
+    "tests/unit/architecture/test_session_db_mutation_authority.py": {
+      "sha256": "8522271a8bafde4d57568af673333e70584c063c78093d0a08d4a0f894e60ea8",
+      "mode": "0o664"
+    },
+    "tests/unit/contracts/test_web_blob_fencing.py": {
+      "sha256": "5bb8e2e7c33c28f31dec2441dae64e9c7add03fe7c92c01b7785875c4ad73964",
+      "mode": "0o664"
+    },
+    "tests/unit/deployment/test_aws_ecs_terraform_package.py": {
+      "sha256": "7608c3d73620c00042d55fc4165e816fcb696ff1e172bcbf71474ca4149dad23",
+      "mode": "0o664"
+    },
+    "tests/unit/deployment/test_azure_container_apps_bundle.py": {
+      "sha256": "5cd54c6af86ab877314f74890638568b87bafd2c94b4aca4ed75402c3029d1ba",
+      "mode": "0o664"
+    },
+    "tests/unit/deployment/test_azure_container_apps_launch_inputs.py": {
+      "sha256": "01936efd5b86a095708c30ea7a2a0d142515ec60752e64bccb9a08d115fde2a1",
+      "mode": "0o664"
+    },
+    "tests/unit/deployment/test_nginx_websocket_template.py": {
+      "sha256": "b49c51e6c06ede2f74a05e8e73d3f94af5e95e549b004d8c712a232f1cf1b047",
+      "mode": "0o664"
+    },
+    "tests/unit/evals/composer_battery/fake_http.py": {
+      "sha256": "c37cbe31bd4534fb205773b06edb971fb0d8d426dc565a044a8c1737509a9cc7",
+      "mode": "0o664"
+    },
+    "tests/unit/evals/composer_battery/test_drive_battery.py": {
+      "sha256": "46b98f76c45a30e8e8d0f8a029f55b0c86028b33b010e66e8f9a8c2b10097da4",
+      "mode": "0o664"
+    },
+    "tests/unit/scripts/test_composer_acceptance_runner.py": {
+      "sha256": "b60658ad8461273a2c34a0e2078696a9c484b92a03508563158a0a77382e8bb2",
+      "mode": "0o664"
+    },
+    "tests/unit/web/_sync_asgi_client.py": {
+      "sha256": "d4483f1669c80ce4ce1820f54407c1104f49f4f943eb481f2b4b50f35cbcbc6f",
+      "mode": "0o664"
+    },
+    "tests/unit/web/acceptance_common/test_replica_probes.py": {
+      "sha256": "60d898e151acb38397ea7dbafd9f53b63a0992d7b630367e7508d29a50d3c6d8",
+      "mode": "0o664"
+    },
+    "tests/unit/web/auth/test_pipeline_user_authorization.py": {
+      "sha256": "ba3495e1b8c7521e53a8052799ac38d6c1b83e310108ed6d8f2d7d6facacefb9",
+      "mode": "0o664"
+    },
+    "tests/unit/web/azure_container_apps_acceptance/test_driver.py": {
+      "sha256": "cae2c092f8ecc3fff49a6797bc071dd19255691685f981c5a8d4268fe9e5f4a5",
+      "mode": "0o664"
+    },
+    "tests/unit/web/azure_container_apps_acceptance/test_facade_contract.py": {
+      "sha256": "2f3a95b0a6e4c7837301849b23ad4c3a3758cc4805c823772057482a52cd58e1",
+      "mode": "0o664"
+    },
+    "tests/unit/web/azure_container_apps_acceptance/test_live_observations.py": {
+      "sha256": "aeb79b67c5e32ed0debe77448151aa183250ccc5770eba5cab98e2b913df3f0b",
+      "mode": "0o664"
+    },
+    "tests/unit/web/azure_container_apps_acceptance/test_replica_probes.py": {
+      "sha256": "3ecd236a4cc212a734e6a5ef9521603114a36f9b86619f346d6a2965e87dd709",
+      "mode": "0o664"
+    },
+    "tests/unit/web/azure_container_apps_acceptance/test_single_revision.py": {
+      "sha256": "2a9d337c4a906f9a6d618f6705bf6a4af3e5ad9df335be04af0dce358a60227e",
+      "mode": "0o664"
+    },
+    "tests/unit/web/composer/test_provider_quota.py": {
+      "sha256": "5eece7f665ad8fac36bf91725a7ef2010411dba2884d31724f877eb90da61a5b",
+      "mode": "0o664"
+    },
+    "tests/unit/web/conftest.py": {
+      "sha256": "9dadd0e1f26454bd4190952dbc288438936c31c9c94a5d1c14774f4f5e74808d",
+      "mode": "0o664"
+    },
+    "tests/unit/web/coordination/test_membership_authority.py": {
+      "sha256": "0f64885c76f82f2fa2975d881df83ebf44004bd4670c50c933de4743b51a9bc3",
+      "mode": "0o664"
+    },
+    "tests/unit/web/execution/test_loss_watcher_backoff.py": {
+      "sha256": "209548a4d34d5b0c3183979c52a6658dc5bd7d55f79d44d3aa5adcb5be58a714",
+      "mode": "0o664"
+    },
+    "tests/unit/web/execution/test_service.py": {
+      "sha256": "55bd5c94f7e6569f465ad387050f7e25365ee0b487db2f723dd7d1479b441779",
+      "mode": "0o664"
+    },
+    "tests/unit/web/execution/test_session_operation_lease.py": {
+      "sha256": "984b3cc78d30116ee17f7047fcbdf70c9c759c44dc06bac5ea83b0890e65fb49",
+      "mode": "0o664"
+    },
+    "tests/unit/web/execution/test_validate_blob_inline.py": {
+      "sha256": "dc275e8cb984b2a24594ea85a2bd9d0bcb8bdef9f93d7524e5760e2423f0fa76",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/routes/composer/test_state_review_debt_offload.py": {
+      "sha256": "0c41936b08436cdbdab477b5875e56b9192a88f9c414c9ee4a9e3d05bd28b16d",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/routes/test_compose_heartbeat_renewal.py": {
+      "sha256": "bb44b074a35aebe7b11fb2a863c97717b611799ed05b239ab7eeb25af1dde149",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/routes/test_composer_request_telemetry.py": {
+      "sha256": "b20359d7995d3a8a188e7e666c431a5703c485fbac01e779cbd5354b7a16d212",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/routes/test_recompose_heartbeat_cancel.py": {
+      "sha256": "cd7ee9ede902bfd1917649fec9ec97e504f1b566b494047e0609c744bc320e4c",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_advisor_recovery_routes.py": {
+      "sha256": "b1542cd41181a90a58d79aed981b1857e1ae1b81773ba5ff2a0d609ef0b0ab0f",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_archive_recovery.py": {
+      "sha256": "c91823a70c87689e513b8f54bc7615ab33bad93d75c3c3734f127db28047d080",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_blob_inline_resolutions_schema.py": {
+      "sha256": "b09f6091f2417df3635db52b92c48eaff07f58e957c44ce39f3306304ca6c65b",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_freeform_mode_persistence.py": {
+      "sha256": "51c68626cfba6b1f0f0f7b479efe788a008dc89a9ef8ff90af871d5f19838a33",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_freeform_route_custody.py": {
+      "sha256": "69e89739a1b830b4dae023e3c03c38e9fe4e86ef99d918877fd2929f93003a42",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_interpretation_events_table.py": {
+      "sha256": "9e05a7bc5bbb4e0c9fbcb175a182de4929e5f70b97dfe53fb8b3f0862677a9fe",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_operation_fence_wiring.py": {
+      "sha256": "7fcf840430c28be99d79f6266a6e34c06a7c87691643a15a5515bdb2b002a9b3",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_persist_compose_turn.py": {
+      "sha256": "b6580933208bcd37856f8ce7386a9382c670af90f78048fa05540627aa4e1829",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_proposal_blob_effect_receipts_schema.py": {
+      "sha256": "ac1569de60f8a41ee90078e29fc0d59846358eda64145a0c626cefa8caee4ad6",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_recompose_admission_refused.py": {
+      "sha256": "cb5e1e881fe7488662e564386d52a73a3e80437454a58cd75f8837bd20003a82",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_routes.py": {
+      "sha256": "63a8d08370be0434af68652697da5db7cb9ef47775b7b301c12f560277a2084b",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_schema.py": {
+      "sha256": "cbc6db02f797cc2ba8b5799b4314781a615a0b17c5fcd140b05f673c36c2ef87",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_schemas.py": {
+      "sha256": "4a69337cfb0639c117078318579af01572ba52a0582d36607f1a4faf18f0cb39",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_service.py": {
+      "sha256": "9a2b0e2f392f2d639d951455b585e6fa0217812d6546bf02334d40f93a6b5ca8",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_static_direct_writers.py": {
+      "sha256": "bf5e482acf215617a56c5d5dd2ee7d1a5247200458da1d1561cb48b55583923f",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_app.py": {
+      "sha256": "2374dc1245d233bddaf5ee8d0a31890bd589415afec9b00b758019f75797a9a7",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_azure_container_apps_runbook_contract.py": {
+      "sha256": "a5edc122a1d17b344cdc4f4c7ab868831ae10e91b056d22eb51842bac81c9dec",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_config.py": {
+      "sha256": "d3820ea1e32040ab718830a5439aa9f44942d6e15f5e1c2f78ee26f364241ebf",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_credential_boundary_inventory.py": {
+      "sha256": "c04beed1e75438c0bf8019cf9ddd9f2aeb7852374c14334e49cb38a274758306",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_operator_pipeline_metrics.py": {
+      "sha256": "96a3db12bdb5d4f477db7a39d4203afad9da182ee129f74cdb95e98e7b448c1e",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_operator_telemetry.py": {
+      "sha256": "9eead7b24db5119ce2722f0127d969a0943f7848fc9356b0ce5d0add0993433b",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_sessions_composer_attribute_contracts.py": {
+      "sha256": "e068627eb846bedf02831e3fa6b44497cd242c2a57a68bf97f886a82ecc2549e",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/application_finalizers.py": {
+      "sha256": "6df51b4177b72e072862f407fc77eb53162790783b4724b844c9c73a84277ab0",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer_stream.py": {
+      "sha256": "15f215b9a0ada57a10048b06524aaf2c5f3f077a664a366e8971dd3cb16cc0d5",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer_stream_auth.py": {
+      "sha256": "1f19b3eb135137979d916df5fc056143cbe2b74995daf4a399db9637b9560fb6",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/composer_watch_reads.py": {
+      "sha256": "9941dab9ddf5b72ab9f04cfc9ed24450e64a859137b4a952031c8ffb411ef16b",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/coordination/composer_operation_authority.py": {
+      "sha256": "c4e776bd84ed97def937b1daabb6a649ad9772a49e7403d043e38be1167310e1",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/execution_lease_cleanup.py": {
+      "sha256": "49cc0c0235dc9e0b30dbeef4ca9a7ef029cf01358514d6f28f19add72692e9f4",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/api/client.composerTransport.test.ts": {
+      "sha256": "09ceb837d899003a3de5955b40258bf75bc26a334f89061fa98bc975f1982ed3",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/api/client.messages.test.ts": {
+      "sha256": "6393c785a53ed0a6d63f5c40ef7a6821fe3c4850fc99d59cacc2bb27f0d6b7c8",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/api/composerOperationDecoder.test.ts": {
+      "sha256": "405ac1777b678f8ef12c1fabe243f5b2608176cec3d2eb9fe51ecb8e749bc41b",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/api/composerOperationDecoder.ts": {
+      "sha256": "1d1da3c232bffa8ef9b4ad7e1ac144389fb66203d2ecd2b67b9dd1b16c41fd52",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/api/composerOperationObserver.deadlines.test.ts": {
+      "sha256": "461cddacc6073b0f1446fe87988fe91f23177584c73c1aadc775300318bcac01",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/api/composerOperationObserver.recovery.test.ts": {
+      "sha256": "7124e324b1acb511306e61aa25e62d85e5933c6689aea6a9566c8e089e35dee7",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/api/composerOperationObserver.test.ts": {
+      "sha256": "59622618eeb25211fd34450898c553b0cd81c8802219202a49777757568e0ba4",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/api/composerOperationObserver.ts": {
+      "sha256": "06047cae52661f0efceb1469ad1d5eccf29687f13986803e146f8e3e9c8a8d68",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/chat/MessageBubble.refusals.test.tsx": {
+      "sha256": "f3b80e1311cfa89c4c3ab315bc4a11527e28a79efb91c267d13e0dfe80b3f8c5",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/components/sidebar/ImportYamlModal.publication.test.tsx": {
+      "sha256": "14cd293573f0f80efbbf9e5e0ffbac000d155b5dfa3b5380a9899abc46a818ab",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/stores/authStore.composerScopeRaces.test.ts": {
+      "sha256": "6f5273c365bbca45e2cc85be198a73edb262b60953dfddf8e55857d6e5d87d86",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/stores/composerOperationCustody.test.ts": {
+      "sha256": "ac9681d6545ce5f285b19a792ee694d6a1c5a055e6a4af8218eff56ca63e2b7d",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/stores/composerOperationCustody.ts": {
+      "sha256": "c0a184522116109ecb123c4d8150869412eb8fc171163a1d05aff10a766d5dda",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/stores/sessionStore.composerOperations.test.ts": {
+      "sha256": "e491b98a3fe7c35807c0c8d37967312b8b034466571a43d7b3562ec3b7da6ee1",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/test/composeTurnDouble.ts": {
+      "sha256": "022594fc6cacbfa83eecf8ca5d3b6b0ba13c39e4b1b40483ddd0d5fc75ffe8c2",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/test/composerRecoveryProducerFixtures.json": {
+      "sha256": "673e5a2fb4fa0ac56eaa295c51fdfd16bc85e91d2339b150262469f9349be3d1",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/frontend/src/types/composerOperations.ts": {
+      "sha256": "12ffbd192a37d466f7fa718b2617e3d95e6d079a4d0acf3e656244ff3927a8a8",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/operator_telemetry_custody.py": {
+      "sha256": "804c2c9122b2657e5157a4ffa8a292f0dc2bf8ab0affaf22bccc38efb0f17fd1",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/operator_telemetry_dispatch.py": {
+      "sha256": "3d77f1b4c36e8505be3efd9b6dd85172fab3c2eaf3933ce236c9a9e9d4638035",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/operator_telemetry_installation.py": {
+      "sha256": "82d90eaed114b614fb1ef7f3d3b328a612ec025ddfa8738cb2bca08cc9f837a1",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/process_watchdog.py": {
+      "sha256": "5136ef13bc817e01f516ac6691030dc1da95e204f90dab690310ba24eafd17ea",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/process_watchdog_codec.py": {
+      "sha256": "8469a61450ca55dfadbaa7a5210663ba075976a3bd211b1198649d135a17f265",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/process_watchdog_helper.py": {
+      "sha256": "e09eb227facc424c402ec94d89c524eb2f5c52831f7a8721287084ff5736c16c",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/required_executor.py": {
+      "sha256": "4ce38dc66023afa5696374adf59c26af9a0fe1465eb056d873f61934c14b45f9",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/required_sql_outcomes.py": {
+      "sha256": "a3971562aee81800a9445befb4970cd31c533f22a9d02071b224c2c14d01818a",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/required_work.py": {
+      "sha256": "1b538a7d961e55a0f6c6904f5014b77b9cb054aa44d33db5ce6ae9775a0c7d8a",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/composer_app_services.py": {
+      "sha256": "54ba8d3051b52e88f1403811b40a981cc5888516bcca2dfd2349673744e1d09d",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/composer_async_worker.py": {
+      "sha256": "30a91812e1c7f5c0cb32577e7492594412563401e3f18f7fd988e34bbf121d64",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/composer_operation_errors.py": {
+      "sha256": "9b6c965c8f5137b4f55b4e08b01aaae7d27a3ed455d17e9ba7b4e540bf614035",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/composer_operation_preconditions.py": {
+      "sha256": "56a0134bb7b3d57ba8de520e6dbb3b634bdaca695f5f92c83cdcd035b1dca5fb",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/composer_operations.py": {
+      "sha256": "895edd79e2c73867f8a22d5d5ed44dc325dcb0a3fba3c484b6a1666492474f01",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/composer_turn.py": {
+      "sha256": "52b167d070ae13ed6ccc83ef2a92c7fff8bad23eed5dfbb29db07da43b3a72b5",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/manual_proposal_failure.py": {
+      "sha256": "01ce0dc5cb6cfab61586d7e0581f360fe11a742cbaf7bc820266e63c80071678",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/operation_codec.py": {
+      "sha256": "dbadc860ec2db7a6a764e8dc7313b5bbf0dbc76cfdde9fd45128d92d92e2e432",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/pipeline_finish_once.py": {
+      "sha256": "d5432e87702942f67c4244d4764e3743d6606b0182e2ff241f50280f79b4354a",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/pipeline_publication.py": {
+      "sha256": "9251d1bef0e9858d32465bee6abd8ec971f9837a0c61d0e80b2d8f8ddb3ec68a",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/pipeline_rejection.py": {
+      "sha256": "b34a1c868d395ec7713dd5f7a7e67bcb9d7132d9ef701e8cc9d4e852098676a3",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/pipeline_rejection_custody.py": {
+      "sha256": "e72f4de0c2400c0fe2e8ab7296e70c04019c05de23689f319bc3b2fc376ea13a",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/pipeline_rejection_finish_once.py": {
+      "sha256": "590c0be357cfb2926acbf60db0826789e05dc0b7db13a95bd8d1e1e6ffc05c5c",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/pipeline_review_evidence.py": {
+      "sha256": "d71b8a54f2badd41c130609e43927a7567feccdd88c71be7a68e90c16540cda2",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/pipeline_revocation.py": {
+      "sha256": "3ceb0af160d66eb30f46fb8435f0decaf4354a3c85143226abd48935fb30a05b",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/pipeline_settlement_payloads.py": {
+      "sha256": "e892b9ea4348f897179925782a5ec79b43d01b8ef8c57be4c03cdbd730bfc074",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/proposal_decoder.py": {
+      "sha256": "017b0c82827778df6543a1787cc9a38aadff6eb6b3d6dd31ea1fd515c5a69416",
+      "mode": "0o664"
+    },
+    "src/elspeth/web/sessions/routes/composer/operations.py": {
+      "sha256": "c22e0829551dc6c7120ca773d7e5924ec3f8db3fa770c1b736395cac9d6233e4",
+      "mode": "0o664"
+    },
+    "tests/fixtures/composer_fakes.py": {
+      "sha256": "c76217ab3ba2e63010a0fa47dd93146e37389dcc082fc1bf0b82f730f84ca4db",
+      "mode": "0o664"
+    },
+    "tests/fixtures/process_watchdog.py": {
+      "sha256": "0f62c456360f49ecb2691db58f4480713eb783942c8b23fccec4d48b147b8334",
+      "mode": "0o664"
+    },
+    "tests/fixtures/required_executor.py": {
+      "sha256": "20da73e8639ca36ab0a04f3a8df3a3f2f631c1e1258c54f4f6ca6364011a057e",
+      "mode": "0o664"
+    },
+    "tests/helpers/app_failed_partial_child.py": {
+      "sha256": "f1eb80fd5d00e823227f1b1df69019eb135653536eb114f91bca18312ce040f1",
+      "mode": "0o664"
+    },
+    "tests/helpers/app_failed_physical_child.py": {
+      "sha256": "a9f8a0a19386a9279658f1d4a5ebc7b31b4d8136d6ac2fb1ac3b65726fb1d2eb",
+      "mode": "0o664"
+    },
+    "tests/helpers/app_failed_receipt_terminal.py": {
+      "sha256": "61f304280c588e4543050407c19999f0c967d255fbd2b040dc408975a9312c3a",
+      "mode": "0o664"
+    },
+    "tests/helpers/child_executor_lifecycle.py": {
+      "sha256": "44fe63b4be7a006eec4c2da9959440dace525ab01d604eaa2237d78fb363e021",
+      "mode": "0o664"
+    },
+    "tests/helpers/composer_https.py": {
+      "sha256": "92e92987a6943937064aca53223979ced4e960d8efcef0442e09bc1e1c15ab43",
+      "mode": "0o664"
+    },
+    "tests/helpers/composer_operations.py": {
+      "sha256": "80938fac2c0dfb39cf1cf11c9e290bf4676ed46e34d1455273fd45cf2dcf8eaf",
+      "mode": "0o664"
+    },
+    "tests/helpers/composer_pg_http.py": {
+      "sha256": "4d26f23ea0cebedd8a4a524b7841bf88cd3ca17dcb3674e1b8b07ad6808bce2a",
+      "mode": "0o664"
+    },
+    "tests/helpers/composer_probe_operations.py": {
+      "sha256": "be7df576516a60d1ba0addb04d1cd64eba71427bb5be0decc955a55816fb7f1d",
+      "mode": "0o664"
+    },
+    "tests/helpers/execute_failed_physical_join_child.py": {
+      "sha256": "1270bbff0d9d0dc994cd9f2bd0b9486d3e0dea22854f17a9d161b668782cb4ec",
+      "mode": "0o664"
+    },
+    "tests/helpers/execution_custody.py": {
+      "sha256": "f0252c6bb88add7dfcee219713e2872344a38077afb008f2e287b842596edbd7",
+      "mode": "0o664"
+    },
+    "tests/helpers/finalizer_failed_counter_child.py": {
+      "sha256": "260b2ab7cddd5ea06e36c20cc3f3736326d575a33be6259c64fb17903e0f6e3c",
+      "mode": "0o664"
+    },
+    "tests/integration/web/composer_react_acceptance_support/react-browser.mjs": {
+      "sha256": "3fe340d0bba7a9aa9ac5f8fd45363c725c831f4426305daa06732699350de510",
+      "mode": "0o664"
+    },
+    "tests/integration/web/composer_react_acceptance_support/react-entry.tsx": {
+      "sha256": "91d22d9ba6d670f933e779c465968f3e617e12b7afdfc3f7c73b092110138223",
+      "mode": "0o664"
+    },
+    "tests/integration/web/test_composer_https_acceptance.py": {
+      "sha256": "01e29821f0b8d68065a63d5a4faa20137c20b7ba90b75a46a4c0593821d83828",
+      "mode": "0o664"
+    },
+    "tests/integration/web/test_composer_react_generation_acceptance.py": {
+      "sha256": "3dfe246b7714c58299c855a5fcb848939cd06a7e585bfff9245d3afea253a686",
+      "mode": "0o664"
+    },
+    "tests/integration/web/test_composer_sso_stream_revocation.py": {
+      "sha256": "4f6ee77a91a1557e11470ed363438c6eb50b6a3b4e18bda20b16056687799c3d",
+      "mode": "0o664"
+    },
+    "tests/testcontainer/web/test_composer_operations_postgres.py": {
+      "sha256": "91a690bedff0aafdaa21bc15eea6da0ab16fd55a9875b45159bf94d8efa612d5",
+      "mode": "0o664"
+    },
+    "tests/unit/architecture/test_pipeline_publication_authority_guards.py": {
+      "sha256": "d3fd91ae6a1f2259893bc8d3c07f1ae97b5fb279646000e2607bced0fc47cc6b",
+      "mode": "0o664"
+    },
+    "tests/unit/evals/test_composer_shell_operations.py": {
+      "sha256": "08a9e5625926d0e4746a57d692777ad6e9fb20f745375c19ae647f271552bea9",
+      "mode": "0o664"
+    },
+    "tests/unit/helpers/test_composer_lease_adapter.py": {
+      "sha256": "cb4e4b7c0e7474a47c013f0ab2228f546a966f8b63727e09c2665ef2f259b4a1",
+      "mode": "0o664"
+    },
+    "tests/unit/web/aws_ecs_acceptance/test_operator_emitter_lifecycle.py": {
+      "sha256": "6a857348882fe0ab9c0995924fd46455a6c794491c6a379df8c0708f69702e9b",
+      "mode": "0o664"
+    },
+    "tests/unit/web/composer/test_checkpoint_owner_compatibility.py": {
+      "sha256": "7a3b19a2055fb35a92dc38e73438e07476e1af1aaf2f947d0fa00585bc8877bc",
+      "mode": "0o664"
+    },
+    "tests/unit/web/composer/test_explicit_provider_custody.py": {
+      "sha256": "f45174a9d122289459a760ced8c82be62d1e65911ae0d3b528db6926cbdb9397",
+      "mode": "0o664"
+    },
+    "tests/unit/web/composer/test_quota_scope_failure_identity.py": {
+      "sha256": "c6d7663f00b6924a1f02c4c0bd533ad13e7362de44bc7ca7b3ef3298de990d8c",
+      "mode": "0o664"
+    },
+    "tests/unit/web/composer/test_review_json_typing.py": {
+      "sha256": "c611b428f8ce036577700d4d63d32dd4b4bca88367b88cbdc9d45c282a65c1d9",
+      "mode": "0o664"
+    },
+    "tests/unit/web/composer/test_set_pipeline_review_finalization.py": {
+      "sha256": "13ee474506db356c188802d1b9996e3453888d744f73966e55e5cd30256854ad",
+      "mode": "0o664"
+    },
+    "tests/unit/web/coordination/test_composer_operation_authority.py": {
+      "sha256": "7a161fb788a9844765f6c873bc6e8938695df50918985218596aa4953e5fb3cc",
+      "mode": "0o664"
+    },
+    "tests/unit/web/execution/test_canonical_execution_fixture.py": {
+      "sha256": "df05f539cbbecb623a6500632f0e7fb750339487168c3089428ac6b13c789baa",
+      "mode": "0o664"
+    },
+    "tests/unit/web/execution/test_execute_cleanup_consumers.py": {
+      "sha256": "455e8b1e1410b7d58609e553fcb7451aae262720f149e1c3bc1aca6419ac6a7e",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_atomic_pipeline_review_evidence.py": {
+      "sha256": "26fb6e1d638ecc709c62a146d6246ff0512536e6625269f48c21cf28ddfb63cd",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_binding_entry_guards.py": {
+      "sha256": "c6c4aa5803961315994cb1938e170d9db682b7517b4d9d3b3d503b3f50ed0baf",
+      "mode": "0o644"
+    },
+    "tests/unit/web/sessions/test_composer_adoption_custody.py": {
+      "sha256": "d0803a244ad4b62a413d24f4593b35471ac998bc4c6f3e6fb434aa13610f4c4a",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_async_worker.py": {
+      "sha256": "7cbd90d0bdb270ffce88300c10575a5fce8a1a0445dce08dbe8e35e596f882ca",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_failure_audit_owner.py": {
+      "sha256": "147a220a84863a723249b49615820224842938640cedf5c40f228610e4a92ec3",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_operation_clock.py": {
+      "sha256": "582a54fa0e9e88f18722dfa3269d3b07c865b0539f7316f4bf8c8aeed3607bcc",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_operation_codec.py": {
+      "sha256": "d43742a970910f4ff139bc89b267275c06fb7aebebd6f731d5ac3cc1c4323e05",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_operation_dtos.py": {
+      "sha256": "7368095afdfe75eea3650e05825b15243124f26b83847c77f6559f6a5067a67e",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_operation_error_parity.py": {
+      "sha256": "b3b0803b8fa82f434c643f7eebbf205bf53f319e834b1e29f2a64e5720c6eda3",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_operation_lifecycle.py": {
+      "sha256": "a1ec05598b70bd15f4902dd154640e77a4737ce60f77b97f56c8d7fcec6b2819",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_operation_settings.py": {
+      "sha256": "0a95e7f5f8e1dd2341c9de78a5936579c84e98632fbb7ea2251775e83bc806d2",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_real_provider_transitions.py": {
+      "sha256": "751e6cbf5df89c19127676654bf41600313354cb356b81c158e5ebe321f77ed1",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_recompose_cutover.py": {
+      "sha256": "4e420d57cef1e89b53ebdeca9bbfeb22af1d0b3ae31b45fda728b01abab7548b",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_required_audit.py": {
+      "sha256": "2a59685523b91bec3049d282d350512368e334219d0fe4d059f876591b2f1ce1",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_required_audit_custody.py": {
+      "sha256": "35fca7dddba2eb6a7c6a0cdc2c1bc7a388c51347b4cc860d35910288938b40e7",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_required_recovery.py": {
+      "sha256": "7223e0bdd73c8bbad7f9b5a312316f7f97dcef5509722abf95690234ebb30df4",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_retry_recovery.py": {
+      "sha256": "2e91aff211277a22ba6a5c26fc34933483317d1f8c30d6ea9eaace672dc70930",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_review_regressions.py": {
+      "sha256": "09f7275a9ba90ce64471a44201b9ee913c46ffc6e890b6b393d78e3067dc35b2",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_route_helper.py": {
+      "sha256": "6c4fa802fcee971fe9a6fb9916cec18102cd3757eea613649ed7c56e057444ae",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_worker_custody.py": {
+      "sha256": "2046bdf9103ea7f94a9e05c7cb9aa979611645cd47e336fc60fe9b2e0750cdc2",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_composer_worker_historical_controls.py": {
+      "sha256": "f8c504694de0956ea3fe805d2f0ce0e0270ae6bf77d0df6c72d6fc30bfd0f429",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_failed_terminal_publication_barrier.py": {
+      "sha256": "7a82885485ddcef5762a258acd5aec3cc3552a77c65d4b5b16e3753b51623d41",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_freeform_cancellation_observation.py": {
+      "sha256": "423a296759c9b5010a7224bcc55c2ad42067e2d6a7c50698adbef2fb95d28fa3",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_lifecycle_physical_receipts.py": {
+      "sha256": "95ba7bdaa1f48fee83679ad08988f6b096ca233eea6740610fc7327e4929ee10",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_pipeline_route_publication_projection.py": {
+      "sha256": "2d85c8c3234eeba74bd339b5242f68a4656b5a3f942659576f2cd8e4fc5c8819",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_renewal_attempt_observation.py": {
+      "sha256": "fbd0fa6c98378c0261ff60a4f1ef76f90b58ef4591fc6e50d3f93af4f4b9818d",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_run_composer_turn.py": {
+      "sha256": "2515344a8e59c6379d8c97913ca29ee2ea165faf6fa9cc4e5c78e47d3912c4d0",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_worker_failed_publication_barrier.py": {
+      "sha256": "95d75c4d3e9dc398baabf4529690676b0082a900824887f3f15d25c664663bb7",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_worker_failure_selection_handoff.py": {
+      "sha256": "0c2aa666c51a326173a937884edd7c51ef7daf485b419a9c86dd8ee88ead9dc2",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_worker_owned_sql_cancellations.py": {
+      "sha256": "3a010283019b92a1ac24c23c79ec9ffeb16de0de75dc9f335f87e6a68b7a1355",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_worker_terminal_binding.py": {
+      "sha256": "2aafde7e0388573071d3464f964c20d5a7d24a1695de8b1ceb73a1cebf90cadf",
+      "mode": "0o664"
+    },
+    "tests/unit/web/sessions/test_worker_terminal_handoff.py": {
+      "sha256": "4415d72e286ad5e745b39c7c38486e4318cdf37bfc7ffa6d261b7010c4941f73",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_app_failed_physical_exit.py": {
+      "sha256": "8ce2d4c9306de4b5e9600ca776733541f6b946121b666ecf1aca38a04569a10d",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_app_failed_receipt_diagnostic.py": {
+      "sha256": "91c12ff7f7d329e3da8cdbdd00d4c56b1dc30f816ed89c84a8e6693e46e9db59",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_composer_stream.py": {
+      "sha256": "854d4193c94fbc242792b76619e286696a736e21ae6ca4afd2a903414710825c",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_composer_stream_live_auth.py": {
+      "sha256": "537b622eb7b4b2a565536647e8dc7aa8e663413d297fdb9e2d47613277a4a9c0",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_composer_stream_pool_capacity.py": {
+      "sha256": "4390a6b3f71775d4069e8b83055e2d872ef55537a639ab96fc94270bd18bba84",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_composer_stream_worker_custody.py": {
+      "sha256": "b207a369e8761620ac55a27cac951347095f1246ff3fc179b9e8e903320b3a37",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_composer_watch_admission_custody.py": {
+      "sha256": "c9a4fd0a0f71b8b14c24d5da0ca8a8f7bfa5524c011c3976b51000a8863ada66",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_core_fixture_edges_native.py": {
+      "sha256": "548956ffa12441f9b1a78d9fafa3b575d72daed9bee50e6d9393a81339aa71b2",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_core_task_observer_native.py": {
+      "sha256": "b76f045df1664fb48ad4ea9ce4edd5e15975e2f64cc962d3eb530babe9246437",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_execute_failed_physical_join.py": {
+      "sha256": "0b8665bcb32ec50e5e4f4a1555b1112d128580ff0348c98cdf9ce8d087efb2fe",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_execute_lease_cleanup_core.py": {
+      "sha256": "f25f322e9d1a7911d2f34f619e1e13903b77e95e2defb5f0ad20e7ff89606b9c",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_finalizer_failed_counter_child.py": {
+      "sha256": "daecc670a1434bf86c3fc82e707233baccc9af9cc4a59e457245b5b59aa6259c",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_lifecycle_original_outcomes.py": {
+      "sha256": "c6549847bc84d077bdb3b6a135b0ab5362625ae79726f37fd6d1675d29231b2f",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_middleware_send_boundary.py": {
+      "sha256": "5b2d276e619010a50b9fe30f58fedaa39b2a4b635de6e7e122adabec056840da",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_mounted_body_rejection_order.py": {
+      "sha256": "55be0dad499cad39b4c009b8663b3f45bffbde18406e6190212d87bb65dcbd76",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_operation_loss_entry_failure.py": {
+      "sha256": "d20859f4632cb6d55d064480b49285aa2f6e0ba8e3af49a36be98bc0cbca0eb8",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_operator_telemetry_custody.py": {
+      "sha256": "da68ef47a46250c8978f6e91ca6e919311cf5663ed49bd9bef4233c95197783c",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_orphan_cleanup_originals.py": {
+      "sha256": "cec3fc2d4e1ccec5e95dd5f2f4a1f34915d9c0f55b9138375b78821e53294f3a",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_process_watchdog.py": {
+      "sha256": "e439d5e9cdb1715539e69cc3260458419895a0c44de862ae35c24992db86a520",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_required_coordinator_entry_integrity.py": {
+      "sha256": "4ae7e0a707e0ab9eff493d0c32deae8b96524e5bd0e996c980c98eb02b970e0b",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_required_executor_completion_identity.py": {
+      "sha256": "b5936e860af26973cb28ad926c6b14521d80bda0b3a57ff5bd6369fb8b83a1da",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_required_executor_custody.py": {
+      "sha256": "72d36b73c3b4b687a8fa8eee3e019ff1f473348ce2bd2ab01cfccfa1c27a7f81",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_required_executor_factory.py": {
+      "sha256": "58a4bf485a2b9de0222d0da762407b24da21a9bfb7e15ed61ae677ea66e265b4",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_required_sql_finish_once.py": {
+      "sha256": "bdc8d5aa4506ca3b23085adb6f8d7de5fa2555f4e7e32c4f534fc7447c9b8788",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_required_work.py": {
+      "sha256": "1a7498b585e7d73344de435d17eaf890de29ca289491e8d6daa3c77e11d43508",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_required_work_unused.py": {
+      "sha256": "7287c0f7bbfecab1c2c43628b3e2ac9d0e72180ae2bb8e062318b1c1371086cd",
+      "mode": "0o664"
+    },
+    "tests/unit/web/test_sync_asgi_composer_loop.py": {
+      "sha256": "aebd8139c206eef6689ac44c023e85a7ca8a70b21ede44c1bd63f28dc65d47ef",
+      "mode": "0o664"
+    }
+  },
+  "status": "EXACT_ALL314_CODE_RECONSTRUCTION_VERIFIED",
+  "baseline_existing_code_files": 173,
+  "new_code_files": 141,
+  "code_paths": 314,
+  "patch_sha256": "d7fc56a4d725caf45e67f67257c5c347695494bec3ba37f86ad872b74daa51de",
+  "gzip_sha256": "3d02518b8ed1d76ea93635ed6f84b0f60338267b45317eaabb2c2ef026f54145",
+  "git_modes_reconstructed": "regular-file executable bits; host group-write bits retained in source-inventory separately",
+  "normal_source_checks": "FAILED; artifact does not clear them"
+}
