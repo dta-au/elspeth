@@ -19,6 +19,15 @@ Landscape audit trail.
 > **AI-generated code:** ELSPETH is a rapid prototype, generated and reviewed by AI,
 > that is in active development with major systems subject to change. Limited user
 > testing has been conducted on a small set of use cases.
+>
+> **Chroma security advisory:** Do not use Chroma with ELSPETH until upstream
+> publishes a fixed release and ELSPETH adopts and verifies it. This includes
+> the `rag_retrieval` transform with `provider: chroma`, the `chroma_sink` sink,
+> and Chroma examples in all connection modes. ChromaDB has unresolved code-execution vulnerabilities;
+> version 1.5.9 is still affected. See the
+> [pre-authentication advisory](https://github.com/advisories/GHSA-f4j7-r4q5-qw2c),
+> [collection-update advisory](https://github.com/advisories/GHSA-36p7-vc44-83pf),
+> and [upstream server and client issue](https://github.com/chroma-core/chroma/issues/6717).
 
 ## What it does
 
